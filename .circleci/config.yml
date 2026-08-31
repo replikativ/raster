@@ -77,6 +77,7 @@ jobs:
 
   test:
     executor: clojure-java24
+    parallelism: 4
     steps:
       - attach_workspace:
           at: ~/
@@ -85,8 +86,8 @@ jobs:
           name: Install OpenBLAS + clang
           command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev clang
       - run:
-          name: Run tests
-          command: clojure -X:test
+          name: Run deterministic test shard
+          command: scripts/ci-test-shard.sh
 
   emit-gpu-compile-fixtures:
     executor: clojure-java24
