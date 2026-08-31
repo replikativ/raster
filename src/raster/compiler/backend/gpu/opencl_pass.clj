@@ -626,7 +626,7 @@
             (par/par-rng-fill-form? form)
             (let [{:keys [seeds n base-seed]} (par/extract-par-rng-fill-info form)
                   k (register-kernel!
-                     (legacy/generate-par-rng-fill-kernel :device-id device-id)
+                     (legacy/generate-par-rng-fill-kernel)
                      :ze-maps)]
               (list 'raster.gpu.ze-runtime/invoke-registered-rng-fill-kernel
                     (:kernel-name k) seeds n base-seed))
@@ -635,7 +635,7 @@
             (par/par-active-ids-form? form)
             (let [{:keys [ids n-active n-agents base-seed]} (par/extract-par-active-ids-info form)
                   k (register-kernel!
-                     (legacy/generate-par-active-ids-kernel :device-id device-id)
+                     (legacy/generate-par-active-ids-kernel)
                      :ze-maps)]
               (list 'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel
                     (:kernel-name k) ids n-active n-agents base-seed))

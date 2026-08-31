@@ -119,7 +119,8 @@
 
 (defn- compile-deftm-internal!
   "Compile a deftm var's par forms to GPU kernels and register them.
-   Returns vector of kernel-info maps."
+   Returns the complete backend result so a session retains first-class dispatches and graphs
+   instead of reconstructing them later from the flat kernel list."
   [v device-id {:keys [dtype min-elements] :or {dtype :float min-elements 0}}]
   (let [walked-body (get-walked-body v dtype)
         resolved (or (resolve-deftm-var v) v)
@@ -147,7 +148,7 @@
                            :min-elements min-elements)]
     (doseq [k (:kernels result)]
       (register! (:kernel-name k) k))
-    (:kernels result)))
+    result))
 
 ;; ================================================================
 ;; Internal: buffer allocation
@@ -368,6 +369,7 @@
            :session-id (random-uuid)
            :arena-id  arena-id
            :kernels   {}       ;; {phase-key → [kernel-info ...]}
+           :dispatches {}      ;; {phase-key → [KernelDispatch ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
            :allocations {}     ;; {buf-key → backend-neutral BufferAllocation}
            :kernel-graphs {}    ;; {graph-key → bound emitted KernelGraph}
@@ -400,8 +402,8 @@
         (free-session-buffers! buffers allocations device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :allocations {} :kernels {} :prepared {} :graphs {}
-               :kernel-graphs {} :events {})))))
+        (swap! sess assoc :closed? true :buffers {} :allocations {} :kernels {} :dispatches {}
+               :prepared {} :graphs {} :kernel-graphs {} :events {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -449,11 +451,15 @@
          ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
          ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
          cache-key [v (get opts :dtype :float)]
-         kernels (or (get-in @sess [:kernel-cache cache-key])
-                     (let [ks (compile-deftm-internal! v device-id opts)]
-                       (swap! sess assoc-in [:kernel-cache cache-key] ks)
-                       ks))]
-     (swap! sess assoc-in [:kernels phase-key] kernels)
+         compiled (or (get-in @sess [:kernel-cache cache-key])
+                      (let [result (compile-deftm-internal! v device-id opts)]
+                        (swap! sess assoc-in [:kernel-cache cache-key] result)
+                        result))
+         kernels (:kernels compiled)]
+     (swap! sess (fn [state]
+                   (-> state
+                       (assoc-in [:kernels phase-key] kernels)
+                       (assoc-in [:dispatches phase-key] (:dispatches compiled)))))
      kernels)))
 
 (defn compile-phases!
@@ -746,24 +752,60 @@
       (destroy-prepared-entry! (:device-id @sess) entry)))
   nil)
 
+(declare bind-kernel-executable! run-kernel-graph! release-kernel-graph!)
+
 (defn invoke-scan!
-  "Invoke a compiled Blelloch exclusive-scan kernel pair from the session.
+  "Invoke a compiled exclusive scan through its scheduled KernelExecutable.
 
    sess: session atom
-   phase-key: keyword identifying the scan kernel pair
+   phase-key: keyword identifying the compiled scan dispatch
    input-keys: vector of buffer keys for inputs
    output-key: buffer key for output
    n: number of elements"
   [sess phase-key input-keys output-key n]
-  (let [{:keys [kernels buffers]} @sess
-        kernel-vec (get kernels phase-key)
-        device-id (:device-id @sess)
-        invoke! (rt-resolve device-id "invoke-registered-scan-exclusive-kernel")]
-    (invoke! (:kernel-name (first kernel-vec))
-             (:kernel-name (second kernel-vec))
-             (mapv #(get buffers %) input-keys)
-             (get buffers output-key)
-             n)))
+  (let [dispatches (get-in @sess [:dispatches phase-key])
+        _ (when-not (= 1 (count dispatches))
+            (throw (ex-info "compiled scan phase must retain exactly one KernelDispatch"
+                            {:phase phase-key :dispatch-count (count dispatches)
+                             :reason :compiled-scan-dispatch-missing})))
+        executable (kdispatch/default-alternative (first dispatches))
+        remaining-inputs (volatile! (seq input-keys))
+        arguments
+        (mapv (fn [slot]
+                (cond
+                  (and (= :scalar (:kind slot)) (= :bound (:role slot)))
+                  {:type (:kernel-dtype slot) :value n}
+
+                  (= :scalar (:kind slot))
+                  (throw (ex-info "invoke-scan! cannot guess a captured scalar binding"
+                                  {:phase phase-key :slot slot
+                                   :reason :compiled-scan-captured-scalar-unbound}))
+
+                  (kabi/writable? slot)
+                  output-key
+
+                  (kabi/readable? slot)
+                  (let [key (first @remaining-inputs)]
+                    (when-not key
+                      (throw (ex-info "compiled scan has more input slots than caller bindings"
+                                      {:phase phase-key :slot slot :input-keys input-keys})))
+                    (vswap! remaining-inputs next)
+                    key)
+
+                  :else
+                  (throw (ex-info "compiled scan ABI slot has no runtime binding policy"
+                                  {:phase phase-key :slot slot}))))
+              (kexec/abi executable))
+        _ (when (seq @remaining-inputs)
+            (throw (ex-info "compiled scan caller supplied unused input bindings"
+                            {:phase phase-key :unused (vec @remaining-inputs)})))
+        handle (bind-kernel-executable! sess [:compiled-scan phase-key]
+                                        executable arguments)]
+    (try
+      (run-kernel-graph! sess handle)
+      (get-in @sess [:buffers output-key])
+      (finally
+        (release-kernel-graph! sess handle)))))
 
 (defn invoke-rng-fill!
   "Invoke a compiled parallel RNG fill kernel from the session.
