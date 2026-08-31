@@ -327,9 +327,9 @@
   (par/map-void! o out
                  (let [nsb (quot (long in) 256)
                        niw (quot (long in) 4)          ; int32 words per row (in bytes / 4)
-                       wb (* (long o) niw)
-                       sbb (* (long o) nsb)
-                       subb (* (long o) (quot (long in) 16))
+                       ^long wb (* (long o) niw)
+                       ^long sbb (* (long o) nsb)
+                       ^long subb (* (long o) (quot (long in) 16))
                        acc (loop [sb 0 a 0.0]
                              (if (< sb nsb)
                                (let [dv (double (ra/aget ds (+ sbb sb)))
@@ -420,4 +420,5 @@
                                                    (double (ra/aget xs (+ (* t nb) b))))
                                                 (double dp)))))
                                a))]
-                   (ra/aset y (+ (* t out) o) (float acc)))))
+                   ;; `ot = t*out + o`; retain the canonical dense destination for TypedSOAC.
+                   (ra/aset y ot (float acc)))))

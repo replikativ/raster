@@ -6,6 +6,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.report :as report]
             [raster.quant.kernels-k :as qk]
+            [raster.quant.pack :as pack]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]))
 
@@ -27,6 +28,12 @@
     (dotimes [i (alength result)]
       (aset result i (.getInt buffer (* i 4))))
     result))
+
+(defn- signed-packed-byte
+  [^ints values index]
+  (let [word (aget values (quot index 4))
+        shift (* 8 (rem index 4))]
+    (int (unchecked-byte (bit-and (unsigned-bit-shift-right word shift) 0xFF)))))
 
 (defn- float-row [^floats values row width]
   (let [result (float-array width)]
@@ -79,6 +86,49 @@
           (dotimes [o out]
             (is (< (Math/abs (- (aget y o) (aget yref o))) 1e-2)
                 (str "Q6_K row " o ": C " (aget y o) " vs ref " (aget yref o)))))))))
+
+(deftest q6k-dp4a-matches-the-composable-kernel-without-a-device
+  (let [out 7 in 256
+        W (gen (* out in) 31) x (gen in 32)
+        {:keys [wq sc ds]} (q/quantize-weight-q6k W q/q6-K)
+        {:keys [xq xs bsums]} (q/quantize-act-q8k x in q/q6-K)
+        wp (bytes->ints-le wq) xp (bytes->ints-le xq)
+        expected (float-array out) actual (float-array out)]
+    (qk/qmatmul-q6k-composable! xq xs bsums wq sc ds expected in out 0 out)
+    (qk/qmatmul-q6k-dp4a! xp xs bsums wp sc ds actual in out)
+    (dotimes [o out]
+      (is (< (Math/abs (- (aget expected o) (aget actual o))) 1e-3)
+          (str "Q6_K output row " o)))))
+
+(deftest signed-i8-prefill-gemm-preserves-independent-dense-rows
+  (let [nrows 3 in 64 out 5 nb (quot in 32)
+        W (gen (* out in) 41) x (gen (* nrows in) 42)
+        {:keys [wp ws]} (pack/quantize-one-q8 W in out "test-weight")
+        xp (int-array (* nrows (quot in 4)))
+        xs (float-array (* nrows nb))
+        actual (float-array (* nrows out))]
+    (qk/quant-act-i8-rows-gpu! x xp xs in nrows)
+    (qk/qmatmul-i8-gemm! xp xs wp ws actual in out nrows)
+    (dotimes [row nrows]
+      (dotimes [o out]
+        (let [expected
+              (float
+               (loop [b 0 acc 0.0]
+                 (if (< b nb)
+                   (let [dp (loop [k 0 dot 0]
+                              (if (< k 32)
+                                (recur (inc k)
+                                       (+ dot
+                                          (* (signed-packed-byte wp (+ (* o in) (* b 32) k))
+                                             (signed-packed-byte xp (+ (* row in) (* b 32) k)))))
+                                dot))]
+                     (recur (inc b)
+                            (+ acc (* (aget ws (+ (* o nb) b))
+                                      (aget xs (+ (* row nb) b))
+                                      dp))))
+                   acc)))]
+          (is (< (Math/abs (- expected (aget actual (+ (* row out) o)))) 1e-4)
+              (str "signed-I8 row " row ", output " o)))))))
 
 (deftest q8k-activation-quantization-has-an-ordinary-row-axis
   (let [nrows 3 in 512 nsb (quot in 256) nsub (quot in 32)
@@ -194,3 +244,30 @@
         "Q4_K row projection reaches the target-neutral integer-dot intrinsic")
     (is (not (re-find #"\\bdouble\\b" (:source (first projection-kernels))))
         "the float projection does not accidentally promote accumulation to FP64")))
+
+(deftest sibling-dp4a-contractions-preserve-typed-soac-through-opencl
+  (let [q6-pipeline (pipeline/show-pipeline #'qk/qmatmul-q6k-dp4a!
+                                            :target-device :ze:0 :dtype :float)
+        i8-pipeline (pipeline/show-pipeline #'qk/qmatmul-i8-gemm!
+                                            :target-device :ze:0 :dtype :float)
+        q6-report (report/from-pipeline q6-pipeline)
+        i8-report (report/from-pipeline i8-pipeline)
+        expected-route {:backend :opencl :source-dialect :typed-soac
+                        :typed-validated true :declines []}]
+    (is (= expected-route (:route q6-report)))
+    (is (= expected-route (:route i8-report)))
+    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 0
+            :backend-reused 1 :backend-relowered 0 :fallback 0}
+           (:lowering q6-report)))
+    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+            :backend-reused 1 :backend-relowered 0 :fallback 0}
+           (:lowering i8-report)))
+    (is (= '[[[bsums :int] [ds :float] [sc :byte] [wp :int] [xp :int]
+              [xs :float] [y :float] [in :int] [_n_bound :int]]]
+           (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels q6-pipeline))))
+    (is (= '[[[wp :int] [ws :float] [xp :int] [xs :float] [y :float]
+              [in :int] [out :int] [_n_bound :int]]]
+           (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels i8-pipeline))))
+    (is (every? #(re-find #"rstr_dp4a" (:source %))
+                (concat (:kernels q6-pipeline) (:kernels i8-pipeline)))
+        "both formats use the one target-neutral integer-dot intrinsic")))
