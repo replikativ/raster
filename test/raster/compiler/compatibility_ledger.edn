@@ -20,11 +20,11 @@
                          [:regtiled :symbolic-dims] 1}}}
 
   :q4k-dp4a-rows-gpu
-  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
-           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 1}}
+  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true
+           :declines {}}
    :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
-   :lowering {:segops 0 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
-              :backend-reused 0 :backend-relowered 0 :fallback 0}
+   :lowering {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+              :backend-reused 1 :backend-relowered 0 :fallback 0}
    :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
               :fallback-reasons [] :declines {}}}
 
