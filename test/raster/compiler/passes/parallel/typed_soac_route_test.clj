@@ -4,6 +4,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -629,6 +630,14 @@
     (is (not-any? #(= :schedule-family-disabled (:reason %))
                   (:declines candidate-routes)))
     (try
+      (contract-route/route-static-typed-contraction-dispatch
+       algorithm (:id operation) (:schedule operation)
+       :dtype :float :desc {})
+      (is false "a static dispatch must not bake runtime-dependent contraction dimensions")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-contraction-dispatch-dynamic-scalar
+               (:reason (ex-data exception))))))
+    (try
       (contract-route/route-typed-contraction
        algorithm (:id operation) (:schedule operation) :dtype :double :desc {})
       (is false "a route dtype that disagrees with the typed equation must fail")
@@ -692,7 +701,12 @@
         candidates
         (contract-route/route-typed-contraction-candidates!
          algorithm (:id operation) (:schedule operation)
-         :dtype :half :desc descriptor)]
+         :dtype :half :desc descriptor)
+        dispatch
+        (contract-route/route-static-typed-contraction-dispatch
+         algorithm (:id operation) (:schedule operation)
+         :dtype :half :desc descriptor)
+        alternatives (:alternatives dispatch)]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
     (is (= :portable-segred (:strategy (select-family :portable))))
@@ -705,6 +719,29 @@
                  (:candidates candidates))))
     (is (every? (comp some? :artifact) (:candidates candidates)))
     (is (empty? (:declines candidates)))
+    (is (= :dpas (:default-strategy dispatch)))
+    (is (= [:dpas :regtiled :portable-segred]
+           (mapv #(get-in % [:attributes :strategy]) alternatives)))
+    (is (every? kernel-graph/kernel-graph? alternatives))
+    (is (apply = (map :abi alternatives)))
+    (is (= '[A B C] (:arguments (first alternatives))))
+    (is (= [6 3 4]
+           (mapv #(count (get-in % [:nodes 0 :operation :abi])) alternatives))
+        "leaf-only shape scalars stay private to each candidate graph")
+    (doseq [alternative alternatives]
+      (is (kernel-graph-call/kernel-graph-call?
+           (kernel-graph-call/make alternative {'A :a 'B :b 'C :c} {}))))
+    (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]
+      (try
+        (contract-route/route-typed-contraction
+         algorithm (:id operation)
+         (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+         :dtype :half :desc descriptor)
+        (is false "a routed leaf outside the pinned schedule family must be rejected")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :no-legal-contraction-family (:reason (ex-data exception))))
+          (is (= :strategy-outside-schedule-families
+                 (get-in (ex-data exception) [:declines 0 :reason]))))))
     (doseq [families [[] [:unknown]]]
       (try
         (contract-route/route-typed-contraction

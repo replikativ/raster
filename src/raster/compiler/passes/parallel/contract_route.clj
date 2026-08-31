@@ -25,6 +25,8 @@
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -237,6 +239,17 @@
 (def ^:private contraction-families
   "Target schedule families for ordinary scalar typed contractions."
   #{:matrix :register-tiled :portable})
+
+(def ^:private strategy-family
+  {:dpas :matrix
+   :dp4a :matrix
+   :regtiled :register-tiled
+   :portable-segred :portable
+   :naive-segred :portable
+   :full-reduce :portable
+   :segmap :portable
+   :quant-naive :portable
+   :staged-segred :portable})
 
 (defn- epilogue-honoured-or-refused
   "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
@@ -500,14 +513,25 @@
                              :operation operation-id
                              :equation-dtype equation-dtype
                              :route-dtype (:dtype options)})))
-        facts (cf/from-components components)]
-    (apply route-contraction nil
-           (mapcat identity
-                   (assoc options
-                          :dtype equation-dtype
-                          :facts facts
-                          :candidate-families families
-                          :operation-id operation-id)))))
+        facts (cf/from-components components)
+        routed (apply route-contraction nil
+                      (mapcat identity
+                              (assoc options
+                                     :dtype equation-dtype
+                                     :facts facts
+                                     :candidate-families families
+                                     :operation-id operation-id)))
+        selected-family (get strategy-family (:strategy routed))]
+    (when-not (contains? (set families) selected-family)
+      (throw (ex-info "selected contraction leaf is outside the enabled schedule families"
+                      {:reason :no-legal-contraction-family
+                       :operation operation-id
+                       :families families
+                       :declines [{:leaf (:strategy routed)
+                                   :reason :strategy-outside-schedule-families
+                                   :data {:selected-family selected-family
+                                          :enabled-families families}}]})))
+    routed))
 
 (defn- enabled-family-decline?
   [decline]
@@ -568,6 +592,147 @@
       (throw (ex-info "no executable typed contraction candidates"
                       {:reason :typed-contraction-no-candidates
                        :route result})))))
+
+(def ^:private logical-pointer-fields
+  [:kind :dtype :kernel-dtype :role :binding :field])
+
+(defn- artifact-pointer-interface
+  [artifact]
+  (->> (map vector (:abi artifact) (:arguments artifact))
+       (remove (fn [[slot _]] (= :scalar (:kind slot))))
+       vec))
+
+(defn- common-pointer-interface
+  [candidates operation-id]
+  (let [interfaces (mapv (comp artifact-pointer-interface :artifact) candidates)
+        arguments (mapv second (first interfaces))]
+    (doseq [[candidate interface] (map vector candidates interfaces)]
+      (when-not (= arguments (mapv second interface))
+        (throw (ex-info "typed contraction candidates have different logical pointer arguments"
+                        {:reason :typed-contraction-candidate-pointer-arguments
+                         :operation operation-id
+                         :family (:family candidate)
+                         :expected arguments
+                         :actual (mapv second interface)}))))
+    (let [abi
+          (mapv
+           (fn [index argument]
+             (let [slots (mapv #(first (nth % index)) interfaces)
+                   semantic-views (mapv #(select-keys % logical-pointer-fields) slots)
+                   _ (when-not (apply = semantic-views)
+                       (throw (ex-info
+                               "typed contraction candidates have incompatible pointer semantics"
+                               {:reason :typed-contraction-candidate-pointer-semantics
+                                :operation operation-id :argument argument
+                                :slots slots})))
+                   aliasing (when (some #(= :no-write-alias (:aliasing %)) slots)
+                              :no-write-alias)
+                   alignments (keep :alignment slots)
+                   alignment (when (seq alignments) (apply max alignments))]
+               (cond-> (assoc (first slots) :name argument)
+                 aliasing (assoc :aliasing aliasing)
+                 (nil? aliasing) (dissoc :aliasing)
+                 alignment (assoc :alignment alignment)
+                 (nil? alignment) (dissoc :alignment))))
+           (range (count arguments)) arguments)]
+      (kabi/validate! abi)
+      {:abi abi :arguments arguments})))
+
+(defn- static-private-scalars!
+  [candidate operation-id]
+  (when (:invoke candidate)
+    (throw (ex-info "typed contraction candidate uses a non-graph leaf invocation protocol"
+                    {:reason :typed-contraction-dispatch-invoke-protocol
+                     :operation operation-id
+                     :family (:family candidate)
+                     :strategy (:strategy candidate)
+                     :invoke (:invoke candidate)})))
+  (doseq [[slot compiler-value] (map vector (get-in candidate [:artifact :abi])
+                                      (get-in candidate [:artifact :arguments]))
+          :when (= :scalar (:kind slot))]
+    (when-not (and (contains? #{:int :long} (:kernel-dtype slot))
+                   (or (integer? compiler-value)
+                       (and (klaunch/expression? compiler-value)
+                            (empty? (klaunch/expression-references compiler-value)))))
+      (throw (ex-info
+              "static typed contraction dispatch has a runtime-dependent private scalar"
+              {:reason :typed-contraction-dispatch-dynamic-scalar
+               :operation operation-id
+               :family (:family candidate)
+               :slot slot
+               :compiler-value compiler-value}))))
+  candidate)
+
+(defn- graph-buffer-role
+  [kind]
+  (case kind
+    :input :input
+    :output :output
+    :inout :inout))
+
+(defn- candidate-graph
+  [candidate operation-id common-abi common-arguments]
+  (let [{:keys [family strategy artifact candidate-schedule]} candidate
+        artifact (kart/validate! artifact)
+        buffers (mapv (fn [slot argument]
+                        [argument
+                         (kgraph/buffer argument (:dtype slot)
+                                        (when (contains? #{:output :inout} (:kind slot))
+                                          (get-in artifact [:attributes :out-elems]))
+                                        :device (graph-buffer-role (:kind slot)))])
+                      common-abi common-arguments)
+        buffer-map (into {} buffers)
+        inputs (into [] (comp (filter #(contains? #{:input :inout} (:kind (first %))))
+                              (map #(get buffer-map (second %))))
+                     (map vector common-abi common-arguments))
+        outputs (into [] (comp (filter #(contains? #{:output :inout} (:kind (first %))))
+                               (map #(get buffer-map (second %))))
+                      (map vector common-abi common-arguments))
+        uses (mapv (fn [slot argument]
+                     (kgraph/->ValueUse argument (kabi/slot-access slot)))
+                   common-abi common-arguments)]
+    (kgraph/make
+     {:inputs inputs
+      :outputs outputs
+      :abi common-abi
+      :arguments common-arguments
+      :nodes [(kgraph/->ScheduledKernel
+               [:typed-contraction operation-id family strategy] artifact uses [])]
+      :effects (:effects artifact)
+      :provenance {:operation-id operation-id
+                   :semantic-op :contraction
+                   :lowering :typed-contraction-candidate}
+      :attributes {:strategy strategy
+                   :candidate-family family
+                   :candidate-schedule candidate-schedule}})))
+
+(defn route-static-typed-contraction-dispatch
+  "Normalize legal static typed contraction leaves behind one logical ABI-compatible dispatch.
+
+   Leaf-only dimensions remain graph-private derived scalars, so matrix, register-tiled and
+   portable kernels can compete through the existing KernelDispatch tuning machinery. This
+   function refuses runtime-dependent private scalars; dynamic-shape dispatch requires those
+   dimensions in a common public scalar ABI rather than silently baking one sample."
+  [program operation-id schedule & options]
+  (let [{:keys [candidates] :as routed}
+        (apply route-typed-contraction-candidates!
+               program operation-id schedule options)
+        candidates (mapv #(static-private-scalars! % operation-id) candidates)
+        {:keys [abi arguments]} (common-pointer-interface candidates operation-id)
+        alternatives (mapv #(candidate-graph % operation-id abi arguments) candidates)
+        default-strategy (:strategy (first candidates))]
+    (kdispatch/make
+     {:id (str "typed-contraction:" (pr-str operation-id))
+      :alternatives alternatives
+      :default-strategy default-strategy
+      :selector {:kind :fixed-strategy :strategy default-strategy}
+      :provenance {:operation-id operation-id
+                   :semantic-op :contraction
+                   :source-dialect :typed-soac}
+      :attributes {:operation-family :typed-contraction
+                   :candidate-schedules
+                   (into {} (map (juxt :strategy :candidate-schedule)) candidates)
+                   :declines (:declines routed)}})))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.
