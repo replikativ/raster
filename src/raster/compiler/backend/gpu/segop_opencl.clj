@@ -26,6 +26,7 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [clojure.walk :as walk]
             [clojure.set]
@@ -1271,8 +1272,8 @@
 
 (defn- syms-in [expr] (set (filter symbol? (tree-seq coll? seq expr))))
 
-;; analyze-contraction is defined below (next to the register-tiled emitter that also uses it);
-;; declared here because the block-tiled emitter above it shares the same analysis.
+;; Compatibility DPAS source gates still consume this structural analysis while their callers
+;; migrate to contraction facts and scheduled KernelBody values.
 (declare analyze-contraction)
 
 (defn- analyze-contraction
@@ -1344,78 +1345,47 @@
      :row-arr (:arr rowop) :row-idx (:idx rowop)
      :col-arr (:arr colop) :col-idx (:idx colop)}))
 
-(defn generate-regtiled-contraction-kernel
-  "REGISTER-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, register
-   level). Block tile BM×BN over the output, BK contraction chunk; each thread owns a
-   TM×TN register micro-tile of outputs (workgroup (BM/TM)×(BN/TN) threads). Cooperative
-   flattened staging of A/B into __local, then a register-blocked inner MAC (acc[TM][TN] +=
-   a[TM]·b[TN]). Zero-padded loads + guarded store handle non-divisible dims. The register
-   tile is precisely the fragment a DPAS/tensorize step (step 4) will consume.
+(defn generate-register-tiled-kernel-body
+  "Emit the verified cooperative register-tiled schedule through the shared C-family backend.
 
-   Prototype scope as analyze-contraction. Requires a 2-D launch: workgroup [BN/TN BM/TM],
-   grid [ceil(N/BN) ceil(M/BM)]. Returns {:kernel-name :source :array-params :dtype :block
-   [BM BN BK] :micro [TM TN] :workgroup [x y] :dims [M N L]}."
-  [segred out-sym & {:keys [dtype bm bn bk tm tn]
-                     :or {dtype :double bm 64 bn 64 bk 16 tm 4 tn 4}}]
-  (let [{:keys [M N L i-sym j-sym l-sym ctype init arr-params row-load col-load]}
-        (analyze-contraction segred dtype)
-        _ (assert (and (zero? (rem bm tm)) (zero? (rem bn tn)))
-                  "regtiled: BM%TM and BN%TN must be 0")
-        nt-row (quot bm tm) nt-col (quot bn tn) NT (* nt-row nt-col)
-        i-c (ce/c-symbol i-sym) j-c (ce/c-symbol j-sym) l-c (ce/c-symbol l-sym)
+   It consumes contraction facts, preserves a typed result transform and derives its ABI from
+   KernelBody; no target source is reconstructed from a compatibility SegRed."
+  [contract-facts out-sym & {:keys [tile descriptor operation-id]}]
+  (let [{:keys [kernel-body bindings dims tile]}
+        (register-tiled-body/lower
+         contract-facts (cond-> {:operation-id operation-id :descriptor descriptor}
+                          tile (assoc :tile tile)))
+        row (:row bindings)
+        col (:col bindings)
         kernel-name (str "regtiled_contract_" (gensym ""))
-        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
-        src (str (codegen/extension-pragmas (or (:dtype segred) dtype))
-                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out) {\n"
-                 "    __local " ctype " As[" bm "][" bk "];\n"
-                 "    __local " ctype " Bs[" bk "][" bn "];\n"
-                 "    int tr = get_local_id(1);\n"
-                 "    int tc = get_local_id(0);\n"
-                 "    int tid = tr * " nt-col " + tc;\n"
-                 "    int block_i = get_group_id(1) * " bm ";\n"
-                 "    int block_j = get_group_id(0) * " bn ";\n"
-                 "    " ctype " acc[" tm "][" tn "];\n"
-                 "    for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) acc[m][n] = " (str init) ";\n"
-                 "    for (int l0 = 0; l0 < " L "; l0 += " bk ") {\n"
-                 "        for (int idx = tid; idx < " (* bm bk) "; idx += " NT ") {\n"
-                 "            int r = idx / " bk "; int c = idx % " bk ";\n"
-                 "            int " i-c " = block_i + r; int " l-c " = l0 + c;\n"
-                 "            As[r][c] = ((" i-c " < " M ") && (" l-c " < " L ")) ? " row-load " : 0.0;\n"
-                 "        }\n"
-                 "        for (int idx = tid; idx < " (* bk bn) "; idx += " NT ") {\n"
-                 "            int r = idx / " bn "; int c = idx % " bn ";\n"
-                 "            int " l-c " = l0 + r; int " j-c " = block_j + c;\n"
-                 "            Bs[r][c] = ((" l-c " < " L ") && (" j-c " < " N ")) ? " col-load " : 0.0;\n"
-                 "        }\n"
-                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                 "        for (int t = 0; t < " bk "; t++) {\n"
-                 "            " ctype " a[" tm "]; " ctype " b[" tn "];\n"
-                 "            for (int m = 0; m < " tm "; m++) a[m] = As[tr*" tm "+m][t];\n"
-                 "            for (int n = 0; n < " tn "; n++) b[n] = Bs[t][tc*" tn "+n];\n"
-                 "            for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) acc[m][n] = acc[m][n] + a[m] * b[n];\n"
-                 "        }\n"
-                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                 "    }\n"
-                 "    for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) {\n"
-                 "        int gr = block_i + tr*" tm " + m; int gc = block_j + tc*" tn " + n;\n"
-                 "        if ((gr < " M ") && (gc < " N ")) out[gr * " N " + gc] = acc[m][n];\n"
-                 "    }\n"
-                 "}\n")]
+        parameter-names (merge (into {} (map (fn [parameter]
+                                                [(:id parameter)
+                                                 (ce/c-symbol (:id parameter))]))
+                                     (:parameters kernel-body))
+                               {row "A" col "B" out-sym "out"})
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body {:parameter-names parameter-names})
+        abi
+        (body-abi/project-contracts
+         (mapv (fn [{:keys [id kind dtype role]}]
+                 (kabi/slot id kind dtype
+                            :c-name (or (get parameter-names id) (ce/c-symbol id))
+                            :role (if (contains? #{:lhs :rhs} role) :operand role)))
+               (:parameters kernel-body))
+         kernel-body)
+        epilogue-slots (filterv #(= :epilogue (:role %)) abi)]
     {:kernel-name kernel-name
-     :source src
-     :array-params arr-params
-     :abi (kabi/validate!
-           (vec (concat
-                 (map #(kabi/slot % :input (or (:dtype segred) dtype)
-                                  :c-name (ce/c-symbol %) :role :operand)
-                      arr-params)
-                 [(kabi/slot out-sym :output (or (:dtype segred) dtype)
-                             :c-name "out" :role :result)])))
-     :dtype (or (:dtype segred) dtype)
-     :block [bm bn bk]
-     :micro [tm tn]
-     :workgroup [nt-col nt-row]
-     :dims [M N L]}))
+     :source source
+     :array-params [row col]
+     :abi abi
+     :dtype (:dtype contract-facts)
+     :block [(:block-m tile) (:block-n tile) (:block-k tile)]
+     :micro [(:thread-m tile) (:thread-n tile)]
+     :workgroup (get-in kernel-body [:launch :workgroup-size])
+     :dims dims
+     :kernel-body kernel-body
+     :epilogue-operands (mapv :name (filter #(= :input (:kind %)) epilogue-slots))
+     :epilogue-scalars (mapv :name (filter #(= :scalar (:kind %)) epilogue-slots))}))
 
 ;; ================================================================
 ;; DPAS/XMX-tensorized contraction (PEAK) — raster's edge over Futhark

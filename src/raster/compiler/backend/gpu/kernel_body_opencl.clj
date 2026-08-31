@@ -1614,6 +1614,7 @@
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
         storage-declarations (concat parameters (:allocations kernel-body))
+        stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
         uses-double? (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
         collective (first (filter #(record-kind? "Collective" %) operations))
@@ -1632,7 +1633,10 @@
          (c-dialect/entry-prefix *scalar-dialect*) (target-name kernel-name) "(\n    "
          (str/join ",\n    "
                    (map #(c-dialect/parameter-declaration
-                          *scalar-dialect* % (get parameter-names (:id %)))
+                          *scalar-dialect*
+                          (cond-> % (contains? stable-reads (:id %))
+                            (assoc :restrict? true))
+                          (get parameter-names (:id %)))
                         parameters))
          ") {\n"
          allocation-source index-source operation-source

@@ -121,16 +121,17 @@
     (is (empty? (:epilogue-operands routed)))
     (is (= '[A B] (mapv :buffer (get-in routed [:kernel-body :stable-reads]))))))
 
-(deftest result-transforms-fall-through-an-ineligible-matrix-and-register-tiled-leaf
+(deftest result-transforms-use-the-register-tiled-body-when-matrix-is-ineligible
   (let [descriptor {:device-type :gpu :backend :ocl
                     :execution {:subgroup-sizes #{}
                                 :preferred-subgroup-size nil
                                 :max-workgroup-size 256}}
         routed (route/route-contraction (portable-result-transform-form)
                                         :dtype :half :desc descriptor)]
-    (is (= :portable-segred (:strategy routed)))
+    (is (= :regtiled (:strategy routed)))
     (is (true? (:fused-epilogue routed)))
-    (is (= [:matrix-capability-unavailable :epilogue-unsupported-by-this-leaf]
+    (is (body/kernel-body? (:kernel-body routed)))
+    (is (= [:matrix-capability-unavailable]
            (mapv :reason (:declines routed))))))
 
 (deftest production-general-contraction-route-carries-the-scheduled-body

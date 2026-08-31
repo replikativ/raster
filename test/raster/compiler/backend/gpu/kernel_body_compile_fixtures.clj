@@ -14,6 +14,7 @@
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
@@ -51,6 +52,28 @@
     (segop-emit/generate-contraction-kernel-body
      (:body planned) :target-dialect dialect
      :kernel-name-prefix "portable_contraction")))
+
+(defn- register-tiled-contraction-source
+  [dialect]
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/*
+                          (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
+                  :operands [{:sym 'bias :dtype :float
+                              :map (axis-map/of-axes [['j 64]])}]
+                  :scalars [{:sym 'scale :dtype :float}]
+                  :dtype :float}
+        facts (contraction-facts/from-components
+               {:out 'C
+                :free-axes [['i 64] ['j 64]]
+                :contract-axes [['k 32]]
+                :body '(raster.numeric/*
+                        (clojure.core/aget A (clojure.core/+ (clojure.core/* i 32) k))
+                        (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
+                :opts {:epilogue epilogue}
+                :dtype :float})
+        kernel-body (:kernel-body (register-tiled-body/lower facts {}))]
+    (body-emit/emit-scalar-kernel
+     "register_tiled_contraction" kernel-body {:target-dialect dialect})))
 
 (defn- problem []
   (attention/make
@@ -125,6 +148,8 @@
                             (reduction-artifact dialect))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
+           (write-source! directory suffix "register-tiled-contraction"
+                          (register-tiled-contraction-source dialect))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

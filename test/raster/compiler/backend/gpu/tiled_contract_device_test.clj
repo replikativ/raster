@@ -3,7 +3,7 @@
    emitter (Arc GPU). Tests BOTH tile-divisible and non-divisible dims (boundary padding).
    Uses launch-2d! (workgroup [T T], grid [ceil(N/T) ceil(M/T)]). Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.backend.gpu.segop-opencl :as sco])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -44,9 +44,9 @@
         form (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
                    (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
                          (list 'aget 'B (list '+ (list '* 'l n) 'j))))
-        sr (cl/contract-form->segred form)
+        verified (facts/contraction-facts form :dtype :double)
         {:keys [kernel-name source block micro workgroup]}
-        (sco/generate-regtiled-contraction-kernel sr 'C)
+        (sco/generate-register-tiled-kernel-body verified 'C)
         [bm bn _] block
         [wgx wgy] workgroup
         _ (register! kernel-name {:source source :dtype :double})

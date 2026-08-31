@@ -111,7 +111,7 @@
                 (scalar-kernel-body)
                 {:parameter-names {'x "input_rows" 'bias "row_bias"
                                    'y "output_rows" 'scale "scale"}})]
-    (is (str/includes? source "__global const half* input_rows"))
+    (is (str/includes? source "__global const half* restrict input_rows"))
     (is (str/includes? source
                        "input_rows[((long)((rstr_query_row * 16)) + ((long)(rstr_lane)"))
     (is (str/includes? source "((rstr_lane < 16)) ? input_rows"))
@@ -120,7 +120,8 @@
     (is (str/includes? source "sub_group_broadcast(rstr_subgroup_sum, 0)"))
     (is (str/includes? source "convert_half_rte(rstr_shared_sum)"))
     (is (str/includes? source "if (((rstr_lane == 0)))"))
-    (is (not (str/includes? source "restrict")))
+    (is (not (str/includes? source "__global half* restrict output_rows"))
+        "only body-proven stable reads acquire a target no-alias qualifier")
     (testing "the emitted target program is valid OpenCL C"
       (if-not (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
         (is true "clang unavailable")

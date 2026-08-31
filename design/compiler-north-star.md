@@ -935,8 +935,15 @@ The immediate continuation after the verified double-buffered weighted-reduction
    stable-read contracts, and its store emitter consumes only typed SSA—no source expression or
    target-local type inference remains on that path. The portable path
    emits unchanged through OpenCL, CUDA and HIP and is compiled by the hardware-free CUDA/HIP CI
-   gates. Hardware-costed multi-consumer placement and migration of the register-tiled leaf to the
-   same scheduled-body store region are the next fusion/scheduling coverage steps.
+   gates. The register-tiled family now also consumes verified contraction facts directly and
+   expresses cooperative dense staging, workgroup barriers, its K loops and register microtile as
+   scalar/control KernelBody. Every microtile store receives an alpha-renamed instance of the same
+   typed result transform, while the body-projected ABI deduplicates shared captures. The former
+   handwritten OpenCL register-tiled generator is deleted; its device numerical oracle now invokes
+   the scheduled body, and hardware-free CI compiles that body with both nvcc and hipcc. A finite
+   descending tile family is filtered by the target workgroup and shared-memory limits before
+   emission; an explicit infeasible tile or a target with no legal candidate declines honestly.
+   Hardware-costed multi-consumer placement is the next fusion/scheduling coverage step.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
    JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and
