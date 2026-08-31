@@ -478,37 +478,68 @@
                                      'raster.compiler.core.hardware/descriptor-for)
                                     device-id)
                                    (catch Throwable _ nil))
-                  r (ensure-contraction-marker-expressible!
-                     (if bound-sr
-                       (croute/route-typed-contraction
-                        typed-algorithm (:id bound-sr) (:schedule bound-sr)
-                        :dtype dtype :tile (:tile schedule) :desc target-desc)
-                       (croute/route-contraction
-                        ;; A compatibility equation routes from its verified facts. Without a
-                        ;; scheduled operation, the direct backend door still consumes the form.
-                        (when-not bound-sc form) :dtype dtype
-                        :facts (:facts bound-sc)
-                        :operation-id (:id bound-sc)
-                        ;; The resolved, feasibility-checked schedule is the single source of tile
-                        ;; geometry.  Previously this option reached opencl-pass but contractions
-                        ;; ignored it and re-derived a default, so a pinned/autotuned :tile changed
-                        ;; neither the KernelBody nor emitted source.
-                        :tile (:tile schedule) :desc target-desc)))
-                  ;; Every routed single-entry leaf is now a complete executable artifact. Routing
-                  ;; diagnostics and tensorization facts live in its attributes/provenance rather
-                  ;; than being flattened into the runtime registry namespace.
-                  kernel (:artifact r)
-                  k (register-kernel! kernel
-                                      :ze-contracts)]
-              ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
-              ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
-              (if (= :reduction (:invoke r))
-                (emit-reduction-invocation k nil)
-                ;; The staging marker carries only ordered values. Output extent and complete 2-D
-                ;; launch live in the artifact; resident extraction never reconstructs geometry.
-                (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
-                      (:kernel-name k)
-                      (vec (:arguments r)))))
+                  typed-dispatch
+                  (when bound-sr
+                    (try
+                      (croute/route-static-typed-contraction-dispatch
+                       typed-algorithm (:id bound-sr) (:schedule bound-sr)
+                       :dtype dtype :tile (:tile schedule) :desc target-desc)
+                      (catch clojure.lang.ExceptionInfo exception
+                        (let [reason (:reason (ex-data exception))]
+                          (if (contains? #{:typed-contraction-dispatch-dynamic-scalar
+                                           :typed-contraction-dispatch-invoke-protocol}
+                                         reason)
+                            (do
+                              (swap! stats update-in [:typed-contraction-dispatch-declines reason]
+                                     (fnil inc 0))
+                              nil)
+                            (throw exception))))))]
+              (if typed-dispatch
+                (let [dispatch
+                      (-> typed-dispatch
+                          (update :alternatives
+                                  (fn [alternatives]
+                                    (mapv
+                                     (fn [graph]
+                                       (kgraph/map-operations
+                                        graph
+                                        (fn [node]
+                                          (maybe-compile-spirv (:operation node)
+                                                               compile-spirv? device-id))))
+                                     alternatives)))
+                          kdispatch/validate!)
+                      artifacts (mapv :operation (mapcat :nodes (:alternatives dispatch)))
+                      executable (kdispatch/default-alternative dispatch)]
+                  (swap! kernels into artifacts)
+                  (swap! dispatches conj dispatch)
+                  (swap! stats update :ze-contracts inc)
+                  (swap! stats update :kernel-graphs inc)
+                  (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                        device-id (:id dispatch) (vec (:arguments executable))))
+                (let [r (ensure-contraction-marker-expressible!
+                         (if bound-sr
+                           (croute/route-typed-contraction
+                            typed-algorithm (:id bound-sr) (:schedule bound-sr)
+                            :dtype dtype :tile (:tile schedule) :desc target-desc)
+                           (croute/route-contraction
+                            ;; A compatibility equation routes from its verified facts. Without a
+                            ;; scheduled operation, the direct backend door still consumes the form.
+                            (when-not bound-sc form) :dtype dtype
+                            :facts (:facts bound-sc)
+                            :operation-id (:id bound-sc)
+                            ;; The resolved, feasibility-checked schedule is the single source of
+                            ;; tile geometry. Previously this option reached opencl-pass but
+                            ;; contractions ignored it and re-derived a default.
+                            :tile (:tile schedule) :desc target-desc)))
+                      ;; A non-dispatchable leaf retains its complete executable artifact and
+                      ;; specialized invocation protocol.
+                      kernel (:artifact r)
+                      k (register-kernel! kernel :ze-contracts)]
+                  (if (= :reduction (:invoke r))
+                    (emit-reduction-invocation k nil)
+                    (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                          (:kernel-name k)
+                          (vec (:arguments r)))))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the

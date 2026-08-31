@@ -348,6 +348,11 @@ operand/result pointers form the shared external ABI, while leaf-only `M/N/K` or
 bounds remain checked graph-private integer scalars. Runtime-dependent private dimensions are
 refused until they are represented in a shared public scalar ABI, preventing an offline sample from
 being mistaken for a valid dynamic specialization.
+The production OpenCL pass registers those static graphs as one fixed-selector dispatch and invokes
+it through the generic scheduled-executable runner. It emits every legal leaf once, preserves the
+current analytic winner as the default, and records dynamic-shape or special-protocol declines
+instead of hiding a fallback. The remaining closed-loop step is a tuning contract that maps a
+validated measured fixed selector back into the resolved schedule/cache on recompilation.
 
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
