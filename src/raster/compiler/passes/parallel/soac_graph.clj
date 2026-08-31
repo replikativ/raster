@@ -12,12 +12,11 @@
     :cons    — consumer mutates array producer reads (anti-dep)"
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
-            [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.fusion-placement :as placement]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
-            [raster.compiler.passes.parallel.schedule-support :as schedule-support]
-            [raster.compiler.core.op-descriptor :as opd]))
+            [raster.compiler.passes.parallel.schedule-support :as schedule-support]))
 
 ;; ================================================================
 ;; FusionGraph record
@@ -331,32 +330,6 @@
 ;; fusion set is a subset of the legal set (F_chosen ⊆ F_legal) by construction.
 ;; ================================================================
 
-(defn- lambda-flops
-  "Sum the :cost-facet flop-equivalent weights of every operator APPLICATION in a
-   kernel body. Op heads are qualified semantic symbols (raster.numeric/+,
-   raster.math/exp — the walker emits qualified). Unknown ops contribute 0: an
-   unknown cost must never INFLATE recompute and fabricate a decline, so the
-   conservative direction is to under-count (keep fusing). Portable flop-equiv,
-   priced by the AM, not a hardware instruction count."
-  [body]
-  (let [total (atom 0)]
-    (letfn [(walk [form]
-              (when (seq? form)
-                (let [h (first form)]
-                  (when (symbol? h)
-                    (swap! total + (long (:flops (opd/cost-facet h) 0)))))
-                (doseq [x form] (walk x))))]
-      (walk body))
-    @total))
-
-(defn- elem-bytes
-  "Byte width of the AM's working element dtype (GPU training default :f16), from the ONE dtype
-   registry — the private table this replaces had no :byte branch and priced int8 at 2 bytes.
-   Returns nil for a dtype the compiler cannot spell, so the caller ABSTAINS: this is a cost
-   model, and a cost model may decline to answer but must never throw or fabricate."
-  [dtype]
-  (when (dt/known? dtype) (dt/bytes-of dtype)))
-
 (defn vertical-fusion-profitable?
   "PROFITABILITY (decline-only). A MULTI-consumer vertical fusion inlines the
    producer body into THIS consumer while the producer stays alive for its other
@@ -380,13 +353,13 @@
   (or (nil? am)
       (empty? (other-consumers graph producer-id consumer-id))   ;; sole consumer → pure win
       (let [producer (get (:nodes graph) producer-id)
-            ridge    (get-in am [:ridge dtype])
-            eb       (elem-bytes dtype)]
-        (or (nil? ridge)
-            (nil? eb)                    ; unspellable dtype ⇒ abstain (fuse), never throw
-            (not (instance? raster.compiler.ir.soac.SoacMap producer))
-            (<= (lambda-flops (:lambda producer))
-                (* (long eb) (double ridge)))))))
+            consumer-count (inc (count (other-consumers graph producer-id consumer-id)))]
+        (or (not (instance? raster.compiler.ir.soac.SoacMap producer))
+            (:fuse? (placement/placement-decision
+                     {:abstract-machine am
+                      :dtype dtype
+                      :expressions [(:lambda producer)]
+                      :consumer-count consumer-count}))))))
 
 (defn- reduction-fusion-expressions
   [product]

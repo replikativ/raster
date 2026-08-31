@@ -35,6 +35,30 @@
           v (raster.par/pmap j n float (+ (clojure.core/aget b j) 1.0))]
          [u v]))
 
+(def ^:private expensive-fanout
+  '(let* [shared (raster.par/pmap i n float
+                                  (Math/exp (Math/exp (Math/exp
+                                                       (clojure.core/aget x i)))))
+          mapped (raster.par/pmap j n float (* (clojure.core/aget shared j) 2.0))
+          reduced (raster.par/reduce acc 0.0 k n
+                                      (+ acc (clojure.core/aget shared k)))]
+         [mapped reduced]))
+
+(deftest production-route-retains-hardware-costed-placement-witnesses
+  (let [poor (route/attempt expensive-fanout :float {'x :float}
+                            {:abstract-machine {:ridge {:float 2.0}}})
+        rich (route/attempt expensive-fanout :float {'x :float}
+                            {:abstract-machine {:ridge {:float 100.0}}})
+        poor-witness (-> poor :stats :placements first)
+        rich-witness (-> rich :stats :placements first)]
+    (is (= :materialize (:decision poor-witness)))
+    (is (= 3 (count (get-in poor [:program :equations]))))
+    (is (= (:placements (:stats poor))
+           (get-in poor [:program :attributes :fusion/placements])))
+    (is (= :recompute (:decision rich-witness)))
+    (is (= 2 (count (get-in rich [:program :equations]))))
+    (is (= :typed-soac (get-in rich [:stats :route])))))
+
 (def ^:private inclusive-scan
   '(let* [result (raster.par/scan out acc 0.0 i n float
                                   (+ acc (clojure.core/aget x i)))]
@@ -269,13 +293,20 @@
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       [y z])
-        {:keys [program stats]} (route/attempt source :float {'x :float})]
+        {:keys [program stats]} (route/attempt source :float {'x :float})
+        hardware-guided (route/attempt source :float {'x :float}
+                                       {:abstract-machine {:ridge {:float 100.0}}})]
     (is (= :typed-soac (:dialect program)))
     (is (:typed-validated stats))
     (is (zero? (:vertical stats)))
     (is (= 2 (count (:equations program))))
     (is (= '[y z] (:outputs program))
-        "a host-visible producer is retained, not erased by vertical fusion")))
+        "a host-visible producer is retained, not erased by vertical fusion")
+    (is (= 1 (get-in hardware-guided [:stats :vertical])))
+    (is (= 1 (count (get-in hardware-guided [:program :equations])))
+        "removing the read lets horizontal fusion produce both observable values in one map")
+    (is (= '[y z] (-> hardware-guided :program :equations first :results)))
+    (is (= '[y z] (get-in hardware-guided [:program :outputs])))))
 
 (deftest effectful-host-binding-keeps-the-compatibility-route
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))

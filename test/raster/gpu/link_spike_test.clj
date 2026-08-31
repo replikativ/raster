@@ -26,8 +26,9 @@
             [raster.gpu.value :as value])
   (:import [java.util.concurrent.atomic AtomicBoolean]))
 
-;; A minimal elementwise forward: y = (x + w) * x  (residual-add then hadamard — the proven-
-;; resident dt-two-step shape). Composing it twice with weights w0,w1 gives the intermediate
+;; A minimal elementwise forward: y = (x + w) * x. Typed placement and horizontal fusion lower the
+;; residual-add/hadamard source to one tuple-free elementwise step. Composing it twice with weights
+;; w0,w1 gives the intermediate
 ;; x1 = (x+w0)*x as a device-resident internal node the link shares between the two instances.
 (deftm spike-had
   [x :- (Array float) w :- (Array float) n :- Long] :- (Array float)
@@ -326,8 +327,8 @@
           result-sym (:result-sym prog)
           scratch-sym (first (remove #(= % result-sym) (map :sym (:allocs prog))))
           x-sym 'x w-sym 'w]
-      (testing "the descriptor is a clean 2-step elementwise chain"
-        (is (= 2 (count steps)))
+      (testing "the descriptor retains the optimally fused elementwise step"
+        (is (= 1 (count steps)))
         (is (every? #(= :map (:convention %)) steps)))
       (let [sess (make-session :ze:0)]
         (try

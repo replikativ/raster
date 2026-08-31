@@ -25,6 +25,11 @@
   [['y '(raster.par/map! y i n nil (* (aget x i) scale))]
    ['z '(raster.par/map! z j n nil (+ (aget y j) bias))]])
 
+(def ^:private expensive-fanout-pairs
+  [['a '(raster.par/map! a i n nil (Math/exp (Math/exp (Math/exp (aget x i)))))]
+   ['b '(raster.par/map! b j n nil (* (aget a j) 2.0))]
+   ['c '(raster.par/reduce acc 0.0 k n (+ acc (aget a k)))]])
+
 (defn- differential-fusion
   [pairs outputs]
   (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes pairs))
@@ -79,6 +84,32 @@
     (is (= '[bias scale] (nth operation 3)))
     (is (= '[%element0 %capture0 %capture1] (second lambda)))
     (is (= '[(+ (* %element0 %capture1) %capture0)] (:body-results region)))))
+
+(deftest typed-multi-consumer-placement-is-hardware-costed
+  (let [program (-> expensive-fanout-pairs
+                    legacy/let-bindings->nodes
+                    graph/build-fusion-graph
+                    :nodes
+                    (adapter/legacy-nodes->program {:outputs '[b c] :dtype :float}))
+        poor-am {:ridge {:float 2.0}}
+        rich-am {:ridge {:float 100.0}}
+        [materialized materialized-stats] (typed-fusion/fusion-fixpoint program poor-am)
+        [recomputed recomputed-stats] (typed-fusion/fusion-fixpoint program rich-am)
+        materialized-witness (-> materialized-stats :placements first)
+        recomputed-witness (-> recomputed-stats :placements first)]
+    (is (= 0 (:vertical materialized-stats)))
+    (is (= 3 (count (dialect/equations materialized))))
+    (is (= :materialize (:decision materialized-witness)))
+    (is (= '[1 2] (:consumers materialized-witness)))
+    (is (= (:placements materialized-stats)
+           (get-in (dialect/facts materialized) [:attributes :fusion/placements])))
+
+    (is (= 2 (:vertical recomputed-stats)))
+    (is (= 2 (count (dialect/equations recomputed))))
+    (is (= :recompute (:decision recomputed-witness)))
+    (is (= 2 (:consumer-count recomputed-witness)))
+    (is (not-any? #{'a} (mapcat #(nth % 2) (dialect/equations recomputed))))
+    (is (= recomputed (dialect/validate! recomputed)))))
 
 (deftest current-graph-rewrites-the-canonical-reduction-region
   (let [pairs [['tmp '(raster.par/map! tmp i n float (* (aget x i) 2.0))]

@@ -326,7 +326,7 @@
       :effects (:effects facts)
       :diagnostics (:diagnostics facts)
       :provenance (assoc (:provenance facts) :pass :typed-soac-fusion)
-      :attributes {:host-control :typed-soac-materialization}
+      :attributes (assoc (:attributes facts) :host-control :typed-soac-materialization)
       :operation? equation-operation?
       :algorithm? (fn [equation algorithm]
                     (and (= algorithm (dialect/validate! algorithm))
@@ -340,7 +340,7 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? scalar-types values]
+  ([form dtype array-types {:keys [resident-reductions? scalar-types values abstract-machine]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form)]
@@ -348,7 +348,7 @@
         (when-let [typed-input (frontend/form->program
                                 form {:dtype dtype :array-types array-types
                                       :scalar-types scalar-types :values values})]
-         (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
+         (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
                [typed-result resident-stats]
                (if resident-reductions?
                  (resident/realize typed-result)

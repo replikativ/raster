@@ -943,10 +943,18 @@ The immediate continuation after the verified double-buffered weighted-reduction
    the scheduled body, and hardware-free CI compiles that body with both nvcc and hipcc. A finite
    descending tile family is filtered by the target workgroup and shared-memory limits before
    emission; an explicit infeasible tile or a target with no legal candidate declines honestly.
-   Hardware-costed multi-consumer placement is the next fusion/scheduling coverage step.
+   Hardware-costed multi-consumer placement now uses one target-neutral roofline policy shared by
+   the TypedSOAC and compatibility graph routes. Typed fan-out values carry an explicit,
+   serializable recompute/materialize witness (fanout, dtype, registered scalar work, abstract-
+   machine ridge, threshold and reason); cheap producers may be cloned into consumers while their
+   equation remains live, whereas a proven-expensive producer stays materialized. A host-visible
+   value remains an observable result even when dependency removal subsequently permits one
+   tuple-valued horizontal kernel. Ordinary compilation and direct session scheduling both pass
+   the same device-stripped Abstract Machine into this decision, and a missing machine retains the
+   typed materialization boundary rather than speculating about duplicated work.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
-   route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
-   JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and
+   route, including resident block transfers. Nested-region JVM scheduling, reducing/atomic
+   scatter variants, the remaining parallel forms, calibrated whole-graph placement costs, and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
