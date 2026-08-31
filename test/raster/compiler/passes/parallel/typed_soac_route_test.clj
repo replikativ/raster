@@ -675,6 +675,9 @@
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (= 1 (get-in emitted [:stats :segop-reused])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))
+    (is (= 1 (get-in emitted [:stats :typed-contraction-dispatch-declines
+                              :typed-contraction-dispatch-dynamic-scalar])))
+    (is (empty? (:dispatches emitted)))
     (is (= 1 (count (:kernels emitted))))))
 
 (deftest typed-contraction-schedule-families-control-leaf-selection
@@ -706,7 +709,10 @@
         (contract-route/route-static-typed-contraction-dispatch
          algorithm (:id operation) (:schedule operation)
          :dtype :half :desc descriptor)
-        alternatives (:alternatives dispatch)]
+        alternatives (:alternatives dispatch)
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                             :dtype :half :min-elements 0)
+        emitted-dispatch (first (:dispatches emitted))]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
     (is (= :portable-segred (:strategy (select-family :portable))))
@@ -731,6 +737,16 @@
     (doseq [alternative alternatives]
       (is (kernel-graph-call/kernel-graph-call?
            (kernel-graph-call/make alternative {'A :a 'B :b 'C :c} {}))))
+    (is (= 1 (count (:dispatches emitted))))
+    (is (= [:dpas :regtiled :portable-segred]
+           (mapv #(get-in % [:attributes :strategy])
+                 (:alternatives emitted-dispatch))))
+    (is (some #(and (seq? %)
+                    (= 'raster.compiler.pipeline/invoke-scheduled-executable! (first %)))
+              (tree-seq coll? seq (:form emitted))))
+    (is (= 3 (count (:kernels emitted))))
+    (is (= 1 (get-in emitted [:stats :ze-contracts])))
+    (is (= 1 (get-in emitted [:stats :kernel-graphs])))
     (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]
       (try
         (contract-route/route-typed-contraction
