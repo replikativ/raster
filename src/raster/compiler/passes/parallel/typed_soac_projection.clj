@@ -45,6 +45,25 @@
     {:combine (descriptor/semantic-op expression)
      :element (second arguments)}))
 
+(defn- result-transform-epilogue
+  [transform]
+  (when transform
+    (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
+          accumulator (first parameters)
+          substitutions
+          (into {}
+                (concat (map (juxt :parameter :value) (:operands transform))
+                        (map (juxt :parameter :value) (:scalars transform))))]
+      {:acc accumulator
+       :expr (util/subst-syms substitutions (first body-results))
+       :operands (mapv #(-> % (assoc :sym (:value %))
+                            (dissoc :value :parameter))
+                       (:operands transform))
+       :scalars (mapv #(-> % (assoc :sym (:value %))
+                           (dissoc :value :parameter))
+                      (:scalars transform))
+       :dtype (:result-dtype transform)})))
+
 (defn segmented-reduce-contract-components
   "Project one validated scalar `segmented-reduce` equation to contraction semantic components.
 
@@ -81,14 +100,16 @@
                 locals
                 (util/subst-syms substitutions (first body-results)))
         {:keys [combine element]} (scalar-fold-parts attributes folded)
-        contraction-dtype (first (:dtypes attributes))]
+        contraction-dtype (first (:dtypes attributes))
+        result-transform (result-transform-epilogue (:result-transform attributes))]
     {:out (first physical-results)
      :free-axes (:segment-axes attributes)
      :contract-axes [[(:index attributes) (:extent attributes)]]
      :body element
-     :opts (array-map :init (first (:identities attributes))
-                      :combine combine
-                      :algebra (first (:algebra attributes)))
+     :opts (cond-> (array-map :init (first (:identities attributes))
+                              :combine combine
+                              :algebra (first (:algebra attributes)))
+             result-transform (assoc :epilogue result-transform))
      :dtype contraction-dtype
      :metadata {:raster.type/elem-type contraction-dtype}}))
 

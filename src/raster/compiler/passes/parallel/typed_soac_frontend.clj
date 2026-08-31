@@ -191,6 +191,36 @@
   [equation-id ordinal]
   [:effect-map equation-id ordinal])
 
+(defn- typed-result-transform
+  "Close a source epilogue descriptor over lexical scalar-region parameters.
+
+   Program value IDs remain on the boundary records; the expression names only lambda parameters
+   and segment indices. This is what makes later ParallelProgram SSA remapping alpha-stable."
+  [epilogue]
+  (when epilogue
+    (let [operands (mapv (fn [ordinal {:keys [sym dtype map]}]
+                           {:value sym
+                            :parameter (symbol (str "%result-operand" ordinal))
+                            :dtype dtype :map map})
+                         (range) (vec (:operands epilogue)))
+          scalars (mapv (fn [ordinal {:keys [sym dtype]}]
+                          {:value sym
+                           :parameter (symbol (str "%result-scalar" ordinal))
+                           :dtype dtype})
+                        (range) (vec (:scalars epilogue)))
+          substitutions
+          (into {}
+                (concat (map (juxt :value :parameter) operands)
+                        (map (juxt :value :parameter) scalars)))
+          accumulator (:acc epilogue)]
+      {:operands operands
+       :scalars scalars
+       :result-dtype (or (:dtype epilogue) :float)
+       :lambda (dialect/lambda-form
+                (vec (concat [accumulator]
+                             (map :parameter operands) (map :parameter scalars)))
+                [(util/subst-syms substitutions (:expr epilogue))])})))
+
 (defn- effect-map-description
   [id symbol index extent {:keys [locals stores]} elem-type]
   (when (and (seq stores) (independent-stores? locals stores))
@@ -290,20 +320,25 @@
     (let [facts (contraction-facts/contraction-facts
                  expression :dtype (or (:raster.type/elem-type (meta expression))
                                        default-dtype :double))
-          {:keys [free-axes contract-axes out opts]} facts]
-      ;; The first direct slice is the ordinary scalar segmented-reduction algebra. Staged
-      ;; quantization and fused epilogues carry additional schedule/store contracts and must not
-      ;; be admitted by dropping those facts.
+          {:keys [free-axes contract-axes out opts]} facts
+          epilogue (:epilogue facts)
+          result-transform (typed-result-transform epilogue)
+          epilogue-arrays (set (map :value (:operands result-transform)))
+          epilogue-scalar-ids (set (map :value (:scalars result-transform)))]
+      ;; The direct slice is scalar segmented-reduction algebra plus an optional closed typed
+      ;; result transform. Staged quantization carries additional schedule/load contracts and must
+      ;; not be admitted by dropping those facts.
       (when (and (seq free-axes) (seq contract-axes)
-                 ;; Decode lambdas, declared physical maps, staged accumulators, epilogues and
-                 ;; output conversions are not scalar fold syntax.  Keep them on the certified
+                 ;; Decode lambdas, declared physical maps, staged accumulators and output
+                 ;; conversions are not scalar fold syntax. Keep them on the certified
                  ;; contraction route until TypedSOAC represents those facts explicitly.
-                 (empty? (apply dissoc opts [:init :combine :algebra]))
+                 (empty? (apply dissoc opts [:init :combine :algebra :epilogue]))
+                 (or (nil? epilogue) (dialect/result-transform? result-transform))
                  (reduction/scalar? (:reduction facts)))
         (let [product (:reduction facts)
               component (first (:components product))
               step-result (first (:results (reduction/fold-region product)))
-              arrays (set (map :sym (:operands facts)))
+              arrays (set/union (set (map :sym (:operands facts))) epilogue-arrays)
               axis-symbols (set (concat (map first free-axes) [(:index product)]))
               bound-symbols (reduce set/union #{}
                                     (map util/free-syms
@@ -311,13 +346,15 @@
                                                  (map second contract-axes))))
               scalars (set/difference
                        (set/union bound-symbols (util/free-syms step-result))
-                       arrays axis-symbols #{(:accumulator component) out})]
+                       arrays axis-symbols epilogue-scalar-ids #{(:accumulator component) out})]
           {:kind :segmented-reduce :id id :sym symbol
            :segment-axes free-axes
            :reduce-index (:index product)
            :reduce-extent (second (:flat-contract-axis facts))
            :results [(effect-result-id id 0)]
-           :product product :inputs arrays :outputs #{out} :scalars scalars
+           :product product :inputs arrays :outputs #{out}
+           :scalars (set/union scalars epilogue-scalar-ids)
+           :result-transform result-transform
            :effect-only? true :host-binding symbol
            :result-storage [{:destination out :access :write :host-return :effect}]})))
 
@@ -613,7 +650,8 @@
                  results)))))
 
 (defn- segmented-reduce-equation
-  [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results]}]
+  [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
+           result-transform]}]
   (let [component (first (:components product))
         stable (vec (sort-by pr-str inputs))
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
@@ -629,7 +667,8 @@
                  :accumulators [(:accumulator component)]
                  :identities [(:neutral component)]
                  :dtypes [(:dtype component)]
-                 :algebra [(:algebra product)]}
+                 :algebra [(:algebra product)]
+                 :result-transform result-transform}
                 [] captures
                 (dialect/lambda-form
                  (vec (concat [(:accumulator component)] capture-parameters))

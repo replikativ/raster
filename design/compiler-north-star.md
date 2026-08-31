@@ -332,10 +332,16 @@ contraction facts from that equation behind a typed routing API and never repars
 form; the OpenCL pipeline
 therefore knows only the typed program, stable operation ID and certified candidate schedule, not
 the projection used by compatibility leaves. Only host materialization and compatibility leaves
-request a generated surface spelling. Staged quantization, decode lambdas,
-declared physical maps, epilogues and output conversions remain on the certified compatibility
-front door, and may still use `SegContract`, until the typed equation has explicit facts for them;
-admitting them while dropping those contracts would be a miscompile, not migration progress.
+request a generated surface spelling. A segmented reduction may now carry one typed scalar
+result-transform: its accumulator, expression, result dtype, tensor operands with axis maps/dtypes,
+and uniform scalar captures with dtypes are all verified at the equation boundary. Contraction
+epilogues expressed by that closed contract therefore stay on TypedSOAC and lower through the same
+matrix store region and ordered ABI as the proven compatibility oracle. Discovering a following map
+as such a transform remains separate alias-aware fusion work; it must not rewrite the fold lambda.
+Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
+the certified compatibility front door, and may still use `SegContract`, until the typed equation
+has explicit facts for them; admitting them while dropping those contracts would be a miscompile,
+not migration progress.
 
 The typed route can also enumerate every legal enabled contraction family without benchmarking or
 choosing among them. Each result retains its pinned `ReductionSchedule`, concrete strategy,
@@ -344,8 +350,9 @@ same compiler products that ordinary execution uses. These alternatives may stil
 physical ABIs and therefore are not falsely packaged as a runtime `KernelDispatch`; ABI
 normalization or graph-private adapters must precede runtime selection through one dispatch.
 For static shapes, one-node candidate graphs now provide exactly that normalization: the logical
-operand/result pointers form the shared external ABI, while leaf-only `M/N/K` or flattened segment
-bounds remain checked graph-private integer scalars. Runtime-dependent private dimensions are
+operand/result pointers and typed result-transform scalars form the shared external ABI, while
+leaf-only `M/N/K` or flattened segment bounds remain checked graph-private integer scalars.
+Runtime-dependent private dimensions are
 refused until they are represented in a shared public scalar ABI, preventing an offline sample from
 being mistaken for a valid dynamic specialization.
 The production OpenCL pass registers those static graphs as one fixed-selector dispatch and invokes
@@ -362,9 +369,10 @@ Tensor contraction uses that same semantic operator rather than reconstructing `
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
 one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;
 ordinary `SegRed` scheduling and peak routing consume those facts unchanged. The compatibility
-`SegContract` projection is now limited to contractions that are not yet in the typed subset. Free axes,
-operand axis maps, decode/storage precision, epilogues and staged accumulator structure remain
-orthogonal contraction facts and schedule choices. Contraction is therefore an ordinary segmented
+`SegContract` projection is now limited to contractions that are not yet in the typed subset. Free
+axes and typed result transforms are part of the functional equation; operand axis maps,
+decode/storage precision and staged accumulator structure remain orthogonal contraction facts and
+schedule choices. Contraction is therefore an ordinary segmented
 TypedSOAC reduction, not a new hard-coded GEMM algebra; matrix, register-tiled and portable kernels
 are competing schedules for that algebra.
 
@@ -912,6 +920,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    SegMap on resident OpenCL execution. Their shared typed scalar computations use one explicit
    ordered local-SSA region that lowers once through JVM and GPU paths; vertical and horizontal
    fusion now alpha-rename and compose those regions without duplicating shared scalar work.
+   Explicit typed segmented-reduction result transforms now reach contraction store regions without
+   compatibility re-lowering; alias-aware segmented-reduction→map discovery is the next fusion
+   coverage step.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
    JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and

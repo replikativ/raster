@@ -217,6 +217,65 @@
     (is (= :typed-soac (get-in (-> scheduled :form :equations first)
                                [:attributes :algorithm-dialect])))))
 
+(deftest explicit-contraction-result-transform-stays-in-typed-soac
+  (let [transform {:acc 'acc
+                   :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
+                   :operands [{:sym 'bias :dtype :float
+                               :map {:groups [[['j 128]]]}}]
+                   :scalars []
+                   :dtype :float}
+        source (list 'let* ['step
+                            (apply list
+                                   (concat
+                                    '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
+                                      (* (clojure.core/aget A (+ (* i 128) l))
+                                         (clojure.core/aget B (+ (* l 128) j))))
+                                    [:epilogue transform]))]
+                     'step)
+        program (frontend/form->program
+                 source {:dtype :half
+                         :array-types {'A :half 'B :half 'C :half 'bias :float}})
+        equation (first (dialect/equations program))
+        attributes (:attributes (dialect/operation-parts equation))
+        typed-transform (:result-transform attributes)]
+    (is (= [{:value 'bias :parameter '%result-operand0 :dtype :float
+             :map {:groups [[['j 128]]]}}]
+           (:operands typed-transform)))
+    (is (= '[acc %result-operand0]
+           (:parameters (dialect/lambda-parts (:lambda typed-transform)))))
+    (is (= '[(raster.numeric/+ acc (clojure.core/aget %result-operand0 j))]
+           (:body-results (dialect/lambda-parts (:lambda typed-transform)))))
+    (is (= '[A B bias] (get-in attributes [:attributes :stable-array-captures])))
+    (is (= '[A B bias] (:inputs (dialect/facts program))))
+    (is (= program (dialect/validate! program)))
+    (let [remapped (dialect/remap-values program {'bias [:binding 'bias]})
+          remapped-transform
+          (get-in (dialect/operation-parts (first (dialect/equations remapped)))
+                  [:attributes :result-transform])]
+      (is (= [:binding 'bias] (get-in remapped-transform [:operands 0 :value])))
+      (is (= (:lambda typed-transform) (:lambda remapped-transform))
+          "SSA value remapping must not rewrite the lexical scalar region")
+      (is (= remapped (dialect/validate! remapped))))))
+
+(deftest contraction-result-transform-cannot-hide-an-untyped-capture
+  (let [transform {:acc 'acc
+                   :expr '(raster.numeric/+ acc undeclared)
+                   :operands [] :scalars [] :dtype :float}
+        contract (apply list
+                        (concat
+                         '(raster.par/contract C [[i 8] [j 8]] [[l 8]]
+                           (* (clojure.core/aget A (+ (* i 8) l))
+                              (clojure.core/aget B (+ (* l 8) j))))
+                         [:epilogue transform]))]
+    (try
+      (frontend/form->program
+       (list 'let* ['step contract] 'step)
+       {:dtype :half :array-types {'A :half 'B :half 'C :half}})
+      (is false "an undeclared result-transform value must not enter TypedSOAC")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-soac-result-transform-expression
+               (:reason (ex-data exception))))))))
+
 (deftest destination-shapes-refine-across-ordered-maps
   (let [program (frontend/form->program
                  '(let* [first-step (raster.par/map! first-out i n float

@@ -514,13 +514,25 @@
                              :equation-dtype equation-dtype
                              :route-dtype (:dtype options)})))
         facts (cf/from-components components)
-        routed (apply route-contraction nil
-                      (mapcat identity
-                              (assoc options
-                                     :dtype equation-dtype
-                                     :facts facts
-                                     :candidate-families families
-                                     :operation-id operation-id)))
+        routed (try
+                 (apply route-contraction nil
+                        (mapcat identity
+                                (assoc options
+                                       :dtype equation-dtype
+                                       :facts facts
+                                       :candidate-families families
+                                       :operation-id operation-id)))
+                 (catch clojure.lang.ExceptionInfo exception
+                   (let [{:keys [reason strategy] :as data} (ex-data exception)]
+                     (if (= :epilogue-unsupported-by-this-leaf reason)
+                       (throw (ex-info "no enabled contraction family can lower the result transform"
+                                       {:reason :no-legal-contraction-family
+                                        :operation operation-id
+                                        :families families
+                                        :declines [{:leaf strategy :reason reason
+                                                    :data (dissoc data :reason :strategy)}]}
+                                       exception))
+                       (throw exception)))))
         selected-family (get strategy-family (:strategy routed))]
     (when-not (contains? (set families) selected-family)
       (throw (ex-info "selected contraction leaf is outside the enabled schedule families"
@@ -593,23 +605,28 @@
                       {:reason :typed-contraction-no-candidates
                        :route result})))))
 
-(def ^:private logical-pointer-fields
+(def ^:private logical-interface-fields
   [:kind :dtype :kernel-dtype :role :binding :field])
 
-(defn- artifact-pointer-interface
+(defn- public-interface-slot?
+  [slot]
+  (or (not= :scalar (:kind slot))
+      (= :epilogue (:role slot))))
+
+(defn- artifact-logical-interface
   [artifact]
   (->> (map vector (:abi artifact) (:arguments artifact))
-       (remove (fn [[slot _]] (= :scalar (:kind slot))))
+       (filter (comp public-interface-slot? first))
        vec))
 
-(defn- common-pointer-interface
+(defn- common-logical-interface
   [candidates operation-id]
-  (let [interfaces (mapv (comp artifact-pointer-interface :artifact) candidates)
+  (let [interfaces (mapv (comp artifact-logical-interface :artifact) candidates)
         arguments (mapv second (first interfaces))]
     (doseq [[candidate interface] (map vector candidates interfaces)]
       (when-not (= arguments (mapv second interface))
-        (throw (ex-info "typed contraction candidates have different logical pointer arguments"
-                        {:reason :typed-contraction-candidate-pointer-arguments
+        (throw (ex-info "typed contraction candidates have different logical ABI arguments"
+                        {:reason :typed-contraction-candidate-interface-arguments
                          :operation operation-id
                          :family (:family candidate)
                          :expected arguments
@@ -618,11 +635,11 @@
           (mapv
            (fn [index argument]
              (let [slots (mapv #(first (nth % index)) interfaces)
-                   semantic-views (mapv #(select-keys % logical-pointer-fields) slots)
+                   semantic-views (mapv #(select-keys % logical-interface-fields) slots)
                    _ (when-not (apply = semantic-views)
                        (throw (ex-info
-                               "typed contraction candidates have incompatible pointer semantics"
-                               {:reason :typed-contraction-candidate-pointer-semantics
+                               "typed contraction candidates have incompatible logical ABI semantics"
+                               {:reason :typed-contraction-candidate-interface-semantics
                                 :operation operation-id :argument argument
                                 :slots slots})))
                    aliasing (when (some #(= :no-write-alias (:aliasing %)) slots)
@@ -649,7 +666,8 @@
                      :invoke (:invoke candidate)})))
   (doseq [[slot compiler-value] (map vector (get-in candidate [:artifact :abi])
                                       (get-in candidate [:artifact :arguments]))
-          :when (= :scalar (:kind slot))]
+          :when (and (= :scalar (:kind slot))
+                     (not (public-interface-slot? slot)))]
     (when-not (and (contains? #{:int :long} (:kernel-dtype slot))
                    (or (integer? compiler-value)
                        (and (klaunch/expression? compiler-value)
@@ -674,23 +692,25 @@
   [candidate operation-id common-abi common-arguments]
   (let [{:keys [family strategy artifact candidate-schedule]} candidate
         artifact (kart/validate! artifact)
-        buffers (mapv (fn [slot argument]
+        interface (mapv vector common-abi common-arguments)
+        pointer-interface (filterv #(not= :scalar (:kind (first %))) interface)
+        buffers (mapv (fn [[slot argument]]
                         [argument
                          (kgraph/buffer argument (:dtype slot)
                                         (when (contains? #{:output :inout} (:kind slot))
                                           (get-in artifact [:attributes :out-elems]))
                                         :device (graph-buffer-role (:kind slot)))])
-                      common-abi common-arguments)
+                      pointer-interface)
         buffer-map (into {} buffers)
         inputs (into [] (comp (filter #(contains? #{:input :inout} (:kind (first %))))
                               (map #(get buffer-map (second %))))
-                     (map vector common-abi common-arguments))
+                     pointer-interface)
         outputs (into [] (comp (filter #(contains? #{:output :inout} (:kind (first %))))
                                (map #(get buffer-map (second %))))
-                      (map vector common-abi common-arguments))
+                      pointer-interface)
         uses (mapv (fn [slot argument]
                      (kgraph/->ValueUse argument (kabi/slot-access slot)))
-                   common-abi common-arguments)]
+                   (mapv first pointer-interface) (mapv second pointer-interface))]
     (kgraph/make
      {:inputs inputs
       :outputs outputs
@@ -747,16 +767,17 @@
 (defn route-static-typed-contraction-dispatch
   "Normalize legal static typed contraction leaves behind one logical ABI-compatible dispatch.
 
-   Leaf-only dimensions remain graph-private derived scalars, so matrix, register-tiled and
-   portable kernels can compete through the existing KernelDispatch tuning machinery. This
-   function refuses runtime-dependent private scalars; dynamic-shape dispatch requires those
-   dimensions in a common public scalar ABI rather than silently baking one sample."
+   Leaf-only dimensions remain graph-private derived scalars, while typed result-transform scalar
+   captures join operand/result pointers in the shared public ABI. Matrix, register-tiled and
+   portable kernels can therefore compete through the existing KernelDispatch tuning machinery.
+   Runtime-dependent private dimensions are refused until they have a common public ABI rather
+   than silently baking one sample."
   [program operation-id schedule & options]
   (let [{:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
                program operation-id schedule options)
         candidates (mapv #(static-private-scalars! % operation-id) candidates)
-        {:keys [abi arguments]} (common-pointer-interface candidates operation-id)
+        {:keys [abi arguments]} (common-logical-interface candidates operation-id)
         default-strategy (:strategy (first candidates))
         dispatch-id (candidate-dispatch-id operation-id candidates)
         candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)

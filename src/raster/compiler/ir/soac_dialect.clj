@@ -65,6 +65,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
@@ -144,6 +145,56 @@
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))))
 
+(defn result-transform?
+  "A typed scalar transform applied once to a completed reduction result.
+
+   This is semantic region data, not target epilogue source: every external value has an explicit
+   operand/scalar role and dtype, and operand indexing is a structured axis map.  Schedules may
+   place the region in a tile store, while untiled lowerings retain the same expression."
+  [value]
+  (let [operands (:operands value)
+        scalars (:scalars value)
+        ids (vec (concat (map :value operands) (map :value scalars)))
+        parameters (when (and (seq? (:lambda value))
+                              (= 'lambda (first (:lambda value))))
+                     (second (:lambda value)))
+        [_ _ region] (:lambda value)
+        [_ locals results] region
+        expected-parameters
+        (vec (concat [(first parameters)]
+                     (map :parameter operands) (map :parameter scalars)))
+        axis-map? (fn [value]
+                    (let [groups (:groups value)]
+                      (and (map? value) (vector? groups) (seq groups)
+                           (every? #(and (vector? %) (seq %)
+                                         (every? (fn [pair]
+                                                   (and (vector? pair) (= 2 (count pair))
+                                                        (value-id? (first pair))
+                                                        (extent? (second pair))))
+                                                 %))
+                                   groups))))]
+    (and (map? value)
+         (vector? parameters) (seq parameters) (every? symbol? parameters)
+         (= parameters expected-parameters)
+         (seq? region) (= 'region (first region))
+         (= [] locals) (vector? results) (= 1 (count results))
+         (vector? operands)
+         (every? (fn [{:keys [value parameter dtype map]}]
+                   (and (value-id? value) (symbol? parameter)
+                        (keyword? dtype) (dtype/known? dtype) (= dtype (dtype/canon dtype))
+                        (axis-map? map)))
+                 operands)
+         (vector? scalars)
+         (every? (fn [{:keys [value parameter dtype]}]
+                   (and (value-id? value) (symbol? parameter)
+                        (keyword? dtype) (dtype/known? dtype) (= dtype (dtype/canon dtype))))
+                 scalars)
+         (= (count ids) (count (distinct ids)))
+         (= (count parameters) (count (distinct parameters)))
+         (keyword? (:result-dtype value))
+         (dtype/known? (:result-dtype value))
+         (= (:result-dtype value) (dtype/canon (:result-dtype value))))))
+
 (defn segmented-reduce-attributes?
   "Attributes for a general segmented reduction. Segment axes are the ordered parallel result
    space; `:index/:extent` remain the innermost reduced axis shared with ordinary reduce."
@@ -156,7 +207,10 @@
                        (symbol? (first %)) (extent? (second %)))
                  axes)
          (= (count indices) (count (distinct indices)))
-         (not (contains? (set indices) (:index value))))))
+         (not (contains? (set indices) (:index value)))
+         (or (nil? (:result-transform value))
+             (and (= 1 (count (:accumulators value)))
+                  (result-transform? (:result-transform value)))))))
 
 (defn scan-attributes?
   "Attributes for a certified scan dialect operation. The explicit mode is load-bearing because
@@ -508,7 +562,8 @@
                  {:equation equation-id :results results :accumulators accumulators})))
 
       segmented-reduce
-      (let [accumulators (:accumulators attributes)]
+      (let [accumulators (:accumulators attributes)
+            transform (:result-transform attributes)]
         (when-not (= accumulators (vec (take (count accumulators) parameters)))
           (fail! :typed-soac-segmented-reduce-accumulators
                  "segmented-reduce accumulator parameters must lead the lambda in declared order"
@@ -516,7 +571,35 @@
         (when-not (= result-count (count accumulators))
           (fail! :typed-soac-segmented-reduce-results
                  "segmented-reduce result arity must equal accumulator arity"
-                 {:equation equation-id :results results :accumulators accumulators})))
+                 {:equation equation-id :results results :accumulators accumulators}))
+        (when transform
+          (let [operand-ids (set (map :value (:operands transform)))
+                scalar-ids (set (map :value (:scalars transform)))
+                transform-ids (set/union operand-ids scalar-ids)
+                stable (set (get-in attributes [:attributes :stable-array-captures]))
+                segment-indices (set (map first (:segment-axes attributes)))
+                {:keys [parameters body-results]} (lambda-parts (:lambda transform))
+                bound (set/union (set parameters) segment-indices)
+                unbound (util/free-syms (first body-results) bound)
+                map-axes (set (mapcat (comp axis-map/axes :map) (:operands transform)))]
+            (when-not (set/subset? transform-ids (set captures))
+              (fail! :typed-soac-result-transform-captures
+                     "segmented-reduce result transforms require explicit capture values"
+                     {:equation equation-id :transform-captures transform-ids
+                      :captures captures}))
+            (when-not (set/subset? operand-ids stable)
+              (fail! :typed-soac-result-transform-operands
+                     "result-transform tensor operands must be stable array captures"
+                     {:equation equation-id :operands operand-ids :stable stable}))
+            (when-not (set/subset? map-axes segment-indices)
+              (fail! :typed-soac-result-transform-axis-map
+                     "result-transform operand maps may reference only segment axes"
+                     {:equation equation-id :axes map-axes
+                      :segment-axes segment-indices}))
+            (when (seq unbound)
+              (fail! :typed-soac-result-transform-expression
+                     "result-transform expressions may reference only their typed region boundary"
+                     {:equation equation-id :unbound unbound :transform transform})))))
 
       scan
       (let [accumulators (:accumulators attributes)]
@@ -810,10 +893,19 @@
                                    (update-in [:attributes :stable-array-captures]
                                               #(mapv rename %)))
                       attributes (if (= 'segmented-reduce kind)
-                                   (update attributes :segment-axes
-                                           #(mapv (fn [[index extent]]
-                                                    [index (if (value-id? extent)
-                                                             (rename extent) extent)]) %))
+                                   (-> attributes
+                                       (update :segment-axes
+                                               #(mapv (fn [[index extent]]
+                                                        [index (if (value-id? extent)
+                                                                 (rename extent) extent)]) %))
+                                       (cond-> (:result-transform attributes)
+                                         (update-in [:result-transform :operands]
+                                                    #(mapv (fn [operand]
+                                                             (update operand :value rename)) %))
+                                         (:result-transform attributes)
+                                         (update-in [:result-transform :scalars]
+                                                    #(mapv (fn [scalar]
+                                                             (update scalar :value rename)) %))))
                                    attributes)
                       operation (if (= 'scalar kind)
                                   (list kind attributes (mapv rename captures) lambda)
