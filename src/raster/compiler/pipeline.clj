@@ -79,6 +79,7 @@
             [raster.analysis.memory :as mem]
             [clojure.set :as set]
             [raster.compiler.core.method-entry :as me]
+            [raster.compiler.report :as report]
             [raster.core :as rcore]))
 
 (defn- check-purity! [walked-body active-params warning-meta]
@@ -2358,6 +2359,15 @@
         (cond->
          (get-in stages [:kernels]) (assoc :kernels (get-in stages [:kernels]))
          (get-in stages [:cuda-result]) (assoc :cuda-result (get-in stages [:cuda-result]))))))
+
+(defn compile-report
+  "Compile once through the diagnostic pipeline and return its normalized compatibility report.
+
+   This is the machine-readable counterpart to `explain-pipeline`. The raw `show-pipeline` stage
+   map remains available for detailed inspection; this function provides stable route, fusion,
+   lowering, and emission facts without re-running or pattern-matching the source program."
+  [f-var & opts]
+  (report/from-pipeline (apply show-pipeline f-var opts)))
 
 ;; ================================================================
 ;; explain-pipeline — human-readable stage-by-stage summary
