@@ -455,6 +455,19 @@
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
               (seq declines) (assoc :fallback-reason (:reason (last declines)))))))))))
 
+(defn- validated-typed-contraction-families
+  [schedule operation-id]
+  (let [families (get-in schedule [:tuning-space :families])]
+    (when-not (and (vector? families) (seq families)
+                   (= (count families) (count (distinct families)))
+                   (every? contraction-families families))
+      (throw (ex-info "typed contraction schedule requires known distinct candidate families"
+                      {:reason :typed-contraction-families
+                       :operation operation-id
+                       :families families
+                       :allowed contraction-families})))
+    families))
+
 (defn route-typed-contraction
   "Route one scheduled scalar TypedSOAC contraction without exposing a source-form or facts adapter
    to the backend.
@@ -471,15 +484,7 @@
             (throw (ex-info "typed contraction requires a contraction candidate schedule"
                             {:reason :typed-contraction-schedule
                              :operation operation-id :schedule schedule})))
-        families (get-in schedule [:tuning-space :families])
-        _ (when-not (and (vector? families) (seq families)
-                         (= (count families) (count (distinct families)))
-                         (every? contraction-families families))
-            (throw (ex-info "typed contraction schedule requires known distinct candidate families"
-                            {:reason :typed-contraction-families
-                             :operation operation-id
-                             :families families
-                             :allowed contraction-families})))
+        families (validated-typed-contraction-families schedule operation-id)
         equation (or (some #(when (= operation-id (second %)) %)
                            (soac-dialect/equations program))
                      (throw (ex-info "typed contraction program lacks its scheduled equation"
@@ -503,6 +508,66 @@
                           :facts facts
                           :candidate-families families
                           :operation-id operation-id)))))
+
+(defn- enabled-family-decline?
+  [decline]
+  (not= :schedule-family-disabled (:reason decline)))
+
+(defn- candidate-declines
+  [family declines]
+  (into []
+        (comp (filter enabled-family-decline?)
+              (map #(assoc % :candidate-family family)))
+        declines))
+
+(defn route-typed-contraction-candidates
+  "Emit every representable family enabled by one typed contraction schedule.
+
+   Compilation remains pure: this function neither benchmarks nor chooses. Each candidate is a
+   complete validated artifact with its concrete leaf strategy; real legality failures are retained
+   with their candidate family, while leaves disabled deliberately by a single-family probe are not
+   reported as failures. Different physical ABIs are permitted here because offline compile-time
+   selection measures each candidate independently; a runtime KernelDispatch requires a later
+   common-interface normalization."
+  [program operation-id schedule & options]
+  (let [schedule (reduction/validate-schedule! schedule)
+        families (validated-typed-contraction-families schedule operation-id)
+        results
+        (mapv
+         (fn [family]
+           (let [pinned (assoc-in schedule [:tuning-space :families] [family])]
+             (try
+               (-> (apply route-typed-contraction program operation-id pinned options)
+                   (assoc :family family)
+                   (assoc :candidate-schedule pinned)
+                   (update :declines #(candidate-declines family %)))
+               (catch clojure.lang.ExceptionInfo exception
+                 (let [{:keys [reason declines] :as data} (ex-data exception)]
+                   (if (= :no-legal-contraction-family reason)
+                      {:family family
+                      :strategy nil
+                      :candidate-schedule pinned
+                      :declines (candidate-declines family declines)
+                      :reason reason
+                      :detail (dissoc data :declines)}
+                     (throw exception)))))))
+         families)
+        candidates (filterv :strategy results)]
+    {:operation-id operation-id
+     :schedule schedule
+     :candidates candidates
+     :declines (into [] (mapcat :declines) results)}))
+
+(defn route-typed-contraction-candidates!
+  "Emit typed contraction candidates or fail when no enabled family has a legal target leaf."
+  [program operation-id schedule & options]
+  (let [result (apply route-typed-contraction-candidates
+                      program operation-id schedule options)]
+    (if (seq (:candidates result))
+      result
+      (throw (ex-info "no executable typed contraction candidates"
+                      {:reason :typed-contraction-no-candidates
+                       :route result})))))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.

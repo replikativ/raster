@@ -337,6 +337,13 @@ declared physical maps, epilogues and output conversions remain on the certified
 front door, and may still use `SegContract`, until the typed equation has explicit facts for them;
 admitting them while dropping those contracts would be a miscompile, not migration progress.
 
+The typed route can also enumerate every legal enabled contraction family without benchmarking or
+choosing among them. Each result retains its pinned `ReductionSchedule`, concrete strategy,
+validated executable artifact and family-qualified decline trail, so offline tuning measures the
+same compiler products that ordinary execution uses. These alternatives may still have different
+physical ABIs and therefore are not falsely packaged as a runtime `KernelDispatch`; ABI
+normalization or graph-private adapters must precede runtime selection through one dispatch.
+
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
 one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;
