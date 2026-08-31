@@ -731,6 +731,17 @@
     (doseq [alternative alternatives]
       (is (kernel-graph-call/kernel-graph-call?
            (kernel-graph-call/make alternative {'A :a 'B :b 'C :c} {}))))
+    (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]
+      (try
+        (contract-route/route-typed-contraction
+         algorithm (:id operation)
+         (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+         :dtype :half :desc descriptor)
+        (is false "a routed leaf outside the pinned schedule family must be rejected")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :no-legal-contraction-family (:reason (ex-data exception))))
+          (is (= :strategy-outside-schedule-families
+                 (get-in (ex-data exception) [:declines 0 :reason]))))))
     (doseq [families [[] [:unknown]]]
       (try
         (contract-route/route-typed-contraction

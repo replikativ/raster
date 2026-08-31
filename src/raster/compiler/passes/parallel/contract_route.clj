@@ -240,6 +240,17 @@
   "Target schedule families for ordinary scalar typed contractions."
   #{:matrix :register-tiled :portable})
 
+(def ^:private strategy-family
+  {:dpas :matrix
+   :dp4a :matrix
+   :regtiled :register-tiled
+   :portable-segred :portable
+   :naive-segred :portable
+   :full-reduce :portable
+   :segmap :portable
+   :quant-naive :portable
+   :staged-segred :portable})
+
 (defn- epilogue-honoured-or-refused
   "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
    silently — the consumer's computation vanishes with no error.
@@ -502,14 +513,25 @@
                              :operation operation-id
                              :equation-dtype equation-dtype
                              :route-dtype (:dtype options)})))
-        facts (cf/from-components components)]
-    (apply route-contraction nil
-           (mapcat identity
-                   (assoc options
-                          :dtype equation-dtype
-                          :facts facts
-                          :candidate-families families
-                          :operation-id operation-id)))))
+        facts (cf/from-components components)
+        routed (apply route-contraction nil
+                      (mapcat identity
+                              (assoc options
+                                     :dtype equation-dtype
+                                     :facts facts
+                                     :candidate-families families
+                                     :operation-id operation-id)))
+        selected-family (get strategy-family (:strategy routed))]
+    (when-not (contains? (set families) selected-family)
+      (throw (ex-info "selected contraction leaf is outside the enabled schedule families"
+                      {:reason :no-legal-contraction-family
+                       :operation operation-id
+                       :families families
+                       :declines [{:leaf (:strategy routed)
+                                   :reason :strategy-outside-schedule-families
+                                   :data {:selected-family selected-family
+                                          :enabled-families families}}]})))
+    routed))
 
 (defn- enabled-family-decline?
   [decline]
@@ -618,6 +640,13 @@
 
 (defn- static-private-scalars!
   [candidate operation-id]
+  (when (:invoke candidate)
+    (throw (ex-info "typed contraction candidate uses a non-graph leaf invocation protocol"
+                    {:reason :typed-contraction-dispatch-invoke-protocol
+                     :operation operation-id
+                     :family (:family candidate)
+                     :strategy (:strategy candidate)
+                     :invoke (:invoke candidate)})))
   (doseq [[slot compiler-value] (map vector (get-in candidate [:artifact :abi])
                                       (get-in candidate [:artifact :arguments]))
           :when (= :scalar (:kind slot))]
