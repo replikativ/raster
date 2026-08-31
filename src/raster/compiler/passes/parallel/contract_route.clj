@@ -706,6 +706,44 @@
                    :candidate-family family
                    :candidate-schedule candidate-schedule}})))
 
+(defn- candidate-dispatch-id
+  [operation-id candidates]
+  (let [identity
+        [operation-id
+         (mapv (fn [{:keys [family strategy artifact]}]
+                 (let [kernel-name (:kernel-name artifact)]
+                   {:family family
+                    :strategy strategy
+                    :artifact (-> (select-keys artifact
+                                               [:target :source :abi :arguments :launch :effects])
+                                  (update :source str/replace kernel-name "<entry-point>"))}))
+               candidates)]]
+    (format "raster_typed_contraction_dispatch_%08x"
+            (bit-and 0xffffffff (long (hash identity))))))
+
+(defn- deterministic-candidate-entry-point
+  [candidate dispatch-id]
+  (let [artifact (kart/validate! (:artifact candidate))
+        old-name (:kernel-name artifact)
+        strategy-name (str/replace (name (:strategy candidate)) #"[^A-Za-z0-9_]" "_")
+        new-name (str dispatch-id "_" strategy-name)]
+    (assoc candidate :artifact
+           (kart/validate!
+            (-> artifact
+                (assoc :kernel-name new-name)
+                (update :source str/replace old-name new-name))))))
+
+(defn- typed-contraction-tuning-contract
+  [schedule dispatch-id abi]
+  (let [interface (mapv #(select-keys % [:kind :dtype :kernel-dtype :role
+                                         :aliasing :alignment])
+                        abi)]
+    {:schedule-path [:typed-contraction :measured-selectors]
+     :schedule-key dispatch-id
+     :numerical-mode {:reduction (:numerical-mode schedule)
+                      :interface interface}
+     :layout {:external-interface interface}}))
+
 (defn route-static-typed-contraction-dispatch
   "Normalize legal static typed contraction leaves behind one logical ABI-compatible dispatch.
 
@@ -719,10 +757,12 @@
                program operation-id schedule options)
         candidates (mapv #(static-private-scalars! % operation-id) candidates)
         {:keys [abi arguments]} (common-pointer-interface candidates operation-id)
-        alternatives (mapv #(candidate-graph % operation-id abi arguments) candidates)
-        default-strategy (:strategy (first candidates))]
+        default-strategy (:strategy (first candidates))
+        dispatch-id (candidate-dispatch-id operation-id candidates)
+        candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)
+        alternatives (mapv #(candidate-graph % operation-id abi arguments) candidates)]
     (kdispatch/make
-     {:id (str "typed-contraction:" (pr-str operation-id))
+     {:id dispatch-id
       :alternatives alternatives
       :default-strategy default-strategy
       :selector {:kind :fixed-strategy :strategy default-strategy}
@@ -732,7 +772,9 @@
       :attributes {:operation-family :typed-contraction
                    :candidate-schedules
                    (into {} (map (juxt :strategy :candidate-schedule)) candidates)
-                   :declines (:declines routed)}})))
+                   :declines (:declines routed)
+                   :tuning (typed-contraction-tuning-contract schedule dispatch-id abi)
+                   :selection :analytic-fixed}})))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.

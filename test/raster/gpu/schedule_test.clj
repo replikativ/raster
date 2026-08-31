@@ -56,6 +56,9 @@
       (is (= {:strategy :auto :score-reuse-subgroup-multiple 16
               :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
+    (testing "static typed contractions default to analytic fixed selection"
+      (is (= {:strategy :auto :measured-selectors {}}
+             (:typed-contraction derived))))
     (testing "GEMM dispatch policy is explicit, serializable schedule data"
       (is (= {:target-fill-multiple 4 :min-split-chunk 1024 :max-splits 64}
              (:gemm-dispatch derived))))
@@ -151,6 +154,18 @@
                              {:strategy :reference
                               :measured-selectors
                               {"dispatch-a" {:kind :runtime-scalar-ranges}}}})
+                           arc-desc))))
+  (testing "typed contraction selectors are validated as persistent schedule data"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown typed contraction strategy"
+                          (sched/feasible?
+                           (sched/resolve (sched/derive-default nil arc-desc)
+                                          {:typed-contraction {:strategy :matrix}})
+                           arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"measured typed contraction selectors must map dispatch IDs"
+                          (sched/feasible?
+                           (sched/resolve (sched/derive-default nil arc-desc)
+                                          {:typed-contraction {:measured-selectors :invalid}})
                            arc-desc))))
   (testing "GEMM dispatch controls reject missing, zero, and non-integral policy data"
     (doseq [invalid [{:max-splits 0}

@@ -495,7 +495,15 @@
                               nil)
                             (throw exception))))))]
               (if typed-dispatch
-                (let [dispatch
+                (let [measured-selector
+                      (get-in schedule [:typed-contraction :measured-selectors
+                                        (:id typed-dispatch)])
+                      typed-dispatch
+                      (if measured-selector
+                        (-> (kdispatch/with-selector typed-dispatch measured-selector)
+                            (assoc-in [:attributes :selection] :measured-fixed))
+                        typed-dispatch)
+                      dispatch
                       (-> typed-dispatch
                           (update :alternatives
                                   (fn [alternatives]

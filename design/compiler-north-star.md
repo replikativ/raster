@@ -351,8 +351,12 @@ being mistaken for a valid dynamic specialization.
 The production OpenCL pass registers those static graphs as one fixed-selector dispatch and invokes
 it through the generic scheduled-executable runner. It emits every legal leaf once, preserves the
 current analytic winner as the default, and records dynamic-shape or special-protocol declines
-instead of hiding a fallback. The remaining closed-loop step is a tuning contract that maps a
-validated measured fixed selector back into the resolved schedule/cache on recompilation.
+instead of hiding a fallback. Each dispatch carries the generic tuning contract that maps a
+validated measured fixed selector into `[:typed-contraction :measured-selectors <dispatch-id>]` in
+the resolved schedule. Its ID and entry points are derived deterministically from canonical emitted
+candidates, so recompilation reproduces the executable identity and can consume a cache hit without
+benchmarking. Measurement remains an explicit runtime action guarded by the existing oracle,
+device-event, stationarity, numerical-mode and layout checks.
 
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical

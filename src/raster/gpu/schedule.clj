@@ -68,6 +68,10 @@
     :segmented-weighted-reduction {:strategy :auto
                                    :score-reuse-subgroup-multiple 16
                                    :measured-selectors {}}
+    ;; Static typed contractions emit ABI-normalized schedule alternatives. Offline fixed-shape
+    ;; tuning writes the validated selector here; recompilation consumes it without benchmarking.
+    :typed-contraction {:strategy :auto
+                        :measured-selectors {}}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
             :derived-by :raster.gpu.schedule/derive-default
@@ -90,6 +94,7 @@
 (def ^:private valid-grf-modes #{:grf128 :grf256})
 (def ^:private valid-segmented-reduction-strategies
   #{:auto :reference :subgroup-score-reuse})
+(def ^:private valid-typed-contraction-strategies #{:auto})
 
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
@@ -195,6 +200,10 @@
         (get-in schedule [:segmented-weighted-reduction :score-reuse-subgroup-multiple] 16)
         measured-selectors
         (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})
+        typed-contraction-strategy
+        (get-in schedule [:typed-contraction :strategy] :auto)
+        typed-contraction-selectors
+        (get-in schedule [:typed-contraction :measured-selectors] {})
         {:keys [target-fill-multiple min-split-chunk max-splits]}
         (:gemm-dispatch schedule)]
     (when-not (valid-precisions prec)
@@ -222,6 +231,17 @@
       (throw (ex-info "schedule: measured selectors require :strategy :auto"
                       {:strategy reduction-strategy
                        :measured-selectors measured-selectors})))
+    (when-not (valid-typed-contraction-strategies typed-contraction-strategy)
+      (throw (ex-info "schedule: unknown typed contraction strategy"
+                      {:strategy typed-contraction-strategy
+                       :expected valid-typed-contraction-strategies})))
+    (when-not (and (map? typed-contraction-selectors)
+                   (every? #(and (string? %) (not-empty %))
+                           (keys typed-contraction-selectors))
+                   (every? map? (vals typed-contraction-selectors)))
+      (throw (ex-info
+              "schedule: measured typed contraction selectors must map dispatch IDs to selector maps"
+              {:measured-selectors typed-contraction-selectors})))
     (doseq [[field value] [[:target-fill-multiple target-fill-multiple]
                            [:min-split-chunk min-split-chunk]
                            [:max-splits max-splits]]]
