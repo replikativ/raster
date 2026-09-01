@@ -29,7 +29,7 @@
                             (list 'clojure.core/+ (list 'clojure.core/* 'i k) 'l))
                       (list 'clojure.core/aget 'B
                             (list 'clojure.core/+ (list 'clojure.core/* 'l n) 'j))))
-          (when combine [:combine combine])))
+          (when combine [:combine combine :init 'Float/NEGATIVE_INFINITY])))
 
 (defn- route [form dtype] (cr/route-contraction form :dtype dtype))
 

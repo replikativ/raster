@@ -14,7 +14,7 @@
                 (list 'raster.numeric/* (list 'aget 'a 't) (list 'aget 'b 't))
                 :stages [{:axis 'blk :extent 2 :dtype :float :init 0.0 :lift 'inner}
                          {:axis 't :extent extent :dtype :int :init 0}])
-          (when combine [:combine combine])))
+          (when combine [:combine combine :init 'Double/NEGATIVE_INFINITY])))
 
 (deftest staged-refuses-a-combine-it-would-silently-turn-into-a-sum
   (testing "every accumulator level uses `+=` and a lift's linearity argument assumes addition, so
@@ -106,7 +106,7 @@
     (let [r (cr/route-contraction
              (list 'raster.par/contract 'O [] [['l 8]]
                    (list 'raster.numeric/* (list 'aget 'a 'l) (list 'aget 'b 'l))
-                   :combine 'max :init -1.0e30)
+                   :combine 'max :init 'Double/NEGATIVE_INFINITY)
              :dtype :double)]
       (is (= :full-reduce (:strategy r)))
       (is (= "fmax" (:c-op r)))

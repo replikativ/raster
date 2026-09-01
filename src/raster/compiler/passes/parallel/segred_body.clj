@@ -52,6 +52,20 @@
       (recur (util/subst-syms (util/binding-env bindings) (first body))))
     expression))
 
+(defn- literal-value
+  [value]
+  (if (and (seq? value)
+           (= 2 (count value))
+           (contains? cast-heads (first value))
+           (number? (second value)))
+    (second value)
+    (case value
+      Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
+      Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
+      Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
+      Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
+      value)))
+
 (defn scalar-plan
   "Project one scalar SegRed into an explicit combine operator, identity and element expression."
   [segred]
@@ -77,22 +91,8 @@
                 {:segred-id (:id segred) :declared declared :derived derived}))
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
-    {:operator operator :identity init :element (:element derived)
+    {:operator operator :identity (literal-value init) :element (:element derived)
      :accumulator acc}))
-
-(defn- literal-value
-  [value]
-  (if (and (seq? value)
-           (= 2 (count value))
-           (contains? cast-heads (first value))
-           (number? (second value)))
-    (second value)
-    (case value
-      Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
-      Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
-      Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
-      Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
-      value)))
 
 (defn launch-group-count
   "Translate SegRed's historical capped-grid expression into inspectable launch IR.

@@ -57,10 +57,11 @@
       (is (= :partial-matrix-k-fragment (:reason planned)))
       (is (= 16 (:matrix-k planned)))))
   (testing "a non-zero reduction initializer cannot be dropped by a zero-initialized matrix body"
-    (is (= :non-zero-matrix-init
-           (:reason (schedule/plan-matrix-body
-                     (facts/contraction-facts (matrix-form 128 128 128 1.0) :dtype :half)
-                     nil nil)))))
+    (try
+      (facts/contraction-facts (matrix-form 128 128 128 1.0) :dtype :half)
+      (is false "non-identity parallel reductions must be rejected before scheduling")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :reduction-nonidentity-init (:reason (ex-data exception)))))))
   (testing "matrix N and subgroup width must agree with an implemented DPAS spelling"
     (let [desc {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 8}}
           planned (schedule/plan-matrix-body

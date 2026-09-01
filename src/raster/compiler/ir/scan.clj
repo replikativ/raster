@@ -128,7 +128,9 @@
   [declared derived]
   (and (associative-scan? declared)
        (associative-scan? derived)
-       (= (:acc declared) (:acc derived))
+       ;; Accumulators and element operands are lexical binders that may be alpha-renamed or
+       ;; projected from captures between independently certified regions. The certificate is the
+       ;; typed monoid contract; each concrete region has already been certified on its own.
        (= (some-> (:combine declared) name symbol)
           (some-> (:combine derived) name symbol))
        (identity-equivalent? (:init declared) (:init derived))

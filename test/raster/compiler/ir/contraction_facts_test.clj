@@ -42,12 +42,12 @@
                (second (rest (first (:results (reduction/fold-region operator)))))))))))
 
 (deftest source-and-semantic-components-enter-the-same-facts-constructor
-  (let [source (form :init 1 :combine 'clojure.core/+)
+  (let [source (form :init 0 :combine 'clojure.core/+)
         parsed (cf/contraction-facts source :dtype :byte)
         components (cf/from-components
                     {:out 'out :free-axes '[[i 4] [j 6]]
                      :contract-axes '[[blk 4] [t 32]] :body body
-                     :opts (array-map :init 1 :combine 'clojure.core/+)
+                     :opts (array-map :init 0 :combine 'clojure.core/+)
                      :dtype :byte})]
     (is (cf/facts? components))
     (is (= (select-keys parsed [:out :free-axes :contract-axes :body :operands
@@ -59,7 +59,7 @@
     (is (= (:form components)
            (cf/surface-form {:out 'out :free-axes '[[i 4] [j 6]]
                              :contract-axes '[[blk 4] [t 32]] :body body
-                             :opts (array-map :init 1 :combine 'clojure.core/+)})))))
+                             :opts (array-map :init 0 :combine 'clojure.core/+)})))))
 
 (deftest a-stage-list-cannot-supply-the-axes-it-is-checked-against
   (testing "the form's contract axes are independent of its :stages — the two are separate slots,

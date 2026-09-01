@@ -11,6 +11,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.fusion-placement :as placement]))
 
@@ -825,6 +826,16 @@
                                                   (:capture-parameters canonical)))
                          :locals (:locals canonical)
                          :body-results (:body-results canonical))
+          updated
+          (if (= :reduce (:kind updated))
+            (let [{:keys [accumulators identities dtypes]} (:attributes updated)
+                  algebra (mapv (fn [accumulator identity component-dtype result]
+                                  (scan/certify-reassociation
+                                   {:acc accumulator :init identity :lambda result}
+                                   component-dtype))
+                                accumulators identities dtypes (:body-results updated))]
+              (assoc-in updated [:attributes :algebra] algebra))
+            updated)
           retain-producer? (> use-count 1)
           fused-kind (keyword (str "map-" (name (:kind consumer))))
           equations (assoc (dialect/equations program) consumer-index (emit-equation updated))

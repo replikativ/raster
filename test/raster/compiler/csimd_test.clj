@@ -8,7 +8,11 @@
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]))
+
+(defn- numeric-invk [impl & arguments]
+  (util/make-invk impl arguments))
 
 (defn- clang-avx2? []
   (try
@@ -20,19 +24,23 @@
   {:space {:dims [{:name 'i :bound 'n}]} :dtype dt
    :reduction (reduction/scalar
                {:accumulator 'acc :neutral 0.0 :dtype dt :result 'out :index 'i
-                :step-result '(.invk raster.numeric/_plus__m_double_double-impl acc
-                                     (.invk raster.numeric/_star__m_double_double-impl
-                                            (clojure.core/aget x (long i))
-                                            (clojure.core/aget x (long i))))})})
+                :step-result
+                (numeric-invk
+                 'raster.numeric/_plus__m_double_double-impl 'acc
+                 (numeric-invk 'raster.numeric/_star__m_double_double-impl
+                               '(clojure.core/aget x (long i))
+                               '(clojure.core/aget x (long i))))})})
 
 (defn- dot-segred [dt]
   {:space {:dims [{:name 'i :bound 'n}]} :dtype dt
    :reduction (reduction/scalar
                {:accumulator 'acc :neutral 0.0 :dtype dt :result 'out :index 'i
-                :step-result '(.invk raster.numeric/_plus__m_double_double-impl acc
-                                     (.invk raster.numeric/_star__m_double_double-impl
-                                            (clojure.core/aget a (long i))
-                                            (clojure.core/aget b (long i))))})})
+                :step-result
+                (numeric-invk
+                 'raster.numeric/_plus__m_double_double-impl 'acc
+                 (numeric-invk 'raster.numeric/_star__m_double_double-impl
+                               '(clojure.core/aget a (long i))
+                               '(clojure.core/aget b (long i))))})})
 
 (defn- run1 [native arrs n]
   (let [out (first arrs)]
