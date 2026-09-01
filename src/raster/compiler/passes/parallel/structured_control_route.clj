@@ -95,35 +95,8 @@
 
 (defn- program-boundary
   [equations outputs]
-  (let [{:keys [inputs available]}
-        (reduce
-         (fn [{:keys [inputs available definitions] :as state} equation]
-           (let [new-inputs (remove available (:operands equation))
-                 input-set (set new-inputs)
-                 duplicate-results (set/intersection definitions (set (:results equation)))
-                 clobbered-inputs (set/intersection (into (set inputs) new-inputs)
-                                                    (set (:results equation)))]
-             (when (seq duplicate-results)
-               (fail! :structured-control-result-redefinition
-                      "mixed algorithms may define each logical value only once"
-                      {:equation (:id equation) :values duplicate-results}))
-             (when (seq clobbered-inputs)
-               (fail! :structured-control-use-before-definition
-                      "a value used before its definition cannot later be defined"
-                      {:equation (:id equation) :values clobbered-inputs}))
-             (-> state
-                 (update :inputs into (remove (set inputs) new-inputs))
-                 (update :available into input-set)
-                 (update :available into (:results equation))
-                 (update :definitions into (:results equation)))))
-         {:inputs [] :available #{} :definitions #{}}
-         equations)
-        unavailable-outputs (remove available outputs)]
-    (when (seq unavailable-outputs)
-      (fail! :structured-control-unavailable-output
-             "mixed program outputs must be inputs or produced values"
-             {:outputs (vec outputs) :unavailable (vec unavailable-outputs)}))
-    {:inputs inputs :outputs (vec outputs)}))
+  {:inputs (program/infer-inputs equations)
+   :outputs (vec outputs)})
 
 (defn- value-types
   [values shape?]
