@@ -31,7 +31,9 @@
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
   (or
-   (some-> (patterns/match-reduce-loop expression) (assoc :inclusive? false))
+   (when-let [matched (patterns/match-reduce-loop expression)]
+     (assoc matched :inclusive? false
+            :update-expr (or (:scoped-update-expr matched) (:update-expr matched))))
    (when-let [{:keys [kind index-sym acc-sym acc-init body-form bound]}
               (patterns/normalize-loop expression)]
      (when (and (= :reduce-loop kind)

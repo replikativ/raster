@@ -676,6 +676,25 @@
 
       :else nil)))
 
+(defn- scoped-recur-value
+  "Retain the lexical bindings surrounding one recur argument.
+
+   Pattern recognition still receives the raw argument in `:update-expr`. Structured ordered-loop
+   lowering consumes this scoped form, so a target IR never sees references to let-bound values
+   after the recur node itself has been removed. Multi-expression/effectful regions remain outside
+   this conservative projection."
+  [then-branch update-expr]
+  (cond
+    (and (seq? then-branch) (= 'recur (first then-branch)))
+    update-expr
+
+    (and (form/binding-form? then-branch)
+         (= 1 (count (drop 2 then-branch))))
+    (with-meta (list (first then-branch) (second then-branch) update-expr)
+      (meta then-branch))
+
+    :else nil))
+
 (defn match-reduce-loop
   "Generic matcher for reduction loops.
 	Returns a structural descriptor of the loop/update shape or nil."
@@ -713,7 +732,8 @@
                :else-expr else-branch
                :recur-form recur-form
                :idx-update-expr idx-update-expr
-               :update-expr update-expr})))))))
+               :update-expr update-expr
+               :scoped-update-expr (scoped-recur-value then-branch update-expr)})))))))
 
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.
