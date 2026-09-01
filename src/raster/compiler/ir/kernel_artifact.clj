@@ -77,6 +77,16 @@
   (validate! (->KernelArtifact kernel-name target source abi arguments launch
                                temporaries effects provenance attributes)))
 
+(defn certify-scheduled-operation
+  "Bind a target artifact to the complete immutable scheduled operation it implements."
+  [artifact scheduled-operation]
+  (when (nil? scheduled-operation)
+    (throw (ex-info "an emitted artifact requires its scheduled operation certificate"
+                    {:reason :kernel-artifact-scheduled-operation})))
+  (validate! (assoc-in (validate! artifact)
+                       [:provenance :scheduled-operation]
+                       scheduled-operation)))
+
 (defn launch-value
   "Read one value from the artifact's launch contract."
   [artifact k]
