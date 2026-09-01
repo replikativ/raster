@@ -9,6 +9,7 @@
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
@@ -488,6 +489,38 @@
             (ex-data
              (try (program-call/map-buffers call (constantly :same-storage))
                   (catch clojure.lang.ExceptionInfo exception exception))))))))
+
+(deftest emitted-program-call-is-a-native-link-plan-instance
+  (let [{:keys [call]} (prepared-mixed-call 0)
+        sources (program-call/buffer-identities call)
+        mapping (zipmap sources (mapv #(vector :program-value %)
+                                      (range (count sources))))
+        remapped (program-call/map-buffers call mapping)
+        source-contracts
+        (reduce (fn [contracts [compiler-value source]]
+                  (assoc contracts source (get-in call [:program :values compiler-value])))
+                {} (program-call/buffer-bindings call))
+        nodes
+        (mapv (fn [[source value-id]]
+                (let [abstract (get source-contracts source)]
+                  (link/node {:id value-id :dtype (:dtype abstract) :shape [64]
+                              :device :ocl:0 :role :state})))
+              mapping)
+        values
+        (mapv (fn [[source value-id]]
+                (link/value {:id value-id :abstract (get source-contracts source)
+                             :leaves [{:name :value :node value-id}]}))
+              mapping)
+        instance (link/program-instance {:id :rk4-call :call remapped})
+        output-id (-> remapped :outputs vals first)
+        plan (link/make {:id :linked-rk4 :target :ocl:0
+                         :nodes nodes :values values
+                         :instances [instance] :outputs [output-id]})]
+    (is (link/program-link-instance? instance))
+    (is (link/link-plan? plan))
+    (is (= #{:state} (set (vals (link/instance-roles plan instance)))))
+    (is (every? #(= 1 (count (:leaves %))) (vals (:values plan))))
+    (is (false? (get-in remapped [:attributes :source-inspected])))))
 
 (deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
   (let [{:keys [call]} (prepared-mixed-call 9)

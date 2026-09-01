@@ -1,5 +1,5 @@
 (ns raster.compiler.ir.link-plan
-  "Pure, backend-neutral composition of compiled resident program descriptors.
+  "Pure, backend-neutral composition of compiled resident descriptors and emitted programs.
 
    A LinkPlan names storage with stable LinkNodes and binds each descriptor's compiler symbols to
    those node identities. Validation closes shapes, dtypes, aliases, scalar environments and
@@ -9,10 +9,13 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
-            [raster.compiler.ir.kernel-graph-call :as kgcall]))
+            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.structured-loop-call :as loop-call]))
 
 (def node-roles #{:input :constant :state :output :internal :scratch})
 (def binder-roles #{:input :constant :state :output :scratch})
@@ -20,6 +23,7 @@
 (defrecord LinkNode [id view role source])
 (defrecord LinkValue [id abstract physical-layout leaves])
 (defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
+(defrecord ProgramLinkInstance [id call roles attributes])
 (defrecord LinkPlan [id target nodes values instances outputs aliases attributes])
 
 (defn link-node? [x]
@@ -27,6 +31,12 @@
 
 (defn link-instance? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkInstance" (.getName (class x)))))
+
+(defn program-link-instance? [x]
+  (and x (= "raster.compiler.ir.link_plan.ProgramLinkInstance" (.getName (class x)))))
+
+(defn plan-instance? [x]
+  (or (link-instance? x) (program-link-instance? x)))
 
 (defn link-plan? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkPlan" (.getName (class x)))))
@@ -292,6 +302,40 @@
    array parameters; runtime pointer binding still comes exclusively from `:bindings`."
   [{:keys [id descriptor bindings scalars schedule roles arguments] :or {scalars {} roles {}}}]
   (validate-instance! (->LinkInstance id descriptor bindings scalars schedule roles arguments)))
+
+(defn validate-program-instance!
+  [instance]
+  (when-not (program-link-instance? instance)
+    (throw (ex-info "expected a ProgramLinkInstance"
+                    {:reason :program-link-instance-type
+                     :instance instance :actual (type instance)})))
+  (let [{:keys [id call roles attributes]} instance
+        call (program-call/validate! call)
+        buffer-values (set (keys (:buffers call)))]
+    (when (nil? id)
+      (throw (ex-info "a program link instance requires a stable identity"
+                      {:reason :program-link-instance-id})))
+    (when-not (and (map? roles) (every? binder-roles (vals roles)))
+      (throw (ex-info "program link roles must map compiler values to resident roles"
+                      {:reason :program-link-instance-roles :instance id
+                       :roles roles :allowed binder-roles})))
+    (when-not (set/subset? (set (keys roles)) buffer-values)
+      (throw (ex-info "program link roles name values outside its resident buffer boundary"
+                      {:reason :program-link-instance-role-values :instance id
+                       :extra (set/difference (set (keys roles)) buffer-values)})))
+    (when-not (map? attributes)
+      (throw (ex-info "program link instance attributes must be a map"
+                      {:reason :program-link-instance-attributes
+                       :instance id :attributes attributes}))))
+  instance)
+
+(defn program-instance
+  "Construct an equation-first emitted program instance whose call buffers are LinkValue IDs.
+
+   KernelGraph temporaries remain graph-private. `:roles` may refine residency policy for public
+   program buffer values but never supplies or reconstructs a binding."
+  [{:keys [id call roles attributes] :or {roles {} attributes {}}}]
+  (validate-program-instance! (->ProgramLinkInstance id call roles attributes)))
 
 (defn instance-arguments
   "Return the descriptor's ordered specialization arguments. Explicit arguments retain array
@@ -628,7 +672,14 @@
     (when-not (and (vector? instances) (seq instances))
       (throw (ex-info "a link plan requires an ordered non-empty instance vector"
                       {:reason :link-instances :instances instances})))
-    (doseq [link-instance instances] (validate-instance! link-instance))
+    (doseq [link-instance instances]
+      (cond
+        (link-instance? link-instance) (validate-instance! link-instance)
+        (program-link-instance? link-instance) (validate-program-instance! link-instance)
+        :else
+        (throw (ex-info "link plan contains an unknown instance variant"
+                        {:reason :link-instance-type :instance link-instance
+                         :actual (type link-instance)}))))
     (when-not (= (count instances) (count (distinct (map :id instances))))
       (throw (ex-info "link instance identities must be unique"
                       {:reason :link-instance-ids :ids (mapv :id instances)})))
@@ -755,14 +806,111 @@
               (instance-step-facts nodes values instance step-index step))
             (map-indexed vector (:steps descriptor))))))
 
+(defn- program-value-node!
+  [nodes values instance-id compiler-value value-id]
+  (let [link-value (get values value-id)]
+    (when-not link-value
+      (throw (ex-info "emitted program buffer names an absent logical LinkValue"
+                      {:reason :program-link-absent-value :instance instance-id
+                       :compiler-value compiler-value :value value-id})))
+    (when-not (= 1 (count (:leaves link-value)))
+      (throw (ex-info "one emitted program graph buffer requires one physical LinkValue leaf"
+                      {:reason :program-link-leaf-count :instance instance-id
+                       :compiler-value compiler-value :value value-id
+                       :leaves (:leaves link-value)})))
+    (get nodes (get-in link-value [:leaves 0 :node]))))
+
+(defn- validate-program-buffer-contracts!
+  [nodes values {:keys [id call roles]}]
+  (let [program-values (get-in call [:program :values])]
+    (doseq [[compiler-value value-id] (:buffers call)]
+      (let [expected (get program-values compiler-value)
+            link-value (get values value-id)
+            node (program-value-node! nodes values id compiler-value value-id)]
+        (when-not (and expected
+                       (= (count (:shape expected)) (count (get-in node [:view :shape])))
+                       (av/storage-contract-compatible? expected (:abstract link-value)))
+          (throw (ex-info "emitted program buffer differs from its logical LinkValue contract"
+                          {:reason :program-link-value-contract :instance id
+                           :compiler-value compiler-value :value value-id
+                           :expected expected :actual (:abstract link-value)
+                           :physical-shape (get-in node [:view :shape])})))
+        (when (and (= :constant (get roles compiler-value))
+                   (not= :constant (:role node)))
+          (throw (ex-info "a constant program binding requires a constant LinkValue"
+                          {:reason :program-link-role-mismatch :instance id
+                           :compiler-value compiler-value :value value-id
+                           :value-role (:role node)})))))
+    (doseq [[compiler-value value-id] (:loop-scratch call)]
+      (program-value-node! nodes values id compiler-value value-id))))
+
+(defn- program-graph-fact
+  [nodes values instance-id step-id phase graph buffers]
+  (let [graph (kgraph/validate! graph)
+        external
+        (vals
+         (reduce (fn [by-id buffer]
+                   (assoc by-id (:id buffer) buffer))
+                 {} (concat (:inputs graph) (:outputs graph))))]
+    {:instance instance-id :step step-id :phase phase
+     :facts
+     (mapv
+      (fn [{:keys [id dtype role]}]
+        (let [value-id (get buffers id ::missing)]
+          (when (= ::missing value-id)
+            (throw (ex-info "emitted graph buffer has no linked program binding"
+                            {:reason :program-link-graph-buffer :instance instance-id
+                             :step step-id :buffer id})))
+          (let [node (program-value-node! nodes values instance-id id value-id)]
+            (when-not (= (dtype/canon dtype) (dtype/canon (get-in node [:view :dtype])))
+              (throw (ex-info "emitted graph buffer dtype differs from its linked node"
+                              {:reason :program-link-graph-dtype :instance instance-id
+                               :step step-id :buffer id :value value-id
+                               :expected dtype :actual (get-in node [:view :dtype])})))
+            {:symbol id :node (:id node)
+             :access (case role
+                       :input :read
+                       :output :write
+                       :inout :read-write)})))
+      external)}))
+
+(defn- validate-program-instance-bindings!
+  [nodes values instance]
+  (let [{:keys [id call]} (validate-program-instance! instance)]
+    (validate-program-buffer-contracts! nodes values instance)
+    (vec
+     (mapcat
+      (fn [[step-index step]]
+        (cond
+          (program-call/evaluated-host-equation? step) []
+          (program-call/emitted-equation-call? step)
+          [(program-graph-fact nodes values id step-index
+                               (get-in step [:equation :id])
+                               (:graph step) (:buffers step))]
+          (loop-call/structured-loop-call? step)
+          (mapv (fn [iteration]
+                  (let [{:keys [buffers]} (loop-call/iteration-binding step iteration)]
+                    (program-graph-fact nodes values id [step-index iteration]
+                                        :structured-loop-iteration
+                                        (:graph step) buffers)))
+                (range (min 3 (:trip-count step))))))
+      (map-indexed vector (:steps call))))))
+
 (defn- validate-effects! [{:keys [target nodes values instances outputs aliases] :as plan}]
   (when (and (not (let [target-name (name target)]
                     (or (= "ze" target-name) (.startsWith target-name "ze:"))))
              (some #(= :scatter (:convention %))
-                   (mapcat (comp :steps :descriptor) instances)))
+                   (mapcat (fn [instance]
+                             (when (link-instance? instance)
+                               (get-in instance [:descriptor :steps])))
+                           instances)))
     (throw (ex-info "linked scatter execution is not available on this target backend"
                     {:reason :link-target-convention :target target :convention :scatter})))
-  (let [step-facts (mapcat #(validate-instance-bindings! nodes values %) instances)
+  (let [step-facts
+        (mapcat #(if (link-instance? %)
+                   (validate-instance-bindings! nodes values %)
+                   (validate-program-instance-bindings! nodes values %))
+                instances)
         initialized (volatile! (into #{}
                                      (keep (fn [[id {:keys [role source]}]]
                                              ;; Ownership answers who releases storage, not whether
@@ -833,15 +981,35 @@
   [plan instance]
   (when-not (link-plan? plan)
     (throw (ex-info "instance-roles requires a LinkPlan" {:actual (type plan)})))
-  (validate-instance! instance)
   (let [nodes (:nodes plan)
         values (:values plan)]
-    (merge
-     (into {}
-           (map (fn [[sym value-id]]
-                  (let [node-id (get-in values [value-id :leaves 0 :node])]
-                    [sym (case (get-in nodes [node-id :role])
+    (cond
+      (link-instance? instance)
+      (let [instance (validate-instance! instance)]
+        (merge
+         (into {}
+               (map (fn [[sym value-id]]
+                      (let [node-id (get-in values [value-id :leaves 0 :node])]
+                        [sym (case (get-in nodes [node-id :role])
+                               :internal :scratch
+                               (get-in nodes [node-id :role]))]))
+                    (:bindings instance)))
+         (:roles instance)))
+
+      (program-link-instance? instance)
+      (let [{:keys [call roles]} (validate-program-instance! instance)]
+        (merge
+         (into {}
+               (map (fn [[compiler-value value-id]]
+                      (let [node-id (get-in values [value-id :leaves 0 :node])]
+                        [compiler-value
+                         (case (get-in nodes [node-id :role])
                            :internal :scratch
                            (get-in nodes [node-id :role]))]))
-                (:bindings instance)))
-     (:roles instance))))
+                    (:buffers call)))
+         roles))
+
+      :else
+      (throw (ex-info "instance-roles requires a recognized LinkPlan instance"
+                      {:reason :link-instance-type :instance instance
+                       :actual (type instance)})))))

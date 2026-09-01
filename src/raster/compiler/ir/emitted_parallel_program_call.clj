@@ -307,6 +307,51 @@
          (update :scratch #(remap-buffer-map remap %))
          (update :outputs #(remap-buffer-map remap %))))))
 
+(defn buffer-bindings
+  "Return every compiler-value/storage pair referenced by an emitted call boundary.
+
+   A zero-trip structured loop can retain a dead carry-output token that is intentionally absent
+   from the call's effective top-level `:buffers`. It is still part of the nested call structure
+   and must therefore participate in total storage-identity projections. Graph-owned temporaries
+   are not call-boundary storage and are excluded."
+  [call]
+  (let [call (validate! call)
+        buffer-result? (fn [id] (seq (get-in call [:program :values id :shape])))
+        output-bindings (fn [outputs]
+                          (keep (fn [[id value]] (when (buffer-result? id) [id value])) outputs))
+        step-bindings
+        (fn [step]
+          (cond
+            (evaluated-host-equation? step)
+            (concat (keep (fn [[id value]] (when (buffer-result? id) [id value]))
+                          (:operands step))
+                    (output-bindings (:outputs step)))
+
+            (emitted-equation-call? step)
+            (concat (:buffers step) (output-bindings (:outputs step)))
+
+            (loop-call/structured-loop-call? step)
+            (let [invariants (get-in step [:buffers :invariants])
+                  carries (get-in step [:buffers :carries])]
+              (concat invariants
+                      (mapcat (fn [{:keys [initial-id output-id initial output alternate]}]
+                                (cond-> [[initial-id initial] [output-id output]]
+                                  (some? alternate) (conj [output-id alternate])))
+                              carries)
+                      (:scratch step)
+                      (:outputs step)))
+
+            :else []))]
+    (vec (distinct (concat (:buffers call)
+                           (:loop-scratch call)
+                           (output-bindings (:outputs call))
+                           (mapcat step-bindings (:steps call)))))))
+
+(defn buffer-identities
+  "Return every distinct external/resident storage token referenced by an emitted call."
+  [call]
+  (vec (distinct (map second (buffer-bindings call)))))
+
 (defn map-buffers
   "Map every external/resident buffer token in an emitted program call exactly once.
 
@@ -320,8 +365,7 @@
       (fail! :emitted-program-buffer-mapper
              "emitted program buffer remapping requires a callable projection"
              {:mapper f}))
-    (let [source-buffers (vec (distinct (concat (vals (:buffers call))
-                                                (vals (:loop-scratch call)))))
+    (let [source-buffers (buffer-identities call)
           target-buffers (mapv f source-buffers)]
       (when-let [source (some (fn [[source target]] (when (nil? target) source))
                               (map vector source-buffers target-buffers))]
