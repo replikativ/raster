@@ -365,12 +365,20 @@
     (is (= '[y z] (-> hardware-guided :program :equations first :results)))
     (is (= '[y z] (get-in hardware-guided [:program :outputs])))))
 
-(deftest effectful-host-binding-keeps-the-compatibility-route
+(deftest effectful-host-binding-reports-why-it-keeps-the-compatibility-route
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        side (println y)
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
-                      z)]
-    (is (nil? (route/attempt source :float)))))
+                      z)
+        result (route/attempt source :float)]
+    (is (nil? (:program result)))
+    (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
+    (is (= [{:id 1
+             :binding 'side
+             :kind :scalar
+             :operation 'println
+             :reason :uncertified-host-scalar}]
+           (get-in result [:declined :bindings])))))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)

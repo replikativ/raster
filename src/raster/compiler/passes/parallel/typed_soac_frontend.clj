@@ -753,42 +753,74 @@
                   (:outputs %) #{})
                descriptions)))
 
+(defn- supported-description?
+  [physical-outputs description]
+  (case (:kind description)
+    :scalar (or (provably-pure-scalar? (:expr description))
+                (generated-scaffolding? description physical-outputs))
+    :map (or (:pure? description)
+             (and (seq (:result-storage description))
+                  (every? (comp symbol? :destination) (:result-storage description))))
+    :scatter (and (seq (:result-storage description))
+                  (or (= :unique (:conflict description))
+                      (dialect/reducing-scatter-conflict? (:conflict description)))
+                  (every? (comp symbol? :destination) (:result-storage description)))
+    :stencil (and (= 1 (count (:result-storage description)))
+                  (symbol? (get-in description [:result-storage 0 :destination])))
+    :reduce true
+    :segmented-reduce (and (seq (:segment-axes description))
+                           (symbol? (get-in description [:result-storage 0 :destination])))
+    :product-reduce (and (seq (:segment-axes description))
+                         (seq (:result-components description))
+                         (every? (comp symbol? :destination) (:result-storage description)))
+    :segmented-fold-map
+    (and (seq (:segment-axes description)) (seq (:folds description))
+         (every? (comp symbol? :destination) (:result-storage description)))
+    :scan (and (= 1 (count (:result-storage description)))
+               (= (:primary-out description)
+                  (get-in description [:result-storage 0 :destination])))
+    false))
+
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (physical-output-symbols descriptions)]
-    (every? (fn [description]
-              (case (:kind description)
-                :scalar (or (provably-pure-scalar? (:expr description))
-                            (generated-scaffolding? description physical-outputs))
-                :map (or (:pure? description)
-                         (and (seq (:result-storage description))
-                              (every? (comp symbol? :destination)
-                                      (:result-storage description))))
-                :scatter (and (seq (:result-storage description))
-                              (or (= :unique (:conflict description))
-                                  (dialect/reducing-scatter-conflict?
-                                   (:conflict description)))
-                              (every? (comp symbol? :destination)
-                                      (:result-storage description)))
-                :stencil (and (= 1 (count (:result-storage description)))
-                              (symbol? (get-in description
-                                               [:result-storage 0 :destination])))
-                :reduce true
-                :segmented-reduce (and (seq (:segment-axes description))
-                                       (symbol? (get-in description [:result-storage 0 :destination])))
-                :product-reduce (and (seq (:segment-axes description))
-                                     (seq (:result-components description))
-                                     (every? (comp symbol? :destination)
-                                             (:result-storage description)))
-                :segmented-fold-map
-                (and (seq (:segment-axes description)) (seq (:folds description))
-                     (every? (comp symbol? :destination)
-                             (:result-storage description)))
-                :scan (and (= 1 (count (:result-storage description)))
-                           (= (:primary-out description)
-                              (get-in description [:result-storage 0 :destination])))
-                false))
-            descriptions)))
+    (every? #(supported-description? physical-outputs %) descriptions)))
+
+(defn coverage-decline
+  "Describe the exact source bindings that prevent admission to the closed TypedSOAC subset.
+
+   This is diagnostic evidence only: it uses the same descriptions and admission predicate as
+   form->program, so reporting cannot become a second legality implementation."
+  [source {:keys [dtype values shape-equalities]
+           :or {dtype :double values {} shape-equalities {}}}]
+  (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+    (let [[_ bindings] source
+          pairs (vec (partition 2 bindings))
+          descriptions (normalize-extents (source-descriptions pairs dtype)
+                                          shape-equalities values)
+          physical-outputs (physical-output-symbols descriptions)
+          declined (remove #(supported-description? physical-outputs %) descriptions)
+          parallel? (some #(not= :scalar (:kind %)) descriptions)]
+      (when (and parallel? (seq declined))
+        {:reason :typed-soac-source-coverage
+         :bindings
+         (mapv (fn [{:keys [id sym kind expr]}]
+                 {:id id
+                  :binding sym
+                  :kind kind
+                  :operation (when (seq? expr) (descriptor/semantic-op expr))
+                  :reason (case kind
+                            :unsupported :unsupported-parallel-operation
+                            :scalar :uncertified-host-scalar
+                            :map :unverified-map-effects
+                            :scatter :unverified-scatter-conflict
+                            :stencil :unverified-stencil-storage
+                            :segmented-reduce :unverified-segmented-reduction
+                            :product-reduce :unverified-product-reduction
+                            :segmented-fold-map :unverified-segmented-fold-map
+                            :scan :unverified-scan-storage
+                            :unverified-operation-contract)})
+               declined)}))))
 
 (defn- element-symbols [n] (mapv #(symbol (str "%element" %)) (range n)))
 (defn- capture-symbols [n] (mapv #(symbol (str "%capture" %)) (range n)))
