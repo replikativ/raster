@@ -5,6 +5,8 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-route :as route]))
 
 (defn- loop-decomposition
@@ -43,7 +45,7 @@
     (is (= '[steps n u] (:inputs typed)))
     (is (= '[u-final] (:outputs typed)))
     (is (= (:algorithm typed-equation) (:algorithm scheduled-equation)))
-    (is (= :structured-control-schedule (:dialect scheduled)))
+    (is (= :scheduled-parallel (:dialect scheduled)))
     (is (schedule/scheduled-loop? (first (:operations scheduled-equation))))
     (testing "the scheduled equation retains the certified one-iteration graph"
       (is (= :kernel-graph
@@ -63,3 +65,96 @@
         typed (route/program-envelope (assoc decomposition :loop loop))]
     (is (= '[n u] (:inputs typed)))
     (is (= '[n u] (:operands (first (:equations typed)))))))
+
+(defn- mixed-source
+  []
+  '(let* [n (int (clojure.core/alength u0))
+          u (clojure.core/aclone u0)
+          scratch (clojure.core/double-array n)
+          time-loop
+          (dotimes [step steps]
+            (raster.par/map! scratch i n double
+                             (+ (clojure.core/aget u i) 1.0))
+            (let* [next (raster.par/pmap j n double
+                                         (+ (clojure.core/aget u j)
+                                            (clojure.core/aget scratch j)
+                                            (* 0.0 step)))]
+                  (java.lang.System/arraycopy next 0 u 0 n)))
+          after (raster.par/pmap k n double
+                                 (* 2.0 (clojure.core/aget u k)))]
+         after))
+
+(defn- source-with-suffix
+  [suffix-bindings result]
+  (let [[_ bindings] (mixed-source)]
+    (list 'let* (vec (concat (take 8 bindings) suffix-bindings)) result)))
+
+(defn- reason-of
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch clojure.lang.ExceptionInfo exception
+      (:reason (ex-data exception)))))
+
+(deftest loop-output-feeds-an-ordinary-typed-suffix
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        decomposition (frontend/form->structured-loop (mixed-source) options)
+        typed (route/program-envelope decomposition options)
+        scheduled (route/schedule-program typed {:target-device :cpu:0 :dtype :double})
+        [loop-equation suffix-equation] (:equations typed)
+        [scheduled-loop scheduled-suffix] (:equations scheduled)
+        loop-output (first (:results loop-equation))]
+    (is (= 2 (count (:equations typed))))
+    (is (= [loop-output 'n] (:operands suffix-equation)))
+    (is (= '[after] (:outputs typed)))
+    (is (= '[steps n u] (:inputs typed)))
+    (is (= true (get-in typed [:attributes :mixed-algorithms])))
+    (is (schedule/scheduled-loop? (first (:operations scheduled-loop))))
+    (is (segop/segop-node? (first (:operations scheduled-suffix))))
+    (is (not-any? #{'u} (:operands suffix-equation)))))
+
+(deftest mixed-routing-never-drops-an-unsupported-suffix
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        source (source-with-suffix
+                '[unsupported (java.lang.System/gc)]
+                'unsupported)
+        decomposition (frontend/form->structured-loop source options)]
+    (is (= :structured-control-unsupported-suffix
+           (reason-of #(route/program-envelope decomposition options))))))
+
+(deftest suffix-shadowing-is-rejected-instead-of-breaking-program-ssa
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        source (source-with-suffix
+                '[u (raster.par/pmap k n double
+                                     (* 2.0 (clojure.core/aget u k)))]
+                'u)
+        decomposition (frontend/form->structured-loop source options)]
+    (is (= :structured-control-use-before-definition
+           (reason-of #(route/program-envelope decomposition options))))))
+
+(deftest algorithm-kind-and-operation-kind-must-remain-paired
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        decomposition (frontend/form->structured-loop (mixed-source) options)
+        typed (route/program-envelope decomposition options)
+        suffix-operation (get-in typed [:equations 1 :operations 0])
+        malformed (assoc-in typed [:equations 0 :operations] [suffix-operation])]
+    (is (= :parallel-program-algorithm
+           (reason-of #(route/schedule-program malformed
+                                               {:target-device :cpu:0 :dtype :double}))))))
