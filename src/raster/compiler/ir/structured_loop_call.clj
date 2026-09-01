@@ -4,8 +4,8 @@
    The call owns no driver handles. It maps outer values to the emitted graph boundary and plans
    double-buffered carry rotation. A runtime may bind/replay each returned iteration through its
    ordinary KernelGraph machinery."
-  (:require [raster.compiler.ir.kernel-artifact :as artifact]
-            [raster.compiler.core.dtype :as dtype]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
@@ -114,21 +114,8 @@
          buffers :buffers scalars :scalars scratch :scratch outputs :outputs attributes :attributes}
         call
         scheduled (schedule/validate! scheduled)
-        emitted (graph/validate! emitted)]
-    (when-not (every? (comp artifact/kernel-artifact? :operation) (:nodes emitted))
-      (fail! :structured-loop-emitted-graph
-             "structured loop call requires a fully emitted KernelGraph" {}))
-    (when-not (and (graph/dataflow-equivalent? (:graph scheduled) emitted)
-                   (every? true?
-                           (map (fn [scheduled-node emitted-node]
-                                  (= (:operation scheduled-node)
-                                     (get-in emitted-node
-                                             [:operation :provenance
-                                              :scheduled-operation])))
-                                (:nodes (:graph scheduled)) (:nodes emitted))))
-      (fail! :structured-loop-emitted-graph
-             "emitted graph dataflow or operation certificates differ from the scheduled iteration"
-             {}))
+        emitted (graph/validate! emitted)
+        _ (emitted-loop/make scheduled emitted)]
     (when-not (and (integer? trip-count) (not (neg? trip-count)))
       (fail! :structured-loop-trip-count "resolved trip count must be non-negative"
              {:trip-count trip-count}))
