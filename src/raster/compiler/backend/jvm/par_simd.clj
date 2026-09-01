@@ -17,7 +17,8 @@
 
   Size guard: skip SIMD for statically-known n < 8 (overhead > benefit).
   For dynamic sizes, emit both paths with runtime branch on n."
-  (:require [raster.compiler.core.op-descriptor :as descriptor]
+  (:require [raster.compiler.core.macroexpand :as macroexpand]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.ir.soac]
@@ -518,6 +519,15 @@
                           (par/expand-par-gather! form))))
                   (do (swap! stats update :fallback inc)
                       (par/expand-par-gather! form))))
+
+              ;; Correctness boundary for a parallel primitive without a JVM SIMD schedule.
+              ;; In particular, a typed segmented contraction projects back to par/contract for
+              ;; host execution. Generic sequence recursion would leave its free/contract axis
+              ;; binders as unresolved bytecode symbols. Expand through raster.par's canonical
+              ;; sequential semantics and retain the counted schedule debt instead.
+              (par/par-form? form)
+              (do (swap! stats update :fallback inc)
+                  (macroexpand/macroexpand-all-preserving form))
 
               ;; let/let* — check for fusable consecutive maps
               (and (seq? form) (contains? #{'let 'let*} (first form)))

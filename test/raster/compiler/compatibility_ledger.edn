@@ -3,10 +3,12 @@
  "Exact fast-lane compiler signatures for representative ML and scientific workloads. Improvements update this debt downward; unexpected route, fallback, or emitter drift fails CI. Large numerical/performance comparisons live in the cold benchmark lane."
  :workloads
  {:dense-relu-jvm
+  ;; One unsupported JVM par primitive is now expanded through the canonical
+  ;; correctness path and counted instead of leaking through the backend.
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true :declines {}}
    :fusion {:vertical 1 :horizontal 0 :iterations 2 :placements 0}
    :lowering {:segops 2 :kernel-graphs 0 :typed-reused 2 :typed-scalar-equations 4
-              :backend-reused 2 :backend-relowered 2 :fallback 2}
+              :backend-reused 2 :backend-relowered 2 :fallback 3}
    :emission {:kernel-count 0 :targets [] :strategies [] :fallback-reasons [] :declines {}}}
 
   :symbolic-dense-contraction-gpu
