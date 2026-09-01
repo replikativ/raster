@@ -402,9 +402,9 @@
 
 (def cast-ops
   "Primitive cast symbols and their result types."
-  {'long 'long, 'int 'int, 'double 'double, 'float 'float
+  {'long 'long, 'int 'int, 'byte 'byte, 'double 'double, 'float 'float
    'clojure.core/long 'long, 'clojure.core/int 'int
-   'clojure.core/double 'double, 'clojure.core/float 'float})
+   'clojure.core/byte 'byte, 'clojure.core/double 'double, 'clojure.core/float 'float})
 
 (defn cast-op?
   "True if sym is a primitive cast operation."

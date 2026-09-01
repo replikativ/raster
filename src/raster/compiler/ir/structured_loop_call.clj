@@ -5,6 +5,7 @@
    double-buffered carry rotation. A runtime may bind/replay each returned iteration through its
    ordinary KernelGraph machinery."
   (:require [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
@@ -26,6 +27,10 @@
 (defn- typed-scalar?
   [value]
   (and (map? value) (keyword? (:type value)) (contains? value :value)))
+
+(defn- same-dtype?
+  [left right]
+  (= (dtype/canon left) (dtype/canon right)))
 
 (defn- external-buffer-ids
   [emitted]
@@ -57,6 +62,12 @@
                        (fail! :structured-loop-trip-count
                               "symbolic loop trip count requires a typed scalar"
                               {:value trip-count :scalar value}))
+                     (let [expected (get-in (control/outer-values algorithm)
+                                            [trip-count :dtype])]
+                       (when-not (same-dtype? expected (:type value))
+                         (fail! :structured-loop-trip-count-type
+                                "symbolic trip-count binding differs from its retained dtype"
+                                {:value trip-count :expected expected :actual (:type value)})))
                      (:value value)))]
     (when-not (and (integer? resolved) (not (neg? resolved)))
       (fail! :structured-loop-trip-count "loop trip count must resolve non-negative"
@@ -64,7 +75,7 @@
     (long resolved)))
 
 (defn- scalar-binding
-  [slots id value]
+  [slots id expected-dtype value]
   (let [slot (get slots id)]
     (when-not slot
       (fail! :structured-loop-scalar-interface
@@ -72,10 +83,12 @@
     (when-not (typed-scalar? value)
       (fail! :structured-loop-scalar "structured loop requires an explicitly typed scalar"
              {:value id :scalar value}))
-    (when-not (= (:kernel-dtype slot) (:type value))
+    (when-not (and (same-dtype? expected-dtype (:kernel-dtype slot))
+                   (same-dtype? expected-dtype (:type value)))
       (fail! :structured-loop-scalar-type
-             "structured loop scalar type differs from the emitted graph ABI"
-             {:value id :expected (:kernel-dtype slot) :actual (:type value)}))
+             "structured loop scalar, retained AbstractValue, and emitted ABI dtypes differ"
+             {:value id :expected expected-dtype
+              :emitted (:kernel-dtype slot) :actual (:type value)}))
     value))
 
 (defn- require-buffer!
@@ -131,6 +144,7 @@
         emitted (graph/validate! emitted)
         graph-buffers (external-buffer-ids emitted)
         slots (scalar-slots emitted)
+        inner-values (:values (soac/facts (control/body algorithm)))
         trip-count (resolve-trip-count algorithm scalars)
         iteration (first (control/loop-index algorithm))
         invariant-buffer-bindings
@@ -143,7 +157,9 @@
         (into {}
               (keep (fn [{:keys [outer parameter]}]
                       (when (contains? slots parameter)
-                        [parameter (scalar-binding slots parameter (get scalars outer))])))
+                        [parameter (scalar-binding slots parameter
+                                                   (get-in inner-values [parameter :dtype])
+                                                   (get scalars outer))])))
               (control/invariants algorithm))
         result-storage (physical-results algorithm)
         carry-plans
@@ -183,6 +199,14 @@
                    :alternate alternate :in-place? in-place?}))
               (control/carried algorithm))
         iteration-slot (get slots iteration)
+        _ (when (and iteration-slot
+                     (not (same-dtype? (get-in inner-values [iteration :dtype])
+                                       (:kernel-dtype iteration-slot))))
+            (fail! :structured-loop-index-type
+                   "emitted induction ABI differs from its retained AbstractValue dtype"
+                   {:iteration iteration
+                    :expected (get-in inner-values [iteration :dtype])
+                    :emitted (:kernel-dtype iteration-slot)}))
         _ (doseq [scalar-id (keys slots)]
             (when-not (or (= scalar-id iteration)
                           (contains? invariant-scalar-bindings scalar-id))

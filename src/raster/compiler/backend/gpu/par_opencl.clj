@@ -116,13 +116,9 @@
                                                      fields)))
                                             soa-arr-params))
         ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
-        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
-        scalar-dtype (fn [s]
-                       (case (scl-type s)
-                         "int" :int
-                         "long" :long
-                         "double" :double
-                         "float" :float))
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
+        scl-type #(get codegen/opencl-type-map (scalar-dtype %) default-ctype)
+        scalar-var-types (into {} (map (juxt identity scl-type)) scl-params)
         element-dtype (fn [tag]
                         (case tag
                           double :double
@@ -182,9 +178,11 @@
         ;; (e.g. `features`, `rows`), so index arithmetic like `(* idx features)` infers an
         ;; integer C type for the offset local rather than defaulting to the float scalar-type
         ;; (which yields non-integer array subscripts in per-row kernels with inner loops).
-        int-scalar-syms (into #{idx} (filter #(= "int" (scl-type %)) scl-params))
+        int-scalar-syms (into #{idx} (filter #(contains? #{:int :long :byte}
+                                                         (scalar-dtype %)) scl-params))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* default-ctype
+                           ce/*scalar-var-types* scalar-var-types
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         ;; Affine-index vectorization (shared c_emit): float4/float2 grid-stride loop
@@ -192,6 +190,7 @@
         ;; provably vectorizable ⇒ scalar loop below.
         loop-region (binding [ce/*emit-config* ce/opencl-config
                               ce/*scalar-type* default-ctype
+                              ce/*scalar-var-types* scalar-var-types
                               ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                       (ce/emit-vectorized-elementwise-loop
                        adapted-body idx all-arr-syms "idx" body-str {:n-bound "_n_bound"}))
