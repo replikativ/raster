@@ -140,7 +140,7 @@
                    outputs)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
-              [(body/->KernelParameter '_n_bound :scalar :long [] nil nil :bound)]))]
+              [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
     {:kernel-body
      (body/make
       {:id [:segmap (:id segmap) :portable-one-item]
@@ -155,7 +155,9 @@
                                     (body/expression :mul group-index workgroup-size)
                                     local-index)
                    :long :exact))]
-       :masks [(body/->Mask :map-active [(body/predicate :lt index '_n_bound)])]
+       :masks [(body/->Mask
+                :map-active
+                [(body/predicate :lt index (body/index-cast '_n_bound :long :exact))])]
        :operations scalar-operations
        :schedule {:strategy :one-work-item-per-element :association :independent
                   :workgroup-size workgroup-size}
