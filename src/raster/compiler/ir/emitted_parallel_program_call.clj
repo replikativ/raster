@@ -316,15 +316,13 @@
    are not call-boundary storage and are excluded."
   [call]
   (let [call (validate! call)
-        buffer-result? (fn [id] (seq (get-in call [:program :values id :shape])))
         output-bindings (fn [outputs]
-                          (keep (fn [[id value]] (when (buffer-result? id) [id value])) outputs))
+                          (remove (comp typed-scalar? second) outputs))
         step-bindings
         (fn [step]
           (cond
             (evaluated-host-equation? step)
-            (concat (keep (fn [[id value]] (when (buffer-result? id) [id value]))
-                          (:operands step))
+            (concat (remove (comp typed-scalar? second) (:operands step))
                     (output-bindings (:outputs step)))
 
             (emitted-equation-call? step)
@@ -382,14 +380,13 @@
                      (fail! :emitted-program-buffer-remap-untracked
                             "nested emitted call references storage outside the program binding"
                             {:buffer %}))
-            buffer-result? (fn [id] (seq (get-in call [:program :values id :shape])))
             remap-host-step
             (fn [step]
               (update step :operands
                       (fn [operands]
                         (into (empty operands)
                               (map (fn [[id value]]
-                                     [id (if (buffer-result? id) (remap value) value)]))
+                                     [id (if (typed-scalar? value) value (remap value))]))
                               operands))))
             remap-step
             (fn [step]
@@ -409,7 +406,7 @@
                         (fn [outputs]
                           (into (empty outputs)
                                 (map (fn [[id value]]
-                                       [id (if (buffer-result? id) (remap value) value)]))
+                                       [id (if (typed-scalar? value) value (remap value))]))
                                 outputs))))]
         (validate! remapped)))))
 

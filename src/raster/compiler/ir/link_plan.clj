@@ -845,7 +845,7 @@
       (program-value-node! nodes values id compiler-value value-id))))
 
 (defn- program-graph-fact
-  [nodes values instance-id step-id phase graph buffers]
+  [nodes values instance-id step-id phase graph buffers scalar-values]
   (let [graph (kgraph/validate! graph)
         external
         (vals
@@ -855,18 +855,26 @@
     {:instance instance-id :step step-id :phase phase
      :facts
      (mapv
-      (fn [{:keys [id dtype role]}]
+      (fn [{:keys [id dtype role elements]}]
         (let [value-id (get buffers id ::missing)]
           (when (= ::missing value-id)
             (throw (ex-info "emitted graph buffer has no linked program binding"
                             {:reason :program-link-graph-buffer :instance instance-id
                              :step step-id :buffer id})))
-          (let [node (program-value-node! nodes values instance-id id value-id)]
+          (let [node (program-value-node! nodes values instance-id id value-id)
+                expected-elements (when (some? elements)
+                                    (kgcall/resolve-integer scalar-values elements))
+                capacity (shape-elements (get-in node [:view :shape]))]
             (when-not (= (dtype/canon dtype) (dtype/canon (get-in node [:view :dtype])))
               (throw (ex-info "emitted graph buffer dtype differs from its linked node"
                               {:reason :program-link-graph-dtype :instance instance-id
                                :step step-id :buffer id :value value-id
                                :expected dtype :actual (get-in node [:view :dtype])})))
+            (when (and expected-elements (> (long expected-elements) (long capacity)))
+              (throw (ex-info "emitted graph extent exceeds its linked node view"
+                              {:reason :program-link-graph-range :instance instance-id
+                               :step step-id :buffer id :value value-id
+                               :expected expected-elements :capacity capacity})))
             {:symbol id :node (:id node)
              :access (case role
                        :input :read
@@ -886,13 +894,14 @@
           (program-call/emitted-equation-call? step)
           [(program-graph-fact nodes values id step-index
                                (get-in step [:equation :id])
-                               (:graph step) (:buffers step))]
+                               (:graph step) (:buffers step) (:scalar-values step))]
           (loop-call/structured-loop-call? step)
           (mapv (fn [iteration]
-                  (let [{:keys [buffers]} (loop-call/iteration-binding step iteration)]
+                  (let [{:keys [buffers scalar-values]}
+                        (loop-call/iteration-binding step iteration)]
                     (program-graph-fact nodes values id [step-index iteration]
                                         :structured-loop-iteration
-                                        (:graph step) buffers)))
+                                        (:graph step) buffers scalar-values)))
                 (range (min 3 (:trip-count step))))))
       (map-indexed vector (:steps call))))))
 

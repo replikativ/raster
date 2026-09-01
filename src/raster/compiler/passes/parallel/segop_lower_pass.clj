@@ -256,6 +256,17 @@
                          (= (:operands equation) (:inputs (soac-dialect/facts algorithm)))
                          (= (:results equation) (soac-dialect/outputs algorithm))))})))
 
+(defn- equation-physical-results
+  [algorithm]
+  (let [facts (soac-dialect/facts algorithm)
+        producers
+        (into {}
+              (mapcat (fn [equation]
+                        (map vector (nth equation 2)
+                             (soac-dialect/physical-results facts equation))))
+              (soac-dialect/equations algorithm))]
+    (mapv producers (soac-dialect/outputs algorithm))))
+
 (defn segop-lower-pass
   "Pipeline pass: convert par forms in let* bindings to SegOp records.
 
@@ -273,44 +284,56 @@
   (if (and (program/parallel-program? form) (= :typed-soac (:dialect form)))
     (let [device-id (or (:target-device opts) :cpu:0)
           dtype (or (:dtype opts) :double)
+          ;; The TypedSOAC program remains purely functional, while `:result-storage` gives every
+          ;; equation result its physical identity. Scheduling later equations must consume that
+          ;; identity—not reintroduce the logical result as a second external graph buffer.
           equations
-          (mapv
-           (fn [equation]
-             (let [algorithm (:algorithm equation)
-                   kind (soac-dialect/operation-kind
-                         (first (soac-dialect/equations algorithm)))
-                   lowered (case kind
-                             scalar {:operations []}
-                             map {:operations (soac-lower/lower-typed-map
-                                               algorithm device-id :dtype dtype)}
-                             scatter {:operations (soac-lower/lower-typed-scatter
-                                                   algorithm device-id :dtype dtype)}
-                             stencil {:operations (soac-lower/lower-typed-stencil
-                                                   algorithm device-id :dtype dtype)}
-                             reduce {:operations (soac-lower/lower-typed-reduce
-                                                  algorithm device-id :dtype dtype)}
-                             segmented-reduce
-                             {:operations (soac-lower/lower-typed-segmented-reduce
-                                           algorithm device-id :dtype dtype)}
-                             product-reduce
-                             {:operations (soac-lower/lower-typed-product-reduce
-                                           algorithm device-id :dtype dtype)}
-                             segmented-fold-map
-                             {:operations (soac-lower/lower-typed-segmented-fold-map
-                                           algorithm device-id :dtype dtype)}
-                             scan (soac-lower/lower-typed-scan
-                                   algorithm device-id :dtype dtype
-                                   :array-types (:array-types opts)))
-                   operations (:operations lowered)]
-               (-> equation
-                   (assoc :operations operations)
-                   (update :provenance assoc :target-dialect :segop)
-                   (update :attributes assoc :device device-id)
-                   (cond-> (:kernel-graph lowered)
-                     (update :attributes assoc :kernel-graph (:kernel-graph lowered)))
-                   (cond-> (= 'scalar kind)
-                     (update :attributes assoc :host-only true)))))
-           (:equations form))
+          (:equations
+           (reduce
+            (fn [{:keys [physical] :as state} equation]
+              (let [algorithm (:algorithm equation)
+                    scheduling-algorithm (soac-dialect/remap-values algorithm physical)
+                    kind (soac-dialect/operation-kind
+                          (first (soac-dialect/equations scheduling-algorithm)))
+                    lowered (case kind
+                              scalar {:operations []}
+                              map {:operations (soac-lower/lower-typed-map
+                                                scheduling-algorithm device-id :dtype dtype)}
+                              scatter {:operations (soac-lower/lower-typed-scatter
+                                                    scheduling-algorithm device-id :dtype dtype)}
+                              stencil {:operations (soac-lower/lower-typed-stencil
+                                                    scheduling-algorithm device-id :dtype dtype)}
+                              reduce {:operations (soac-lower/lower-typed-reduce
+                                                   scheduling-algorithm device-id :dtype dtype)}
+                              segmented-reduce
+                              {:operations (soac-lower/lower-typed-segmented-reduce
+                                            scheduling-algorithm device-id :dtype dtype)}
+                              product-reduce
+                              {:operations (soac-lower/lower-typed-product-reduce
+                                            scheduling-algorithm device-id :dtype dtype)}
+                              segmented-fold-map
+                              {:operations (soac-lower/lower-typed-segmented-fold-map
+                                            scheduling-algorithm device-id :dtype dtype)}
+                              scan (soac-lower/lower-typed-scan
+                                    scheduling-algorithm device-id :dtype dtype
+                                    :array-types (:array-types opts)))
+                    operations (:operations lowered)
+                    scheduled-equation
+                    (-> equation
+                        (assoc :operations operations)
+                        (update :provenance assoc :target-dialect :segop)
+                        (update :attributes assoc :device device-id)
+                        (cond-> (:kernel-graph lowered)
+                          (update :attributes assoc :kernel-graph (:kernel-graph lowered)))
+                        (cond-> (= 'scalar kind)
+                          (update :attributes assoc :host-only true)))
+                    result-storage (zipmap (:results equation)
+                                           (equation-physical-results algorithm))]
+                (-> state
+                    (update :equations conj scheduled-equation)
+                    (update :physical merge result-storage))))
+            {:physical {} :equations []}
+            (:equations form)))
           ;; A multi-phase schedule introduces physical SSA values that do not exist in the
           ;; functional algorithm. They still require explicit contracts; an emitter must never
           ;; infer their dtype or extent from a generated name.
