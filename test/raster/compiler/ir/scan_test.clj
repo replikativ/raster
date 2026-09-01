@@ -28,6 +28,16 @@
                (- (aget x i) (aget target i)))
            (:element facts)))))
 
+(deftest reassociation-certification-uses-the-central-effect-analysis
+  (let [facts (scan/certify-reassociation
+               {:acc 'acc :init 0.0
+                :lambda '(raster.numeric/+
+                          acc
+                          (raster.numeric/* (aget a i) (aget b i)))}
+               :half)]
+    (is (scan/associative-scan? facts))
+    (is (= 'raster.numeric/* (first (:element facts))))))
+
 (deftest general-recurrences-are-not-relabelled-parallel-scans
   (testing "an RNN recurrence is sequential unless it is explicitly lifted to an associative algebra"
     (try

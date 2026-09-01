@@ -5,8 +5,8 @@
    recurrence is not automatically a parallel scan: Blelloch/Hillis-Steele scheduling is sound
    only when the body is an associative combine of the prior accumulator and an accumulator-free
    element expression. This boundary proves that property before SegScan scheduling."
-  (:require [raster.ad.purity :as purity]
-            [raster.compiler.core.op-descriptor :as descriptor]
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]))
 
 (defrecord AssociativeScan [acc init combine element identity dtype])
@@ -54,13 +54,10 @@
 
 (defn- pure-element?
   [expr]
-  (cond
-    (seq? expr) (let [op (descriptor/semantic-op expr)]
-                  (and op
-                       (= :pure (purity/pure-op? op))
-                       (every? pure-element? (descriptor/call-args expr))))
-    (coll? expr) (every? pure-element? expr)
-    :else true))
+  ;; Effect analysis is deliberately centralized in the Beichte-backed scalar-effects
+  ;; boundary.  A second syntactic operator allow-list here would disagree with the
+  ;; canonical registry for valid Raster operations (for example raster.numeric/*).
+  (= :pure (effects/analyze-effect expr)))
 
 (defn- reason
   [operation suffix]
