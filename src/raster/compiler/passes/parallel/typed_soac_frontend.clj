@@ -528,7 +528,11 @@
            :scalars (set/union scalars epilogue-scalar-ids)
            :result-transform result-transform
            :effect-only? true :host-binding symbol
-           :result-storage [{:destination out :access :write :host-return :effect}]})))
+           ;; Contract is effectful at the source spelling because it writes `out`, but its
+           ;; TypedSOAC equation denotes the mathematical output tensor. A terminal reference to
+           ;; that physical destination therefore returns the logical value; generic map-void
+           ;; destinations remain `:effect` storage and retain host nil semantics.
+           :result-storage [{:destination out :access :write :host-return :buffer}]})))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
