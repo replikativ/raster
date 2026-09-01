@@ -524,10 +524,16 @@
               ;; In particular, a typed segmented contraction projects back to par/contract for
               ;; host execution. Generic sequence recursion would leave its free/contract axis
               ;; binders as unresolved bytecode symbols. Expand through raster.par's canonical
-              ;; sequential semantics and retain the counted schedule debt instead.
+              ;; sequential semantics and retain the counted schedule debt instead. Ordinary
+              ;; macroexpand is deliberately wrong here: it rewrites the walker's `.invk` nodes
+              ;; into interop forms before the bytecode backend consumes them.
               (par/par-form? form)
               (do (swap! stats update :fallback inc)
-                  (macroexpand/macroexpand-all-preserving form))
+                  (macroexpand/macroexpand-all-preserving
+                   form
+                   ;; Preserve the walker's devirtualized typed calls. Unlike macroexpand-core,
+                   ;; this intentionally expands raster.par macros at the correctness boundary.
+                   #(and (symbol? %) (.startsWith (name %) "."))))
 
               ;; let/let* — check for fusable consecutive maps
               (and (seq? form) (contains? #{'let 'let*} (first form)))

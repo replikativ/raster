@@ -269,7 +269,9 @@
    Typed equations own parallel/scalar computation, but a caller-owned physical destination may
    retain an ordinary allocation expression. That expression can depend on pure scalar bindings
    introduced by inlining (for example `size = m*n`). Preserve that dependency closure instead of
-   leaving an alpha-renamed callee parameter free in the reconstructed JVM/C host form."
+   leaving an alpha-renamed callee parameter free in the reconstructed JVM/C host form. `pairs`
+   contains only bindings without a realized typed equation, so dependency traversal stops at the
+   new semantic boundary instead of resurrecting a fused-away producer."
   [pairs roots]
   (let [definitions (into {} (map (fn [[symbol expression]] [symbol expression])) pairs)
         definition-symbols (set (keys definitions))]
@@ -298,7 +300,9 @@
               (:equations (dialect/facts program)))
         host-bindings
         (required-host-bindings
-         original-pairs
+         (keep-indexed (fn [id pair]
+                         (when (empty? (get by-placement id)) pair))
+                       original-pairs)
          (set/union physical-destinations
                     (into #{} (mapcat util/free-syms) body)))
         pairs
