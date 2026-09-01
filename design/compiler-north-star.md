@@ -605,7 +605,9 @@ rather than rediscovering a reduction from source spelling.
 Sequential control around a parallel algorithm is represented separately as the Pattern-declared
 `TypedStructuredControl` dialect. Its canonical loop is a typed fixpoint around one closed
 `TypedSOAC` body: it binds an integer induction value, ordered invariants, and ordered loop-carried
-scalars or tensors, and gives each final result a distinct outer SSA value. The body boundary,
+scalars or tensors, and gives each final result a distinct outer SSA value. The minimal body input
+boundary is an ordered subset of those declared binders, so an unused induction value or invariant
+does not require fake scalar work. The body boundary,
 effects, and `AbstractValue` contracts are checked modulo the explicit outer-to-inner alpha-renaming;
 zero iterations therefore retain the initial value contract without emitter inference. Values
 defined and consumed only inside the body are ordinary SSA scratch, not entries in another memory

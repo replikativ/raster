@@ -47,6 +47,7 @@
     (is (= '[steps n alpha u0] (control/outer-operands program)))
     (is (= '[u-final] (control/outer-results program)))
     (is (= '[iteration n-in alpha-in u-in] (control/body-inputs program)))
+    (is (= '[iteration n-in alpha-in u-in] (control/used-body-inputs program)))
     (is (= '[u-next] (control/body-results program)))
     (testing "zero trips retain the same typed initial/output contract"
       (let [zero-trip (assoc (vec program) 2 '[iteration 0])
@@ -67,6 +68,21 @@
           (is false "reordered body inputs must fail")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-loop-body-inputs (:reason (ex-data exception))))))))
+
+    (testing "declared binders may be unused by a minimal TypedSOAC boundary"
+      (let [body (control/body program)
+            equation (first (soac/equations body))
+            operation (nth equation 3)
+            operation (assoc (vec operation) 3 '[alpha-in])
+            operation (apply list operation)
+            lambda (soac/lambda-form '[u-value alpha-value] '[(+ u-value alpha-value)])
+            operation (apply list (assoc (vec operation) 4 lambda))
+            equation (apply list (assoc (vec equation) 3 operation))
+            facts (assoc (soac/facts body) :inputs '[n-in alpha-in u-in])
+            unused-iteration-body (soac/make facts [equation] (soac/outputs body))
+            unused-iteration (apply list (assoc (vec program) 5 unused-iteration-body))]
+        (is (= '[n-in alpha-in u-in] (control/used-body-inputs unused-iteration)))
+        (is (= unused-iteration (control/validate! unused-iteration outer-values)))))
 
     (testing "loop-carried values retain one AbstractValue contract"
       (let [bad-values (assoc outer-values 'u-final
