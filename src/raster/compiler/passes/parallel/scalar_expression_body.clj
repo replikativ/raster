@@ -121,6 +121,10 @@
               (let [expression (inline-lets expression)
                     expected (canon-type expected)]
                 (cond
+                  (instance? raster.compiler.ir.kernel_body.Literal expression)
+                  {:operations [] :result expression
+                   :type (canon-type (:type expression))}
+
                   (number? expression)
                   {:operations [] :result (body/literal expression expected) :type expected}
 

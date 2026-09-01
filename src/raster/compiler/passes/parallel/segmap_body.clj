@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
@@ -42,10 +43,43 @@
 
 (defn- scalar-forms
   [expression]
-  (let [expression (scalar-expression/inline-lets expression)]
-    (if (and (seq? expression) (= 'do (first expression)))
-      (vec (rest expression))
-      [expression])))
+  (if (and (seq? expression) (= 'do (first expression)))
+    (vec (rest expression))
+    [expression]))
+
+(defn- scalar-region
+  "Read typed local SSA directly from a scheduled SegMap.
+
+   Direct TypedSOAC lowering carries the authoritative local dtype beside each definition. The
+   source-shaped lambda remains only for compatibility-created SegMaps; its binder metadata is
+   projected once here and is never used to infer an arithmetic function or result type."
+  [segmap]
+  (if-let [{:keys [locals result] :as region} (:scalar-region segmap)]
+    (do
+      (when-not (and (vector? locals)
+                     (every? #(and (symbol? (:id %)) (:dtype %) (contains? % :init)) locals)
+                     (contains? region :result))
+        (decline! :typed-local-region
+                  "scheduled typed map carries a malformed scalar region"
+                  {:operation (:id segmap) :scalar-region region}))
+      {:locals locals :result result})
+    (let [expression (:lambda segmap)]
+      (if (and (seq? expression)
+               (contains? #{'let 'let* 'clojure.core/let} (first expression)))
+        (let [[_ bindings & body] expression]
+          (when-not (= 1 (count body))
+            (decline! :local-region-shape
+                      "map scalar local region requires one result expression"
+                      {:expression expression :body-count (count body)}))
+          {:locals
+           (mapv (fn [[id init]]
+                   {:id id
+                    :dtype (some-> (or (:raster.type/tag (meta id)) (:tag (meta id)))
+                                   dtype/dtype-for-scalar-tag dtype/canon)
+                    :init init})
+                 (partition 2 bindings))
+           :result (first body)})
+        {:locals [] :result expression}))))
 
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
@@ -66,7 +100,11 @@
         index (:name (first dimensions))
         bound (:bound (first dimensions))
         inputs (vec (sort-by name (:inputs segmap)))
-        outputs (vec (sort-by name (:outputs segmap)))
+        primary-output (:out-sym segmap)
+        outputs (if primary-output
+                  (vec (concat (sort-by name (disj (:outputs segmap) primary-output))
+                               [primary-output]))
+                  (vec (sort-by name (:outputs segmap))))
         scalars (vec (sort-by name (:scalars segmap)))
         _ (when (seq (set/intersection (set inputs) (set outputs)))
             (decline! :inout-storage
@@ -97,14 +135,32 @@
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate :map-active
                   :id-prefix "map" :decline! decline!})
-        forms (scalar-forms (:lambda segmap))
-        primary-output (:out-sym segmap)
+        {:keys [locals result]} (scalar-region segmap)
+        base-environment (assoc scalar-types index :long)
+        local-state
+        (reduce
+         (fn [{:keys [substitutions operations environment]}
+              {:keys [id init] local-dtype :dtype}]
+           (let [local-type (some-> local-dtype dtype/canon)
+                 _ (when-not local-type
+                     (decline! :local-dtype
+                               "map scalar local is missing its scheduled dtype"
+                               {:operation (:id segmap) :local id
+                                :scalar-region (:scalar-region segmap)}))
+                 init (util/subst-syms substitutions init)
+                 lowered ((:lower lowerer) init local-type environment)]
+             {:substitutions (assoc substitutions id (:result lowered))
+              :operations (into operations (:operations lowered))
+              :environment (assoc environment (:result lowered) (:type lowered))}))
+         {:substitutions {} :operations [] :environment base-environment}
+         locals)
+        forms (scalar-forms (util/subst-syms (:substitutions local-state) result))
         explicit-forms (if primary-output (pop forms) forms)
         primary-form (when primary-output (peek forms))
         _ (when (and primary-output (empty? forms))
             (decline! :missing-result "map result has no scalar expression"
                       {:operation (:id segmap) :output primary-output}))
-        environment (assoc scalar-types index :long)
+        environment (:environment local-state)
         lower-store
         (fn [form]
           (when-not (descriptor/aset-call? form)
@@ -126,7 +182,8 @@
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))
         scalar-operations
-        (vec (concat explicit-operations
+        (vec (concat (:operations local-state)
+                     explicit-operations
                      (:operations primary-lowered)
                      (when primary-output
                        [(body/->ScalarStore primary-output [index]

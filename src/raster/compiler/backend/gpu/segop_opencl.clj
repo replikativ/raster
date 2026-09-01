@@ -410,6 +410,7 @@
       :provenance {:dialect :kernel-body :source-dialect :segmap
                    :segop-id (:id segmap)}
       :attributes {:kernel-body kernel-body
+                   :emission-route :kernel-body
                    :array-params (vec (concat inputs outputs))
                    :scalar-params scalars
                    :dtype (:dtype segmap)
@@ -720,6 +721,37 @@
                    :kernel-body kernel-body
                    :emission-route :kernel-body
                    :target-dialect target-dialect}})))
+
+(defn generate-scheduled-segmap-kernel
+  "Emit one scheduled SegMap through the single KernelBody-first C-family boundary.
+
+   Portable targets never consume source-shaped OpenCL fallback code. OpenCL retains the verified
+   compatibility emitter for scalar regions and memory effects that KernelBody cannot represent
+   yet, with the structured decline attached to the artifact so the remaining debt is observable."
+  [operation & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
+                :or {kernel-name-prefix "segmap" scalar-types {} array-types {}
+                     target-dialect :opencl-intel}}]
+  (let [dtype (or (:dtype operation) dtype :double)
+        target (kernel-body-c-dialect/resolve! target-dialect)]
+    (try
+      (generate-segmap-kernel-body
+       operation :dtype dtype :scalar-types scalar-types :array-types array-types
+       :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
+      (catch clojure.lang.ExceptionInfo exception
+        (if (and (kernel-body-c-dialect/opencl? target)
+                 (segmap-body/declined? exception))
+          (-> (if (:out-sym operation)
+                (generate-segmap-kernel
+                 operation (:out-sym operation)
+                 :dtype dtype :scalar-types scalar-types :array-types array-types
+                 :kernel-name-prefix kernel-name-prefix)
+                (generate-explicit-segmap-kernel
+                 operation :dtype dtype :scalar-types scalar-types :array-types array-types
+                 :kernel-name-prefix (str kernel-name-prefix "_effect")))
+              (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+              (assoc-in [:attributes :kernel-body-decline]
+                        (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+          (throw exception))))))
 
 (defn generate-segred-kernel
   "Generate OpenCL C reduction kernels from a SegRed record.
@@ -1110,7 +1142,6 @@
   [graph {:keys [scalar-types array-types target-dialect]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
-        opencl? (kernel-body-c-dialect/opencl? target)
         array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
@@ -1119,29 +1150,11 @@
            (kart/certify-scheduled-operation
             (cond
               (instance? raster.compiler.ir.segop.SegMap operation)
-              (try
-                (generate-segmap-kernel-body
-                 operation :dtype (:dtype operation)
-                 :scalar-types scalar-types :array-types array-types
-                 :target-dialect target-dialect
-                 :kernel-name-prefix "graph_segmap")
-                (catch clojure.lang.ExceptionInfo exception
-                  (if (and opencl? (segmap-body/declined? exception))
-                    (-> (if (:out-sym operation)
-                          (generate-segmap-kernel
-                           operation (:out-sym operation)
-                           :dtype (:dtype operation)
-                           :scalar-types scalar-types :array-types array-types
-                           :kernel-name-prefix "graph_segmap")
-                          (generate-explicit-segmap-kernel
-                           operation :dtype (:dtype operation)
-                           :scalar-types scalar-types :array-types array-types
-                           :kernel-name-prefix "graph_segmap_effect"))
-                        (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
-                        (assoc-in [:attributes :kernel-body-decline]
-                                  (assoc (ex-data exception)
-                                         :fallback :verified-segmap-opencl)))
-                    (throw exception))))
+              (generate-scheduled-segmap-kernel
+               operation :dtype (:dtype operation)
+               :scalar-types scalar-types :array-types array-types
+               :target-dialect target-dialect
+               :kernel-name-prefix "graph_segmap")
 
               (instance? raster.compiler.ir.segop.SegStencil operation)
               (generate-segstencil-kernel-body

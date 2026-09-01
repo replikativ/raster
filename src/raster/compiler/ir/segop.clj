@@ -44,7 +44,9 @@
            [id          ;; int — from original SOAC id
             space       ;; SegSpace
             level       ;; SegLevel
-            lambda      ;; expr — kernel body S-expression
+            lambda      ;; expr — transitional source projection for compatibility emission
+            scalar-region ;; nil | {:locals [{:id :dtype :init} ...] :result expr}
+                          ;; Authoritative typed scalar SSA for direct TypedSOAC scheduling.
             inputs      ;; #{sym} — array symbols read
             outputs     ;; #{sym} — array symbols written
             scalars     ;; #{sym} — scalar parameters

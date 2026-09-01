@@ -19,6 +19,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -387,3 +388,24 @@
     (is (= [:float :float :int :int] (mapv :dtype (:abi k))))
     (is (re-find #"int offset" (:source k)))
     (is (= '[a out offset n] (:arguments k)))))
+
+(deftest scheduled-segmap-uses-one-observable-compatibility-boundary
+  (let [form '(raster.par/map! out i n float
+                               (clojure.core/aget a i))
+        operation (-> (soac/par-form->soac 'out form 2)
+                      (lower/lower-map nil :dtype :float)
+                      first)
+        artifact
+        (with-redefs [segmap-body/lower
+                      (fn [& _]
+                        (throw (ex-info "simulated portable coverage gap"
+                                        {:reason :segmap-kernel-body-declined
+                                         :missing-rule :simulated
+                                         :fallback :none})))]
+          (sg/generate-scheduled-segmap-kernel operation :dtype :float))]
+    (is (= :verified-segmap-opencl
+           (get-in artifact [:attributes :emission-route])))
+    (is (= :simulated
+           (get-in artifact [:attributes :kernel-body-decline :missing-rule])))
+    (is (= :verified-segmap-opencl
+           (get-in artifact [:attributes :kernel-body-decline :fallback])))))
