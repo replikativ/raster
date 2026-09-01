@@ -815,8 +815,10 @@ after submission, while download destinations become visible only after the
 host wait. Level Zero's current shared allocations complete their Panama copy
 inline and report host-monotonic timing explicitly rather than pretending that
 a device copy event exists. Logical compute and transfer queues initially map
-to one physical in-order OpenCL queue, preserving ordering until execution-plan
-lowering can express and realize cross-queue dependencies safely. Immediate-wait
+to distinct physical in-order OpenCL queues for explicit range submissions.
+Callers await a transfer event before the same buffer changes queue roles;
+unrelated immutable transfers may overlap compute. Automatic cross-queue wait
+edges for a mixed execution plan remain future lowering work. Immediate-wait
 measurements are the calibration path; `host-wall-ns` otherwise includes any
 intentional host work between submission and wait.
 

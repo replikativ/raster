@@ -247,7 +247,8 @@
          :platform nil       ;; MemorySegment (cl_platform_id)
          :device nil         ;; MemorySegment (cl_device_id)
          :context nil        ;; MemorySegment (cl_context)
-         :queue nil          ;; MemorySegment (cl_command_queue)
+         :queue nil          ;; compute cl_command_queue
+         :transfer-queue nil ;; independent transfer cl_command_queue
          :arena nil          ;; Arena for long-lived allocations
          :device-name nil
          :device-info nil
@@ -361,7 +362,8 @@
   "Initialize OpenCL runtime. Idempotent.
   Finds the first platform with a device of the requested type (default GPU;
   RASTER_OCL_DEVICE_TYPE=cpu|all selects CPU/any device — POCL, Intel CPU
-  runtime, vendor-portability testing), creates context and in-order queue."
+  runtime, vendor-portability testing), creates a context plus independent
+  in-order compute and transfer queues."
   []
   (when-not (:initialized? @state)
     (let [arena (Arena/ofShared)
@@ -413,16 +415,39 @@
                                                         (.allocateFrom arena PTR device)
                                                         MemorySegment/NULL MemorySegment/NULL err-seg]))
           _ (when (not= CL_SUCCESS (read-int err-seg))
+              (.close arena)
               (throw (ex-info "clCreateContext failed" {:error (read-int err-seg)})))
 
-          ;; One physical in-order queue initially realizes the backend-neutral compute and
-          ;; transfer queue classes. Profiling is enabled so transfer GPUEvents have device
-          ;; timestamps without introducing unsynchronized cross-queue execution.
+          ;; Compute and transfer are distinct physical in-order queues. Callers establish
+          ;; cross-queue dependencies by awaiting an event before the same buffer changes roles;
+          ;; unrelated immutable transfer and compute work may proceed independently.
           queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
                                       (into-array Object
                                                   [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))
           _ (when (not= CL_SUCCESS (read-int err-seg))
-              (throw (ex-info "clCreateCommandQueue failed" {:error (read-int err-seg)})))]
+              (try
+                (.invokeWithArguments ^MethodHandle @h-clReleaseContext
+                                      (into-array Object [ctx]))
+                (catch Exception _))
+              (.close arena)
+              (throw (ex-info "clCreateCommandQueue(compute) failed"
+                              {:error (read-int err-seg)})))
+          transfer-queue
+          (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                (into-array Object
+                                            [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))
+          _ (when (not= CL_SUCCESS (read-int err-seg))
+              (try
+                (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
+                                      (into-array Object [queue]))
+                (catch Exception _))
+              (try
+                (.invokeWithArguments ^MethodHandle @h-clReleaseContext
+                                      (into-array Object [ctx]))
+                (catch Exception _))
+              (.close arena)
+              (throw (ex-info "clCreateCommandQueue(transfer) failed"
+                              {:error (read-int err-seg)})))]
 
       (swap! state assoc
              :initialized? true
@@ -430,6 +455,7 @@
              :device device
              :context ctx
              :queue queue
+             :transfer-queue transfer-queue
              :arena arena
              :device-name dev-name
              :device-info device-info
@@ -1503,7 +1529,7 @@
     (cl-call! "clReleaseEvent" @h-clReleaseEvent [event])))
 
 (defn submit-range-batch!
-  "Submit a validated range batch on the profiling-enabled OpenCL queue without waiting.
+  "Submit a validated range batch on the independent OpenCL transfer queue without waiting.
 
    Every command owns a private native staging slice until the returned completion token is
    awaited and released. Upload sources are copied into immutable staging before return; download
@@ -1517,7 +1543,7 @@
        :completion {:timing-source :host-monotonic
                     :elapsed-ns 0 :bytes total-bytes :commands 0
                     :direction direction :asynchronous? false}}
-      (let [queue (:queue @state)
+      (let [queue (:transfer-queue @state)
             arena (Arena/ofShared)
             event-outs (.allocate arena (* 8 (count active)))
             status-out (.allocate arena I32)
@@ -1685,9 +1711,19 @@
         (release-event! event)))))
 
 (defn synchronize-async!
-  "Block until all enqueued work completes."
+  "Block until all compute and transfer work completes."
   []
-  (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
+  (let [{:keys [queue transfer-queue]} @state]
+    (cl-call! "clFinish" @h-clFinish [queue])
+    (cl-call! "clFinish" @h-clFinish [transfer-queue])))
+
+(defn transfer-capabilities
+  "Return the OpenCL runtime's physical transfer execution contract."
+  []
+  {:submission :device-event
+   :host-staging :runtime-owned-native
+   :independent-physical-queue? true
+   :queue-ordering :in-order})
 
 (defn reset-graph-events!
   "Discard the most recent OpenCL profiling sample and release its native events."
@@ -1768,8 +1804,13 @@
 (defn shutdown!
   "Shutdown OpenCL runtime, releasing all handles."
   []
-  (let [{:keys [queue context arena initialized?]} @state]
+  (let [{:keys [queue transfer-queue context arena initialized?]} @state]
     (when initialized?
+      (when transfer-queue
+        (let [ret (int (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
+                                             (into-array Object [transfer-queue])))]
+          (when-not (zero? ret)
+            (println (str "[ocl-runtime] WARNING: clReleaseCommandQueue(transfer) failed with error " ret)))))
       (when queue
         (let [ret (int (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
                                              (into-array Object [queue])))]
@@ -1784,7 +1825,8 @@
         (.close ^Arena arena))
       (clojure.core/reset! state
                            {:initialized? false :platform nil :device nil :context nil
-                            :queue nil :arena nil :device-name nil :device-info nil
+                            :queue nil :transfer-queue nil
+                            :arena nil :device-name nil :device-info nil
                             :unified-memory? false
                             :buffer-offset-alignment nil
                             :programs {} :kernels {}}))))
@@ -1797,7 +1839,8 @@
       (.close ^Arena arena)))
   (clojure.core/reset! state
                        {:initialized? false :platform nil :device nil :context nil
-                        :queue nil :arena nil :device-name nil :device-info nil
+                        :queue nil :transfer-queue nil
+                        :arena nil :device-name nil :device-info nil
                         :unified-memory? false
                         :buffer-offset-alignment nil
                         :programs {} :kernels {}})
