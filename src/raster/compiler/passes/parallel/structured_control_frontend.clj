@@ -330,6 +330,7 @@
                              :output carry-output}]
                            body outer-values)]
                       {:loop loop
+                       :source source
                        :loop-binding binder
                        :prefix-bindings prefix-pairs
                        :suffix-bindings suffix-pairs
