@@ -1110,6 +1110,7 @@
   [graph {:keys [scalar-types array-types target-dialect]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
+        opencl? (kernel-body-c-dialect/opencl? target)
         array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
@@ -1118,11 +1119,29 @@
            (kart/certify-scheduled-operation
             (cond
               (instance? raster.compiler.ir.segop.SegMap operation)
-              (generate-segmap-kernel-body
-               operation :dtype (:dtype operation)
-               :scalar-types scalar-types :array-types array-types
-               :target-dialect target-dialect
-               :kernel-name-prefix "graph_segmap")
+              (try
+                (generate-segmap-kernel-body
+                 operation :dtype (:dtype operation)
+                 :scalar-types scalar-types :array-types array-types
+                 :target-dialect target-dialect
+                 :kernel-name-prefix "graph_segmap")
+                (catch clojure.lang.ExceptionInfo exception
+                  (if (and opencl? (segmap-body/declined? exception))
+                    (-> (if (:out-sym operation)
+                          (generate-segmap-kernel
+                           operation (:out-sym operation)
+                           :dtype (:dtype operation)
+                           :scalar-types scalar-types :array-types array-types
+                           :kernel-name-prefix "graph_segmap")
+                          (generate-explicit-segmap-kernel
+                           operation :dtype (:dtype operation)
+                           :scalar-types scalar-types :array-types array-types
+                           :kernel-name-prefix "graph_segmap_effect"))
+                        (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+                        (assoc-in [:attributes :kernel-body-decline]
+                                  (assoc (ex-data exception)
+                                         :fallback :verified-segmap-opencl)))
+                    (throw exception))))
 
               (instance? raster.compiler.ir.segop.SegStencil operation)
               (generate-segstencil-kernel-body
@@ -1151,7 +1170,7 @@
                                {:reason :kernel-graph-reduction-output
                                 :target :opencl-c :node id :outputs outputs})))
              (kart/certify-scheduled-operation
-              (generate-segred-kernel-body
+              (generate-segred-kernel
                operation (first outputs)
                :dtype (:dtype operation)
                :scalar-types scalar-types :array-types array-types
@@ -1203,7 +1222,9 @@
    an operation from source spelling or node names."
   [graph & {:as opts}]
   (let [graph (kgraph/validate! graph)
-        target-dialect (get opts :target-dialect :opencl-intel)]
+        target-dialect (get opts :target-dialect :opencl-intel)
+        opencl? (kernel-body-c-dialect/opencl?
+                 (kernel-body-c-dialect/resolve! target-dialect))]
     (cond
       (scan/associative-scan? (get-in graph [:attributes :scan-algebra]))
       (apply generate-scan-kernel-graph graph (mapcat identity opts))
@@ -1215,7 +1236,7 @@
       (try
         (generate-elementwise-kernel-graph graph opts)
         (catch clojure.lang.ExceptionInfo exception
-          (if (segmap-body/declined? exception)
+          (if (and (not opencl?) (segmap-body/declined? exception))
             (throw (ex-info "scheduled map is outside the portable KernelBody C-family subset"
                             {:reason :kernel-graph-target-lowering-missing
                              :target-dialect target-dialect
@@ -1227,17 +1248,7 @@
       (and (seq (:nodes graph))
            (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
                    (:nodes graph)))
-      (try
-        (generate-reduction-kernel-graph graph opts)
-        (catch clojure.lang.ExceptionInfo exception
-          (if (segred-body/declined? exception)
-            (throw (ex-info "scheduled reduction is outside the portable KernelBody C-family subset"
-                            {:reason :kernel-graph-target-lowering-missing
-                             :target-dialect target-dialect
-                             :kernel-body-decline (ex-data exception)
-                             :fallback :none}
-                            exception))
-            (throw exception))))
+      (generate-reduction-kernel-graph graph opts)
 
       (and (seq (:nodes graph))
            (every? #(instance? raster.compiler.ir.segop.SegFoldMap (:operation %))

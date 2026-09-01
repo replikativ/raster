@@ -48,7 +48,7 @@
     (is (= 2 (second (get temporary-specs partials)))
         "dynamic two-phase scratch resolves through KernelLaunch IR at call time")))
 
-(deftest scheduled-reduction-graph-never-selects-the-compatibility-emitter
+(deftest scheduled-reduction-graph-does-not-export-an-opencl-fallback-to-cuda
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
                       result)
@@ -65,7 +65,8 @@
                                           {:reason :segred-kernel-body-declined
                                            :missing-rule :simulated
                                            :fallback :none})))]
-            (sg/generate-kernel-graph graph :array-types {'a :double}))
+            (sg/generate-kernel-graph graph :array-types {'a :double}
+                                      :target-dialect :cuda))
           nil
           (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :kernel-graph-target-lowering-missing (:reason (ex-data exception))))
