@@ -52,9 +52,13 @@
                   (map (fn [parameter array]
                          [parameter (list 'clojure.core/aget array (:index attributes))])
                        elements arrays))]
-        {:locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
+        {:locals (mapv #(update % :init (fn [init]
+                                          (projection/scalar-folds->source
+                                           (util/subst-syms substitutions init))))
                        locals)
-         :bodies (mapv #(util/subst-syms substitutions %) body-results)}))))
+         :bodies (mapv #(projection/scalar-folds->source
+                         (util/subst-syms substitutions %))
+                       body-results)}))))
 
 (defn- materialize-region
   [locals body]

@@ -17,7 +17,9 @@
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.core.hardware :as hw]
             [clojure.set]
@@ -666,7 +668,7 @@
 ;; SegMap → SIMD
 ;; ================================================================
 
-(defn compile-segmap
+(defn- compile-vector-segmap
   "Compile a SegMap to SIMD S-expression.
    out-sym: the output array symbol (from the par form context, not from SegOp).
    cast: cast function symbol for aset (from par form context).
@@ -801,6 +803,72 @@
               (list 'let* [n-sym (list 'int bound)]
                     (wrap-simd (make-loop '(int 0) n-sym out))))]
         (when simd-body-expr body-form)))))
+
+(declare compile-segred)
+
+(defn- scalar-folds
+  [expression]
+  (->> (tree-seq coll? seq expression)
+       (filter soac-dialect/scalar-fold-form?)
+       vec))
+
+(defn- compile-scalar-fold
+  [fold segmap]
+  (let [{:keys [attributes lambda]} (soac-dialect/scalar-fold-parts fold)
+        {:keys [parameters locals body-results]} (soac-dialect/lambda-parts lambda)
+        [accumulator index] parameters
+        operator (reduction/scalar
+                  {:accumulator accumulator :neutral (:identity attributes)
+                   :dtype (:dtype attributes) :result nil :index index
+                   :step-result (first body-results)
+                   :attributes {:source :typed-soac-scalar-fold}})
+        scheduled (segop/->SegRed
+                   [:scalar-fold (:id segmap) index]
+                   (segop/make-seg-space index (:extent attributes))
+                   (segop/->SegLevel :thread :virtual)
+                   operator nil (:inputs segmap) #{} (:scalars segmap)
+                   nil :single nil (:dtype attributes))]
+    (when (empty? locals)
+      (compile-segred scheduled))))
+
+(defn- compile-fold-map-scalar-loop
+  [segmap out-sym cast store-offset]
+  (let [folds (scalar-folds (:lambda segmap))
+        complete? (atom true)
+        body
+        (clojure.walk/postwalk
+         (fn [form]
+           (if (soac-dialect/scalar-fold-form? form)
+             (if-let [compiled (compile-scalar-fold form segmap)]
+               compiled
+               (do (reset! complete? false) form))
+             form))
+         (:lambda segmap))]
+    (when (and (seq folds) @complete?)
+      (let [idx (seg-idx segmap)
+            bound (seg-bound segmap)
+            n-sym (gensym "n__")
+            j-sym (gensym "j__")
+            body (clojure.walk/postwalk
+                  (fn [form] (if (= form idx) j-sym form))
+                  (bc/desugar-invk body))
+            store-index (if store-offset (ix+ store-offset j-sym) j-sym)
+            value (if cast (list cast body) body)]
+        (list 'let* [n-sym (list 'int bound)]
+              (list 'loop* [j-sym '(int 0)]
+                    (list 'if (ix< j-sym n-sym)
+                          (list 'do
+                                (list 'clojure.core/aset out-sym store-index value)
+                                (list 'recur (list 'clojure.core/unchecked-inc-int j-sym)))
+                          out-sym)))))))
+
+(defn compile-segmap
+  "Compile a scheduled SegMap. Pointwise maps vectorize across their mapped dimension; maps with
+  explicit scalar Fold terms keep the outer map scalar and SIMD-schedule each inner fold."
+  [segmap out-sym cast & {:keys [store-offset]}]
+  (if (seq (scalar-folds (:lambda segmap)))
+    (compile-fold-map-scalar-loop segmap out-sym cast store-offset)
+    (compile-vector-segmap segmap out-sym cast :store-offset store-offset)))
 
 ;; ================================================================
 ;; par/gather → SIMD hardware vgather
