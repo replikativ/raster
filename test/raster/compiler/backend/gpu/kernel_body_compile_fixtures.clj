@@ -53,6 +53,16 @@
                      (raster.numeric/+ accumulator
                                        (raster.arrays/aget input index)))))
 
+(deftm public-c-family-stencil
+  "Public equation-first radius-one stencil compiled by nvcc/hipcc without a physical device."
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/stencil!
+     output [input] 1 :dirichlet float index n
+     (raster.numeric/+
+      (raster.arrays/aget input (dec index))
+      (raster.arrays/aget input (inc index))))))
+
 (defn- reduction-artifact
   [dialect]
   (let [form (with-meta
@@ -200,6 +210,8 @@
                  #'public-c-family-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-scan {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-stencil {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 

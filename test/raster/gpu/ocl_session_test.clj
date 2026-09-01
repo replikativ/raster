@@ -85,6 +85,13 @@
   (raster.par/scan-exclusive out acc 0.0 i n float
                              (clojure.core/+ acc (ra/aget x i))))
 
+(deftm ocl-session-stencil
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/stencil!
+   out [x] 1 :dirichlet float i n
+   (clojure.core/+ (ra/aget x (clojure.core/dec i))
+                   (ra/aget x (clojure.core/inc i)))))
+
 (deftest ocl-map-void-mixed-storage-abi-roundtrip
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "mixed-storage map-void")
@@ -235,6 +242,27 @@
       (is (= (float n) (aget out (dec n))))
       (is (every? (fn [i] (= (float (inc i)) (aget out i)))
                   [0 1 255 256 511 512 1024])))))
+
+(deftest ocl-resident-typed-stencil-runs-through-portable-kernel-body
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed stencil KernelBody")
+    (let [n 513
+          descriptor (pl/compile-gpu-program #'ocl-session-stencil :ocl:0 :dtype :float)
+          x (float-array (map float (range n)))
+          out (float-array n)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= :portable-segstencil
+               (get-in descriptor [:steps 0 :artifact :attributes
+                                   :kernel-body :attributes :kind])))
+        (let [program (fixture/instantiate! session descriptor [x out n]
+                                            {'x :input 'out :output})
+              ^floats result (get (fixture/run! program [x out n]) 'out)]
+          (is (= 0.0 (double (aget result 0))))
+          (is (= 0.0 (double (aget result (dec n)))))
+          (is (every? (fn [i] (= (double (* 2 i)) (double (aget result i))))
+                      [1 2 255 256 511])))
+        (finally (gpu/close-session! session))))))
 
 (deftest ocl-resident-and-staged-exclusive-scan-use-the-same-typed-graph
   (if-not @device-probe/opencl-available?

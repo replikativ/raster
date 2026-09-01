@@ -87,10 +87,11 @@ stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stor
 same KernelBody to all three C-family targets. Canonical loop/recur scalar carries become ordered
 KernelBody `ForLoop` regions rather than being reassociated as reductions. This is sufficient for
 the public seven-stage GQA composition to emit entirely as CUDA/HIP and pass both vendor compilers;
-SegStencil remains the explicit portable C-family coverage gap. Certified scans now lower their
+certified stencils and scans now lower their
 single- or three-phase schedule to target-neutral KernelBody scalar SSA, workgroup storage,
 barriers, ordered block carries, and inclusive/exclusive result placement. The same bodies compile
-with OpenCL, nvcc, and hipcc; the former handwritten OpenCL scan source path has been deleted.
+with OpenCL, nvcc, and hipcc; the former handwritten OpenCL scan and stencil source paths have
+been deleted.
 
 The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,

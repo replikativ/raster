@@ -237,30 +237,46 @@
                   (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
                         intrinsic (intrinsics/descriptor operator)
                         arguments (vec (descriptor/call-args expression))]
-                    (when-not (and intrinsic (= (:arity intrinsic) (count arguments)))
+                    (when-not intrinsic
                       (decline! :scalar-expression
                                 "scalar expression has no canonical intrinsic"
                                 {:expression expression :operator operator}))
-                    (let [comparison? (= :cmp (:kind intrinsic))
-                          operand-type (if comparison?
-                                         (dtype/canon
-                                          (or (source-type (first arguments) :int env) :int))
-                                         expected)
-                          lowered (mapv #(lower % operand-type env) arguments)
-                          result-type (if comparison? :predicate operand-type)
-                          _ (when-not (every? #(= operand-type (:type %)) lowered)
-                              (decline! :operand-dtype
-                                        "scalar intrinsic operands require one dtype"
-                                        {:expression expression :operand-type operand-type
-                                         :actual (mapv :type lowered)}))
-                          result (fresh "value")]
-                      {:operations
-                       (conj (vec (mapcat :operations lowered))
-                             (body/->ScalarCompute
-                              (body/value result result-type)
-                              (body/scalar-expression operator result-type
-                                                      (mapv :result lowered))))
-                       :result result :type result-type}))
+                    (if (and (= 2 (:arity intrinsic)) (> (count arguments) 2)
+                             (contains? #{:+ :* :- :div :min :max} operator))
+                      ;; Preserve source evaluation order while spelling variadic scalar folds in
+                      ;; the binary KernelBody vocabulary. This is normalization, not algebraic
+                      ;; reassociation: `(- a b c)` becomes `(- (- a b) c)`.
+                      (lower (reduce (fn [left right]
+                                       (list (descriptor/semantic-op expression) left right))
+                                     arguments)
+                             expected env)
+                      (do
+                        (when-not (= (:arity intrinsic) (count arguments))
+                          (decline! :scalar-expression
+                                    "scalar expression has the wrong intrinsic arity"
+                                    {:expression expression :operator operator
+                                     :expected (:arity intrinsic)
+                                     :actual (count arguments)}))
+                        (let [comparison? (= :cmp (:kind intrinsic))
+                              operand-type (if comparison?
+                                             (dtype/canon
+                                              (or (source-type (first arguments) :int env) :int))
+                                             expected)
+                              lowered (mapv #(lower % operand-type env) arguments)
+                              result-type (if comparison? :predicate operand-type)
+                              _ (when-not (every? #(= operand-type (:type %)) lowered)
+                                  (decline! :operand-dtype
+                                            "scalar intrinsic operands require one dtype"
+                                            {:expression expression :operand-type operand-type
+                                             :actual (mapv :type lowered)}))
+                              result (fresh "value")]
+                          {:operations
+                           (conj (vec (mapcat :operations lowered))
+                                 (body/->ScalarCompute
+                                  (body/value result result-type)
+                                  (body/scalar-expression operator result-type
+                                                          (mapv :result lowered))))
+                           :result result :type result-type}))))
 
                   :else
                   (decline! :scalar-expression
