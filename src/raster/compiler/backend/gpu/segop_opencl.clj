@@ -382,12 +382,12 @@
         abi (kabi/validate!
              (vec (concat
                    (map #(kabi/slot % :input (input-dtype %)
-                                     :c-name (ce/c-symbol %) :role :operand
-                                     :aliasing :no-write-alias)
+                                    :c-name (ce/c-symbol %) :role :operand
+                                    :aliasing :no-write-alias)
                         inputs)
                    [(kabi/slot out :output dtype :c-name "out" :role :result)]
                    (map #(kabi/slot % :scalar (scalar-dtype %)
-                                     :c-name (ce/c-symbol %) :role :parameter)
+                                    :c-name (ce/c-symbol %) :role :parameter)
                         scalars)
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas dtype (map input-dtype inputs))
@@ -423,8 +423,8 @@
                       scalar-types {} array-types {}}}]
   (let [{:keys [kernel-body segment-count]}
         (segfoldmap-body/lower segfoldmap
-                              {:workgroup-size workgroup-size
-                               :scalar-types scalar-types :array-types array-types})
+                               {:workgroup-size workgroup-size
+                                :scalar-types scalar-types :array-types array-types})
         parameters (:parameters kernel-body)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         parameter-names (into {}
@@ -746,188 +746,231 @@
     (or
      (:artifact kernel-body-attempt)
      (let [idx (seg-idx segred)
-        bound (seg-bound segred)
-        {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
+           bound (seg-bound segred)
+           {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         ;; #55 fix: normalize devirtualized array prims ((.invk aget-impl arr i)
         ;; → canonical aget head) BEFORE any rewrapping, exactly as SegMap does.
         ;; Without it, a parametric-array kernel (qlinear-k) emitted broken
         ;; gpufn_aget helper calls while a typed-array kernel (decoder-gpu)
         ;; emitted x[i] — same op, ns-sensitive lowering.
-        lambda (ce/normalize-array-prims lambda)
-        dtype (or (:dtype segred) dtype)
-        kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ctype (dt/ctype :opencl dtype)
-        arr-params (vec (sort-by name (:inputs segred)))
-        scl-params (vec (sort-by name (:scalars segred)))
-        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k))))
-                                   scalar-types))
-        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
-        scalar-dtype (fn [s]
-                       (case (scl-type s)
-                         "int" :int
-                         "long" :long
-                         "double" :double
-                         "float" :float))
+           lambda (ce/normalize-array-prims lambda)
+           dtype (or (:dtype segred) dtype)
+           kernel-name (str kernel-name-prefix "_" (gensym ""))
+           ctype (dt/ctype :opencl dtype)
+           arr-params (vec (sort-by name (:inputs segred)))
+           scl-params (vec (sort-by name (:scalars segred)))
+           int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k))))
+                                      scalar-types))
+           scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
+           scalar-dtype (fn [s]
+                          (case (scl-type s)
+                            "int" :int
+                            "long" :long
+                            "double" :double
+                            "float" :float))
         ;; Detect reduction op from lambda — unwrap let to find op, keep let for elem
-        [let-bindings inner-body]
-        (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
-          (let [[_ binds & bdy] lambda]
+           [let-bindings inner-body]
+           (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
+             (let [[_ binds & bdy] lambda]
             ;; A reduce combine's let body must be ONE expression `(op acc elem)`. Taking
             ;; `(last bdy)` of a multi-statement body would SILENTLY DROP the earlier forms
             ;; — the same shape as the single-aset-void store-drop. If earlier statements
             ;; exist they carry computation/effects the combine depends on; reject loudly.
-            (when (> (count bdy) 1)
-              (throw (ex-info (str "SegRed: reduce combine lambda has a multi-statement body ("
-                                   (count bdy) " forms) — only a single combine expression is"
-                                   " modeled; earlier forms would be dropped")
-                              {:lambda lambda :body (vec bdy)})))
-            [(vec (partition 2 binds)) (last bdy)])
-          [nil lambda])
+               (when (> (count bdy) 1)
+                 (throw (ex-info (str "SegRed: reduce combine lambda has a multi-statement body ("
+                                      (count bdy) " forms) — only a single combine expression is"
+                                      " modeled; earlier forms would be dropped")
+                                 {:lambda lambda :body (vec bdy)})))
+               [(vec (partition 2 binds)) (last bdy)])
+             [nil lambda])
         ;; .invk-aware: the walker devirtualizes (raster.numeric/+ acc x) into
         ;; (.invk _plus_impl acc x) with :raster.op/original metadata. semantic-op recovers the
         ;; original op and call-args the real operands — never parse the mangled impl name (which
         ;; would mis-detect the op and capture the impl symbol as the element). Same fix #37 made
         ;; for SegMap; here it keeps SegRed combine-op detection sound for both bare and .invk forms.
-        op-sym (when (seq? inner-body) (descriptor/semantic-op inner-body))
-        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*,
-                            'raster.numeric/+ '+, 'raster.numeric/* '*,
-                            'clojure.core/max 'max, 'raster.numeric/max 'max, 'Math/max 'max,
-                            'clojure.core/min 'min, 'raster.numeric/min 'min, 'Math/min 'min}
-                           op-sym op-sym)
+           op-sym (when (seq? inner-body) (descriptor/semantic-op inner-body))
+           normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*,
+                               'raster.numeric/+ '+, 'raster.numeric/* '*,
+                               'clojure.core/max 'max, 'raster.numeric/max 'max, 'Math/max 'max,
+                               'clojure.core/min 'min, 'raster.numeric/min 'min, 'Math/min 'min}
+                              op-sym op-sym)
         ;; Unknown combine ops must FAIL LOUD — the old default silently combined with "+"
         ;; (a max reduce summed the per-lane maxima). Only associative ops are legal here.
-        c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
-                    (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
-                                         " — GPU reduction needs an associative op (+ * max min)")
-                                    {:op op-sym :lambda lambda})))
-        c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
-        identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
+           c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
+                       (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
+                                            " — GPU reduction needs an associative op (+ * max min)")
+                                       {:op op-sym :lambda lambda})))
+           c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
+           identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
         ;; fmax/fmin are functions, not infix operators
-        c-combine (fn [a b] (if (#{"fmax" "fmin"} c-op)
-                              (str c-op "(" a ", " b ")")
-                              (str "(" a " " c-op " " b ")")))
+           c-combine (fn [a b] (if (#{"fmax" "fmin"} c-op)
+                                 (str c-op "(" a ", " b ")")
+                                 (str "(" a " " c-op " " b ")")))
         ;; Extract the element expression (the non-acc operand) from the SEMANTIC args.
-        op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
+           op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
         ;; A segmented reduce combine is BINARY: (op acc elem). A variadic combine like
         ;; (+ acc x y) has 3 operands — extracting only ONE non-acc operand would SILENTLY
         ;; emit a kernel that sums just `x`, dropping `y` (the store-drop family). A legit
         ;; fused map→reduce nests the map body as a single elem operand, so >2 is unmodeled.
-        _ (when (> (count op-args) 2)
-            (throw (ex-info (str "SegRed: reduce combine op has " (count op-args)
-                                 " operands — only a binary (op acc elem) combine is modeled;"
-                                 " extra operands would be dropped")
-                            {:op op-sym :op-args op-args :lambda lambda})))
+           _ (when (> (count op-args) 2)
+               (throw (ex-info (str "SegRed: reduce combine op has " (count op-args)
+                                    " operands — only a binary (op acc elem) combine is modeled;"
+                                    " extra operands would be dropped")
+                               {:op op-sym :op-args op-args :lambda lambda})))
         ;; Typed float pipelines cast the accumulator to `(float acc)` while double pipelines
         ;; use `(double acc)`. Treat both as the accumulator position; recognizing only double
         ;; made an otherwise-valid float SegRed return nil and fall through to a legacy kernel
         ;; whose body referenced captured scalars absent from its signature.
-        acc-at? (fn [a] (or (= a acc)
-                            (and (seq? a)
-                                 (contains? #{'float 'double 'clojure.core/float
-                                              'clojure.core/double}
-                                            (first a))
-                                 (= acc (second a)))))
-        [_acc-pos elem-expr-raw]
-        (when (>= (count op-args) 2)
-          (let [a0 (nth op-args 0) a1 (nth op-args 1)]
-            (cond
-              (acc-at? a0) [:left a1]
-              (acc-at? a1) [:right a0]
-              :else [nil nil])))
+           acc-at? (fn [a] (or (= a acc)
+                               (and (seq? a)
+                                    (contains? #{'float 'double 'clojure.core/float
+                                                 'clojure.core/double}
+                                               (first a))
+                                    (= acc (second a)))))
+           [_acc-pos elem-expr-raw]
+           (when (>= (count op-args) 2)
+             (let [a0 (nth op-args 0) a1 (nth op-args 1)]
+               (cond
+                 (acc-at? a0) [:left a1]
+                 (acc-at? a1) [:right a0]
+                 :else [nil nil])))
         ;; Re-wrap in let if there were bindings (preserves local variable scope)
         ;; preserve the raw expr's metadata across the rewrap — dropping it
         ;; severed :raster.op/original on .invk forms (part of #55)
-        elem-expr (if (and elem-expr-raw (seq let-bindings))
-                    (with-meta (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
-                      (meta elem-expr-raw))
-                    elem-expr-raw)
-        adapted-elem (when elem-expr (ce/adapt-casts-for-dtype elem-expr dtype))
-        idx-c-name (ce/c-symbol idx)
-        elem-str (when adapted-elem
-                   (binding [ce/*emit-config* ce/opencl-config
-                             ce/*scalar-type* ctype
-                             ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
-                     (ce/emit-expr adapted-elem idx (set (map #(symbol (name %)) arr-params)) idx-c-name)))
+           elem-expr (if (and elem-expr-raw (seq let-bindings))
+                       (with-meta (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
+                         (meta elem-expr-raw))
+                       elem-expr-raw)
+           adapted-elem (when elem-expr (ce/adapt-casts-for-dtype elem-expr dtype))
+           idx-c-name (ce/c-symbol idx)
+           elem-str (when adapted-elem
+                      (binding [ce/*emit-config* ce/opencl-config
+                                ce/*scalar-type* ctype
+                                ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
+                        (ce/emit-expr adapted-elem idx (set (map #(symbol (name %)) arr-params)) idx-c-name)))
         ;; Build kernel source
-        workgroup-size 256
-        arr-param-str (str/join ", "
-                                (map (fn [s] (str "__global const " ctype "* restrict "
-                                                  (ce/c-symbol s)))
-                                     arr-params))
-        scl-param-str (str/join ", "
-                                (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
+           workgroup-size 256
+           arr-param-str (str/join ", "
+                                   (map (fn [s] (str "__global const " ctype "* restrict "
+                                                     (ce/c-symbol s)))
+                                        arr-params))
+           scl-param-str (str/join ", "
+                                   (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
         ;; The emitted name is pinned by the ordered ABI.
-        all-params (str/join ", "
-                             (remove empty?
-                                     [arr-param-str
-                                      (str "__global " ctype "* restrict output")
-                                      scl-param-str
-                                      "int _n_bound"]))
-        result-name (or out-sym 'output)
-        abi (kabi/validate!
-             (vec (concat
-                   (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand)
-                        arr-params)
-                   [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
-                   (map #(kabi/slot % :scalar (scalar-dtype %)
-                                    :c-name (ce/c-symbol %) :role :parameter)
-                        scl-params)
-                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
+           all-params (str/join ", "
+                                (remove empty?
+                                        [arr-param-str
+                                         (str "__global " ctype "* restrict output")
+                                         scl-param-str
+                                         "int _n_bound"]))
+           result-name (or out-sym 'output)
+           abi (kabi/validate!
+                (vec (concat
+                      (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand)
+                           arr-params)
+                      [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
+                      (map #(kabi/slot % :scalar (scalar-dtype %)
+                                       :c-name (ce/c-symbol %) :role :parameter)
+                           scl-params)
+                      [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         ;; Static shared memory is part of the artifact launch contract (no dynamic-local ABI slot).
-        _ (when-not elem-str
-            (throw (ex-info "SegRed emission produced no element expression"
-                            {:reason :illegal-op-remains
-                             :missing-rule :segred-element-expression
-                             :target-dialect :kernel-artifact
-                             :segred-id (:id segred)
-                             :lambda lambda
-                             :fallback :none})))
-        source (str (codegen/extension-pragmas dtype)
-                    "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
-                    "__kernel void " kernel-name
-                    "(" all-params ") {\n"
-                    "    __local " ctype " sdata[" workgroup-size "];\n"
-                    "    int tid = get_local_id(0);\n"
-                    "    " ctype " val = " c-identity-val ";\n"
-                    "    int stride = get_global_size(0);\n"
-                    "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
-                    "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
-                    "        val = " (c-combine "val" elem-str) ";\n"
-                    "    }\n"
-                    "    sdata[tid] = val;\n"
-                    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-                    "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
-                    "        if (tid < s) {\n"
-                    "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
-                    "        }\n"
-                    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                    "    }\n"
-                    "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
-                    "}\n")]
-    (kart/make
-     {:kernel-name kernel-name
-      :source source
-      :abi abi
-      :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
-      :launch (klaunch/spec
-               {:workgroup-size [workgroup-size]
-                :group-count [(klaunch/ceil-div (seg-bound segred) workgroup-size)]
-                :shared-memory-bytes (* workgroup-size (dt/bytes-of dtype))})
-      :temporaries []
-      :effects {:kind :pure-reduction}
-      :provenance {:dialect :segred :segop-id (:id segred)}
-      :attributes {:array-params arr-params
-                   :scalar-params scl-params
-                   :dtype dtype
-                   :n-phases 2
-                   :identity-val identity-val
-                   :c-op c-op
-                   :emission-route :verified-segred-opencl
-                   :kernel-body-decline (:decline kernel-body-attempt)}})))))
+           _ (when-not elem-str
+               (throw (ex-info "SegRed emission produced no element expression"
+                               {:reason :illegal-op-remains
+                                :missing-rule :segred-element-expression
+                                :target-dialect :kernel-artifact
+                                :segred-id (:id segred)
+                                :lambda lambda
+                                :fallback :none})))
+           source (str (codegen/extension-pragmas dtype)
+                       "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
+                       "__kernel void " kernel-name
+                       "(" all-params ") {\n"
+                       "    __local " ctype " sdata[" workgroup-size "];\n"
+                       "    int tid = get_local_id(0);\n"
+                       "    " ctype " val = " c-identity-val ";\n"
+                       "    int stride = get_global_size(0);\n"
+                       "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
+                       "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
+                       "        val = " (c-combine "val" elem-str) ";\n"
+                       "    }\n"
+                       "    sdata[tid] = val;\n"
+                       "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
+                       "        if (tid < s) {\n"
+                       "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
+                       "        }\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    }\n"
+                       "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
+                       "}\n")]
+       (kart/make
+        {:kernel-name kernel-name
+         :source source
+         :abi abi
+         :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
+         :launch (klaunch/spec
+                  {:workgroup-size [workgroup-size]
+                   :group-count [(klaunch/ceil-div (seg-bound segred) workgroup-size)]
+                   :shared-memory-bytes (* workgroup-size (dt/bytes-of dtype))})
+         :temporaries []
+         :effects {:kind :pure-reduction}
+         :provenance {:dialect :segred :segop-id (:id segred)}
+         :attributes {:array-params arr-params
+                      :scalar-params scl-params
+                      :dtype dtype
+                      :n-phases 2
+                      :identity-val identity-val
+                      :c-op c-op
+                      :emission-route :verified-segred-opencl
+                      :kernel-body-decline (:decline kernel-body-attempt)}})))))
 
 ;; ================================================================
 ;; KernelGraph scan → OpenCL KernelArtifacts
 ;; ================================================================
+
+(defn- finalize-emitted-graph
+  "Give an artifact-valued graph its one ordered external ABI.
+
+   Node artifacts remain free to order their own physical parameters. The graph boundary groups
+   equal symbolic scalars, proves their emitted dtypes agree, and exposes every external buffer
+   exactly once."
+  [emitted target-dialect]
+  (let [external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
+        scalar-pairs (->> (:nodes emitted)
+                          (mapcat (fn [node]
+                                    (map vector (get-in node [:operation :abi])
+                                         (get-in node [:operation :arguments]))))
+                          (filter (fn [[slot argument]]
+                                    (and (= :scalar (:kind slot)) (symbol? argument))))
+                          vec)
+        scalar-groups (group-by second scalar-pairs)
+        _ (doseq [[argument pairs] scalar-groups]
+            (when-not (apply = (map (comp :kernel-dtype first) pairs))
+              (throw (ex-info "kernel graph scalar has inconsistent emitted ABI dtypes"
+                              {:reason :kernel-graph-scalar-dtype
+                               :argument argument :slots (mapv first pairs)}))))
+        pointer-abi (mapv (fn [{:keys [id dtype role]}]
+                            (kabi/slot id (if (= :input role) :input :output) dtype
+                                       :role (case role
+                                               :input :operand
+                                               :output :result
+                                               :inout :inout)))
+                          external-buffers)
+        scalar-arguments (vec (sort-by name (keys scalar-groups)))
+        scalar-abi (mapv (fn [argument]
+                           (let [slots (mapv first (get scalar-groups argument))
+                                 dtype (:kernel-dtype (first slots))
+                                 role (if (some #(= :bound (:role %)) slots)
+                                        :bound :parameter)]
+                             (kabi/slot argument :scalar dtype :role role)))
+                         scalar-arguments)]
+    (-> emitted
+        (assoc :abi (vec (concat pointer-abi scalar-abi))
+               :arguments (vec (concat (map :id external-buffers) scalar-arguments)))
+        (assoc-in [:provenance :target-dialect] target-dialect)
+        (assoc-in [:attributes :emitted?] true)
+        kgraph/validate!)))
 
 (defn- scan-c-combine
   [combine dtype]
@@ -1150,41 +1193,52 @@
               :provenance {:dialect :segscan :segop-id (:id operation) :graph-node id}
               :attributes {:phase phase :dtype dtype :scan-mode scan-mode
                            :scan-workgroup scan-workgroup}})))
-        emitted (kgraph/map-operations graph emit-node)
-        external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
-        scalar-pairs (->> (:nodes emitted)
-                          (mapcat (fn [node]
-                                    (map vector (get-in node [:operation :abi])
-                                         (get-in node [:operation :arguments]))))
-                          (filter (fn [[slot argument]]
-                                    (and (= :scalar (:kind slot)) (symbol? argument))))
-                          vec)
-        scalar-groups (group-by second scalar-pairs)
-        _ (doseq [[argument pairs] scalar-groups]
-            (when-not (apply = (map (comp :kernel-dtype first) pairs))
-              (throw (ex-info "scan graph scalar has inconsistent emitted ABI dtypes"
-                              {:argument argument :slots (mapv first pairs)}))))
-        pointer-abi (mapv (fn [{:keys [id dtype role]}]
-                            (kabi/slot id (if (= :input role) :input :output) dtype
-                                       :role (case role
-                                               :input :operand
-                                               :output :result
-                                               :inout :inout)))
-                          external-buffers)
-        scalar-arguments (vec (sort-by name (keys scalar-groups)))
-        scalar-abi (mapv (fn [argument]
-                           (let [slots (mapv first (get scalar-groups argument))
-                                 dtype (:kernel-dtype (first slots))
-                                 role (if (some #(= :bound (:role %)) slots)
-                                        :bound :parameter)]
-                             (kabi/slot argument :scalar dtype :role role)))
-                         scalar-arguments)]
-    (-> emitted
-        (assoc :abi (vec (concat pointer-abi scalar-abi))
-               :arguments (vec (concat (map :id external-buffers) scalar-arguments)))
-        (assoc-in [:provenance :target-dialect] :opencl-c)
-        (assoc-in [:attributes :emitted?] true)
-        kgraph/validate!)))
+        emitted (kgraph/map-operations graph emit-node)]
+    (finalize-emitted-graph emitted :opencl-c)))
+
+(defn- generate-elementwise-kernel-graph
+  [graph {:keys [scalar-types array-types]
+          :or {scalar-types {} array-types {}}}]
+  (let [declared-array-types
+        (into {}
+              (map (juxt :id :dtype))
+              (distinct (concat (:inputs graph) (:outputs graph) (:temporaries graph))))
+        _ (doseq [[id declared] declared-array-types
+                  :let [supplied (or (get array-types id)
+                                     (when (symbol? id)
+                                       (get array-types (symbol (name id)))))]
+                  :when (and supplied (not= supplied declared))]
+            (throw (ex-info "kernel graph buffer dtype differs from target emission facts"
+                            {:reason :kernel-graph-buffer-dtype
+                             :buffer id :declared declared :supplied supplied})))
+        array-types (merge array-types declared-array-types)
+        emitted
+        (kgraph/map-operations
+         graph
+         (fn [{:keys [id operation]}]
+           (cond
+             (instance? raster.compiler.ir.segop.SegMap operation)
+             (if (:out-sym operation)
+               (generate-segmap-kernel
+                operation (:out-sym operation)
+                :dtype (:dtype operation)
+                :scalar-types scalar-types :array-types array-types
+                :kernel-name-prefix "graph_segmap")
+               (generate-explicit-segmap-kernel
+                operation :dtype (:dtype operation)
+                :scalar-types scalar-types :array-types array-types
+                :kernel-name-prefix "graph_segmap_effect"))
+
+             (instance? raster.compiler.ir.segop.SegStencil operation)
+             (generate-segstencil-kernel
+              operation :scalar-types scalar-types :array-types array-types
+              :kernel-name-prefix "graph_segstencil")
+
+             :else
+             (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
+                             {:reason :kernel-graph-node-target-lowering-missing
+                              :target :opencl-c :node id :operation operation})))))]
+    (finalize-emitted-graph emitted :opencl-c)))
 
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
@@ -1197,6 +1251,12 @@
     (cond
       (scan/associative-scan? (get-in graph [:attributes :scan-algebra]))
       (apply generate-scan-kernel-graph graph (mapcat identity opts))
+
+      (and (seq (:nodes graph))
+           (every? #(or (instance? raster.compiler.ir.segop.SegMap (:operation %))
+                        (instance? raster.compiler.ir.segop.SegStencil (:operation %)))
+                   (:nodes graph)))
+      (generate-elementwise-kernel-graph graph opts)
 
       :else
       (throw (ex-info "OpenCL backend has no target lowering for scheduled KernelGraph"
@@ -1514,8 +1574,8 @@
         col (:col bindings)
         kernel-name (str "regtiled_contract_" (gensym ""))
         parameter-names (merge (into {} (map (fn [parameter]
-                                                [(:id parameter)
-                                                 (ce/c-symbol (:id parameter))]))
+                                               [(:id parameter)
+                                                (ce/c-symbol (:id parameter))]))
                                      (:parameters kernel-body))
                                {row "A" col "B" out-sym "out"})
         source (kernel-body-opencl/emit-scalar-kernel
