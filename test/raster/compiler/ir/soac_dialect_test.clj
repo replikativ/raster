@@ -247,6 +247,7 @@
            (dialect/parameter-layout equation)))
     (testing "radius and boundary policy are part of typed syntax"
       (doseq [bad-attributes [(assoc attributes :radius 0)
+                              (assoc attributes :radius 2)
                               (assoc attributes :boundary :periodic)]]
         (try
           (dialect/make facts
@@ -289,6 +290,27 @@
             (is false "an unproved neighborhood index must not reach scheduling")
             (catch clojure.lang.ExceptionInfo exception
               (is (= :typed-soac-stencil-index (:reason (ex-data exception)))))))))
+    (testing "devirtualized array loads are covered by the same radius proof"
+      (let [read (with-meta
+                   '(.invk raster.arrays/aget_m_doubles_long-impl input (+ i 2))
+                   {:raster.op/original 'raster.arrays/aget})
+            bad-lambda (dialect/lambda-form '[a input] [(list '+ 'a read)])]
+        (try
+          (dialect/make facts
+                        [(list '= 'stencil-0 '[result]
+                               (list 'stencil attributes arrays captures bad-lambda))]
+                        '[result])
+          (is false "walker-devirtualized reads must not evade the radius certificate")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-stencil-index (:reason (ex-data exception))))))))
+    (testing "the first schedule requires homogeneous neighborhood tensors"
+      (try
+        (dialect/make
+         (assoc-in facts [:values 'u] (av/tensor {:dtype :float :shape '[n]}))
+         [equation] '[result])
+        (is false "mixed input/output vector species require an explicit later schedule")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-stencil-input-type (:reason (ex-data exception)))))))
     (testing "value remapping preserves the tensor/storage boundary and rejects collisions"
       (let [remapped (dialect/remap-values
                       program {'u [:argument :u] 'du [:storage :du]

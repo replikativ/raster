@@ -348,7 +348,21 @@
     (is (= #{'du} (:outputs stencil)))
     (is (= #{'alpha 'inv-dx2} (:scalars stencil)))
     (is (= :no-write-alias (:aliasing stencil)))
-    (is (= :typed-soac (:algorithm-dialect stencil)))))
+    (is (= :typed-soac (:algorithm-dialect stencil)))
+    (testing "the verifier rejects in-place neighborhood updates before scheduling"
+      (let [aliased (list 'let* ['result
+                                  '(raster.par/stencil!
+                                    u [u] 1 :dirichlet double i n
+                                    (+ (clojure.core/aget u (clojure.core/- i 1))
+                                       (clojure.core/aget u (clojure.core/+ i 1))))]
+                          'result)]
+        (try
+          (frontend/form->program
+           aliased {:dtype :double :array-types {'u :double}
+                    :scalar-types {'n :long}})
+          (is false "an aliased output invalidates stable neighborhood reads")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-stencil-alias (:reason (ex-data exception))))))))))
 
 (deftest explicit-contraction-result-transform-stays-in-typed-soac
   (let [transform {:acc 'acc

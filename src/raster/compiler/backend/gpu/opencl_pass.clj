@@ -643,28 +643,19 @@
 
             ;; par/stencil!
             (par/par-stencil-form? form)
-            (let [{:keys [bound]} (par/extract-par-stencil-info form)]
-              (if (and (number? bound) (< bound min-elements))
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-stencil! form))
-                (let [scheduled (take-bound-segop
-                                 stats :segstencil
-                                 #(and (instance? raster.compiler.ir.segop.SegStencil %)
-                                       (= :typed-soac (:algorithm-dialect %))))]
-                  (if scheduled
-                    (let [kernel (segop-cl/generate-segstencil-kernel
-                                  scheduled :scalar-types top-scalar-types
-                                  :array-types top-array-types)
-                          k (register-kernel! kernel :ze-maps)]
-                      (emit-map-invocation k device-id))
-                    (let [kernel (legacy/generate-par-stencil-kernel
-                                  form :dtype dtype :device-id device-id
-                                  :scalar-types top-scalar-types)
-                          k (register-kernel! kernel :ze-maps)
-                          {:keys [out]} (par/extract-par-stencil-info form)]
-                      (list 'raster.gpu.ze-runtime/invoke-registered-kernel
-                            (:kernel-name k) (vec (:array-params k))
-                            out (vec (:scalar-params k)) bound))))))
+            (if-let [scheduled (take-bound-segop
+                                stats :segstencil
+                                #(and (instance? raster.compiler.ir.segop.SegStencil %)
+                                      (= :typed-soac (:algorithm-dialect %))))]
+              (let [kernel (segop-cl/generate-segstencil-kernel
+                            scheduled :scalar-types top-scalar-types
+                            :array-types top-array-types)
+                    k (register-kernel! kernel :ze-maps)]
+                (emit-map-invocation k device-id))
+              (throw (ex-info "GPU stencil source has no verified TypedSOAC schedule"
+                              {:reason :unscheduled-stencil
+                               :target-dialect :opencl
+                               :form form})))
 
             ;; par/scatter!
             (par/par-scatter-form? form)

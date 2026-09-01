@@ -63,6 +63,7 @@
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -131,13 +132,12 @@
 (defn stencil-attributes?
   "Attributes for a boundary-aware neighborhood map.
 
-   The first production schedule certifies a static positive radius and Dirichlet boundaries.
+   The first production schedule certifies a radius-one domain and Dirichlet boundaries.
    Neighborhood arrays remain explicit stable captures, so the scalar region sees whole tensors
    and retains its shifted indices rather than pretending they are pointwise elements."
   [value]
   (and (map-attributes? value)
-       (integer? (:radius value))
-       (pos? (:radius value))
+       (= 1 (:radius value))
        (= :dirichlet (:boundary value))
        (vector? (:dtypes value))
        (= 1 (count (:dtypes value)))
@@ -538,9 +538,6 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :dialect :typed-soac))))
 
-(def ^:private stencil-aget-ops
-  '#{aget clojure.core/aget})
-
 (def ^:private stencil-index-casts
   '#{byte short int long clojure.core/byte clojure.core/short clojure.core/int clojure.core/long})
 
@@ -593,11 +590,14 @@
         radius (:radius attributes)]
     (doseq [body body-results
             form (tree-seq coll? seq body)
-            :when (and (seq? form)
-                       (= 3 (count form))
-                       (contains? stencil-aget-ops (first form))
-                       (contains? stable-parameters (second form)))]
-      (let [index-expression (nth form 2)
+            :when (descriptor/aget-call? form)]
+      (let [array-parameter (descriptor/aget-array-sym form)
+            _ (when-not (contains? stable-parameters array-parameter)
+                (fail! :typed-soac-stencil-array-role
+                       "every stencil array load must read an explicit stable tensor capture"
+                       {:equation equation-id :array-parameter array-parameter
+                        :stable-parameters stable-parameters :load form}))
+            index-expression (descriptor/aget-index form)
             offset (stencil-index-offset index index-expression)]
         (when (or (nil? offset) (> (abs (long offset)) radius))
           (fail! :typed-soac-stencil-index
@@ -919,6 +919,14 @@
 
       stencil
       (let [result-dtype (first (:dtypes attributes))]
+        (doseq [id stable-array-captures
+                :let [value (get values id)]]
+          (when (and value
+                     (not (and (= :tensor (:kind value))
+                               (= result-dtype (:dtype value)))))
+            (fail! :typed-soac-stencil-input-type
+                   "the first stencil schedule requires homogeneous tensor element dtypes"
+                   {:equation equation-id :id id :value value :dtype result-dtype})))
         (doseq [id results]
           (let [value (get values id)]
             (when (and value
@@ -1003,6 +1011,18 @@
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]
+        (when (and (= 'stencil kind)
+                   (seq (set/intersection
+                         (set destinations)
+                         (set (get-in (operation-parts equation)
+                                     [:attributes :attributes :stable-array-captures])))))
+          (fail! :typed-soac-stencil-alias
+                 "stencil output storage must not alias a stable neighborhood input"
+                 {:equation equation-id
+                  :destinations destinations
+                  :stable-array-captures
+                  (get-in (operation-parts equation)
+                          [:attributes :attributes :stable-array-captures])}))
         (when-not (= (count destinations) (count (distinct destinations)))
           (fail! :typed-soac-result-storage-alias
                  "one pointwise equation may write each physical destination only once"

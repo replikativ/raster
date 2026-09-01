@@ -324,7 +324,7 @@
         radius (:radius segstencil)
         boundary (:boundary segstencil)
         _ (when-not (and (= :dirichlet boundary)
-                         (integer? radius) (pos? radius)
+                         (= 1 radius)
                          (= :no-write-alias (:aliasing segstencil)))
             (throw (ex-info "scheduled stencil has no certified OpenCL lowering"
                             {:reason :segstencil-opencl-subset

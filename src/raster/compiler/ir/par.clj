@@ -66,6 +66,18 @@
                       (list 'clojure.core/aset seeds-arr i-sym 's5__)))
           seeds-arr)))
 
+(defn stencil-alias-guard-form
+  "Return the shared JVM precondition for a stencil's stable neighborhood inputs."
+  [out-sym in-arrays]
+  (let [tests (mapv #(list 'identical? out-sym %) in-arrays)
+        alias? (if (= 1 (count tests)) (first tests) (apply list 'or tests))]
+    (list 'if alias?
+          (list 'throw
+                (list 'ex-info
+                      "stencil output aliases a stable neighborhood input"
+                      {:reason :stencil-input-output-alias}))
+          nil)))
+
 (defn expand-par-stencil!
   "Expand a (raster.par/stencil! out [in-arrays] radius boundary cast idx bound body)
   form to a plain sequential loop S-expression. Used by pipeline passes."
@@ -73,17 +85,25 @@
   (let [[_ out-sym in-arrays radius boundary cast-fn idx-sym bound-expr body-expr] form
         n-sym (gensym "n__")
         j-sym (gensym "j__")
+        boundary-value (case boundary
+                         :dirichlet 0.0
+                         (throw (ex-info "unsupported stencil boundary policy"
+                                         {:reason :stencil-boundary-policy
+                                          :boundary boundary})))
         aset-expr (if cast-fn
                     (list cast-fn body-expr)
                     body-expr)]
     (list 'let* [n-sym (list 'int bound-expr)]
           ;; Fill boundary elements with boundary value
           (list 'do
-                (list 'dotimes [j-sym radius]
-                      (list 'clojure.core/aset out-sym j-sym boundary)
-                      (list 'clojure.core/aset out-sym (list '- n-sym 1 j-sym) boundary))
+                (stencil-alias-guard-form out-sym in-arrays)
+                (list 'dotimes [j-sym (list 'min radius n-sym)]
+                      (list 'clojure.core/aset out-sym j-sym boundary-value)
+                      (list 'clojure.core/aset out-sym
+                            (list 'clojure.core/- n-sym 1 j-sym) boundary-value))
             ;; Interior loop
-                (list 'dotimes [j-sym (list '- n-sym (list '* 2 radius))]
+                (list 'dotimes [j-sym (list 'max 0 (list 'clojure.core/- n-sym
+                                                         (list 'clojure.core/* 2 radius)))]
                       (list 'let* [idx-sym (list 'int (list '+ j-sym radius))]
                             (list 'clojure.core/aset out-sym idx-sym aset-expr)))
                 out-sym))))

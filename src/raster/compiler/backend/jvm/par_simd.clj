@@ -361,9 +361,11 @@
             (list 'let* [species-sym species-expr
                          lanes-sym (list '.length species-sym)
                          n-sym (list 'int bound)]
-                  (list 'if (ix<= n-sym 0)
-                        out
-                        (list 'do
+                  (list 'do
+                        (par/stencil-alias-guard-form out in-arrays)
+                        (list 'if (ix<= n-sym 0)
+                              out
+                              (list 'do
                 ;; Fill boundary elements with boundary value
                         (list 'clojure.core/aset out 0 0.0)
                         (list 'clojure.core/aset out (ix- n-sym 1) 0.0)
@@ -391,7 +393,7 @@
                                             (list 'if (list '< j-sym (list '- n-sym radius))
                                                   (list 'do scalar-aset
                                                         (list 'recur (list 'inc j-sym)))
-                                                  out))))))))))))))
+                                                  out)))))))))))))))
 
 (defn compile-segstencil
   "Compile a scheduled SegStencil without recovering fields from source syntax."
@@ -406,11 +408,6 @@
     :bound (:bound (segop/seg-space-reduced-dim (:space segstencil)))
     :body (:lambda segstencil)
     :elem-type (:dtype segstencil)}))
-
-(defn compile-par-stencil
-  "Compatibility wrapper for a source-shaped raster.par/stencil! form."
-  [form & {:keys [elem-type]}]
-  (compile-stencil-info (par/extract-par-stencil-info form) :elem-type elem-type))
 
 ;; ================================================================
 ;; Pipeline pass: SIMD optimization
@@ -537,17 +534,28 @@
 
               ;; raster.par/stencil!
               (par/par-stencil-form? form)
-              (let [{:keys [cast elem-type]} (par/extract-par-stencil-info form)
+              (let [{:keys [cast elem-type radius]} (par/extract-par-stencil-info form)
                     stencil-dtype (or elem-type (cast->elem-type cast) :double)
                     scheduled (take-bound
                                #(instance? raster.compiler.ir.segop.SegStencil %)
                                stencil-dtype)
-                    simd-form (if scheduled
-                                (compile-segstencil scheduled)
-                                (compile-par-stencil form :elem-type stencil-dtype))]
-                (if simd-form
+                    simd-form (when scheduled (compile-segstencil scheduled))]
+                (cond
+                  simd-form
                   (do (swap! stats update :simd-stencils (fnil inc 0))
                       simd-form)
+
+                  scheduled
+                  (do (swap! stats update :fallback inc)
+                      (par/expand-par-stencil! form))
+
+                  (= 1 radius)
+                  (throw (ex-info "radius-one stencil source has no verified TypedSOAC schedule"
+                                  {:reason :unscheduled-stencil
+                                   :target-dialect :jvm-simd
+                                   :form form}))
+
+                  :else
                   (do (swap! stats update :fallback inc)
                       (par/expand-par-stencil! form))))
 
