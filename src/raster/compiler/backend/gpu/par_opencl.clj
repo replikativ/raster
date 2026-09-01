@@ -29,19 +29,6 @@
 ;; OpenCL-specific helpers (expression emission delegated to c-emit)
 ;; ================================================================
 
-(def ^:private atomic-add-float-helper
-  "OpenCL CAS-loop for float atomic-add (no native float atomic_add in OpenCL 1.x)."
-  "float atomic_add_float(volatile __global float *addr, float val) {
-    int old = *(volatile __global int*)addr;
-    int assumed;
-    do {
-        assumed = old;
-        old = atomic_cmpxchg((volatile __global int*)addr, assumed,
-                              as_int(as_float(assumed) + val));
-    } while (old != assumed);
-    return as_float(old);
-}\n")
-
 (def ^:private rstr-dp4a-helper
   "Portable int8 4-way dot-accumulate helper SOURCE — canonical home is the
    intrinsics registry (:dp4a :c-helper-src); this def just reads it."
@@ -233,7 +220,7 @@
         source (str (codegen/extension-pragmas dtype (when needs-fp64? :double))
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
-                    (when needs-float-atomic? atomic-add-float-helper)
+                    (when needs-float-atomic? ce/opencl-atomic-add-float-helper)
                     ;; registry-owned intrinsic definitions (rstr_dp4a …), defined iff called
                     (ce/intrinsic-helper-sources body-str)
                     "__kernel void " kernel-name
@@ -628,7 +615,7 @@
         needs-float-atomic? (contains? #{:float :double} dtype)
         source (str (codegen/extension-pragmas dtype)
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
-                    (when needs-float-atomic? atomic-add-float-helper)
+                    (when needs-float-atomic? ce/opencl-atomic-add-float-helper)
                     "__kernel void " kernel-name
                     "(__global " ctype "* " out-c
                     ", __global const " ctype "* restrict " src-c
@@ -745,7 +732,7 @@
         ;; Only + is supported for atomic reduce-by-key (most common case)
         source (str (codegen/extension-pragmas dtype)
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
-                    (when needs-float-atomic? atomic-add-float-helper)
+                    (when needs-float-atomic? ce/opencl-atomic-add-float-helper)
                     "__kernel void " kernel-name
                     "(__global " ctype "* " out-c
                     ", __global const int* restrict " keys-c

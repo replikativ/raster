@@ -83,11 +83,39 @@
    :float-min       "fmin"
    :float-suffix?   true})
 
+(def opencl-atomic-add-float-helper
+  "OpenCL 1.x CAS-loop used when the verified array dtype selects float atomic addition."
+  "float atomic_add_float(volatile __global float *addr, float val) {
+    int old = *(volatile __global int*)addr;
+    int assumed;
+    do {
+        assumed = old;
+        old = atomic_cmpxchg((volatile __global int*)addr, assumed,
+                              as_int(as_float(assumed) + val));
+    } while (old != assumed);
+    return as_float(old);
+}\n")
+
 ;; ================================================================
 ;; Dynamic state
 ;; ================================================================
 
 (def ^:dynamic *scalar-type* "double")
+
+(def ^:dynamic *array-dtypes*
+  "Verified array element dtypes supplied by the scheduled ABI. Expression emission consults this
+  only where the target spelling depends on storage type (notably atomics); metadata remains a
+  compatibility fallback for callers that have not bound an ABI map."
+  {})
+
+(defn- array-dtype
+  [array]
+  (or (get *array-dtypes* array)
+      (when (symbol? array)
+        (get *array-dtypes* (symbol (name array))))
+      (when (symbol? array)
+        (dtype/dtype-for-scalar-tag
+         (or (:raster.type/tag (meta array)) (:tag (meta array)))))))
 
 (def ^:dynamic *loop-result-var*
   "When a loop is emitted as a statement-expression value (reduction), the C
@@ -1224,8 +1252,8 @@
            arr-str (c-symbol arr)
            idx-str (emit-expr idx-e idx-sym array-syms opencl-idx)
            val-str (emit-expr val-e idx-sym array-syms opencl-idx)
-           tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))
-           is-float? (contains? #{'floats 'float} tag)
+           array-dtype (array-dtype arr)
+           is-float? (= :float array-dtype)
            atomic-fn (if is-float?
                        (let [f (:atomic-add-float *emit-config*)]
                          (if (= f :cas-helper) "atomic_add_float" f))
@@ -1865,6 +1893,14 @@
                  c-helper-src)))
        distinct
        (str/join "\n")))
+
+(defn helper-sources
+  "Target helper definitions required by an already-emitted C-family body."
+  [body-str]
+  (str (when (and (= :cas-helper (:atomic-add-float *emit-config*))
+                  (str/includes? body-str "atomic_add_float("))
+         opencl-atomic-add-float-helper)
+       (intrinsic-helper-sources body-str)))
 
 (defn generate-c-helper
   "Generate a static C helper function from a GPU-inlinable deftm."

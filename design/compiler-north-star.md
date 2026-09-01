@@ -409,6 +409,15 @@ row gather as ordinary graph dataflow, while chunked paged prefill and cache per
 bulk host/device staging with block scatter/gather. Neither path introduces a decoder, attention,
 page-manager, or quantization primitive into the compiler.
 
+Repeated-destination updates are not smuggled through the unique-write contract. Flat
+`scatter!` and additive `reduce-by-key` now canonicalize to the same proof-carrying TypedSOAC
+scatter: its conflict value records the operator, identity, dtype and checked commutative-monoid
+certificate, while each scalar-region write denotes a contribution. The scalar JVM schedule
+executes exact ordered read/modify/write updates; the portable OpenCL schedule selects typed atomic
+addition and retains an `:inout` ABI. Thus histogram/scatter algebra is independent from the key,
+value and destination layouts. Strided contributions, non-additive atomics, privatized/tiled
+histograms and deterministic floating-point accumulation remain schedule and numerical-policy work.
+
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
 
@@ -973,9 +982,11 @@ The immediate continuation after the verified double-buffered weighted-reduction
    route, including resident block transfers. The public flat `par/gather` spelling now canonicalizes
    to that ordinary typed map: JVM scheduling recognizes an exact stable indirect read and selects
    hardware `vgather`, while C-family targets emit the same SegMap. Kernel-local C names are fresh
-   with respect to the typed ABI, so an index buffer cannot shadow the launch coordinate. Strided
-   gather, reducing/atomic scatter variants, the remaining parallel forms, calibrated whole-graph
-   placement costs, and deletion of the remaining graph/backend fallbacks remain.
+   with respect to the typed ABI, so an index buffer cannot shadow the launch coordinate. Flat
+   additive reducing scatters also carry a checked conflict algebra through this boundary and select
+   exact JVM or atomic OpenCL schedules. Strided gather/scatter, additional atomic monoids,
+   privatized histogram schedules, the remaining parallel forms, calibrated whole-graph placement
+   costs, and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

@@ -958,6 +958,29 @@
                               (when (= cast 'float) :float)
                               :double)))))
 
+(defn compile-effect-segmap
+  "Lower a scheduled explicit-store SegMap to its exact ordered JVM loop.
+
+  Unique stores and reducing scatters share this scalar host schedule. GPU targets may distribute
+  the former and use certified atomics for the latter; the JVM fallback macro is deliberately not
+  run concurrently because its read/modify/write implementation is sequential."
+  [segmap]
+  (when (nil? (:out-sym segmap))
+    (let [index (seg-idx segmap)
+          bound (seg-bound segmap)
+          n-sym (gensym "effect_n__")
+          j-sym (gensym "effect_i__")
+          body (clojure.walk/postwalk
+                (fn [form] (if (= form index) j-sym form))
+                (bc/desugar-invk (:lambda segmap)))]
+      (list 'let* [n-sym (list 'int bound)]
+            (list 'loop* [j-sym '(int 0)]
+                  (list 'if (ix< j-sym n-sym)
+                        (list 'do body
+                              (list 'recur
+                                    (list 'clojure.core/unchecked-inc-int j-sym)))
+                        nil))))))
+
 ;; ================================================================
 ;; SegRed → SIMD (multi-accumulator)
 ;; ================================================================
