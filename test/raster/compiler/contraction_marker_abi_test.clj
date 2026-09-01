@@ -8,6 +8,9 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.par-fusion :as fusion]
@@ -213,26 +216,31 @@
         (is (= :float (:expected scalar-data)))
         (is (= :int (:actual scalar-data)))))))
 
-(deftest compile-gpu-program-extracts-a-real-contraction-as-an-ordered-resident-step
+(deftest compile-gpu-program-extracts-a-real-contraction-as-an-ordered-resident-executable
   (let [descriptor (pipeline/compile-gpu-program #'resident-contract-descriptor-probe
                                                   :ze:0 :dtype :float)
         step (first (:steps descriptor))
+        executable (:artifact step)
         args [(float-array 64) (float-array 64)]
         call-arguments (mapv (fn [{:keys [kind type value-fn]}]
                                (if (= :scalar kind)
                                  {:type type :value (value-fn args)}
                                  (Object.)))
                              (:argument-specs step))
-        call (kcall/make (:artifact step) call-arguments)]
-    (is (= :contract (:convention step)))
+        {:keys [buffers scalar-values]} (kexec/graph-bindings executable call-arguments)
+        call (kgcall/make executable buffers scalar-values)
+        kernel-call (get-in call [:nodes 0 :call])]
+    (is (= :executable (:convention step)))
+    (is (kgraph/kernel-graph? executable)
+        "typed contraction candidates retain their common graph boundary")
     (is (= '[A B C] (mapv (comp :name :slot) (:argument-specs step))))
     (is (= [:input :input :output] (mapv :kind (:argument-specs step))))
     (is (= 'C (:result-sym descriptor)) "the invoke result aliases its ABI :result buffer")
     (is (= {'A :input 'B :input} (:array-roles descriptor)))
     (is (= :float (:dtype (first (:allocs descriptor))))
         "scratch allocation dtype comes from the contraction output ABI")
-    (is (= 64 (kart/attribute (:artifact step) :out-elems)))
-    (is (= 2 (count (get-in call [:geometry :workgroup-size]))))
-    (is (= 2 (count (get-in call [:geometry :group-count]))))
-    (is (every? pos? (get-in call [:geometry :workgroup-size])))
-    (is (every? pos? (get-in call [:geometry :group-count])))))
+    (is (= 64 (kart/attribute (first (kexec/artifacts executable)) :out-elems)))
+    (is (= 2 (count (get-in kernel-call [:geometry :workgroup-size]))))
+    (is (= 2 (count (get-in kernel-call [:geometry :group-count]))))
+    (is (every? pos? (get-in kernel-call [:geometry :workgroup-size])))
+    (is (every? pos? (get-in kernel-call [:geometry :group-count])))))

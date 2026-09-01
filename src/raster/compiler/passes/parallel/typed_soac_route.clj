@@ -4,7 +4,8 @@
    Supported programs are represented and fused in the typed dialect whether or not a fusion
    fires. The resulting functional equations are mechanically projected into the surrounding host
    control expression and retained as first-class algorithms in a ParallelProgram."
-  (:require [raster.compiler.core.dtype :as dtype]
+  (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -262,6 +263,27 @@
          :site [:binding result]
          :source source}))))
 
+(defn- required-host-bindings
+  "Return the transitive source bindings needed by host materialization.
+
+   Typed equations own parallel/scalar computation, but a caller-owned physical destination may
+   retain an ordinary allocation expression. That expression can depend on pure scalar bindings
+   introduced by inlining (for example `size = m*n`). Preserve that dependency closure instead of
+   leaving an alpha-renamed callee parameter free in the reconstructed JVM/C host form. `pairs`
+   contains only bindings without a realized typed equation, so dependency traversal stops at the
+   new semantic boundary instead of resurrecting a fused-away producer."
+  [pairs roots]
+  (let [definitions (into {} (map (fn [[symbol expression]] [symbol expression])) pairs)
+        definition-symbols (set (keys definitions))]
+    (loop [required (set/intersection definition-symbols (set roots))]
+      (let [dependencies
+            (->> required
+                 (mapcat #(util/free-syms (get definitions %)))
+                 set
+                 (set/intersection definition-symbols))
+            required' (set/union required dependencies)]
+        (if (= required required') required (recur required'))))))
+
 (defn- realize-source
   [form program]
   (let [[let-head bindings & body] form
@@ -276,6 +298,13 @@
                          (map :destination
                               (get-in equation-facts [:attributes :result-storage])))))
               (:equations (dialect/facts program)))
+        host-bindings
+        (required-host-bindings
+         (keep-indexed (fn [id pair]
+                         (when (empty? (get by-placement id)) pair))
+                       original-pairs)
+         (set/union physical-destinations
+                    (into #{} (mapcat util/free-syms) body)))
         pairs
         (vec
          (mapcat
@@ -287,7 +316,7 @@
                ;; allocation. Preserve a defining source binding when one exists; dropping it
                ;; leaves CPU-C/JVM materialization with an unbound destination and also loses a
                ;; resident scratch allocation before GPU extraction.
-               (when (and (contains? physical-destinations symbol)
+               (when (and (contains? host-bindings symbol)
                           (empty? (get by-placement id)))
                  [original-pair])
                (mapcat :pairs (get by-placement id)))))

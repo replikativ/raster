@@ -20,8 +20,16 @@
   [value]
   (cond
     (nil? value) []
-    (map? value) [value]
-    (sequential? value) value
+    (and (coll? value) (empty? value)) []
+    (map? value)
+    (if (some #(contains? value %) [:reason :message :leaf :value])
+      [value]
+      (mapcat (fn [[reason count]]
+                (if (and (nat-int? count) (pos? count))
+                  (repeat count {:reason reason})
+                  [{:reason reason :value count}]))
+              value))
+    (sequential? value) (remove #(and (coll? %) (empty? %)) value)
     :else [{:value value}]))
 
 (defn- normalize-decline

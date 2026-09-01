@@ -60,6 +60,28 @@
                                   {:scalar-types {'nrows :long 'width :long}})
                    [:stats :front-end])))))
 
+(deftest devirtualized-output-allocation-is-generated-scaffolding
+  (let [allocation (with-meta
+                     '(.invk raster.arrays/alloc-like_m_array_long-impl x size)
+                     {:raster.op/original 'raster.arrays/alloc-like})
+        source (list 'let*
+                     (vector 'size '(clojure.core/* m n)
+                             'out allocation
+                             'result '(raster.par/map! out i n float
+                                                       (clojure.core/aget x i)))
+                     'result)
+        direct (frontend/form->program
+                source {:dtype :float :array-types {'x :float 'out :float}
+                        :scalar-types {'m :long 'n :long}})
+        routed (route/attempt source :float {'x :float 'out :float}
+                              {:scalar-types {'m :long 'n :long}})]
+    (is (= ['map] (mapv dialect/operation-kind (dialect/equations direct))))
+    (is (= :analyzed-source
+           (get-in routed [:stats :front-end])))
+    (is (= ['size '(clojure.core/* m n)]
+           (vec (take 2 (second (get-in routed [:program :source])))))
+        "host allocation retains the transitive scalar binding that computes its extent")))
+
 (deftest guarded-dense-write-is-an-explicit-inout-map
   (let [program
         (frontend/form->program

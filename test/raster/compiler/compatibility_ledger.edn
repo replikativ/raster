@@ -10,9 +10,11 @@
    :emission {:kernel-count 0 :targets [] :strategies [] :fallback-reasons [] :declines {}}}
 
   :symbolic-dense-contraction-gpu
-  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false :declines {}}
+  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true
+           :declines {[:backend-applied-stats :typed-contraction-dispatch-declines
+                       :typed-contraction-dispatch-dynamic-scalar] 1}}
    :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
-   :lowering {:segops 1 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+   :lowering {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 0
               :backend-reused 1 :backend-relowered 0 :fallback 0}
    :emission {:kernel-count 1 :targets [:opencl-c] :strategies [:portable-segred]
               :fallback-reasons [:symbolic-dims]
@@ -30,11 +32,11 @@
 
   :gqa-causal-mha-gpu
   {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
-           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 6}}
-   :fusion {:vertical 0 :horizontal 1 :iterations 2 :placements 0}
-   :lowering {:segops 2 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
-              :backend-reused 0 :backend-relowered 0 :fallback 0}
-   :emission {:kernel-count 8 :targets [:opencl-c] :strategies []
+           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 2}}
+   :fusion {:vertical 0 :horizontal 2 :iterations 2 :placements 0}
+   :lowering {:segops 5 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 3 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 7 :targets [:opencl-c] :strategies []
               :fallback-reasons [] :declines {}}}
 
   :heat-rhs-1d-jvm

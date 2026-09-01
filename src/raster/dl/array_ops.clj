@@ -331,55 +331,51 @@
 
 ;; ================================================================
 ;; pack-heads / unpack-heads: multi-head attention layout combinators.
-;; Both are parametric (All [T]) and expressed as a resident strided copy:
-;; a `par/map-void!` over the n-heads*seq-len output BLOCKS (one work-item per
-;; [head, seq] block), each copying `head-dim` contiguous elements from the
-;; permuted source offset. Index math is clojure.core integer arithmetic
-;; (quot/rem/*/+ — the flat block coordinate → source/dest offsets), so it
-;; lowers in-kernel; the inner contiguous copy vectorizes on CPU and becomes a
-;; resident :map-void OpenCL kernel on GPU (same shape as par/gather /
-;; kv-append! / the decode kernels). No index table, no atomics — a pure
-;; permutation. pack-heads and unpack-heads are exact duals (the AD templates
-;; below reference each other by name, so the resident rewrite leaves them
-;; untouched).
+;; Both are parametric (All [T]) and expressed as output-element-parallel
+;; permutations. The launch spans seq-len*n-heads*head-dim, so every work item
+;; owns exactly one dense output coordinate and the typed SOAC legality proof is
+;; simply `out[idx]`. Index math is ordinary clojure.core integer arithmetic;
+;; there is no index table, allocation policy, or attention-specific compiler
+;; rule. pack-heads and unpack-heads are exact duals (the AD templates below
+;; reference each other by name, so the resident rewrite leaves them untouched).
 ;; ================================================================
 
 (deftm pack-heads
   "Reshape [seq-len, n-heads*head-dim] (row-major) → [n-heads, seq-len, head-dim]
   so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d].
-  Resident strided copy: work-item e = h*seq-len + s copies a head-dim slab."
+  Resident strided copy: work-item idx = (h*seq-len+s)*head-dim+d owns out[idx]."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-       (let [out (alloc-like x (* seq-len n-heads head-dim))]
-         (par/map-void! e (clojure.core/* n-heads seq-len)
-                        (let [h (quot e seq-len)
-                              s (rem e seq-len)
-                              dst (clojure.core/* e head-dim)
-                              src (clojure.core/+ (clojure.core/* s (clojure.core/* n-heads head-dim))
-                                                  (clojure.core/* h head-dim))]
-                          (loop [d 0]
-                            (if (< d head-dim)
-                              (do (aset out (clojure.core/+ dst d) (aget x (clojure.core/+ src d)))
-                                  (recur (inc d)))
-                              nil))))
-         out)))
+       (let [out (alloc-like x (* seq-len n-heads head-dim))
+             result (par/map! out idx
+                              (clojure.core/* (clojure.core/* n-heads seq-len) head-dim)
+                              nil
+                              (let [^long d (rem idx head-dim)
+                                    ^long e (quot idx head-dim)
+                                    ^long h (quot e seq-len)
+                                    ^long s (rem e seq-len)
+                                    ^long src (clojure.core/+ (clojure.core/* s (clojure.core/* n-heads head-dim))
+                                                              (clojure.core/+ (clojure.core/* h head-dim) d))]
+                                (aget x src)))]
+         result)))
 
 (deftm unpack-heads
   "Dual of pack-heads: [n-heads, seq-len, head-dim] → [seq-len, n-heads*head-dim]:
   out[s*(nh*hd) + h*hd + d] = x[h*seq*hd + s*hd + d].
-  Resident strided copy: work-item e = s*n-heads + h copies a head-dim slab."
+  Resident strided copy: work-item idx = (s*n-heads+h)*head-dim+d owns out[idx]."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-       (let [out (alloc-like x (* seq-len n-heads head-dim))]
-         (par/map-void! e (clojure.core/* seq-len n-heads)
-                        (let [s (quot e n-heads)
-                              h (rem e n-heads)
-                              dst (clojure.core/* e head-dim)
-                              src (clojure.core/* (clojure.core/+ (clojure.core/* h seq-len) s) head-dim)]
-                          (loop [d 0]
-                            (if (< d head-dim)
-                              (do (aset out (clojure.core/+ dst d) (aget x (clojure.core/+ src d)))
-                                  (recur (inc d)))
-                              nil))))
-         out)))
+       (let [out (alloc-like x (* seq-len n-heads head-dim))
+             result (par/map! out idx
+                              (clojure.core/* (clojure.core/* seq-len n-heads) head-dim)
+                              nil
+                              (let [^long d (rem idx head-dim)
+                                    ^long e (quot idx head-dim)
+                                    ^long s (quot e n-heads)
+                                    ^long h (rem e n-heads)
+                                    ^long src (clojure.core/+ (clojure.core/* (clojure.core/+ (clojure.core/* h seq-len) s)
+                                                                              head-dim)
+                                                              d)]
+                                (aget x src)))]
+         result)))
 
 (deftm blit-slab!
   "Copy `len` contiguous elements from `src[0..len)` into `dst[dst-off .. dst-off+len)`.
