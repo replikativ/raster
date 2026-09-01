@@ -76,6 +76,13 @@ that SegRed. The GPU schedules eligible scalar regions as one verified workgroup
 with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and an ordered result ABI;
 the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
 Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
+The public `equation-first/compile` boundary now selects that C-family emitter directly from a
+synthetic or physical OpenCL, CUDA, or HIP target descriptor. Its first hardware-free public
+vertical covers portable SegRed and SegFoldMap KernelBodies, preserves `:fallback :none`, validates
+that every artifact target agrees with the emitted program dialect, and sends the resulting CUDA
+and HIP reduction phases through nvcc/hipcc in CI. Graph families that have not yet acquired a
+portable KernelBody (currently SegMap, SegStencil, and SegScan) fail at this boundary instead of
+embedding OpenCL source in a CUDA/HIP program.
 
 The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
@@ -1073,8 +1080,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. The public flat `par/gather` spelling now canonicalizes
    to that ordinary typed map: JVM scheduling recognizes an exact stable indirect read and selects
-   hardware `vgather`, while C-family targets emit the same SegMap. Kernel-local C names are fresh
-   with respect to the typed ABI, so an index buffer cannot shadow the launch coordinate. Flat
+   hardware `vgather`, while OpenCL emits the same scheduled SegMap. Portable scalar/control
+   KernelBody lowering for SegMap is the remaining step before the public CUDA/HIP C-family entry
+   accepts this graph family. Kernel-local C names are fresh with respect to the typed ABI, so an
+   index buffer cannot shadow the launch coordinate. Flat
    additive reducing scatters also carry a checked conflict algebra through this boundary and select
    exact JVM or atomic OpenCL schedules. Strided gather/scatter, additional atomic monoids,
    privatized histogram schedules, the remaining parallel forms, calibrated whole-graph placement

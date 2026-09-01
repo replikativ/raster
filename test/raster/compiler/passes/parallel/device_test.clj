@@ -11,12 +11,14 @@
   (testing "device ids normalize to backend families"
     (is (= :cpu (device/device-type :cpu:0)))
     (is (= :cuda (device/device-type :cuda:1)))
+    (is (= :hip (device/device-type :hip:2)))
     (is (= :ze (device/device-type :ze:0)))
     (is (= :ocl (device/device-type :ocl:3))))
 
   (testing "bare family keywords still parse when encountered"
     (is (= :cpu (device/device-type :cpu)))
-    (is (= :cuda (device/device-type :cuda)))))
+    (is (= :cuda (device/device-type :cuda)))
+    (is (= :hip (device/device-type :hip)))))
 
 ;; ================================================================
 ;; allocation helpers
@@ -34,6 +36,7 @@
 (deftest select-backend-test
   (testing "explicit device targets win"
     (is (= :cuda (device/select-backend :cuda:0 nil)))
+    (is (= :hip (device/select-backend :hip:0 nil)))
     (is (= :opencl (device/select-backend :ze:0 nil)))
     (is (= :opencl (device/select-backend :ocl:0 nil))))
 
@@ -46,6 +49,7 @@
   (testing "GPU target and dtype helpers centralize target policy"
     (is (true? (device/gpu-target? :ze:0)))
     (is (true? (device/gpu-target? :cuda:0)))
+    (is (true? (device/gpu-target? :hip:0)))
     (is (false? (device/gpu-target? :cpu:0)))
     (is (true? (device/level-zero-target? :ze:0)))
     (is (nil? (device/preferred-dtype :cpu:0)))
@@ -54,6 +58,7 @@
   (testing "runtime backend selection handles device and simd policy"
     (is (= :opencl (device/select-runtime-backend :ze:0 true nil)))
     (is (= :cuda (device/select-runtime-backend :cuda:0 true nil)))
+    (is (= :hip (device/select-runtime-backend :hip:0 true nil)))
     (is (= :simd (device/select-runtime-backend nil true nil)))
     (is (= :scalar (device/select-runtime-backend nil false nil)))))
 

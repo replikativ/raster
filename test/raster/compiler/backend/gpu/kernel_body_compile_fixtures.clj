@@ -1,11 +1,13 @@
 (ns raster.compiler.backend.gpu.kernel-body-compile-fixtures
   "Generate production scheduled KernelBody sources for hardware-free CUDA/HIP CI gates."
   (:require [clojure.java.io :as io]
+            [raster.arrays]
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -18,7 +20,21 @@
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
-            [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.core :refer [deftm]]
+            [raster.numeric]
+            [raster.par]
+            [raster.runtime.hardware :as hardware]))
+
+(deftm public-c-family-dot
+  "Public equation-first workload compiled by nvcc/hipcc without a physical device."
+  (All [T] [left :- (Array T) right :- (Array T) n :- Long] :- Double
+       (raster.par/reduce
+        accumulator 0.0 index n
+        (raster.numeric/+
+         accumulator
+         (raster.numeric/* (raster.arrays/aget left index)
+                           (raster.arrays/aget right index))))))
 
 (defn- reduction-artifact
   [dialect]
@@ -142,6 +158,26 @@
          :descriptor {:device-type :gpu :backend :hip :vendor "AMD"
                       :subgroup-size 32 :max-workgroup-size 1024}}})
 
+(defn- equation-first-artifacts
+  [target descriptor]
+  (let [device-id (keyword (str (name target) ":equation-first-compile-gate"))
+        capabilities (cond-> {:subgroup-sizes [(:subgroup-size descriptor)]
+                              :warp-size (:subgroup-size descriptor)
+                              :max-workgroup-size (:max-workgroup-size descriptor)
+                              :shared-local-memory 65536
+                              :total-eus 64}
+                       (:compute-capability descriptor)
+                       (assoc :compute-capability (:compute-capability descriptor))
+
+                       (= :hip target)
+                       (assoc :gfx-arch :gfx1100))]
+    (hardware/register-target-device!
+     device-id {:type target
+                :name (str "Synthetic " (name target) " public compile gate")
+                :capabilities capabilities})
+    (:kernels (equation-first/compile
+               #'public-c-family-dot {:target device-id :dtype :float}))))
+
 (defn- write-artifact!
   [directory suffix label artifact]
   (let [file (io/file directory (str label suffix))]
@@ -183,7 +219,8 @@
                    plan pipelined-schedule dialect descriptor)
         swizzled-pipelined (attention-emit/emit-fp16-pipelined
                             plan swizzled-pipelined-schedule dialect descriptor)
-        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
+        tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
+        public-artifacts (equation-first-artifacts target descriptor)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
@@ -215,9 +252,15 @@
                            "pipelined_staging"
                            (body-fixtures/pipelined-staging-body 32 :preferred)
                            {:target-dialect dialect :target-features descriptor}))]
-          (map-indexed (fn [index artifact]
-                         (write-artifact! directory suffix (str "tiled-" index) artifact))
-                       (executable/artifacts tiled)))))
+          (concat
+           (map-indexed
+            (fn [index artifact]
+              (write-artifact! directory suffix (str "equation-first-" index) artifact))
+            public-artifacts)
+           (map-indexed
+            (fn [index artifact]
+              (write-artifact! directory suffix (str "tiled-" index) artifact))
+            (executable/artifacts tiled))))))
 
 (defn -main
   [& [root]]

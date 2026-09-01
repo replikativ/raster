@@ -754,6 +754,15 @@
             {:decline (ex-data exception)}))]
     (or
      (:artifact kernel-body-attempt)
+     (when-not (kernel-body-c-dialect/opencl?
+                (kernel-body-c-dialect/resolve! target-dialect))
+       (throw (ex-info
+               "scheduled reduction is outside the portable KernelBody C-family subset"
+               {:reason :kernel-graph-target-lowering-missing
+                :target-dialect target-dialect
+                :operation (:id segred)
+                :kernel-body-decline (:decline kernel-body-attempt)
+                :fallback :none})))
      (let [idx (seg-idx segred)
            bound (seg-bound segred)
            {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
@@ -1258,8 +1267,8 @@
     (finalize-emitted-graph emitted :opencl-c scalar-types)))
 
 (defn- generate-reduction-kernel-graph
-  [graph {:keys [scalar-types array-types]
-          :or {scalar-types {} array-types {}}}]
+  [graph {:keys [scalar-types array-types target-dialect]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
   (let [array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
@@ -1274,24 +1283,46 @@
               (generate-segred-kernel
                operation (first outputs)
                :dtype (:dtype operation)
-               :scalar-types scalar-types :array-types array-types)
+               :scalar-types scalar-types :array-types array-types
+               :target-dialect target-dialect)
               operation))))]
-    (finalize-emitted-graph emitted :opencl-c scalar-types)))
+    (finalize-emitted-graph
+     emitted
+     (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
+     scalar-types)))
 
 (defn- generate-fold-map-kernel-graph
-  [graph {:keys [scalar-types array-types]
-          :or {scalar-types {} array-types {}}}]
-  (let [array-types (graph-array-types graph array-types)
+  [graph {:keys [scalar-types array-types target-dialect]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+  (let [target (kernel-body-c-dialect/resolve! target-dialect)
+        array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
          graph
          (fn [{:keys [operation]}]
-           (kart/certify-scheduled-operation
-            (generate-segfoldmap-kernel
-             operation :scalar-types scalar-types :array-types array-types
-             :kernel-name-prefix "graph_segmented_fold_map")
-            operation)))]
-    (finalize-emitted-graph emitted :opencl-c scalar-types)))
+           (try
+             (kart/certify-scheduled-operation
+              (generate-segfoldmap-kernel
+               operation :scalar-types scalar-types :array-types array-types
+               :target-dialect target-dialect
+               :kernel-name-prefix "graph_segmented_fold_map")
+              operation)
+             (catch clojure.lang.ExceptionInfo exception
+               (if (and (not (kernel-body-c-dialect/opencl? target))
+                        (segfoldmap-body/declined? exception))
+                 (throw (ex-info
+                         "scheduled fold-map is outside the portable KernelBody C-family subset"
+                         {:reason :kernel-graph-target-lowering-missing
+                          :target-dialect target-dialect
+                          :operation (:id operation)
+                          :kernel-body-decline (ex-data exception)
+                          :fallback :none}
+                         exception))
+                 (throw exception))))))]
+    (finalize-emitted-graph
+     emitted
+     (kernel-body-c-dialect/target target)
+     scalar-types)))
 
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
@@ -1300,16 +1331,27 @@
    by scheduling. Unsupported graph families fail loudly; callers never fall back to reconstructing
    an operation from source spelling or node names."
   [graph & {:as opts}]
-  (let [graph (kgraph/validate! graph)]
+  (let [graph (kgraph/validate! graph)
+        target-dialect (get opts :target-dialect :opencl-intel)
+        opencl? (kernel-body-c-dialect/opencl?
+                 (kernel-body-c-dialect/resolve! target-dialect))]
     (cond
       (scan/associative-scan? (get-in graph [:attributes :scan-algebra]))
-      (apply generate-scan-kernel-graph graph (mapcat identity opts))
+      (if opencl?
+        (apply generate-scan-kernel-graph graph (mapcat identity opts))
+        (throw (ex-info "scan graph has no portable KernelBody C-family lowering"
+                        {:reason :kernel-graph-target-lowering-missing
+                         :target-dialect target-dialect :fallback :none})))
 
       (and (seq (:nodes graph))
            (every? #(or (instance? raster.compiler.ir.segop.SegMap (:operation %))
                         (instance? raster.compiler.ir.segop.SegStencil (:operation %)))
                    (:nodes graph)))
-      (generate-elementwise-kernel-graph graph opts)
+      (if opencl?
+        (generate-elementwise-kernel-graph graph opts)
+        (throw (ex-info "elementwise graph has no portable KernelBody C-family lowering"
+                        {:reason :kernel-graph-target-lowering-missing
+                         :target-dialect target-dialect :fallback :none})))
 
       (and (seq (:nodes graph))
            (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
@@ -1322,9 +1364,10 @@
       (generate-fold-map-kernel-graph graph opts)
 
       :else
-      (throw (ex-info "OpenCL backend has no target lowering for scheduled KernelGraph"
+      (throw (ex-info "C-family backend has no target lowering for scheduled KernelGraph"
                       {:reason :kernel-graph-target-lowering-missing
-                       :target :opencl-c
+                       :target-dialect target-dialect
+                       :fallback :none
                        :provenance (:provenance graph)
                        :attributes (:attributes graph)})))))
 
