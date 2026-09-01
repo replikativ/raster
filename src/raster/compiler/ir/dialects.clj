@@ -22,6 +22,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.core.util :as util]
             [clojure.set :as set]))
 
@@ -510,6 +511,25 @@
     (catch clojure.lang.ExceptionInfo e
       {:fail :segop-program :details (ex-data e) :message (.getMessage e)})))
 
+(defn valid-scheduled-program?
+  [value]
+  (or (valid-segop-program? value)
+      (structured-route/valid-scheduled-program? value)))
+
+(defn validate-scheduled-program
+  [value]
+  (cond
+    (valid-segop-program? value) :ok
+    (structured-route/valid-scheduled-program? value) :ok
+    :else {:fail :scheduled-parallel-program
+           :segop (validate-segop-program value)
+           :structured-control
+           (try
+             (structured-route/validate-scheduled-program! value)
+             :ok
+             (catch clojure.lang.ExceptionInfo exception
+               {:details (ex-data exception) :message (.getMessage exception)}))}))
+
 (defn valid-typed-soac-program?
   [value]
   (try
@@ -532,11 +552,14 @@
 
 (defn valid-source-or-typed-soac?
   [value]
-  (or (valid-let*-ordered? value) (valid-typed-soac-program? value)))
+  (or (valid-let*-ordered? value)
+      (valid-typed-soac-program? value)
+      (structured-route/valid-typed-program? value)))
 
 (defn validate-source-or-typed-soac
   [value]
-  (if (valid-typed-soac-program? value)
+  (if (or (valid-typed-soac-program? value)
+          (structured-route/valid-typed-program? value))
     :ok
     (validate-let*-ordered value)))
 
@@ -564,7 +587,7 @@
    :par-fused        [valid-let*-ordered? validate-let*-ordered]
    :soac-fused       [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :materialized     [valid-source-or-typed-soac? validate-source-or-typed-soac]
-   :segop-lowered    [valid-segop-program? validate-segop-program]
+   :segop-lowered    [valid-scheduled-program? validate-scheduled-program]
    :compound-detected [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :gpu-planned      [valid-let*-ordered? validate-let*-ordered]
    :dtype-remapped   [valid-let*-ordered? validate-let*-ordered]

@@ -103,7 +103,7 @@
               (double-array [0.5 0.5])
               (double-array [0.25])
               (double-array [1.0 -1.0])]]
-    (is (= {:segops 2 :kernel-graphs 0 :typed-reused 2
+    (is (= {:segops 2 :kernel-graphs 0 :structured-loops 0 :typed-reused 2
             :typed-scalar-equations 4 :backend-reused 2
             :backend-relowered 0 :fallback 0}
            (:lowering report)))

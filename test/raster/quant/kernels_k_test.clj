@@ -232,7 +232,8 @@
             :declines []}
            (:route projection-report))
         "Q4_K uses the validated typed route rather than compatibility lowering")
-    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+    (is (= {:segops 1 :kernel-graphs 0 :structured-loops 0
+            :typed-reused 1 :typed-scalar-equations 1
             :backend-reused 1 :backend-relowered 0 :fallback 0}
            (:lowering projection-report))
         "the scheduled SegMap is preserved through OpenCL emission")
@@ -256,10 +257,12 @@
                         :typed-validated true :declines []}]
     (is (= expected-route (:route q6-report)))
     (is (= expected-route (:route i8-report)))
-    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 0
+    (is (= {:segops 1 :kernel-graphs 0 :structured-loops 0
+            :typed-reused 1 :typed-scalar-equations 0
             :backend-reused 1 :backend-relowered 0 :fallback 0}
            (:lowering q6-report)))
-    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+    (is (= {:segops 1 :kernel-graphs 0 :structured-loops 0
+            :typed-reused 1 :typed-scalar-equations 1
             :backend-reused 1 :backend-relowered 0 :fallback 0}
            (:lowering i8-report)))
     (is (= '[[[bsums :int] [ds :float] [sc :byte] [wp :int] [xp :int]

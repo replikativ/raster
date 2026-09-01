@@ -13,6 +13,7 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
@@ -75,6 +76,38 @@
 (defn- scheduled-operation?
   [operation]
   (or (schedule/scheduled-loop? operation) (segop/segop-node? operation)))
+
+(declare fail!)
+
+(defn validate-typed-program!
+  "Validate the exact mixed typed algorithm union admitted by this route."
+  [parallel-program]
+  (when-not (= :typed-parallel (:dialect parallel-program))
+    (fail! :structured-control-program-dialect
+           "typed structured-control routing requires :typed-parallel"
+           {:dialect (:dialect parallel-program)}))
+  (program/validate! parallel-program typed-operation? typed-algorithm-boundary?))
+
+(defn valid-typed-program?
+  [parallel-program]
+  (try
+    (boolean (validate-typed-program! parallel-program))
+    (catch clojure.lang.ExceptionInfo _ false)))
+
+(defn validate-scheduled-program!
+  "Validate the exact scheduled loop/SegOp union admitted by this route."
+  [parallel-program]
+  (when-not (= :scheduled-parallel (:dialect parallel-program))
+    (fail! :structured-control-program-dialect
+           "scheduled structured-control routing requires :scheduled-parallel"
+           {:dialect (:dialect parallel-program)}))
+  (program/validate! parallel-program scheduled-operation? scheduled-algorithm-boundary?))
+
+(defn valid-scheduled-program?
+  [parallel-program]
+  (try
+    (boolean (validate-scheduled-program! parallel-program))
+    (catch clojure.lang.ExceptionInfo _ false)))
 
 (defn- merge-values
   [left right]
@@ -173,11 +206,34 @@
        :operation? typed-operation?
        :algorithm? typed-algorithm-boundary?}))))
 
+(defn attempt
+  "Attempt the complete structured-control semantic route.
+
+   Absence means the source is outside the generic counted-loop shape. An unsupported post-loop
+   continuation is an explicit coverage decline and leaves the caller free to preserve the
+   original source; contradictions after certification still escape."
+  [source options]
+  (when-let [decomposition (frontend/form->structured-loop source options)]
+    (try
+      (let [parallel-program (program-envelope decomposition options)
+            equations (:equations parallel-program)]
+        {:program parallel-program
+         :stats {:route :typed-structured-control
+                 :typed-validated true
+                 :structured-loop-equations
+                 (count (filter #(control/loop-program? (:algorithm %)) equations))
+                 :typed-soac-equations
+                 (count (filter #(soac/program-form? (:algorithm %)) equations))}})
+      (catch clojure.lang.ExceptionInfo exception
+        (if (= :structured-control-unsupported-suffix (:reason (ex-data exception)))
+          {:declined (select-keys (ex-data exception) [:reason :suffix-bindings :outer-body])}
+          (throw exception))))))
+
 (defn schedule-program
   "Schedule every typed-control equation through the ordinary loop-body SOAC vertical."
   [parallel-program opts]
   (let [parallel-program
-        (program/validate! parallel-program typed-operation? typed-algorithm-boundary?)
+        (validate-typed-program! parallel-program)
         {:keys [equations values]}
         (reduce
          (fn [{:keys [equations values]} equation]
@@ -219,17 +275,18 @@
                   :values (merge-values values (:values scheduled))}))))
          {:equations [] :values (:values parallel-program)}
          (:equations parallel-program))]
-    (program/make
-     {:dialect :scheduled-parallel
-      :source (:source parallel-program)
-      :values values
-      :inputs (:inputs parallel-program)
-      :equations equations
-      :outputs (:outputs parallel-program)
-      :effects (:effects parallel-program)
-      :diagnostics (:diagnostics parallel-program)
-      :provenance (assoc (:provenance parallel-program)
-                         :target-dialect :scheduled-parallel)
-      :attributes (:attributes parallel-program)
-      :operation? scheduled-operation?
-      :algorithm? scheduled-algorithm-boundary?})))
+    (validate-scheduled-program!
+     (program/make
+      {:dialect :scheduled-parallel
+       :source (:source parallel-program)
+       :values values
+       :inputs (:inputs parallel-program)
+       :equations equations
+       :outputs (:outputs parallel-program)
+       :effects (:effects parallel-program)
+       :diagnostics (:diagnostics parallel-program)
+       :provenance (assoc (:provenance parallel-program)
+                          :target-dialect :scheduled-parallel)
+       :attributes (:attributes parallel-program)
+       :operation? scheduled-operation?
+       :algorithm? scheduled-algorithm-boundary?}))))
