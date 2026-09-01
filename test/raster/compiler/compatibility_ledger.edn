@@ -54,5 +54,12 @@
               :fallback-reasons [] :declines {}}}
 
   :heat-loss-rk4-gpu
-  {:declined {:reason :emitted-parallel-program-call-required
-              :target-dialect :opencl-parallel}}}}
+  {:route {:semantic-dialect :typed-parallel
+           :scheduled-dialect :scheduled-parallel
+           :emitted-dialect :opencl-parallel
+           :fallback :none}
+   :lowering {:nodes 5 :values 5 :instances 1 :program-instances 1
+              :outputs 1 :driver-allocations 0}
+   :emission {:structured-loops-emitted 1
+              :typed-equations-emitted 1
+              :host-scalar-equations 1}}}}

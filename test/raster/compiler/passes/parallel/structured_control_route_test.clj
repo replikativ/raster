@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -301,24 +302,20 @@
                                       [suffix-operation])))))))))
 
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
-  (let [options {:dtype :double :target-device :ze:debug
-                 :source-ns (the-ns 'raster.ode.pde)
-                 :public-parameters '[u0 target alpha inv-dx2 dt nsteps]
-                 :array-types {'u0 :double 'target :double}
-                 :scalar-types {'alpha :double 'inv-dx2 :double
-                                'dt :double 'nsteps :long}}
-        walked (pipeline/get-walked-body #'pde/heat-loss-rk4 :double)
-        source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-        semantic (pipeline/run-passes
-                  source pipeline/gpu-resident-pre-soa-passes options)
-        scheduled (route/schedule-program semantic options)
-        emitted (program-opencl/emit-program scheduled options)
-        emitted-program (:program emitted)
+  (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
+        compilation (equation-first/compile
+                     #'pde/heat-loss-rk4 {:dtype :double :target :ze:debug})
+        semantic (:semantic compilation)
+        scheduled (:scheduled compilation)
+        emitted {:program (:emitted compilation)
+                 :kernels (:kernels compilation)
+                 :stats (get-in compilation [:stats :emission])}
+        emitted-program (:emitted compilation)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
         materialized
         (materialization/materialize
          invocation-plan
-         [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
+         arguments
          evaluate-test-scalar)
         loop-operation (get-in scheduled [:equations 0 :operations 0])
         loop-equation (first (:equations emitted-program))
@@ -356,7 +353,9 @@
                   (:results equation))))
         call (program-call/make emitted-program buffers scalar-values
                                 {loop-output :rk4-carry-scratch} host-evaluator)
-        linked-plan (invocation-link/lower materialized emitted-program :ze:debug host-evaluator)]
+        linked-plan (equation-first/lower compilation arguments)]
+    (is (equation-first/equation-first-compilation? compilation))
+    (is (= :none (get-in compilation [:stats :fallback])))
     (is (= :typed-parallel (:dialect semantic)))
     (is (invocation/invocation-plan? invocation-plan))
     (is (= '[u0 target alpha inv-dx2 dt nsteps]

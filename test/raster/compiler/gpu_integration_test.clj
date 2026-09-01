@@ -6,11 +6,14 @@
 
   Verifies:
     1. Functional correctness against analytical heat equation solution
-    2. GPU compilation fails loudly while structured loops containing SOACs remain debt
-
-  The hardware-free exact debt signature is also recorded in compatibility_ledger.edn."
+    2. The real RK4/PDE workload crosses the public equation-first TypedSOAC compiler
+    3. The resulting allocation-free LinkPlan executes numerically on an available GPU."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.dl.gpu-grad-parity :as gp]))
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.link-plan :as link-plan]
+            [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.link :as gpu-link]
+            [raster.ode.pde :as pde]))
 
 ;; ================================================================
 ;; GPU availability check
@@ -92,15 +95,35 @@
                 (format "%s: CPU=%.10f analytical=%.10f tol=%.6f"
                         label (double cpu-loss) analytical tol))))))))
 
-(deftest gpu-rk4-structured-loop-declines-honestly-test
-  (testing "GPU compilation rejects the unsupported structured SOAC loop"
-    (when-gpu "gpu-rk4-structured-loop-decline"
-              (require '[raster.compiler.pipeline :as pipeline])
-              (require 'raster.ode.pde)
-              (try
-                ((resolve 'raster.compiler.pipeline/compile-aot)
-                 (resolve 'raster.ode.pde/heat-loss-rk4)
-                 {:target-device :ze:0})
-                (is false "RK4 must not compile by deleting its loop or using the legacy compound emitter")
-                (catch clojure.lang.ExceptionInfo exception
-                  (is (= :unscheduled-stencil (:reason (ex-data exception)))))))))
+(deftest gpu-rk4-uses-the-public-equation-first-vertical-test
+  (let [n 64
+        nsteps 3
+        [u0 target alpha inv-dx2 dt] (setup-heat-problem n)
+        arguments [u0 target alpha inv-dx2 dt nsteps]
+        compilation (equation-first/compile
+                     #'pde/heat-loss-rk4 {:target :ze:0 :dtype :double})
+        plan (equation-first/lower compilation arguments)]
+    (testing "compilation and lowering are inspectable and allocate no driver resources"
+      (is (equation-first/equation-first-compilation? compilation))
+      (is (= :typed-parallel (get-in compilation [:semantic :dialect])))
+      (is (= :scheduled-parallel (get-in compilation [:scheduled :dialect])))
+      (is (= :opencl-parallel (get-in compilation [:emitted :dialect])))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (link-plan/link-plan? plan))
+      (is (= 0 (get-in plan [:attributes :driver-allocations])))
+      (is (= 1 (count (:outputs plan)))))
+    (testing "the public LinkPlan executes the same numerical program on an available GPU"
+      (when-gpu "gpu-rk4-equation-first-execution"
+                (let [expected (pde/heat-loss-rk4 (aclone u0) (aclone target)
+                                                  alpha inv-dx2 dt nsteps)
+                      executable (gpu-link/instantiate! plan)]
+                  (try
+                    (gpu-link/run! executable)
+                    (let [actual (double (aget ^doubles
+                                          (gpu-link/download executable
+                                                             (first (:outputs plan)))
+                                               0))]
+                      (is (< (Math/abs (- (double expected) actual)) 1.0e-10)
+                          (format "CPU=%.15g GPU=%.15g" (double expected) actual)))
+                    (finally
+                      (gpu-link/close! executable))))))))

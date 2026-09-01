@@ -1,6 +1,8 @@
 (ns raster.compiler.compatibility-ledger-test
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is use-fixtures]]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.attention :as attention]
             [raster.linalg.contract :as contract]
@@ -40,6 +42,21 @@
    :emission (-> (:emission report)
                  (update :declines #(frequencies-by (juxt :leaf :reason) %)))})
 
+(defn- equation-first-signature
+  [compilation plan]
+  {:route {:semantic-dialect (get-in compilation [:semantic :dialect])
+           :scheduled-dialect (get-in compilation [:scheduled :dialect])
+           :emitted-dialect (get-in compilation [:emitted :dialect])
+           :fallback (get-in compilation [:stats :fallback])}
+   :lowering {:nodes (count (:nodes plan))
+              :values (count (:values plan))
+              :instances (count (:instances plan))
+              :program-instances (count (filter link-plan/program-link-instance?
+                                                (:instances plan)))
+              :outputs (count (:outputs plan))
+              :driver-allocations (get-in plan [:attributes :driver-allocations])}
+   :emission (get-in compilation [:stats :emission])})
+
 (defn- compile-workload
   [id]
   (case id
@@ -61,11 +78,11 @@
     (pipeline/compile-report #'pde/heat-rhs-1d! :dtype :double)
 
     :heat-loss-rk4-gpu
-    (try
-      (pipeline/compile-report #'pde/heat-loss-rk4
-                               :target-device target :dtype :double)
-      (catch clojure.lang.ExceptionInfo exception
-        {:declined (select-keys (ex-data exception) [:reason :target-dialect])}))
+    (let [compilation (equation-first/compile
+                       #'pde/heat-loss-rk4 {:target target :dtype :double})
+          plan (equation-first/lower
+                compilation [(double-array 8) (double-array 8) 0.1 1.0 0.01 3])]
+      (equation-first-signature compilation plan))
 
     (throw (ex-info "compatibility ledger has no workload compiler"
                     {:workload id}))))
@@ -82,7 +99,10 @@
            (set (keys workloads))))
     (doseq [[id expected] workloads]
       (let [report (compile-workload id)
-            actual (if (:declined report) report (signature report))]
+            actual (cond
+                     (:declined report) report
+                     (= :heat-loss-rk4-gpu id) report
+                     :else (signature report))]
         (is (= expected actual)
             (str "compiler compatibility changed for " id
                  "; improve the ledger downward or explain the new debt"))
