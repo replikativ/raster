@@ -246,6 +246,25 @@
     (validate! (update graph :nodes
                        #(mapv (fn [node] (assoc node :operation (f node))) %)))))
 
+(defn dataflow-contract
+  "Project the target-independent buffers, accesses, and ordering of a KernelGraph.
+
+   Operations and the emitted external ABI are deliberately excluded: target lowering replaces
+   the former and constructs the latter. Buffer contracts, node identities, uses, dependencies,
+   and semantic graph effects may not change during that replacement."
+  [graph]
+  (let [graph (validate! graph)]
+    {:inputs (:inputs graph)
+     :outputs (:outputs graph)
+     :temporaries (:temporaries graph)
+     :nodes (mapv #(select-keys % [:id :uses :dependencies]) (:nodes graph))
+     :effects (:effects graph)}))
+
+(defn dataflow-equivalent?
+  "Whether two valid graphs have exactly the same target-independent dataflow contract."
+  [left right]
+  (= (dataflow-contract left) (dataflow-contract right)))
+
 (defn- ordered [xs]
   (vec (sort-by pr-str xs)))
 

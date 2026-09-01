@@ -98,14 +98,16 @@
     (when-not (every? (comp artifact/kernel-artifact? :operation) (:nodes emitted))
       (fail! :structured-loop-emitted-graph
              "structured loop call requires a fully emitted KernelGraph" {}))
-    (when-not (and (= (mapv :id (:nodes (:graph scheduled))) (mapv :id (:nodes emitted)))
+    (when-not (and (graph/dataflow-equivalent? (:graph scheduled) emitted)
                    (every? true?
                            (map (fn [scheduled-node emitted-node]
-                                  (= (get-in emitted-node [:operation :provenance :segop-id])
-                                     (get-in scheduled-node [:operation :id])))
+                                  (= (:operation scheduled-node)
+                                     (get-in emitted-node
+                                             [:operation :provenance
+                                              :scheduled-operation])))
                                 (:nodes (:graph scheduled)) (:nodes emitted))))
       (fail! :structured-loop-emitted-graph
-             "emitted graph identities or semantic provenance differ from the scheduled iteration"
+             "emitted graph dataflow or operation certificates differ from the scheduled iteration"
              {}))
     (when-not (and (integer? trip-count) (not (neg? trip-count)))
       (fail! :structured-loop-trip-count "resolved trip count must be non-negative"

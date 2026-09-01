@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.structured-control-lower-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -67,7 +67,12 @@
     (is (= {:kind :host-repetition :association :sequential}
            (:strategy scheduled)))
     (is (= :typed-soac (get-in scheduled [:attributes :body-dialect])))
-    (is (= scheduled (lower/validate! scheduled)))))
+    (is (= scheduled (lower/validate! scheduled)))
+    (testing "the scheduled graph is re-derived from exact SegOp dataflow"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"storage, uses, or dependencies differ"
+           (lower/validate!
+            (assoc-in scheduled [:graph :inputs 0 :elements] 'different-extent)))))))
 
 (deftest structured-loop-body-dataflow-becomes-one-verified-iteration-graph
   (let [scheduled (lower/schedule (loop-program true) {:target-device :cpu:0 :dtype :float})
@@ -83,6 +88,9 @@
       (is (every? artifact/kernel-artifact? (map :operation (:nodes emitted))))
       (is (= '[u-in u-next alpha-in iteration n-in] (:arguments emitted)))
       (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
+      (is (= (mapv :operation (:nodes graph))
+             (mapv #(get-in % [:operation :provenance :scheduled-operation])
+                   (:nodes emitted))))
       (is (every? #(re-find #"__kernel void graph_segmap" (:source %))
                   (map :operation (:nodes emitted))))
       (let [call (loop-call/make
@@ -101,7 +109,25 @@
                (:buffers (loop-call/iteration-binding call 2))))
         (is (= {:type :int :value 2}
                (get-in (loop-call/iteration-binding call 2)
-                       [:scalar-values 'iteration])))))))
+                       [:scalar-values 'iteration])))
+        (testing "a copied SegOp ID cannot hide a changed operation certificate"
+          (let [tampered (assoc-in emitted
+                                   [:nodes 0 :operation :provenance
+                                    :scheduled-operation :grid :block-size]
+                                   128)]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"operation certificates differ"
+                 (loop-call/validate! (assoc call :graph tampered))))))
+        (testing "target emission cannot change buffers or graph effects"
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"dataflow or operation certificates differ"
+               (loop-call/validate!
+                (assoc call :graph
+                       (assoc-in emitted [:inputs 0 :elements] 'different-extent)))))
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"dataflow or operation certificates differ"
+               (loop-call/validate!
+                (assoc call :graph (assoc emitted :effects {:semantic #{:io}}))))))))))
 
 (deftest zero-trip-loop-returns-the-initial-logical-value-without-scratch
   (let [scheduled (lower/schedule (loop-program) {:target-device :cpu:0 :dtype :float})

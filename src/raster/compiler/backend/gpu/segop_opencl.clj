@@ -1193,7 +1193,11 @@
               :provenance {:dialect :segscan :segop-id (:id operation) :graph-node id}
               :attributes {:phase phase :dtype dtype :scan-mode scan-mode
                            :scan-workgroup scan-workgroup}})))
-        emitted (kgraph/map-operations graph emit-node)]
+        emitted (kgraph/map-operations
+                 graph
+                 (fn [node]
+                   (kart/certify-scheduled-operation
+                    (emit-node node) (:operation node))))]
     (finalize-emitted-graph emitted :opencl-c)))
 
 (defn- generate-elementwise-kernel-graph
@@ -1216,28 +1220,30 @@
         (kgraph/map-operations
          graph
          (fn [{:keys [id operation]}]
-           (cond
-             (instance? raster.compiler.ir.segop.SegMap operation)
-             (if (:out-sym operation)
-               (generate-segmap-kernel
-                operation (:out-sym operation)
-                :dtype (:dtype operation)
-                :scalar-types scalar-types :array-types array-types
-                :kernel-name-prefix "graph_segmap")
-               (generate-explicit-segmap-kernel
-                operation :dtype (:dtype operation)
-                :scalar-types scalar-types :array-types array-types
-                :kernel-name-prefix "graph_segmap_effect"))
+           (kart/certify-scheduled-operation
+            (cond
+              (instance? raster.compiler.ir.segop.SegMap operation)
+              (if (:out-sym operation)
+                (generate-segmap-kernel
+                 operation (:out-sym operation)
+                 :dtype (:dtype operation)
+                 :scalar-types scalar-types :array-types array-types
+                 :kernel-name-prefix "graph_segmap")
+                (generate-explicit-segmap-kernel
+                 operation :dtype (:dtype operation)
+                 :scalar-types scalar-types :array-types array-types
+                 :kernel-name-prefix "graph_segmap_effect"))
 
-             (instance? raster.compiler.ir.segop.SegStencil operation)
-             (generate-segstencil-kernel
-              operation :scalar-types scalar-types :array-types array-types
-              :kernel-name-prefix "graph_segstencil")
+              (instance? raster.compiler.ir.segop.SegStencil operation)
+              (generate-segstencil-kernel
+               operation :scalar-types scalar-types :array-types array-types
+               :kernel-name-prefix "graph_segstencil")
 
-             :else
-             (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
-                             {:reason :kernel-graph-node-target-lowering-missing
-                              :target :opencl-c :node id :operation operation})))))]
+              :else
+              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
+                              {:reason :kernel-graph-node-target-lowering-missing
+                               :target :opencl-c :node id :operation operation})))
+            operation)))]
     (finalize-emitted-graph emitted :opencl-c)))
 
 (defn generate-kernel-graph

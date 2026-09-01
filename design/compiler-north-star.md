@@ -623,6 +623,13 @@ schedule selected only when its participation, memory, and synchronization proof
 vertical consumes scientific time loops, the source-shaped compound detector and handwritten local
 emitter are deleted rather than retained as a compatibility route.
 
+The one-iteration graph is re-derived during validation from the retained TypedSOAC algorithm and
+scheduled SegOps; buffers, storage contracts, uses, hazards, and dependencies cannot be supplied as
+independent claims. Target emission may replace only each scheduled operation. Every resulting
+`KernelArtifact` retains the complete immutable operation it implements, while graph validation
+requires the pre/post-emission dataflow contracts to be identical. A copied operation ID is not an
+emission certificate.
+
 Functionalizing a mutating host loop is deliberately proof-gated. A relational host
 `AbstractValue` refinement records shape equalities exposed by typed length queries, clones,
 same-shaped allocation, and pure maps. A primitive copy becomes a loop-carried state transition
