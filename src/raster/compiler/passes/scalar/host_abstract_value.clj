@@ -44,6 +44,14 @@
                  (= 1 (count arguments)))
         (first arguments)))))
 
+(defn- fresh-allocation-value
+  [source-value shape]
+  (av/tensor
+   {:dtype (:dtype source-value)
+    :shape shape
+    :logical-layout (:logical-layout source-value)
+    :representation (:representation source-value)}))
+
 (defn- array-allocation
   [expression]
   (when (and (seq? expression)
@@ -117,7 +125,17 @@
         alength-array (when alength-expression
                         (first (descriptor/call-args alength-expression)))
         clone-source (source-shaped-allocation expression)
-        allocation (array-allocation expression)]
+        allocation (array-allocation expression)
+        destination-write
+        (cond
+          (par/par-stencil-form? expression)
+          (select-keys (par/extract-par-stencil-info expression)
+                       [:out :bound :cast :elem-type])
+
+          (par/par-map-form? expression)
+          (let [{:keys [out bound cast elem-type offset]}
+                (par/extract-par-map-info expression)]
+            (when-not offset {:out out :bound bound :cast cast :elem-type elem-type})))]
     (cond
       alength-expression
       (let [state (assoc-in state [:values symbol]
@@ -128,8 +146,9 @@
       clone-source
       (if-let [source-value (get values clone-source)]
         (assoc-in state [:values symbol]
-                  (assoc source-value :shape (canonical-shape (:equalities state)
-                                                              (:shape source-value))))
+                  (fresh-allocation-value
+                   source-value
+                   (canonical-shape (:equalities state) (:shape source-value))))
         state)
 
       allocation
@@ -146,6 +165,20 @@
         (when (and elem-type cast-dtype (not= elem-type cast-dtype))
           (throw (ex-info "parallel map element type disagrees with its explicit cast"
                           {:reason :host-abstract-value-pmap-dtype
+                           :element-type elem-type :cast-dtype cast-dtype
+                           :expression expression})))
+        (assoc-in state [:values symbol]
+                  (tensor (or elem-type cast-dtype default-dtype)
+                          [(or (shape-extent state bound) bound)])))
+
+      destination-write
+      (let [{:keys [bound cast elem-type]} destination-write
+            cast-dtype (some-> cast descriptor/cast-result-tag
+                               dtype/dtype-for-scalar-tag)
+            elem-type (some-> elem-type dtype/canon)]
+        (when (and elem-type cast-dtype (not= elem-type cast-dtype))
+          (throw (ex-info "parallel write element type disagrees with its explicit cast"
+                          {:reason :host-abstract-value-write-dtype
                            :element-type elem-type :cast-dtype cast-dtype
                            :expression expression})))
         (assoc-in state [:values symbol]
@@ -222,3 +255,34 @@
                  (= source-shape destination-shape [copied-extent]))
         {:source source :destination destination :extent copied-extent
          :dtype (:dtype source-value)}))))
+
+(defn full-array-write
+  "Return a certified descriptor for one complete rank-one destination-writing SOAC.
+
+   This is a storage proof, not an operation-name inference rule: the parallel dialect extractor
+   supplies the destination and iteration extent, while retained AbstractValues prove that the
+   operation covers the destination's complete logical storage contract. Offset maps deliberately
+   remain outside this proof."
+  [analysis result expression]
+  (let [{:keys [out bound kind]}
+        (cond
+          (par/par-stencil-form? expression)
+          (assoc (select-keys (par/extract-par-stencil-info expression) [:out :bound])
+                 :kind :stencil)
+
+          (par/par-map-form? expression)
+          (let [{:keys [out bound offset]} (par/extract-par-map-info expression)]
+            (when-not offset {:out out :bound bound :kind :map}))
+
+          :else nil)
+        destination-value (get-in analysis [:values out])
+        result-value (get-in analysis [:values result])
+        destination-shape (value-shape analysis destination-value)
+        result-shape (value-shape analysis result-value)
+        write-extent (shape-extent analysis bound)]
+    (when (and (symbol? out) (symbol? result)
+               (= :tensor (:kind destination-value) (:kind result-value))
+               (av/storage-contract-compatible? destination-value result-value)
+               (= 1 (count destination-shape) (count result-shape))
+               (= destination-shape result-shape [write-extent]))
+      {:destination out :extent write-extent :dtype (:dtype destination-value) :kind kind})))
