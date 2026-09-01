@@ -7,6 +7,7 @@
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
@@ -18,7 +19,8 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
-            [raster.compiler.passes.parallel.structured-control-route :as structured-route]))
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
 (defn- fail!
   [reason message data]
@@ -64,7 +66,29 @@
      scheduled-graph
      :scalar-types (merge (:scalar-types opts) types)
      :array-types (:array-types opts)
-     :target-dialect (get opts :target-dialect :opencl-intel))))
+     :target-dialect (get opts :target-dialect :opencl-intel)
+     :target-device (:target-device opts)
+     :contraction-facts (:contraction-facts opts))))
+
+(defn- contraction-facts-by-operation
+  "Project typed contraction facts once at the algorithm/schedule boundary.
+
+   The target emitter receives verified facts keyed by the immutable SegRed identity; it never
+   reparses retained Clojure source or guesses that an arbitrary segmented reduction is GEMM."
+  [algorithm operations]
+  (let [equations (into {} (map (juxt second identity)) (soac/equations algorithm))]
+    (into {}
+          (keep (fn [operation]
+                  (when (= :contraction (:phase operation))
+                    (let [equation (or (get equations (:id operation))
+                                       (fail! :c-family-contraction-equation
+                                              "scheduled contraction lacks its typed equation"
+                                              {:operation (:id operation)}))]
+                      [(:id operation)
+                       (contraction-facts/from-components
+                        (typed-projection/segmented-reduce-contract-components
+                         algorithm equation))]))))
+          operations)))
 
 (defn- target-program-dialect
   [target-dialect]
@@ -115,7 +139,12 @@
                                graph-contract
                                (assoc :provenance (:provenance graph-contract)
                                       :attributes (:attributes graph-contract))))
-            emitted (emit-graph scheduled-graph (:values body) (:operations equation) opts)]
+            operations (:operations equation)
+            contraction-facts (contraction-facts-by-operation algorithm operations)
+            emitted (emit-graph scheduled-graph (:values body) operations
+                                (cond-> opts
+                                  (seq contraction-facts)
+                                  (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations
                [(emitted-equation/make algorithm body emitted {:provenance provenance})]))
 

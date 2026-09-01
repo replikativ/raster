@@ -6,6 +6,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.contract-lower :as lower]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
@@ -47,6 +48,9 @@
     (is (body/kernel-body? kernel))
     (is (= :sequential-segments (get-in kernel [:schedule :strategy])))
     (is (= [256] (get-in kernel [:launch :workgroup-size])))
+    (is (= [1]
+           (mapv #(launch/resolve-expression {'m 7} %)
+                 (get-in kernel [:launch :group-count]))))
     (is (= '[A x y k m _nseg] (mapv :id (:parameters kernel))))
     (is (= [:input :input :output :scalar :scalar :scalar]
            (mapv :kind (:parameters kernel))))
@@ -153,6 +157,17 @@
                   (throw (ex-info "legacy source template was called" {})))]
     (is (= :portable-segred
            (:strategy (route/route-contraction matvec :dtype :float :desc {}))))))
+
+(deftest full-reduction-emitter-refuses-a-segmented-space
+  (let [verified (facts/contraction-facts matvec :dtype :float)
+        segmented (lower/contract-form->segred matvec :dtype :float :facts verified)
+        failure (try
+                  (emit/generate-segred-kernel segmented 'y :dtype :float)
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception
+                    (ex-data exception)))]
+    (is (= :segmented-reduction-requires-contraction-schedule (:reason failure)))
+    (is (= :none (:fallback failure)))))
 
 (deftest flattened-symbolic-reduction-extents-remain-in-the-typed-abi
   (let [form '(raster.par/contract y [[i m]] [[l1 k1] [l2 k2]]

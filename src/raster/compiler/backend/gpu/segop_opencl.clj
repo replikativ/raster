@@ -27,6 +27,7 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
@@ -770,6 +771,11 @@
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
+  (when (seq (segop/seg-space-segment-dims (:space segred)))
+    (throw (ex-info
+            "segmented reductions require a verified contraction schedule"
+            {:reason :segmented-reduction-requires-contraction-schedule
+             :operation (:id segred) :fallback :none})))
   (let [_certified-plan
         ;; Both emitters reassociate the fold. Prove the concrete scheduled scalar region before
         ;; either route is selected; a KernelBody coverage decline must never become permission
@@ -1169,9 +1175,12 @@
             operation)))]
     (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
+(declare generate-contraction-kernel-artifact)
+
 (defn- generate-reduction-kernel-graph
-  [graph {:keys [scalar-types array-types target-dialect]
-          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel
+               contraction-facts {}}}]
   (let [array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
@@ -1183,11 +1192,30 @@
                                {:reason :kernel-graph-reduction-output
                                 :target :opencl-c :node id :outputs outputs})))
              (kart/certify-scheduled-operation
-              (generate-segred-kernel
-               operation (first outputs)
-               :dtype (:dtype operation)
-               :scalar-types scalar-types :array-types array-types
-               :target-dialect target-dialect)
+              (if (seq (segop/seg-space-segment-dims (:space operation)))
+                (let [facts (or (get contraction-facts (:id operation))
+                                (throw (ex-info
+                                        "segmented reduction lacks verified contraction facts"
+                                        {:reason :kernel-graph-segmented-reduction-facts
+                                         :operation (:id operation) :fallback :none})))
+                      descriptor (hw/descriptor-for target-device)
+                      planned (contraction-schedule/plan-portable-body
+                               facts operation descriptor
+                               {:array-types array-types :scalar-types scalar-types})]
+                  (when-not (:ok planned)
+                    (throw (ex-info
+                            "segmented reduction has no portable KernelBody schedule"
+                            {:reason :kernel-graph-segmented-reduction-body
+                             :operation (:id operation) :schedule-decline planned
+                             :fallback :none})))
+                  (generate-contraction-kernel-artifact
+                   (:body planned) :target-dialect target-dialect
+                   :kernel-name-prefix "graph_contraction"))
+                (generate-segred-kernel
+                 operation (first outputs)
+                 :dtype (:dtype operation)
+                 :scalar-types scalar-types :array-types array-types
+                 :target-dialect target-dialect))
               operation))))]
     (finalize-emitted-graph
      emitted
@@ -1328,6 +1356,40 @@
      :output output
      :kernel-body kernel-body
      :launch (:launch kernel-body)}))
+
+(defn generate-contraction-kernel-artifact
+  "Emit one portable contraction KernelBody as a complete executable compiler value."
+  [kernel-body & {:keys [kernel-name-prefix target-dialect]
+                  :or {kernel-name-prefix "contract" target-dialect :opencl-intel}}]
+  (let [kernel-body (kbody/validate! kernel-body)
+        emitted (generate-contraction-kernel-body
+                 kernel-body :kernel-name-prefix kernel-name-prefix
+                 :target-dialect target-dialect)
+        launch-segment-count (get-in kernel-body [:attributes :launch-segment-count])
+        arguments (mapv (fn [parameter]
+                          (if (= '_nseg (:id parameter)) launch-segment-count (:id parameter)))
+                        (:parameters kernel-body))]
+    (kart/make
+     {:kernel-name (:kernel-name emitted)
+      :target (:target emitted)
+      :source (:source emitted)
+      :abi (:abi emitted)
+      :arguments arguments
+      :launch (:launch emitted)
+      :effects {:kind :pure-contraction}
+      :provenance {:dialect :kernel-body
+                   :source-dialect :segcontract
+                   :segop-id (get-in kernel-body [:provenance :segop-id])}
+      :attributes {:array-params (:array-params emitted)
+                   :scalar-params (:scalar-params emitted)
+                   :epilogue-operands (:epilogue-operands emitted)
+                   :epilogue-scalars (:epilogue-scalars emitted)
+                   :written-arrays #{(:output emitted)}
+                   :kernel-body kernel-body
+                   :strategy (get-in kernel-body [:schedule :strategy])
+                   :out-elems launch-segment-count
+                   :emission-route :kernel-body
+                   :target-dialect target-dialect}})))
 
 (defn generate-segmented-reduce-kernel
   "NAIVE segmented reduction (a contraction) → OpenCL. One work-item per SEGMENT (free-axis

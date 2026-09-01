@@ -20,10 +20,8 @@
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
               :host-scalar-equations 0
-              :emission-routes {:verified-segred-opencl 1}
-              :kernel-body-declines
-              {[:segred-kernel-body-declined :unbound-index-symbol
-                :verified-segred-opencl] 1}}}
+              :emission-routes {:kernel-body 1}
+              :kernel-body-declines {}}}
 
   :q4k-dp4a-rows-gpu
   {:route {:semantic-dialect :typed-parallel

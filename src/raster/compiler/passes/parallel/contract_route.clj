@@ -88,9 +88,11 @@
     :source source
     :abi abi
     :arguments arguments
-    :launch (klaunch/spec
-             {:workgroup-size (mapv launch-dimension wg)
-              :group-count (mapv launch-dimension grid)})
+    :launch (if (= :portable-segred strategy)
+              (get-in descriptor [:kernel-body :launch])
+              (klaunch/spec
+               {:workgroup-size (mapv launch-dimension wg)
+                :group-count (mapv launch-dimension grid)}))
     :temporaries []
     :effects {:kind :tensor-contraction}
     :provenance {:dialect :segcontract :strategy strategy}
