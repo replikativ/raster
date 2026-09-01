@@ -6,7 +6,7 @@
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true :declines {}}
    :fusion {:vertical 1 :horizontal 0 :iterations 2 :placements 0}
    :lowering {:segops 2 :kernel-graphs 0 :typed-reused 2 :typed-scalar-equations 4
-              :backend-reused 2 :backend-relowered 2 :fallback 2}
+              :backend-reused 2 :backend-relowered 0 :fallback 0}
    :emission {:kernel-count 0 :targets [] :strategies [] :fallback-reasons [] :declines {}}}
 
   :symbolic-dense-contraction-gpu

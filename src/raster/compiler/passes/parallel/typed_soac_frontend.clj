@@ -263,6 +263,9 @@
   (cond
     (par/par-map-pure-form? expression)
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
+          elem-type (dtype/canon (or elem-type
+                                     (dtype/dtype-for-scalar-tag cast)
+                                     default-dtype))
           io (extract-io body idx [symbol])]
       (merge {:kind :map :id id :sym symbol :results [symbol]
               :index idx :extent bound :locals [] :casts [cast] :bodies [body]
@@ -272,6 +275,9 @@
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
           (par/extract-par-map-info expression)
+          elem-type (dtype/canon (or elem-type
+                                     (dtype/dtype-for-scalar-tag cast)
+                                     default-dtype))
           io (extract-io body idx [out])]
       ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
       ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
@@ -725,11 +731,17 @@
      (if (par/par-reduce-form? form)
        (let [{:keys [acc init idx bound body elem-type]}
              (par/extract-par-reduce-info form)
-             fold-dtype (dtype/canon (or elem-type default-dtype :double))]
+             fold-dtype (dtype/canon (or elem-type default-dtype :double))
+             algebra (when (and (symbol? acc) (symbol? idx))
+                       (try
+                         (scan/certify {:acc acc :init init :lambda body} fold-dtype)
+                         (catch clojure.lang.ExceptionInfo _ nil)))]
          (if (and (symbol? acc) (symbol? idx) (dialect/scalar-literal? init))
            (list 'fold
-                 {:accumulator acc :index idx :identity init :dtype fold-dtype
-                  :extent bound :association :ordered}
+                 (cond-> {:accumulator acc :index idx :identity init :dtype fold-dtype
+                          :extent bound
+                          :association (if algebra :implementation-defined :ordered)}
+                   algebra (assoc :algebra algebra))
                  (dialect/lambda-form [acc idx] [body]))
            form))
        form))

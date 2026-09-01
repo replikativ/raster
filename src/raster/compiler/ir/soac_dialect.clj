@@ -306,7 +306,11 @@
          (true? (get-in value [:algebra :associative?])))))
 
 (defn fold-attributes?
-  "Attributes of one sequential, loop-carried fold inside a segmented fold-map."
+  "Attributes of one loop-carried scalar fold.
+
+   Ordered folds preserve the source recurrence.  Implementation-defined
+   association is admitted only with the same checked monoid certificate used
+   by parallel scans; this is the proof that permits target reassociation."
   [value]
   (and (map? value)
        (symbol? (:accumulator value))
@@ -316,7 +320,9 @@
        (dtype/known? (:dtype value))
        (= (:dtype value) (dtype/canon (:dtype value)))
        (or (extent? (:extent value)) (seq? (:extent value)))
-       (= :ordered (:association value))))
+       (or (= :ordered (:association value))
+           (and (= :implementation-defined (:association value))
+                (scan-ir/associative-scan? (:algebra value))))))
 
 (defn segmented-fold-map-attributes?
   "Attributes for independent segments containing dependent ordered folds and a final dense map."
@@ -1004,6 +1010,11 @@
                                       :unbound unbound}))
                             (conj bound id)))
                         bound fold-locals)]
+            (when-not (= :ordered (:association attributes))
+              (fail! :typed-soac-segmented-fold-map-association
+                     "segmented fold-map folds must preserve declared order"
+                     {:equation equation-id :fold ordinal
+                      :association (:association attributes)}))
             (let [unbound-extent
                   (set/difference (util/free-syms (:extent attributes))
                                   (set/union segment-indices (set captures)))]
