@@ -178,7 +178,14 @@
       (set/difference
        (reduce set/union #{} (map util/free-syms expressions))
        arrays axis-indices))
-    (or (:scalars operation) #{})))
+    (let [space (:space operation)
+          axes (into #{(:flat-idx space)} (map :name) (:dims space))
+          arrays (set/union (operation-inputs operation) (operation-outputs operation))
+          extent-expressions (cond-> (mapv :bound (:dims space))
+                               (:extent operation) (conj (:extent operation)))
+          extent-scalars (reduce set/union #{} (map util/free-syms extent-expressions))]
+      (set/union (or (:scalars operation) #{})
+                 (set/difference extent-scalars arrays axes)))))
 
 (defn segop-grid
   "Get the KernelGrid from a SegOp."

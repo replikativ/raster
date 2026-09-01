@@ -167,15 +167,16 @@
         (mapv (fn [slot argument]
                 (if (= :scalar (:kind slot))
                   (let [value (checked-scalar values argument (get scalars argument))]
-                    (when-not (= (dtype/canon (:kernel-dtype slot))
+                    (when-not (= (dtype/canon (:dtype slot))
                                  (dtype/canon (:type value)))
                       (fail! :emitted-program-scalar-abi
-                             "runtime scalar dtype differs from the emitted graph ABI"
+                             "runtime scalar dtype differs from the logical graph ABI"
                              {:equation (:id equation) :value argument
-                              :expected (:kernel-dtype slot) :actual (:type value)}))
+                              :expected (:dtype slot) :actual (:type value)}))
                     value)
                   (require-buffer buffers argument :equation-interface)))
               (:abi graph) (:arguments graph))
+        runtime-arguments (executable/typed-runtime-arguments graph runtime-arguments)
         bindings (executable/graph-bindings graph runtime-arguments)
         outputs (select-keys buffers (:results equation))]
     {:call (validate-equation-call!

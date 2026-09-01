@@ -54,27 +54,37 @@
 
 (defn- preparation-plan
   [call execution-id]
-  (reduce
-   (fn [{:keys [entries step-keys] :as plan} [step-index step]]
-     (cond
-       (program-call/evaluated-host-equation? step)
-       plan
+  (let [program-scalars (:scalar-values call)
+        plan
+        (reduce
+         (fn [{:keys [entries step-keys] :as plan} [step-index step]]
+           (cond
+             (program-call/evaluated-host-equation? step)
+             plan
 
-       (program-call/emitted-equation-call? step)
-       (let [key [:parallel-program execution-id step-index]]
-         {:entries (conj entries
-                         {:key key :graph (:graph step)
-                          :buffers (:buffers step)
-                          :scalar-values (:scalar-values step)})
-          :step-keys (assoc step-keys step-index key)})
+             (program-call/emitted-equation-call? step)
+             (let [key [:parallel-program execution-id step-index]]
+               {:entries (conj entries
+                               {:key key :graph (:graph step)
+                                :buffers (:buffers step)
+                                :scalar-values (:scalar-values step)})
+                :step-keys (assoc step-keys step-index key)})
 
-       (loop-call/structured-loop-call? step)
-       (let [{:keys [bindings] loop-entries :entries}
-             (loop-staging-plan step execution-id step-index)]
-         {:entries (into entries loop-entries)
-          :step-keys (assoc step-keys step-index bindings)})))
-   {:entries [] :step-keys {}}
-   (map-indexed vector (:steps call))))
+             (loop-call/structured-loop-call? step)
+             (let [{:keys [bindings] loop-entries :entries}
+                   (loop-staging-plan step execution-id step-index)]
+               {:entries (into entries loop-entries)
+                :step-keys (assoc step-keys step-index bindings)})))
+         {:entries [] :step-keys {}}
+         (map-indexed vector (:steps call)))]
+    ;; Kernel-local maps deliberately contain only ABI scalars. Program-wide shape values still
+    ;; participate in graph buffer extents, including intermediate tensors consumed by a later
+    ;; equation, so retain them while staging. A local target-width cast remains authoritative.
+    (update plan :entries
+            (fn [entries]
+              (mapv #(update % :scalar-values
+                             (fn [local] (merge program-scalars local)))
+                    entries)))))
 
 (defn staging-plan
   "Return the bounded set of distinct graph bindings to prepare without contacting a driver.

@@ -99,3 +99,29 @@
   "Whether two validated AbstractValues have the same logical raw-storage contract."
   [left right]
   (= (storage-contract left) (storage-contract right)))
+
+(defn- unknown-dimension?
+  [dimension]
+  (and (seq? dimension) (= 'unknown-dimension (first dimension)) (= 2 (count dimension))))
+
+(defn merge-refinement
+  "Join two facts for the same SSA value when they differ only by unknown shape dimensions.
+
+   A concrete/static/symbolic dimension refines `(unknown-dimension id)`; two distinct known
+   dimensions remain a contradiction. All non-shape AbstractValue facets must agree exactly, so
+   this is a checked information refinement rather than dtype/layout/ownership inference. Returns
+   nil when neither value refines the other."
+  [left right]
+  (let [left (validate! left)
+        right (validate! right)]
+    (when (and (= (assoc left :shape []) (assoc right :shape []))
+               (= (count (:shape left)) (count (:shape right))))
+      (let [shape (mapv (fn [left-dimension right-dimension]
+                          (cond
+                            (= left-dimension right-dimension) left-dimension
+                            (unknown-dimension? left-dimension) right-dimension
+                            (unknown-dimension? right-dimension) left-dimension
+                            :else ::conflict))
+                        (:shape left) (:shape right))]
+        (when-not (some #{::conflict} shape)
+          (assoc left :shape shape))))))

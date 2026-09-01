@@ -29,6 +29,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
+            [raster.nn :as nn]
             [raster.ode.pde :as pde]))
 
 (defn- evaluate-test-scalar-expression [expression operands]
@@ -456,6 +457,32 @@
           remapped (program-call/map-buffers call mapping)]
       (is (every? (set (vals mapping)) (vals (:outputs remapped)))
           "the rank-zero GPU reduction result remains resident storage during remapping"))))
+
+(deftest loop-free-mlp-shares-the-public-equation-first-vertical
+  (let [arguments [(double-array [1.0 0.0 0.0 1.0])
+                   (double-array [0.0 0.0])
+                   (double-array [0.5 0.5])
+                   (double-array [0.25])
+                   (double-array [1.0 -1.0])]
+        compilation (equation-first/compile #'nn/predict-fn {:target :ze:0})
+        semantic (:semantic compilation)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])
+        linked-plan (equation-first/lower compilation arguments)
+        call (get-in linked-plan [:instances 0 :call])
+        staging (program-runtime/staging-plan call :loop-free-mlp)
+        first-layer-rows (first (get-in semantic [:values 'b1 :shape]))
+        host-equation (first (filter #(true? (get-in % [:attributes :host-only]))
+                                     (get-in compilation [:scheduled :equations])))]
+    (is (= :typed-parallel (:dialect semantic)))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
+    (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
+    (is (= [first-layer-rows] (:operands host-equation))
+        "the second layer consumes the certified intermediate extent, not a device alength")
+    (is (= 2 (count staging)))
+    (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
+        "program shape facts remain available when a later kernel has no ABI use for them")
+    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))
 
 (defn- prepared-mixed-call
   ([trip-count]

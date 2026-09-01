@@ -89,8 +89,13 @@
                                             (dissoc options :target))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         semantic (pipeline/run-passes source pipeline/gpu-resident-pre-soa-passes
-                                       compiler-options)
+         semantic-candidate (pipeline/run-passes
+                             source pipeline/gpu-resident-pre-soa-passes compiler-options)
+         semantic (case (:dialect semantic-candidate)
+                    :typed-parallel semantic-candidate
+                    :typed-soac (structured-route/promote-soac-program
+                                 semantic-candidate compiler-options)
+                    semantic-candidate)
          _ (when-not (= :typed-parallel (:dialect semantic))
              (fail! :equation-first-coverage
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
@@ -139,10 +144,15 @@
         materialized
         (materialization/materialize
          invocation-plan (vec arguments)
-         (partial scalar/evaluate-invocation-step source-ns))]
+         (partial scalar/evaluate-invocation-step source-ns))
+        buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
+                            (:program-buffers materialized))
+        evaluate-host (fn [equation context]
+                        (scalar/evaluate-host-equation
+                         source-ns equation (assoc context :buffer-shapes buffer-shapes)))]
     (invocation-link/lower
      materialized (:emitted compilation) (:target compilation)
-     (partial scalar/evaluate-host-equation source-ns))))
+     evaluate-host)))
 
 (defn compile-link-plan
   "Convenience composition of `compile` and `lower`; still performs no runtime allocation."

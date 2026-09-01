@@ -47,6 +47,19 @@
                :at-least :subgroup-score-reuse
                :otherwise :reference}}))
 
+(deftest logical-scalars-narrow-only-at-the-target-abi
+  (let [narrowed (assoc-in reference [:abi 2 :kernel-dtype] :int)]
+    (is (= {:type :int :value 64}
+           (last (kexec/typed-runtime-arguments
+                  narrowed [:x :out {:type :long :value 64}]))))
+    (is (thrown? ArithmeticException
+                 (kexec/typed-runtime-arguments
+                  narrowed [:x :out {:type :long :value (inc (long Integer/MAX_VALUE))}])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"wrong logical ABI dtype"
+         (kexec/typed-runtime-arguments
+          narrowed [:x :out {:type :int :value 64}])))))
+
 (defn- staged-graph
   []
   (let [temporary 'dispatch-temporary
@@ -240,7 +253,7 @@
        (fn [_ function-name]
          (case function-name
            "kernel-dispatch-registry-entry" #(when (= % "staged-graph-dispatch")
-                                                graph-dispatch)
+                                               graph-dispatch)
            "device-buffer?" (constantly false)
            (throw (ex-info "unexpected runtime resolution" {:function function-name}))))
        #'gpu/with-gpu-session*
