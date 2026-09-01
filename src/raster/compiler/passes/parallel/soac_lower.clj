@@ -24,7 +24,8 @@
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
+            [raster.compiler.passes.parallel.execution-plan :as execution-plan]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]))
 
 (declare lower-reduce)
 (declare lower-map)
@@ -786,9 +787,27 @@
               phase-2-space (segop/make-seg-space phase-2-idx (:num-blocks grid-1))
               grid-2 (single-block-grid grid-1)
               level-2 (segop/->SegLevel :block :none)
+              {:keys [operator identity accumulator]} (segred-body/scalar-plan phase-1)
+              combine-op ({:+ 'clojure.core/+
+                           :* 'clojure.core/*
+                           :min 'clojure.core/min
+                           :max 'clojure.core/max} operator)
+              component (first (:components reduction))
+              phase-2-reduction
+              (reduction/scalar
+               {:accumulator accumulator
+                :neutral identity
+                :dtype (:dtype component)
+                :result (:sym soac)
+                :index phase-2-idx
+                :step-result (list combine-op accumulator
+                                   (list 'clojure.core/aget partials-sym phase-2-idx))
+                :algebra (:algebra reduction)
+                :attributes (assoc (:attributes reduction)
+                                   :physical-phase :cross-block)})
               phase-2 (segop/->SegRed (+ (:id soac) 1000)
                                       phase-2-space level-2
-                                      reduction nil
+                                      phase-2-reduction nil
                                       #{partials-sym} #{(:sym soac)}
                                       #{} grid-2 :cross-block nil
                                       dtype)]

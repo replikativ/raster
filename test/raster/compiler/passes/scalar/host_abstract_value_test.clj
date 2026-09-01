@@ -28,6 +28,8 @@
     (is (= ['n] (get-in analysis [:values 'u :shape])))
     (is (= ['n] (get-in analysis [:values 'scratch :shape])))
     (is (= ['n] (get-in analysis [:values 'next :shape])))
+    (is (= 'n (get-in analysis [:equalities '(clojure.core/alength u)]))
+        "the syntax extent used by TypedSOAC retains its relational shape proof")
     (is (= {:source 'next :destination 'u :extent 'n :dtype :double}
            (host-av/full-array-copy analysis copy-expression)))))
 
@@ -69,6 +71,18 @@
     (is (= :float (get-in analysis [:values 'y :dtype])))
     (is (= ['n] (get-in analysis [:values 'y :shape])))
     (is (nil? (get-in analysis [:values 'unknown])))))
+
+(deftest retained-scalar-metadata-is-propagated-without-operator-inference
+  (let [binding (with-meta 'derived {:raster.type/tag 'double})
+        expression (with-meta '(unknown.library/scalar-op input) {:tag 'double})
+        analysis (host-av/analyze
+                  (list 'let* [binding expression
+                               'untyped '(unknown.library/scalar-op input)]
+                        binding)
+                  {})]
+    (is (= {:kind :tensor :dtype :double :shape []}
+           (select-keys (get-in analysis [:values binding]) [:kind :dtype :shape])))
+    (is (nil? (get-in analysis [:values 'untyped])))))
 
 (deftest complete-parallel-writes-retain-their-destination-contract
   (let [source

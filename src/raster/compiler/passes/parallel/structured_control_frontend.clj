@@ -56,13 +56,14 @@
 
 (defn- fresh-allocation-bindings
   [pairs]
-  (into #{}
-        (keep (fn [[binder initializer]]
-                (when (and (seq? initializer)
-                           (descriptor/alloc-op?
-                            (descriptor/semantic-op initializer)))
-                  binder)))
-        pairs))
+  (reduce (fn [fresh [binder initializer]]
+            (if (or (and (seq? initializer)
+                         (descriptor/alloc-op?
+                          (descriptor/semantic-op initializer)))
+                    (and (symbol? initializer) (contains? fresh initializer)))
+              (conj fresh binder)
+              fresh))
+          #{} pairs))
 
 (defn- arraycopy-destination
   [expression]
@@ -160,6 +161,30 @@
                         body {})]
     (assoc state :result result)))
 
+(defn- terminal-copy
+  "Find the final state transition modulo an ordinary return of the copied destination.
+
+   Expanded mutating helpers conventionally spell their value semantics as
+   `(do (System/arraycopy next ... carry ...) carry)`. The trailing `carry` is not another state
+   transition, so the functional body excludes both it and the certified copy. Any other trailing
+   expression remains unsupported."
+  [pairs]
+  (when (seq pairs)
+    (let [[copy-binding copy-expression] (peek pairs)
+          copy-destination (arraycopy-destination copy-expression)]
+      (if copy-destination
+        {:binding copy-binding :expression copy-expression :body-pairs (pop pairs)}
+        (when (< 1 (count pairs))
+          (let [[returned-binding returned-expression] (peek pairs)
+                before-return (pop pairs)
+                [copy-binding copy-expression] (peek before-return)
+                copy-destination (arraycopy-destination copy-expression)]
+            (when (and (symbol? returned-expression)
+                       (= returned-expression copy-destination))
+              {:binding copy-binding :expression copy-expression
+               :returned-binding returned-binding
+               :body-pairs (pop before-return)})))))))
+
 (defn- values->array-types
   [values]
   (into {} (keep (fn [[id value]]
@@ -228,8 +253,10 @@
               reserved (source-symbols source)
               flattened (flatten-loop-body loop-body reserved)
               flattened-pairs (:pairs flattened)
-              [copy-binding copy-expression] (peek flattened-pairs)
-              body-pairs (when (seq flattened-pairs) (pop flattened-pairs))
+              terminal (terminal-copy flattened-pairs)
+              copy-binding (:binding terminal)
+              copy-expression (:expression terminal)
+              body-pairs (:body-pairs terminal)
               flattened-source (when (seq flattened-pairs)
                                  (list 'let* (vec (mapcat identity flattened-pairs))
                                        copy-binding))
@@ -270,13 +297,14 @@
                   typed-values (:values body-analysis)
                   typed-program
                   (typed-frontend/form->program
-                   typed-source
+                   (typed-frontend/normalize-source typed-source)
                    {:dtype dtype
                     :values (assoc typed-values iteration
                                    (av/tensor {:dtype :long :shape []}))
                     :array-types (merge (values->array-types typed-values) array-types)
                     :scalar-types (merge (values->scalar-types typed-values) scalar-types
-                                         {iteration :long})})]
+                                         {iteration :long})
+                    :shape-equalities (:equalities body-analysis)})]
               (when typed-program
                 (let [typed-program (add-iteration-value typed-program iteration)
                       [fused fusion-stats]
@@ -309,10 +337,18 @@
                                     (vec (concat [iteration-parameter]
                                                  (map :parameter invariant-bindings)
                                                  [carry-parameter]))))
-                          outer-values (assoc boundary-values
-                                              carry-output
-                                              (get-in outer-analysis
-                                                      [:values carry-initial]))
+                          outer-operands
+                          (vec (concat (when (soac/value-id? trip-count) [trip-count])
+                                       (map :outer invariant-bindings)
+                                       [carry-initial]))
+                          ;; A loop retains exactly its semantic boundary, not every value visible
+                          ;; in the enclosing lexical scope. Suffix-only values are certified by
+                          ;; the suffix TypedSOAC program and must not create false value conflicts
+                          ;; when that program refines a conservative shape.
+                          outer-values
+                          (assoc (select-keys boundary-values outer-operands)
+                                 carry-output
+                                 (get-in outer-analysis [:values carry-initial]))
                           loop-facts
                           {:id (symbol (str (name binder) "-typed-fixpoint"))
                            :effects (:effects (soac/facts body))

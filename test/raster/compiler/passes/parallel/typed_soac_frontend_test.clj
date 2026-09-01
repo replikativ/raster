@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
@@ -59,6 +60,21 @@
            (get-in (route/attempt source :float {'x :float 'target :float}
                                   {:scalar-types {'nrows :long 'width :long}})
                    [:stats :front-end])))))
+
+(deftest retained-array-shapes-prove-compound-parallel-extents
+  (let [program
+        (frontend/form->program
+         '(let* [total (raster.par/reduce acc 0.0 i
+                                           (clojure.core/alength x)
+                                           (+ acc (clojure.core/aget x i)))]
+                total)
+         {:dtype :double
+          :values {'x (av/tensor {:dtype :double :shape ['n]})}
+          :array-types {'x :double}
+          :scalar-types {'n :long}})
+        equation (first (dialect/equations program))]
+    (is (= 'n (dialect/operation-extent equation)))
+    (is (= ['n] (get-in (dialect/facts program) [:values 'x :shape])))))
 
 (deftest devirtualized-output-allocation-is-generated-scaffolding
   (let [allocation (with-meta

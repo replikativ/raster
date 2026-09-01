@@ -54,5 +54,5 @@
               :fallback-reasons [] :declines {}}}
 
   :heat-loss-rk4-gpu
-  {:declined {:reason :unscheduled-stencil
-              :target-dialect :opencl}}}}
+  {:declined {:reason :emitted-parallel-program-call-required
+              :target-dialect :opencl-parallel}}}}

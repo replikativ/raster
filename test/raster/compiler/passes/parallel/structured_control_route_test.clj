@@ -19,7 +19,8 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]
-            [raster.gpu.parallel-program :as program-runtime]))
+            [raster.gpu.parallel-program :as program-runtime]
+            [raster.ode.pde :as pde]))
 
 (defn- loop-decomposition
   []
@@ -259,6 +260,32 @@
                (reason-of #(program-opencl/validate-program!
                             (assoc-in program [:equations 0 :operations]
                                       [suffix-operation])))))))))
+
+(deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
+  (let [options {:dtype :double :target-device :ze:debug
+                 :source-ns (the-ns 'raster.ode.pde)
+                 :array-types {'u0 :double 'target :double}
+                 :scalar-types {'alpha :double 'inv-dx2 :double
+                                'dt :double 'nsteps :long}}
+        walked (pipeline/get-walked-body #'pde/heat-loss-rk4 :double)
+        source (if (= 1 (count walked)) (first walked) (list* 'do walked))
+        semantic (pipeline/run-passes
+                  source pipeline/gpu-resident-pre-soa-passes options)
+        scheduled (route/schedule-program semantic options)
+        emitted (program-opencl/emit-program scheduled options)
+        loop-operation (get-in scheduled [:equations 0 :operations 0])]
+    (is (= :typed-parallel (:dialect semantic)))
+    (is (= :scheduled-parallel (:dialect scheduled)))
+    (is (= 4 (count (:equations scheduled)))
+        "one generic fixpoint and three suffix equations represent the RK4 loss")
+    (is (= 8 (count (get-in loop-operation [:graph :nodes])))
+        "the loop body is the ordinary stencil/map schedule, not an RK4 primitive")
+    (is (= :opencl-parallel (get-in emitted [:program :dialect])))
+    (is (= 10 (count (:kernels emitted))))
+    (is (= {:structured-loops-emitted 1
+            :typed-equations-emitted 1
+            :host-scalar-equations 2}
+           (:stats emitted)))))
 
 (defn- prepared-mixed-call
   [trip-count]

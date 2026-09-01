@@ -82,7 +82,9 @@
                         (and (symbol? expr) (contains? param-idx expr))
                         (nth args (get param-idx expr))
                         (seq? expr)
-                        (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
+                        (with-meta
+                          (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
+                          (meta expr))
                         :else expr))
                     alloc-ctor (first body)]
                 {:allocates? true
@@ -139,7 +141,9 @@
                             (and (symbol? expr) (get binding-map expr))
                             (resolve-to-args (get binding-map expr) args)
                             (seq? expr)
-                            (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
+                            (with-meta
+                              (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
+                              (meta expr))
                             :else expr))]
                     ;; Build into-variant: body with alloc binding → buf param
                     (let [alloc-sym (:sym match)

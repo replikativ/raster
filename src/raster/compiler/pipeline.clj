@@ -48,6 +48,7 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.parallel-program-opencl :as parallel-program-opencl]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -976,17 +977,32 @@
       ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
       ;; generators read declared types instead of guessing. The materialized form preserves
       ;; the original param symbols, so a name-keyed type map still applies.
-        (let [form (cond-> form
-                     (or (:scalar-types opts) (:array-types opts))
-                     (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
-              result (opencl-pass/opencl-pass form
-                                              :device-id target-device
-                                              :dtype (:dtype opts)
-                                              :schedule (:schedule opts))]
-          (register-gpu-kernels! (:kernels result) target-device)
-          (register-gpu-dispatches! (:dispatches result) target-device)
-          {:form (:form result) :stats (:stats result)
-           :kernels (:kernels result) :dispatches (:dispatches result) :backend :opencl})
+        (if (and (parallel-program/parallel-program? form)
+                 (= :scheduled-parallel (:dialect form)))
+          (let [{:keys [program kernels stats]}
+                (parallel-program-opencl/emit-program form opts)]
+            ;; Emission is complete and source-independent here. The ordinary compile-aot entry
+            ;; cannot guess physical buffers, scalar values, or loop scratch for the checked
+            ;; whole-program call; doing so would reintroduce the source/ABI binder this vertical
+            ;; removed. The resident-call integration is the next explicit compiler boundary.
+            (throw (ex-info
+                    "emitted parallel program requires an explicit checked runtime call"
+                    {:reason :emitted-parallel-program-call-required
+                     :target-dialect :opencl-parallel
+                     :program program :kernel-count (count kernels)
+                     :emission-stats stats :fallback :none})))
+          (let [form (cond-> form
+                       (or (:scalar-types opts) (:array-types opts))
+                       (vary-meta assoc :scalar-types (:scalar-types opts)
+                                  :array-types (:array-types opts)))
+                result (opencl-pass/opencl-pass form
+                                                :device-id target-device
+                                                :dtype (:dtype opts)
+                                                :schedule (:schedule opts))]
+            (register-gpu-kernels! (:kernels result) target-device)
+            (register-gpu-dispatches! (:dispatches result) target-device)
+            {:form (:form result) :stats (:stats result)
+             :kernels (:kernels result) :dispatches (:dispatches result) :backend :opencl}))
 
         :simd
         (let [clean-form (strip-compound-markers form)
