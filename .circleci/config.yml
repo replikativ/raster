@@ -176,6 +176,7 @@ jobs:
 
               echo "Creating release for version ${VERSION}"
               gh release create "v${VERSION}" \
+                --target "${CIRCLE_SHA1}" \
                 --title "Release ${VERSION}" \
                 --notes "Raster ${VERSION}" \
                 "$JAR_FILE" || echo "Release may already exist"
