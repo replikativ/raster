@@ -135,6 +135,37 @@
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
 
+(deftest vertical-fusion-does-not-recompute-a-read-after-an-intervening-write
+  (let [source '(let* [producer (raster.par/pmap i n float
+                                                  (clojure.core/aget x i))
+                       middle (raster.par/map! x j n float
+                                               (+ (clojure.core/aget x j) 1.0))
+                       consumer (raster.par/pmap k n float
+                                                  (* (clojure.core/aget producer k) 2.0))]
+                      consumer)
+        program (frontend/form->program source {:dtype :float :array-types {'x :float}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 3 (count (dialect/equations result))))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (some #{'producer} (flatten (dialect/equations result)))
+        "the consumer must read the value captured before x is mutated")))
+
+(deftest horizontal-fusion-does-not-move-a-read-before-an-intervening-write
+  (let [source '(let* [left (raster.par/pmap i n float
+                                              (+ (clojure.core/aget a i) 1.0))
+                       middle (raster.par/map! x j n float
+                                               (+ (clojure.core/aget x j) 1.0))
+                       right (raster.par/pmap k n float
+                                               (* (clojure.core/aget x k) 2.0))]
+                      [left right])
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'a :float 'x :float}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 3 (count (dialect/equations result))))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= '[left middle right] (dialect/outputs result))
+        "the effect result remains observable and ordered between the two reads")))
+
 (deftest aliased-equations-decline-unproved-fusion
   (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
         program (adapter/legacy-nodes->program (:nodes legacy-graph)
