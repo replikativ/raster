@@ -31,6 +31,7 @@
 (defn- declared-output-arg
   "The 0-based index of the ONE argument a mutating op writes, when the op EXPLICITLY
    declares it in the op-descriptor registry:
+     - :effects :mutation-target-arg      (primitive partial writes, e.g. arraycopy)
      - :buffer-write :buf-arg-idx        (e.g. dense-into!, qlinear-i8!)
      - :buffer {:allocates? false, :in-place-arg i}  (the *-into! shape: writes into,
        and returns, a caller-provided buffer)
@@ -44,7 +45,8 @@
   [op-sym]
   (letfn [(idx-of [s]
             (when-let [d (descriptor/get-op-descriptor s)]
-              (or (get-in d [:buffer-write :buf-arg-idx])
+              (or (get-in d [:effects :mutation-target-arg])
+                  (get-in d [:buffer-write :buf-arg-idx])
                   (let [b (:buffer d)]
                     (when (and b (false? (:allocates? b))) (:in-place-arg b))))))]
     (when (symbol? op-sym)

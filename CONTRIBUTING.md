@@ -31,7 +31,8 @@ Use `:reload` (not `:reload-all`) when requiring `raster.core` to avoid ClassCas
 
 ```bash
 clojure -M:test                           # run all tests
-clojure -M:test -e :exec-fn -- -n raster.core-test  # single namespace
+clojure -M:test -n raster.core-test       # single namespace
+clojure -X:test :nses '[raster.core-test]' # single namespace (exec API)
 ```
 
 ### Benchmarks

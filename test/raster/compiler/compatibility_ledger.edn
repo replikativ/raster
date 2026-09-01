@@ -46,4 +46,8 @@
    :lowering {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
               :backend-reused 1 :backend-relowered 0 :fallback 0}
    :emission {:kernel-count 0 :targets [] :strategies []
-              :fallback-reasons [] :declines {}}}}}
+              :fallback-reasons [] :declines {}}}
+
+  :heat-loss-rk4-gpu
+  {:declined {:reason :unscheduled-stencil
+              :target-dialect :opencl}}}}
