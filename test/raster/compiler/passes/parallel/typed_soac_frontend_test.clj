@@ -487,6 +487,34 @@
                   (keys (:values (dialect/facts program))))
         "region-local SSA values are lexical, not fake program inputs")))
 
+(deftest typed-local-snapshots-may-feed-several-updated-destinations
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (let* [^float m-new (+ (clojure.core/aget m i)
+                                        (clojure.core/aget grad i))
+                        ^float v-new (+ (clojure.core/aget v i)
+                                        (* (clojure.core/aget grad i)
+                                           (clojure.core/aget grad i)))]
+                       (clojure.core/aset m i (float m-new))
+                       (clojure.core/aset v i (float v-new))
+                       (clojure.core/aset param i
+                                          (float (- (clojure.core/aget param i)
+                                                    (/ m-new (+ v-new 1.0)))))))]
+               effect)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'grad :float 'm :float 'v :float 'param :float}})
+        equation (first (dialect/equations program))
+        {:keys [locals body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= 2 (count locals)))
+    (is (= 3 (count body-results)))
+    (is (= ['m 'v 'param] (dialect/physical-results program equation)))
+    (is (= [:read-write :read-write :read-write]
+           (mapv :access (dialect/result-storage program 0))))))
+
 (deftest ordered-void-bodies-decline-the-functional-tuple-map
   (doseq [[label body]
           [["one destination written twice"
@@ -495,10 +523,6 @@
            ["a later store observes an earlier sibling write"
             '(do (clojure.core/aset a i (float (clojure.core/aget x i)))
                  (clojure.core/aset b i (float (clojure.core/aget a i))))]
-           ["a typed local cannot hide a sibling destination dependency"
-            '(let* [^float observed (clojure.core/aget a i)]
-                   (clojure.core/aset a i (float (clojure.core/aget x i)))
-                   (clojure.core/aset b i (float observed)))]
            ["an untyped shared local cannot enter a typed region"
             '(let* [v (+ (clojure.core/aget x i) 1.0)]
                    (clojure.core/aset a i (float v))

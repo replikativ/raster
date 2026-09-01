@@ -116,6 +116,25 @@
       (is (= '[state x y] (kart/attribute k :array-params)))
       (is (= '[state x y limit scale n] (:arguments k))))))
 
+(deftest multi-store-lexical-snapshots-do-not-vectorize-past-their-writes
+  (let [form '(raster.par/map-void!
+               i n
+               (let* [^float next-state (+ (clojure.core/aget state i)
+                                           (clojure.core/aget grad i))]
+                     (clojure.core/aset state i (float next-state))
+                     (clojure.core/aset param i
+                                        (float (- (clojure.core/aget param i)
+                                                  next-state)))))
+        source (:source
+                (par-opencl/generate-par-map-void-kernel
+                 form :dtype :float
+                 :array-types {'state :float 'grad :float 'param :float}))]
+    (is (str/includes? source "float next_state ="))
+    (is (not (str/includes? source "vstore4"))
+        "inlining a pre-store snapshot into sequential vector stores changes semantics")
+    (is (< (str/index-of source "float next_state =")
+           (str/index-of source "state[idx] =")))))
+
 (deftest generate-gather-kernel-is-a-side-effect-artifact
   (let [k (par-opencl/generate-par-gather-kernel
            '(raster.par/gather out src index n stride) :dtype :float)]

@@ -178,22 +178,21 @@
 
     :else nil))
 
-(defn- expanded-local-expression
-  [locals expression]
-  (reduce (fn [body {:keys [id init]}]
-            (util/subst-syms {id init} body))
-          expression (reverse locals)))
-
 (defn- independent-stores?
-  [locals stores]
+  [_locals stores]
   (let [destinations (mapv :out stores)
         destination-set (set destinations)]
     (and (= (count destinations) (count destination-set))
          (every? (fn [{:keys [out index predicate value]}]
+                   ;; Region locals are lexical SSA snapshots evaluated before the
+                   ;; store sequence.  A local may therefore read any destination
+                   ;; without introducing an ordering dependency between tuple
+                   ;; results.  Only a DIRECT sibling-destination read in a store
+                   ;; expression observes an earlier write and must decline the
+                   ;; functional effect-map representation.
                    (empty? (disj (set/intersection destination-set
                                                    (par/collect-aget-arrays
-                                                    (expanded-local-expression
-                                                     locals (list 'do index predicate value))))
+                                                    (list 'do index predicate value)))
                                  out)))
                  stores))))
 

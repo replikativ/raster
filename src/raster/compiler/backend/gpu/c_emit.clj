@@ -2110,8 +2110,19 @@
       (when (some #(and (seq? %) (= 'fold (first %)))
                   (tree-seq coll? seq body))
         (vec-bail!))
-      (let [core (inline-pure-lets body)
+      (let [;; A multi-store lexical region can snapshot arrays that its later
+            ;; stores mutate (Adam/AdamW are the canonical case).  The current
+            ;; vector emitter inlines locals and emits vstores in sequence; that
+            ;; would turn the snapshot back into a post-store load.  Keep these
+            ;; regions on the scalar grid-stride path until vector KernelBody
+            ;; lowering represents their SSA locals explicitly.
+            lexical-region? (boolean
+                             (some #(and (seq? %)
+                                         (contains? #{'let 'let*} (first %)))
+                                   (tree-seq coll? seq body)))
+            core (inline-pure-lets body)
             stores (or (collect-stores core) (vec-bail!))]
+        (when (and lexical-region? (> (count stores) 1)) (vec-bail!))
         (when (idx-leaks? core idx-sym) (vec-bail!))
         ;; no control flow in a vectorizable straight-line body
         (walk/postwalk
