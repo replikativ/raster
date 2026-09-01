@@ -3,8 +3,9 @@
 
    The plan is validated completely before a session is created or touched. Instantiation allocates
    each unique owned allocation once, imports caller-owned allocations explicitly, materializes
-   node views, binds every descriptor through raster.gpu.core/bind-step!, and records one replay
-   graph. Attention, GEMM, reductions and quant kernels are not special cases here."
+   node views, and binds either descriptor instances through raster.gpu.core/bind-step! or one
+   equation-first emitted program through reusable KernelGraphs. Attention, GEMM, reductions and
+   quant kernels are not special cases here."
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
@@ -13,14 +14,15 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.value :as value]))
 
 (declare close! run!)
 
 (defrecord LinkedExecutable
-           [plan session owns-session? graph-key phases allocation-keys node-views pending-inputs
-            profile? closed?]
+           [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
+            pending-inputs profile? closed?]
   java.io.Closeable
   (close [this] (close! this))
   clojure.lang.IFn
@@ -71,7 +73,7 @@
       (resident-value/composite value-id fields))))
 
 (defn- cleanup-attached!
-  [session graph-key phases allocation-keys]
+  [session graph-key phases prepared-program allocation-keys]
   ;; A failed backend destructor must not strand the resources that follow it. Preserve the first
   ;; failure for the caller, but attempt the complete reverse-order teardown.
   (let [failure (volatile! nil)
@@ -81,6 +83,7 @@
                           (when-not @failure (vreset! failure error)))))]
     (when graph-key (attempt! #(gpu/release-recorded-graph! session graph-key)))
     (doseq [phase (reverse phases)] (attempt! #(gpu/release-prepared! session phase)))
+    (when prepared-program (attempt! #(parallel-program/release-prepared! prepared-program)))
     (doseq [key (reverse allocation-keys)] (attempt! #(gpu/free-buffer! session key)))
     (when-let [error @failure] (throw error))))
 
@@ -91,12 +94,21 @@
    - `:session` attaches to an existing same-device session; otherwise the executable owns one.
    - `:external-buffers` maps every borrowed/external allocation identity to a backend DeviceBuffer.
 
-   Attached executables own only their phases, graph recording and allocation registrations. Their
-   close does not close the caller session and never frees caller-owned buffers."
+   Attached executables own only their phases or prepared equation graphs, graph recording and
+   allocation registrations. Their close does not close the caller session and never frees
+   caller-owned buffers. The initial equation-first runtime accepts one ProgramLinkInstance; mixed
+   descriptor/program scheduling remains a fail-loud compiler boundary."
   ([plan] (instantiate! plan {}))
   ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [plan (link-plan/validate! plan)
+         program-instances (filterv link-plan/program-link-instance? (:instances plan))
+         _ (when (and (seq program-instances) (not= 1 (count (:instances plan))))
+             (throw (ex-info
+                     "runtime composition of emitted programs with other instances is not yet scheduled"
+                     {:reason :link-runtime-mixed-program-instances
+                      :instances (mapv :id (:instances plan))
+                      :program-instances (mapv :id program-instances)})))
          target (:target plan)
          owns-session? (nil? session)
          session (or session (gpu/make-session target))
@@ -117,6 +129,7 @@
          supplied-external-ids (set (keys external-buffers))
          allocation-keys (volatile! [])
          phases (volatile! [])
+         prepared-program (volatile! nil)
          recorded-key (volatile! nil)]
      (when-not (= external-ids supplied-external-ids)
        (when owns-session? (gpu/close-session! session))
@@ -166,44 +179,64 @@
                    :when source]
              (gpu/upload-range! session (get node-views node-id) source
                                 {:elements (reduce * 1 (:shape view))}))
-           (doseq [instance (:instances plan)
-                   [step-index step] (map-indexed vector (get-in instance [:descriptor :steps]))]
-             (let [phase (phase-key execution-id (:id instance) step-index)
-                   bindings (:bindings instance)]
-               (gpu/bind-step!
-                session (assoc step :phase phase) (link-plan/instance-arguments instance)
-                (fn [symbol]
-                  (let [value-id (get bindings symbol)]
-                    (try (resident-link-value plan node-views value-id)
-                         (catch clojure.lang.ExceptionInfo error
-                           (throw (ex-info (.getMessage error)
-                                           (assoc (ex-data error)
-                                                  :instance (:id instance) :symbol symbol)
-                                           error))))))
-                {:schedule (or (:schedule instance) (get-in instance [:descriptor :schedule]))
-                 :roles (link-plan/instance-roles plan instance)})
-               (vswap! phases conj phase)))
-           (let [gkey (graph-key execution-id)]
-             (gpu/record-graph! session @phases gkey {:profile? profile?})
-             (vreset! recorded-key gkey)
-             (->LinkedExecutable plan session owns-session? gkey @phases @allocation-keys
-                                 node-views
-                                 (atom (into #{}
-                                             (keep (fn [[node-id {:keys [role source view]}]]
-                                                     (when (and (contains? #{:input :constant :state}
-                                                                           role)
-                                                                (nil? source)
-                                                                (= :owned (get-in view
-                                                                                  [:allocation
-                                                                                   :ownership])))
-                                                       node-id)))
-                                             (:nodes plan)))
-                                 (boolean profile?)
-                                 (atom false)))))
+           (if-let [instance (first program-instances)]
+             (vreset!
+              prepared-program
+              (parallel-program/prepare-with!
+               (:call instance)
+               {:bind! (fn [key graph buffers scalars]
+                         (gpu/bind-kernel-graph!
+                          session [::program-graph execution-id key] graph
+                          (into {}
+                                (map (fn [[compiler-value value-id]]
+                                       [compiler-value
+                                        (resident-link-value plan node-views value-id)]))
+                                buffers)
+                          scalars {:profile? profile?}))
+                :run! #(gpu/run-kernel-graph! session %)
+                :release! #(gpu/release-kernel-graph! session %)}))
+             (do
+               (doseq [instance (:instances plan)
+                       [step-index step]
+                       (map-indexed vector (get-in instance [:descriptor :steps]))]
+                 (let [phase (phase-key execution-id (:id instance) step-index)
+                       bindings (:bindings instance)]
+                   (gpu/bind-step!
+                    session (assoc step :phase phase) (link-plan/instance-arguments instance)
+                    (fn [symbol]
+                      (let [value-id (get bindings symbol)]
+                        (try (resident-link-value plan node-views value-id)
+                             (catch clojure.lang.ExceptionInfo error
+                               (throw (ex-info (.getMessage error)
+                                               (assoc (ex-data error)
+                                                      :instance (:id instance) :symbol symbol)
+                                               error))))))
+                    {:schedule (or (:schedule instance)
+                                   (get-in instance [:descriptor :schedule]))
+                     :roles (link-plan/instance-roles plan instance)})
+                   (vswap! phases conj phase)))
+               (let [gkey (graph-key execution-id)]
+                 (gpu/record-graph! session @phases gkey {:profile? profile?})
+                 (vreset! recorded-key gkey))))
+           (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
+                               @allocation-keys node-views
+                               (atom (into #{}
+                                           (keep (fn [[node-id {:keys [role source view]}]]
+                                                   (when (and (contains? #{:input :constant :state}
+                                                                         role)
+                                                              (nil? source)
+                                                              (= :owned (get-in view
+                                                                                [:allocation
+                                                                                 :ownership])))
+                                                     node-id)))
+                                           (:nodes plan)))
+                               (boolean profile?)
+                               (atom false))))
        (catch Throwable error
          (if owns-session?
            (try (gpu/close-session! session) (catch Throwable _))
-           (try (cleanup-attached! session @recorded-key @phases @allocation-keys)
+           (try (cleanup-attached! session @recorded-key @phases @prepared-program
+                                   @allocation-keys)
                 (catch Throwable _)))
          (throw error))))))
 
@@ -311,6 +344,10 @@
   ([executable instance-selector step-selector]
    (let [executable (ensure-live! executable :linked-dispatch)
          instance (select-instance (:plan executable) instance-selector)]
+     (when (link-plan/program-link-instance? instance)
+       (throw (ex-info "equation-first program instances do not expose one descriptor dispatch"
+                       {:reason :linked-program-has-no-descriptor-dispatch
+                        :instance (:id instance)})))
      (assoc (select-dispatch-step (:descriptor instance) step-selector)
             :instance-id (:id instance)
             :descriptor (:descriptor instance)))))
@@ -531,7 +568,9 @@
       (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
                       {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
                        :nodes @(:pending-inputs executable)})))
-    (gpu/replay! (:session executable) (:graph-key executable))
+    (if-let [prepared (:prepared-program executable)]
+      (parallel-program/run-prepared! prepared)
+      (gpu/replay! (:session executable) (:graph-key executable)))
     (outputs executable)))
 
 (defn upload!
@@ -645,6 +684,9 @@
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready."
   [executable]
   (let [executable (ensure-live! executable :profile!)]
+    (when (:prepared-program executable)
+      (throw (ex-info "equation-first program profiling requires an aggregate event schedule"
+                      {:reason :link-program-profile-unsupported})))
     (when (seq @(:pending-inputs executable))
       (throw (ex-info "linked executable has inputs or state that have not been initialized"
                       {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
@@ -658,6 +700,9 @@
         state-nodes (into #{} (keep (fn [[node-id node]]
                                       (when (= :state (:role node)) node-id)))
                           (get-in executable [:plan :nodes]))]
+    (when (:prepared-program executable)
+      (throw (ex-info "equation-first program measurement requires an aggregate event schedule"
+                      {:reason :link-program-measure-unsupported})))
     (when (seq @(:pending-inputs executable))
       (throw (ex-info "linked executable has inputs or state that have not been initialized"
                       {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
@@ -696,5 +741,6 @@
     (if (:owns-session? executable)
       (gpu/close-session! (:session executable))
       (cleanup-attached! (:session executable) (:graph-key executable)
-                         (:phases executable) (:allocation-keys executable))))
+                         (:phases executable) (:prepared-program executable)
+                         (:allocation-keys executable))))
   nil)

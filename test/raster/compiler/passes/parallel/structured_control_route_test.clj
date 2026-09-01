@@ -25,6 +25,8 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.ode.pde :as pde]))
 
@@ -423,6 +425,32 @@
       (is (= :invocation-link-zero-initializer
              (reason-of #(invocation-link/lower requires-zero emitted-program
                                                 :ze:debug host-evaluator)))))
+    (let [session (atom {:device-id :ze:debug :closed? false})
+          events (atom [])]
+      (with-redefs [gpu/alloc! (fn [_ specs] (swap! events conj [:allocate (set (keys specs))]))
+                    gpu/buffer-view (fn [_ key view] {:key key :view view})
+                    gpu/upload-range! (fn [_ view _source spec]
+                                        (swap! events conj [:upload (:key view) spec]))
+                    gpu/bind-kernel-graph! (fn [_ key _graph bindings _scalars _options]
+                                             (swap! events conj [:bind key (set (keys bindings))])
+                                             {:handle key})
+                    gpu/run-kernel-graph! (fn [_ handle]
+                                            (swap! events conj [:run handle]))
+                    gpu/release-kernel-graph! (fn [_ handle]
+                                                (swap! events conj [:release handle]))
+                    gpu/free-buffer! (fn [_ key] (swap! events conj [:free key]))
+                    gpu/record-graph! (fn [& _]
+                                        (throw (AssertionError.
+                                                "program replay must not use descriptor phases")))]
+        (let [executable (gpu-link/instantiate! linked-plan {:session session})]
+          (is (= 4 (count (filter #(= :bind (first %)) @events))))
+          (is (= (set (:outputs linked-plan))
+                 (set (keys (gpu-link/run! executable)))))
+          (is (= 4 (count (filter #(= :run (first %)) @events))))
+          (gpu-link/close! executable)
+          (is (= 4 (count (filter #(= :release (first %)) @events))))
+          (is (= (count (:nodes linked-plan))
+                 (count (filter #(= :free (first %)) @events)))))))
     (let [sources (program-call/buffer-identities call)
           mapping (zipmap sources (mapv #(vector :rk4-storage %)
                                         (range (count sources))))
