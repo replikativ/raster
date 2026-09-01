@@ -120,7 +120,9 @@
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-reduce
                                                  :ze:0 :dtype :float)
         step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))
-        runtime-params [(float-array 513) (float-array 513) 0.75 513]
+        workgroup-size (first (get-in step [:artifact :launch :workgroup-size]))
+        n (inc (* 2 workgroup-size))
+        runtime-params [(float-array n) (float-array n) 0.75 n]
         ordered-values
         (mapv (fn [{:keys [kind sym type value-fn]}]
                 (if (= :scalar kind)

@@ -132,33 +132,81 @@
     (second expression)
     expression))
 
+(defn- cast-policy
+  [source target]
+  (let [source (dtype/canon source)
+        target (dtype/canon target)]
+    (cond
+      (= source target) nil
+
+      (and (dtype/fp-dtype? source) (dtype/fp-dtype? target))
+      (if (< (dtype/bytes-of source) (dtype/bytes-of target))
+        [:exact :exact]
+        [:nearest-even :ieee])
+
+      (and (dtype/integral? source) (dtype/fp-dtype? target))
+      (if (and (= :double target) (<= (dtype/bytes-of source) 4))
+        [:exact :exact]
+        [:nearest-even (if (= :half target) :ieee :exact)])
+
+      (and (dtype/fp-dtype? source) (dtype/integral? target))
+      [:toward-zero :saturate]
+
+      (and (dtype/integral? source) (dtype/integral? target))
+      [:exact :wrap]
+
+      :else
+      (decline! :scalar-cast
+                "KernelBody reduction has no explicit numerical cast policy"
+                {:source-dtype source :target-dtype target}))))
+
+(defn- promoted-dtype
+  [types]
+  (let [types (mapv dtype/canon types)
+        floating (filterv dtype/fp-dtype? types)
+        candidates (if (seq floating) floating types)]
+    (when-not (and (seq candidates) (every? dtype/known? candidates))
+      (decline! :scalar-promotion
+                "KernelBody reduction cannot promote unknown scalar dtypes"
+                {:types types}))
+    (apply max-key dtype/bytes-of candidates)))
+
 (defn lower-element-operations
-  "Lower a scalar reduction element into typed SSA. `coordinate-lower` may translate a verified
+  "Lower a scalar reduction element into typed SSA. coordinate-lower may translate a verified
    source-level flat array index into KernelBody index arithmetic; without it, this retains the
-   pointwise full-reduction contract. A predicate requires an explicit typed load fallback."
+   pointwise full-reduction contract. Mixed scalar arithmetic is widened explicitly and the final
+   element is narrowed to the accumulator dtype before it enters the certified monoid."
   [expression {:keys [index coordinate dtype arrays scalars scalar-types coordinate-lower
                       load-predicate load-other]}]
-  (let [operations (atom [])
+  (let [dtype (dtype/canon dtype)
+        operations (atom [])
         counter (atom 0)
         fresh (fn [prefix] (symbol (str prefix "-" (swap! counter inc))))
-        emit! (fn [operation result]
+        emit! (fn [operation value value-dtype]
                 (swap! operations conj operation)
-                result)]
-    (letfn [(lower [expression]
+                {:value value :dtype (dtype/canon value-dtype)})]
+    (letfn [(cast! [{:keys [value dtype] :as typed} target]
+              (let [source (dtype/canon dtype)
+                    target (dtype/canon target)]
+                (if (= source target)
+                  typed
+                  (let [[rounding overflow] (cast-policy source target)
+                        result (fresh "element-cast")]
+                    (emit! (body/->ScalarCompute
+                            (body/value result target)
+                            (body/cast-expression value target rounding overflow))
+                           result target)))))
+
+            (lower [expression]
               (let [expression (inline-scalar-bindings expression)]
                 (cond
                   (number? expression)
-                  (body/literal expression dtype)
+                  {:value (body/literal expression dtype) :dtype dtype}
 
                   (symbol? expression)
                   (if (contains? scalars expression)
-                    (if (= (dtype/canon dtype)
-                           (dtype/canon (get scalar-types expression dtype)))
-                      expression
-                      (decline! :scalar-dtype
-                                "KernelBody reduction value scalar must match the accumulator dtype"
-                                {:expression expression :dtype dtype
-                                 :scalar-dtype (get scalar-types expression)}))
+                    {:value expression
+                     :dtype (dtype/canon (get scalar-types expression dtype))}
                     (decline! :unbound-scalar
                               "KernelBody element expression references an undeclared scalar"
                               {:expression expression :scalars scalars}))
@@ -184,42 +232,39 @@
                               (when load-predicate
                                 (or load-other (body/literal 0 dtype)))
                               :cached)
-                             result)))
+                             result dtype)))
 
                   (and (seq? expression) (contains? cast-heads (first expression))
                        (= 2 (count expression)))
-                  (let [target (get cast-heads (first expression))]
-                    (when-not (= (dtype/canon target) (dtype/canon dtype))
-                      (decline! :scalar-cast
-                                "initial KernelBody reduction requires element casts to its dtype"
-                                {:expression expression :source-dtype dtype :target-dtype target}))
-                    (lower (second expression)))
+                  (cast! (lower (second expression)) (get cast-heads (first expression)))
 
                   (seq? expression)
                   (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
-                        descriptor (intrinsics/descriptor operator)
-                        arguments (vec (descriptor/call-args expression))]
-                    (when-not (and descriptor
-                                   (= (:arity descriptor) (count arguments))
-                                   (intrinsics/accepts-scalar-dtype? operator dtype)
-                                   (not= :cmp (:kind descriptor)))
+                        intrinsic (intrinsics/descriptor operator)
+                        arguments (vec (descriptor/call-args expression))
+                        typed-inputs (mapv lower arguments)
+                        result-dtype (promoted-dtype (mapv :dtype typed-inputs))]
+                    (when-not (and intrinsic
+                                   (= (:arity intrinsic) (count arguments))
+                                   (intrinsics/accepts-scalar-dtype? operator result-dtype)
+                                   (not= :cmp (:kind intrinsic)))
                       (decline! :scalar-expression
                                 "KernelBody element expression contains an unsupported scalar operation"
-                                {:expression expression :operator operator :dtype dtype}))
-                    (let [inputs (mapv lower arguments)
+                                {:expression expression :operator operator
+                                 :result-dtype result-dtype}))
+                    (let [inputs (mapv (comp :value #(cast! % result-dtype)) typed-inputs)
                           result (fresh "element-value")]
                       (emit! (body/->ScalarCompute
-                              (body/value result dtype)
-                              (body/scalar-expression operator dtype inputs))
-                             result)))
+                              (body/value result result-dtype)
+                              (body/scalar-expression operator result-dtype inputs))
+                             result result-dtype)))
 
                   :else
                   (decline! :scalar-expression
                             "KernelBody element expression has an unsupported value"
                             {:expression expression :type (type expression)}))))]
-      (let [result (lower expression)]
-        {:operations @operations :result result}))))
-
+      (let [result (cast! (lower expression) dtype)]
+        {:operations @operations :result (:value result)}))))
 (defn lower
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
@@ -230,7 +275,10 @@
   (let [dtype (or (:dtype segred) dtype)
         index (:name (segop/seg-space-reduced-dim (:space segred)))
         bound (:bound (segop/seg-space-reduced-dim (:space segred)))
-        workgroup-size (get-in segred [:grid :block-size])
+        ;; Direct compatibility-front-door reductions can arrive before target scheduling. Keep
+        ;; the portable baseline explicit here; scheduled TypedSOAC operations retain their
+        ;; descriptor-derived block size and capped group count.
+        workgroup-size (or (get-in segred [:grid :block-size]) 256)
         arrays (vec (sort-by name (:inputs segred)))
         scalars (vec (sort-by name (:scalars segred)))
         scalar-dtype (fn [id] (or (get scalar-types id)
@@ -273,8 +321,9 @@
              (conj (set scalars) element-index)
              decline!))})
         output (or out-sym 'output)
-        group-count (launch-group-count (get-in segred [:grid :num-blocks])
-                                        bound workgroup-size)
+        group-count (if-let [grid-expression (get-in segred [:grid :num-blocks])]
+                      (launch-group-count grid-expression bound workgroup-size)
+                      (launch/ceil-div bound-dimension workgroup-size))
         scratch 'workgroup-reduction-scratch
         barrier (fn [] (body/->WorkgroupBarrier
                         :workgroup #{:workgroup} :acquire-release (body/full-participation)))

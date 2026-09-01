@@ -49,7 +49,7 @@
     (is (= 2 (second (get temporary-specs partials)))
         "dynamic two-phase scratch resolves through KernelLaunch IR at call time")))
 
-(deftest scheduled-reduction-graph-does-not-export-an-opencl-fallback-to-cuda
+(deftest scheduled-reduction-graph-has-no-source-shaped-target-fallback
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
                       result)
@@ -58,22 +58,24 @@
         algorithm (get-in typed [:equations 0 :algorithm])
         scheduled (:form (segop-lower/segop-lower-pass typed options))
         graph (equation-graph/make algorithm scheduled)
-        exception
-        (try
-          (with-redefs [segred-body/lower
-                        (fn [& _]
-                          (throw (ex-info "simulated portable coverage gap"
-                                          {:reason :segred-kernel-body-declined
-                                           :missing-rule :simulated
-                                           :fallback :none})))]
-            (sg/generate-kernel-graph graph :array-types {'a :double}
-                                      :target-dialect :cuda))
-          nil
-          (catch clojure.lang.ExceptionInfo exception exception))]
-    (is (= :kernel-graph-target-lowering-missing (:reason (ex-data exception))))
-    (is (= :simulated (get-in (ex-data exception)
-                              [:kernel-body-decline :missing-rule])))
-    (is (= :none (:fallback (ex-data exception))))))
+        decline (fn [& _]
+                  (throw (ex-info "simulated portable coverage gap"
+                                  {:reason :segred-kernel-body-declined
+                                   :missing-rule :simulated
+                                   :fallback :none})))]
+    (doseq [target-dialect [:opencl-intel :cuda]]
+      (testing (name target-dialect)
+        (let [exception
+              (try
+                (with-redefs [segred-body/lower decline]
+                  (sg/generate-kernel-graph graph :array-types {'a :double}
+                                            :target-dialect target-dialect))
+                nil
+                (catch clojure.lang.ExceptionInfo exception exception))]
+          (is (= :kernel-graph-target-lowering-missing (:reason (ex-data exception))))
+          (is (= :simulated (get-in (ex-data exception)
+                                    [:kernel-body-decline :missing-rule])))
+          (is (= :none (:fallback (ex-data exception)))))))))
 
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
@@ -343,6 +345,30 @@
     (is (= :int (some #(when (= 'offset (:name %)) (:dtype %)) (:abi artifact))))
     (is (re-find #"element_index.* \+ offset" (:source artifact)))
     (is (nil? (get-in artifact [:attributes :kernel-body-decline])))))
+
+(deftest mixed-floating-reduction-arithmetic-is-explicit-typed-ssa
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i n
+                                   (+ acc (* (double scale) (clojure.core/aget a i))))
+               {:raster.type/elem-type :float})
+        node (soac/par-form->soac 'result form 88 :dtype :float)
+        operation (first (lower/lower-reduce node :ze:0 :dtype :float))
+        artifact (sg/generate-segred-kernel
+                  operation nil :dtype :float
+                  :scalar-types {'scale :double 'n :long})
+        loop-body (:operations (first (:operations
+                                       (get-in artifact [:attributes :kernel-body]))))
+        casts (keep (fn [operation]
+                      (let [expression (:expression operation)]
+                        (when (= :cast (:op expression))
+                          [(:result-type expression) (:options expression)])))
+                    loop-body)]
+    (is (= [[:double {:rounding :exact :overflow :exact}]
+            [:float {:rounding :nearest-even :overflow :ieee}]]
+           casts))
+    (is (= :double (some #(when (= 'scale (:name %)) (:kernel-dtype %))
+                         (:abi artifact))))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))))
 
 ;; ================================================================
 ;; Horizontally-fused multi-output SegMap: the SECONDARY output (written
