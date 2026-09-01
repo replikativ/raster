@@ -620,6 +620,15 @@ schedule selected only when its participation, memory, and synchronization proof
 vertical consumes scientific time loops, the source-shaped compound detector and handwritten local
 emitter are deleted rather than retained as a compatibility route.
 
+Functionalizing a mutating host loop is deliberately proof-gated. A relational host
+`AbstractValue` refinement records shape equalities exposed by typed length queries, clones,
+same-shaped allocation, and pure maps. A primitive copy becomes a loop-carried state transition
+only when that analysis proves zero offsets, the complete rank-one extent, and equal logical
+dtypes; partial or offset copies remain effects and decline this route. The refinement consumes the
+canonical dtype facets and typed `AbstractValue` seeds rather than introducing another operator or
+type registry. This is the initial rank-one proof needed by the scientific-loop vertical, not the
+eventual N-dimensional shape solver.
+
 ### 3.3 Schedule and transform IR
 
 A schedule is an immutable transformation program over the functional parallel
