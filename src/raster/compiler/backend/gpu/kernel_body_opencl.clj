@@ -1660,7 +1660,9 @@
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
         helper-source (c-dialect/helper-source
-                       *scalar-dialect* (ce/intrinsic-helper-sources operation-source))
+                       *scalar-dialect*
+                       (ce/intrinsic-helper-sources operation-source
+                                                    (:id *scalar-dialect*)))
         storage-declarations (concat parameters (:allocations kernel-body))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)

@@ -235,14 +235,16 @@
               (is (zero? exit) err))))))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
-  (doseq [[target qualifier compiler]
-          [[:opencl-portable "inline int rstr_dp4a" nil]
-           [:cuda "__device__ __forceinline__ int rstr_dp4a" "nvcc"]
-           [:hip "__device__ __forceinline__ int rstr_dp4a" "hipcc"]]]
+  (doseq [[target qualifier physical-op compiler]
+          [[:opencl-portable "inline int rstr_dp4a" "a0*b0" nil]
+           [:cuda "__device__ __forceinline__ int rstr_dp4a" "__dp4a(a, b, acc)" "nvcc"]
+           [:hip "__device__ __forceinline__ int rstr_dp4a"
+            "__ockl_sdot4(a, b, acc, false)" "hipcc"]]]
     (testing (name target)
       (let [source (opencl/emit-scalar-kernel
                     "dp4a_helper" (dp4a-kernel-body) {:target-dialect target})]
         (is (str/includes? source qualifier))
+        (is (str/includes? source physical-op))
         (is (= 2 (count (re-seq #"rstr_dp4a\(" source)))
             "one registry-owned definition accompanies one typed call")
         (when (and compiler (command-available? compiler))

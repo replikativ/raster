@@ -116,6 +116,13 @@
    ;; The VECTOR schedules (AVX2 maddubs, wasm i32x4.dot) are :wi8-dot above.
    :dp4a {:arity 3 :kind :dp4a
           :c {:fn "rstr_dp4a"}
+          :target-helper-src
+          {:cuda (str "__device__ __forceinline__ int rstr_dp4a(int a, int b, int acc) {\n"
+                      "    return __dp4a(a, b, acc);\n"
+                      "}\n")
+           :hip (str "__device__ __forceinline__ int rstr_dp4a(int a, int b, int acc) {\n"
+                     "    return __ockl_sdot4(a, b, acc, false);\n"
+                     "}\n")}
           :c-helper-src (str "inline int rstr_dp4a(int a, int b, int acc) {\n"
                              "    unsigned int ua = (unsigned int)a;\n"
                              "    unsigned int ub = (unsigned int)b;\n"

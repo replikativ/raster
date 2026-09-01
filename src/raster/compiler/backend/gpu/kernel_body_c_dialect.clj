@@ -129,7 +129,7 @@
          (when (or uses-half? uses-double? uses-subgroups?) "\n"))
     (str "#include <stdint.h>\n#include <math.h>\n"
          (case (:id dialect)
-           :cuda "#include <cuda_fp16.h>\n"
+           :cuda "#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n"
            :hip (str "#include <hip/hip_runtime.h>\n"
                      "#include <hip/hip_fp16.h>\n"))
          "\n")))
