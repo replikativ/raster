@@ -13,3 +13,14 @@
     (is (effects/removable-expr? pure-call))
     (is (not (effects/removable-expr? unknown-call))
         "an invk without certified semantic metadata remains conservative")))
+
+(deftest allocation-purity-does-not-imply-commonable-identity
+  (let [allocation
+        (with-meta
+          '(.invk raster.arrays/zeros-like_m_floats_long-impl exemplar n)
+          {:raster.op/original 'raster.arrays/zeros-like
+           :raster.type/tag 'floats :tag 'floats})]
+    (is (effects/removable-expr? allocation)
+        "an unused local allocation may be eliminated")
+    (is (not (effects/cse-safe-expr? allocation))
+        "two live allocations may not share mutable identity")))

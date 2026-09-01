@@ -176,8 +176,15 @@
          (empty? flags))))
 
 (defn cse-safe-expr?
-  "True if an expression is safe to common-subexpression eliminate."
+  "True if an expression is safe to common-subexpression eliminate.
+
+   External purity is necessary but not sufficient: an allocator is removable
+   when its result is dead, yet two live allocations have distinct mutable
+   identities and must never be coalesced.  Keep that distinction here rather
+   than teaching individual compiler markers or consumers to protect their
+   operands."
   [expr]
   (and (seq? expr)
        (symbol? (first expr))
+       (not (descriptor/alloc-op? (form/effective-op expr)))
        (removable-expr? expr)))
