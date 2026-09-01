@@ -9,6 +9,7 @@
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -23,6 +24,31 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.ode.pde :as pde]))
+
+(defn- evaluate-test-scalar-expression [expression operands]
+  (cond
+    (number? expression) expression
+    (symbol? expression)
+    (if-let [value (get operands expression)]
+      (:value value)
+      (throw (ex-info "test scalar references an unknown operand" {:expression expression})))
+    (seq? expression)
+    (let [operation (name (first expression))
+          arguments (mapv #(evaluate-test-scalar-expression % operands) (rest expression))]
+      (case operation
+        "int" (int (first arguments))
+        "long" (long (first arguments))
+        "float" (float (first arguments))
+        "double" (double (first arguments))
+        "*" (reduce * arguments)
+        "/" (reduce / arguments)
+        (throw (ex-info "test scalar operation is unsupported" {:expression expression}))))
+    :else (throw (ex-info "test scalar expression is unsupported" {:expression expression}))))
+
+(defn- evaluate-test-scalar [step operands]
+  (let [expression (-> step :region soac/lambda-parts :body-results first)]
+    {:type (get-in step [:value :dtype])
+     :value (evaluate-test-scalar-expression expression operands)}))
 
 (defn- loop-decomposition
   []
@@ -284,6 +310,11 @@
         emitted (program-opencl/emit-program scheduled options)
         emitted-program (:program emitted)
         invocation-plan (get-in semantic [:attributes :invocation-plan])
+        materialized
+        (materialization/materialize
+         invocation-plan
+         [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]
+         evaluate-test-scalar)
         loop-operation (get-in scheduled [:equations 0 :operations 0])
         loop-equation (first (:equations emitted-program))
         trip-count-id (second (control/loop-index (:algorithm loop-equation)))
@@ -331,6 +362,13 @@
     (is (= 4 (count (filter invocation/value-alias? (:steps invocation-plan)))))
     (is (= 3 (count (filter invocation/scalar-compute? (:steps invocation-plan)))))
     (is (every? #(not (contains? % :expression)) (:steps invocation-plan)))
+    (is (= (set (:inputs semantic))
+           (set (concat (keys (:program-buffers materialized))
+                        (keys (:program-scalars materialized))))))
+    (is (= 0 (get-in materialized [:attributes :driver-allocations])))
+    (let [alias (first (filter invocation/value-alias? (:steps invocation-plan)))]
+      (is (identical? (get-in materialized [:values (:id alias)])
+                      (get-in materialized [:values (:source alias)]))))
     (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))
                                            (:parameters invocation-plan))))
           narrowed (first (filter #(some (fn [operand]
