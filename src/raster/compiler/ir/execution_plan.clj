@@ -8,7 +8,7 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph-call :as kgcall]))
 
-(def queue-classes #{:compute :transfer :collective :host})
+(def queue-classes #{:compute :transfer :collective :storage :host})
 (def queue-orderings #{:in-order :out-of-order})
 
 (defrecord LogicalQueue [id class ordinal ordering])
@@ -37,6 +37,12 @@
   "The default target-neutral in-order host/device transfer queue."
   []
   (->LogicalQueue :transfer-0 :transfer 0 :in-order))
+
+(defn storage-queue
+  "The default target-neutral in-order durable-content queue. Storage promotion/localization may
+   overlap compute, transfers and collectives, but remains an explicit schedulable resource."
+  []
+  (->LogicalQueue :storage-0 :storage 0 :in-order))
 
 (defn validate!
   "Validate and return an ExecutionPlan.

@@ -40,7 +40,8 @@
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
             [raster.gpu.measurement :as measurement]
-            [raster.gpu.resident-value :as resident-value]))
+            [raster.gpu.resident-value :as resident-value])
+  (:import [java.lang AutoCloseable]))
 
 ;; ================================================================
 ;; Backend dispatch
@@ -1082,35 +1083,45 @@
   (and x (= "raster.gpu.core.GPUEvent" (.getName (class x)))))
 
 (defn- submit-transfer-ranges!
-  [sess entries direction]
-  (locking sess
-    (let [{:keys [device-id session-id closed?]} @sess]
-      (when closed?
-        (throw (ex-info "cannot submit a transfer to a closed GPU session"
-                        {:direction direction})))
-      ;; Validation and host-side upload staging both complete before the event becomes visible.
-      ;; The backend owns any native staging until await/release consumes its completion token.
-      (let [plans (plan-transfer-ranges sess entries direction)
-            values (mapv (fn [[buffer _ host]]
-                           (if (= :upload direction) buffer host))
-                         plans)
-            submitted-ns (System/nanoTime)
-            backend-event ((rt-resolve device-id "submit-range-batch!")
-                           (mapv (fn [[buffer plan _]] [buffer plan]) plans)
-                           direction)
-            submit-return-ns (System/nanoTime)
-            event-id (random-uuid)
-            event (->GPUEvent session-id event-id (execution/transfer-queue))]
-        (swap! sess assoc-in [:events event-id]
-               {:event event
-                :kind :transfer
-                :direction direction
-                :status :pending
-                :backend-event backend-event
-                :submitted-ns submitted-ns
-                :submit-return-ns submit-return-ns
-                :value values})
-        event))))
+  ([sess entries direction]
+   (submit-transfer-ranges! sess entries direction []))
+  ([sess entries direction retained-resources]
+   (when-not (and (vector? retained-resources)
+                  (every? #(instance? AutoCloseable %) retained-resources))
+     (throw (ex-info "retained transfer resources must be a vector of AutoCloseable values"
+                     {:direction direction :resources retained-resources})))
+   (locking sess
+     (let [{:keys [device-id session-id closed?]} @sess]
+       (when closed?
+         (throw (ex-info "cannot submit a transfer to a closed GPU session"
+                         {:direction direction})))
+       ;; Validation and host-side upload staging both complete before the event becomes visible.
+       ;; The backend owns any native staging until await/release consumes its completion token.
+       ;; Retained resources cover a stronger future path in which the backend borrows a mapped
+       ;; source/destination directly: successful submission transfers their close responsibility
+       ;; to this event, and completion releases them exactly once.
+       (let [plans (plan-transfer-ranges sess entries direction)
+             values (mapv (fn [[buffer _ host]]
+                            (if (= :upload direction) buffer host))
+                          plans)
+             submitted-ns (System/nanoTime)
+             backend-event ((rt-resolve device-id "submit-range-batch!")
+                            (mapv (fn [[buffer plan _]] [buffer plan]) plans)
+                            direction)
+             submit-return-ns (System/nanoTime)
+             event-id (random-uuid)
+             event (->GPUEvent session-id event-id (execution/transfer-queue))]
+         (swap! sess assoc-in [:events event-id]
+                {:event event
+                 :kind :transfer
+                 :direction direction
+                 :status :pending
+                 :backend-event backend-event
+                 :submitted-ns submitted-ns
+                 :submit-return-ns submit-return-ns
+                 :retained-resources retained-resources
+                 :value values})
+         event)))))
 
 (defn submit-upload-ranges!
   "Validate and submit a batch of host-to-resident ranges without waiting.
@@ -1122,6 +1133,16 @@
   [sess entries]
   (submit-transfer-ranges! sess entries :upload))
 
+(defn submit-upload-ranges-retained!
+  "Submit host-to-resident ranges and transfer ownership of scoped host resources to the event.
+
+   `retained-resources` must be a vector of AutoCloseable leases. On successful submission they
+   remain live until await-event! or release-event! establishes completion; session close also
+   drains the event. If submission throws, ownership remains with the caller. This is the safe seam
+   for mmap/LMDB payloads and future direct DMA that does not make an owned staging copy."
+  [sess entries retained-resources]
+  (submit-transfer-ranges! sess entries :upload retained-resources))
+
 (defn submit-download-ranges!
   "Validate and submit a batch of resident-to-host ranges without waiting.
 
@@ -1130,6 +1151,12 @@
    with `event-measurement` after awaiting it."
   [sess entries]
   (submit-transfer-ranges! sess entries :download))
+
+(defn submit-download-ranges-retained!
+  "Download into scoped host resources retained through device completion. See
+   submit-upload-ranges-retained! for ownership semantics."
+  [sess entries retained-resources]
+  (submit-transfer-ranges! sess entries :download retained-resources))
 
 (defn- external-graph-buffer-ids
   [graph]
@@ -1271,10 +1298,22 @@
       (throw (ex-info "GPU event is no longer owned by this session"
                       {:event event :events (keys (:events @sess))}))))
 
+(defn- close-retained-resources
+  [resources]
+  (reduce (fn [errors resource]
+            (try
+              (.close ^AutoCloseable resource)
+              errors
+              (catch Exception error
+                (conj errors error))))
+          []
+          (reverse resources)))
+
 (defn- await-event-under-lock!
   [sess event]
   (let [{:keys [device-id closed?]} @sess
-        {:keys [status backend-event kind submitted-ns submit-return-ns] :as entry}
+        {:keys [status backend-event kind submitted-ns submit-return-ns retained-resources]
+         :as entry}
         (resolve-event-entry sess event)]
     (when closed?
       (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
@@ -1289,9 +1328,19 @@
                                  {:host-wall-ns (- completed-ns submitted-ns)
                                   :submit-host-ns (- submit-return-ns submitted-ns)}))]
         ((rt-resolve device-id "release-event!") backend-event)
-        (let [completed (cond-> (assoc entry :status :complete :backend-event nil)
-                          measurement (assoc :measurement measurement))]
+        (let [release-errors (close-retained-resources retained-resources)
+              completed (cond-> (assoc entry
+                                       :status :complete
+                                       :backend-event nil
+                                       :retained-resources [])
+                          measurement (assoc :measurement measurement)
+                          (seq release-errors) (assoc :retention-release-errors release-errors))]
+          ;; Record completion before surfacing a lease-close failure: the native event has already
+          ;; been consumed and must never be released a second time.
           (swap! sess assoc-in [:events (:id event)] completed)
+          (when (seq release-errors)
+            (throw (ex-info "transfer completed but retained resource release failed"
+                            {:event event :errors release-errors} (first release-errors))))
           completed)))))
 
 (defn event-complete?
