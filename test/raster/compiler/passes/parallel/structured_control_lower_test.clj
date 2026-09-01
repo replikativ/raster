@@ -6,6 +6,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
+            [raster.compiler.ir.structured-loop-call :as loop-call]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (defn- loop-program
@@ -83,4 +84,35 @@
       (is (= '[u-in u-next alpha-in iteration n-in] (:arguments emitted)))
       (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
       (is (every? #(re-find #"__kernel void graph_segmap" (:source %))
-                  (map :operation (:nodes emitted)))))))
+                  (map :operation (:nodes emitted))))
+      (let [call (loop-call/make
+                  scheduled emitted
+                  {'u0 :initial-buffer 'u-final :output-buffer}
+                  {'steps {:type :long :value 3}
+                   'n {:type :int :value 64}
+                   'alpha {:type :float :value 0.25}}
+                  {'u-final :scratch-buffer})]
+        (is (= {'u-final :output-buffer} (:outputs call)))
+        (is (= {'u-in :initial-buffer 'u-next :output-buffer}
+               (:buffers (loop-call/iteration-binding call 0))))
+        (is (= {'u-in :output-buffer 'u-next :scratch-buffer}
+               (:buffers (loop-call/iteration-binding call 1))))
+        (is (= {'u-in :scratch-buffer 'u-next :output-buffer}
+               (:buffers (loop-call/iteration-binding call 2))))
+        (is (= {:type :int :value 2}
+               (get-in (loop-call/iteration-binding call 2)
+                       [:scalar-values 'iteration])))))))
+
+(deftest zero-trip-loop-returns-the-initial-logical-value-without-scratch
+  (let [scheduled (lower/schedule (loop-program) {:target-device :cpu:0 :dtype :float})
+        emitted (opencl/generate-kernel-graph
+                 (:graph scheduled) :scalar-types {'alpha-in :float 'iteration :long})
+        call (loop-call/make
+              scheduled emitted
+              {'u0 :initial-buffer 'u-final :unused-output-buffer}
+              {'steps {:type :long :value 0}
+               'n {:type :int :value 64}
+               'alpha {:type :float :value 0.25}}
+              {})]
+    (is (= 0 (:trip-count call)))
+    (is (= {'u-final :initial-buffer} (:outputs call)))))
