@@ -16,8 +16,13 @@
                                   :segop-declined [{:reason :missing-rule}]}
           :kernels [{:target :opencl-c
                      :attributes {:strategy :portable
+                                  :emission-route :verified-segmap-opencl
                                   :fallback-reason :symbolic-dims
-                                  :declines [{:leaf :tensorized :reason :symbolic-dims}]}}]})]
+                                  :declines [{:leaf :tensorized :reason :symbolic-dims}]
+                                  :kernel-body-decline
+                                  {:reason :segmap-kernel-body-declined
+                                   :missing-rule :scalar-fold
+                                   :fallback :verified-segmap-opencl}}}]})]
     (is (= {:backend :opencl :source-dialect :typed-soac :typed-validated true
             :declines [{:stage :backend-applied-stats
                         :kind :segop-declined
@@ -30,9 +35,12 @@
             :backend-reused 2 :backend-relowered 1 :fallback 0}
            (:lowering normalized)))
     (is (= {:kernel-count 1 :targets [:opencl-c] :strategies [:portable]
+            :routes {:verified-segmap-opencl 1}
             :fallback-reasons [:symbolic-dims]
             :declines [{:stage :emission :kind :candidate
-                        :leaf :tensorized :reason :symbolic-dims}]}
+                        :leaf :tensorized :reason :symbolic-dims}
+                       {:stage :emission :kind :kernel-body-coverage
+                        :leaf :scalar-fold :reason :segmap-kernel-body-declined}]}
            (:emission normalized)))
     (is (= {:assessed? false :resident? nil :device-scratch-count nil
             :host-array-allocs-in-compute nil :internal-host-roundtrips nil}
