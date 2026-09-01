@@ -67,6 +67,22 @@
           (is (= @submitted @awaited @released))
           (is (empty? (:events @session))))))))
 
+(deftest transfer-capabilities-preserve-backend-and-device-identity
+  (let [session (atom {:device-id :ocl:3})]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [device-id function-name]
+         (is (= :ocl:3 device-id))
+         (is (= "transfer-capabilities" function-name))
+         (fn [] {:submission :device-event
+                 :independent-physical-queue? true}))}
+      (fn []
+        (is (= {:submission :device-event
+                :independent-physical-queue? true
+                :backend :ocl
+                :device-id :ocl:3}
+               (g/transfer-capabilities session)))))))
+
 ;; gemma-270m's real KV shape: 2048 positions x (1 kv-head x 256 head-dim)
 (def ^:private maxpos 2048)
 (def ^:private kvrow 256)
@@ -256,7 +272,7 @@
                   (str k " carries ITS OWN layer's prefix, not a neighbour's")))))))))
 
 (defn- asynchronous-mixed-storage-roundtrip!
-  [device-id expected-timing-source]
+  [device-id expected-timing-source expected-independent-queue?]
   (let [n 257
         float-source (float-array (map #(float (+ 1 %)) (range n)))
         half-source (short-array (map #(Float/floatToFloat16 (float (+ 1 %))) (range n)))
@@ -266,6 +282,9 @@
         half-destination (short-array n)
         session (g/make-session device-id)]
     (try
+      (is (= expected-independent-queue?
+             (:independent-physical-queue?
+              (g/transfer-capabilities session))))
       (g/alloc! session {:float-buffer [:float n nil]
                          :half-buffer [:half n nil]})
       (let [event (g/submit-upload-ranges!
@@ -302,12 +321,12 @@
 (deftest level-zero-asynchronous-batch-has-honest-host-timing
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "asynchronous mixed-storage range batch on Level Zero")
-    (asynchronous-mixed-storage-roundtrip! :ze:0 :host-monotonic)))
+    (asynchronous-mixed-storage-roundtrip! :ze:0 :host-monotonic false)))
 
 (deftest opencl-asynchronous-batch-has-device-event-timing
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "asynchronous mixed-storage range batch on OpenCL")
-    (asynchronous-mixed-storage-roundtrip! :ocl:0 :device-event)))
+    (asynchronous-mixed-storage-roundtrip! :ocl:0 :device-event true)))
 
 (deftest a-bad-entry-anywhere-leaves-the-whole-cache-untouched
   (if-not @gp/gpu-available?

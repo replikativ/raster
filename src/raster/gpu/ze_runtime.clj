@@ -935,6 +935,14 @@
                     :direction direction
                     :asynchronous? false}})))
 
+(defn transfer-capabilities
+  "Return the Level Zero runtime's physical transfer execution contract."
+  []
+  {:submission :inline-host-copy
+   :host-staging :caller-owned
+   :independent-physical-queue? false
+   :queue-ordering :inline})
+
 (defn upload-range!
   "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element
    `src-element`) into `buf` starting at element `dst-element`. Elements, not bytes: the byte

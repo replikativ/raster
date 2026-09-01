@@ -377,6 +377,18 @@
            :events {}           ;; {event-id → session-owned asynchronous completion}
            :closed?   false})))
 
+(defn transfer-capabilities
+  "Return backend transfer execution capabilities for `sess`.
+
+  `:independent-physical-queue?` reports whether transfer submission uses a
+  physical queue distinct from compute. It is a scheduling capability, not a
+  promise that a particular device overlaps copy and kernels under load."
+  [sess]
+  (let [device-id (:device-id @sess)]
+    (assoc ((rt-resolve device-id "transfer-capabilities"))
+           :backend (backend-type device-id)
+           :device-id device-id)))
+
 (declare release-event!)
 
 (defn close-session!
@@ -1126,10 +1138,11 @@
 (defn submit-upload-ranges!
   "Validate and submit a batch of host-to-resident ranges without waiting.
 
-   Returns a session-owned `GPUEvent` on the logical transfer queue. OpenCL owns an immutable
-   native staging copy until the event is awaited/released, so callers may reuse their source after
-   submission. Level Zero shared allocations may complete inline; that distinction is reported by
-   `event-measurement`, not exposed as a different API."
+   Returns a session-owned `GPUEvent` on the logical transfer queue. OpenCL submits through an
+   independent physical in-order transfer queue and owns an immutable native staging copy until
+   the event is awaited/released, so callers may reuse their source after submission. Level Zero
+   shared allocations may complete inline; inspect `transfer-capabilities` and
+   `event-measurement` rather than assuming physical overlap."
   [sess entries]
   (submit-transfer-ranges! sess entries :upload))
 
