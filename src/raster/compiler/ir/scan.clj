@@ -1,12 +1,13 @@
 (ns raster.compiler.ir.scan
-  "Certified algebra for parallel prefix scans.
+  "Certified scalar algebra for parallel scans and reductions.
 
    Raster's surface `par/scan` is also a general left-to-right recurrence primitive. Such a
    recurrence is not automatically a parallel scan: Blelloch/Hillis-Steele scheduling is sound
    only when the body is an associative combine of the prior accumulator and an accumulator-free
    element expression. This boundary proves that property before SegScan scheduling."
-  (:require [raster.ad.purity :as purity]
-            [raster.compiler.core.op-descriptor :as descriptor]))
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.util :as util]))
 
 (defrecord AssociativeScan [acc init combine element identity dtype])
 
@@ -53,13 +54,88 @@
 
 (defn- pure-element?
   [expr]
-  (cond
-    (seq? expr) (let [op (descriptor/semantic-op expr)]
-                  (and op
-                       (= :pure (purity/pure-op? op))
-                       (every? pure-element? (descriptor/call-args expr))))
-    (coll? expr) (every? pure-element? expr)
-    :else true))
+  ;; Effect analysis is deliberately centralized in the Beichte-backed scalar-effects
+  ;; boundary.  A second syntactic operator allow-list here would disagree with the
+  ;; canonical registry for valid Raster operations (for example raster.numeric/*).
+  (= :pure (effects/analyze-effect expr)))
+
+(defn- reason
+  [operation suffix]
+  (keyword (str (name operation) "-" suffix)))
+
+(defn- certify*
+  [reduction-op dtype operation]
+  (let [{:keys [acc init lambda]} reduction-op
+        lambda (try
+                 (util/inline-pure-lets lambda)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (if (= :impure-binding (:reason (ex-data exception)))
+                     (throw (ex-info "parallel reduction element contains an impure binding"
+                                     {:reason (reason operation "element-impure-or-unknown")
+                                      :body lambda :reduction-op reduction-op}
+                                     exception))
+                     (throw exception))))
+        combine (descriptor/semantic-op lambda)
+        args (vec (descriptor/call-args lambda))
+        dtype (or dtype :double)
+        supported-dtypes (if (= :scan operation)
+                           #{:int :long :float :double}
+                           #{:byte :int :long :half :float :double})]
+    (when-not (contains? supported-dtypes dtype)
+      (throw (ex-info "parallel reduction dtype is not supported by the current kernel dialect"
+                      {:reason (reason operation "dtype-unsupported")
+                       :dtype dtype :reduction-op reduction-op})))
+    (when-not (and combine (= 2 (count args))
+                   (descriptor/commutative-monoid-op? combine))
+      (throw (ex-info "parallel recurrence is not a certified associative reduction"
+                      {:reason (reason operation "not-associative")
+                       :combine combine :body lambda :reduction-op reduction-op})))
+    (let [[left right] args
+          element (cond
+                    (and (acc-ref? left acc) (not (contains-symbol? right acc))) right
+                    (and (acc-ref? right acc) (not (contains-symbol? left acc))) left
+                    :else nil)]
+      (when-not element
+        (throw (ex-info "parallel reduction must combine one accumulator with an accumulator-free element"
+                        {:reason (reason operation "not-elementwise")
+                         :acc acc :body lambda :reduction-op reduction-op})))
+      (when-not (pure-element? element)
+        (throw (ex-info "parallel reduction element expression is impure or has unknown effects"
+                        {:reason (reason operation "element-impure-or-unknown")
+                         :element element :body lambda :reduction-op reduction-op})))
+      (let [identity (descriptor/typed-reduce-identity combine dtype)]
+        (when-not (identity-equivalent? init identity)
+          (throw (ex-info "parallel reduction with a non-identity init requires a distinct schedule"
+                          {:reason (reason operation "nonidentity-init")
+                           :combine combine :init init :identity identity :dtype dtype})))
+        (->AssociativeScan acc init combine element identity dtype)))))
+
+(defn certify-reassociation
+  "Certify a scalar recurrence for parallel reassociation.
+
+   This is the shared proof boundary for reductions, scans, reducing scatters and nested folds.
+   Pure `let` regions are beta-reduced by the compiler's one capture-safe implementation before
+   the registered monoid and exact typed identity are checked."
+  [reduction-op dtype]
+  (certify* reduction-op dtype :reduction))
+
+(defn compatible-certificate?
+  "Whether two independently derived certificates prove the same typed monoid contract.
+
+   Element expressions may differ across a mechanical parameter-to-load projection, so the
+   comparison deliberately covers only the reassociation facts; callers must independently
+   certify each concrete scalar region before using this predicate."
+  [declared derived]
+  (and (associative-scan? declared)
+       (associative-scan? derived)
+       ;; Accumulators and element operands are lexical binders that may be alpha-renamed or
+       ;; projected from captures between independently certified regions. The certificate is the
+       ;; typed monoid contract; each concrete region has already been certified on its own.
+       (= (some-> (:combine declared) name symbol)
+          (some-> (:combine derived) name symbol))
+       (identity-equivalent? (:init declared) (:init derived))
+       (identity-equivalent? (:identity declared) (:identity derived))
+       (= (:dtype declared) (:dtype derived))))
 
 (defn certify
   "Certify `scan-op` as a parallel associative scan or throw a structured conversion decline.
@@ -70,33 +146,4 @@
    The initial value must be the registered identity: injecting a non-identity once globally needs
    a distinct schedule and must not be duplicated independently in every block."
   [scan-op dtype]
-  (let [{:keys [acc init lambda]} scan-op
-        combine (descriptor/semantic-op lambda)
-        args (vec (descriptor/call-args lambda))
-        dtype (or dtype :double)]
-    (when-not (contains? #{:int :long :float :double} dtype)
-      (throw (ex-info "parallel scan dtype is not supported by the current kernel dialect"
-                      {:reason :scan-dtype-unsupported :dtype dtype :scan-op scan-op})))
-    (when-not (and combine (= 2 (count args))
-                   (descriptor/commutative-monoid-op? combine))
-      (throw (ex-info "par/scan is a general recurrence, not a certified associative scan"
-                      {:reason :scan-not-associative
-                       :combine combine :body lambda :scan-op scan-op})))
-    (let [[left right] args
-          element (cond
-                    (and (acc-ref? left acc) (not (contains-symbol? right acc))) right
-                    (and (acc-ref? right acc) (not (contains-symbol? left acc))) left
-                    :else nil)]
-      (when-not element
-        (throw (ex-info "parallel scan body must combine one accumulator with an accumulator-free element"
-                        {:reason :scan-not-elementwise :acc acc :body lambda :scan-op scan-op})))
-      (when-not (pure-element? element)
-        (throw (ex-info "parallel scan element expression is impure or has unknown effects"
-                        {:reason :scan-element-impure-or-unknown
-                         :element element :body lambda :scan-op scan-op})))
-      (let [identity (descriptor/typed-reduce-identity combine dtype)]
-        (when-not (identity-equivalent? init identity)
-          (throw (ex-info "parallel scan with a non-identity init requires a distinct global-prefix schedule"
-                          {:reason :scan-nonidentity-init
-                           :combine combine :init init :identity identity :dtype dtype})))
-        (->AssociativeScan acc init combine element identity dtype)))))
+  (certify* scan-op dtype :scan))

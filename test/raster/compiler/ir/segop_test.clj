@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.segop-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
@@ -97,11 +98,22 @@
             {:keys [acc lambda]} (segop/scalar-reduce-op phase-two)]
         (is (instance? raster.compiler.ir.segop.SegRed phase-two))
         (is (= :cross-block (:phase phase-two)))
+        (is (= [:reduction-phase 0 :cross-block] (:id phase-two)))
+        (is (launch/dimension-expression? (get-in phase-two [:space :dims 0 :bound])))
         (is (= (list 'clojure.core/+ acc
                      (list 'clojure.core/aget partials index))
                lambda)
             "the scheduled second phase reduces its partial buffer, not the original element body")
         (is (not (contains? (:inputs phase-two) 'a)))))))
+
+(deftest lower-reduce-phase-id-is-structured-for-any-equation-id
+  (let [reduction (assoc (soac/par-form->soac
+                          'result
+                          '(raster.par/reduce acc 0.0 j n (+ acc (aget a j))) 0)
+                         :id 'symbolic-reduction)
+        phase-two (second (lower/lower-reduce reduction nil))]
+    (is (= [:reduction-phase 'symbolic-reduction :cross-block] (:id phase-two)))
+    (is (launch/dimension-expression? (get-in phase-two [:space :dims 0 :bound])))))
 
 (deftest lower-reduce-single-phase-test
   (testing "Small constant reduce lowers to a single SegRed"

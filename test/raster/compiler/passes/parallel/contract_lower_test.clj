@@ -45,12 +45,12 @@
       (is (= '#{y} (:outputs sr))))))
 
 (deftest contract-form-custom-init-combine
-  (testing "opts :init/:combine flow into reduce-op (e.g. max-plus semiring)"
+  (testing "the exact typed identity and combine flow into the certified max-plus reduction"
     (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
                                      (+ (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
-                                     :init -1.0e30 :combine max)
+                                     :init Double/NEGATIVE_INFINITY :combine max)
           sr (cl/contract-form->segred form)]
-      (is (= -1.0e30 (:init (segop/scalar-reduce-op sr))))
+      (is (= 'Double/NEGATIVE_INFINITY (:init (segop/scalar-reduce-op sr))))
       (is (= 'max (first (:lambda (segop/scalar-reduce-op sr))))))))
 
 (deftest contract-form-three-free-axes

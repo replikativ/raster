@@ -4,6 +4,7 @@
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -15,20 +16,21 @@
   (av/tensor {:dtype dtype :shape shape :representation {:kind :plain}}))
 
 (defn- program []
-  (let [equation
-        '(= contract-equation [C]
-            (segmented-reduce
-             {:segment-axes [[i m] [j n]]
-              :index l :extent k
-              :accumulators [acc] :identities [0.0]
-              :dtypes [:float] :algebra [{}]
-              :attributes {:stable-array-captures [A B]}}
-             [] [A B n k]
-             (lambda [acc lhs rhs width inner]
-               (region []
-                       [(+ acc
-                           (* (aget lhs (+ (* i inner) l))
-                              (aget rhs (+ (* l width) j))))]))))
+  (let [body '(+ acc
+                 (* (aget lhs (+ (* i inner) l))
+                    (aget rhs (+ (* l width) j))))
+        algebra (scan/certify-reassociation
+                 {:acc 'acc :init 0.0 :lambda body} :float)
+        equation
+        (list '= 'contract-equation ['C]
+              (list 'segmented-reduce
+                    {:segment-axes '[[i m] [j n]]
+                     :index 'l :extent 'k
+                     :accumulators ['acc] :identities [0.0]
+                     :dtypes [:float] :algebra [algebra]
+                     :attributes {:stable-array-captures ['A 'B]}}
+                    [] ['A 'B 'n 'k]
+                    (dialect/lambda-form ['acc 'lhs 'rhs 'width 'inner] [body])))
         facts
         (assoc (dialect/default-program-facts
                 {:front-end :typed-segmented-reduction-test})

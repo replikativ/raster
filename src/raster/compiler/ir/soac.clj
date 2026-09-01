@@ -398,13 +398,27 @@
 
 (defn let-bindings->nodes
   "Convert a sequence of [sym expr] binding pairs to SOAC/Scalar nodes.
-  Each pair gets a sequential id for ordering."
+  Each pair gets a sequential id for ordering.
+
+  This compatibility adapter must not turn a legal sequential `par/reduce` fallback into an
+  invalid parallel tree. If the canonical reduction constructor declines reassociation (for
+  example a finite max sentinel rather than the true typed identity), retain the complete source
+  expression as a ScalarBinding. Direct typed routing remains strict and reports its structured
+  decline separately."
   [pairs]
   (vec
    (map-indexed
     (fn [id [sym expr]]
-      (or (par-form->soac sym expr id)
-          (->ScalarBinding id sym expr)))
+      (let [converted
+            (try
+              (par-form->soac sym expr id)
+              (catch clojure.lang.ExceptionInfo exception
+                (if (and (par/par-reduce-form? expr)
+                         (some-> exception ex-data :reason name
+                                 (.startsWith "reduction-")))
+                  nil
+                  (throw exception))))]
+        (or converted (->ScalarBinding id sym expr))))
     pairs)))
 
 (declare node-all-free-syms node-produced-syms)

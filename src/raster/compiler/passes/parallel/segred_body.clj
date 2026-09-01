@@ -14,9 +14,10 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.segop :as segop]))
+            [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
-(def ^:private associative-operators #{:+ :* :min :max})
 (def ^:private cast-heads
   {'byte :byte, 'clojure.core/byte :byte
    'int :int, 'clojure.core/int :int
@@ -51,48 +52,49 @@
       (recur (util/subst-syms (util/binding-env bindings) (first body))))
     expression))
 
-(defn- accumulator-use?
-  [accumulator expression]
-  (or (= accumulator expression)
-      (and (seq? expression)
-           (contains? (set (keys cast-heads)) (first expression))
-           (= 2 (count expression))
-           (= accumulator (second expression)))))
+(defn- literal-value
+  [value]
+  (if (and (seq? value)
+           (= 2 (count value))
+           (contains? cast-heads (first value))
+           (number? (second value)))
+    (second value)
+    (case value
+      Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
+      Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
+      Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
+      Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
+      value)))
 
 (defn scalar-plan
   "Project one scalar SegRed into an explicit combine operator, identity and element expression."
   [segred]
   (let [{:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         expression (inline-scalar-bindings lambda)
-        operator (when (seq? expression)
-                   (intrinsics/canonical (descriptor/semantic-op expression)))
-        arguments (vec (when (seq? expression) (descriptor/call-args expression)))]
-    (when-not (and acc (some? init) (contains? associative-operators operator)
-                   (= 2 (count arguments)))
-      (decline! :scalar-combine
-                "KernelBody reduction requires a binary associative scalar combine"
-                {:segred-id (:id segred) :accumulator acc :identity init
-                 :operator operator :arguments arguments :lambda lambda}))
-    (let [[left right] arguments
-          left-accumulator? (accumulator-use? acc left)
-          right-accumulator? (accumulator-use? acc right)
-          element (if left-accumulator? right left)]
-      (when (= left-accumulator? right-accumulator?)
-        (decline! :accumulator-position
-                  "KernelBody reduction combine does not contain its accumulator exactly once"
-                  {:segred-id (:id segred) :accumulator acc :arguments arguments}))
-      {:operator operator :identity init :element element :accumulator acc})))
+        component (first (get-in segred [:reduction :components]))
+        dtype (:dtype component)
+        declared-algebra (get-in segred [:reduction :algebra])
+        declared (if (scan/associative-scan? declared-algebra)
+                   declared-algebra
+                   (first (:components declared-algebra)))
+        derived (try
+                  (scan/certify-reassociation
+                   {:acc acc :init init :lambda expression} dtype)
+                  (catch clojure.lang.ExceptionInfo exception
+                    (decline! :certified-monoid
+                              "KernelBody reduction requires a certified typed monoid"
+                              {:segred-id (:id segred) :certificate-error (ex-data exception)})))
+        operator (intrinsics/canonical (:combine derived))]
+    (when-not (scan/compatible-certificate? declared derived)
+      (decline! :certified-monoid
+                "scheduled reduction algebra disagrees with its concrete scalar region"
+                {:segred-id (:id segred) :declared declared :derived derived}))
+    ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
+    ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
+    {:operator operator :identity (literal-value init) :element (:element derived)
+     :accumulator acc}))
 
-(defn- literal-value
-  [value]
-  (case value
-    Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
-    Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
-    Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
-    Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
-    value))
-
-(defn- launch-group-count
+(defn launch-group-count
   "Translate SegRed's historical capped-grid expression into inspectable launch IR.
 
    `compute-launch-params` predates KernelLaunch and represents the reduction grid as
@@ -228,10 +230,13 @@
                                   (get scalar-types (symbol (name id))) dtype))
         array-dtype (fn [id] (or (get array-types id)
                                  (get array-types (symbol (name id))) dtype))
+        bound-dimension (if (or (symbol? bound) (keyword? bound) (vector? bound))
+                          (launch/runtime-value bound)
+                          bound)
         _ (when-not (and (contains? #{:float :double} (dtype/canon dtype))
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
-                         (or (and (integer? bound) (pos? bound)) (symbol? bound))
+                         (launch/dimension-expression? bound-dimension)
                          (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
                          (every? #(= (dtype/canon dtype) (dtype/canon (scalar-dtype %))) scalars))
             (decline! :uniform-scalar-storage
@@ -280,13 +285,31 @@
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input dtype [bound] :global (layout/row-major [bound] dtype) :operand)
+                     % :input dtype ['_n_bound] :global
+                     (layout/row-major ['_n_bound] dtype) :operand)
                    arrays)
               [(body/->KernelParameter output :output dtype ['partial-count] :global
                                        (layout/row-major ['partial-count] dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
+        result-region (get-in segred [:reduction :attributes :result-region])
+        _ (when (and result-region (seq (:operands result-region)))
+            (decline! :full-reduction-result-operands
+                      "full-reduction result transforms cannot address tensor operands"
+                      {:segred-id (:id segred) :operands (:operands result-region)}))
+        transformed
+        (when result-region
+          (scalar-region-lower/lower
+           result-region
+           {:accumulator final-value :accumulator-dtype dtype :store-dtype dtype
+            :parameters (into {} (map (fn [parameter] [(:id parameter) parameter])) parameters)
+            :coordinate-lower (fn [_]
+                                (decline! :full-reduction-result-operands
+                                          "full-reduction result transform has no tensor axes"
+                                          {:segred-id (:id segred)}))
+            :id-prefix "completed-reduction"}))
+        stored-value (or (:result transformed) final-value)
         kernel-body
         (body/make
          {:id [:segred (:id segred) :workgroup-tree]
@@ -336,8 +359,9 @@
                              (barrier)]
                             tree-stages
                             [(body/->ScalarLoad (body/value final-value dtype) scratch [0]
-                                                :lane-zero (body/literal identity dtype) :cached)
-                             (body/->ScalarStore output ['group-index] final-value :lane-zero)]))
+                                                :lane-zero (body/literal identity dtype) :cached)]
+                            (:operations transformed)
+                            [(body/->ScalarStore output ['group-index] stored-value :lane-zero)]))
           :schedule {:strategy :workgroup-tree
                      :workgroup-size workgroup-size
                      :reduction-operator operator}

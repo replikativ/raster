@@ -16,6 +16,28 @@
                         :lambda '(raster.numeric/+ (float acc) (aget values i))}
                        :float)))))
 
+(deftest reassociation-certification-uses-the-shared-pure-let-rewrite
+  (let [facts (scan/certify-reassociation
+               {:acc 'acc :init 0.0
+                :lambda '(let* [difference (- (aget x i) (aget target i))]
+                           (+ acc (* difference difference)))}
+               :double)]
+    (is (scan/associative-scan? facts))
+    (is (= '+ (:combine facts)))
+    (is (= '(* (- (aget x i) (aget target i))
+               (- (aget x i) (aget target i)))
+           (:element facts)))))
+
+(deftest reassociation-certification-uses-the-central-effect-analysis
+  (let [facts (scan/certify-reassociation
+               {:acc 'acc :init 0.0
+                :lambda '(raster.numeric/+
+                          acc
+                          (raster.numeric/* (aget a i) (aget b i)))}
+               :half)]
+    (is (scan/associative-scan? facts))
+    (is (= 'raster.numeric/* (first (:element facts))))))
+
 (deftest general-recurrences-are-not-relabelled-parallel-scans
   (testing "an RNN recurrence is sequential unless it is explicitly lifted to an associative algebra"
     (try

@@ -1037,9 +1037,12 @@
                                  source :float {'a :float 'out :float}
                                  {:resident-reductions? true})]
     (is (= :typed-soac (:dialect program)))
+    (is (= 1 (:vertical stats)))
     (is (zero? (:resident-reductions stats)))
-    (is (= :plain (get-in program [:values 'total :representation :kind])))
-    (is (= [:binding 'scaled] (get-in program [:equations 1 :site])))
+    (is (nil? (get-in program [:values 'total]))
+        "the unobservable pre-epilogue scalar is no longer materialized")
+    (is (= :plain (get-in program [:values 'scaled :representation :kind])))
+    (is (= [:binding 'scaled] (get-in program [:equations 0 :site])))
     (is (some #{'raster.par/reduce} (flatten (:source program))))
     (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
 

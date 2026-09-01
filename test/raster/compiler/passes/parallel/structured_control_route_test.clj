@@ -273,19 +273,67 @@
                   source pipeline/gpu-resident-pre-soa-passes options)
         scheduled (route/schedule-program semantic options)
         emitted (program-opencl/emit-program scheduled options)
-        loop-operation (get-in scheduled [:equations 0 :operations 0])]
+        emitted-program (:program emitted)
+        loop-operation (get-in scheduled [:equations 0 :operations 0])
+        loop-equation (first (:equations emitted-program))
+        trip-count-id (second (control/loop-index (:algorithm loop-equation)))
+        loop-output (-> loop-equation :algorithm control/carried first :output)
+        device-results
+        (set (mapcat :results
+                     (remove #(true? (get-in % [:attributes :host-only]))
+                             (:equations emitted-program))))
+        buffer-ids
+        (into device-results
+              (filter #(seq (:shape (get (:values emitted-program) %)))
+                      (:inputs emitted-program)))
+        buffers (zipmap buffer-ids (map #(keyword (str "rk4-buffer-" (hash %))) buffer-ids))
+        scalar-values
+        (into {}
+              (keep (fn [id]
+                      (when-not (contains? buffer-ids id)
+                        (let [dtype (get-in emitted-program [:values id :dtype])]
+                          [id {:type dtype
+                               :value (case dtype
+                                        :int (if (= id trip-count-id) 2 64)
+                                        :long 2
+                                        :float (float 0.25)
+                                        :double 0.25)}]))))
+              (:inputs emitted-program))
+        call
+        (program-call/make
+         emitted-program buffers scalar-values {loop-output :rk4-carry-scratch}
+         (fn [equation {:keys [operands]}]
+           (let [operand-id (first (:operands equation))
+                 divisor (double (get-in operands [operand-id :value]))]
+             (into {}
+                   (map (fn [id]
+                          [id {:type (get-in emitted-program [:values id :dtype])
+                               :value (/ 1.0 divisor)}]))
+                   (:results equation)))))]
     (is (= :typed-parallel (:dialect semantic)))
     (is (= :scheduled-parallel (:dialect scheduled)))
-    (is (= 4 (count (:equations scheduled)))
-        "one generic fixpoint and three suffix equations represent the RK4 loss")
+    (is (= 3 (count (:equations scheduled)))
+        "the generic fixpoint, host inv-n, and reduction with a final scalar epilogue represent the RK4 loss")
     (is (= 8 (count (get-in loop-operation [:graph :nodes])))
         "the loop body is the ordinary stencil/map schedule, not an RK4 primitive")
     (is (= :opencl-parallel (get-in emitted [:program :dialect])))
     (is (= 10 (count (:kernels emitted))))
     (is (= {:structured-loops-emitted 1
             :typed-equations-emitted 1
-            :host-scalar-equations 2}
-           (:stats emitted)))))
+            :host-scalar-equations 1}
+           (:stats emitted)))
+    (let [[partial final] (take-last 2 (:kernels emitted))
+          inv-n? #(and (symbol? %) (.startsWith (name %) "inv-n_"))]
+      (is (= [:kernel-body :kernel-body]
+             (mapv #(get-in % [:attributes :emission-route]) [partial final])))
+      (is (not-any? inv-n? (:arguments partial))
+          "the pre-combine phase must not apply or even bind the completed-result transform")
+      (is (some inv-n? (:arguments final))
+          "only the final reduction phase consumes the scalar epilogue input"))
+    (is (= ["StructuredLoopCall" "EvaluatedHostEquation" "EmittedEquationCall"]
+           (mapv #(-> % class .getSimpleName) (:steps call)))
+        "the real emitted workload must cross the checked runtime-call boundary")
+    (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))))
 
 (defn- prepared-mixed-call
   [trip-count]

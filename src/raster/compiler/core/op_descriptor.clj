@@ -935,7 +935,7 @@
       (throw (ex-info (str "no :algebra facet for reduction op " op-sym
                            " — register it (op-descriptor) before reducing with it")
                       {:op op-sym :dtype dtype})))
-    (let [float? (= dtype :float)]
+    (let [float? (contains? #{:half :float} dtype)]
       (case base
         (min Math/min) (if float? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
         (max Math/max) (if float? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)

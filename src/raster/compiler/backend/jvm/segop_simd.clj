@@ -817,24 +817,24 @@
   (let [{:keys [attributes lambda]} (soac-dialect/scalar-fold-parts fold)
         {:keys [parameters locals body-results]} (soac-dialect/lambda-parts lambda)
         [accumulator index] parameters
-        operator (reduction/scalar
-                  {:accumulator accumulator :neutral (:identity attributes)
-                   :dtype (:dtype attributes) :result nil :index index
-                   :step-result (first body-results)
-                   :algebra (or (:algebra attributes) {})
-                   :attributes {:source :typed-soac-scalar-fold}})
-        scheduled (segop/->SegRed
-                   [:scalar-fold (:id segmap) index]
-                   (segop/make-seg-space index (:extent attributes))
-                   (segop/->SegLevel :thread :virtual)
-                   operator nil (:inputs segmap) #{} (:scalars segmap)
-                   nil :single nil (:dtype attributes))
         cast (case (:dtype attributes)
                :float 'float :double 'double :int 'int :long 'long)
         n-sym (gensym "fold_n__")]
     (when (empty? locals)
       (if (= :implementation-defined (:association attributes))
-        (compile-segred scheduled)
+        (let [operator (reduction/scalar
+                        {:accumulator accumulator :neutral (:identity attributes)
+                         :dtype (:dtype attributes) :result nil :index index
+                         :step-result (first body-results)
+                         :algebra (or (:algebra attributes) {})
+                         :attributes {:source :typed-soac-scalar-fold}})
+              scheduled (segop/->SegRed
+                         [:scalar-fold (:id segmap) index]
+                         (segop/make-seg-space index (:extent attributes))
+                         (segop/->SegLevel :thread :virtual)
+                         operator nil (:inputs segmap) #{} (:scalars segmap)
+                         nil :single nil (:dtype attributes))]
+          (compile-segred scheduled))
         (list 'let* [n-sym (list 'int (:extent attributes))]
               (list 'loop* [index '(int 0)
                             accumulator (list cast (:identity attributes))]
