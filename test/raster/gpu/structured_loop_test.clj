@@ -17,15 +17,13 @@
         equation
         (list '= 'advance '[u-next]
               (list 'map {:index 'i :extent 'n-in}
-                    '[u-in] '[alpha-in iteration]
-                    (soac/lambda-form
-                     '[u-value alpha-value iteration-value]
-                     '[(+ u-value alpha-value (* 0.0 iteration-value))])))
+                    '[u-in] '[alpha-in]
+                    (soac/lambda-form '[u-value alpha-value] '[(+ u-value alpha-value)])))
         body (soac/make
               (soac/default-program-facts
                {:values {'iteration extent 'n-in extent 'alpha-in scalar
                          'u-in inner-tensor 'u-next inner-tensor}
-                :inputs '[iteration n-in alpha-in u-in]
+                :inputs '[n-in alpha-in u-in]
                 :equations {'advance (soac/default-equation-facts)}})
               [equation] '[u-next])
         algorithm
@@ -40,7 +38,7 @@
          {'steps extent 'n extent 'alpha scalar 'u0 tensor 'u-final tensor})
         scheduled (lower/schedule algorithm {:target-device :cpu:0 :dtype :float})
         emitted (opencl/generate-kernel-graph
-                 (:graph scheduled) :scalar-types {'alpha-in :float 'iteration :long})]
+                 (:graph scheduled) :scalar-types {'alpha-in :float})]
     (loop-call/make
      scheduled emitted
      {'u0 :initial 'u-final :output}

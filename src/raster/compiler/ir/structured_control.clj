@@ -17,9 +17,9 @@
        typed-soac-body)
 
    `trip-count` is either a non-negative integer or an outer scalar value ID.  At zero trips each
-   output denotes its corresponding initial value.  The body input boundary is exactly the
-   iteration parameter followed by invariant parameters and carried parameters; its ordered
-   outputs are exactly the carried results."
+   output denotes its corresponding initial value. The body may use any ordered subset of the
+   iteration parameter, invariant parameters, and carried parameters; its ordered outputs are
+   exactly the carried results."
   (:require [clojure.walk :as walk]
             [pattern.nanopass.dialect :as dialect :refer [def-dialect]]
             [raster.compiler.ir.abstract-value :as av]
@@ -90,10 +90,16 @@
   (mapv :output (carried program)))
 
 (defn body-inputs
+  "All declared loop-body binders in canonical scope order."
   [program]
   (vec (concat [(first (loop-index program))]
                (map :parameter (invariants program))
                (map :parameter (carried program)))))
+
+(defn used-body-inputs
+  "The minimal ordered input boundary used by the closed TypedSOAC body."
+  [program]
+  (vec (:inputs (soac/facts (body program)))))
 
 (defn body-results
   [program]
@@ -176,10 +182,14 @@
        (fail! :typed-loop-outer-bindings
               "loop operands and results must be distinct in the enclosing scope"
               {:ids outer-ids}))
-     (when-not (= expected-inputs (:inputs body-facts))
-       (fail! :typed-loop-body-inputs
-              "loop body inputs must exactly follow iteration, invariants, and carried values"
-              {:expected expected-inputs :actual (:inputs body-facts)}))
+     (let [actual-inputs (:inputs body-facts)
+           actual-set (set actual-inputs)
+           expected-used (filterv actual-set expected-inputs)]
+       (when-not (= expected-used actual-inputs)
+         (fail! :typed-loop-body-inputs
+                "loop body inputs must be an ordered subset of declared structured-loop binders"
+                {:declared expected-inputs :expected-used expected-used
+                 :actual actual-inputs})))
      (when-not (= expected-results (soac/outputs body-program))
        (fail! :typed-loop-body-results
               "loop body outputs must exactly match the ordered carried results"
