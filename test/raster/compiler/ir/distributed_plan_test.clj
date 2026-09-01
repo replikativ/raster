@@ -207,3 +207,53 @@
                              :route [:gpu-0->gpu-1] :bytes 64}]]})
                 (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-collective-round-link-conflict (:reason (ex-data error))))))
+
+(defn- two-device-halo
+  [routes]
+  (distributed/schedule-halo
+   (distributed/halo-exchange
+    {:id :batch-halo :value :batch :axis 0 :width 1 :boundary :nonperiodic})
+   (:batch (training-values)) (:batch (training-shards)) routes
+   [:stencil-0 :stencil-1]))
+
+(deftest halo-exchange-derives-neighbor-regions-and-byte-costs
+  (let [halo (two-device-halo
+              {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]
+               [:gpu-1 :gpu-0] [:gpu-1->gpu-0]})
+        compute [(distributed/compute-step
+                  {:id :stencil-0 :device :gpu-0 :duration-ns 100})
+                 (distributed/compute-step
+                  {:id :stencil-1 :device :gpu-1 :duration-ns 150})]
+        plan (distributed/plan
+              {:id :halo-probe
+               :mesh (distributed/mesh [{:name :space :size 2}] [:gpu-0 :gpu-1])
+               :topology (two-device-topology)
+               :values (training-values) :shards (training-shards)
+               :halos [halo]
+               :steps (into compute (:steps halo))
+               :outputs (:completions halo)})
+        simulation (distributed/simulate plan)
+        certificate (:certificate (distributed/certify plan))
+        [forward backward] (:steps halo)]
+    (is (= [16 16] (mapv :bytes (:steps halo))))
+    (is (= {:offsets [3 0] :shape [1 4]}
+           (get-in forward [:attributes :source-region])))
+    (is (= {:offsets [4 0] :shape [1 4]}
+           (get-in backward [:attributes :source-region])))
+    (is (= 1151 (:makespan-ns simulation)))
+    (is (= 32 (:transferred-bytes simulation)))
+    (is (= {:id :batch-halo :value :batch :axis 0 :width 1
+            :boundary :nonperiodic
+            :steps [[:batch-halo :edge 0 :forward]
+                    [:batch-halo :edge 0 :backward]]
+            :completions [[:batch-halo :edge 0 :forward]
+                          [:batch-halo :edge 0 :backward]]
+            :bytes 32}
+           (first (:halos certificate))))))
+
+(deftest halo-scheduling-requires-every-directed-neighbor-route
+  (let [error (try
+                (two-device-halo {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]})
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :distributed-halo-route (:reason (ex-data error))))
+    (is (= :gpu-1 (:source (ex-data error))))))

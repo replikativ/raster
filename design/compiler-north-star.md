@@ -925,6 +925,14 @@ steps, parallel legs cannot claim the same directed link, and the certificate re
 semantic operation and its schedule. This makes ring/tree/native implementations replaceable while
 the dependency DAG and topology simulator account for their actual bytes and routes.
 
+Axis-partitioned scientific values now use the same machinery for nonperiodic halo exchange. A
+semantic `HaloExchange` names the value, partition axis, halo width, and boundary policy. Scheduling
+derives adjacent owned shard faces, exact source rectangles, dtype-sized byte counts, and both
+directed routes; those facts are retained on transfer steps and in the distributed certificate.
+The first contract intentionally supports nonperiodic one-axis partitions. Periodic boundaries,
+multidimensional decomposition, overlap lifetimes, and AMR coarse/fine interpolation need explicit
+semantics rather than being smuggled through generic transfer attributes.
+
 The first distributed target should be data-parallel training with explicit gradient all-reduce,
 followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
 Pipeline and expert parallelism should wait until the value, sharding, communication and failure
