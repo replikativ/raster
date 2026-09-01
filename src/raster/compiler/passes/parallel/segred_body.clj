@@ -75,7 +75,9 @@
       (decline! :certified-monoid
                 "scheduled reduction algebra disagrees with its concrete scalar region"
                 {:segred-id (:id segred) :declared declared :derived derived}))
-    {:operator operator :identity (:identity derived) :element (:element derived)
+    ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
+    ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
+    {:operator operator :identity init :element (:element derived)
      :accumulator acc}))
 
 (defn- literal-value
