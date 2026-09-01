@@ -81,8 +81,11 @@ synthetic or physical OpenCL, CUDA, or HIP target descriptor. Its first hardware
 vertical covers portable SegRed and SegFoldMap KernelBodies, preserves `:fallback :none`, validates
 that every artifact target agrees with the emitted program dialect, and sends the resulting CUDA
 and HIP reduction phases through nvcc/hipcc in CI. Graph families that have not yet acquired a
-portable KernelBody (currently SegMap, SegStencil, and SegScan) fail at this boundary instead of
-embedding OpenCL source in a CUDA/HIP program.
+portable KernelBody fail at this boundary instead of embedding OpenCL source in a CUDA/HIP
+program. Typed one-dimensional SegMap now shares one scalar-expression lowering with SegFoldMap:
+stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stores emit from the
+same KernelBody to all three C-family targets. Loop-carried map regions, SegStencil, and SegScan
+remain explicit coverage gaps.
 
 The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
@@ -1080,10 +1083,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. The public flat `par/gather` spelling now canonicalizes
    to that ordinary typed map: JVM scheduling recognizes an exact stable indirect read and selects
-   hardware `vgather`, while OpenCL emits the same scheduled SegMap. Portable scalar/control
-   KernelBody lowering for SegMap is the remaining step before the public CUDA/HIP C-family entry
-   accepts this graph family. Kernel-local C names are fresh with respect to the typed ABI, so an
-   index buffer cannot shadow the launch coordinate. Flat
+   hardware `vgather`, while the portable scalar/control KernelBody emits the admitted scheduled
+   SegMap subset across OpenCL, CUDA and HIP. Loop-carried scalar regions remain a checked decline
+   until their TypedSOAC loop values lower to KernelBody `ForLoop`. Kernel-local C names are fresh
+   with respect to the typed ABI, so an index buffer cannot shadow the launch coordinate. Flat
    additive reducing scatters also carry a checked conflict algebra through this boundary and select
    exact JVM or atomic OpenCL schedules. Strided gather/scatter, additional atomic monoids,
    privatized histogram schedules, the remaining parallel forms, calibrated whole-graph placement

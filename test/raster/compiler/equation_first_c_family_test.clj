@@ -47,12 +47,30 @@
          (raster.numeric/* (raster.arrays/aget left index)
                            (raster.arrays/aget right index))))))
 
-(deftm uncovered-elementwise
+(deftm c-family-elementwise
   [input :- (Array float) n :- Long] :- (Array float)
   (let [output (float-array n)]
     (raster.par/map! output index n float
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
+
+(deftm c-family-effect-map!
+  [input :- (Array float) left :- (Array float) right :- (Array long) n :- Long] :- Void
+  (raster.par/map-void!
+   index n
+   (do (raster.arrays/aset left index
+                           (float (raster.numeric/* (float 2.0)
+                                                    (raster.arrays/aget input index))))
+       (raster.arrays/aset right index (long index)))))
+
+(deftm uncovered-stencil
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/stencil!
+     output [input] 1 :dirichlet float index n
+     (raster.numeric/+
+      (raster.arrays/aget input (dec index))
+      (raster.arrays/aget input (inc index))))))
 
 (deftm c-family-segment-sum!
   [output :- (Array float) segment-count :- Long width :- Long] :- Void
@@ -93,11 +111,41 @@
         (is (= (:emitted compilation)
                (emitted-program/validate! (:emitted compilation))))))))
 
-(deftest public-c-family-route-never-borrows-opencl-source
+(deftest public-elementwise-map-uses-portable-kernel-body
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'c-family-elementwise {:target target :dtype :float})
+          kernel (first (:kernels compilation))]
+      (is (= [module-target] (mapv :target (:kernels compilation))))
+      (is (= :portable-segmap
+             (get-in kernel [:attributes :kernel-body :attributes :kind])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-effect-map-preserves-typed-multi-output-storage
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'c-family-effect-map! {:target target :dtype :float})
+          linked (equation-first/lower
+                  compilation [(float-array 8) (float-array 8) (long-array 8) 8])
+          kernel (first (:kernels compilation))]
+      (is (= module-target (:target kernel)))
+      (is (= #{'left 'right}
+             (into #{}
+                   (comp (filter #(= :output (:kind %))) (map :id))
+                   (get-in kernel [:attributes :kernel-body :parameters]))))
+      (is (empty? (:outputs linked)) "Void host semantics remain effect-only")
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest uncovered-c-family-route-never-borrows-opencl-source
   (doseq [target [cuda-target hip-target]]
     (let [failure (reason-of #(equation-first/compile
-                               #'uncovered-elementwise {:target target :dtype :float}))]
-      (is (= :kernel-graph-target-lowering-missing (:reason failure)))
+                               #'uncovered-stencil {:target target :dtype :float}))]
+      (is (contains? #{:equation-first-coverage :kernel-graph-target-lowering-missing}
+                     (:reason failure)))
       (is (= :none (:fallback failure))))))
 
 (deftest public-segmented-fold-map-uses-the-same-c-family-boundary
