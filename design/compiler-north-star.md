@@ -87,7 +87,10 @@ stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stor
 same KernelBody to all three C-family targets. Canonical loop/recur scalar carries become ordered
 KernelBody `ForLoop` regions rather than being reassociated as reductions. This is sufficient for
 the public seven-stage GQA composition to emit entirely as CUDA/HIP and pass both vendor compilers;
-SegStencil and SegScan remain explicit coverage gaps.
+SegStencil remains the explicit portable C-family coverage gap. Certified scans now lower their
+single- or three-phase schedule to target-neutral KernelBody scalar SSA, workgroup storage,
+barriers, ordered block carries, and inclusive/exclusive result placement. The same bodies compile
+with OpenCL, nvcc, and hipcc; the former handwritten OpenCL scan source path has been deleted.
 
 The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
@@ -99,7 +102,10 @@ certificate; its caller-owned destination and output layout are facts, not part 
 algebra. Both modes lower directly to the same one- or three-node SegScan `KernelGraph` without
 constructing a legacy `SoacScan`. Exclusive mode retains logical traversal extent `n`, records its
 result as `n+1` through checked symbolic integer-expression IR, and specializes scheduled stores to
-materialize the identity at zero and prefixes at `idx+1`. The GPU backend now target-lowers that
+materialize the identity at zero and prefixes at `idx+1`. Scan uses the same checked
+logical-result/physical-`result-storage` relation as every other destination-writing TypedSOAC;
+the destination is neither a functional capture nor a scan-specific backend convention. The GPU
+backend now target-lowers that
 scheduled value through one fail-loud graph-emission boundary, wraps it in the same
 `KernelDispatch` value used by other selectable
 schedules, and resident descriptor extraction retains it as one executable step. LinkPlan and the

@@ -59,8 +59,8 @@
 
 (deftest session-runner-owns-only-graph-temporaries-and-bound-driver-objects
   (let [graph (emitted-graph)
-        values-buffer {:dtype :float :n-elements 1025 :byte-size 4100}
-        output-buffer {:dtype :float :n-elements 1025 :byte-size 4100}
+        values-buffer {:id :values-buffer :dtype :float :n-elements 1025 :byte-size 4100}
+        output-buffer {:id :output-buffer :dtype :float :n-elements 1025 :byte-size 4100}
         allocation (fn [id]
                      (bview/allocation {:id id :byte-size 4100 :memory-space :shared
                                         :device :ze:0 :coherence :host-coherent
@@ -274,14 +274,16 @@
         (let [handle (gpu/bind-kernel-graph!
                       sess :view-scan graph {'values input 'out output}
                       {'n {:type :int :value n}})
-              sub-buffer (first @slices)
+              [input-sub-buffer output-sub-buffer] @slices
               temporary (first (vals (get-in @sess [:kernel-graphs :view-scan
                                                     :temporary-buffers])))]
-          (is (= 1 (count @slices)) "only the nonzero view needs a cl_mem sub-buffer")
-          (is (identical? sub-buffer (get-in @sess [:kernel-graphs :view-scan
-                                                    :outputs 'out])))
+          (is (= [[0 n-bytes] [output-offset n-bytes]]
+                 (mapv (juxt :byte-offset :byte-size) @slices))
+              "both proper subranges retain their exact physical extent")
+          (is (identical? output-sub-buffer
+                          (get-in @sess [:kernel-graphs :view-scan :outputs 'out])))
           (gpu/release-kernel-graph! sess handle)
-          (is (= #{sub-buffer temporary} (set @freed)))
+          (is (= #{input-sub-buffer output-sub-buffer temporary} (set @freed)))
           (is (not-any? #(identical? root-buffer %) @freed)
               "the session-owned root allocation survives graph release"))
         (reset! slices [])
@@ -291,9 +293,9 @@
                               (gpu/bind-kernel-graph!
                                sess :failed-view-scan graph {'values input 'out output}
                                {'n {:type :int :value n}})))
-        (is (= 1 (count @slices)))
-        (is (= 2 (count @freed))
-            "failed binding releases both its created sub-buffer and temporary")
-        (is (some :sub-buffer @freed))
+        (is (= 2 (count @slices)))
+        (is (= 3 (count @freed))
+            "failed binding releases both created sub-buffers and its temporary")
+        (is (= 2 (count (filter :sub-buffer @freed))))
         (is (some :temporary @freed))
         (is (empty? (:kernel-graphs @sess)))))))

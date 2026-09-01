@@ -545,13 +545,14 @@
         {:keys [accumulators elements capture-parameters]}
         (soac-dialect/parameter-layout equation)
         facts (soac-dialect/facts program)
-        destination (get-in facts [:equations equation-id :attributes :destination])
+        storage (soac-dialect/result-storage facts equation-id)
+        destination (:destination (first storage))
         _ (when-not (and (= 1 (count results)) (= 1 (count accumulators))
-                         (= 1 (count body-results)) destination)
+                         (= 1 (count body-results)) (= 1 (count storage)) destination)
             (throw (ex-info "typed scan requires one result, accumulator and destination"
                             {:reason :typed-soac-scan-subset :equation equation-id
                              :results results :accumulators accumulators
-                             :destination destination})))
+                             :result-storage storage})))
         index (:index attributes)
         substitutions
         (into (zipmap capture-parameters captures)

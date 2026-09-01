@@ -55,6 +55,14 @@
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
 
+(deftm c-family-scan
+  "A public certified scan lowered as a three-stage portable KernelGraph."
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/scan output accumulator (float 0.0) index n float
+                     (raster.numeric/+ accumulator
+                                       (raster.arrays/aget input index)))))
+
 (deftm c-family-effect-map!
   [input :- (Array float) left :- (Array float) right :- (Array long) n :- Long] :- Void
   (raster.par/map-void!
@@ -131,6 +139,27 @@
       (is (= [module-target] (mapv :target (:kernels compilation))))
       (is (= :portable-segmap
              (get-in kernel [:attributes :kernel-body :attributes :kind])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-scan-uses-one-portable-kernel-body-graph
+  (doseq [[target program-dialect module-target]
+          [[cuda-target :cuda-parallel :cuda-c]
+           [hip-target :hip-parallel :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'c-family-scan {:target target :dtype :float})
+          linked (equation-first/lower
+                  compilation [(float-array [1 2 3 4]) 4])
+          kernels (:kernels compilation)]
+      (is (= program-dialect (get-in compilation [:emitted :dialect])))
+      (is (= [:intra-block :block-scan :carry-in]
+             (mapv #(get-in % [:attributes :phase]) kernels)))
+      (is (every? #(= module-target (:target %)) kernels))
+      (is (every? #(= :portable-segscan
+                      (get-in % [:attributes :kernel-body :attributes :kind]))
+                  kernels))
+      (is (not-any? #(re-find #"__kernel|get_global_id|get_local_id" (:source %)) kernels))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
+      (is (= 1 (count (:outputs linked))))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest public-effect-map-preserves-typed-multi-output-storage

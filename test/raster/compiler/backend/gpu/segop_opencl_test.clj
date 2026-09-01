@@ -12,9 +12,11 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as lower]
@@ -90,6 +92,21 @@
      (sg/generate-scan-kernel-graph graph
                                     :scalar-types (:scalar-types opts)))))
 
+(defn- kernel-body-operations
+  [artifact]
+  (letfn [(walk [operations]
+            (mapcat
+             (fn [operation]
+               (cons operation
+                     (concat (walk (or (:operations operation) []))
+                             (walk (or (:then-operations operation) []))
+                             (walk (or (:else-operations operation) [])))))
+             operations))]
+    (walk (get-in artifact [:attributes :kernel-body :operations]))))
+
+(defn- operation-kind [operation]
+  (some-> operation class .getSimpleName))
+
 (deftest segscan-graph-emits-one-verified-artifact-per-scheduled-node
   (let [emitted (emitted-scan-graph
                  '(raster.par/scan out acc 0.0 i n double
@@ -101,16 +118,31 @@
     (is (every? kart/kernel-artifact? [intra block carry]))
     (is (= [:intra-block :block-scan :carry-in]
            (mapv #(get-in % [:attributes :phase]) [intra block carry])))
+    (is (every? #(= :portable-segscan
+                    (get-in % [:attributes :kernel-body :attributes :kind]))
+                [intra block carry]))
     (testing "stage 1 owns both the result and graph temporary in one exact ABI"
       (is (= [:temporary :result :operand :parameter :bound]
              (mapv :role (:abi intra))))
       (is (= '[scale n] (take-last 2 (:arguments intra))))
-      (is (re-find #"value = \(double\).*scale.*values\[idx\]" (:source intra))))
+      (let [operations (kernel-body-operations intra)]
+        (is (some #(and (= "ScalarLoad" (operation-kind %))
+                        (= 'values (:buffer %)))
+                  operations))
+        (is (some #(and (= "ScalarCompute" (operation-kind %))
+                        (= :* (get-in % [:expression :op])))
+                  operations))))
     (testing "block totals are scanned in one chunked workgroup for unbounded symbolic sizes"
       (is (= [1] (get-in block [:launch :group-count])))
-      (is (re-find #"for \(int base = 0; base < _n_bound; base \+= 256\)" (:source block))))
+      (let [loop (some #(when (= "ForLoop" (operation-kind %)) %) (kernel-body-operations block))]
+        (is (= [0 '_n_bound 256 :ordered]
+               [(:lower loop) (:upper loop) (:step loop)
+                (get-in loop [:attributes :association])]))))
     (testing "carry consumes the scanned total of the preceding block"
-      (is (re-find #"block_totals_.*\[block - 1\].*out_\[idx\]" (:source carry))))
+      (let [loads (filter #(= "ScalarLoad" (operation-kind %))
+                          (kernel-body-operations carry))]
+        (is (= #{(first (map :id (:temporaries emitted))) 'out}
+               (set (map :buffer loads))))))
     (testing "entry-point names are valid C identifiers"
       (is (every? #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" (:kernel-name %))
                   [intra block carry])))
@@ -159,9 +191,35 @@
 (deftest segscan-carry-emits-the-certified-combine
   (let [emitted (emitted-scan-graph
                  '(raster.par/scan out acc 1.0 i n double (* acc (aget values i))))
-        carry (get-in emitted [:nodes 2 :operation])]
-    (is (re-find #"block_totals_.*\[block - 1\] \* out_\[idx\]" (:source carry))
+        carry (get-in emitted [:nodes 2 :operation])
+        combines (for [operation (kernel-body-operations carry)
+                       :when (= "ScalarCompute" (operation-kind operation))]
+                   (get-in operation [:expression :op]))]
+    (is (= [:*] (vec combines))
         "carry propagation must use the certified monoid, not a hard-coded addition")))
+
+(deftest segscan-carry-separates-its-launch-width-from-the-scanned-block-width
+  (let [node (soac/par-form->soac
+              'scan-result
+              '(raster.par/scan out acc 0.0 i n float (+ acc (aget values i)))
+              73)
+        operations (lower/lower-scan node nil :dtype :float)
+        scan-width (get-in operations [0 :grid :block-size])
+        carry-width (quot scan-width 2)
+        operations (assoc-in operations [2 :grid]
+                             (segop/->KernelGrid
+                              (klaunch/ceil-div 'n carry-width)
+                              carry-width 0))
+        graph (lower/scan-kernel-graph
+               node operations {:array-types {'values :float 'out :float}})
+        carry (get-in (sg/generate-scan-kernel-graph graph) [:nodes 2 :operation])
+        scan-block (some #(when (= 'scan-block (:id %)) %)
+                         (get-in carry [:attributes :kernel-body :indices]))]
+    (is (= [carry-width] (get-in carry [:launch :workgroup-size])))
+    (is (= scan-width
+           (get-in carry [:attributes :kernel-body :schedule :scan-block-size])))
+    (is (= (kernel-body/expression :floor-div 'scan-index scan-width)
+           (:expression scan-block)))))
 
 ;; ================================================================
 ;; Silently-ignored-information family: a SegRed combine that the

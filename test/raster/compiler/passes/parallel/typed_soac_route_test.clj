@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
@@ -17,6 +18,12 @@
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.program-tuning :as program-tuning]))
+
+(defn- scalar-stores
+  [artifact]
+  (filterv #(= "raster.compiler.ir.kernel_body.ScalarStore"
+                (.getName (class %)))
+           (get-in artifact [:attributes :kernel-body :operations])))
 
 (def ^:private map-map
   '(let* [y (raster.par/pmap i n float
@@ -495,7 +502,8 @@
         equation (first (:equations scheduled))
         graph (get-in equation [:attributes :kernel-graph])
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
-        [intra _ carry] (:kernels emitted)]
+        [intra _ carry] (:kernels emitted)
+        result-index [(kernel-body/expression :add 'scan-index 1)]]
     (is (= :typed-soac (:route stats)))
     (is (= :exclusive
            (get-in (dialect/operation-parts
@@ -504,9 +512,13 @@
     (is (= :exclusive (get-in graph [:attributes :scan-mode])))
     (is (= (kernel-launch/sum 'n 1) (:elements (first (:outputs graph)))))
     (is (= 3 (count (:nodes graph))))
-    (is (re-find #"\[0\] = 0.0f" (:source intra)))
-    (is (re-find #"\[idx \+ 1\] = sdata\[tid\]" (:source intra)))
-    (is (re-find #"\[idx \+ 1\]" (:source carry)))
+    (is (some #(and (= 'out (:buffer %)) (= result-index (:coordinates %)))
+              (scalar-stores intra)))
+    (is (some #(and (= 'out (:buffer %)) (= [0] (:coordinates %))
+                    (= :scan-first-lane (:predicate %)))
+              (scalar-stores intra)))
+    (is (some #(and (= 'out (:buffer %)) (= result-index (:coordinates %)))
+              (scalar-stores carry)))
     (is (= 1 (get-in emitted [:stats :kernel-graphs])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))))
 
@@ -551,7 +563,9 @@
     (is (= 1 (count (:nodes graph))))
     (is (= (kernel-launch/sum 0 1) (:elements (first (:outputs graph)))))
     (is (= [1] (get-in artifact [:launch :group-count])))
-    (is (re-find #"\[0\] = 0.0f" (:source artifact)))
+    (is (some #(and (= 'out (:buffer %)) (= [0] (:coordinates %))
+                    (= :scan-first-lane (:predicate %)))
+              (scalar-stores artifact)))
     (is (identical? out (execute out)))
     (is (= 0.0 (double (aget out 0))))))
 

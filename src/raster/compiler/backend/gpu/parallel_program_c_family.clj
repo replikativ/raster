@@ -95,7 +95,16 @@
 
       (soac/program-form? algorithm)
       (let [body (scheduled-body parallel-program equation)
-            scheduled-graph (equation-graph/make algorithm body)
+            ;; Multi-phase schedules retain family-independent decisions (algebra, phase
+            ;; decomposition, tuning choice) on their certified graph. Rebuilding the physical
+            ;; dataflow remains generic, but those schedule facts must survive to target lowering.
+            graph-contract (get-in equation [:attributes :kernel-graph])
+            scheduled-graph (equation-graph/make
+                             algorithm body
+                             (cond-> {}
+                               graph-contract
+                               (assoc :provenance (:provenance graph-contract)
+                                      :attributes (:attributes graph-contract))))
             emitted (emit-graph scheduled-graph (:values body) (:operations equation) opts)]
         (assoc equation :operations
                [(emitted-equation/make algorithm body emitted {:provenance provenance})]))

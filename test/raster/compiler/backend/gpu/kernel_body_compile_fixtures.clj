@@ -45,6 +45,14 @@
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
 
+(deftm public-c-family-scan
+  "Public equation-first scan compiled by nvcc/hipcc without a physical device."
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/scan output accumulator (float 0.0) index n float
+                     (raster.numeric/+ accumulator
+                                       (raster.arrays/aget input index)))))
+
 (defn- reduction-artifact
   [dialect]
   (let [form (with-meta
@@ -190,6 +198,8 @@
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-map {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 

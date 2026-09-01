@@ -302,12 +302,16 @@
       scan
       (let [result (first results)
             mode (:mode attributes)
-            destination (get-in placement-facts [:attributes :destination])
+            ;; Scans share the same logical-result/physical-storage contract as maps and
+            ;; segmented reductions. Materialization must not recover a second, scan-only
+            ;; destination convention from equation attributes.
+            storage (get-in placement-facts [:attributes :result-storage])
+            destination (:destination (first storage))
             _ (when-not (and (= 1 (count results)) destination)
                 (throw (ex-info "typed scan requires one caller-owned destination"
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results
-                                 :destination destination})))
+                                 :result-storage storage})))
             source (with-meta
                      (list (case mode
                              :inclusive 'raster.par/scan

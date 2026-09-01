@@ -43,6 +43,17 @@
               :typed-equations-emitted 7
               :host-scalar-equations 0}}
 
+  :prefix-sum-gpu
+  {:route {:semantic-dialect :typed-parallel
+           :scheduled-dialect :scheduled-parallel
+           :emitted-dialect :opencl-parallel
+           :fallback :none}
+   :lowering {:nodes 2 :values 2 :instances 1 :program-instances 1
+              :outputs 1 :driver-allocations 0}
+   :emission {:structured-loops-emitted 0
+              :typed-equations-emitted 1
+              :host-scalar-equations 0}}
+
   :heat-rhs-1d-jvm
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true
            :declines {}}

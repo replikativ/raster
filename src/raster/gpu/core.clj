@@ -1252,11 +1252,16 @@
 (defn- runtime-buffer-for-view
   [device-id buffer view]
   (let [raw-dtype (dtype/canon (:dtype buffer))
-        view-dtype (dtype/canon (:dtype view))]
+        view-dtype (dtype/canon (:dtype view))
+        whole-buffer? (and (zero? (:byte-offset view))
+                           (= (:byte-length view) (:byte-size buffer)))]
     (when-not (= raw-dtype view-dtype)
       (throw (ex-info "kernel ABI cannot reinterpret a resident buffer dtype"
                       {:buffer-dtype raw-dtype :view-dtype view-dtype :view (:id view)})))
-    (if (zero? (:byte-offset view))
+    ;; A zero-origin prefix is still a range, not the whole allocation. Preserve its exact
+    ;; physical extent so KernelABI no-write-alias validation can prove it disjoint from a later
+    ;; sibling view of the same allocation.
+    (if whole-buffer?
       {:buffer buffer :owned-view? false}
       (case (backend-type device-id)
         :ze {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
