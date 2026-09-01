@@ -17,6 +17,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as soac-adapter]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
 
@@ -334,16 +335,21 @@
                 (fn [values operation]
                   (if (and (instance? raster.compiler.ir.segop.SegRed operation)
                            (= :block-local (:phase operation)))
-                    (reduce (fn [values id]
-                              (if (contains? values id)
-                                values
-                                (assoc values id
-                                       (av/tensor
-                                        {:dtype (:dtype operation)
-                                         :shape [(:num-blocks (:grid operation))]
-                                         :representation {:kind :plain}
-                                         :memory-space :device}))))
-                            values (:outputs operation))
+                    (let [grid (:grid operation)
+                          reduced-bound (-> operation :space segop/seg-space-reduced-dim :bound)
+                          partial-extent
+                          (segred-body/launch-group-count
+                           (:num-blocks grid) reduced-bound (:block-size grid))]
+                      (reduce (fn [values id]
+                                (if (contains? values id)
+                                  values
+                                  (assoc values id
+                                         (av/tensor
+                                          {:dtype (:dtype operation)
+                                           :shape (soac-dialect/extent-shape partial-extent)
+                                           :representation {:kind :plain}
+                                           :memory-space :device}))))
+                              values (:outputs operation)))
                     values))
                 values (:operations equation))))
            (:values form) equations)

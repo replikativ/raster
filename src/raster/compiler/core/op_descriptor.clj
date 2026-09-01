@@ -925,7 +925,7 @@
    single source emitters use to seed accumulators (segop-simd, GPU segred).
    Derived from the :algebra facet's abstract identity; min/max (whose abstract
    identity is nil — no identity over unbounded domains) become the dtype's
-   ∓Infinity, which IS their identity over IEEE floats. Emits a LITERAL or a
+   ∓Infinity over IEEE floats or exact extrema over bounded integers. Emits a LITERAL or a
    symbol suitable for splicing into generated code. Throws for ops without a
    registered monoid — an unregistered reduction must fail loud, not seed 0."
   [op-sym dtype]
@@ -935,16 +935,23 @@
       (throw (ex-info (str "no :algebra facet for reduction op " op-sym
                            " — register it (op-descriptor) before reducing with it")
                       {:op op-sym :dtype dtype})))
-    (let [float? (contains? #{:half :float} dtype)]
+    (let [dtype (dtype/canon dtype)
+          floating? (not (dtype/integral? dtype))
+          float-width? (contains? #{:half :float} dtype)
+          limits (:limits (dtype/info dtype))]
       (case base
-        (min Math/min) (if float? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
-        (max Math/max) (if float? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)
+        (min Math/min) (if floating?
+                         (if float-width? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
+                         (:max limits))
+        (max Math/max) (if floating?
+                         (if float-width? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)
+                         (:min limits))
         ;; numeric monoids: type the abstract identity for the dtype
         (let [id (:identity a)]
           (cond
             (nil? id) (throw (ex-info (str "op " op-sym " has no identity") {:op op-sym}))
             (contains? #{:int :long :byte} dtype) id
-            float?    (list 'float (double id))
+            float-width? (list 'float (double id))
             :else     (double id)))))))
 
 ;; --- Analytic cost (:cost facet; hardware-guided fusion profitability) ---

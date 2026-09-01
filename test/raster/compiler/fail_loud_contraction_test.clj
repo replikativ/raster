@@ -14,7 +14,7 @@
                 (list 'raster.numeric/* (list 'aget 'a 't) (list 'aget 'b 't))
                 :stages [{:axis 'blk :extent 2 :dtype :float :init 0.0 :lift 'inner}
                          {:axis 't :extent extent :dtype :int :init 0}])
-          (when combine [:combine combine :init 'Double/NEGATIVE_INFINITY])))
+          (when combine [:combine combine :init Byte/MIN_VALUE])))
 
 (deftest staged-refuses-a-combine-it-would-silently-turn-into-a-sum
   (testing "every accumulator level uses `+=` and a lift's linearity argument assumes addition, so
