@@ -474,26 +474,30 @@
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form)]
        (try
-         (when-let [typed-input (frontend/form->program
-                                 form {:dtype dtype :array-types array-types
-                                       :scalar-types scalar-types :values values})]
-           (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
-                 [typed-result resident-stats]
-                 (if resident-reductions?
-                   (resident/realize typed-result)
-                   [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-             (if (not-any? #(contains? #{:map :scatter :stencil :reduce
-                                         :segmented-reduce :product-reduce
-                                         :segmented-fold-map :scan}
-                                       (:kind (fusion/equation-info %)))
-                           (dialect/equations typed-result))
-               {:declined {:reason :no-certified-parallel-equation
-                           :stats (merge typed-stats resident-stats)}}
-               (let [{:keys [source realized]} (realize-source form typed-result)]
-                 {:program (envelope typed-result source realized)
-                  :stats (merge typed-stats resident-stats
-                                {:route :typed-soac :typed-validated true
-                                 :front-end :analyzed-source})}))))
+         (let [frontend-options {:dtype dtype :array-types array-types
+                                 :scalar-types scalar-types :values values}
+               typed-input (frontend/form->program form frontend-options)]
+           (if-not typed-input
+             (when-let [decline (frontend/coverage-decline form frontend-options)]
+               {:declined decline})
+             (let [[typed-result typed-stats]
+                   (fusion/fusion-fixpoint typed-input abstract-machine)
+                   [typed-result resident-stats]
+                   (if resident-reductions?
+                     (resident/realize typed-result)
+                     [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+               (if (not-any? #(contains? #{:map :scatter :stencil :reduce
+                                           :segmented-reduce :product-reduce
+                                           :segmented-fold-map :scan}
+                                         (:kind (fusion/equation-info %)))
+                             (dialect/equations typed-result))
+                 {:declined {:reason :no-certified-parallel-equation
+                             :stats (merge typed-stats resident-stats)}}
+                 (let [{:keys [source realized]} (realize-source form typed-result)]
+                   {:program (envelope typed-result source realized)
+                    :stats (merge typed-stats resident-stats
+                                  {:route :typed-soac :typed-validated true
+                                   :front-end :analyzed-source})})))))
          (catch clojure.lang.ExceptionInfo exception
            (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
              (throw exception))
