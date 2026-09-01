@@ -138,6 +138,13 @@
   [dialect]
   (if (opencl? dialect) "__kernel void " "extern \"C\" __global__ void "))
 
+(defn helper-source
+  "Add only the target-language qualifier to registry-owned scalar helper definitions."
+  [dialect source]
+  (if (or (empty? source) (opencl? dialect))
+    source
+    (str/replace source #"(?m)^inline " "__device__ __forceinline__ ")))
+
 (defn workgroup-arena-declaration
   "Spell one statically sized, explicitly aligned workgroup-memory arena."
   [dialect name bytes alignment]

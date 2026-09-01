@@ -38,11 +38,11 @@
     (is (dispatch/no-inline? #'par/dp4a))))
 
 (deftest an-intrinsic-intermediate-is-tagged
-  (testing "every walked dp4a call carries its Long result type — this is what the census needs"
+  (testing "every walked dp4a call carries its int32 result type — this is what the census needs"
     (let [wb ((requiring-resolve 'raster.core/ensure-walked-body!) #'dp4a-chain!)
           calls (filter #(= 'raster.par/dp4a (:raster.op/original (meta %))) (tree-seq coll? seq wb))]
       (is (= 2 (count calls)))
-      (is (every? #(= 'long (:raster.type/tag (meta %))) calls)
+      (is (every? #(= 'int (:raster.type/tag (meta %))) calls)
           (str "tags: " (mapv #(:raster.type/tag (meta %)) calls))))))
 
 (deftest an-intrinsic-lowers-through-the-registry-not-its-body

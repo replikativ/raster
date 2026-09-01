@@ -105,6 +105,22 @@
   ([] (pipelined-staging-kernel-body :preferred))
   ([overlap] (fixtures/pipelined-staging-body 32 overlap)))
 
+(defn- dp4a-kernel-body []
+  (body/make
+   {:id :dp4a-helper-test
+    :parameters [(body/->KernelParameter 'a :scalar :int [] nil nil :a)
+                 (body/->KernelParameter 'b :scalar :int [] nil nil :b)
+                 (body/->KernelParameter 'out :output :int [1] :global
+                                         (layout/row-major [1] :int) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'dot :int)
+                  (body/scalar-expression :dp4a :int
+                                          ['a 'b (body/literal 0 :int)]))
+                 (body/->ScalarStore 'out [0] 'dot nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -217,6 +233,21 @@
             (is true (str compiler " unavailable; source structure remains covered"))
             (let [{:keys [exit err]} (compile-c-family-source target source)]
               (is (zero? exit) err))))))))
+
+(deftest registry-intrinsic-helpers-follow-the-c-family-target
+  (doseq [[target qualifier compiler]
+          [[:opencl-portable "inline int rstr_dp4a" nil]
+           [:cuda "__device__ __forceinline__ int rstr_dp4a" "nvcc"]
+           [:hip "__device__ __forceinline__ int rstr_dp4a" "hipcc"]]]
+    (testing (name target)
+      (let [source (opencl/emit-scalar-kernel
+                    "dp4a_helper" (dp4a-kernel-body) {:target-dialect target})]
+        (is (str/includes? source qualifier))
+        (is (= 2 (count (re-seq #"rstr_dp4a\(" source)))
+            "one registry-owned definition accompanies one typed call")
+        (when (and compiler (command-available? compiler))
+          (let [{:keys [exit err]} (compile-c-family-source target source)]
+            (is (zero? exit) err)))))))
 
 (deftest portable-opencl-keeps-the-scheduled-subgroup-width
   (let [source (opencl/emit-scalar-kernel
