@@ -8,6 +8,17 @@
   (:require [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
+(declare release-prepared!)
+
+(defrecord PreparedParallelProgram [call plan handles binding-order run! release! closed?]
+  java.io.Closeable
+  (close [this] (release-prepared! this)))
+
+(defn prepared-parallel-program?
+  [value]
+  (and value (= "raster.gpu.parallel_program.PreparedParallelProgram"
+                (.getName (class value)))))
+
 (defn- loop-staging-plan
   [step execution-id step-index]
   (when (and (get-in step [:scalars :iteration]) (> (:trip-count step) 1))
@@ -75,11 +86,12 @@
   (let [call (program-call/validate! call)]
     (:entries (preparation-plan call execution-id))))
 
-(defn run-with!
-  "Bind the complete call, then execute it through an injected graph executor.
+(defn prepare-with!
+  "Bind every distinct graph/carry variant once and return a reusable prepared program.
 
-   `executor` contains `:bind!`, `:run!`, and `:release!`. A staging failure releases all prior
-   handles without launching; an execution failure releases the entire staged program."
+   Preparation is transactional: a failed binding releases all earlier handles in reverse order.
+   `run-prepared!` streams loop replay from the bounded binding table, so preparation remains
+   constant in the loop trip count."
   [call {:keys [bind! run! release!] :as executor}]
   (let [call (program-call/validate! call)]
     (doseq [[operation function] [[:bind! bind!] [:run! run!] [:release! release!]]]
@@ -87,37 +99,78 @@
         (throw (ex-info "parallel program executor requires callable operations"
                         {:reason :parallel-program-executor
                          :operation operation :executor executor}))))
-    (let [staged (volatile! {})
+    (let [handles (volatile! {})
           binding-order (volatile! [])
           plan (preparation-plan call (random-uuid))]
       (try
         (doseq [{:keys [key graph buffers scalar-values]} (:entries plan)]
           (let [handle (bind! key graph buffers scalar-values)]
-            (vswap! staged assoc key handle)
+            (vswap! handles assoc key handle)
             (vswap! binding-order conj key)))
-        (doseq [[step-index step] (map-indexed vector (:steps call))]
-          (cond
-            (program-call/evaluated-host-equation? step)
-            nil
-
-            (program-call/emitted-equation-call? step)
-            (run! (get @staged (get-in plan [:step-keys step-index])))
-
-            (loop-call/structured-loop-call? step)
-            (doseq [iteration (range (:trip-count step))]
-              (let [{:keys [buffers scalar-values]}
-                    (loop-call/iteration-binding step iteration)
-                    key (get-in plan [:step-keys step-index [buffers scalar-values]])]
-                (when-not key
-                  (throw (ex-info
-                          "structured loop escaped its certified bounded carry rotation"
-                          {:reason :parallel-program-unbounded-loop-binding
-                           :step-index step-index :iteration iteration})))
-                (run! (get @staged key))))))
-        (:outputs call)
-        (finally
+        (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false))
+        (catch Throwable error
           (doseq [key (rseq @binding-order)]
-            (release! (get @staged key))))))))
+            (try (release! (get @handles key)) (catch Throwable _)))
+          (throw error))))))
+
+(defn run-prepared!
+  "Replay one PreparedParallelProgram and return its resident output bindings."
+  [prepared]
+  (when-not (prepared-parallel-program? prepared)
+    (throw (ex-info "run-prepared! requires a PreparedParallelProgram"
+                    {:actual (type prepared)})))
+  (when @(:closed? prepared)
+    (throw (ex-info "prepared parallel program is closed"
+                    {:reason :parallel-program-closed})))
+  (let [{:keys [call plan handles]} prepared]
+    (doseq [[step-index step] (map-indexed vector (:steps call))]
+      (cond
+        (program-call/evaluated-host-equation? step)
+        nil
+
+        (program-call/emitted-equation-call? step)
+        ((:run! prepared) (get handles (get-in plan [:step-keys step-index])))
+
+        (loop-call/structured-loop-call? step)
+        (doseq [iteration (range (:trip-count step))]
+          (let [{:keys [buffers scalar-values]}
+                (loop-call/iteration-binding step iteration)
+                key (get-in plan [:step-keys step-index [buffers scalar-values]])]
+            (when-not key
+              (throw (ex-info
+                      "structured loop escaped its certified bounded carry rotation"
+                      {:reason :parallel-program-unbounded-loop-binding
+                       :step-index step-index :iteration iteration})))
+            ((:run! prepared) (get handles key))))))
+    (:outputs call)))
+
+(defn release-prepared!
+  "Release every prepared graph in reverse binding order. Idempotent."
+  [prepared]
+  (when-not (prepared-parallel-program? prepared)
+    (throw (ex-info "release-prepared! requires a PreparedParallelProgram"
+                    {:actual (type prepared)})))
+  (when (compare-and-set! (:closed? prepared) false true)
+    (let [failure (volatile! nil)]
+      (doseq [key (rseq (:binding-order prepared))]
+        (try
+          ((:release! prepared) (get (:handles prepared) key))
+          (catch Throwable error
+            (when-not @failure (vreset! failure error)))))
+      (when-let [error @failure] (throw error))))
+  nil)
+
+(defn run-with!
+  "Bind the complete call, then execute it through an injected graph executor.
+
+  `executor` contains `:bind!`, `:run!`, and `:release!`. A staging failure releases all prior
+   handles without launching; an execution failure releases the entire staged program."
+  [call executor]
+  (let [prepared (prepare-with! call executor)]
+    (try
+      (run-prepared! prepared)
+      (finally
+        (release-prepared! prepared)))))
 
 (defn run!
   "Run a prepared emitted parallel program in one GPU session."

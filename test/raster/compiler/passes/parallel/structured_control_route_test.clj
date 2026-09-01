@@ -581,6 +581,29 @@
       (is (= 4 (count releases)))
       (is (= 4 (count (distinct (map (comp :key second) bindings))))))))
 
+(deftest prepared-parallel-program-reuses-bounded-graph-bindings
+  (let [call (:call (prepared-mixed-call 3))
+        events (atom [])
+        prepared
+        (program-runtime/prepare-with!
+         call
+         {:bind! (fn [key _graph _buffers _scalars]
+                   (let [handle {:key key}]
+                     (swap! events conj [:bind handle])
+                     handle))
+          :run! #(swap! events conj [:run %])
+          :release! #(swap! events conj [:release %])})]
+    (is (program-runtime/prepared-parallel-program? prepared))
+    (program-runtime/run-prepared! prepared)
+    (program-runtime/run-prepared! prepared)
+    (is (= 4 (count (filter #(= :bind (first %)) @events))))
+    (is (= 8 (count (filter #(= :run (first %)) @events))))
+    (program-runtime/release-prepared! prepared)
+    (is (= 4 (count (filter #(= :release (first %)) @events))))
+    (is (= :parallel-program-closed
+           (reason-of #(program-runtime/run-prepared! prepared))))
+    (is (nil? (program-runtime/release-prepared! prepared)))))
+
 (deftest structured-loop-preparation-stays-constant-for-huge-trip-counts
   (let [call (:call (prepared-mixed-call 1000000000))]
     (is (= 4 (count (program-runtime/staging-plan call :execution)))
