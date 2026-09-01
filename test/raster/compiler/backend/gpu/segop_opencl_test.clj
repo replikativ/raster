@@ -61,21 +61,26 @@
                    {:scalar-types {'n :long 'alpha :double 'inv-dx2 :double}})
                   :program :equations first :algorithm)
         scheduled (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
-        artifact (sg/generate-segstencil-kernel
+        artifact (sg/generate-segstencil-kernel-body
                   scheduled
                   :array-types {'du :double 'u :double}
                   :scalar-types {'n :long 'alpha :double 'inv-dx2 :double})
-        source (:source artifact)
-        guard-position (str/index-of source "if (idx < 1 || idx >= _n_bound - 1)")
-        first-load-position (str/index-of source "u[")]
+        kernel-body (get-in artifact [:attributes :kernel-body])
+        if-region (some #(when (= "IfRegion" (some-> % class .getSimpleName)) %)
+                        (:operations kernel-body))
+        interior-region (some #(when (= "IfRegion" (some-> % class .getSimpleName)) %)
+                              (:then-operations if-region))
+        loads (filterv #(= "ScalarLoad" (some-> % class .getSimpleName))
+                       (:then-operations interior-region))]
     (is (kart/kernel-artifact? artifact))
     (is (= '[u du alpha inv-dx2 _n_bound] (mapv :name (:abi artifact))))
     (is (= [:input :output :scalar :scalar :scalar] (mapv :kind (:abi artifact))))
     (is (= [:double :double :double :double :int] (mapv :dtype (:abi artifact))))
     (is (= :no-write-alias (get-in artifact [:abi 0 :aliasing])))
     (is (= {:kind :stencil :boundary :dirichlet :radius 1} (:effects artifact)))
-    (is (and guard-position first-load-position (< guard-position first-load-position))
-        "the boundary test must dominate every neighborhood read")))
+    (is (= :portable-segstencil (get-in kernel-body [:attributes :kind])))
+    (is (= 3 (count loads))
+        "the interior control region must dominate every neighborhood read")))
 
 (defn- segred-source [body-expr]
   (let [form (list 'raster.par/reduce 'acc 0.0 'j 'n body-expr)

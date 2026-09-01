@@ -290,6 +290,17 @@
             (is false "an unproved neighborhood index must not reach scheduling")
             (catch clojure.lang.ExceptionInfo exception
               (is (= :typed-soac-stencil-index (:reason (ex-data exception)))))))))
+    (testing "analyzed inc/dec forms retain the unit-affine radius proof"
+      (doseq [unit-index '[(clojure.core/inc (long i))
+                           (clojure.core/dec (long i))]]
+        (let [unit-lambda (dialect/lambda-form
+                           '[a input]
+                           [(list '+ 'a (list 'clojure.core/aget 'input unit-index))])
+              unit-equation (list '= 'stencil-0 '[result]
+                                  (list 'stencil attributes arrays captures unit-lambda))]
+          (is (pattern-dialect/valid?
+               dialect/TypedSOAC
+               (dialect/make facts [unit-equation] '[result]))))))
     (testing "devirtualized array loads are covered by the same radius proof"
       (let [read (with-meta
                    '(.invk raster.arrays/aget_m_doubles_long-impl input (+ i 2))

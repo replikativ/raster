@@ -72,7 +72,7 @@
                                                     (raster.arrays/aget input index))))
        (raster.arrays/aset right index (long index)))))
 
-(deftm uncovered-stencil
+(deftm c-family-stencil
   [input :- (Array float) n :- Long] :- (Array float)
   (let [output (float-array n)]
     (raster.par/stencil!
@@ -208,13 +208,18 @@
       (is (= 1 (count (:outputs linked))))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
-(deftest uncovered-c-family-route-never-borrows-opencl-source
-  (doseq [target [cuda-target hip-target]]
-    (let [failure (reason-of #(equation-first/compile
-                               #'uncovered-stencil {:target target :dtype :float}))]
-      (is (contains? #{:equation-first-coverage :kernel-graph-target-lowering-missing}
-                     (:reason failure)))
-      (is (= :none (:fallback failure))))))
+(deftest public-stencil-uses-portable-kernel-body
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'c-family-stencil {:target target :dtype :float})
+          kernel (first (:kernels compilation))]
+      (is (= [module-target] (mapv :target (:kernels compilation))))
+      (is (= :portable-segstencil
+             (get-in kernel [:attributes :kernel-body :attributes :kind])))
+      (is (not (re-find #"__kernel|get_global_id|get_local_id" (:source kernel))))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest public-segmented-fold-map-uses-the-same-c-family-boundary
   (doseq [[target module-target]

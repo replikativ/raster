@@ -667,13 +667,28 @@
 (defn- stencil-index-offset
   "Return the constant offset of one admitted affine stencil index, or nil.
 
-   The initial typed stencil contract deliberately admits only `i`, `i + c`, `c + i`, and
-   `i - c`. This keeps the radius proof semantic and target-independent; emitters never guess
+   The initial typed stencil contract deliberately admits only `i`, `inc i`, `dec i`, `i + c`,
+   `c + i`, and `i - c`. `inc`/`dec` are the analyzed canonical forms of the same unit-affine
+   indices. This keeps the radius proof semantic and target-independent; emitters never guess
    whether an arbitrary index expression remains inside the guarded neighborhood."
   [index expression]
   (let [expression (unwrap-stencil-index-cast expression)]
     (cond
     (= index expression) 0
+
+    (and (seq? expression) (= 2 (count expression))
+         (contains? '#{inc clojure.core/inc unchecked-inc-int
+                       clojure.core/unchecked-inc-int}
+                    (first expression))
+         (= index (unwrap-stencil-index-cast (second expression))))
+    1
+
+    (and (seq? expression) (= 2 (count expression))
+         (contains? '#{dec clojure.core/dec unchecked-dec-int
+                       clojure.core/unchecked-dec-int}
+                    (first expression))
+         (= index (unwrap-stencil-index-cast (second expression))))
+    -1
 
     (and (seq? expression) (= 3 (count expression))
          (contains? '#{+ clojure.core/+} (first expression)))

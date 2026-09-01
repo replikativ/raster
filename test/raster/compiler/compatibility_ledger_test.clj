@@ -113,6 +113,13 @@
     :heat-rhs-1d-jvm
     (pipeline/compile-report #'pde/heat-rhs-1d! :dtype :double)
 
+    :heat-rhs-1d-gpu
+    (let [compilation (equation-first/compile
+                       #'pde/heat-rhs-1d! {:target target :dtype :double})
+          plan (equation-first/lower
+                compilation [(double-array 8) (double-array 8) 0.1 1.0])]
+      (equation-first-signature compilation plan))
+
     :heat-loss-rk4-gpu
     (let [compilation (equation-first/compile
                        #'pde/heat-loss-rk4 {:target target :dtype :double})
@@ -132,6 +139,7 @@
              :gqa-causal-mha-gpu
              :prefix-sum-gpu
              :heat-rhs-1d-jvm
+             :heat-rhs-1d-gpu
              :heat-loss-rk4-gpu}
            (set (keys workloads))))
     (doseq [[id expected] workloads]
@@ -142,6 +150,7 @@
                                   :q4k-dp4a-rows-gpu
                                   :gqa-causal-mha-gpu
                                   :prefix-sum-gpu
+                                  :heat-rhs-1d-gpu
                                   :heat-loss-rk4-gpu} id) report
                      :else (signature report))]
         (is (= expected actual)

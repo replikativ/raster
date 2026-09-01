@@ -1,9 +1,9 @@
 (ns raster.compiler.backend.gpu.segop-opencl
-  "OpenCL kernel generation from SegOp IR.
+  "C-family kernel generation from scheduled SegOp IR.
 
-   Translates SegMap and SegRed records into OpenCL C source strings.
-   Uses the pre-computed inputs/outputs/scalars from SegOp lowering
-   instead of re-analyzing par forms.
+   Portable schedules lower through typed KernelBody and emit OpenCL, CUDA, or HIP source. The
+   remaining specialized OpenCL leaves use the same pre-computed inputs/outputs/scalars from
+   SegOp lowering instead of re-analyzing par forms.
 
    This is the GPU counterpart to segop_simd.clj — both consume the
    same SegOp IR but produce different target code."
@@ -31,6 +31,7 @@
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
+            [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -322,95 +323,6 @@
        :out-param out-param
        :dtype out-dtype}})))
 
-(defn generate-segstencil-kernel
-  "Generate a guarded OpenCL kernel directly from a scheduled SegStencil.
-
-   The boundary branch dominates every neighborhood load, so a radius-one stencil never issues
-   an out-of-range read.  Ordered ABI slots project the scheduled no-write-alias precondition
-   instead of relying on C `restrict` as an unchecked promise."
-  [segstencil & {:keys [kernel-name-prefix scalar-types array-types]
-                 :or {kernel-name-prefix "par_stencil" scalar-types {} array-types {}}}]
-  (let [idx (seg-idx segstencil)
-        bound (seg-bound segstencil)
-        dtype (:dtype segstencil)
-        out (:out-sym segstencil)
-        inputs (vec (sort-by name (:inputs segstencil)))
-        scalars (vec (sort-by name (:scalars segstencil)))
-        body (ce/normalize-array-prims (:lambda segstencil))
-        radius (:radius segstencil)
-        boundary (:boundary segstencil)
-        _ (when-not (and (= :dirichlet boundary)
-                         (= 1 radius)
-                         (= :no-write-alias (:aliasing segstencil)))
-            (throw (ex-info "scheduled stencil has no certified OpenCL lowering"
-                            {:reason :segstencil-opencl-subset
-                             :radius radius :boundary boundary
-                             :aliasing (:aliasing segstencil)})))
-        kernel-name (str kernel-name-prefix "_" (gensym ""))
-        default-ctype (dt/ctype :opencl dtype)
-        input-dtype (fn [id]
-                      (or (get array-types id)
-                          (get array-types (symbol (name id)))
-                          dtype))
-        input-ctype #(dt/ctype :opencl (input-dtype %))
-        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
-        scalar-ctype #(dt/ctype :opencl (scalar-dtype %))
-        scalar-var-types (into {} (map (juxt identity scalar-ctype)) scalars)
-        input-params (str/join ", "
-                               (map #(str "__global const " (input-ctype %)
-                                          "* restrict " (ce/c-symbol %))
-                                    inputs))
-        output-param (str "__global " default-ctype "* restrict out")
-        scalar-params (str/join ", "
-                                (map #(str (scalar-ctype %) " " (ce/c-symbol %)) scalars))
-        all-params (str/join ", "
-                             (remove empty? [input-params output-param scalar-params
-                                             "int _n_bound"]))
-        int-scalars (set (keep #(when (contains? #{:int :long} (scalar-dtype %)) %) scalars))
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
-        body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* default-ctype
-                           ce/*scalar-var-types* scalar-var-types
-                           ce/*idx-sym* idx
-                           ce/*int-vars* (into ce/*int-vars* int-scalars)]
-                   (ce/emit-expr adapted-body idx (set inputs)))
-        workgroup-size (or (get-in segstencil [:grid :block-size]) 256)
-        abi (kabi/validate!
-             (vec (concat
-                   (map #(kabi/slot % :input (input-dtype %)
-                                    :c-name (ce/c-symbol %) :role :operand
-                                    :aliasing :no-write-alias)
-                        inputs)
-                   [(kabi/slot out :output dtype :c-name "out" :role :result)]
-                   (map #(kabi/slot % :scalar (scalar-dtype %)
-                                    :c-name (ce/c-symbol %) :role :parameter)
-                        scalars)
-                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
-        source (str (apply codegen/extension-pragmas dtype (map input-dtype inputs))
-                    (ce/helper-sources body-str)
-                    "__kernel void " kernel-name "(" all-params ") {\n"
-                    "    for (int idx = get_global_id(0); idx < _n_bound; "
-                    "idx += get_global_size(0)) {\n"
-                    "        if (idx < " radius " || idx >= _n_bound - " radius ") {\n"
-                    "            out[idx] = (" default-ctype ")0;\n"
-                    "        } else {\n"
-                    "            out[idx] = (" default-ctype ")(" body-str ");\n"
-                    "        }\n"
-                    "    }\n"
-                    "}\n")]
-    (kart/make
-     {:kernel-name kernel-name
-      :source source
-      :abi abi
-      :arguments (vec (concat inputs [out] scalars [bound]))
-      :launch (klaunch/spec {:workgroup-size [workgroup-size]
-                             :group-count [(klaunch/ceil-div bound workgroup-size)]})
-      :temporaries []
-      :effects {:kind :stencil :boundary boundary :radius radius}
-      :provenance {:dialect :segstencil :segop-id (:id segstencil)}
-      :attributes {:array-params inputs :scalar-params scalars :out-param out
-                   :dtype dtype :aliasing :no-write-alias}})))
-
 (defn generate-segfoldmap-kernel
   "Schedule and emit one ordered SegFoldMap through the shared scalar KernelBody dialect."
   [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
@@ -501,6 +413,49 @@
                    :array-params (vec (concat inputs outputs))
                    :scalar-params scalars
                    :dtype (:dtype segmap)
+                   :aliasing :no-write-alias}})))
+
+(defn generate-segstencil-kernel-body
+  "Schedule and emit one certified SegStencil through portable KernelBody."
+  [stencil & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
+              :or {kernel-name-prefix "segstencil"
+                   target-dialect :opencl-intel
+                   scalar-types {} array-types {}}}]
+  (let [workgroup-size (or workgroup-size (get-in stencil [:grid :block-size]) 256)
+        {:keys [kernel-body bound inputs outputs scalars]}
+        (segstencil-body/lower
+         stencil {:workgroup-size workgroup-size
+                  :scalar-types scalar-types :array-types array-types})
+        parameters (:parameters kernel-body)
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        parameter-names (into {}
+                              (map (fn [parameter]
+                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
+                              parameters)
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+        abi (body-abi/project-contracts
+             (mapv (fn [{:keys [id kind dtype role]}]
+                     (kabi/slot id kind dtype :c-name (get parameter-names id)
+                                :role (if (= id '_n_bound) :bound role)))
+                   parameters)
+             kernel-body)
+        arguments (mapv (fn [parameter]
+                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
+                        parameters)]
+    (kart/make
+     {:kernel-name kernel-name :source source :abi abi :arguments arguments
+      :launch (:launch kernel-body) :temporaries []
+      :effects {:kind :stencil :boundary (:boundary stencil) :radius (:radius stencil)}
+      :target (kernel-body-c-dialect/target
+               (kernel-body-c-dialect/resolve! target-dialect))
+      :provenance {:dialect :kernel-body :source-dialect :segstencil
+                   :segop-id (:id stencil)}
+      :attributes {:kernel-body kernel-body
+                   :array-params (vec (concat inputs outputs))
+                   :scalar-params scalars :dtype (:dtype stencil)
+                   :boundary (:boundary stencil) :radius (:radius stencil)
                    :aliasing :no-write-alias}})))
 
 ;; ================================================================
@@ -1181,14 +1136,10 @@
                     (throw exception))))
 
               (instance? raster.compiler.ir.segop.SegStencil operation)
-              (if opencl?
-                (generate-segstencil-kernel
-                 operation :scalar-types scalar-types :array-types array-types
-                 :kernel-name-prefix "graph_segstencil")
-                (throw (ex-info "stencil has no portable KernelBody C-family lowering"
-                                {:reason :kernel-graph-target-lowering-missing
-                                 :target-dialect target-dialect :operation (:id operation)
-                                 :fallback :none})))
+              (generate-segstencil-kernel-body
+               operation :scalar-types scalar-types :array-types array-types
+               :target-dialect target-dialect
+               :kernel-name-prefix "graph_segstencil")
 
               :else
               (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"

@@ -665,7 +665,7 @@
                                 stats :segstencil
                                 #(and (instance? raster.compiler.ir.segop.SegStencil %)
                                       (= :typed-soac (:algorithm-dialect %))))]
-              (let [kernel (segop-cl/generate-segstencil-kernel
+              (let [kernel (segop-cl/generate-segstencil-kernel-body
                             scheduled :scalar-types top-scalar-types
                             :array-types top-array-types)
                     k (register-kernel! kernel :ze-maps)]
