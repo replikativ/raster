@@ -1,7 +1,8 @@
 (ns raster.compiler.ir.distributed-plan-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as abstract-value]
-            [raster.compiler.ir.distributed-plan :as distributed]))
+            [raster.compiler.ir.distributed-plan :as distributed]
+            [raster.compiler.ir.scan :as scan]))
 
 (defn- two-device-topology
   []
@@ -145,3 +146,64 @@
         error (try (distributed/verify! modified)
                    (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-certificate (:reason (ex-data error))))))
+
+(defn- two-device-all-reduce
+  []
+  (let [operation
+        (distributed/collective-operation
+         {:id :gradient-all-reduce :kind :all-reduce :group :data
+          :value :weights
+          :reduction (scan/certify {:acc 'acc :init 0.0 :lambda '(+ acc element)} :float)})
+        schedule
+        (distributed/collective-schedule
+         {:algorithm :direct-exchange
+          :rounds [[{:source :gpu-0 :target :gpu-1 :route [:gpu-0->gpu-1] :bytes 64}
+                    {:source :gpu-1 :target :gpu-0 :route [:gpu-1->gpu-0] :bytes 64}]]})]
+    (distributed/schedule-collective operation schedule [:gradient-0 :gradient-1])))
+
+(deftest semantic-all-reduce-retains-its-topology-schedule
+  (let [collective (two-device-all-reduce)
+        compute [(distributed/compute-step
+                  {:id :gradient-0 :device :gpu-0 :duration-ns 100})
+                 (distributed/compute-step
+                  {:id :gradient-1 :device :gpu-1 :duration-ns 150})]
+        plan (distributed/plan
+              {:id :all-reduce-probe
+               :mesh (distributed/mesh [{:name :data :size 2}] [:gpu-0 :gpu-1])
+               :topology (two-device-topology)
+               :values (training-values) :shards (training-shards)
+               :collective-groups {:data (distributed/collective-group
+                                          :data [:gpu-0 :gpu-1])}
+               :collectives [collective]
+               :steps (into compute (:steps collective))
+               :outputs (:completions collective)})
+        simulation (distributed/simulate plan)
+        certificate (:certificate (distributed/certify plan))]
+    (is (= 2 (count (:completions collective))))
+    (is (= 1153 (:makespan-ns simulation)))
+    (is (= 128 (:transferred-bytes simulation)))
+    (is (= {:id :gradient-all-reduce :kind :all-reduce :group :data
+            :value :weights :algorithm :direct-exchange
+            :steps [[:gradient-all-reduce :round 0 :leg 0]
+                    [:gradient-all-reduce :round 0 :leg 1]]
+            :completions [[:gradient-all-reduce :round 0 :leg 0]
+                          [:gradient-all-reduce :round 0 :leg 1]]}
+           (first (:collectives certificate))))))
+
+(deftest reducing-collectives-require-an-associativity-certificate
+  (let [error (try
+                (distributed/collective-operation
+                 {:id :unchecked :kind :all-reduce :group :data :value :weights})
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :distributed-collective-reduction (:reason (ex-data error))))))
+
+(deftest parallel-collective-legs-cannot-oversubscribe-one-directed-link
+  (let [error (try
+                (distributed/collective-schedule
+                 {:algorithm :invalid
+                  :rounds [[{:source :gpu-0 :target :gpu-1
+                             :route [:gpu-0->gpu-1] :bytes 64}
+                            {:source :gpu-0 :target :gpu-1
+                             :route [:gpu-0->gpu-1] :bytes 64}]]})
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :distributed-collective-round-link-conflict (:reason (ex-data error))))))
