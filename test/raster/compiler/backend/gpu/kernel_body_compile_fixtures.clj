@@ -36,6 +36,14 @@
          (raster.numeric/* (raster.arrays/aget left index)
                            (raster.arrays/aget right index))))))
 
+(deftm public-c-family-map
+  "Public equation-first scalar map compiled by nvcc/hipcc without a physical device."
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/map! output index n float
+                     (raster.numeric/* (float 2.0)
+                                       (raster.arrays/aget input index)))))
+
 (defn- reduction-artifact
   [dialect]
   (let [form (with-meta
@@ -175,8 +183,12 @@
      device-id {:type target
                 :name (str "Synthetic " (name target) " public compile gate")
                 :capabilities capabilities})
-    (:kernels (equation-first/compile
-               #'public-c-family-dot {:target device-id :dtype :float}))))
+    (vec
+     (concat
+      (:kernels (equation-first/compile
+                 #'public-c-family-dot {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-map {:target device-id :dtype :float}))))))
 
 (defn- write-artifact!
   [directory suffix label artifact]

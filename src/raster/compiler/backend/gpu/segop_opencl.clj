@@ -29,6 +29,7 @@
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
+            [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -453,6 +454,52 @@
                    :array-params (vec (concat (:inputs segfoldmap) (:outputs segfoldmap)))
                    :scalar-params (vec (:scalars segfoldmap))
                    :dtype (first (:dtypes segfoldmap))
+                   :aliasing :no-write-alias}})))
+
+(defn generate-segmap-kernel-body
+  "Schedule and emit one typed SegMap through the shared scalar KernelBody dialect."
+  [segmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
+             :or {kernel-name-prefix "segmap"
+                  target-dialect :opencl-intel workgroup-size 256
+                  scalar-types {} array-types {}}}]
+  (let [{:keys [kernel-body bound inputs outputs scalars]}
+        (segmap-body/lower segmap
+                           {:workgroup-size workgroup-size
+                            :scalar-types scalar-types :array-types array-types})
+        parameters (:parameters kernel-body)
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        parameter-names (into {}
+                              (map (fn [parameter]
+                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
+                              parameters)
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+        abi (body-abi/project-contracts
+             (mapv (fn [{:keys [id kind dtype role]}]
+                     (kabi/slot id kind dtype :c-name (get parameter-names id)
+                                :role (if (= id '_n_bound) :bound role)))
+                   parameters)
+             kernel-body)
+        arguments (mapv (fn [parameter]
+                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
+                        parameters)]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments arguments
+      :launch (:launch kernel-body)
+      :temporaries []
+      :effects {:kind :elementwise-map :write-conflict :unique}
+      :target (kernel-body-c-dialect/target
+               (kernel-body-c-dialect/resolve! target-dialect))
+      :provenance {:dialect :kernel-body :source-dialect :segmap
+                   :segop-id (:id segmap)}
+      :attributes {:kernel-body kernel-body
+                   :array-params (vec (concat inputs outputs))
+                   :scalar-params scalars
+                   :dtype (:dtype segmap)
                    :aliasing :no-write-alias}})))
 
 ;; ================================================================
@@ -1233,9 +1280,11 @@
     (merge array-types declared-array-types)))
 
 (defn- generate-elementwise-kernel-graph
-  [graph {:keys [scalar-types array-types]
-          :or {scalar-types {} array-types {}}}]
-  (let [array-types (graph-array-types graph array-types)
+  [graph {:keys [scalar-types array-types target-dialect]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+  (let [target (kernel-body-c-dialect/resolve! target-dialect)
+        opencl? (kernel-body-c-dialect/opencl? target)
+        array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
          graph
@@ -1243,28 +1292,42 @@
            (kart/certify-scheduled-operation
             (cond
               (instance? raster.compiler.ir.segop.SegMap operation)
-              (if (:out-sym operation)
-                (generate-segmap-kernel
-                 operation (:out-sym operation)
-                 :dtype (:dtype operation)
-                 :scalar-types scalar-types :array-types array-types
-                 :kernel-name-prefix "graph_segmap")
-                (generate-explicit-segmap-kernel
+              (try
+                (generate-segmap-kernel-body
                  operation :dtype (:dtype operation)
                  :scalar-types scalar-types :array-types array-types
-                 :kernel-name-prefix "graph_segmap_effect"))
+                 :target-dialect target-dialect
+                 :kernel-name-prefix "graph_segmap")
+                (catch clojure.lang.ExceptionInfo exception
+                  (if (and opencl? (segmap-body/declined? exception))
+                    (if (:out-sym operation)
+                      (generate-segmap-kernel
+                       operation (:out-sym operation)
+                       :dtype (:dtype operation)
+                       :scalar-types scalar-types :array-types array-types
+                       :kernel-name-prefix "graph_segmap")
+                      (generate-explicit-segmap-kernel
+                       operation :dtype (:dtype operation)
+                       :scalar-types scalar-types :array-types array-types
+                       :kernel-name-prefix "graph_segmap_effect"))
+                    (throw exception))))
 
               (instance? raster.compiler.ir.segop.SegStencil operation)
-              (generate-segstencil-kernel
-               operation :scalar-types scalar-types :array-types array-types
-               :kernel-name-prefix "graph_segstencil")
+              (if opencl?
+                (generate-segstencil-kernel
+                 operation :scalar-types scalar-types :array-types array-types
+                 :kernel-name-prefix "graph_segstencil")
+                (throw (ex-info "stencil has no portable KernelBody C-family lowering"
+                                {:reason :kernel-graph-target-lowering-missing
+                                 :target-dialect target-dialect :operation (:id operation)
+                                 :fallback :none})))
 
               :else
               (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
                               {:reason :kernel-graph-node-target-lowering-missing
                                :target :opencl-c :node id :operation operation})))
             operation)))]
-    (finalize-emitted-graph emitted :opencl-c scalar-types)))
+    (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
 (defn- generate-reduction-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect]
@@ -1347,11 +1410,17 @@
            (every? #(or (instance? raster.compiler.ir.segop.SegMap (:operation %))
                         (instance? raster.compiler.ir.segop.SegStencil (:operation %)))
                    (:nodes graph)))
-      (if opencl?
+      (try
         (generate-elementwise-kernel-graph graph opts)
-        (throw (ex-info "elementwise graph has no portable KernelBody C-family lowering"
-                        {:reason :kernel-graph-target-lowering-missing
-                         :target-dialect target-dialect :fallback :none})))
+        (catch clojure.lang.ExceptionInfo exception
+          (if (and (not opencl?) (segmap-body/declined? exception))
+            (throw (ex-info "scheduled map is outside the portable KernelBody C-family subset"
+                            {:reason :kernel-graph-target-lowering-missing
+                             :target-dialect target-dialect
+                             :kernel-body-decline (ex-data exception)
+                             :fallback :none}
+                            exception))
+            (throw exception))))
 
       (and (seq (:nodes graph))
            (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
