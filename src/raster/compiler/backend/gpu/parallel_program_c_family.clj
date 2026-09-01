@@ -10,6 +10,7 @@
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
@@ -71,6 +72,15 @@
     :opencl-c :opencl-parallel
     :cuda-c :cuda-parallel
     :hip-cpp :hip-parallel))
+
+(defn- kernel-attribute
+  [kernel key]
+  (or (get kernel key) (get-in kernel [:attributes key])))
+
+(defn- kernel-body-decline-key
+  [kernel]
+  (when-let [decline (kernel-attribute kernel :kernel-body-decline)]
+    [(:reason decline) (:missing-rule decline) (:fallback decline)]))
 
 (defn- emit-equation
   [parallel-program equation opts]
@@ -164,4 +174,7 @@
               (count (filter (comp emitted-equation/emitted-equation? first :operations)
                              equations))
               :host-scalar-equations
-              (count (filter #(get-in % [:attributes :host-only]) equations))}})))
+              (count (filter #(get-in % [:attributes :host-only]) equations))
+              :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
+              :kernel-body-declines
+              (frequencies (keep kernel-body-decline-key kernels))}})))

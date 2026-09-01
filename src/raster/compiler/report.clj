@@ -4,7 +4,8 @@
    This namespace does not compile, inspect source forms, or infer operations. It turns the
    authoritative records produced by the pipeline and its emitters into a small, stable report
    suitable for compatibility ledgers and tooling."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]))
 
 (def schema-version 1)
 
@@ -77,8 +78,13 @@
   [kernels]
   (->> kernels
        (mapcat (fn [kernel]
-                 (map #(normalize-decline :emission :candidate %)
-                      (decline-values (kernel-attribute kernel :declines)))))
+                 (concat
+                  (map #(normalize-decline :emission :candidate %)
+                       (decline-values (kernel-attribute kernel :declines)))
+                  (map #(normalize-decline
+                         :emission :kernel-body-coverage
+                         (cond-> % (:missing-rule %) (assoc :leaf (:missing-rule %))))
+                       (decline-values (kernel-attribute kernel :kernel-body-decline))))))
        vec))
 
 (defn- source-dialect
@@ -122,13 +128,16 @@
                 :backend-reused (counter backend-stats :segop-reused)
                 :backend-relowered (counter backend-stats :segop-relowered)
                 :fallback (counter backend-stats :fallback)}
-     :emission {:kernel-count (count kernels)
-                :targets (->> kernels (map :target) (remove nil?) distinct vec)
-                :strategies (->> kernels (map kernel-strategy) (remove nil?) distinct vec)
-                :fallback-reasons (->> kernels
-                                       (map #(kernel-attribute % :fallback-reason))
-                                       (remove nil?) distinct vec)
-                :declines (emitted-declines kernels)}
+     :emission (cond->
+                {:kernel-count (count kernels)
+                 :targets (->> kernels (map :target) (remove nil?) distinct vec)
+                 :strategies (->> kernels (map kernel-strategy) (remove nil?) distinct vec)
+                 :fallback-reasons (->> kernels
+                                        (map #(kernel-attribute % :fallback-reason))
+                                        (remove nil?) distinct vec)
+                 :declines (emitted-declines kernels)}
+                 (seq kernels)
+                 (assoc :routes (frequencies (map kernel-artifact/emission-route kernels))))
      :residency {:assessed? false
                  :resident? nil
                  :device-scratch-count nil

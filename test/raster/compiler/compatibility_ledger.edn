@@ -19,7 +19,11 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0}}
+              :host-scalar-equations 0
+              :emission-routes {:verified-segred-opencl 1}
+              :kernel-body-declines
+              {[:segred-kernel-body-declined :unbound-index-symbol
+                :verified-segred-opencl] 1}}}
 
   :q4k-dp4a-rows-gpu
   {:route {:semantic-dialect :typed-parallel
@@ -30,7 +34,11 @@
               :outputs 0 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0}}
+              :host-scalar-equations 0
+              :emission-routes {:verified-segmap-opencl 1}
+              :kernel-body-declines
+              {[:segmap-kernel-body-declined :unbound-scalar
+                :verified-segmap-opencl] 1}}}
 
   :gqa-causal-mha-gpu
   {:route {:semantic-dialect :typed-parallel
@@ -41,7 +49,9 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 7
-              :host-scalar-equations 0}}
+              :host-scalar-equations 0
+              :emission-routes {:kernel-body 7}
+              :kernel-body-declines {}}}
 
   :prefix-sum-gpu
   {:route {:semantic-dialect :typed-parallel
@@ -52,7 +62,9 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0}}
+              :host-scalar-equations 0
+              :emission-routes {:kernel-body 3}
+              :kernel-body-declines {}}}
 
   :heat-rhs-1d-jvm
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true
@@ -73,7 +85,9 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0}}
+              :host-scalar-equations 0
+              :emission-routes {:kernel-body 1}
+              :kernel-body-declines {}}}
 
   :heat-loss-rk4-gpu
   {:route {:semantic-dialect :typed-parallel
@@ -84,4 +98,6 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 1
               :typed-equations-emitted 1
-              :host-scalar-equations 1}}}}
+              :host-scalar-equations 1
+              :emission-routes {:kernel-body 10}
+              :kernel-body-declines {}}}}}

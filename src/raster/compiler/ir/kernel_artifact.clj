@@ -96,3 +96,16 @@
   "Read one emitter attribute without flattening it into the runtime registry namespace."
   [artifact k]
   (get (:attributes (validate! artifact)) k))
+
+(defn emission-route
+  "Return the stable route used to produce an artifact.
+
+   New emitters set `:emission-route` explicitly. Existing verified artifacts retain their
+   provenance dialect as an observable compatibility class until they are migrated; only an
+   artifact with neither fact is reported as unclassified. This accessor intentionally accepts
+   artifact-shaped maps so pure compiler-report tests need not construct target source."
+  [artifact]
+  (or (get artifact :emission-route)
+      (get-in artifact [:attributes :emission-route])
+      (get-in artifact [:provenance :dialect])
+      :unclassified))

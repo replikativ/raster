@@ -292,7 +292,9 @@
     (is (every? artifact/kernel-artifact? kernels))
     (is (= {:structured-loops-emitted 1
             :typed-equations-emitted 1
-            :host-scalar-equations 0}
+            :host-scalar-equations 0
+            :emission-routes {:kernel-body 3}
+            :kernel-body-declines {}}
            stats))
     (is (= program (program-opencl/validate-program! program)))
     (testing "emitted algorithm kinds cannot be exchanged between equations"
@@ -398,7 +400,9 @@
     (is (= 10 (count (:kernels emitted))))
     (is (= {:structured-loops-emitted 1
             :typed-equations-emitted 1
-            :host-scalar-equations 1}
+            :host-scalar-equations 1
+            :emission-routes {:kernel-body 10}
+            :kernel-body-declines {}}
            (:stats emitted)))
     (let [[partial final] (take-last 2 (:kernels emitted))
           inv-n? #(and (symbol? %) (.startsWith (name %) "inv-n_"))]
