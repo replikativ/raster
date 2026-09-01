@@ -602,6 +602,22 @@ association contract and lower to an exact scalar loop. Portable C-family emissi
 term as a sequential fold; future subgroup/workgroup schedules must be selected from its certificate
 rather than rediscovering a reduction from source spelling.
 
+Sequential control around a parallel algorithm is represented separately as the Pattern-declared
+`TypedStructuredControl` dialect. Its canonical loop is a typed fixpoint around one closed
+`TypedSOAC` body: it binds an integer induction value, ordered invariants, and ordered loop-carried
+scalars or tensors, and gives each final result a distinct outer SSA value. The body boundary,
+effects, and `AbstractValue` contracts are checked modulo the explicit outer-to-inner alpha-renaming;
+zero iterations therefore retain the initial value contract without emitter inference. Values
+defined and consumed only inside the body are ordinary SSA scratch, not entries in another memory
+registry. The association contract is explicitly sequential.
+
+This does not add a time-loop SOAC or a PDE-specific primitive. SOAC fusion continues to reason
+algebraically about the parallel body. The first lowering must preserve the fixpoint as explicit
+host repetition of a target-neutral scheduled `KernelGraph`; a persistent workgroup loop is a later
+schedule selected only when its participation, memory, and synchronization proofs hold. Once this
+vertical consumes scientific time loops, the source-shaped compound detector and handwritten local
+emitter are deleted rather than retained as a compatibility route.
+
 ### 3.3 Schedule and transform IR
 
 A schedule is an immutable transformation program over the functional parallel
