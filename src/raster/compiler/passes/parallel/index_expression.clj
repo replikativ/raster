@@ -4,7 +4,8 @@
    Schedules provide their own decline function so this small shared vocabulary does not decide
    whether a missing rule is a map, reduction, scan, or contraction coverage failure."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (def ^:private operators
   {'+ :add, 'clojure.core/+ :add, 'raster.numeric/+ :add
@@ -69,3 +70,34 @@
       (decline! :index-expression
                 "portable index expression has an unsupported value"
                 {:expression expression :type (type expression)}))))
+
+(defn to-launch-expression
+  "Project non-negative KernelBody index arithmetic into resolvable host launch IR.
+
+   KernelBody and KernelLaunch deliberately use distinct expression records because one executes
+   in a kernel and the other is resolved by the runtime binder. This conversion admits only the
+   monotone extent vocabulary shared by both; subtraction and modulo remain kernel-local."
+  [expression decline!]
+  (cond
+    (integer? expression) expression
+    (or (symbol? expression) (keyword? expression)) (launch/runtime-value expression)
+
+    (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+    (to-launch-expression (:argument expression) decline!)
+
+    (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+    (let [arguments (mapv #(to-launch-expression % decline!) (:arguments expression))]
+      (case (:op expression)
+        :add (apply launch/sum arguments)
+        :mul (apply launch/product arguments)
+        :floor-div (apply launch/floor-div arguments)
+        :ceil-div (apply launch/ceil-div arguments)
+        :min (apply launch/minimum arguments)
+        (decline! :launch-index-expression
+                  "kernel index operation is not a non-negative launch extent"
+                  {:expression expression :operation (:op expression)})))
+
+    :else
+    (decline! :launch-index-expression
+              "kernel index value cannot be projected into launch IR"
+              {:expression expression :type (type expression)})))

@@ -10,9 +10,11 @@
     3. The resulting allocation-free LinkPlan executes numerically on an available GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.link :as gpu-link]
+            [raster.linalg.contract :as contract]
             [raster.ode.pde :as pde]))
 
 ;; ================================================================
@@ -125,5 +127,32 @@
                                                0))]
                       (is (< (Math/abs (- (double expected) actual)) 1.0e-10)
                           (format "CPU=%.15g GPU=%.15g" (double expected) actual)))
+                    (finally
+                      (gpu-link/close! executable))))))))
+
+(deftest symbolic-dense-contraction-uses-one-correct-kernel-body-test
+  (let [left (float-array [1 2 3 4 5 6])
+        right (float-array [7 8 9 10 11 12])
+        compilation (equation-first/compile
+                     #'contract/contract-mm {:target :ze:0 :dtype :float})
+        plan (equation-first/lower compilation [left right 2 3 2])
+        artifact (first (:kernels compilation))
+        body (get-in artifact [:attributes :kernel-body])]
+    (testing "the typed equation owns the segment schedule and target-neutral body"
+      (is (= {:kernel-body 1}
+             (get-in compilation [:stats :emission :emission-routes])))
+      (is (empty? (get-in compilation [:stats :emission :kernel-body-declines])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (kernel-body/kernel-body? body))
+      (is (= :sequential-segments (get-in body [:schedule :strategy])))
+      (is (= '[A B C k m n _nseg] (mapv :id (:parameters body))))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))
+    (testing "all free-axis segments execute with their own verified operand coordinates"
+      (when-gpu "gpu-symbolic-dense-contraction-execution"
+                (let [executable (gpu-link/instantiate! plan)]
+                  (try
+                    (gpu-link/run! executable)
+                    (is (= [58.0 64.0 139.0 154.0]
+                           (vec (gpu-link/download executable (first (:outputs plan))))))
                     (finally
                       (gpu-link/close! executable))))))))

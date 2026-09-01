@@ -95,6 +95,7 @@
         index-scope (into axis-symbols scalars)
         segment-count-source (segop/seg-space-num-segments-expr space)
         segment-count (lower-index segment-count-source index-scope)
+        launch-segment-count (index-expression/to-launch-expression segment-count decline!)
         reduced-bound (lower-index (:bound reduced-dim) index-scope)
         segment-index 'segment-index
         group-index 'segment-group
@@ -117,12 +118,17 @@
             (decline! :literal-identity
                       "portable contraction requires a typed numeric reduction identity"
                       {:identity identity :segred-id (:id segred)}))
-        coordinate-lower #(lower-index (axis-map/index-expr %) index-scope)
+        ;; Operand indices in the certified contraction body are already the authoritative
+        ;; physical coordinate expressions.  `operand-maps` prove those expressions and provide
+        ;; storage extents; they are not a wrapper around the expression handed back by
+        ;; `lower-element-operations`.
+        element-coordinate-lower #(lower-index % index-scope)
+        epilogue-coordinate-lower #(lower-index (axis-map/index-expr %) index-scope)
         {:keys [operations result]}
         (segred-body/lower-element-operations
          element {:index reduced-index :coordinate reduced-index :dtype dtype
                   :arrays (set arrays) :scalars (set scalars)
-                  :coordinate-lower coordinate-lower
+                  :coordinate-lower element-coordinate-lower
                   :load-predicate active-mask
                   :load-other (body/literal identity dtype)})
         accumulator 'segment-accumulator
@@ -168,7 +174,7 @@
               :accumulator-dtype dtype
               :store-dtype dtype
               :parameters parameter-map
-              :coordinate-lower coordinate-lower
+              :coordinate-lower epilogue-coordinate-lower
               :predicate active-mask}))
           stored-result (or (:result lowered-transform) reduction-result)]
       {:kernel-body
@@ -211,12 +217,13 @@
                     :reduction-operator operator}
          :launch (launch/spec
                   {:workgroup-size [workgroup-size]
-                   :group-count [(launch/ceil-div segment-count workgroup-size)]})
+                   :group-count [(launch/ceil-div launch-segment-count workgroup-size)]})
          :provenance {:dialect :kernel-body :source-dialect :segcontract
                       :segop-id (:id segred)}
          :attributes {:kind :portable-contraction
                       :identity identity :operator operator
                       :segment-count segment-count
+                      :launch-segment-count launch-segment-count
                       :reduced-bound reduced-bound
                       :axis-symbols (vec (concat (map :name segment-dims)
                                                  [reduced-index]))
@@ -225,4 +232,5 @@
        :scalars scalars
        :output output
        :segment-count segment-count
+       :launch-segment-count launch-segment-count
        :workgroup-size workgroup-size})))

@@ -23,6 +23,7 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as dl-attention]
+            [raster.linalg.contract :as contract]
             [raster.numeric]
             [raster.par]
             [raster.quant.kernels-k :as qk]
@@ -213,6 +214,8 @@
                  #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-stencil {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'contract/contract-mm {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
