@@ -287,6 +287,132 @@
              {:expected (:outputs parallel-program) :actual (keys outputs)}))
     call))
 
+(defn- remap-buffer-map
+  [remap buffers]
+  (into (empty buffers) (map (fn [[id buffer]] [id (remap buffer)])) buffers))
+
+(defn- remap-loop-call
+  [call remap]
+  (let [remap-optional #(when (some? %) (remap %))]
+    (loop-call/validate!
+     (-> call
+         (update-in [:buffers :invariants] #(remap-buffer-map remap %))
+         (update-in [:buffers :carries]
+                    (fn [carries]
+                      (mapv #(-> %
+                                 (update :initial remap)
+                                 (update :output remap)
+                                 (update :alternate remap-optional))
+                            carries)))
+         (update :scratch #(remap-buffer-map remap %))
+         (update :outputs #(remap-buffer-map remap %))))))
+
+(defn buffer-bindings
+  "Return every compiler-value/storage pair referenced by an emitted call boundary.
+
+   A zero-trip structured loop can retain a dead carry-output token that is intentionally absent
+   from the call's effective top-level `:buffers`. It is still part of the nested call structure
+   and must therefore participate in total storage-identity projections. Graph-owned temporaries
+   are not call-boundary storage and are excluded."
+  [call]
+  (let [call (validate! call)
+        buffer-result? (fn [id] (seq (get-in call [:program :values id :shape])))
+        output-bindings (fn [outputs]
+                          (keep (fn [[id value]] (when (buffer-result? id) [id value])) outputs))
+        step-bindings
+        (fn [step]
+          (cond
+            (evaluated-host-equation? step)
+            (concat (keep (fn [[id value]] (when (buffer-result? id) [id value]))
+                          (:operands step))
+                    (output-bindings (:outputs step)))
+
+            (emitted-equation-call? step)
+            (concat (:buffers step) (output-bindings (:outputs step)))
+
+            (loop-call/structured-loop-call? step)
+            (let [invariants (get-in step [:buffers :invariants])
+                  carries (get-in step [:buffers :carries])]
+              (concat invariants
+                      (mapcat (fn [{:keys [initial-id output-id initial output alternate]}]
+                                (cond-> [[initial-id initial] [output-id output]]
+                                  (some? alternate) (conj [output-id alternate])))
+                              carries)
+                      (:scratch step)
+                      (:outputs step)))
+
+            :else []))]
+    (vec (distinct (concat (:buffers call)
+                           (:loop-scratch call)
+                           (output-bindings (:outputs call))
+                           (mapcat step-bindings (:steps call)))))))
+
+(defn buffer-identities
+  "Return every distinct external/resident storage token referenced by an emitted call."
+  [call]
+  (vec (distinct (map second (buffer-bindings call)))))
+
+(defn map-buffers
+  "Map every external/resident buffer token in an emitted program call exactly once.
+
+   `f` is a pure storage-identity projection, typically MaterializedBuffer → LinkValue ID. The
+   mapping must be total, non-nil, and injective over distinct source storage: this operation may
+   rename existing aliases but cannot silently introduce a new alias. Graph-owned temporaries are
+   intentionally absent from EmittedParallelProgramCall and remain private to KernelGraph."
+  [call f]
+  (let [call (validate! call)]
+    (when-not (ifn? f)
+      (fail! :emitted-program-buffer-mapper
+             "emitted program buffer remapping requires a callable projection"
+             {:mapper f}))
+    (let [source-buffers (buffer-identities call)
+          target-buffers (mapv f source-buffers)]
+      (when-let [source (some (fn [[source target]] (when (nil? target) source))
+                              (map vector source-buffers target-buffers))]
+        (fail! :emitted-program-buffer-remap-missing
+               "emitted program buffer projection returned nil"
+               {:source source}))
+      (when-not (= (count target-buffers) (count (distinct target-buffers)))
+        (fail! :emitted-program-buffer-remap-collision
+               "emitted program buffer projection collapsed distinct storage identities"
+               {:sources source-buffers :targets target-buffers}))
+      (let [mapping (zipmap source-buffers target-buffers)
+            remap #(if (contains? mapping %)
+                     (get mapping %)
+                     (fail! :emitted-program-buffer-remap-untracked
+                            "nested emitted call references storage outside the program binding"
+                            {:buffer %}))
+            buffer-result? (fn [id] (seq (get-in call [:program :values id :shape])))
+            remap-host-step
+            (fn [step]
+              (update step :operands
+                      (fn [operands]
+                        (into (empty operands)
+                              (map (fn [[id value]]
+                                     [id (if (buffer-result? id) (remap value) value)]))
+                              operands))))
+            remap-step
+            (fn [step]
+              (cond
+                (evaluated-host-equation? step) (remap-host-step step)
+                (emitted-equation-call? step)
+                (-> step
+                    (update :buffers #(remap-buffer-map remap %))
+                    (update :outputs #(remap-buffer-map remap %)))
+                (loop-call/structured-loop-call? step) (remap-loop-call step remap)))
+            remapped
+            (-> call
+                (update :steps #(mapv remap-step %))
+                (update :buffers #(remap-buffer-map remap %))
+                (update :loop-scratch #(remap-buffer-map remap %))
+                (update :outputs
+                        (fn [outputs]
+                          (into (empty outputs)
+                                (map (fn [[id value]]
+                                       [id (if (buffer-result? id) (remap value) value)]))
+                                outputs))))]
+        (validate! remapped)))))
+
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.
 
