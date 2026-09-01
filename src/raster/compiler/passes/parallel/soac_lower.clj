@@ -349,6 +349,75 @@
                        (if contraction? :contraction :segmented)
                        contraction-schedule output-dtype)])))
 
+(defn typed-product-reduce-program?
+  "Whether a validated one-equation TypedSOAC program is a product reduction."
+  [program]
+  (and (soac-dialect/program-form? program)
+       (= 1 (count (soac-dialect/equations program)))
+       (= 'product-reduce
+          (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
+
+(defn lower-typed-product-reduce
+  "Mechanically project a typed two-region product reduction into the existing SegRed schedule."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)]
+    (when-not (typed-product-reduce-program? program)
+      (throw (ex-info "typed product reduction lowering requires one product-reduce equation"
+                      {:reason :typed-soac-product-reduce-subset :program program})))
+    (let [equation (first (soac-dialect/equations program))
+          [_ equation-id results] equation
+          {:keys [attributes arrays captures element-lambda combine-lambda]}
+          (soac-dialect/operation-parts equation)
+          element (soac-dialect/lambda-parts element-lambda)
+          combine (soac-dialect/lambda-parts combine-lambda)
+          coordinate (flat-segment-coordinate (:segment-axes attributes)
+                                              (:index attributes) (:extent attributes))
+          array-count (count arrays)
+          element-parameters (:parameters element)
+          array-parameters (subvec element-parameters 0 array-count)
+          capture-parameters (subvec element-parameters array-count)
+          substitutions
+          (into (zipmap capture-parameters captures)
+                (map (fn [parameter array]
+                       [parameter (list 'clojure.core/aget array coordinate)])
+                     array-parameters arrays))
+          element-bindings
+          (vec (mapcat (fn [{:keys [id init]}]
+                         [id (util/subst-syms substitutions init)])
+                       (:locals element)))
+          element-results (mapv #(util/subst-syms substitutions %)
+                                (:body-results element))
+          combine-bindings
+          (vec (mapcat (fn [{:keys [id init]}] [id init]) (:locals combine)))
+          facts (soac-dialect/facts program)
+          physical-results (soac-dialect/physical-results facts equation)
+          result-by-component (zipmap (:result-components attributes) physical-results)
+          components
+          (mapv (fn [ordinal component-id accumulator neutral component-dtype]
+                  {:id component-id :accumulator accumulator :neutral neutral
+                   :dtype component-dtype :result (get result-by-component ordinal)})
+                (range) (:component-ids attributes) (:accumulators attributes)
+                (:identities attributes) (:dtypes attributes))
+          operator
+          (reduction/make
+           {:components components :index (:index attributes)
+            :element-bindings element-bindings :element-results element-results
+            :combine-parameters (mapv vec (partition 2 (:parameters combine)))
+            :combine-bindings combine-bindings :combine-results (:body-results combine)
+            :algebra (:algebra attributes)
+            :attributes {:source :typed-soac :equation equation-id :segmented true}})
+          stable (set (get-in attributes [:attributes :stable-array-captures]))
+          inputs (into (set arrays) stable)
+          scalars (set/difference (set captures) stable)
+          output-dtype (or (first (:dtypes attributes)) dtype :double)
+          node (cond-> (soac/->SoacReduce equation-id (first results) operator
+                                           (:segment-axes attributes) (:extent attributes)
+                                           inputs (vec (keep :result components)) scalars)
+                 output-dtype (assoc :elem-type output-dtype))]
+      (mapv #(assoc % :algorithm-dialect :typed-soac
+                    :algorithm-equation equation-id)
+            (lower-reduce node device-id :dtype output-dtype)))))
+
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."
   [program]

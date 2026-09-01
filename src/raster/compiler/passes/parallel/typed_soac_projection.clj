@@ -118,3 +118,47 @@
   [program equation]
   (contraction-facts/surface-form
    (segmented-reduce-contract-components program equation)))
+
+(defn- source-bindings
+  [locals substitutions]
+  (vec
+   (mapcat (fn [{:keys [id dtype init]}]
+             (let [tag (dtype/scalar-tag-for-dtype dtype)]
+               [(with-meta id {:raster.type/tag tag})
+                (list tag (util/subst-syms substitutions init))]))
+           locals)))
+
+(defn product-reduce-form
+  "Spell one validated product-reduce equation in Raster's interpreted host vocabulary."
+  [program equation]
+  (let [program (dialect/validate! program)
+        [_ equation-id results] equation
+        {:keys [kind attributes captures element-lambda combine-lambda]}
+        (dialect/operation-parts equation)
+        physical-results (dialect/physical-results program equation)
+        component-count (count (:component-ids attributes))
+        result-components (:result-components attributes)
+        outputs (reduce (fn [outputs [component result]] (assoc outputs component result))
+                        (vec (repeat component-count nil))
+                        (map vector result-components physical-results))
+        element (dialect/lambda-parts element-lambda)
+        element-substitutions (zipmap (:parameters element) captures)
+        combine (dialect/lambda-parts combine-lambda)
+        _ (when-not (= 'product-reduce kind)
+            (throw (ex-info "product projection requires a product-reduce equation"
+                            {:reason :typed-soac-product-projection
+                             :equation equation-id :kind kind :results results})))
+        form
+        (list 'raster.par/product-reduce!
+              outputs
+              (mapv vector (:accumulators attributes)
+                    (:identities attributes) (:dtypes attributes))
+              (:segment-axes attributes) (:index attributes) (:extent attributes)
+              (source-bindings (:locals element) element-substitutions)
+              (mapv #(util/subst-syms element-substitutions %) (:body-results element))
+              (mapv vec (partition 2 (:parameters combine)))
+              (source-bindings (:locals combine) {})
+              (:body-results combine)
+              (:algebra attributes))]
+    (with-meta form {:raster.type/elem-type
+                     ((:dtypes attributes) (first result-components))})))

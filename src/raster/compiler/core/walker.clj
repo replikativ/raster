@@ -977,7 +977,7 @@
                   (let [walked (walk init env)
                         tag (or (inf/hint-tag sym) (inf/infer-arg-tag walked (:type-env env)))
                         env' (if tag (ctx-assoc-type env sym tag) env)]
-                    [env' (conj bindings sym walked)]))
+                    [env' (conj bindings (if tag (stamp-type-meta sym tag) sym) walked)]))
                 [index-env []]
                 (partition 2 element-bindings))
         combine-env
@@ -991,7 +991,7 @@
                   (let [walked (walk init env)
                         tag (or (inf/hint-tag sym) (inf/infer-arg-tag walked (:type-env env)))
                         env' (if tag (ctx-assoc-type env sym tag) env)]
-                    [env' (conj bindings sym walked)]))
+                    [env' (conj bindings (if tag (stamp-type-meta sym tag) sym) walked)]))
                 [combine-env []]
                 (partition 2 combine-bindings))
         hinted-outputs

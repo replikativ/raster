@@ -40,8 +40,9 @@
 
 (defn- scalar-region
   [equation]
-  (let [{:keys [attributes arrays captures lambda]} (dialect/operation-parts equation)
-        {:keys [locals body-results]} (dialect/lambda-parts lambda)
+  (let [{:keys [attributes arrays captures lambda element-lambda]}
+        (dialect/operation-parts equation)
+        {:keys [locals body-results]} (dialect/lambda-parts (or lambda element-lambda))
         {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
         substitutions
         (into (zipmap capture-parameters captures)
@@ -237,6 +238,16 @@
          :site [:binding host-binding]
          :source source})
 
+      product-reduce
+      (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            source (projection/product-reduce-form program equation)]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding source]]
+         :site [:binding host-binding]
+         :source source})
+
       scan
       (let [result (first results)
             mode (:mode attributes)
@@ -382,7 +393,8 @@
                (if resident-reductions?
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :scatter :reduce :segmented-reduce :scan}
+           (if (not-any? #(contains? #{:map :scatter :reduce :segmented-reduce
+                                       :product-reduce :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

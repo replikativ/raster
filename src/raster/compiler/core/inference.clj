@@ -1842,13 +1842,31 @@
                          nil)))))
     (catch Throwable _ nil)))
 
+(defn- late-env-tag
+  "Return `sym`'s dispatch tag from either compiler type-environment shape.
+
+   The walker carries the canonical rich entry
+   `{sym {:tag tag :element element-tag ...}}`; later scalar passes retain the
+   historical compact `{sym tag}` projection.  `infer-arg-tag` is shared by both
+   layers, so environment access belongs here instead of at individual operation
+   cases."
+  [env sym]
+  (let [entry (get env sym)]
+    (if (map? entry) (:tag entry) entry)))
+
+(defn- late-env-element-tag
+  "Return the explicitly retained element tag from a rich type environment."
+  [env sym]
+  (let [entry (get env sym)]
+    (when (map? entry) (:element entry))))
+
 (defn infer-arg-tag
   "Infer the type tag of an expression in the late pipeline.
    Priority: env lookup → :tag metadata → resolved-var tag → structural analysis.
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
-    (symbol? expr) (or (get env expr)
+    (symbol? expr) (or (late-env-tag env expr)
                        (:raster.type/tag (meta expr))
                        (:tag (meta expr))
                        (when (namespace expr) (var-ref-tag expr)))
@@ -1873,7 +1891,8 @@
             ;; non-mutating default of arg 1 would be wrong for scan).
             (contains? #{'raster.par/scan 'par/scan} head)
             (let [out-sym (second expr)]
-              (when (symbol? out-sym) (or (get env out-sym) (:tag (meta out-sym)))))
+              (when (symbol? out-sym)
+                (or (late-env-tag env out-sym) (:tag (meta out-sym)))))
             ;; Allocations: handle both direct (double-array size)
             ;; and devirtualized (.invk zeros-like_m_...-impl ref size) forms.
             ;; Stays inline rather than a :result-type facet entry: the rule is a
@@ -1896,10 +1915,11 @@
             ;; via env/:tag only — routing through the facet would narrow it.
             (descriptor/aget-op? head)
             (when (symbol? (second expr))
-              (let [arr-tag (or (get env (second expr)) (:tag (meta (second expr))))]
-                (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
-                      'bytes 'byte 'shorts 'short 'chars 'char 'booleans 'boolean}
-                     arr-tag)))
+              (let [arr-sym (second expr)
+                    arr-tag (or (late-env-tag env arr-sym) (:tag (meta arr-sym)))]
+                (or (late-env-element-tag env arr-sym)
+                    (:raster.type/element (meta arr-sym))
+                    (get types/primitive-array-element-types arr-tag))))
             ;; :result-type facet — ops whose result tag derives from their arg
             ;; tags via a registry rule (op-descriptor): oftype → the ELEMENT
             ;; type of its ref (first arg) — `(n/oftype Q x)` is a float at
