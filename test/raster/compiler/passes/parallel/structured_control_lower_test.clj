@@ -1,6 +1,8 @@
 (ns raster.compiler.passes.parallel.structured-control-lower-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -74,4 +76,11 @@
     (is (= '[u-temporary] (mapv :id (:temporaries graph))))
     (is (= [(:id first-node)] (:dependencies second-node)))
     (is (= '[u-in] (mapv :id (:inputs graph))))
-    (is (= '[u-next] (mapv :id (:outputs graph))))))
+    (is (= '[u-next] (mapv :id (:outputs graph))))
+    (let [emitted (opencl/generate-kernel-graph
+                   graph :scalar-types {'alpha-in :float 'iteration :long})]
+      (is (every? artifact/kernel-artifact? (map :operation (:nodes emitted))))
+      (is (= '[u-in u-next alpha-in iteration n-in] (:arguments emitted)))
+      (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
+      (is (every? #(re-find #"__kernel void graph_segmap" (:source %))
+                  (map :operation (:nodes emitted)))))))
