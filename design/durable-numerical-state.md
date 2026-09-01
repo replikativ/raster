@@ -94,6 +94,15 @@ The common runtime capability should consequently be scoped, not a naked segment
 File-backed Konserve and LMDB can implement that capability with different lifetime rules. Remote
 stores implement promotion to a local provider, not a fictitious remote mmap.
 
+`raster.runtime.numerical-content` now defines this seam as capability-described storage tiers,
+provider-owned promotion/localization events, and an `AutoCloseable` `LocalContentLease`. A retained
+Raster range-transfer event may take ownership of one or more leases after successful submission;
+completion or session shutdown releases them exactly once. Failed validation leaves ownership with
+the caller. This supports today's staging implementations and a future borrowed direct-DMA path
+without changing the manifest or weakening mmap/LMDB lifetime rules. A nonblocking completion poll
+does not release the lease: cancellation stops admission of new work, then `release-event!` waits at
+the current transfer boundary and consumes the event and lease together.
+
 In-place mmap editing is for ephemeral working copies. Mutating an object already published under a
 content address violates snapshot immutability. Same-sized Boring edits may dirty only touched
 pages, which is valuable while constructing the next chunk; the result must then be sealed under a

@@ -80,3 +80,11 @@
     (is (= :transfer (:class queue)))
     (is (= :in-order (:ordering queue)))
     (is (not= queue (execution/compute-queue)))))
+
+(deftest durable-storage-has-a-distinct-logical-resource-queue
+  (let [queue (execution/storage-queue)]
+    (is (execution/logical-queue? queue))
+    (is (= :storage (:class queue)))
+    (is (= :in-order (:ordering queue)))
+    (is (not= queue (execution/transfer-queue)))
+    (is (not= queue (execution/compute-queue)))))
