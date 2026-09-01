@@ -12,7 +12,8 @@
               :typed-validated true :declines []}
              (:route compiler-report))
           (str (:name (meta operation)) " route"))
-      (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+      (is (= {:segops 1 :kernel-graphs 0 :structured-loops 0
+              :typed-reused 1 :typed-scalar-equations 1
               :backend-reused 1 :backend-relowered 0 :fallback 0}
              (:lowering compiler-report))
           (str (:name (meta operation)) " lowering"))
