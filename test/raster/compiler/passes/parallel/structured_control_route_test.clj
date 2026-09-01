@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -9,6 +10,9 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-route :as route]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]))
 
 (defn- loop-decomposition
@@ -201,3 +205,23 @@
         scheduled (pipeline/schedule-parallel-form (mixed-source) options)]
     (is (not= :scheduled-parallel (:dialect (:form scheduled))))
     (is (not= :typed-structured-control (get-in scheduled [:stats :source-dialect])))))
+
+(deftest ordinary-suffix-equations-use-the-same-kernel-graph-builder
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        typed (:program (route/attempt (mixed-source) options))
+        algorithm (get-in typed [:equations 1 :algorithm])
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (typed-route/program-envelope algorithm) options))
+        kernel-graph (equation-graph/make
+                      algorithm scheduled
+                      {:provenance {:source-dialect :mixed-suffix}})]
+    (is (= kernel-graph (graph/validate! kernel-graph)))
+    (is (= (vec (mapcat :operations (:equations scheduled)))
+           (mapv :operation (:nodes kernel-graph))))
+    (is (= :mixed-suffix (get-in kernel-graph [:provenance :source-dialect])))
+    (is (nil? (:source scheduled)))))
