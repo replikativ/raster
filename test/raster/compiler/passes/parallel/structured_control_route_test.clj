@@ -1,7 +1,11 @@
 (ns raster.compiler.passes.parallel.structured-control-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -225,3 +229,31 @@
            (mapv :operation (:nodes kernel-graph))))
     (is (= :mixed-suffix (get-in kernel-graph [:provenance :source-dialect])))
     (is (nil? (:source scheduled)))))
+
+(deftest equation-first-opencl-emits-loop-and-suffix-without-reading-source
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        opaque-source (assoc scheduled :source ::must-not-be-inspected)
+        {:keys [program kernels stats]} (program-opencl/emit-program opaque-source options)
+        [loop-equation suffix-equation] (:equations program)]
+    (is (= :opencl-parallel (:dialect program)))
+    (is (= ::must-not-be-inspected (:source program)))
+    (is (emitted-loop/emitted-loop? (first (:operations loop-equation))))
+    (is (emitted-equation/emitted-equation? (first (:operations suffix-equation))))
+    (is (every? artifact/kernel-artifact? kernels))
+    (is (= {:structured-loops-emitted 1
+            :typed-equations-emitted 1
+            :host-scalar-equations 0}
+           stats))
+    (is (= program (program-opencl/validate-program! program)))
+    (testing "emitted algorithm kinds cannot be exchanged between equations"
+      (let [suffix-operation (get-in suffix-equation [:operations 0])]
+        (is (= :parallel-program-algorithm
+               (reason-of #(program-opencl/validate-program!
+                            (assoc-in program [:equations 0 :operations]
+                                      [suffix-operation])))))))))
