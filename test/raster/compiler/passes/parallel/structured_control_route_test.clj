@@ -11,6 +11,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -342,17 +343,18 @@
                                         :float (float 0.25)
                                         :double 0.25)}]))))
               (:inputs emitted-program))
-        call
-        (program-call/make
-         emitted-program buffers scalar-values {loop-output :rk4-carry-scratch}
-         (fn [equation {:keys [operands]}]
-           (let [operand-id (first (:operands equation))
-                 divisor (double (get-in operands [operand-id :value]))]
-             (into {}
-                   (map (fn [id]
-                          [id {:type (get-in emitted-program [:values id :dtype])
-                               :value (/ 1.0 divisor)}]))
-                   (:results equation)))))]
+        host-evaluator
+        (fn [equation {:keys [operands]}]
+          (let [operand-id (first (:operands equation))
+                divisor (double (get-in operands [operand-id :value]))]
+            (into {}
+                  (map (fn [id]
+                         [id {:type (get-in emitted-program [:values id :dtype])
+                              :value (/ 1.0 divisor)}]))
+                  (:results equation))))
+        call (program-call/make emitted-program buffers scalar-values
+                                {loop-output :rk4-carry-scratch} host-evaluator)
+        linked-plan (invocation-link/lower materialized emitted-program :ze:debug host-evaluator)]
     (is (= :typed-parallel (:dialect semantic)))
     (is (invocation/invocation-plan? invocation-plan))
     (is (= '[u0 target alpha inv-dx2 dt nsteps]
@@ -408,6 +410,19 @@
            (mapv #(-> % class .getSimpleName) (:steps call)))
         "the real emitted workload must cross the checked runtime-call boundary")
     (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))
+    (is (link/link-plan? linked-plan))
+    (is (link/program-link-instance? (first (:instances linked-plan))))
+    (is (= 2 (count (filter (comp some? :source val) (:nodes linked-plan)))))
+    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
+    (is (= 1 (count (:outputs linked-plan))))
+    (let [[compiler-value buffer] (first (:program-buffers materialized))
+          zero-buffer (assoc buffer :source nil :initialization :zero)
+          requires-zero (-> materialized
+                            (assoc-in [:program-buffers compiler-value] zero-buffer)
+                            (assoc-in [:values (:id buffer)] zero-buffer))]
+      (is (= :invocation-link-zero-initializer
+             (reason-of #(invocation-link/lower requires-zero emitted-program
+                                                :ze:debug host-evaluator)))))
     (let [sources (program-call/buffer-identities call)
           mapping (zipmap sources (mapv #(vector :rk4-storage %)
                                         (range (count sources))))
