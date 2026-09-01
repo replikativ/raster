@@ -10,9 +10,11 @@
    resident descriptor extractor or reconstruct ABI/storage facts from emitted source."
   (:refer-clojure :exclude [compile])
   (:require [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
-            [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
+            [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
@@ -74,12 +76,32 @@
             :scalar-types (:scalar-types parameter-types)}
            (when param-env {:param-env param-env}))))
 
+(defn- target-source-dialect
+  "Select source spelling from the same hardware descriptor used by scheduling.
+
+   A missing optional descriptor still has a conservative family default: Level Zero is the
+   explicit Intel path, while generic OpenCL uses portable subgroup spelling."
+  [target backend]
+  (or (try
+        (some-> target hardware/descriptor-for gpu-target/kernel-body-c-dialect)
+        (catch Throwable _ nil))
+      (case (device/device-type target)
+        :ze :opencl-intel
+        :ocl :opencl-portable
+        :cuda :cuda
+        :hip :hip
+        (case backend
+          :cuda :cuda
+          :hip :hip
+          nil))))
+
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
 
-   Options currently require `:target` in the Level Zero/OpenCL family. CUDA/HIP source emitters
-   will plug in at this same scheduled-program boundary; unsupported target families fail rather
-   than borrowing the compatibility backend. `:dtype` defaults from the deftm's retained tags."
+   `:target` may select Level Zero/OpenCL, CUDA, or HIP. CUDA/HIP compilation is hardware-free:
+   it produces verified target source artifacts but does not require an installed runtime or a
+   physical device. Unsupported target families and uncovered KernelBody graph families fail
+   rather than borrowing the compatibility backend. `:dtype` defaults from retained deftm tags."
   ([f-var] (compile f-var {}))
   ([f-var {:keys [target dtype] :or {target :ze:0} :as options}]
    (when-not (var? f-var)
@@ -103,9 +125,11 @@
                      :dialect (:dialect semantic) :fallback :none}))
          scheduled (structured-route/schedule-program semantic compiler-options)
          backend (device/select-runtime-backend target true nil)
+         target-dialect (target-source-dialect target backend)
          emission
-         (case backend
-           :opencl (program-opencl/emit-program scheduled compiler-options)
+         (if target-dialect
+           (program-c-family/emit-program
+            scheduled (assoc compiler-options :target-dialect target-dialect))
            (fail! :equation-first-target-emitter
                   "equation-first scheduled program has no public source emitter for this target"
                   {:target target :backend backend :fallback :none}))
