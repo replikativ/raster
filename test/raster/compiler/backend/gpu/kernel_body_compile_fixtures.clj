@@ -25,6 +25,7 @@
             [raster.dl.attention :as dl-attention]
             [raster.numeric]
             [raster.par]
+            [raster.quant.kernels-k :as qk]
             [raster.runtime.hardware :as hardware]))
 
 (deftm public-c-family-dot
@@ -212,6 +213,8 @@
                  #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-stencil {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 

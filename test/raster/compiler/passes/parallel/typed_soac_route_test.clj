@@ -253,6 +253,41 @@
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [4.0 9.0 16.0 25.0] (mapv double b)))))
 
+(deftest ordered-map-loop-retains-its-lexical-update-region
+  (let [source '(let* [result
+                       (raster.par/map! out i n float
+                                        (loop* [j 0 acc (float 0.0)]
+                                          (if (< (long j) (long width))
+                                            (let* [value
+                                                   (clojure.core/aget
+                                                    x (+ (* (long i) (long width))
+                                                         (long j)))]
+                                              (recur (inc (long j))
+                                                     (+ (float acc) (float value))))
+                                            acc)))]
+                      result)
+        typed (:program
+               (route/attempt source :float {'x :float 'out :float}
+                              {:scalar-types {'n :long 'width :long}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    typed {:dtype :float :target-device :ocl:0
+                           :array-types {'x :float 'out :float}
+                           :scalar-types {'n :long 'width :long}}))
+        operation (first (:operations (first (:equations scheduled))))
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :array-types {'x :float 'out :float}
+                  :scalar-types {'n :long 'width :long})
+        loop-operation
+        (some #(when (= "ForLoop" (some-> % class .getSimpleName)) %)
+              (get-in artifact [:attributes :kernel-body :operations]))]
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
+    (is loop-operation)
+    (is (some #(= "ScalarLoad" (some-> % class .getSimpleName))
+              (:operations loop-operation))
+        "the scoped let-bound value remains a load inside the ordered loop body")))
+
 (deftest typed-inout-preserves-sequential-jvm-semantics
   (let [source '(let* [step (raster.par/map! target i n float
                                              (* (clojure.core/aget target i) 2.0))]

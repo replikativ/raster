@@ -35,10 +35,8 @@
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
               :host-scalar-equations 0
-              :emission-routes {:verified-segmap-opencl 1}
-              :kernel-body-declines
-              {[:segmap-kernel-body-declined :unbound-scalar
-                :verified-segmap-opencl] 1}}}
+              :emission-routes {:kernel-body 1}
+              :kernel-body-declines {}}}
 
   :gqa-causal-mha-gpu
   {:route {:semantic-dialect :typed-parallel
