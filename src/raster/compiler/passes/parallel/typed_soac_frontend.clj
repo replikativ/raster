@@ -1127,9 +1127,15 @@
         destination-results
         (into {}
               (mapcat (fn [description]
-                        (map (fn [result {:keys [destination]}]
-                               [destination result])
-                             (:results description) (:result-storage description))))
+                        (keep (fn [[result {:keys [destination host-return]}]]
+                                ;; Effect-only operations expose their destinations through the
+                                ;; reconstructed host form, not as numerical TypedSOAC results.
+                                ;; Only value-returning storage contracts may rewrite a terminal
+                                ;; physical destination to its logical SSA result.
+                                (when (= :buffer host-return)
+                                  [destination result]))
+                              (map vector (:results description)
+                                   (:result-storage description)))))
               descriptions)
         returned-destination-results
         (into #{} (keep destination-results) body-uses)]
