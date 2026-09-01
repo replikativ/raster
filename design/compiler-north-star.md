@@ -978,7 +978,8 @@ the two resource classes to overlap, and reports makespan, per-device peak memor
 total transferred bytes. The re-derived certificate contains those costs and shard/route witnesses.
 This is deliberately a planning model: measured costs may replace analytic durations, and Datahike
 may retain its immutable plan/measurement history, but driver buffers, communicators, and events do
-not enter the IR. Collective agreement is described below; halo regions are the next extension.
+not enter the IR. Collective agreement, halo regions, and an initial block-structured AMR layer are
+described below.
 
 Collective agreement is now an explicit extension of the same plan. `all-reduce`, `all-gather`,
 `reduce-scatter`, and `broadcast` retain their semantic kind, group, value, and root/reduction
@@ -994,8 +995,28 @@ semantic `HaloExchange` names the value, partition axis, halo width, and boundar
 derives adjacent owned shard faces, exact source rectangles, dtype-sized byte counts, and both
 directed routes; those facts are retained on transfer steps and in the distributed certificate.
 The first contract intentionally supports nonperiodic one-axis partitions. Periodic boundaries,
-multidimensional decomposition, overlap lifetimes, and AMR coarse/fine interpolation need explicit
-semantics rather than being smuggled through generic transfer attributes.
+multidimensional decomposition, and overlap lifetimes still need explicit semantics rather than
+being smuggled through generic transfer attributes.
+
+Block-structured adaptive meshes now have an explicit outer `AMRWorkloadPlan`. A certified
+`RefinementHierarchy` retains rectangular patch identity, level coordinates, per-axis ratios,
+alignment, non-overlap, and a proper-nesting margin. Each patch binds one durable
+`NumericalStateManifest` field to one fully owned distributed value. Semantic prolongation and
+restriction retain exact source/target rectangles, compatible storage contracts, and declared
+operator requirements; planning mechanically expands cross-device cases to dtype-sized routed
+transfers followed by target-device compute with explicit read/write roles. The outer certificate
+incorporates the complete durable-state and `DistributedPlan` certificates, not merely their
+user-selected identities. This composition is intentional: mesh semantics do not become
+opaque transfer attributes, while storage placement and fabric resources do not leak into the
+hierarchy.
+
+This first AMR schema is not yet a claim of executable numerical operators or conservative,
+subcycled AMR execution. It is cell-centred, joins adjacent levels, and has explicit
+`:hierarchy-only` and complete-patch `:transfer-cycle` modes. A conservative
+hyperbolic/PDE vertical must next represent level time ratios, flux-register contributions,
+reflux ordering, and average-down dependencies, then validate mass/lake-at-rest and restart
+oracles on a non-trivial 2-D workload. Version 1 also deliberately requires the full proper-nesting
+margin to fit one parent patch; it has no physical-boundary exemption.
 
 The first distributed target should be data-parallel training with explicit gradient all-reduce,
 followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
