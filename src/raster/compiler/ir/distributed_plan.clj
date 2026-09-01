@@ -10,6 +10,7 @@
 
    Native MPI/NCCL/RCCL/oneCCL/UCX resources are later realizations of this contract."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -19,6 +20,7 @@
 (def shard-ownerships #{:owned :replica})
 (def step-kinds #{:compute :transfer})
 (def collective-kinds #{:all-reduce :all-gather :reduce-scatter :broadcast})
+(def halo-boundaries #{:nonperiodic})
 
 (defrecord DeviceMesh [axes devices])
 (defrecord DeviceResource [id memory-capacity-bytes descriptor attributes])
@@ -30,14 +32,17 @@
 (defrecord CollectiveOperation [id kind group value reduction root attributes])
 (defrecord CollectiveSchedule [algorithm rounds numerical-mode attributes])
 (defrecord ScheduledCollective [operation schedule dependencies steps completions])
+(defrecord HaloExchange [id value axis width boundary attributes])
+(defrecord ScheduledHalo [exchange routes dependencies steps completions])
 (defrecord DistributedStep
            [id kind device source target route value bytes duration-ns dependencies
             peak-memory-bytes attributes])
 (defrecord DistributedPlan
            [id mesh topology values shards collective-groups collectives
-            device-plans steps outputs attributes])
+            halos device-plans steps outputs attributes])
 (defrecord DistributedPlanCertificate
-           [plan-id mesh-shape shard-coverage collectives route-costs cost-vector device-plans])
+           [plan-id mesh-shape shard-coverage collectives halos
+            route-costs cost-vector device-plans])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
@@ -50,6 +55,8 @@
 (defn collective-operation? [value] (instance? CollectiveOperation value))
 (defn collective-schedule? [value] (instance? CollectiveSchedule value))
 (defn scheduled-collective? [value] (instance? ScheduledCollective value))
+(defn halo-exchange? [value] (instance? HaloExchange value))
+(defn scheduled-halo? [value] (instance? ScheduledHalo value))
 (defn distributed-step? [value] (instance? DistributedStep value))
 (defn distributed-plan? [value] (instance? DistributedPlan value))
 (defn certificate? [value] (instance? DistributedPlanCertificate value))
@@ -289,6 +296,98 @@
          {:steps [] :completions []}
          (map-indexed vector (:rounds schedule)))]
     (->ScheduledCollective operation schedule dependencies steps completions)))
+
+(defn halo-exchange
+  [{:keys [id value axis width boundary attributes]
+    :or {boundary :nonperiodic attributes {}}}]
+  (when-not (and id value (integer? axis) (not (neg? axis))
+                 (pos-int? width) (contains? halo-boundaries boundary) (map? attributes))
+    (fail! "halo exchange requires a value, axis, positive width, and supported boundary policy"
+           :distributed-halo-exchange
+           {:id id :value value :axis axis :width width
+            :boundary boundary :attributes attributes}))
+  (->HaloExchange id value axis width boundary attributes))
+
+(defn- halo-region
+  [candidate axis width side]
+  (let [offsets (:offsets candidate)
+        shape (:shape candidate)
+        start (case side
+                :lower (nth offsets axis)
+                :upper (+ (nth offsets axis) (nth shape axis) (- width)))]
+    {:offsets (assoc offsets axis start)
+     :shape (assoc shape axis width)}))
+
+(defn schedule-halo
+  "Derive a nonperiodic neighbor exchange from certified axis-partitioned shards.
+
+   `routes` maps `[source-device target-device]` to an ordered directed-link path. All neighbor
+   transfers share one round after `dependencies`; exact source rectangles and byte counts are
+   retained on each transfer step."
+  [exchange abstract shards routes dependencies]
+  (let [exchange (if (halo-exchange? exchange) exchange (halo-exchange exchange))
+        {:keys [id value axis width]} exchange
+        sharding (:sharding abstract)
+        global-shape (:shape abstract)
+        candidates (if (and (vector? global-shape) (< axis (count global-shape)))
+                     (vec (sort-by #(nth (:offsets %) axis) shards))
+                     [])]
+    (when-not (and (abstract-value/abstract-value? abstract)
+                   (= :partitioned (:kind sharding)) (= axis (:axis sharding))
+                   (< axis (count global-shape)) (>= (count candidates) 2))
+      (fail! "halo exchange requires a matching axis-partitioned AbstractValue"
+             :distributed-halo-sharding
+             {:halo id :axis axis :sharding sharding :shards candidates}))
+    (when-not (map? routes)
+      (fail! "halo schedule routes must be keyed by device pairs"
+             :distributed-halo-routes {:halo id :routes routes}))
+    (doseq [candidate candidates]
+      (when (< (nth (:shape candidate) axis) width)
+        (fail! "halo width exceeds a local owned shard"
+               :distributed-halo-width
+               {:halo id :shard (:id candidate) :width width
+                :local-extent (nth (:shape candidate) axis)})))
+    (let [face-elements (* width (reduce * 1 (keep-indexed
+                                              (fn [i extent] (when (not= i axis) extent))
+                                              global-shape)))
+          bytes (* face-elements (dtype/bytes-of (:dtype abstract)))
+          legs
+          (vec
+           (mapcat
+            (fn [edge-index [left right]]
+              (mapv
+               (fn [[direction source target side destination-side]]
+                 (let [route (get routes [(:device source) (:device target)])]
+                   (when-not route
+                     (fail! "halo schedule lacks a route for an adjacent shard pair"
+                            :distributed-halo-route
+                            {:halo id :source (:device source) :target (:device target)}))
+                   {:edge edge-index :direction direction :source source :target target
+                    :leg (communication-leg
+                          {:source (:device source) :target (:device target)
+                           :route (vec route) :bytes bytes
+                           :attributes {:source-shard (:id source)
+                                        :target-shard (:id target)
+                                        :source-region (halo-region source axis width side)
+                                        :destination-side destination-side}})}))
+               [[:forward left right :upper :lower]
+                [:backward right left :lower :upper]]))
+            (range) (partition 2 1 candidates)))
+          link-ids (mapcat (comp :route :leg) legs)]
+      (when-not (= (count link-ids) (count (distinct link-ids)))
+        (fail! "parallel halo legs cannot claim the same directed link"
+               :distributed-halo-link-conflict {:halo id :links (vec link-ids)}))
+      (let [steps
+            (mapv (fn [{:keys [edge direction leg]}]
+                    (transfer-step
+                     {:id [id :edge edge direction]
+                      :source (:source leg) :target (:target leg) :route (:route leg)
+                      :value value :bytes (:bytes leg) :dependencies (vec dependencies)
+                      :attributes (merge (:attributes leg)
+                                         {:halo id :axis axis :width width
+                                          :edge edge :direction direction})}))
+                  legs)]
+        (->ScheduledHalo exchange routes (vec dependencies) steps (mapv :id steps))))))
 
 (defn- concrete-shape!
   [value-id value]
@@ -541,6 +640,31 @@
                  {:collective id :completions completions})))))
   collectives)
 
+(defn- validate-halos!
+  [topology values shards halos steps]
+  (when-not (and (vector? halos) (every? scheduled-halo? halos))
+    (fail! "distributed halos must be an ordered vector of ScheduledHalo values"
+           :distributed-halos {:halos halos}))
+  (unique-by! "distributed halos" :distributed-halo-identities
+              (comp :id :exchange) halos)
+  (let [step-by-id (into {} (map (juxt :id identity)) steps)]
+    (doseq [{:keys [exchange routes dependencies steps] :as scheduled} halos]
+      (let [value-id (:value exchange)
+            abstract (get values value-id)
+            candidates (get shards value-id)
+            expected (schedule-halo exchange abstract candidates routes dependencies)]
+        (when-not (= expected scheduled)
+          (fail! "scheduled halo does not match its value shards and routes"
+                 :distributed-halo-lowering
+                 {:halo (:id exchange) :expected expected :actual scheduled}))
+        (doseq [step steps]
+          (transfer-duration-ns topology step)
+          (when-not (= step (get step-by-id (:id step)))
+            (fail! "halo expansion step is absent or differs from the distributed DAG"
+                   :distributed-halo-step
+                   {:halo (:id exchange) :step (:id step)})))))
+    halos))
+
 (defn- validate-device-plans!
   [mesh device-plans]
   (when-not (map? device-plans)
@@ -646,7 +770,7 @@
   (when-not (distributed-plan? plan)
     (fail! "expected a DistributedPlan value"
            :distributed-plan-type {:actual (type plan)}))
-  (let [{:keys [id mesh topology values shards collective-groups collectives
+  (let [{:keys [id mesh topology values shards collective-groups collectives halos
                 device-plans steps outputs attributes]} plan]
     (when (nil? id)
       (fail! "distributed plan requires a stable identity" :distributed-plan-id {}))
@@ -672,6 +796,7 @@
              :distributed-shards {:shards shards}))
     (validate-value-shards! mesh topology values shards)
     (validate-collectives! mesh topology values collective-groups collectives steps)
+    (validate-halos! topology values shards halos steps)
     (validate-device-plans! mesh device-plans)
     (validate-steps! mesh topology values steps outputs)
     (when-not (map? attributes)
@@ -681,12 +806,12 @@
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
-           device-plans steps outputs attributes]
+           halos device-plans steps outputs attributes]
     :or {values {} shards {} collective-groups {} collectives []
-         device-plans {} steps [] outputs [] attributes {}}}]
+         halos [] device-plans {} steps [] outputs [] attributes {}}}]
   (validate!
-   (->DistributedPlan id mesh topology values shards collective-groups collectives device-plans
-                      (vec steps) (vec outputs) attributes)))
+   (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
+                      device-plans (vec steps) (vec outputs) attributes)))
 
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
@@ -794,6 +919,12 @@
               :value (:value operation) :algorithm (:algorithm schedule)
               :steps (mapv :id steps) :completions completions})
            (:collectives plan))
+     (mapv (fn [{:keys [exchange steps completions]}]
+             {:id (:id exchange) :value (:value exchange) :axis (:axis exchange)
+              :width (:width exchange) :boundary (:boundary exchange)
+              :steps (mapv :id steps) :completions completions
+              :bytes (reduce + 0 (map :bytes steps))})
+           (:halos plan))
      (route-costs plan)
      (:cost-vector simulation)
      (into {}
