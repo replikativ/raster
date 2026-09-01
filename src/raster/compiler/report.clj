@@ -116,6 +116,7 @@
               :placements (counter soac-stats :placements)}
      :lowering {:segops (counter segop-stats :segops-lowered)
                 :kernel-graphs (counter segop-stats :kernel-graphs-lowered)
+                :structured-loops (counter segop-stats :structured-loops-scheduled)
                 :typed-reused (counter segop-stats :typed-soac-reused)
                 :typed-scalar-equations (counter segop-stats :typed-scalar-equations)
                 :backend-reused (counter backend-stats :segop-reused)

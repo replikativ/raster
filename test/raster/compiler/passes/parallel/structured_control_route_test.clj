@@ -1,13 +1,15 @@
 (ns raster.compiler.passes.parallel.structured-control-route-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
-            [raster.compiler.passes.parallel.structured-control-route :as route]))
+            [raster.compiler.passes.parallel.structured-control-route :as route]
+            [raster.compiler.pipeline :as pipeline]))
 
 (defn- loop-decomposition
   []
@@ -158,3 +160,44 @@
     (is (= :parallel-program-algorithm
            (reason-of #(route/schedule-program malformed
                                                {:target-device :cpu:0 :dtype :double}))))))
+
+(deftest public-scheduler-selects-the-structured-semantic-program
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        attempted (route/attempt (mixed-source) options)
+        scheduled (pipeline/schedule-parallel-form (mixed-source) options)]
+    (is (= :typed-structured-control (get-in attempted [:stats :route])))
+    (is (dialects/valid-source-or-typed-soac? (:program attempted)))
+    (is (= :scheduled-parallel (:dialect (:form scheduled))))
+    (is (dialects/valid-scheduled-program? (:form scheduled)))
+    (is (= :typed-structured-control (get-in scheduled [:stats :source-dialect])))
+    (is (= 1 (get-in scheduled [:stats :structured-loops-scheduled])))
+    (is (= 2 (count (:equations (:form scheduled)))))))
+
+(deftest structured-attempt-exposes-a-coverage-decline
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        source (source-with-suffix '[unsupported (java.lang.System/gc)] 'unsupported)
+        attempted (route/attempt source options)]
+    (is (nil? (:program attempted)))
+    (is (= :structured-control-unsupported-suffix
+           (get-in attempted [:declined :reason])))))
+
+(deftest cpu-public-scheduling-does-not-enter-the-gpu-structured-route
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :cpu:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        scheduled (pipeline/schedule-parallel-form (mixed-source) options)]
+    (is (not= :scheduled-parallel (:dialect (:form scheduled))))
+    (is (not= :typed-structured-control (get-in scheduled [:stats :source-dialect])))))

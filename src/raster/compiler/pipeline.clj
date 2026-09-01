@@ -42,6 +42,7 @@
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
@@ -770,6 +771,32 @@
       (core-hw/abstract-machine (core-hw/descriptor-for target-device))
       (catch Throwable _ nil))))
 
+(defn- semantic-program-attempt
+  "Try the finite semantic-program variants in specificity order.
+
+   Structured control is currently GPU-only until the equation-first JVM schedule lands. A
+   coverage decline preserves the original source and remains visible beside any later TypedSOAC
+   decline; certified contradictions are never converted into fallback."
+  [source opts abstract-machine]
+  (let [common {:dtype (:dtype opts)
+                :values (:values opts)
+                :array-types (:array-types opts)
+                :scalar-types (:scalar-types opts)
+                :abstract-machine abstract-machine}
+        structured (when (device/gpu-target? (:target-device opts))
+                     (structured-route/attempt source common))]
+    (if (:program structured)
+      structured
+      (let [typed (typed-soac-route/attempt
+                   source (:dtype opts) (:array-types opts)
+                   {:resident-reductions? (true? (:resident-reductions? opts))
+                    :scalar-types (:scalar-types opts)
+                    :values (:values opts)
+                    :abstract-machine abstract-machine})]
+        (cond-> (or typed {})
+          (:declined structured)
+          (assoc :structured-control-declined (:declined structured)))))))
+
 (defn- pass-soac-fuse
   "SOAC graph-based fusion: vertical (map→map, map→reduce, map→scan),
   horizontal (independent same-bound maps), iterated to fixpoint.
@@ -778,13 +805,9 @@
   [form opts]
   (if (form/binding-form? form)
     (let [am (abstract-machine-for-target (:target-device opts))
-          typed (typed-soac-route/attempt
-                 form (:dtype opts) (:array-types opts)
-                 {:resident-reductions? (true? (:resident-reductions? opts))
-                  :scalar-types (:scalar-types opts)
-                  :abstract-machine am})]
-      (if (:program typed)
-        {:form (:program typed) :stats (:stats typed)}
+          semantic (semantic-program-attempt form opts am)]
+      (if (:program semantic)
+        {:form (:program semantic) :stats (:stats semantic)}
         (let [[let-sym bindings-vec & body-exprs] form
               pairs (vec (partition 2 bindings-vec))
               nodes (soac/let-bindings->nodes pairs)
@@ -801,23 +824,26 @@
               new-bindings (vec (mapcat identity new-pairs))]
           {:form (list* let-sym new-bindings body-exprs)
            :stats (cond-> stats
-                    (:declined typed) (assoc :typed-soac-declined (:declined typed)))})))
+                    (:declined semantic)
+                    (assoc :typed-soac-declined (:declined semantic))
+                    (:structured-control-declined semantic)
+                    (assoc :typed-structured-control-declined
+                           (:structured-control-declined semantic)))})))
     ;; A bare top-level parallel expression has no binding site for the direct SSA front end.
     ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
     ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
     (let [source (top-level-binding-form form)
           am (abstract-machine-for-target (:target-device opts))
-          typed (typed-soac-route/attempt
-                 source (:dtype opts) (:array-types opts)
-                 {:resident-reductions? (true? (:resident-reductions? opts))
-                  :scalar-types (:scalar-types opts)
-                  :abstract-machine am})]
-      (if (:program typed)
-        {:form (:program typed) :stats (:stats typed)}
+          semantic (semantic-program-attempt source opts am)]
+      (if (:program semantic)
+        {:form (:program semantic) :stats (:stats semantic)}
         (let [fallback (par-fusion/par-fusion-pass form)]
           (cond-> fallback
-            (:declined typed)
-            (assoc-in [:stats :typed-soac-declined] (:declined typed))))))))
+            (:declined semantic)
+            (assoc-in [:stats :typed-soac-declined] (:declined semantic))
+            (:structured-control-declined semantic)
+            (assoc-in [:stats :typed-structured-control-declined]
+                      (:structured-control-declined semantic))))))))
 
 (defn- register-gpu-kernels!
   "Register generated GPU kernels eagerly so they're available at eval time.
@@ -895,7 +921,17 @@
   "Lower par forms to typed equations in a first-class SegOp ParallelProgram.
   (=> :compound-detected :segop-lowered)"
   [form opts]
-  (segop-lower/segop-lower-pass form opts))
+  (if (and (parallel-program/parallel-program? form)
+           (= :typed-parallel (:dialect form)))
+    (let [scheduled (structured-route/schedule-program form opts)
+          equations (:equations scheduled)]
+      {:form scheduled
+       :stats {:structured-loops-scheduled
+               (count (filter #(get-in % [:attributes :graph-dialect]) equations))
+               :typed-soac-reused
+               (count (filter #(= :typed-soac
+                                  (get-in % [:attributes :algorithm-dialect])) equations))}})
+    (segop-lower/segop-lower-pass form opts)))
 
 (defn- pass-compound-detect
   "Compound kernel detection: finds dotimes loops with ≥2 par forms
@@ -1080,18 +1116,23 @@
    validated TypedSOAC algorithm and are scheduled exactly once before backend emission."
   [source {:keys [dtype array-types scalar-types target-device] :as opts}]
   (let [source (top-level-binding-form source)
-        typed (typed-soac-route/attempt source dtype array-types
-                                        {:scalar-types scalar-types
-                                         :abstract-machine
-                                         (abstract-machine-for-target target-device)})
+        typed (semantic-program-attempt source opts
+                                        (abstract-machine-for-target target-device))
         semantic (or (:program typed) source)
-        scheduled (segop-lower/segop-lower-pass
-                   semantic (assoc opts :dtype dtype :target-device target-device))]
+        scheduled (pass-segop-lower semantic
+                                    (assoc opts :dtype dtype :target-device target-device))]
     (update scheduled :stats merge
             (cond-> {:parallel-scheduling :shared}
-              (:program typed) (assoc :source-dialect :typed-soac
-                                      :typed-soac (:stats typed))
-              (:declined typed) (assoc :typed-soac-declined (:declined typed))))))
+              (:program typed)
+              (assoc :source-dialect (get-in typed [:stats :route])
+                     :semantic-program (:stats typed))
+              (= :typed-soac (get-in typed [:stats :route]))
+              (assoc :typed-soac (:stats typed))
+              (:declined typed)
+              (assoc :typed-soac-declined (:declined typed))
+              (:structured-control-declined typed)
+              (assoc :typed-structured-control-declined
+                     (:structured-control-declined typed))))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)
