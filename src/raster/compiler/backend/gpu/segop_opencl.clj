@@ -940,7 +940,7 @@
    Node artifacts remain free to order their own physical parameters. The graph boundary groups
    equal symbolic scalars, proves their emitted dtypes agree, and exposes every external buffer
    exactly once."
-  [emitted target-dialect]
+  [emitted target-dialect scalar-types]
   (let [external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
         scalar-pairs (->> (:nodes emitted)
                           (mapcat (fn [node]
@@ -965,10 +965,12 @@
         scalar-arguments (vec (sort-by name (keys scalar-groups)))
         scalar-abi (mapv (fn [argument]
                            (let [slots (mapv first (get scalar-groups argument))
-                                 dtype (:kernel-dtype (first slots))
+                                 kernel-dtype (:kernel-dtype (first slots))
+                                 logical-dtype (or (get scalar-types argument) kernel-dtype)
                                  role (if (some #(= :bound (:role %)) slots)
                                         :bound :parameter)]
-                             (kabi/slot argument :scalar dtype :role role)))
+                             (kabi/slot argument :scalar logical-dtype
+                                        :kernel-dtype kernel-dtype :role role)))
                          scalar-arguments)]
     (-> emitted
         (assoc :abi (vec (concat pointer-abi scalar-abi))
@@ -1203,7 +1205,7 @@
                  (fn [node]
                    (kart/certify-scheduled-operation
                     (emit-node node) (:operation node))))]
-    (finalize-emitted-graph emitted :opencl-c)))
+    (finalize-emitted-graph emitted :opencl-c scalar-types)))
 
 (defn- graph-array-types
   [graph array-types]
@@ -1253,7 +1255,7 @@
                               {:reason :kernel-graph-node-target-lowering-missing
                                :target :opencl-c :node id :operation operation})))
             operation)))]
-    (finalize-emitted-graph emitted :opencl-c)))
+    (finalize-emitted-graph emitted :opencl-c scalar-types)))
 
 (defn- generate-reduction-kernel-graph
   [graph {:keys [scalar-types array-types]
@@ -1274,7 +1276,7 @@
                :dtype (:dtype operation)
                :scalar-types scalar-types :array-types array-types)
               operation))))]
-    (finalize-emitted-graph emitted :opencl-c)))
+    (finalize-emitted-graph emitted :opencl-c scalar-types)))
 
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.

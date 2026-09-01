@@ -5,7 +5,8 @@
    properties that dispatch selection and offline tuning may compare: target, ordered external
    ABI, compiler arguments, logical effects, strategy, and concrete entry-point artifacts. Graph
    temporaries, dependencies, and derived scalars remain graph-owned schedule details."
-  (:require [raster.compiler.ir.kernel-abi :as kabi]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]))
 
@@ -76,7 +77,9 @@
 (defn- cast-runtime-scalar
   [dtype value]
   (case dtype
-    :int (int value)
+    :int (if (integer? value)
+           (Math/toIntExact (long value))
+           (int value))
     :long (long value)
     :float (float value)
     :double (double value)
@@ -97,11 +100,13 @@
             (if (= :scalar (:kind slot))
               (if (and (map? value) (contains? value :type) (contains? value :value))
                 (do
-                  (when-not (= (:kernel-dtype slot) (:type value))
-                    (throw (ex-info "kernel executable scalar argument has the wrong ABI dtype"
-                                    {:slot slot :expected (:kernel-dtype slot)
+                  (when-not (= (dtype/canon (:dtype slot))
+                               (dtype/canon (:type value)))
+                    (throw (ex-info "kernel executable scalar argument has the wrong logical ABI dtype"
+                                    {:slot slot :expected (:dtype slot)
                                      :actual (:type value) :value value})))
-                  (update value :value #(cast-runtime-scalar (:kernel-dtype slot) %)))
+                  {:type (:kernel-dtype slot)
+                   :value (cast-runtime-scalar (:kernel-dtype slot) (:value value))})
                 {:type (:kernel-dtype slot)
                  :value (cast-runtime-scalar (:kernel-dtype slot) value)})
               value))

@@ -19,6 +19,19 @@
   [value]
   (and (map? value) (keyword? (:type value)) (contains? value :value)))
 
+(defn buffer-operand
+  "Describe one shaped host/runtime buffer to a host-only typed scalar equation."
+  [shape]
+  (let [shape (vec shape)]
+    (when-not (every? #(and (integer? %) (not (neg? %))) shape)
+      (fail! :typed-scalar-buffer-shape "typed scalar buffer shape must be concrete"
+             {:shape shape}))
+    {::buffer true :shape shape}))
+
+(defn- buffer-operand?
+  [value]
+  (and (map? value) (true? (::buffer value)) (vector? (:shape value))))
+
 (defn- namespace-object
   [source-ns]
   (cond
@@ -72,29 +85,45 @@
     (when-not operation
       (fail! :typed-scalar-operation "typed scalar call has no retained semantic operation"
              {:expression expression}))
-    (case operation
-      if (let [[predicate consequent alternate] arguments]
-           (evaluate-expression source-ns environment
-                                (if (evaluate-expression source-ns environment predicate)
-                                  consequent alternate)))
-      and (loop [[argument & remaining] arguments, result true]
-            (if argument
-              (let [value (evaluate-expression source-ns environment argument)]
-                (if value (recur remaining value) value))
-              result))
-      or (loop [[argument & remaining] arguments]
-           (when argument
-             (let [value (evaluate-expression source-ns environment argument)]
-               (if value value (recur remaining)))))
-      (let [values (mapv #(evaluate-expression source-ns environment %) arguments)]
-        (if-let [callable (resolve-callable source-ns operation)]
-          (apply callable values)
-          (if-let [owner (resolve-class source-ns operation)]
-            (clojure.lang.Reflector/invokeStaticMethod
-             (.getName ^Class owner) (name operation) (to-array values))
-            (fail! :typed-scalar-operation
-                   "typed scalar semantic operation cannot be resolved by the JVM backend"
-                   {:operation operation :expression expression :source-ns (ns-name source-ns)})))))))
+    (cond
+      (descriptor/alength-op? operation)
+      (let [[argument & extra] arguments
+            value (evaluate-expression source-ns environment argument)]
+        (when (or (nil? argument) (seq extra))
+          (fail! :typed-scalar-alength "typed scalar alength requires one buffer operand"
+                 {:expression expression}))
+        (cond
+          (buffer-operand? value) (first (:shape value))
+          (and value (.isArray (class value))) (alength value)
+          :else (fail! :typed-scalar-alength
+                       "typed scalar alength operand has no host shape contract"
+                       {:expression expression :operand value})))
+
+      :else
+      (case operation
+        if (let [[predicate consequent alternate] arguments]
+             (evaluate-expression source-ns environment
+                                  (if (evaluate-expression source-ns environment predicate)
+                                    consequent alternate)))
+        and (loop [[argument & remaining] arguments, result true]
+              (if argument
+                (let [value (evaluate-expression source-ns environment argument)]
+                  (if value (recur remaining value) value))
+                result))
+        or (loop [[argument & remaining] arguments]
+             (when argument
+               (let [value (evaluate-expression source-ns environment argument)]
+                 (if value value (recur remaining)))))
+        (let [values (mapv #(evaluate-expression source-ns environment %) arguments)]
+          (if-let [callable (resolve-callable source-ns operation)]
+            (apply callable values)
+            (if-let [owner (resolve-class source-ns operation)]
+              (clojure.lang.Reflector/invokeStaticMethod
+               (.getName ^Class owner) (name operation) (to-array values))
+              (fail! :typed-scalar-operation
+                     "typed scalar semantic operation cannot be resolved by the JVM backend"
+                     {:operation operation :expression expression
+                      :source-ns (ns-name source-ns)}))))))))
 
 (defn evaluate-expression
   "Interpret one proven-pure scalar expression in `environment`.
@@ -132,14 +161,16 @@
     (when-not (= (count parameters) (count operands))
       (fail! :typed-scalar-arity "typed scalar operand count differs from its lambda"
              {:parameters parameters :operand-count (count operands)}))
-    (when-not (every? typed-scalar? operands)
-      (fail! :typed-scalar-operand "typed scalar region requires typed scalar operands"
+    (when-not (every? #(or (typed-scalar? %) (buffer-operand? %)) operands)
+      (fail! :typed-scalar-operand "typed scalar region requires typed scalar or buffer operands"
              {:operands operands}))
     (when-not (= (count body-results) (count result-dtypes))
       (fail! :typed-scalar-results "typed scalar result dtypes differ from its result arity"
              {:results (count body-results) :dtypes result-dtypes}))
     (let [initial (into {} (map (fn [parameter operand]
-                                  [parameter (:value operand)])
+                                  [parameter (if (typed-scalar? operand)
+                                               (:value operand)
+                                               operand)])
                                 parameters operands))
           environment
           (reduce (fn [environment {:keys [id dtype init]}]
@@ -168,8 +199,14 @@
 
 (defn evaluate-host-equation
   "EmittedParallelProgramCall evaluator for one host-only TypedSOAC equation."
-  [source-ns equation {:keys [operands values]}]
+  [source-ns equation {:keys [operands values buffer-shapes]}]
   (let [algorithm (soac/validate! (:algorithm equation))
+        operands (reduce-kv (fn [operands id value]
+                              (assoc operands id
+                                     (if-let [shape (get buffer-shapes id)]
+                                       (buffer-operand shape)
+                                       value)))
+                            {} operands)
         environment
         (reduce
          (fn [environment algorithm-equation]

@@ -845,8 +845,22 @@
       (program-value-node! nodes values id compiler-value value-id))))
 
 (defn- program-graph-fact
-  [nodes values instance-id step-id phase graph buffers scalar-values]
+  [nodes values instance-id step-id phase graph buffers program-scalars scalar-values]
   (let [graph (kgraph/validate! graph)
+        extent-values
+        (into {}
+              (keep (fn [[compiler-value value-id]]
+                      (let [node (program-value-node!
+                                  nodes values instance-id compiler-value value-id)
+                            shape (get-in node [:view :shape])]
+                        (when (seq shape)
+                          [(list 'extent compiler-value) (first shape)]))))
+              buffers)
+        ;; A graph ABI contains only scalars consumed by that kernel. Buffer shapes may also name
+        ;; an earlier, program-wide shape value which the kernel does not otherwise consume. Keep
+        ;; those certified facts available for range validation; kernel-local narrowed values win
+        ;; when the same logical scalar is present in both maps.
+        scalar-values (merge extent-values program-scalars scalar-values)
         external
         (vals
          (reduce (fn [by-id buffer]
@@ -894,14 +908,16 @@
           (program-call/emitted-equation-call? step)
           [(program-graph-fact nodes values id step-index
                                (get-in step [:equation :id])
-                               (:graph step) (:buffers step) (:scalar-values step))]
+                               (:graph step) (:buffers step)
+                               (:scalar-values call) (:scalar-values step))]
           (loop-call/structured-loop-call? step)
           (mapv (fn [iteration]
                   (let [{:keys [buffers scalar-values]}
                         (loop-call/iteration-binding step iteration)]
                     (program-graph-fact nodes values id [step-index iteration]
                                         :structured-loop-iteration
-                                        (:graph step) buffers scalar-values)))
+                                        (:graph step) buffers
+                                        (:scalar-values call) scalar-values)))
                 (range (min 3 (:trip-count step))))))
       (map-indexed vector (:steps call))))))
 

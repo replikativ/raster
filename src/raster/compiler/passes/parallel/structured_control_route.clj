@@ -6,7 +6,10 @@
    algorithms. Scheduling replaces the equation's typed control operation with one checked
    ScheduledStructuredLoop; it does not reconstruct or recognize a source-shaped compound loop."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
@@ -18,7 +21,8 @@
             [raster.compiler.passes.parallel.structured-control-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
-            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]))
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (defn- ordered-distinct
   [values]
@@ -110,13 +114,251 @@
     (boolean (validate-scheduled-program! parallel-program))
     (catch clojure.lang.ExceptionInfo _ false)))
 
+(defn- declared-parameter-value
+  [program-values array-types scalar-types parameter]
+  (let [retained (get program-values parameter)]
+    (cond
+      (contains? array-types parameter)
+      ;; The analyzed algorithm may retain `(unknown-dimension p)` because shape is deliberately
+      ;; absent until invocation. The public flat-array boundary has a stronger fact: its one
+      ;; dimension is the extent of that exact argument.
+      (av/tensor {:dtype (get array-types parameter)
+                  :shape [(list 'extent parameter)]
+                  :representation (or (:representation retained) {:kind :plain})
+                  :memory-space (:memory-space retained)
+                  :placement (:placement retained)
+                  :sharding (:sharding retained)
+                  :ownership (:ownership retained)
+                  :effects (or (:effects retained) #{})
+                  :attributes (or (:attributes retained) {})})
+
+      (contains? scalar-types parameter)
+      (or retained (av/tensor {:dtype (get scalar-types parameter) :shape []}))
+
+      retained retained
+
+      :else
+      (fail! :structured-control-public-value
+             "public parameter has no retained or declared AbstractValue"
+             {:parameter parameter :available (set (keys program-values))}))))
+
+(defn- shape-projection-source
+  [expression]
+  (loop [expression expression]
+    (if (and (seq? expression)
+             (descriptor/cast-op? (descriptor/semantic-op expression))
+             (= 1 (count (descriptor/call-args expression))))
+      (recur (first (descriptor/call-args expression)))
+      (when (and (seq? expression)
+                 (descriptor/alength-op? (descriptor/semantic-op expression))
+                 (= 1 (count (descriptor/call-args expression)))
+                 (symbol? (first (descriptor/call-args expression))))
+        (first (descriptor/call-args expression))))))
+
+(defn- scalar-value?
+  [value]
+  (and (= :tensor (:kind value)) (empty? (:shape value))))
+
+(defn- dimension-expression
+  [dimension]
+  (if (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
+    (second dimension)
+    dimension))
+
+(defn- host-computable-dimension?
+  [program-values dimension]
+  (let [dimension (dimension-expression dimension)
+        references (util/free-syms dimension)]
+    (or (integer? dimension)
+        (and (symbol? dimension) (scalar-value? (get program-values dimension)))
+        (and (seq? dimension)
+             (= :pure (effects/analyze-effect dimension))
+             (every? #(scalar-value? (get program-values %)) references)))))
+
+(defn- certified-shape-dimension
+  [program-values source]
+  (let [shape (:shape (get program-values source))
+        dimension (when (= 1 (count shape)) (first shape))]
+    (when (and dimension (host-computable-dimension? program-values dimension))
+      (dimension-expression dimension))))
+
+(defn- canonicalize-shape-projection
+  [program-values public-inputs symbol expression]
+  (let [source (shape-projection-source expression)
+        dimension (when (and source (not (contains? public-inputs source)))
+                    (certified-shape-dimension program-values source))]
+    (if-not dimension
+      expression
+      (let [result-dtype (:dtype (get program-values symbol))
+            dimension-dtype (when (symbol? dimension)
+                              (:dtype (get program-values dimension)))]
+        (if (or (nil? dimension-dtype) (= result-dtype dimension-dtype))
+          dimension
+          (list (dtype/scalar-tag-for-dtype result-dtype) dimension))))))
+
+(defn- host-shape-equation?
+  [program-values program-inputs program-outputs equation]
+  (let [algorithm (:algorithm equation)]
+    (when (and (soac/program-form? algorithm)
+               (empty? (:effects equation))
+               (= 1 (count (:results equation)))
+               (not-any? (set (:results equation)) program-outputs)
+               (= 1 (count (soac/equations algorithm))))
+      (let [algorithm-equation (first (soac/equations algorithm))
+            {:keys [kind captures lambda]} (soac/operation-parts algorithm-equation)
+            {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+            expression (when (and (= 'scalar kind) (empty? locals)
+                                  (= 1 (count body-results)))
+                         (util/subst-syms (zipmap parameters captures)
+                                          (first body-results)))
+            source (shape-projection-source expression)]
+        (and source
+             (or (contains? program-inputs source)
+                 (certified-shape-dimension program-values source)))))))
+
+(defn- hoist-host-shape-equations
+  [parallel-program]
+  (let [program-values (:values parallel-program)
+        program-inputs (set (:inputs parallel-program))
+        program-outputs (:outputs parallel-program)
+        [hoisted retained] ((juxt filter remove)
+                            #(host-shape-equation? program-values program-inputs program-outputs %)
+                            (:equations parallel-program))
+        hoisted (vec hoisted)
+        retained (vec retained)]
+    (if (empty? hoisted)
+      parallel-program
+      (let [required (set (program/infer-inputs retained))
+            hoisted-results (vec (mapcat :results hoisted))
+            inputs (vec (distinct (concat (:inputs parallel-program)
+                                          (filter required hoisted-results))))]
+        (-> parallel-program
+            (assoc :equations retained
+                   :inputs inputs
+                   :effects (reduce set/union #{} (map :effects retained)))
+            (update :attributes assoc
+                    :invocation-shape-equations (count hoisted)))))))
+
+(defn- required-prefix-symbols
+  [pairs roots]
+  (let [definitions (into {} (map (fn [[symbol expression]] [symbol expression])) pairs)
+        available (set (keys definitions))]
+    (loop [required (set/intersection available (set roots))]
+      (let [dependencies (->> required
+                              (mapcat #(util/free-syms (get definitions %)))
+                              set
+                              (set/intersection available))
+            required' (set/union required dependencies)]
+        (if (= required required') required (recur required'))))))
+
+(defn- invocation-prefix
+  [parallel-program public-parameters]
+  (let [source (:source parallel-program)]
+    (when-not (and (seq? source) (contains? #{'let 'let*} (first source)))
+      (fail! :structured-control-invocation-source
+             "an analyzed TypedSOAC program requires a flat retained host source boundary"
+             {:source source}))
+    (let [program-values (:values parallel-program)
+          public-inputs (set public-parameters)
+          source-pairs (mapv (fn [[symbol expression]]
+                               [symbol (canonicalize-shape-projection
+                                        program-values public-inputs symbol expression)])
+                             (partition 2 (second source)))
+          equation-sites (into #{} (keep (fn [equation]
+                                           (when (= :binding (first (:site equation)))
+                                             (second (:site equation)))))
+                               (:equations parallel-program))
+          candidates (filterv (fn [[symbol _]]
+                                (not (contains? equation-sites symbol)))
+                              source-pairs)
+          roots (set/difference (set (:inputs parallel-program))
+                                (set public-parameters))
+          required (required-prefix-symbols candidates roots)
+          bindings (filterv (comp required first) candidates)
+          produced (set (map first bindings))
+          missing (set/difference roots produced)]
+      (when (seq missing)
+        (fail! :structured-control-invocation-prefix
+               "internal TypedSOAC inputs are not public parameters or host-prefix values"
+               {:inputs missing :public-parameters (set public-parameters)
+                :available produced}))
+      bindings)))
+
+(defn- normalize-public-contracts
+  [parallel-program parameter-values]
+  (let [normalize-values (fn [values]
+                           (reduce-kv (fn [values id value]
+                                        (if (and (contains? values id)
+                                                 (some (fn [dimension]
+                                                         (and (seq? dimension)
+                                                              (= 'unknown-dimension
+                                                                 (first dimension))))
+                                                       (:shape (get values id))))
+                                          (assoc values id value)
+                                          values))
+                                      values parameter-values))]
+    (update parallel-program :values normalize-values)))
+
+(defn promote-soac-program
+  "Promote one analyzed, loop-free TypedSOAC ParallelProgram into the common typed program union.
+
+   The numerical equations are unchanged. This pass adds only the public invocation contract:
+   direct parameters map by identity, while the transitive non-equation host prefix becomes typed
+   ShapeProjection/ScalarCompute/allocation steps. Structured loops and loop-free algorithms can
+   therefore share scheduling, emission, ProgramCall, LinkPlan, and runtime lowering."
+  [parallel-program {:keys [public-parameters active-params array-types scalar-types]}]
+  (when-not (= :typed-soac (:dialect parallel-program))
+    (fail! :structured-control-soac-promotion
+           "loop-free promotion requires an analyzed :typed-soac ParallelProgram"
+           {:dialect (:dialect parallel-program)}))
+  (let [parallel-program (hoist-host-shape-equations parallel-program)
+        public-parameters (vec (or public-parameters active-params))
+        _ (when-not (seq public-parameters)
+            (fail! :structured-control-public-parameters
+                   "loop-free equation-first promotion requires ordered public parameters" {}))
+        retained-values (:values parallel-program)
+        parameter-values (into {} (map (fn [parameter]
+                                         [parameter
+                                          (declared-parameter-value
+                                           retained-values array-types scalar-types parameter)]))
+                               public-parameters)
+        parallel-program (normalize-public-contracts parallel-program parameter-values)
+        program-values (:values parallel-program)
+        prefix (invocation-prefix parallel-program public-parameters)
+        binding-values (into {} (map (fn [[symbol expression]]
+                                       (let [value (get program-values symbol)]
+                                         (when-not value
+                                           (fail! :structured-control-prefix-value
+                                                  "host-prefix binding has no retained AbstractValue"
+                                                  {:symbol symbol :expression expression}))
+                                         [symbol value]))
+                                     prefix))
+        promoted (assoc parallel-program :dialect :typed-parallel)
+        plan (invocation/from-prefix
+              {:id [:program-invocation (mapv :id (:equations parallel-program))]
+               :parameters public-parameters
+               :parameter-values parameter-values
+               :bindings prefix
+               :binding-values binding-values
+               :program-values program-values
+               :program-inputs (:inputs parallel-program)
+               :program-outputs (:outputs parallel-program)
+               :attributes {:source-dialect :closed-clojure
+                            :algorithm-dialect :typed-soac
+                            :target-dialect :typed-invocation}})]
+    (-> promoted
+        (update :attributes assoc
+                :host-control :typed-invocation
+                :invocation-plan (invocation/validate-against! plan promoted))
+        validate-typed-program!)))
+
 (defn- merge-values
   [left right]
   (reduce-kv
    (fn [values id value]
      (if-let [prior (get values id)]
-       (if (= prior value)
-         values
+       (if-let [refined (av/merge-refinement prior value)]
+         (assoc values id refined)
          (throw (ex-info "mixed typed algorithms disagree on one AbstractValue"
                          {:reason :structured-control-value-conflict
                           :id id :first prior :second value})))

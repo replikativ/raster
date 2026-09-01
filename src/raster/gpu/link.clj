@@ -185,14 +185,23 @@
               (parallel-program/prepare-with!
                (:call instance)
                {:bind! (fn [key graph buffers scalars]
-                         (gpu/bind-kernel-graph!
-                          session [::program-graph execution-id key] graph
-                          (into {}
-                                (map (fn [[compiler-value value-id]]
-                                       [compiler-value
-                                        (resident-link-value plan node-views value-id)]))
-                                buffers)
-                          scalars {:profile? profile?}))
+                         (let [resident-buffers
+                               (into {}
+                                     (map (fn [[compiler-value value-id]]
+                                            [compiler-value
+                                             (resident-link-value plan node-views value-id)]))
+                                     buffers)
+                               extent-scalars
+                               (into {}
+                                     (keep (fn [[compiler-value resident]]
+                                             (when-let [extent (first (get-in resident [:view :shape]))]
+                                               [(list 'extent compiler-value)
+                                                {:type :long :value extent}])))
+                                     resident-buffers)]
+                           (gpu/bind-kernel-graph!
+                            session [::program-graph execution-id key] graph
+                            resident-buffers (merge extent-scalars scalars)
+                            {:profile? profile?})))
                 :run! #(gpu/run-kernel-graph! session %)
                 :release! #(gpu/release-kernel-graph! session %)}))
              (do
