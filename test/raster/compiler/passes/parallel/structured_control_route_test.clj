@@ -142,7 +142,7 @@
                                      (* 2.0 (clojure.core/aget u k)))]
                 'u)
         decomposition (frontend/form->structured-loop source options)]
-    (is (= :structured-control-use-before-definition
+    (is (= :parallel-program-result-redefinition
            (reason-of #(route/program-envelope decomposition options))))))
 
 (deftest algorithm-kind-and-operation-kind-must-remain-paired

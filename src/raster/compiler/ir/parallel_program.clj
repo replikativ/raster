@@ -5,7 +5,8 @@
    current compiler still needs `source` to reconstruct scalar host control around emitted kernel
    calls, but scheduled operations live in equations, never in Clojure symbol metadata.  As more
    scalar control becomes explicit, `source` can shrink without changing value or operation IDs."
-  (:require [raster.compiler.ir.abstract-value :as av]))
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.abstract-value :as av]))
 
 (defrecord ProgramEquation
            [id site source operands results algorithm operations effects provenance attributes])
@@ -28,6 +29,47 @@
 (defn- distinct-vector?
   [value]
   (and (vector? value) (= (count value) (count (distinct value)))))
+
+(defn infer-inputs
+  "Infer external inputs in first-use order from an ordered equation sequence.
+
+   This is a constructor helper, not a substitute for validation. A value used before a later
+   definition is inferred as external and `validate!` subsequently rejects that definition as an
+   input clobber."
+  [equations]
+  (:inputs
+   (reduce (fn [{:keys [inputs available] :as state} equation]
+             (let [external (remove available (:operands equation))]
+               (-> state
+                   (update :inputs into (remove (set inputs) external))
+                   (update :available into external)
+                   (update :available into (:results equation)))))
+           {:inputs [] :available #{}}
+           equations)))
+
+(defn- validate-dataflow!
+  [{:keys [inputs equations outputs] :as program}]
+  (let [available
+        (reduce
+         (fn [available equation]
+           (let [missing (set/difference (set (:operands equation)) available)
+                 redefined (set/intersection (set (:results equation)) available)]
+             (when (seq missing)
+               (throw (ex-info "equation operands must be program inputs or earlier results"
+                               {:reason :parallel-program-use-before-definition
+                                :equation (:id equation) :values missing})))
+             (when (seq redefined)
+               (throw (ex-info "equation results must be fresh logical values"
+                               {:reason :parallel-program-result-redefinition
+                                :equation (:id equation) :values redefined})))
+             (into available (:results equation))))
+         (set inputs) equations)
+        unavailable (set/difference (set outputs) available)]
+    (when (seq unavailable)
+      (throw (ex-info "program outputs must be inputs or equation results"
+                      {:reason :parallel-program-unavailable-output
+                       :values unavailable})))
+    program))
 
 (defn validate!
   "Validate a ParallelProgram and return it unchanged.
@@ -114,6 +156,7 @@
        (when-not (map? (:attributes equation))
          (throw (ex-info "equation attributes must be a map"
                          {:reason :parallel-program-attributes :equation (:id equation)}))))
+     (validate-dataflow! program)
      (when-not (set? effects)
        (throw (ex-info "parallel program effects must be an explicit set"
                        {:reason :parallel-program-effects :effects effects})))

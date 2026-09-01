@@ -13,6 +13,30 @@
                                        {:target-device :cpu:0 :dtype :double
                                         :array-types {'values :double}})))
 
+(defn- dataflow-equation
+  [id operands results]
+  (program/->ProgramEquation id [:test id] nil (vec operands) (vec results) nil [:test]
+                             #{} {} {}))
+
+(defn- dataflow-program
+  [inputs equations outputs]
+  (let [ids (set (concat inputs outputs (mapcat :operands equations) (mapcat :results equations)))
+        value (av/tensor {:dtype :int :shape []})]
+    (program/make {:dialect :test
+                   :values (zipmap ids (repeat value))
+                   :inputs inputs
+                   :equations equations
+                   :outputs outputs
+                   :operation? #{:test}})))
+
+(defn- reason-of
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch clojure.lang.ExceptionInfo exception
+      (:reason (ex-data exception)))))
+
 (deftest segops-are-first-class-typed-equations
   (let [p (lowered-program)
         equation (first (:equations p))]
@@ -89,3 +113,41 @@
     (is (nil? (:algorithm equation)))
     (is (seq (:operations equation)))
     (is (= [:binding 'total] (:site equation)))))
+
+(deftest parallel-program-enforces-ordered-logical-ssa
+  (testing "external inputs and earlier results are the only available operands"
+    (is (= :parallel-program-use-before-definition
+           (reason-of #(dataflow-program
+                        '[input]
+                        [(dataflow-equation 'first '[later] '[middle])
+                         (dataflow-equation 'second '[input] '[later])]
+                        '[middle])))))
+  (testing "results cannot clobber a program input or an earlier result"
+    (is (= :parallel-program-result-redefinition
+           (reason-of #(dataflow-program
+                        '[input]
+                        [(dataflow-equation 'clobber '[input] '[input])]
+                        '[input]))))
+    (is (= :parallel-program-result-redefinition
+           (reason-of #(dataflow-program
+                        '[input]
+                        [(dataflow-equation 'first '[input] '[result])
+                         (dataflow-equation 'second '[result] '[result])]
+                        '[result])))))
+  (testing "outputs must be available at the end of the program"
+    (is (= :parallel-program-unavailable-output
+           (reason-of #(dataflow-program
+                        '[input]
+                        [(dataflow-equation 'equation '[input] '[result])]
+                        '[missing])))))
+  (testing "pass-through outputs and unused inputs/results remain legal"
+    (is (program/parallel-program?
+         (dataflow-program
+          '[input unused]
+          [(dataflow-equation 'equation '[input] '[unused-result])]
+          '[input])))))
+
+(deftest external-input-inference-preserves-first-use-order
+  (let [equations [(dataflow-equation 'first '[z a] '[x])
+                   (dataflow-equation 'second '[x b a] '[y])]]
+    (is (= '[z a b] (program/infer-inputs equations)))))
