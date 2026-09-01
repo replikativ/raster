@@ -611,7 +611,10 @@ does not require fake scalar work. The body boundary,
 effects, and `AbstractValue` contracts are checked modulo the explicit outer-to-inner alpha-renaming;
 zero iterations therefore retain the initial value contract without emitter inference. Values
 defined and consumed only inside the body are ordinary SSA scratch, not entries in another memory
-registry. The association contract is explicitly sequential.
+registry. The enclosing AbstractValue environment is retained in the loop facts, so scheduling and
+runtime-call construction revalidate the same boundary instead of trusting a transient front-end
+check. Repeated outer operands are ordinary SSA uses; loop results alone must be fresh definitions.
+The association contract is explicitly sequential.
 
 This does not add a time-loop SOAC or a PDE-specific primitive. SOAC fusion continues to reason
 algebraically about the parallel body. The first lowering must preserve the fixpoint as explicit

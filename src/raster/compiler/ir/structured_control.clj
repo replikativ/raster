@@ -9,7 +9,7 @@
 
    Canonical form:
 
-     (loop-program facts
+     (loop-program facts-with-outer-values
        [iteration-parameter trip-count]
        [{:outer invariant :parameter body-parameter} ...]
        [{:initial initial-value :parameter body-parameter
@@ -20,7 +20,8 @@
    output denotes its corresponding initial value. The body may use any ordered subset of the
    iteration parameter, invariant parameters, and carried parameters; its ordered outputs are
    exactly the carried results."
-  (:require [clojure.walk :as walk]
+  (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [pattern.nanopass.dialect :as dialect :refer [def-dialect]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]))
@@ -29,6 +30,8 @@
   [value]
   (and (map? value)
        (soac/equation-id? (:id value))
+       (map? (:values value))
+       (every? av/abstract-value? (vals (:values value)))
        (set? (:effects value))
        (map? (:provenance value))
        (map? (:attributes value))
@@ -76,6 +79,11 @@
 (defn invariants [program] (vec (nth program 3)))
 (defn carried [program] (vec (nth program 4)))
 (defn body [program] (nth program 5))
+
+(defn outer-values
+  "Retained enclosing AbstractValue environment used to certify every loop boundary."
+  [program]
+  (:values (facts program)))
 
 (defn outer-operands
   "Ordered values read by one loop expression.  A symbolic trip count is an operand."
@@ -147,97 +155,92 @@
              {:role role :left-id left-id :left left :right-id right-id :right right}))))
 
 (defn validate!
-  "Validate a typed structured loop and return it unchanged.
-
-   With `outer-values`, also certify the symbolic trip count and every outer/inner invariant and
-   carry boundary.  This second arity is what an enclosing ParallelProgram must use."
-  ([program] (validate! program nil))
-  ([program outer-values]
-   (when-not (loop-program? program)
-     (fail! :typed-loop-program "expected a loop-program form" {:program program}))
-   (when-not (dialect/valid? TypedStructuredControl program)
-     (fail! :typed-loop-syntax "program does not conform to the structured-control dialect"
-            {:details (dialect/validate TypedStructuredControl program)}))
-   (let [loop-facts (facts program)
-         [iteration trip-count] (loop-index program)
-         invariant-bindings (invariants program)
-         carry-bindings (carried program)
-         body-program (soac/validate! (body program))
-         body-facts (soac/facts body-program)
-         inner-values (:values body-facts)
-         expected-inputs (body-inputs program)
-         expected-results (body-results program)
-         inner-ids (vec (concat expected-inputs expected-results))
-         outer-ids (vec (concat (outer-operands program) (outer-results program)))
-         inner->outer
-         (into {}
-               (concat (map (juxt :parameter :outer) invariant-bindings)
-                       (map (juxt :parameter :initial) carry-bindings)
-                       (map (juxt :result :output) carry-bindings)))]
-     (when-not (distinct-vector? inner-ids)
-       (fail! :typed-loop-inner-bindings
-              "iteration, invariant, carry, and result IDs must be distinct inside the body"
-              {:ids inner-ids}))
-     (when-not (distinct-vector? outer-ids)
-       (fail! :typed-loop-outer-bindings
-              "loop operands and results must be distinct in the enclosing scope"
-              {:ids outer-ids}))
-     (let [actual-inputs (:inputs body-facts)
-           actual-set (set actual-inputs)
-           expected-used (filterv actual-set expected-inputs)]
-       (when-not (= expected-used actual-inputs)
-         (fail! :typed-loop-body-inputs
-                "loop body inputs must be an ordered subset of declared structured-loop binders"
-                {:declared expected-inputs :expected-used expected-used
-                 :actual actual-inputs})))
-     (when-not (= expected-results (soac/outputs body-program))
-       (fail! :typed-loop-body-results
-              "loop body outputs must exactly match the ordered carried results"
-              {:expected expected-results :actual (soac/outputs body-program)}))
-     (when-not (= (:effects loop-facts) (:effects body-facts))
-       (fail! :typed-loop-effects "loop effects must equal its body effects"
-              {:declared (:effects loop-facts) :body (:effects body-facts)}))
-     (let [iteration-value (require-value! inner-values iteration :iteration)]
-       (when-not (integer-scalar? iteration-value)
-         (fail! :typed-loop-index-type "loop iteration parameter must be an integer scalar"
-                {:id iteration :value iteration-value})))
-     (doseq [{:keys [parameter]} invariant-bindings]
-       (require-value! inner-values parameter :invariant-parameter))
-     (doseq [{:keys [parameter result]} carry-bindings]
-       (let [parameter-value (require-value! inner-values parameter :carry-parameter)
-             result-value (require-value! inner-values result :carry-result)]
-         (require-compatible! parameter parameter-value result result-value {} :body-carry)))
-     (when outer-values
-       (when-not (map? outer-values)
-         (fail! :typed-loop-outer-values "outer values must be an ID-to-AbstractValue map"
-                {:values outer-values}))
-       (when (soac/value-id? trip-count)
-         (let [trip-value (require-value! outer-values trip-count :trip-count)]
-           (when-not (integer-scalar? trip-value)
-             (fail! :typed-loop-trip-count-type "symbolic trip count must be an integer scalar"
-                    {:id trip-count :value trip-value}))))
-       (doseq [{:keys [outer parameter]} invariant-bindings]
-         (require-compatible!
-          outer (require-value! outer-values outer :invariant)
-          parameter (require-value! inner-values parameter :invariant-parameter)
-          inner->outer :invariant))
-       (doseq [{:keys [initial parameter result output]} carry-bindings]
-         (let [initial-value (require-value! outer-values initial :carry-initial)
-               parameter-value (require-value! inner-values parameter :carry-parameter)
-               result-value (require-value! inner-values result :carry-result)
-               output-value (require-value! outer-values output :carry-output)]
-           (require-compatible! initial initial-value parameter parameter-value
-                                inner->outer :carry-input)
-           (require-compatible! output output-value result result-value
-                                inner->outer :carry-output))))
-     program)))
+  "Validate a typed structured loop and its retained enclosing AbstractValue environment."
+  [program]
+  (when-not (loop-program? program)
+    (fail! :typed-loop-program "expected a loop-program form" {:program program}))
+  (when-not (dialect/valid? TypedStructuredControl program)
+    (fail! :typed-loop-syntax "program does not conform to the structured-control dialect"
+           {:details (dialect/validate TypedStructuredControl program)}))
+  (let [loop-facts (facts program)
+        [iteration trip-count] (loop-index program)
+        invariant-bindings (invariants program)
+        carry-bindings (carried program)
+        body-program (soac/validate! (body program))
+        body-facts (soac/facts body-program)
+        outer-values (:values loop-facts)
+        inner-values (:values body-facts)
+        expected-inputs (body-inputs program)
+        expected-results (body-results program)
+        inner-ids (vec (concat expected-inputs expected-results))
+        outer-results (outer-results program)
+        outer-operands (outer-operands program)
+        inner->outer
+        (into {}
+              (concat (map (juxt :parameter :outer) invariant-bindings)
+                      (map (juxt :parameter :initial) carry-bindings)
+                      (map (juxt :result :output) carry-bindings)))]
+    (when-not (distinct-vector? inner-ids)
+      (fail! :typed-loop-inner-bindings
+             "iteration, invariant, carry, and result IDs must be distinct inside the body"
+             {:ids inner-ids}))
+    (when-not (and (distinct-vector? outer-results)
+                   (empty? (set/intersection (set outer-results)
+                                             (set outer-operands))))
+      (fail! :typed-loop-outer-bindings
+             "loop results must be fresh and distinct from every enclosing operand"
+             {:operands outer-operands :results outer-results}))
+    (let [actual-inputs (:inputs body-facts)
+          actual-set (set actual-inputs)
+          expected-used (filterv actual-set expected-inputs)]
+      (when-not (= expected-used actual-inputs)
+        (fail! :typed-loop-body-inputs
+               "loop body inputs must be an ordered subset of declared structured-loop binders"
+               {:declared expected-inputs :expected-used expected-used
+                :actual actual-inputs})))
+    (when-not (= expected-results (soac/outputs body-program))
+      (fail! :typed-loop-body-results
+             "loop body outputs must exactly match the ordered carried results"
+             {:expected expected-results :actual (soac/outputs body-program)}))
+    (when-not (= (:effects loop-facts) (:effects body-facts))
+      (fail! :typed-loop-effects "loop effects must equal its body effects"
+             {:declared (:effects loop-facts) :body (:effects body-facts)}))
+    (let [iteration-value (require-value! inner-values iteration :iteration)]
+      (when-not (integer-scalar? iteration-value)
+        (fail! :typed-loop-index-type "loop iteration parameter must be an integer scalar"
+               {:id iteration :value iteration-value})))
+    (doseq [{:keys [parameter]} invariant-bindings]
+      (require-value! inner-values parameter :invariant-parameter))
+    (doseq [{:keys [parameter result]} carry-bindings]
+      (let [parameter-value (require-value! inner-values parameter :carry-parameter)
+            result-value (require-value! inner-values result :carry-result)]
+        (require-compatible! parameter parameter-value result result-value {} :body-carry)))
+    (doseq [[_ value] outer-values]
+      (av/validate! value))
+    (when (soac/value-id? trip-count)
+      (let [trip-value (require-value! outer-values trip-count :trip-count)]
+        (when-not (integer-scalar? trip-value)
+          (fail! :typed-loop-trip-count-type "symbolic trip count must be an integer scalar"
+                 {:id trip-count :value trip-value}))))
+    (doseq [{:keys [outer parameter]} invariant-bindings]
+      (require-compatible!
+       outer (require-value! outer-values outer :invariant)
+       parameter (require-value! inner-values parameter :invariant-parameter)
+       inner->outer :invariant))
+    (doseq [{:keys [initial parameter result output]} carry-bindings]
+      (let [initial-value (require-value! outer-values initial :carry-initial)
+            parameter-value (require-value! inner-values parameter :carry-parameter)
+            result-value (require-value! inner-values result :carry-result)
+            output-value (require-value! outer-values output :carry-output)]
+        (require-compatible! initial initial-value parameter parameter-value
+                             inner->outer :carry-input)
+        (require-compatible! output output-value result result-value
+                             inner->outer :carry-output)))
+    program))
 
 (defn make
   "Construct and validate a typed structured loop."
-  ([loop-facts index invariant-bindings carry-bindings body-program]
-   (make loop-facts index invariant-bindings carry-bindings body-program nil))
-  ([loop-facts index invariant-bindings carry-bindings body-program outer-values]
-   (validate!
-    (list 'loop-program loop-facts (vec index) (vec invariant-bindings)
-          (vec carry-bindings) body-program)
-    outer-values)))
+  [loop-facts index invariant-bindings carry-bindings body-program outer-values]
+  (validate!
+   (list 'loop-program (assoc loop-facts :values outer-values)
+         (vec index) (vec invariant-bindings) (vec carry-bindings) body-program)))

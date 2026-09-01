@@ -43,7 +43,8 @@
 (deftest structured-loop-is-a-pattern-declared-functional-fixpoint
   (let [{:keys [program outer-values]} (fixture)]
     (is (pattern-dialect/valid? control/TypedStructuredControl program))
-    (is (= program (control/validate! program outer-values)))
+    (is (= outer-values (control/outer-values program)))
+    (is (= program (control/validate! program)))
     (is (= '[steps n alpha u0] (control/outer-operands program)))
     (is (= '[u-final] (control/outer-results program)))
     (is (= '[iteration n-in alpha-in u-in] (control/body-inputs program)))
@@ -52,7 +53,7 @@
     (testing "zero trips retain the same typed initial/output contract"
       (let [zero-trip (assoc (vec program) 2 '[iteration 0])
             zero-trip (apply list zero-trip)]
-        (is (= zero-trip (control/validate! zero-trip outer-values)))))))
+        (is (= zero-trip (control/validate! zero-trip)))))))
 
 (deftest structured-loop-boundaries-are-certified
   (let [{:keys [program outer-values]} (fixture)]
@@ -64,7 +65,7 @@
                       (soac/outputs (control/body program)))
             bad (apply list (assoc (vec program) 5 bad-body))]
         (try
-          (control/validate! bad outer-values)
+          (control/validate! bad)
           (is false "reordered body inputs must fail")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-loop-body-inputs (:reason (ex-data exception))))))))
@@ -82,21 +83,25 @@
             unused-iteration-body (soac/make facts [equation] (soac/outputs body))
             unused-iteration (apply list (assoc (vec program) 5 unused-iteration-body))]
         (is (= '[n-in alpha-in u-in] (control/used-body-inputs unused-iteration)))
-        (is (= unused-iteration (control/validate! unused-iteration outer-values)))))
+        (is (= unused-iteration (control/validate! unused-iteration)))))
 
     (testing "loop-carried values retain one AbstractValue contract"
       (let [bad-values (assoc outer-values 'u-final
-                              (av/tensor {:dtype :double :shape '[n]}))]
+                              (av/tensor {:dtype :double :shape '[n]}))
+            bad (apply list (assoc (vec program) 1
+                                   (assoc (control/facts program) :values bad-values)))]
         (try
-          (control/validate! program bad-values)
+          (control/validate! bad)
           (is false "a changed carry dtype must fail")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-loop-value-mismatch (:reason (ex-data exception))))))))
 
     (testing "a symbolic trip count is an integer scalar"
-      (let [bad-values (assoc outer-values 'steps scalar)]
+      (let [bad-values (assoc outer-values 'steps scalar)
+            bad (apply list (assoc (vec program) 1
+                                   (assoc (control/facts program) :values bad-values)))]
         (try
-          (control/validate! program bad-values)
+          (control/validate! bad)
           (is false "floating trip counts must fail")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-loop-trip-count-type (:reason (ex-data exception))))))))
@@ -105,7 +110,7 @@
       (let [bad (apply list (assoc (vec program) 1
                                    (assoc (control/facts program) :effects #{:io})))]
         (try
-          (control/validate! bad outer-values)
+          (control/validate! bad)
           (is false "loop effects must equal body effects")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-loop-effects (:reason (ex-data exception))))))))
@@ -116,7 +121,21 @@
                                              [:attributes :association]
                                              :parallel)))]
         (try
-          (control/validate! bad outer-values)
+          (control/validate! bad)
           (is false "structured time loops cannot silently reassociate")
           (catch clojure.lang.ExceptionInfo exception
-            (is (= :typed-loop-syntax (:reason (ex-data exception))))))))))
+            (is (= :typed-loop-syntax (:reason (ex-data exception))))))))
+
+    (testing "one outer value may feed several body binders"
+      (let [shared-trip (apply list (assoc (vec program) 2 '[iteration n]))]
+        (is (= '[n n alpha u0] (control/outer-operands shared-trip)))
+        (is (= shared-trip (control/validate! shared-trip)))))
+
+    (testing "loop outputs are fresh SSA definitions"
+      (let [bad-carry (assoc (first (control/carried program)) :output 'u0)
+            bad (apply list (assoc (vec program) 4 [bad-carry]))]
+        (try
+          (control/validate! bad)
+          (is false "a loop result cannot overwrite an outer operand identity")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-loop-outer-bindings (:reason (ex-data exception))))))))))
