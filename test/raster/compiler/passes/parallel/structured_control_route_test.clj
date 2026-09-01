@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.structured-control-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
@@ -96,6 +97,12 @@
           after (raster.par/pmap k n double
                                  (* 2.0 (clojure.core/aget u k)))]
          after))
+
+(defn- mixed-source-without-induction
+  []
+  (walk/postwalk
+   #(if (= '(* 0.0 step) %) 0.0 %)
+   (mixed-source)))
 
 (defn- source-with-suffix
   [suffix-bindings result]
@@ -336,33 +343,35 @@
     (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))))
 
 (defn- prepared-mixed-call
-  [trip-count]
-  (let [initial (av/tensor {:dtype :double :shape ['extent]
-                            :representation {:kind :plain}})
-        options {:dtype :double
-                 :target-device :ocl:0
-                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
-                 :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
-        emitted (:program (program-opencl/emit-program
-                           (assoc scheduled :source ::must-not-be-inspected) options))
-        loop-equation (first (:equations emitted))
-        carried (first (control/carried (:algorithm loop-equation)))
-        initial (:initial carried)
-        loop-output (:output carried)
-        result (first (:outputs emitted))
-        scalar (fn [id value]
-                 {:type (get-in emitted [:values id :dtype]) :value value})]
-    {:call
-     (program-call/make
-      emitted
-      {initial :initial loop-output :loop-output result :suffix-output}
-      {'steps (scalar 'steps trip-count)
-       'n (scalar 'n 64)}
-      (if (> trip-count 1) {loop-output :carry-scratch} {})
-      nil)
-     :loop-output loop-output
-     :result result}))
+  ([trip-count]
+   (prepared-mixed-call trip-count (mixed-source-without-induction)))
+  ([trip-count source]
+   (let [initial (av/tensor {:dtype :double :shape ['extent]
+                             :representation {:kind :plain}})
+         options {:dtype :double
+                  :target-device :ocl:0
+                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                  :scalar-types {'steps :long}}
+         scheduled (:form (pipeline/schedule-parallel-form source options))
+         emitted (:program (program-opencl/emit-program
+                            (assoc scheduled :source ::must-not-be-inspected) options))
+         loop-equation (first (:equations emitted))
+         carried (first (control/carried (:algorithm loop-equation)))
+         initial (:initial carried)
+         loop-output (:output carried)
+         result (first (:outputs emitted))
+         scalar (fn [id value]
+                  {:type (get-in emitted [:values id :dtype]) :value value})]
+     {:call
+      (program-call/make
+       emitted
+       {initial :initial loop-output :loop-output result :suffix-output}
+       {'steps (scalar 'steps trip-count)
+        'n (scalar 'n 64)}
+       (if (> trip-count 1) {loop-output :carry-scratch} {})
+       nil)
+      :loop-output loop-output
+      :result result})))
 
 (deftest emitted-program-stages-once-before-running-resident-equations
   (let [{:keys [call loop-output result]} (prepared-mixed-call 3)
@@ -387,6 +396,59 @@
     (is (= :suffix-output (get (last bindings) result)))
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
+
+(deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
+  (let [{:keys [call]} (prepared-mixed-call 9)
+        events (atom [])]
+    (program-runtime/run-with!
+     call
+     {:bind! (fn [key _graph buffers _scalars]
+               (let [handle {:key key :buffers buffers}]
+                 (swap! events conj [:bind handle])
+                 handle))
+      :run! #(swap! events conj [:run %])
+      :release! #(swap! events conj [:release %])})
+    (let [bindings (filter #(= :bind (first %)) @events)
+          runs (filter #(= :run (first %)) @events)
+          releases (filter #(= :release (first %)) @events)]
+      (is (= 4 (count bindings))
+          "one preserved-input prologue, two carry parities, and one suffix are prepared")
+      (is (= 10 (count runs)) "nine loop launches replay three handles before the suffix")
+      (is (= 4 (count releases)))
+      (is (= 4 (count (distinct (map (comp :key second) bindings))))))))
+
+(deftest structured-loop-preparation-stays-constant-for-huge-trip-counts
+  (let [call (:call (prepared-mixed-call 1000000000))]
+    (is (= 4 (count (program-runtime/staging-plan call :execution)))
+        "one billion iterations still prepare three carry variants and one suffix")
+    (let [events (atom [])
+          launches (atom 0)]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"stop streamed replay"
+           (program-runtime/run-with!
+            call
+            {:bind! (fn [key & _]
+                      (swap! events conj [:bind key])
+                      key)
+             :run! (fn [handle]
+                     (swap! events conj [:run handle])
+                     (when (= 4 (swap! launches inc))
+                       (throw (ex-info "stop streamed replay" {}))))
+             :release! (fn [handle]
+                         (swap! events conj [:release handle]))})))
+      (is (= 4 (count (filter #(= :bind (first %)) @events))))
+      (is (= 4 (count (filter #(= :run (first %)) @events))))
+      (is (= 4 (count (filter #(= :release (first %)) @events)))))))
+
+(deftest stage-once-declines-a-changing-induction-scalar
+  (let [call (:call (prepared-mixed-call 3 (mixed-source)))]
+    (try
+      (program-runtime/staging-plan call :execution)
+      (is false "an iteration-varying ABI value cannot be frozen into a prepared graph")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :parallel-program-dynamic-loop-binding
+               (:reason (ex-data exception))))
+        (is (= :bounded-iteration-execution (:fallback (ex-data exception))))))))
 
 (deftest zero-trip-program-feeds-the-initial-carry-to-its-suffix
   (let [{:keys [call loop-output result]} (prepared-mixed-call 0)
@@ -423,7 +485,8 @@
                  :target-device :ocl:0
                  :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
                  :scalar-types {'steps :long}}
-        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled (:form (pipeline/schedule-parallel-form
+                          (mixed-source-without-induction) options))
         base (:program (program-opencl/emit-program
                         (assoc scheduled :source ::must-not-be-inspected) options))
         loop-equation (first (:equations base))

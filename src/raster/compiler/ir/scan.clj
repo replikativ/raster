@@ -6,6 +6,7 @@
    only when the body is an associative combine of the prior accumulator and an accumulator-free
    element expression. This boundary proves that property before SegScan scheduling."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]))
 
@@ -14,15 +15,19 @@
 (defn associative-scan? [x]
   (and x (= "raster.compiler.ir.scan.AssociativeScan" (.getName (class x)))))
 
+(def ^:private cast-dtypes
+  {'float :float, 'clojure.core/float :float
+   'double :double, 'clojure.core/double :double
+   'int :int, 'clojure.core/int :int
+   'long :long, 'clojure.core/long :long})
+
 (defn- acc-ref?
-  [expr acc]
+  [expr acc reduction-dtype]
   (or (= expr acc)
       (and (seq? expr)
            (= 2 (count expr))
-           (contains? #{'float 'double 'int 'long
-                        'clojure.core/float 'clojure.core/double
-                        'clojure.core/int 'clojure.core/long}
-                      (first expr))
+           (= (dtype/canon reduction-dtype)
+              (some-> (get cast-dtypes (first expr)) dtype/canon))
            (= acc (second expr)))))
 
 (defn- contains-symbol?
@@ -33,23 +38,24 @@
     :else false))
 
 (defn- literal-value
-  [expr]
+  [expr _reduction-dtype]
   (if (and (seq? expr)
            (= 2 (count expr))
-           (contains? #{'float 'double 'int 'long
-                        'clojure.core/float 'clojure.core/double
-                        'clojure.core/int 'clojure.core/long}
-                      (first expr))
+           ;; Casts around literal identities are representation spelling, not accumulator
+           ;; evidence. Compare the literal exactly in the reduction domain below; unlike
+           ;; acc-ref?, accepting `(double 0.0)` for an explicitly float scan cannot change which
+           ;; value is carried or hide a cross-dtype accumulator.
+           (contains? cast-dtypes (first expr))
            (number? (second expr)))
     (second expr)
     expr))
 
 (defn- identity-equivalent?
-  [left right]
-  (let [left (literal-value left)
-        right (literal-value right)]
+  [left right reduction-dtype]
+  (let [left (literal-value left reduction-dtype)
+        right (literal-value right reduction-dtype)]
     (if (and (number? left) (number? right))
-      (== (double left) (double right))
+      (== left right)
       (= left right))))
 
 (defn- pure-element?
@@ -77,7 +83,7 @@
                      (throw exception))))
         combine (descriptor/semantic-op lambda)
         args (vec (descriptor/call-args lambda))
-        dtype (or dtype :double)
+        dtype (dtype/canon (or dtype :double))
         supported-dtypes (if (= :scan operation)
                            #{:int :long :float :double}
                            #{:byte :int :long :half :float :double})]
@@ -92,8 +98,8 @@
                        :combine combine :body lambda :reduction-op reduction-op})))
     (let [[left right] args
           element (cond
-                    (and (acc-ref? left acc) (not (contains-symbol? right acc))) right
-                    (and (acc-ref? right acc) (not (contains-symbol? left acc))) left
+                    (and (acc-ref? left acc dtype) (not (contains-symbol? right acc))) right
+                    (and (acc-ref? right acc dtype) (not (contains-symbol? left acc))) left
                     :else nil)]
       (when-not element
         (throw (ex-info "parallel reduction must combine one accumulator with an accumulator-free element"
@@ -104,7 +110,7 @@
                         {:reason (reason operation "element-impure-or-unknown")
                          :element element :body lambda :reduction-op reduction-op})))
       (let [identity (descriptor/typed-reduce-identity combine dtype)]
-        (when-not (identity-equivalent? init identity)
+        (when-not (identity-equivalent? init identity dtype)
           (throw (ex-info "parallel reduction with a non-identity init requires a distinct schedule"
                           {:reason (reason operation "nonidentity-init")
                            :combine combine :init init :identity identity :dtype dtype})))
@@ -131,11 +137,11 @@
        ;; Accumulators and element operands are lexical binders that may be alpha-renamed or
        ;; projected from captures between independently certified regions. The certificate is the
        ;; typed monoid contract; each concrete region has already been certified on its own.
+       (= (:dtype declared) (:dtype derived))
        (= (some-> (:combine declared) name symbol)
           (some-> (:combine derived) name symbol))
-       (identity-equivalent? (:init declared) (:init derived))
-       (identity-equivalent? (:identity declared) (:identity derived))
-       (= (:dtype declared) (:dtype derived))))
+       (identity-equivalent? (:init declared) (:init derived) (:dtype declared))
+       (identity-equivalent? (:identity declared) (:identity derived) (:dtype declared))))
 
 (defn certify
   "Certify `scan-op` as a parallel associative scan or throw a structured conversion decline.

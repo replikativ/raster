@@ -13,6 +13,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -22,7 +23,7 @@
 
 (deftest two-phase-reduction-graph-emits-its-explicit-scheduled-dataflow
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
-                                                  (+ acc (clojure.core/aget a i)))]
+                                                 (+ acc (clojure.core/aget a i)))]
                       result)
         options {:dtype :double :array-types {'a :double}
                  :scalar-types {'n :long}}
@@ -33,22 +34,26 @@
         emitted (sg/generate-kernel-graph
                  graph :array-types {'a :double} :scalar-types {'n :long})
         [phase-one phase-two] (mapv :operation (:nodes emitted))
-        partials (first (:inputs (second (mapv :operation (:nodes graph)))))]
+        partials (first (:inputs (second (mapv :operation (:nodes graph)))))
+        temporary-specs (graph-call/temporary-specs
+                         emitted {'n {:type :long :value 1025}})]
     (is (= 2 (count (:nodes emitted))))
     (is (every? kart/kernel-artifact? [phase-one phase-two]))
     (is (str/includes? (:source phase-two) (str (name partials) "[")))
     (is (not (re-find #"\ba\[" (:source phase-two)))
-        "the cross-block target kernel must not resurrect the original reduction body")))
+        "the cross-block target kernel must not resurrect the original reduction body")
+    (is (= 2 (second (get temporary-specs partials)))
+        "dynamic two-phase scratch resolves through KernelLaunch IR at call time")))
 
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
-                        (raster.par/stencil!
-                         du [u] 1 :dirichlet double i n
-                         (* alpha inv-dx2
-                            (+ (clojure.core/aget u (clojure.core/- i 1))
-                               (* -2.0 (clojure.core/aget u i))
-                               (clojure.core/aget u (clojure.core/+ i 1)))))]
-                       result)
+                       (raster.par/stencil!
+                        du [u] 1 :dirichlet double i n
+                        (* alpha inv-dx2
+                           (+ (clojure.core/aget u (clojure.core/- i 1))
+                              (* -2.0 (clojure.core/aget u i))
+                              (clojure.core/aget u (clojure.core/+ i 1)))))]
+                      result)
         typed (-> (typed-route/attempt
                    source :double {'du :double 'u :double}
                    {:scalar-types {'n :long 'alpha :double 'inv-dx2 :double}})

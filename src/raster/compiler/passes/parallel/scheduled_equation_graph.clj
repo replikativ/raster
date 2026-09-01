@@ -17,7 +17,16 @@
 
 (defn- value-elements
   [value]
-  (let [shape (:shape value)]
+  (let [dimension-value (fn [dimension]
+                          ;; AbstractValue uses `(value id)` to distinguish a compound stable
+                          ;; value ID from shape syntax. KernelGraph owns explicit integer
+                          ;; expressions, so remove only that marker at this physical boundary.
+                          (if (and (seq? dimension)
+                                   (= 'value (first dimension))
+                                   (= 2 (count dimension)))
+                            (second dimension)
+                            dimension))
+        shape (mapv dimension-value (:shape value))]
     (cond
       (empty? shape) 1
       (= 1 (count shape)) (first shape)

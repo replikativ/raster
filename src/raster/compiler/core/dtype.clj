@@ -37,13 +37,16 @@
             :bytes 2 :jvm-array-class-name "[S" :aliases #{:float16 :f16}}
    :int    {:native {:c "int" :opencl "int" :glsl "int"}
             :scalar-tag 'int :array-tag 'ints :vt :i32 :needs-pragma nil :fp? false
-            :bytes 4 :jvm-array-class-name "[I" :aliases #{:int32 :i32}}
+            :bytes 4 :jvm-array-class-name "[I" :aliases #{:int32 :i32}
+            :limits {:min Integer/MIN_VALUE :max Integer/MAX_VALUE}}
    :long   {:native {:c "long long" :opencl "long" :glsl "int"}
             :scalar-tag 'long :array-tag 'longs :vt :i64 :needs-pragma nil :fp? false
-            :bytes 8 :jvm-array-class-name "[J" :aliases #{:int64 :i64}}
+            :bytes 8 :jvm-array-class-name "[J" :aliases #{:int64 :i64}
+            :limits {:min Long/MIN_VALUE :max Long/MAX_VALUE}}
    :byte   {:native {:c "int8_t" :opencl "char" :glsl "int"}
             :scalar-tag 'byte :array-tag 'bytes :vt :i32 :needs-pragma nil :fp? false
-            :bytes 1 :jvm-array-class-name "[B" :aliases #{:int8 :i8}}})
+            :bytes 1 :jvm-array-class-name "[B" :aliases #{:int8 :i8}
+            :limits {:min Byte/MIN_VALUE :max Byte/MAX_VALUE}}})
 
 (def ^:private alias->canonical
   (into {} (for [[k v] dtype-info, a (cons k (:aliases v))] [a k])))

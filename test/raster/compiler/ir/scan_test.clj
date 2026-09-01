@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.scan-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.scan :as scan]))
 
 (deftest associative-scan-certification
@@ -14,13 +15,43 @@
     (is (scan/associative-scan?
          (scan/certify {:acc 'acc :init 0.0
                         :lambda '(raster.numeric/+ (float acc) (aget values i))}
+                       :float))))
+  (testing "only a cast to the reduction dtype denotes the accumulator"
+    (doseq [body '[(+ (int acc) (aget values i))
+                   (+ (float acc) (aget values i))]]
+      (try
+        (scan/certify {:acc 'acc :init 0.0 :lambda body} :double)
+        (is false (str "cross-dtype accumulator cast must decline: " body))
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :scan-not-elementwise (:reason (ex-data exception))))))))
+  (testing "a frontend numeric-literal cast does not change the exact identity"
+    (is (scan/associative-scan?
+         (scan/certify {:acc 'acc :init '(double 0.0)
+                        :lambda '(+ acc (aget values i))}
                        :float)))))
+
+(deftest integral-min-max-use-the-exact-bounded-domain-identities
+  (is (= Integer/MAX_VALUE (descriptor/typed-reduce-identity 'min :int)))
+  (is (= Integer/MIN_VALUE (descriptor/typed-reduce-identity 'max :int)))
+  (is (= Long/MAX_VALUE (descriptor/typed-reduce-identity 'min :long)))
+  (is (= Long/MIN_VALUE (descriptor/typed-reduce-identity 'max :long)))
+  (is (scan/associative-scan?
+       (scan/certify {:acc 'acc :init Integer/MIN_VALUE
+                      :lambda '(max acc (aget values i))}
+                     :int)))
+  (try
+    (scan/certify {:acc 'acc :init 'Double/NEGATIVE_INFINITY
+                   :lambda '(max acc (aget values i))}
+                  :int)
+    (is false "an IEEE infinity is not an integer-domain identity")
+    (catch clojure.lang.ExceptionInfo exception
+      (is (= :scan-nonidentity-init (:reason (ex-data exception)))))))
 
 (deftest reassociation-certification-uses-the-shared-pure-let-rewrite
   (let [facts (scan/certify-reassociation
                {:acc 'acc :init 0.0
                 :lambda '(let* [difference (- (aget x i) (aget target i))]
-                           (+ acc (* difference difference)))}
+                               (+ acc (* difference difference)))}
                :double)]
     (is (scan/associative-scan? facts))
     (is (= '+ (:combine facts)))
