@@ -7,8 +7,32 @@
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.soac-dialect :as dialect]))
+
+(defn from-typed-result-transform
+  "Project a validated TypedSOAC result transform to the shared scheduled ScalarRegion.
+
+   This is a mechanical alpha-boundary projection: dtypes, captures and the expression already
+   belong to TypedSOAC. No source operator or type inference occurs here."
+  [transform]
+  (when transform
+    (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
+          accumulator (first parameters)
+          substitutions
+          (into {}
+                (concat (map (juxt :parameter :value) (:operands transform))
+                        (map (juxt :parameter :value) (:scalars transform))))]
+      (body/->ScalarRegion
+       (vec (concat [accumulator]
+                    (map :value (:operands transform))
+                    (map :value (:scalars transform))))
+       (util/subst-syms substitutions (first body-results))
+       (mapv #(-> % (assoc :sym (:value %)) (dissoc :value :parameter))
+             (:operands transform))
+       (:result-dtype transform)))))
 
 (defn make-region
   "Convert the target-neutral result-transform descriptor into KernelBody region data."

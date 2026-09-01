@@ -14,7 +14,8 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.segop :as segop]))
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (def ^:private associative-operators #{:+ :* :min :max})
 (def ^:private cast-heads
@@ -92,7 +93,7 @@
     Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
     value))
 
-(defn- launch-group-count
+(defn launch-group-count
   "Translate SegRed's historical capped-grid expression into inspectable launch IR.
 
    `compute-launch-params` predates KernelLaunch and represents the reduction grid as
@@ -228,10 +229,13 @@
                                   (get scalar-types (symbol (name id))) dtype))
         array-dtype (fn [id] (or (get array-types id)
                                  (get array-types (symbol (name id))) dtype))
+        bound-dimension (if (or (symbol? bound) (keyword? bound) (vector? bound))
+                          (launch/runtime-value bound)
+                          bound)
         _ (when-not (and (contains? #{:float :double} (dtype/canon dtype))
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
-                         (or (and (integer? bound) (pos? bound)) (symbol? bound))
+                         (launch/dimension-expression? bound-dimension)
                          (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
                          (every? #(= (dtype/canon dtype) (dtype/canon (scalar-dtype %))) scalars))
             (decline! :uniform-scalar-storage
@@ -280,13 +284,31 @@
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input dtype [bound] :global (layout/row-major [bound] dtype) :operand)
+                     % :input dtype ['_n_bound] :global
+                     (layout/row-major ['_n_bound] dtype) :operand)
                    arrays)
               [(body/->KernelParameter output :output dtype ['partial-count] :global
                                        (layout/row-major ['partial-count] dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
+        result-region (get-in segred [:reduction :attributes :result-region])
+        _ (when (and result-region (seq (:operands result-region)))
+            (decline! :full-reduction-result-operands
+                      "full-reduction result transforms cannot address tensor operands"
+                      {:segred-id (:id segred) :operands (:operands result-region)}))
+        transformed
+        (when result-region
+          (scalar-region-lower/lower
+           result-region
+           {:accumulator final-value :accumulator-dtype dtype :store-dtype dtype
+            :parameters (into {} (map (fn [parameter] [(:id parameter) parameter])) parameters)
+            :coordinate-lower (fn [_]
+                                (decline! :full-reduction-result-operands
+                                          "full-reduction result transform has no tensor axes"
+                                          {:segred-id (:id segred)}))
+            :id-prefix "completed-reduction"}))
+        stored-value (or (:result transformed) final-value)
         kernel-body
         (body/make
          {:id [:segred (:id segred) :workgroup-tree]
@@ -336,8 +358,9 @@
                              (barrier)]
                             tree-stages
                             [(body/->ScalarLoad (body/value final-value dtype) scratch [0]
-                                                :lane-zero (body/literal identity dtype) :cached)
-                             (body/->ScalarStore output ['group-index] final-value :lane-zero)]))
+                                                :lane-zero (body/literal identity dtype) :cached)]
+                            (:operations transformed)
+                            [(body/->ScalarStore output ['group-index] stored-value :lane-zero)]))
           :schedule {:strategy :workgroup-tree
                      :workgroup-size workgroup-size
                      :reduction-operator operator}
