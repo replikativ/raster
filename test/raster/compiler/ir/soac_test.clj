@@ -146,6 +146,14 @@
       (is (instance? raster.compiler.ir.soac.ScalarBinding (nth nodes 1)))
       (is (instance? raster.compiler.ir.soac.SoacReduce (nth nodes 2))))))
 
+(deftest nonidentity-reduction-remains-a-sequential-compatibility-binding
+  (let [expression '(raster.par/reduce best finite-sentinel i n
+                      (raster.numeric/max best (raster.arrays/aget values i)))
+        node (first (soac/let-bindings->nodes [['result expression]]))]
+    (is (instance? raster.compiler.ir.soac.ScalarBinding node))
+    (is (= expression (:expr node)))
+    (is (= [['result expression]] (soac/nodes->let-bindings [node])))))
+
 (deftest nodes->let-bindings-roundtrip-test
   (testing "Round-trip through nodes preserves binding order"
     (let [pairs [['out '(raster.par/map! out i n double (* (aget a i) 2.0))]
