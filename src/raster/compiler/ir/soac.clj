@@ -9,7 +9,6 @@
     SoacMap     — element-wise parallel map
     SoacReduce  — parallel fold with associative operator
     SoacScan    — parallel prefix scan (inclusive)
-    SoacStencil — neighborhood stencil (fixed radius)
     ScalarBinding — non-parallel scalar/allocation binding"
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
@@ -58,20 +57,6 @@
             outputs     ;; #{sym} — output array symbols
             scalars])   ;; #{sym} — free scalars
 
-(defrecord SoacStencil
-           [id          ;; int
-            sym         ;; symbol
-            in-arrays   ;; vector — input array symbols
-            radius      ;; int — stencil radius
-            boundary    ;; keyword — boundary handling (:dirichlet etc.)
-            cast-fn     ;; symbol or nil
-            idx         ;; symbol — loop index variable
-            bound       ;; expr — iteration count
-            lambda      ;; expr — stencil body
-            inputs      ;; #{sym} — array symbols read
-            outputs     ;; #{sym} — output array symbols
-            scalars])   ;; #{sym} — free scalars
-
 (defrecord ScalarBinding
            [id          ;; int
             sym         ;; symbol
@@ -102,7 +87,6 @@
 (defn soac-map? [node] (record-kind? "raster.compiler.ir.soac.SoacMap" node))
 (defn soac-reduce? [node] (record-kind? "raster.compiler.ir.soac.SoacReduce" node))
 (defn soac-scan? [node] (record-kind? "raster.compiler.ir.soac.SoacScan" node))
-(defn soac-stencil? [node] (record-kind? "raster.compiler.ir.soac.SoacStencil" node))
 (defn scalar-binding? [node] (record-kind? "raster.compiler.ir.soac.ScalarBinding" node))
 (defn screma? [node] (record-kind? "raster.compiler.ir.soac.Screma" node))
 (defn contract? [node] (record-kind? "raster.compiler.ir.soac.SoacContract" node))
@@ -215,7 +199,10 @@
 
 (defn par-form->soac
   "Convert a raster.par/* S-expression to a SOAC record.
-  Returns a SoacMap, SoacReduce, SoacScan, SoacStencil, or nil."
+  Returns a SoacMap, SoacReduce, SoacScan, SoacContract, or nil.
+
+  Stencil source intentionally returns nil: its only compiler algorithm is the validated
+  TypedSOAC stencil equation. The compatibility graph must not reconstruct a second stencil IR."
   [sym expr id & {:keys [dtype]}]
   (cond
     ;; par/contract → SoacContract. Was DECLINED here (:no-lowering-rule) — the one par form that
@@ -315,19 +302,6 @@
                           cast-fn body-expr inputs outputs scalars)
         elem-type (assoc :elem-type elem-type)))
 
-    ;; Stencil: (raster.par/stencil! out [in-arrays] radius boundary cast idx bound body)
-    (par/par-stencil-form? expr)
-    (let [info (par/extract-par-stencil-info expr)
-          {:keys [inputs outputs scalars]}
-          (extract-io (:body info) (:idx info) [(:out info)])
-          elem-type (or (:elem-type info)
-                        (:raster.type/elem-type (meta expr)))]
-      (cond-> (->SoacStencil id sym (:in-arrays info) (:radius info)
-                             (:boundary info) (:cast info)
-                             (:idx info) (:bound info)
-                             (:body info) inputs outputs scalars)
-        elem-type (assoc :elem-type elem-type)))
-
     ;; Imperative par/map-void! with a SINGLE 1:1 in-place write — model as a
     ;; non-pure (in-place) SoacMap whose OUTPUT is the written array and whose
     ;; LAMBDA is the written value. This makes it indistinguishable from a pure
@@ -413,11 +387,6 @@
      SoacScan
      (list 'raster.par/scan (:out soac) (:acc soac) (:init soac)
            (:idx soac) (:bound soac) (:cast-fn soac) (:lambda soac))
-
-     SoacStencil
-     (list 'raster.par/stencil! (first (:outputs soac))
-           (:in-arrays soac) (:radius soac) (:boundary soac)
-           (:cast-fn soac) (:idx soac) (:bound soac) (:lambda soac))
 
      ;; Not a SOAC
      (throw (ex-info "Cannot convert non-SOAC to par form" {:node soac})))
@@ -528,7 +497,7 @@
 ;; ================================================================
 
 (defn soac?
-  "Check if a node is a generic SOAC (map/reduce/scan/stencil) — NOT a ScalarBinding, and NOT a
+  "Check if a node is a generic compatibility SOAC (map/reduce/scan) — NOT a ScalarBinding, and NOT a
    SoacContract (a contraction has its own lowering; generic map/reduce lowering must skip it)."
   [node]
   (and (not (scalar-binding? node))
@@ -552,7 +521,6 @@
       (soac-map? node)     (:outputs node)
       (soac-reduce? node)  (set (filter symbol? (:outputs node)))
       (soac-scan? node)    (:outputs node)
-      (soac-stencil? node) (:outputs node)
       :else nil)))
 
 (defn soac-bound

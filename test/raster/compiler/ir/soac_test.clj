@@ -51,15 +51,12 @@
       (is (= 'n (:bound node)))
       (is (= 'double (:cast-fn node))))))
 
-(deftest par-stencil->soac-test
-  (testing "Convert raster.par/stencil! to SoacStencil"
+(deftest par-stencil-has-no-legacy-soac-record
+  (testing "Stencil semantics live only in the validated TypedSOAC dialect"
     (let [expr '(raster.par/stencil! out [a] 1 :dirichlet double i n
                                      (+ (aget a (- i 1)) (aget a i) (aget a (+ i 1))))
           node (soac/par-form->soac 'out expr 3)]
-      (is (instance? raster.compiler.ir.soac.SoacStencil node))
-      (is (= '[a] (:in-arrays node)))
-      (is (= 1 (:radius node)))
-      (is (= :dirichlet (:boundary node))))))
+      (is (nil? node)))))
 
 (deftest non-par->nil-test
   (testing "Non-par expression returns nil"
