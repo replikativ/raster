@@ -12,24 +12,32 @@
   (:require [clojure.set :as set]
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.execution-plan :as execution-plan]
-            [raster.compiler.ir.link-plan :as link-plan]))
+            [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.scan :as scan]))
 
 (def shard-kinds #{:replicated :partitioned})
 (def shard-ownerships #{:owned :replica})
 (def step-kinds #{:compute :transfer})
+(def collective-kinds #{:all-reduce :all-gather :reduce-scatter :broadcast})
 
 (defrecord DeviceMesh [axes devices])
 (defrecord DeviceResource [id memory-capacity-bytes descriptor attributes])
 (defrecord TopologyLink [id source target kind bandwidth-bytes-s latency-ns attributes])
 (defrecord ClusterTopology [devices links])
 (defrecord ValueShard [id value device offsets shape ownership])
+(defrecord CollectiveGroup [id devices])
+(defrecord CommunicationLeg [source target route bytes attributes])
+(defrecord CollectiveOperation [id kind group value reduction root attributes])
+(defrecord CollectiveSchedule [algorithm rounds numerical-mode attributes])
+(defrecord ScheduledCollective [operation schedule dependencies steps completions])
 (defrecord DistributedStep
            [id kind device source target route value bytes duration-ns dependencies
             peak-memory-bytes attributes])
 (defrecord DistributedPlan
-           [id mesh topology values shards device-plans steps outputs attributes])
+           [id mesh topology values shards collective-groups collectives
+            device-plans steps outputs attributes])
 (defrecord DistributedPlanCertificate
-           [plan-id mesh-shape shard-coverage route-costs cost-vector device-plans])
+           [plan-id mesh-shape shard-coverage collectives route-costs cost-vector device-plans])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
@@ -37,6 +45,11 @@
 (defn topology-link? [value] (instance? TopologyLink value))
 (defn cluster-topology? [value] (instance? ClusterTopology value))
 (defn value-shard? [value] (instance? ValueShard value))
+(defn collective-group? [value] (instance? CollectiveGroup value))
+(defn communication-leg? [value] (instance? CommunicationLeg value))
+(defn collective-operation? [value] (instance? CollectiveOperation value))
+(defn collective-schedule? [value] (instance? CollectiveSchedule value))
+(defn scheduled-collective? [value] (instance? ScheduledCollective value))
 (defn distributed-step? [value] (instance? DistributedStep value))
 (defn distributed-plan? [value] (instance? DistributedPlan value))
 (defn certificate? [value] (instance? DistributedPlanCertificate value))
@@ -181,6 +194,101 @@
     :or {dependencies [] attributes {}}}]
   (->DistributedStep id :transfer nil source target (vec route) value bytes nil
                      (vec dependencies) 0 attributes))
+
+(defn collective-group
+  [id devices]
+  (let [devices (vec devices)]
+    (when (or (nil? id) (< (count devices) 2) (some nil? devices)
+              (not= (count devices) (count (distinct devices))))
+      (fail! "collective group requires an identity and at least two unique devices"
+             :distributed-collective-group {:id id :devices devices}))
+    (->CollectiveGroup id devices)))
+
+(defn communication-leg
+  [{:keys [source target route bytes attributes] :or {attributes {}}}]
+  (when-not (and source target (not= source target)
+                 (vector? route) (seq route)
+                 (integer? bytes) (not (neg? bytes))
+                 (map? attributes))
+    (fail! "communication leg requires distinct endpoints, a route, and non-negative bytes"
+           :distributed-communication-leg
+           {:source source :target target :route route :bytes bytes :attributes attributes}))
+  (->CommunicationLeg source target route bytes attributes))
+
+(defn collective-operation
+  [{:keys [id kind group value reduction root attributes] :or {attributes {}}}]
+  (when (or (nil? id) (not (contains? collective-kinds kind))
+            (nil? group) (nil? value) (not (map? attributes)))
+    (fail! "collective operation requires an identity, kind, group, value, and attributes"
+           :distributed-collective-operation
+           {:id id :kind kind :group group :value value :attributes attributes}))
+  (when (and (contains? #{:all-reduce :reduce-scatter} kind)
+             (not (scan/associative-scan? reduction)))
+    (fail! "reducing collective requires a certified associative reduction"
+           :distributed-collective-reduction {:id id :kind kind :reduction reduction}))
+  (when (and (not (contains? #{:all-reduce :reduce-scatter} kind)) reduction)
+    (fail! "non-reducing collective cannot carry a reduction contract"
+           :distributed-collective-reduction {:id id :kind kind :reduction reduction}))
+  (when (and (= :broadcast kind) (nil? root))
+    (fail! "broadcast collective requires a root device"
+           :distributed-collective-root {:id id}))
+  (when (and (not= :broadcast kind) root)
+    (fail! "only broadcast collectives may carry a root device"
+           :distributed-collective-root {:id id :kind kind :root root}))
+  (->CollectiveOperation id kind group value reduction root attributes))
+
+(defn collective-schedule
+  [{:keys [algorithm rounds numerical-mode attributes]
+    :or {numerical-mode {} attributes {}}}]
+  (let [rounds (mapv (fn [round] (mapv #(if (communication-leg? %)
+                                          % (communication-leg %)) round)) rounds)]
+    (when-not (and (keyword? algorithm) (seq rounds) (every? seq rounds)
+                   (map? numerical-mode) (map? attributes))
+      (fail! "collective schedule requires an algorithm and non-empty communication rounds"
+             :distributed-collective-schedule
+             {:algorithm algorithm :rounds rounds :numerical-mode numerical-mode
+              :attributes attributes}))
+    (doseq [[round-index round] (map-indexed vector rounds)]
+      (let [link-ids (mapcat :route round)]
+        (when-not (= (count link-ids) (count (distinct link-ids)))
+          (fail! "parallel collective legs cannot claim the same directed link"
+                 :distributed-collective-round-link-conflict
+                 {:round round-index :links (vec link-ids)}))))
+    (->CollectiveSchedule algorithm rounds numerical-mode attributes)))
+
+(defn schedule-collective
+  "Expand a semantic collective's communication schedule to topology-routed transfer steps.
+
+   Each round is a barrier: its legs may overlap, and the next round waits for all of them. The
+   semantic CollectiveOperation is retained beside these cost/execution steps."
+  [operation schedule dependencies]
+  (let [operation (if (collective-operation? operation) operation
+                      (collective-operation operation))
+        schedule (if (collective-schedule? schedule) schedule
+                     (collective-schedule schedule))
+        dependencies (vec dependencies)
+        {:keys [steps completions]}
+        (reduce
+         (fn [{:keys [steps completions]} [round-index legs]]
+           (let [waits (if (zero? round-index) dependencies completions)
+                 round-steps
+                 (mapv (fn [leg-index leg]
+                         (transfer-step
+                          {:id [(:id operation) :round round-index :leg leg-index]
+                           :source (:source leg) :target (:target leg)
+                           :route (:route leg) :value (:value operation) :bytes (:bytes leg)
+                           :dependencies waits
+                           :attributes (merge (:attributes leg)
+                                              {:collective (:id operation)
+                                               :collective-kind (:kind operation)
+                                               :algorithm (:algorithm schedule)
+                                               :round round-index :leg leg-index})}))
+                       (range) legs)]
+             {:steps (into steps round-steps)
+              :completions (mapv :id round-steps)}))
+         {:steps [] :completions []}
+         (map-indexed vector (:rounds schedule)))]
+    (->ScheduledCollective operation schedule dependencies steps completions)))
 
 (defn- concrete-shape!
   [value-id value]
@@ -349,6 +457,90 @@
         serialization (* (/ (double (:bytes transfer)) bottleneck) 1.0e9)]
     (long (Math/ceil (+ latency serialization)))))
 
+(defn- validate-collectives!
+  [mesh topology values groups collectives steps]
+  (when-not (and (map? groups) (every? collective-group? (vals groups))
+                 (every? (fn [[id group]] (= id (:id group))) groups))
+    (fail! "collective groups must map their identities to CollectiveGroup values"
+           :distributed-collective-groups {:groups groups}))
+  (doseq [[group-id group] groups]
+    (when-not (set/subset? (set (:devices group)) (set (:devices mesh)))
+      (fail! "collective group contains a device outside the mesh"
+             :distributed-collective-group-device
+             {:group group-id :devices (:devices group) :mesh (:devices mesh)})))
+  (when-not (and (vector? collectives) (every? scheduled-collective? collectives))
+    (fail! "distributed collectives must be an ordered vector of ScheduledCollective values"
+           :distributed-collectives {:collectives collectives}))
+  (unique-by! "distributed collectives" :distributed-collective-identities
+              (comp :id :operation) collectives)
+  (let [step-by-id (into {} (map (juxt :id identity)) steps)]
+    (doseq [{:keys [operation schedule dependencies steps completions] :as scheduled} collectives]
+      (let [{:keys [id kind group value reduction root]} operation
+            group-value (get groups group)
+            abstract (get values value)
+            devices (set (:devices group-value))
+            sharding (:sharding abstract)
+            sharding-devices (set (or (:devices sharding) (:devices mesh)))
+            expected (schedule-collective operation schedule dependencies)]
+        (when-not group-value
+          (fail! "collective names an undeclared group"
+                 :distributed-collective-group-reference {:collective id :group group}))
+        (when-not abstract
+          (fail! "collective names an undeclared AbstractValue"
+                 :distributed-collective-value {:collective id :value value}))
+        (when-not (= devices sharding-devices)
+          (fail! "collective group and value sharding devices disagree"
+                 :distributed-collective-sharding-group
+                 {:collective id :group devices :sharding sharding-devices}))
+        (if (contains? #{:all-reduce :all-gather :broadcast} kind)
+          (when-not (= :replicated (:kind sharding))
+            (fail! "collective output requires replicated sharding"
+                   :distributed-collective-output-sharding
+                   {:collective id :kind kind :sharding sharding}))
+
+          (when-not (= :partitioned (:kind sharding))
+            (fail! "reduce-scatter output requires partitioned sharding"
+                   :distributed-collective-output-sharding
+                   {:collective id :kind kind :sharding sharding})))
+        (when (and reduction (not= (:dtype reduction) (:dtype abstract)))
+          (fail! "collective reduction dtype differs from its AbstractValue"
+                 :distributed-collective-dtype
+                 {:collective id :reduction (:dtype reduction) :value (:dtype abstract)}))
+        (when (and (= :broadcast kind) (not (contains? devices root)))
+          (fail! "broadcast root must belong to its collective group"
+                 :distributed-collective-root {:collective id :root root :devices devices}))
+        (let [participants (set (mapcat (juxt :source :target)
+                                        (mapcat identity (:rounds schedule))))]
+          (when-not (= devices participants)
+            (fail! "collective schedule does not involve every group member"
+                   :distributed-collective-participation
+                   {:collective id :expected devices :actual participants})))
+        (doseq [leg (mapcat identity (:rounds schedule))]
+          (when-not (and (contains? devices (:source leg))
+                         (contains? devices (:target leg)))
+            (fail! "collective communication leg leaves its group"
+                   :distributed-collective-leg-group
+                   {:collective id :leg leg :devices devices}))
+          (transfer-duration-ns topology
+                                (transfer-step {:id [:collective-validation id]
+                                                :source (:source leg) :target (:target leg)
+                                                :route (:route leg) :value value
+                                                :bytes (:bytes leg)})))
+        (when-not (= expected scheduled)
+          (fail! "scheduled collective does not match its semantic operation and rounds"
+                 :distributed-collective-lowering
+                 {:collective id :expected expected :actual scheduled}))
+        (doseq [step steps]
+          (when-not (= step (get step-by-id (:id step)))
+            (fail! "collective expansion step is absent or differs from the distributed DAG"
+                   :distributed-collective-step
+                   {:collective id :step (:id step)})))
+        (when-not (= completions (:completions expected))
+          (fail! "collective completions differ from its final communication round"
+                 :distributed-collective-completions
+                 {:collective id :completions completions})))))
+  collectives)
+
 (defn- validate-device-plans!
   [mesh device-plans]
   (when-not (map? device-plans)
@@ -454,7 +646,8 @@
   (when-not (distributed-plan? plan)
     (fail! "expected a DistributedPlan value"
            :distributed-plan-type {:actual (type plan)}))
-  (let [{:keys [id mesh topology values shards device-plans steps outputs attributes]} plan]
+  (let [{:keys [id mesh topology values shards collective-groups collectives
+                device-plans steps outputs attributes]} plan]
     (when (nil? id)
       (fail! "distributed plan requires a stable identity" :distributed-plan-id {}))
     (when-not (device-mesh? mesh)
@@ -478,6 +671,7 @@
       (fail! "distributed shard mappings must be a map"
              :distributed-shards {:shards shards}))
     (validate-value-shards! mesh topology values shards)
+    (validate-collectives! mesh topology values collective-groups collectives steps)
     (validate-device-plans! mesh device-plans)
     (validate-steps! mesh topology values steps outputs)
     (when-not (map? attributes)
@@ -486,10 +680,12 @@
   plan)
 
 (defn plan
-  [{:keys [id mesh topology values shards device-plans steps outputs attributes]
-    :or {values {} shards {} device-plans {} steps [] outputs [] attributes {}}}]
+  [{:keys [id mesh topology values shards collective-groups collectives
+           device-plans steps outputs attributes]
+    :or {values {} shards {} collective-groups {} collectives []
+         device-plans {} steps [] outputs [] attributes {}}}]
   (validate!
-   (->DistributedPlan id mesh topology values shards device-plans
+   (->DistributedPlan id mesh topology values shards collective-groups collectives device-plans
                       (vec steps) (vec outputs) attributes)))
 
 (defn simulate
@@ -593,6 +789,11 @@
      (:id plan)
      (mapv (juxt :name :size) (get-in plan [:mesh :axes]))
      (shard-coverage plan)
+     (mapv (fn [{:keys [operation schedule steps completions]}]
+             {:id (:id operation) :kind (:kind operation) :group (:group operation)
+              :value (:value operation) :algorithm (:algorithm schedule)
+              :steps (mapv :id steps) :completions completions})
+           (:collectives plan))
      (route-costs plan)
      (:cost-vector simulation)
      (into {}

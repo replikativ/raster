@@ -914,7 +914,16 @@ the two resource classes to overlap, and reports makespan, per-device peak memor
 total transferred bytes. The re-derived certificate contains those costs and shard/route witnesses.
 This is deliberately a planning model: measured costs may replace analytic durations, and Datahike
 may retain its immutable plan/measurement history, but driver buffers, communicators, and events do
-not enter the IR. Collective agreement and halo regions are the next semantic extension.
+not enter the IR. Collective agreement is described below; halo regions are the next extension.
+
+Collective agreement is now an explicit extension of the same plan. `all-reduce`, `all-gather`,
+`reduce-scatter`, and `broadcast` retain their semantic kind, group, value, and root/reduction
+contracts; reducing collectives require the existing certified associative algebra rather than an
+operator name guessed by a communicator backend. A separate `CollectiveSchedule` selects an
+algorithm and ordered communication rounds. Each round expands mechanically to routed transfer
+steps, parallel legs cannot claim the same directed link, and the certificate retains both the
+semantic operation and its schedule. This makes ring/tree/native implementations replaceable while
+the dependency DAG and topology simulator account for their actual bytes and routes.
 
 The first distributed target should be data-parallel training with explicit gradient all-reduce,
 followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
