@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -86,6 +87,7 @@
     (is (= '[u-next] (mapv :id (:outputs graph))))
     (let [emitted (opencl/generate-kernel-graph
                    graph :scalar-types {'alpha-in :float 'iteration :long})]
+      (is (emitted-loop/emitted-loop? (emitted-loop/make scheduled emitted)))
       (is (every? artifact/kernel-artifact? (map :operation (:nodes emitted))))
       (is (= '[u-in u-next alpha-in iteration n-in] (:arguments emitted)))
       (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
@@ -119,16 +121,16 @@
                                     :scheduled-operation :grid :block-size]
                                    128)]
             (is (thrown-with-msg?
-                 clojure.lang.ExceptionInfo #"operation certificates differ"
+                 clojure.lang.ExceptionInfo #"operation certificate"
                  (loop-call/validate! (assoc call :graph tampered))))))
         (testing "target emission cannot change buffers or graph effects"
           (is (thrown-with-msg?
-               clojure.lang.ExceptionInfo #"dataflow or operation certificates differ"
+               clojure.lang.ExceptionInfo #"scheduled loop dataflow"
                (loop-call/validate!
                 (assoc call :graph
                        (assoc-in emitted [:inputs 0 :elements] 'different-extent)))))
           (is (thrown-with-msg?
-               clojure.lang.ExceptionInfo #"dataflow or operation certificates differ"
+               clojure.lang.ExceptionInfo #"scheduled loop dataflow"
                (loop-call/validate!
                 (assoc call :graph (assoc emitted :effects {:semantic #{:io}}))))))))))
 
