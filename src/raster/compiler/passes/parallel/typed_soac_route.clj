@@ -434,6 +434,30 @@
                          (= (:operands equation) (:inputs (dialect/facts algorithm)))
                          (= (:results equation) (dialect/outputs algorithm))))})))
 
+(defn program-envelope
+  "Wrap an already constructed TypedSOAC program in the same ParallelProgram boundary used by
+   the analyzed-source production route.
+
+   This source-free entry is for compiler-generated algorithms such as structured-control bodies.
+   Each equation keeps its closed TypedSOAC subprogram and stable value/equation facts; no host
+   expression is reconstructed merely to enter scheduling."
+  [typed-program]
+  (let [typed-program (dialect/validate! typed-program)
+        realized (into {}
+                       (map (fn [equation]
+                              (let [equation-id (second equation)]
+                                [equation-id {:site [:algorithm equation-id] :source nil}])))
+                       (dialect/equations typed-program))]
+    (-> (envelope typed-program nil realized)
+        (assoc :attributes (assoc (:attributes (dialect/facts typed-program))
+                                  :host-control :explicit-typed-algorithm))
+        (parallel-program/validate!
+         equation-operation?
+         (fn [equation algorithm]
+           (and (= algorithm (dialect/validate! algorithm))
+                (= (:operands equation) (:inputs (dialect/facts algorithm)))
+                (= (:results equation) (dialect/outputs algorithm))))))))
+
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
    the form is outside this closed subset."
@@ -446,29 +470,29 @@
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form)]
        (try
-        (when-let [typed-input (frontend/form->program
-                                form {:dtype dtype :array-types array-types
-                                      :scalar-types scalar-types :values values})]
-         (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
-               [typed-result resident-stats]
-               (if resident-reductions?
-                 (resident/realize typed-result)
-                 [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :scatter :stencil :reduce
-                                       :segmented-reduce :product-reduce
-                                       :segmented-fold-map :scan}
-                                     (:kind (fusion/equation-info %)))
-                         (dialect/equations typed-result))
-             {:declined {:reason :no-certified-parallel-equation
-                         :stats (merge typed-stats resident-stats)}}
-             (let [{:keys [source realized]} (realize-source form typed-result)]
-               {:program (envelope typed-result source realized)
-                :stats (merge typed-stats resident-stats
-                              {:route :typed-soac :typed-validated true
-                               :front-end :analyzed-source})}))))
-        (catch clojure.lang.ExceptionInfo exception
-          (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
-            (throw exception))
-          {:declined {:reason (or (:reason (ex-data exception)) :typed-soac-route-declined)
-                      :message (.getMessage exception)
-                      :details (ex-data exception)}}))))))
+         (when-let [typed-input (frontend/form->program
+                                 form {:dtype dtype :array-types array-types
+                                       :scalar-types scalar-types :values values})]
+           (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
+                 [typed-result resident-stats]
+                 (if resident-reductions?
+                   (resident/realize typed-result)
+                   [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+             (if (not-any? #(contains? #{:map :scatter :stencil :reduce
+                                         :segmented-reduce :product-reduce
+                                         :segmented-fold-map :scan}
+                                       (:kind (fusion/equation-info %)))
+                           (dialect/equations typed-result))
+               {:declined {:reason :no-certified-parallel-equation
+                           :stats (merge typed-stats resident-stats)}}
+               (let [{:keys [source realized]} (realize-source form typed-result)]
+                 {:program (envelope typed-result source realized)
+                  :stats (merge typed-stats resident-stats
+                                {:route :typed-soac :typed-validated true
+                                 :front-end :analyzed-source})}))))
+         (catch clojure.lang.ExceptionInfo exception
+           (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
+             (throw exception))
+           {:declined {:reason (or (:reason (ex-data exception)) :typed-soac-route-declined)
+                       :message (.getMessage exception)
+                       :details (ex-data exception)}}))))))
