@@ -261,6 +261,27 @@
 (defn- operation-description
   [id symbol expression default-dtype]
   (cond
+    ;; A flat gather is semantically an ordinary dense map with one pointwise index input and one
+    ;; stable, indirectly-read data input.  Keep it in that small functional vocabulary; the JVM
+    ;; scheduler may later select hardware vgather from the typed scalar region, while GPU targets
+    ;; consume the same SegMap.  The strided spelling needs a two-dimensional iteration space (or
+    ;; an explicitly hoisted product extent), so it remains outside this first exact migration.
+    (par/par-gather-form? expression)
+    (let [{:keys [out src index n stride]} (par/extract-par-gather-info expression)]
+      (when-not stride
+        (let [idx (clojure.core/symbol (str "gather_i__" id))
+              body (list 'clojure.core/aget src
+                         (list 'clojure.core/aget index idx))
+              elem-type (dtype/canon default-dtype)
+              io (extract-io body idx [out])]
+          (merge {:kind :map :id id :sym symbol :results [symbol]
+                  :index idx :extent n :locals [] :casts [nil] :bodies [body]
+                  :result-storage [{:destination out :access :write
+                                    :host-return :buffer}]
+                  :host-binding symbol :elem-type elem-type
+                  :source-operation :raster.par/gather}
+                 io))))
+
     (par/par-map-pure-form? expression)
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
           elem-type (dtype/canon (or elem-type

@@ -874,13 +874,19 @@
                                 (list 'recur (list 'clojure.core/unchecked-inc-int j-sym)))
                           out-sym)))))))
 
+(declare compile-indexed-gather-segmap)
+
 (defn compile-segmap
   "Compile a scheduled SegMap. Pointwise maps vectorize across their mapped dimension; maps with
-  explicit scalar Fold terms keep the outer map scalar and SIMD-schedule each inner fold."
+  explicit scalar Fold terms keep the outer map scalar and SIMD-schedule each inner fold. Stable
+  indirect reads select hardware vgather from this scheduled scalar region rather than from a raw
+  raster.par source form."
   [segmap out-sym cast & {:keys [store-offset]}]
   (if (seq (scalar-folds (:lambda segmap)))
     (compile-fold-map-scalar-loop segmap out-sym cast store-offset)
-    (compile-vector-segmap segmap out-sym cast :store-offset store-offset)))
+    (or (when-not store-offset
+          (compile-indexed-gather-segmap segmap out-sym cast))
+        (compile-vector-segmap segmap out-sym cast :store-offset store-offset))))
 
 ;; ================================================================
 ;; par/gather → SIMD hardware vgather
@@ -920,6 +926,37 @@
                                                       (list 'clojure.core/aget index j-sym)))
                                           (list 'recur (list 'inc j-sym)))
                                     out))))))))
+
+(defn- exact-indexed-gather
+  "Return [source index-map] for the canonical typed scalar region
+  `source[index-map[i]]`.  Casts around the result are already represented by SegMap's result
+  dtype/store cast and are deliberately not guessed here."
+  [expression index]
+  (when (and (seq? expression)
+             (descriptor/aget-call? expression))
+    (let [[source source-index] (descriptor/call-args expression)]
+      (when (and (symbol? source)
+                 (seq? source-index)
+                 (descriptor/aget-call? source-index)
+                 (= 2 (count (descriptor/call-args source-index))))
+        (let [[index-map map-index] (descriptor/call-args source-index)]
+          (when (and (symbol? index-map)
+                     (= index (descriptor/unwrap-int-cast map-index)))
+            [source index-map]))))))
+
+(defn compile-indexed-gather-segmap
+  "Select the JVM hardware-vgather schedule from a typed SegMap's exact scalar region.
+
+  This is a schedule recognizer over verified compiler IR, not a second source-language route.
+  Repeated source indices are legal because every destination coordinate is written exactly once."
+  [segmap out-sym cast]
+  (let [body (-> (:lambda segmap) clean-dead-bindings bc/desugar-invk)
+        index (seg-idx segmap)]
+    (when-let [[source index-map] (exact-indexed-gather body index)]
+      (compile-par-gather out-sym source index-map (seg-bound segmap)
+                          (or (:dtype segmap)
+                              (when (= cast 'float) :float)
+                              :double)))))
 
 ;; ================================================================
 ;; SegRed → SIMD (multi-accumulator)
