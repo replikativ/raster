@@ -2,6 +2,14 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
+(deftest allocation-initialization-contracts
+  (is (= :zero (descriptor/allocation-initialization 'double-array)))
+  (is (= :zero (descriptor/allocation-initialization 'raster.arrays/zeros-like_m_double)))
+  (is (= :unspecified (descriptor/allocation-initialization 'similar_m_double)))
+  (is (= :copy (descriptor/allocation-initialization 'clojure.core/aclone)))
+  (is (descriptor/copy-allocation-op? 'aclone_m_double))
+  (is (nil? (descriptor/allocation-initialization 'example/not-an-allocation))))
+
 (deftest descriptor-facets-merge-directly-test
   (testing "buffer, device, and shape registrations converge on one descriptor"
     (descriptor/register-buffer-semantics! 'test.descriptor/op

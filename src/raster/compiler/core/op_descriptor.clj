@@ -381,26 +381,46 @@
     (merge base
            (into {} (map (fn [[k v]] [(symbol "clojure.core" (name k)) v]) base)))))
 
-(def ^:private known-allocator-base-names
-  "Base names (before _m_ mangling) of deftm functions that are pure allocators.
-   Includes aclone — the hoister fills via arraycopy instead of zero-fill."
-  #{"zeros-like" "alloc-like" "similar" "aclone"})
+(def ^:private known-allocator-initializations
+  "Base names (before _m_ mangling) of deftm functions that are pure allocators."
+  {"zeros-like" :zero, "alloc-like" :unspecified, "similar" :unspecified, "aclone" :copy})
+
+(defn- allocator-base-name
+  [sym]
+  (when (symbol? sym)
+    (let [n (name sym)]
+      (if-let [idx (clojure.string/index-of n "_m_")]
+        (subs n 0 idx)
+        n))))
+
+(defn allocation-initialization
+  "Return the semantic initialization contract of an allocation operation.
+
+   `:copy` means the first source-shaped argument must be copied, `:zero` means the language
+   guarantees zero initialization, and `:unspecified` means callers may leave the fresh storage
+   uninitialized. nil means the operation is not a recognized allocator. This classification lives
+   beside `alloc-op?` so invocation planning and host hoisting cannot drift."
+  [sym]
+  (let [base (allocator-base-name sym)]
+    (or
+     (get known-allocator-initializations base)
+     (cond
+      (or (contains? alloc-ops sym)
+          (contains? alloc-sym->array-tag sym)
+          (contains? alloc-sym->array-tag (some-> base symbol))) :zero
+      :else nil))))
 
 (defn alloc-op?
   "True if sym is an array allocation operation.
    Recognizes standard constructors (double-array etc.) and deftm allocators
    (zeros-like, aclone) including their mangled variants."
   [sym]
-  (and (symbol? sym)
-       (let [n (name sym)]
-         (or (contains? alloc-ops sym)
-             (contains? alloc-sym->array-tag sym)
-             (contains? alloc-sym->array-tag (symbol n))
-             ;; Check base name for known deftm allocators
-             (let [base (if-let [idx (clojure.string/index-of n "_m_")]
-                          (subs n 0 idx)
-                          n)]
-               (contains? known-allocator-base-names base))))))
+  (boolean (allocation-initialization sym)))
+
+(defn copy-allocation-op?
+  "Whether `sym` allocates fresh storage initialized by copying a source value."
+  [sym]
+  (= :copy (allocation-initialization sym)))
 
 ;; --- Primitive casts ---
 

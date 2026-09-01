@@ -7,6 +7,7 @@
    ScheduledStructuredLoop; it does not reconstruct or recognize a source-shaped compound loop."
   (:require [clojure.set :as set]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -175,7 +176,8 @@
    When a suffix is itself in the TypedSOAC subset, its uses of the physical carried array are
    alpha-remapped to the loop's fresh logical output and appended as ordinary typed equations."
   ([decomposition] (program-envelope decomposition {}))
-  ([{:keys [loop source loop-binding] :as decomposition} options]
+  ([{:keys [loop source loop-binding prefix-bindings parameter-values outer-values]
+     :as decomposition} options]
    (when-not (and (map? decomposition) loop)
      (throw (ex-info "structured-control routing requires a certified frontend decomposition"
                      {:reason :structured-control-decomposition
@@ -190,21 +192,40 @@
          values (merge-values (control/outer-values loop) (:values suffix-envelope))
          program-outputs (or (:outputs suffix-envelope) (control/outer-results loop))
          {:keys [inputs outputs]} (program-boundary equations program-outputs)
-         effects (reduce set/union #{} (map :effects equations))]
-     (program/make
-      {:dialect :typed-parallel
-       :source source
-       :values values
-       :inputs inputs
-       :equations equations
-       :outputs outputs
-       :effects effects
-       :provenance {:source-dialect :typed-structured-control
-                    :pass :structured-control-route}
-       :attributes {:host-control :typed-structured-control
-                    :mixed-algorithms (boolean suffix)}
-       :operation? typed-operation?
-       :algorithm? typed-algorithm-boundary?}))))
+         effects (reduce set/union #{} (map :effects equations))
+         parallel-program
+         (program/make
+          {:dialect :typed-parallel
+           :source source
+           :values values
+           :inputs inputs
+           :equations equations
+           :outputs outputs
+           :effects effects
+           :provenance {:source-dialect :typed-structured-control
+                        :pass :structured-control-route}
+           :attributes {:host-control :typed-structured-control
+                        :mixed-algorithms (boolean suffix)}
+           :operation? typed-operation?
+           :algorithm? typed-algorithm-boundary?})
+         public-parameters (or (:public-parameters options) (:active-params options))]
+     (if (seq public-parameters)
+       (let [plan (invocation/from-prefix
+                   {:id [:program-invocation (:id (control/facts loop))]
+                    :parameters public-parameters
+                    :parameter-values parameter-values
+                    :bindings prefix-bindings
+                    :binding-values outer-values
+                    :program-values values
+                    :program-inputs inputs
+                    :program-outputs outputs
+                    :attributes {:source-dialect :closed-clojure
+                                 :target-dialect :typed-invocation}})]
+         (-> parallel-program
+             (assoc-in [:attributes :invocation-plan]
+                       (invocation/validate-against! plan parallel-program))
+             validate-typed-program!))
+       parallel-program))))
 
 (defn attempt
   "Attempt the complete structured-control semantic route.
