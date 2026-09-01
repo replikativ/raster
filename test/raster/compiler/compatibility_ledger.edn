@@ -32,10 +32,10 @@
 
   :gqa-causal-mha-gpu
   {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
-           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 2}}
+           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 1}}
    :fusion {:vertical 0 :horizontal 2 :iterations 2 :placements 0}
-   :lowering {:segops 5 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
-              :backend-reused 3 :backend-relowered 0 :fallback 0}
+   :lowering {:segops 6 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 4 :backend-relowered 0 :fallback 0}
    :emission {:kernel-count 7 :targets [:opencl-c] :strategies []
               :fallback-reasons [] :declines {}}}
 

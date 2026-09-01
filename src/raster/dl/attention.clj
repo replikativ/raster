@@ -1091,25 +1091,26 @@
        (let [slab (* seq-len head-dim)
              ss (* seq-len seq-len)
              S (alloc-like Q (* batch ss))
-             W (alloc-like Q (* batch ss))]
-         ;; kernel 1: raw scaled causal scores S[b,i,j] (0 above the diagonal)
-         (raster.par/map-void! t (clojure.core/* batch ss)
-                               (let [b (quot t ss)
-                                     r (rem t ss)
-                                     i (quot r seq-len)
-                                     j (rem r seq-len)
-                                     boff (clojure.core/* b slab)]
-                                 (if (<= j i)
-                                   (let [qrow (clojure.core/+ boff (clojure.core/* i head-dim))
-                                         krow (clojure.core/+ boff (clojure.core/* j head-dim))
-                                         dot (loop [d 0 acc 0.0]
-                                               (if (< d head-dim)
-                                                 (recur (inc d)
-                                                        (+ acc (* (aget Q (clojure.core/+ qrow d))
-                                                                  (aget K (clojure.core/+ krow d)))))
-                                                 acc))]
-                                     (aset S t (/ dot (n/oftype dot (n/sqrt (double head-dim))))))
-                                   (aset S t 0.0))))
+             W (alloc-like Q (* batch ss))
+             ;; kernel 1: raw scaled causal scores S[b,i,j] (0 above the diagonal)
+             scores
+             (raster.par/map! S t (clojure.core/* batch ss) nil
+                              (let [b (quot t ss)
+                                    r (rem t ss)
+                                    i (quot r seq-len)
+                                    j (rem r seq-len)
+                                    boff (clojure.core/* b slab)]
+                                (if (<= j i)
+                                  (let [qrow (clojure.core/+ boff (clojure.core/* i head-dim))
+                                        krow (clojure.core/+ boff (clojure.core/* j head-dim))
+                                        dot (loop [d 0 acc 0.0]
+                                              (if (< d head-dim)
+                                                (recur (inc d)
+                                                       (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                 (aget K (clojure.core/+ krow d)))))
+                                                acc))]
+                                    (/ dot (n/oftype dot (n/sqrt (double head-dim)))))
+                                  0.0)))]
          ;; kernel 2: per query row — mx/Z over the ≤i scores, write normalized weights
          (raster.par/map-void! bi (clojure.core/* batch seq-len)
                                (let [b (quot bi seq-len)
@@ -1117,18 +1118,18 @@
                                      roff (clojure.core/+ (clojure.core/* b ss) (clojure.core/* i seq-len))
                                      mx (loop [j 0 mm -1.0e38]
                                           (if (<= j i)
-                                            (recur (inc j) (n/max mm (aget S (clojure.core/+ roff j))))
+                                            (recur (inc j) (n/max mm (aget scores (clojure.core/+ roff j))))
                                             mm))
                                      sum (loop [j 0 s 0.0]
                                            (if (<= j i)
-                                             (recur (inc j) (+ s (m/exp (- (aget S (clojure.core/+ roff j)) mx))))
+                                             (recur (inc j) (+ s (m/exp (- (aget scores (clojure.core/+ roff j)) mx))))
                                              s))
                                      inv (/ 1.0 sum)]
                                  (loop [j 0]
                                    (if (< j seq-len)
                                      (do (if (<= j i)
                                            (aset W (clojure.core/+ roff j)
-                                                 (* (m/exp (- (aget S (clojure.core/+ roff j)) mx)) inv))
+                                                 (* (m/exp (- (aget scores (clojure.core/+ roff j)) mx)) inv))
                                            (aset W (clojure.core/+ roff j) 0.0))
                                          (recur (inc j)))
                                      nil))))
