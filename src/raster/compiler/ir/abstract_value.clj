@@ -4,7 +4,8 @@
    An AbstractValue describes program semantics: logical element type and shape, representation,
    placement and sharding constraints. It deliberately contains no BufferView or backend handle.
    Physical realization is a later concern; one logical value may become one dense buffer or an
-   ordered tree of packed/scale/index buffers without teaching the allocator its numeric format.")
+   ordered tree of packed/scale/index buffers without teaching the allocator its numeric format."
+  (:require [raster.compiler.core.dtype :as dtype]))
 
 (def value-kinds #{:tensor :record :opaque})
 
@@ -79,3 +80,22 @@
    as `{:kind :quantized :scheme :q4-k}` without prescribing its physical buffer leaves."
   [opts]
   (make (assoc opts :kind :tensor)))
+
+(def ^:private storage-contract-facets
+  [:kind :dtype :logical-layout :representation])
+
+(defn storage-contract
+  "Return the logical facets that must agree before two values can share raw element storage.
+
+   Shape is excluded because relational analyses may prove symbolic dimensions equivalent;
+   placement, ownership, and effects describe where/how a value is used rather than its element
+   representation. Keyword dtypes are canonicalized through the compiler's single dtype table."
+  [value]
+  (validate! value)
+  (cond-> (select-keys value storage-contract-facets)
+    (keyword? (:dtype value)) (update :dtype dtype/canon)))
+
+(defn storage-contract-compatible?
+  "Whether two validated AbstractValues have the same logical raw-storage contract."
+  [left right]
+  (= (storage-contract left) (storage-contract right)))
