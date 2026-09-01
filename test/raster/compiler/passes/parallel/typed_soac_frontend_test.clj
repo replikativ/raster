@@ -42,9 +42,9 @@
 
 (deftest compound-parallel-extents-become-typed-scalar-ssa
   (let [source '(let* [step (raster.par/map! target i
-                                              (clojure.core/* nrows width)
-                                              float (clojure.core/aget x i))]
-                        step)
+                                             (clojure.core/* nrows width)
+                                             float (clojure.core/aget x i))]
+                      step)
         normalized (frontend/normalize-source source)
         program (frontend/form->program
                  normalized
@@ -65,8 +65,8 @@
   (let [program
         (frontend/form->program
          '(let* [total (raster.par/reduce acc 0.0 i
-                                           (clojure.core/alength x)
-                                           (+ acc (clojure.core/aget x i)))]
+                                          (clojure.core/alength x)
+                                          (+ acc (clojure.core/aget x i)))]
                 total)
          {:dtype :double
           :values {'x (av/tensor {:dtype :double :shape ['n]})}
@@ -102,9 +102,9 @@
   (let [program
         (frontend/form->program
          '(let* [step (raster.par/map-void! i n
-                                             (if (< i limit)
-                                               (clojure.core/aset
-                                                out i (clojure.core/aget src i))))]
+                                            (if (< i limit)
+                                              (clojure.core/aset
+                                               out i (clojure.core/aget src i))))]
                 step)
          {:dtype :float
           :array-types {'src :float 'out :float}
@@ -219,8 +219,8 @@
 (deftest contraction-enters-as-a-general-typed-segmented-reduction
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
-                       (* (clojure.core/aget A (+ (* i k) l))
-                          (clojure.core/aget B (+ (* l n) j))))]
+                                          (* (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
                step)
         options {:dtype :float
                  :array-types {'A :float 'B :float 'C :float}
@@ -367,10 +367,10 @@
     (is (= :typed-soac (:algorithm-dialect stencil)))
     (testing "the verifier rejects in-place neighborhood updates before scheduling"
       (let [aliased (list 'let* ['result
-                                  '(raster.par/stencil!
-                                    u [u] 1 :dirichlet double i n
-                                    (+ (clojure.core/aget u (clojure.core/- i 1))
-                                       (clojure.core/aget u (clojure.core/+ i 1))))]
+                                 '(raster.par/stencil!
+                                   u [u] 1 :dirichlet double i n
+                                   (+ (clojure.core/aget u (clojure.core/- i 1))
+                                      (clojure.core/aget u (clojure.core/+ i 1))))]
                           'result)]
         (try
           (frontend/form->program
@@ -391,8 +391,8 @@
                             (apply list
                                    (concat
                                     '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
-                                      (* (clojure.core/aget A (+ (* i 128) l))
-                                         (clojure.core/aget B (+ (* l 128) j))))
+                                                          (* (clojure.core/aget A (+ (* i 128) l))
+                                                             (clojure.core/aget B (+ (* l 128) j))))
                                     [:epilogue transform]))]
                      'step)
         program (frontend/form->program
@@ -427,8 +427,8 @@
         contract (apply list
                         (concat
                          '(raster.par/contract C [[i 8] [j 8]] [[l 8]]
-                           (* (clojure.core/aget A (+ (* i 8) l))
-                              (clojure.core/aget B (+ (* l 8) j))))
+                                               (* (clojure.core/aget A (+ (* i 8) l))
+                                                  (clojure.core/aget B (+ (* l 8) j))))
                          [:epilogue transform]))]
     (try
       (frontend/form->program
@@ -477,6 +477,18 @@
         (is (= #{:memory/write} (:effects facts)))
         (is (= [] (dialect/outputs program))
             "the host nil result is not mislabeled as a tensor result")))))
+
+(deftest returned-write-destination-projects-to-its-logical-result
+  (let [program
+        (frontend/form->program
+         '(let* [effect (raster.par/map! out i n float
+                                         (+ (clojure.core/aget x i) 1.0))]
+                out)
+         {:dtype :float :array-types {'x :float 'out :float}})
+        equation (first (dialect/equations program))]
+    (is (= ['out] (dialect/physical-results program equation)))
+    (is (= (vec (nth equation 2)) (dialect/outputs program))
+        "a returned destination denotes the fresh logical result, not an undeclared buffer")))
 
 (deftest typed-shared-locals-become-one-region-ssa-spine
   (let [expression

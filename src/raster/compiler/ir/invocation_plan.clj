@@ -2,10 +2,11 @@
   "Typed semantic boundary from public function arguments to an internal ParallelProgram.
 
    ParallelProgram inputs are compiler SSA values: they may include shape projections, narrowed
-   scalars, cloned state, and fresh scratch. InvocationPlan retains how ordered public parameters
-   produce those values without asking a runtime to inspect the original function body or infer
-   storage roles from names. Physical allocation, views, ownership, and transfers remain the job of
-   ResidentPlan/LinkPlan lowering."
+   scalars, cloned state, and fresh scratch. `storage-bindings` separately retain caller-owned
+   write-only destinations, which are physical result storage rather than numerical operands.
+   InvocationPlan records how ordered public parameters produce both boundaries without asking a
+   runtime to inspect the original function body or infer storage roles from names. Physical
+   allocation, views, ownership, and transfers remain the job of LinkPlan lowering."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -20,7 +21,8 @@
 (defrecord BufferClone [id symbol operands source value])
 (defrecord ValueAlias [id symbol operands source value])
 (defrecord InvocationPlan
-           [id parameters steps bindings program-inputs program-outputs values attributes])
+           [id parameters steps bindings storage-bindings
+            program-inputs program-outputs values attributes])
 
 (defn- record-kind?
   [class-name value]
@@ -184,7 +186,8 @@
   [plan]
   (when-not (invocation-plan? plan)
     (fail! :invocation-plan-type "expected an InvocationPlan" {:actual (type plan)}))
-  (let [{:keys [id parameters steps bindings program-inputs program-outputs values attributes]} plan]
+  (let [{:keys [id parameters steps bindings storage-bindings
+                program-inputs program-outputs values attributes]} plan]
     (when (nil? id)
       (fail! :invocation-plan-id "invocation plan requires a stable identity" {}))
     (when-not (and (vector? parameters) (every? invocation-parameter? parameters)
@@ -193,7 +196,7 @@
       (fail! :invocation-parameters
              "public invocation parameters must have unique ordered IDs and symbols"
              {:parameters parameters}))
-    (when-not (and (vector? steps) (vector? bindings)
+    (when-not (and (vector? steps) (vector? bindings) (vector? storage-bindings)
                    (distinct-vector? program-inputs) (distinct-vector? program-outputs)
                    (map? values) (map? attributes))
       (fail! :invocation-plan-fields "invocation plan fields have invalid container types"
@@ -209,22 +212,34 @@
                               (validate-step! step values available))
                             (set (map :id parameters)) steps)
           expected-bindings (mapv :program-value bindings)
-          invocation-values (mapv :invocation-value bindings)]
+          storage-values (mapv :program-value storage-bindings)
+          invocation-values (mapv :invocation-value (concat bindings storage-bindings))]
       (when-not (= program-inputs expected-bindings)
         (fail! :invocation-program-input-order
                "invocation bindings must exactly follow the internal program input order"
                {:inputs program-inputs :bindings expected-bindings}))
+      (when-not (and (distinct-vector? storage-values)
+                     (empty? (set/intersection (set program-inputs) (set storage-values))))
+        (fail! :invocation-storage-bindings
+               "write-only storage bindings must be distinct from logical program inputs"
+               {:inputs program-inputs :storage storage-values}))
       (when-let [missing (seq (set/difference (set invocation-values) available))]
         (fail! :invocation-program-input-value
                "internal program input is not produced by the invocation prefix"
                {:values (set missing)}))
-      (doseq [{program-value :program-value invocation-value :invocation-value} bindings]
+      (doseq [{program-value :program-value invocation-value :invocation-value}
+              (concat bindings storage-bindings)]
         (when-not (compatible-value? (get values program-value) (get values invocation-value))
           (fail! :invocation-program-input-contract
                  "public materialization differs from the internal program value contract"
                  {:program-value program-value :invocation-value invocation-value
                   :program-contract (get values program-value)
                   :invocation-contract (get values invocation-value)})))
+      (doseq [{:keys [program-value]} storage-bindings]
+        (when-not (buffer-value? (get values program-value))
+          (fail! :invocation-storage-value
+                 "write-only storage binding must name a tensor buffer"
+                 {:program-value program-value :value (get values program-value)})))
       (doseq [output program-outputs]
         (when-not (contains? values output)
           (fail! :invocation-program-output
@@ -319,12 +334,12 @@
   "Build a typed invocation plan from a certified flat host prefix.
 
    `parameters` is the public function order. `parameter-values` describes those values before any
-   lexical shadowing; `binding-values` describes prefix results. `program-values`, inputs, and
-   outputs are the already validated internal ParallelProgram boundary. Stable SSA IDs keep a
+   lexical shadowing; `binding-values` describes prefix results. `program-values`, logical inputs,
+   write-only external storage, and outputs are the validated internal program boundary. Stable SSA IDs keep a
    narrowed binding such as `nsteps = (int nsteps)` distinct from its public long parameter."
   [{:keys [id parameters parameter-values bindings binding-values program-values
-           program-inputs program-outputs attributes]
-    :or {attributes {}}}]
+           program-inputs program-storage program-outputs attributes]
+    :or {program-storage [] attributes {}}}]
   (let [parameters (vec parameters)
         public
         (mapv (fn [ordinal symbol]
@@ -350,18 +365,19 @@
                        :environment (assoc environment symbol (:id step))})))
                 {:steps [] :values initial-values :environment initial-environment}
                 (map-indexed vector bindings))
-        input-bindings
-        (mapv (fn [program-value]
-                (if-let [invocation-value (get environment program-value)]
-                  {:program-value program-value :invocation-value invocation-value}
-                  (fail! :invocation-program-input
-                         "internal program input has no public or materialized producer"
-                         {:program-value program-value
-                          :available (set (keys environment))})))
-              program-inputs)
+        binding-for
+        (fn [kind program-value]
+          (if-let [invocation-value (get environment program-value)]
+            {:program-value program-value :invocation-value invocation-value}
+            (fail! kind
+                   "internal program value has no public or materialized producer"
+                   {:program-value program-value
+                    :available (set (keys environment))})))
+        input-bindings (mapv #(binding-for :invocation-program-input %) program-inputs)
+        storage-bindings (mapv #(binding-for :invocation-program-storage %) program-storage)
         values (merge program-values values)]
     (validate!
-     (->InvocationPlan id public steps input-bindings (vec program-inputs)
+     (->InvocationPlan id public steps input-bindings storage-bindings (vec program-inputs)
                        (vec program-outputs) values attributes))))
 
 (defn validate-against!
@@ -372,7 +388,9 @@
                    (= (:program-outputs plan) (:outputs parallel-program))
                    (every? (fn [id] (= (get (:values plan) id)
                                        (get (:values parallel-program) id)))
-                           (concat (:inputs parallel-program) (:outputs parallel-program))))
+                           (concat (:inputs parallel-program)
+                                   (:outputs parallel-program)
+                                   (map :program-value (:storage-bindings plan)))))
       (fail! :invocation-program-mismatch
              "invocation plan no longer matches its internal ParallelProgram boundary"
              {:plan-inputs (:program-inputs plan) :program-inputs (:inputs parallel-program)
