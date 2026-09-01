@@ -8,27 +8,14 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
-            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]))
-
-(def ^:private index-operators
-  {'+ :add, 'clojure.core/+ :add, 'raster.numeric/+ :add
-   '- :sub, 'clojure.core/- :sub, 'raster.numeric/- :sub
-   '* :mul, 'clojure.core/* :mul, 'raster.numeric/* :mul
-   'quot :floor-div, 'clojure.core/quot :floor-div
-   'rem :mod, 'clojure.core/rem :mod
-   'mod :mod, 'clojure.core/mod :mod
-   'min :min, 'clojure.core/min :min
-   'max :max, 'clojure.core/max :max})
-
-(def ^:private index-casts
-  '#{int long clojure.core/int clojure.core/long})
 
 (defn- decline!
   [rule message data]
@@ -45,49 +32,7 @@
 (defn lower-index
   "Translate verified source index arithmetic into KernelBody index expressions."
   [expression scope]
-  (let [expression (descriptor/unwrap-int-cast expression)]
-    (cond
-      (integer? expression) expression
-
-      (symbol? expression)
-      (if (contains? scope expression)
-        expression
-        (decline! :unbound-index-symbol
-                  "portable contraction index references an undeclared symbol"
-                  {:expression expression :scope scope}))
-
-      (and (seq? expression) (contains? index-casts (first expression))
-           (= 2 (count expression)))
-      (lower-index (second expression) scope)
-
-      (and (seq? expression)
-           (descriptor/increment-op? (descriptor/semantic-op expression))
-           (= 1 (count (descriptor/call-args expression))))
-      (body/expression :add
-                       (lower-index (first (descriptor/call-args expression)) scope)
-                       1)
-
-      (and (seq? expression)
-           (descriptor/decrement-op? (descriptor/semantic-op expression))
-           (= 1 (count (descriptor/call-args expression))))
-      (body/expression :sub
-                       (lower-index (first (descriptor/call-args expression)) scope)
-                       1)
-
-      (seq? expression)
-      (let [operator (get index-operators (descriptor/semantic-op expression))
-            arguments (vec (descriptor/call-args expression))]
-        (when-not (and operator (seq arguments)
-                       (or (not= :sub operator) (= 2 (count arguments))))
-          (decline! :index-expression
-                    "portable contraction requires explicit integer affine/decomposition arithmetic"
-                    {:expression expression :operator (descriptor/semantic-op expression)}))
-        (apply body/expression operator (map #(lower-index % scope) arguments)))
-
-      :else
-      (decline! :index-expression
-                "portable contraction index has an unsupported value"
-                {:expression expression :type (type expression)}))))
+  (index-expression/lower expression scope decline!))
 
 (defn- product-expression
   [values]

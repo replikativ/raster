@@ -16,6 +16,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (def ^:private cast-heads
@@ -30,7 +31,7 @@
   (throw (ex-info message (assoc data
                                  :reason :segred-kernel-body-declined
                                  :missing-rule rule
-                                 :fallback :verified-segred-opencl))))
+                                 :fallback :none))))
 
 (defn declined?
   [exception]
@@ -135,7 +136,7 @@
   "Lower a scalar reduction element into typed SSA. `coordinate-lower` may translate a verified
    source-level flat array index into KernelBody index arithmetic; without it, this retains the
    pointwise full-reduction contract. A predicate requires an explicit typed load fallback."
-  [expression {:keys [index coordinate dtype arrays scalars coordinate-lower
+  [expression {:keys [index coordinate dtype arrays scalars scalar-types coordinate-lower
                       load-predicate load-other]}]
   (let [operations (atom [])
         counter (atom 0)
@@ -151,7 +152,13 @@
 
                   (symbol? expression)
                   (if (contains? scalars expression)
-                    expression
+                    (if (= (dtype/canon dtype)
+                           (dtype/canon (get scalar-types expression dtype)))
+                      expression
+                      (decline! :scalar-dtype
+                                "KernelBody reduction value scalar must match the accumulator dtype"
+                                {:expression expression :dtype dtype
+                                 :scalar-dtype (get scalar-types expression)}))
                     (decline! :unbound-scalar
                               "KernelBody element expression references an undeclared scalar"
                               {:expression expression :scalars scalars}))
@@ -216,8 +223,8 @@
 (defn lower
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
-   `array-types` and `scalar-types` are authoritative ABI facts. This vertical initially accepts
-   the uniform-dtype storage contract already implemented by the scalar SegRed runtime."
+   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
+   accumulator remain uniform; integral scalar parameters may participate in index expressions."
   [segred out-sym & {:keys [dtype array-types scalar-types]
                      :or {dtype :double array-types {} scalar-types {}}}]
   (let [dtype (or (:dtype segred) dtype)
@@ -238,9 +245,9 @@
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
                          (launch/dimension-expression? bound-dimension)
                          (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
-                         (every? #(= (dtype/canon dtype) (dtype/canon (scalar-dtype %))) scalars))
+                         (every? #(dtype/known? (dtype/canon (scalar-dtype %))) scalars))
             (decline! :uniform-scalar-storage
-                      "KernelBody scalar reduction requires a static power-of-two workgroup and uniform scalar storage"
+                      "KernelBody scalar reduction requires a static power-of-two workgroup and uniform tensor storage"
                       {:segred-id (:id segred) :dtype dtype :bound bound
                        :workgroup-size workgroup-size :arrays arrays :scalars scalars}))
         {:keys [operator identity element]} (scalar-plan segred)
@@ -254,8 +261,17 @@
         next-lane-accumulator 'next-lane-accumulator
         lane-result 'lane-result
         {:keys [operations result]}
-        (lower-element-operations element {:index index :coordinate element-index :dtype dtype
-                                           :arrays (set arrays) :scalars (set scalars)})
+        (lower-element-operations
+         element
+         {:index index :coordinate element-index :dtype dtype
+          :arrays (set arrays) :scalars (set scalars)
+          :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
+          :coordinate-lower
+          (fn [source-coordinate]
+            (index-expression/lower
+             (util/subst-syms {index element-index} source-coordinate)
+             (conj (set scalars) element-index)
+             decline!))})
         output (or out-sym 'output)
         group-count (launch-group-count (get-in segred [:grid :num-blocks])
                                         bound workgroup-size)

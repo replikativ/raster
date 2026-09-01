@@ -965,6 +965,7 @@
       (let [source-type (:type (first infos))
             source-integral? (contains? #{:byte :int :long} source-type)
             result-integral? (contains? #{:byte :int :long} result-type)
+            result-floating? (dtype/fp-dtype? result-type)
             both-floating? (and (dtype/fp-dtype? source-type) (dtype/fp-dtype? result-type))
             narrowing? (and both-floating?
                             (> (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
@@ -982,18 +983,34 @@
         (when (or (= :predicate result-type) (= :predicate (:type (first infos))))
           (throw (ex-info "numeric casts cannot create or consume predicates"
                           {:expression expression})))
-        ;; Rounding has no meaning when the source is already integral. Wrapping is a
-        ;; representation operation only between integral types. FP same-width/widening casts are
-        ;; exact; FP narrowing states an IEEE overflow and directional rounding contract.
-        (when-not (and (or (not source-integral?) (= :exact rounding))
-                       (or (not= :wrap overflow)
-                           (and source-integral? result-integral?))
-                       (if both-floating?
-                         (if narrowing?
-                           (and (= :ieee overflow)
-                                (contains? #{:nearest-even :toward-zero :up :down} rounding))
-                           (and (= :exact rounding) (= :exact overflow)))
-                         (not= :ieee overflow)))
+        ;; Integral-to-integral conversion has no rounding. Integral-to-floating conversion can
+        ;; lose precision and therefore states nearest-even explicitly; float/double cover the
+        ;; complete integral range, while half retains IEEE overflow. FP same-width/widening casts
+        ;; are exact; FP narrowing states IEEE overflow and a directional rounding contract.
+        (when-not
+         (cond
+           (and source-integral? result-integral?)
+           (and (= :exact rounding) (not= :ieee overflow))
+
+           (and source-integral? result-floating?)
+           (or (and (= :double result-type)
+                    (<= (dtype/bytes-of source-type) 4)
+                    (= [:exact :exact] [rounding overflow]))
+               (and (= :nearest-even rounding)
+                    (= (if (= :half result-type) :ieee :exact) overflow)))
+
+           both-floating?
+           (if narrowing?
+             (and (= :ieee overflow)
+                  (contains? #{:nearest-even :toward-zero :up :down} rounding))
+             (and (= :exact rounding) (= :exact overflow)))
+
+           ;; Floating-to-integral casts may state their directional rounding and their chosen
+           ;; finite-range policy, but never borrow representation wrapping or IEEE FP overflow.
+           result-integral?
+           (and (not= :wrap overflow) (not= :ieee overflow))
+
+           :else false)
           (throw (ex-info "scalar cast policies disagree with its source and result dtypes"
                           {:reason :kernel-body-cast-policy
                            :source-type source-type :result-type result-type

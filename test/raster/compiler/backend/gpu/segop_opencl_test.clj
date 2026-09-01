@@ -19,6 +19,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
@@ -46,6 +47,32 @@
         "the cross-block target kernel must not resurrect the original reduction body")
     (is (= 2 (second (get temporary-specs partials)))
         "dynamic two-phase scratch resolves through KernelLaunch IR at call time")))
+
+(deftest scheduled-reduction-graph-does-not-export-an-opencl-fallback-to-cuda
+  (let [source '(let* [result (raster.par/reduce acc 0.0 i n
+                                                 (+ acc (clojure.core/aget a i)))]
+                      result)
+        options {:dtype :double :array-types {'a :double}}
+        typed (:program (typed-route/attempt source :double {'a :double} options))
+        algorithm (get-in typed [:equations 0 :algorithm])
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        graph (equation-graph/make algorithm scheduled)
+        exception
+        (try
+          (with-redefs [segred-body/lower
+                        (fn [& _]
+                          (throw (ex-info "simulated portable coverage gap"
+                                          {:reason :segred-kernel-body-declined
+                                           :missing-rule :simulated
+                                           :fallback :none})))]
+            (sg/generate-kernel-graph graph :array-types {'a :double}
+                                      :target-dialect :cuda))
+          nil
+          (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :kernel-graph-target-lowering-missing (:reason (ex-data exception))))
+    (is (= :simulated (get-in (ex-data exception)
+                              [:kernel-body-decline :missing-rule])))
+    (is (= :none (:fallback (ex-data exception))))))
 
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
@@ -304,20 +331,17 @@
       (is (= '[a output _n_bound] (mapv :name (:abi k))))
       (is (= '[a nil n] (:arguments k))))))
 
-(deftest segred-kernel-body-decline-is-retained-in-the-fallback-artifact
+(deftest mixed-index-scalars-stay-on-the-portable-reduction-route
   (let [form '(raster.par/reduce acc 0.0 i n
                                  (+ acc (clojure.core/aget a (+ i offset))))
         node (soac/par-form->soac 'result form 22 :dtype :float)
         operation (first (lower/lower-reduce node nil :dtype :float))
         artifact (sg/generate-segred-kernel
                   operation nil :dtype :float :scalar-types {'offset :int})]
-    (is (= :verified-segred-opencl (get-in artifact [:attributes :emission-route])))
-    (is (= :segred-kernel-body-declined
-           (get-in artifact [:attributes :kernel-body-decline :reason])))
-    (is (= :uniform-scalar-storage
-           (get-in artifact [:attributes :kernel-body-decline :missing-rule])))
-    (is (= :verified-segred-opencl
-           (get-in artifact [:attributes :kernel-body-decline :fallback])))))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (= :int (some #(when (= 'offset (:name %)) (:dtype %)) (:abi artifact))))
+    (is (re-find #"element_index.* \+ offset" (:source artifact)))
+    (is (nil? (get-in artifact [:attributes :kernel-body-decline])))))
 
 ;; ================================================================
 ;; Horizontally-fused multi-output SegMap: the SECONDARY output (written

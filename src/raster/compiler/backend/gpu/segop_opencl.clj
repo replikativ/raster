@@ -758,7 +758,7 @@
                              :reason :segred-result-transform-lowering
                              :fallback :none)
                       exception)))
-            {:decline (ex-data exception)}))]
+            {:decline (assoc (ex-data exception) :fallback :verified-segred-opencl)}))]
     (or
      (:artifact kernel-body-attempt)
      (when-not (kernel-body-c-dialect/opencl?
@@ -1127,16 +1127,20 @@
                  :kernel-name-prefix "graph_segmap")
                 (catch clojure.lang.ExceptionInfo exception
                   (if (and opencl? (segmap-body/declined? exception))
-                    (if (:out-sym operation)
-                      (generate-segmap-kernel
-                       operation (:out-sym operation)
-                       :dtype (:dtype operation)
-                       :scalar-types scalar-types :array-types array-types
-                       :kernel-name-prefix "graph_segmap")
-                      (generate-explicit-segmap-kernel
-                       operation :dtype (:dtype operation)
-                       :scalar-types scalar-types :array-types array-types
-                       :kernel-name-prefix "graph_segmap_effect"))
+                    (-> (if (:out-sym operation)
+                          (generate-segmap-kernel
+                           operation (:out-sym operation)
+                           :dtype (:dtype operation)
+                           :scalar-types scalar-types :array-types array-types
+                           :kernel-name-prefix "graph_segmap")
+                          (generate-explicit-segmap-kernel
+                           operation :dtype (:dtype operation)
+                           :scalar-types scalar-types :array-types array-types
+                           :kernel-name-prefix "graph_segmap_effect"))
+                        (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+                        (assoc-in [:attributes :kernel-body-decline]
+                                  (assoc (ex-data exception)
+                                         :fallback :verified-segmap-opencl)))
                     (throw exception))))
 
               (instance? raster.compiler.ir.segop.SegStencil operation)
