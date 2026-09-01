@@ -260,6 +260,7 @@
               flattened-source (when (seq flattened-pairs)
                                  (list 'let* (vec (mapcat identity flattened-pairs))
                                        copy-binding))
+              parameter-analysis (host-av/analyze '(let* [] nil) options)
               outer-analysis (host-av/analyze prefix-source options)
               body-analysis
               (when flattened-source
@@ -369,6 +370,8 @@
                        :source source
                        :loop-binding binder
                        :prefix-bindings prefix-pairs
+                       :parameter-values (:values parameter-analysis)
+                       :outer-values (:values outer-analysis)
                        :suffix-bindings suffix-pairs
                        :outer-body (vec outer-body)
                        :flattened-body-source flattened-source

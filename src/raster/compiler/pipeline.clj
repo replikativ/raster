@@ -783,6 +783,7 @@
                 :values (:values opts)
                 :array-types (:array-types opts)
                 :scalar-types (:scalar-types opts)
+                :public-parameters (or (:public-parameters opts) (:active-params opts))
                 :abstract-machine abstract-machine}
         structured (when (device/gpu-target? (:target-device opts))
                      (structured-route/attempt source common))]

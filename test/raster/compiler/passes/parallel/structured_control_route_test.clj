@@ -9,6 +9,7 @@
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -271,6 +272,7 @@
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
   (let [options {:dtype :double :target-device :ze:debug
                  :source-ns (the-ns 'raster.ode.pde)
+                 :public-parameters '[u0 target alpha inv-dx2 dt nsteps]
                  :array-types {'u0 :double 'target :double}
                  :scalar-types {'alpha :double 'inv-dx2 :double
                                 'dt :double 'nsteps :long}}
@@ -281,6 +283,7 @@
         scheduled (route/schedule-program semantic options)
         emitted (program-opencl/emit-program scheduled options)
         emitted-program (:program emitted)
+        invocation-plan (get-in semantic [:attributes :invocation-plan])
         loop-operation (get-in scheduled [:equations 0 :operations 0])
         loop-equation (first (:equations emitted-program))
         trip-count-id (second (control/loop-index (:algorithm loop-equation)))
@@ -318,6 +321,30 @@
                                :value (/ 1.0 divisor)}]))
                    (:results equation)))))]
     (is (= :typed-parallel (:dialect semantic)))
+    (is (invocation/invocation-plan? invocation-plan))
+    (is (= '[u0 target alpha inv-dx2 dt nsteps]
+           (mapv :symbol (:parameters invocation-plan))))
+    (is (= (:inputs semantic) (mapv :program-value (:bindings invocation-plan))))
+    (is (= 1 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
+    (is (= 1 (count (filter invocation/buffer-clone? (:steps invocation-plan)))))
+    (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan)))))
+    (is (= 4 (count (filter invocation/value-alias? (:steps invocation-plan)))))
+    (is (= 3 (count (filter invocation/scalar-compute? (:steps invocation-plan)))))
+    (is (every? #(not (contains? % :expression)) (:steps invocation-plan)))
+    (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))
+                                           (:parameters invocation-plan))))
+          narrowed (first (filter #(some (fn [operand]
+                                           (= public-nsteps (:value operand)))
+                                         (:operands %))
+                                  (:steps invocation-plan)))
+          bound-nsteps (some (fn [{:keys [invocation-value]}]
+                               (when (= (:id narrowed) invocation-value)
+                                 invocation-value))
+                             (:bindings invocation-plan))]
+      (is (invocation/scalar-compute? narrowed))
+      (is (not= public-nsteps (:id narrowed)))
+      (is (= public-nsteps (-> narrowed :operands first :value)))
+      (is (= (:id narrowed) bound-nsteps)))
     (is (= :scheduled-parallel (:dialect scheduled)))
     (is (= 3 (count (:equations scheduled)))
         "the generic fixpoint, host inv-n, and reduction with a final scalar epilogue represent the RK4 loss")
