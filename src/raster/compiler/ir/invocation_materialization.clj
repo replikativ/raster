@@ -2,9 +2,10 @@
   "Pure specialization of a typed InvocationPlan against ordered public arguments.
 
    The result contains typed scalars and logical buffer initializers for the exact internal
-   ParallelProgram input order. It allocates no driver objects and does not evaluate Clojure
-   source: scalar regions are delegated as closed TypedSOAC regions to an injected compiler or
-   interpreter. A later lowering realizes MaterializedBuffers as LinkValues/BufferViews."
+   ParallelProgram inputs plus explicitly bound caller-owned result storage. It allocates no driver
+   objects and does not evaluate Clojure source: scalar regions are delegated as closed TypedSOAC
+   regions to an injected compiler or interpreter. A later lowering realizes MaterializedBuffers
+   as LinkValues/BufferViews."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
@@ -208,12 +209,19 @@
       (fail! :invocation-materialization-values
              "materialization must retain every public parameter and invocation SSA result"
              {:expected invocation-ids :actual (set (keys values))}))
-    (when-not (= (set (:program-inputs plan))
-                 (set (concat (keys program-buffers) (keys program-scalars))))
-      (fail! :invocation-materialization-inputs
-             "materialized bindings must partition the exact ParallelProgram inputs"
-             {:expected (:program-inputs plan)
-              :buffers (keys program-buffers) :scalars (keys program-scalars)}))
+    (let [storage-values (set (map :program-value (:storage-bindings plan)))
+          materialized-values (set/union (set (:program-inputs plan)) storage-values)]
+      (when-not (= materialized-values
+                   (set (concat (keys program-buffers) (keys program-scalars))))
+        (fail! :invocation-materialization-inputs
+               "materialized bindings must partition logical inputs and external result storage"
+               {:expected materialized-values
+                :buffers (keys program-buffers) :scalars (keys program-scalars)}))
+      (when-let [scalar-storage (seq (set/intersection storage-values
+                                                       (set (keys program-scalars))))]
+        (fail! :invocation-materialization-storage-kind
+               "external result storage cannot materialize as scalar values"
+               {:values (set scalar-storage)})))
     (when (seq (set/intersection (set (keys program-buffers))
                                  (set (keys program-scalars))))
       (fail! :invocation-materialization-input-kind
@@ -227,7 +235,8 @@
                  {:program-value id :expected expected :actual (:shape buffer)}))))
     (doseq [[id scalar] program-scalars]
       (checked-scalar id (get-in plan [:values id]) scalar))
-    (doseq [{:keys [program-value invocation-value]} (:bindings plan)]
+    (doseq [{:keys [program-value invocation-value]}
+            (concat (:bindings plan) (:storage-bindings plan))]
       (when-not (= (get values invocation-value)
                    (or (get program-buffers program-value)
                        (get program-scalars program-value)))
@@ -332,7 +341,7 @@
           (into {}
                 (map (fn [{:keys [program-value invocation-value]}]
                        [program-value (get values invocation-value)]))
-                (:bindings plan))
+                (concat (:bindings plan) (:storage-bindings plan)))
           program-buffers (into {} (filter (comp materialized-buffer? val)) input-values)
           program-scalars (into {} (filter (comp typed-scalar? val)) input-values)]
       (validate!

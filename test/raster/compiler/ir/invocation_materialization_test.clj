@@ -70,6 +70,26 @@
                             (materialization/materialize plan [(float-array 3) 0.25 7]
                                                          evaluate-scalar))))))
 
+(deftest caller-owned-write-only-storage-is-materialized-outside-logical-inputs
+  (let [value (array-value :float 4)
+        plan (invocation/from-prefix
+              {:id :write-only-storage
+               :parameters '[x y]
+               :parameter-values {'x value 'y value}
+               :bindings [] :binding-values {}
+               :program-values {'x value 'y value}
+               :program-inputs '[x]
+               :program-storage '[y]
+               :program-outputs []})
+        x (float-array 4)
+        y (float-array 4)
+        materialized (materialization/materialize plan [x y] evaluate-scalar)]
+    (is (= '[x] (mapv :program-value (:bindings plan))))
+    (is (= '[y] (mapv :program-value (:storage-bindings plan))))
+    (is (= #{'x 'y} (set (keys (:program-buffers materialized)))))
+    (is (identical? y (get-in materialized [:program-buffers 'y :source])))
+    (is (empty? (:program-scalars materialized)))))
+
 (deftest concrete-public-and-program-shapes-are-checked
   (testing "a static public shape cannot silently accept a different array length"
     (let [value (array-value :double 3)

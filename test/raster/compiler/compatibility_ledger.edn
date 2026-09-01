@@ -11,27 +11,26 @@
    :emission {:kernel-count 0 :targets [] :strategies [] :fallback-reasons [] :declines {}}}
 
   :symbolic-dense-contraction-gpu
-  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true
-           :declines {[:backend-applied-stats :typed-contraction-dispatch-declines
-                       :typed-contraction-dispatch-dynamic-scalar] 1}}
-   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
-   :lowering {:segops 1 :kernel-graphs 0 :structured-loops 0
-              :typed-reused 1 :typed-scalar-equations 0
-              :backend-reused 1 :backend-relowered 0 :fallback 0}
-   :emission {:kernel-count 1 :targets [:opencl-c] :strategies [:portable-segred]
-              :fallback-reasons [:symbolic-dims]
-              :declines {[:dpas :matrix-capability-unavailable] 1
-                         [:regtiled :symbolic-dims] 1}}}
+  {:route {:semantic-dialect :typed-parallel
+           :scheduled-dialect :scheduled-parallel
+           :emitted-dialect :opencl-parallel
+           :fallback :none}
+   :lowering {:nodes 3 :values 3 :instances 1 :program-instances 1
+              :outputs 1 :driver-allocations 0}
+   :emission {:structured-loops-emitted 0
+              :typed-equations-emitted 1
+              :host-scalar-equations 0}}
 
   :q4k-dp4a-rows-gpu
-  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true
-           :declines {}}
-   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
-   :lowering {:segops 1 :kernel-graphs 0 :structured-loops 0
-              :typed-reused 1 :typed-scalar-equations 1
-              :backend-reused 1 :backend-relowered 0 :fallback 0}
-   :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
-              :fallback-reasons [] :declines {}}}
+  {:route {:semantic-dialect :typed-parallel
+           :scheduled-dialect :scheduled-parallel
+           :emitted-dialect :opencl-parallel
+           :fallback :none}
+   :lowering {:nodes 9 :values 9 :instances 1 :program-instances 1
+              :outputs 0 :driver-allocations 0}
+   :emission {:structured-loops-emitted 0
+              :typed-equations-emitted 1
+              :host-scalar-equations 0}}
 
   :gqa-causal-mha-gpu
   {:route {:semantic-dialect :typed-parallel

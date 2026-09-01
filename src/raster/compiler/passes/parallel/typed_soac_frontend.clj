@@ -242,19 +242,19 @@
           results (mapv #(effect-result-id id %) (range (count stores)))]
       (when (or pointwise? (= :unique conflict))
         (merge {:kind (if pointwise? :map :scatter)
-              :id id :sym symbol :index index :extent extent
-              :results results :locals locals :bodies values :casts (mapv :cast stores)
-              :write-indices write-indices :predicates predicates
-              :conflict (when-not pointwise? conflict)
-              :effect-only? true :host-binding symbol :elem-type elem-type
-              :result-storage
-              (mapv (fn [destination]
-                      {:destination destination
-                       :access (if (or (not pointwise?)
-                                       (contains? (:inputs io) destination))
-                                 :read-write :write)
-                       :host-return :effect})
-                    destinations)}
+                :id id :sym symbol :index index :extent extent
+                :results results :locals locals :bodies values :casts (mapv :cast stores)
+                :write-indices write-indices :predicates predicates
+                :conflict (when-not pointwise? conflict)
+                :effect-only? true :host-binding symbol :elem-type elem-type
+                :result-storage
+                (mapv (fn [destination]
+                        {:destination destination
+                         :access (if (or (not pointwise?)
+                                         (contains? (:inputs io) destination))
+                                   :read-write :write)
+                         :host-return :effect})
+                      destinations)}
                io)))))
 
 (defn- reducing-scatter-description
@@ -528,7 +528,11 @@
            :scalars (set/union scalars epilogue-scalar-ids)
            :result-transform result-transform
            :effect-only? true :host-binding symbol
-           :result-storage [{:destination out :access :write :host-return :effect}]})))
+           ;; Contract is effectful at the source spelling because it writes `out`, but its
+           ;; TypedSOAC equation denotes the mathematical output tensor. A terminal reference to
+           ;; that physical destination therefore returns the logical value; generic map-void
+           ;; destinations remain `:effect` storage and retain host nil semantics.
+           :result-storage [{:destination out :access :write :host-return :buffer}]})))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
@@ -1118,10 +1122,31 @@
                                     (mapcat #(when (= :scalar (:kind %))
                                                (util/free-syms (:expr %)))
                                             descriptions)))
-        body-uses (set (mapcat util/free-syms body))]
+        body-uses (set (mapcat util/free-syms body))
+        ;; Destination-writing source forms return the destination buffer, while TypedSOAC names
+        ;; the fresh logical result produced by that write. Preserve the public return by
+        ;; projecting a returned physical destination to its corresponding logical SSA result.
+        ;; This is the same result-storage relation later consumed by scheduling and linking; no
+        ;; operation-specific knowledge is introduced here.
+        destination-results
+        (into {}
+              (mapcat (fn [description]
+                        (keep (fn [[result {:keys [destination host-return]}]]
+                                ;; Effect-only operations expose their destinations through the
+                                ;; reconstructed host form, not as numerical TypedSOAC results.
+                                ;; Only value-returning storage contracts may rewrite a terminal
+                                ;; physical destination to its logical SSA result.
+                                (when (= :buffer host-return)
+                                  [destination result]))
+                              (map vector (:results description)
+                                   (:result-storage description)))))
+              descriptions)
+        returned-destination-results
+        (into #{} (keep destination-results) body-uses)]
     (vec (sort-by pr-str
                   (set/union (set/difference terminal-operation-definitions operation-uses)
-                             (set/intersection all-definitions body-uses))))))
+                             (set/intersection all-definitions body-uses)
+                             returned-destination-results)))))
 
 (defn- selected-scalars
   [descriptions operation-equations outputs]
@@ -1294,7 +1319,7 @@
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
                           (:map :scatter :stencil :reduce :segmented-reduce
-                           :product-reduce :segmented-fold-map :scan)
+                                :product-reduce :segmented-fold-map :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)

@@ -412,6 +412,15 @@
                    program-values binding-values)
         parallel-program (assoc parallel-program :values program-values)
         promoted (assoc parallel-program :dialect :typed-parallel)
+        public-set (set public-parameters)
+        external-result-storage
+        (->> (:equations parallel-program)
+             (mapcat #(get-in % [:attributes :result-storage]))
+             (map :destination)
+             (filter public-set)
+             (remove (set (:inputs parallel-program)))
+             distinct
+             vec)
         plan (invocation/from-prefix
               {:id [:program-invocation (mapv :id (:equations parallel-program))]
                :parameters public-parameters
@@ -420,6 +429,7 @@
                :binding-values binding-values
                :program-values program-values
                :program-inputs (:inputs parallel-program)
+               :program-storage external-result-storage
                :program-outputs (:outputs parallel-program)
                :attributes {:source-dialect :closed-clojure
                             :algorithm-dialect :typed-soac

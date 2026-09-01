@@ -64,11 +64,22 @@
     (pipeline/compile-report #'nn/predict-fn)
 
     :symbolic-dense-contraction-gpu
-    (pipeline/compile-report #'contract/contract-mm :target-device target :dtype :float)
+    (let [compilation (equation-first/compile
+                       #'contract/contract-mm {:target target :dtype :float})
+          plan (equation-first/lower
+                compilation [(float-array 6) (float-array 6) 2 3 2])]
+      (equation-first-signature compilation plan))
 
     :q4k-dp4a-rows-gpu
-    (pipeline/compile-report #'qk/qmatmul-q4k-dp4a-rows!
-                             :target-device target :dtype :float)
+    (let [compilation (equation-first/compile
+                       #'qk/qmatmul-q4k-dp4a-rows! {:target target :dtype :float})
+          plan (equation-first/lower
+                compilation
+                [(int-array 64) (float-array 1) (int-array 8)
+                 (int-array 64) (float-array 2) (float-array 2)
+                 (byte-array 16) (byte-array 16) (float-array 2)
+                 256 2 1])]
+      (equation-first-signature compilation plan))
 
     :gqa-causal-mha-gpu
     (let [compilation (equation-first/compile
@@ -108,7 +119,10 @@
       (let [report (compile-workload id)
             actual (cond
                      (:declined report) report
-                     (contains? #{:gqa-causal-mha-gpu :heat-loss-rk4-gpu} id) report
+                     (contains? #{:symbolic-dense-contraction-gpu
+                                  :q4k-dp4a-rows-gpu
+                                  :gqa-causal-mha-gpu
+                                  :heat-loss-rk4-gpu} id) report
                      :else (signature report))]
         (is (= expected actual)
             (str "compiler compatibility changed for " id
