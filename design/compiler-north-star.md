@@ -303,16 +303,21 @@ kernel remains available for already padded layouts. Padding is layout, not quan
 memory ownership.
 
 Decoder selection is likewise an ordinary indexed row reduction, not an attention or quantization
-primitive. Scalar reduction is now the one-component case of a canonical typed `ProductReduction`;
-multi-result reductions carry ordered, independently typed components plus distinct element and
-closed binary-combine regions. The first portable `ReductionSchedule` maps a segmented product to
+primitive. TypedSOAC represents it as `product-reduce`: ordered independently typed components,
+identities and algebra accompany distinct element and closed binary-combine regions. A component
+may participate in the algebra without becoming a materialized SSA result; an explicit ordinal map
+connects only retained components to caller-owned result storage. This projects mechanically to the
+canonical `ProductReduction` used by scheduling rather than recovering either region from source.
+The first portable `ReductionSchedule` maps a segmented product to
 strided lane folds, a fixed workgroup-local tree and segment stores. Its workgroup is constrained by
 the target thread limit and the sum of every component's local-memory width, while numerical mode
 and tuning candidates remain inspectable data. `argmax-rows!` therefore emits one mixed-type
 `(value,index)` workgroup tree per row with no compiler-visible global scratch. The semantic ABI
 contains only values, output indices, row count and width; ties select the lowest index, and the first
-NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
-multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
+NaN outranks numeric values so corruption is visible and deterministic. Its public compile report
+now proves direct analyzed-source-to-TypedSOAC routing, typed schedule reuse and zero compatibility
+fallback. Subgroup/shuffle and multi-workgroup alternatives remain schedule candidates, not new
+semantic primitives.
 
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
