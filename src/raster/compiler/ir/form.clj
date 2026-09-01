@@ -74,6 +74,10 @@
         (contains? #{'fn 'fn* 'ftm} head)
         {:kind :lambda :introduces-scope? true :liftable? false :head head}
 
+        ;; TypedSOAC scalar folds carry a lexical accumulator and iteration index.
+        (= 'fold head)
+        {:kind :fold :introduces-scope? true :liftable? false :head head}
+
         ;; Special forms — NOT liftable
         (contains? #{'try 'catch 'finally 'recur 'throw 'new} head)
         {:kind :special :introduces-scope? false :liftable? false :head head}
@@ -271,6 +275,23 @@
                                             parsed scopes')]
                           (apply rl form head (concat (when nm [nm]) arities')))))})
 
+        ;; (fold attrs (lambda [acc index] (region [] [step])))
+        :fold
+        (let [[_ attributes [_ parameters [_ locals results]]] form]
+          (when (and (map? attributes) (vector? parameters)
+                     (vector? locals) (empty? locals) (vector? results))
+            {:sequential? false
+             :scopes [{:binders parameters :inits [] :body results}]
+             :outer [(:identity attributes) (:extent attributes)]
+             :rebuild
+             (fn [[{:keys [binders body]}] [identity extent]]
+               (let [attributes' (assoc attributes
+                                        :accumulator (first binders)
+                                        :index (second binders)
+                                        :identity identity :extent extent)]
+                 (rl form 'fold attributes'
+                     (list 'lambda (vec binders) (list 'region [] (vec body))))))}))
+
         ;; letfn* — mutual recursion: binders visible to their own inits
         ;; (matched as :call by form-info, so dispatch on head here)
         :call
@@ -367,7 +388,7 @@
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
-  (contains? #{:scope :lambda :par} (:kind (form-info form))))
+  (contains? #{:scope :lambda :par :fold} (:kind (form-info form))))
 
 (defn call-form?
   "True if the form is a function call (.invk or regular)."

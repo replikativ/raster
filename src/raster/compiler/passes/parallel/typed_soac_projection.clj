@@ -5,11 +5,31 @@
    equation in the temporary surface vocabulary consumed by a target route while that route is
    migrated to accept the typed equation directly.  Keeping the projection here prevents the
    execution materializer and SegOp lowering from inventing subtly different forms."
-  (:require [raster.compiler.core.dtype :as dtype]
+  (:require [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.soac-dialect :as dialect]))
+
+(defn scalar-folds->source
+  "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
+  [expression]
+  (walk/postwalk
+   (fn [form]
+     (if (dialect/scalar-fold-form? form)
+       (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
+             {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
+             [accumulator index] parameters]
+         (when (seq locals)
+           (throw (ex-info "scalar fold projection does not admit local SSA yet"
+                           {:reason :typed-soac-scalar-fold-projection :fold form})))
+         (with-meta
+           (list 'raster.par/reduce accumulator (:identity attributes)
+                 index (:extent attributes) (first body-results))
+           {:raster.type/elem-type (:dtype attributes)}))
+       form))
+   expression))
 
 (defn- materialize-region
   [locals body]

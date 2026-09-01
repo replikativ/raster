@@ -306,16 +306,23 @@
          (true? (get-in value [:algebra :associative?])))))
 
 (defn fold-attributes?
-  "Attributes of one sequential, loop-carried fold inside a segmented fold-map."
+  "Attributes of one loop-carried scalar fold.
+
+   Ordered folds preserve the source recurrence.  Implementation-defined
+   association is admitted only with the same checked monoid certificate used
+   by parallel scans; this is the proof that permits target reassociation."
   [value]
   (and (map? value)
        (symbol? (:accumulator value))
+       (or (nil? (:index value)) (symbol? (:index value)))
        (scalar-literal? (:identity value))
        (keyword? (:dtype value))
        (dtype/known? (:dtype value))
        (= (:dtype value) (dtype/canon (:dtype value)))
        (or (extent? (:extent value)) (seq? (:extent value)))
-       (= :ordered (:association value))))
+       (or (= :ordered (:association value))
+           (and (= :implementation-defined (:association value))
+                (scan-ir/associative-scan? (:algebra value))))))
 
 (defn segmented-fold-map-attributes?
   "Attributes for independent segments containing dependent ordered folds and a final dense map."
@@ -393,6 +400,7 @@
 
   (Scalar [s :enforce]
           ?sym ?lit
+          ?f
           (if ?s:test ?s:then ?s:else)
           (do (?:+ s))
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
@@ -541,6 +549,25 @@
                      {:id id :dtype dtype :init init})
                    local-forms)
      :body-results (vec body-results)}))
+
+(defn scalar-fold-form?
+  "True for a typed ordered fold embedded in a scalar region."
+  [value]
+  (and (seq? value) (= 'fold (first value)) (= 3 (count value))))
+
+(defn scalar-fold-parts
+  "Project a scalar-region fold without recovering semantics from host source."
+  [value]
+  (when (scalar-fold-form? value)
+    (let [[_ attributes lambda] value]
+      {:attributes attributes :lambda lambda})))
+
+(defn- nested-scalar-folds
+  [expressions]
+  (->> expressions
+       (mapcat #(tree-seq coll? seq %))
+       (filter scalar-fold-form?)
+       vec))
 
 (defn emit-locals
   "Return local-value forms for normalized local maps."
@@ -755,6 +782,36 @@
                                {:equation equation-id :local local :unbound unbound}))
                       (conj bound id)))
                   initial-bound locals)]
+      (doseq [fold (nested-scalar-folds
+                    (concat (map :init locals) body-results))]
+        (let [{:keys [attributes lambda]} (scalar-fold-parts fold)
+              {fold-parameters :parameters fold-locals :locals
+               fold-results :body-results} (lambda-parts lambda)
+              expected [(:accumulator attributes) (:index attributes)]
+              extent-unbound (util/free-syms (:extent attributes) final-bound)
+              step-bound (into final-bound fold-parameters)
+              step-unbound (when (= 1 (count fold-results))
+                             (util/free-syms (first fold-results) step-bound))]
+          (when-not (and (symbol? (:index attributes))
+                         (= expected fold-parameters)
+                         (empty? fold-locals)
+                         (= 1 (count fold-results))
+                         (empty? extent-unbound)
+                         (empty? step-unbound)
+                         (not (some write-form? fold-results)))
+            (fail! :typed-soac-scalar-fold
+                   "scalar folds require a closed ordered [accumulator index] region"
+                   {:equation equation-id :fold fold :expected expected
+                    :parameters fold-parameters :locals fold-locals
+                    :results fold-results :extent-unbound extent-unbound
+                    :step-unbound step-unbound}))))
+      (doseq [expression (concat (map :init locals) body-results)
+              form (tree-seq coll? seq expression)
+              :when (and (seq? form) (symbol? (first form))
+                         (= "raster.par" (namespace (first form))))]
+        (fail! :typed-soac-opaque-parallel-scalar
+               "parallel scalar-region work must use an explicit TypedSOAC term"
+               {:equation equation-id :form form}))
       (doseq [body body-results
               expression (if (= 'scatter kind)
                            (vals (write-parts body))
@@ -953,6 +1010,11 @@
                                       :unbound unbound}))
                             (conj bound id)))
                         bound fold-locals)]
+            (when-not (= :ordered (:association attributes))
+              (fail! :typed-soac-segmented-fold-map-association
+                     "segmented fold-map folds must preserve declared order"
+                     {:equation equation-id :fold ordinal
+                      :association (:association attributes)}))
             (let [unbound-extent
                   (set/difference (util/free-syms (:extent attributes))
                                   (set/union segment-indices (set captures)))]

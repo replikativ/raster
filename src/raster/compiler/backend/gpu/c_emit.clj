@@ -435,6 +435,10 @@
      (when-let [t (:raster.type/tag (meta expr))]
        (get tag->ctype t)))
    (cond
+     (and (seq? expr) (= 'fold (first expr)))
+     (let [[_ attributes [_ parameters [_ locals results]]] expr]
+       (get type-map (:dtype attributes) *scalar-type*))
+
      (and (seq? expr) (= 2 (count expr))
           (contains? #{'int 'float 'double 'long} (first expr)))
      (get tag->ctype (first expr) *scalar-type*)
@@ -950,6 +954,28 @@
          (throw (ex-info "vector precision cast" {:raster.compiler.backend.gpu.c-emit/bail true})))
        (emit-cast (remap-type (name (first expr)))
                   (emit-expr (second expr) idx-sym array-syms opencl-idx)))
+
+     ;; TypedSOAC scalar Fold. It remains a semantic term through scheduling;
+     ;; the C-family leaf chooses the portable one-work-item sequential schedule.
+     ;; Reassociated subgroup/workgroup schedules are separate lowering choices,
+     ;; never inferred here from the source spelling.
+     (and (seq? expr) (= 'fold (first expr)) (= 3 (count expr)))
+     (let [[_ attributes [_ parameters [_ locals results]]] expr
+           [accumulator index] parameters
+           ctype (get type-map (:dtype attributes) *scalar-type*)]
+       (when-not (and (supports-stmt-expr?) (= 2 (count parameters))
+                      (empty? locals) (= 1 (count results)))
+         (throw (ex-info "C-family scalar fold requires a statement-expression leaf"
+                         {:reason :c-emit-scalar-fold-subset :fold expr})))
+       (let [acc (c-symbol accumulator)
+             i (c-symbol index)
+             init (emit-expr (:identity attributes) idx-sym array-syms opencl-idx)
+             extent (emit-expr (:extent attributes) idx-sym array-syms opencl-idx)
+             step (binding [*int-vars* (conj *int-vars* index)]
+                    (emit-expr (first results) idx-sym array-syms opencl-idx))]
+         (str "({ " ctype " " acc " = (" ctype ")(" init "); "
+              "for (int " i " = 0; " i " < " extent "; ++" i ") { "
+              acc " = " step "; } " acc "; })")))
 
      ;; let/let* -> local variables with CSE
      (and (seq? expr) (contains? #{'let 'let*} (first expr)))
@@ -2045,6 +2071,9 @@
   [body idx-sym array-syms]
   (when (contains? #{"float" "double"} *scalar-type*)
     (try
+      (when (some #(and (seq? %) (= 'fold (first %)))
+                  (tree-seq coll? seq body))
+        (vec-bail!))
       (let [core (inline-pure-lets body)
             stores (or (collect-stores core) (vec-bail!))]
         (when (idx-leaks? core idx-sym) (vec-bail!))

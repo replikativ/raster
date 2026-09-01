@@ -82,11 +82,9 @@
                      elements arrays))
           locals (mapv #(update % :init
                                 (fn [init]
-                                  (-> (util/subst-syms substitutions init)
-                                      par/expand-par-forms)))
+                                  (util/subst-syms substitutions init)))
                        locals)
-          bodies (mapv #(-> (util/subst-syms substitutions %)
-                            par/expand-par-forms)
+          bodies (mapv #(util/subst-syms substitutions %)
                        body-results)
           result (first results)
           facts (soac-dialect/facts program)

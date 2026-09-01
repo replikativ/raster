@@ -7,6 +7,7 @@
    Once an operation is accepted, all value, effect and provenance facts are made explicit before
    fusion or scheduling sees it."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -262,6 +263,9 @@
   (cond
     (par/par-map-pure-form? expression)
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
+          elem-type (dtype/canon (or elem-type
+                                     (dtype/dtype-for-scalar-tag cast)
+                                     default-dtype))
           io (extract-io body idx [symbol])]
       (merge {:kind :map :id id :sym symbol :results [symbol]
               :index idx :extent bound :locals [] :casts [cast] :bodies [body]
@@ -271,6 +275,9 @@
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
           (par/extract-par-map-info expression)
+          elem-type (dtype/canon (or elem-type
+                                     (dtype/dtype-for-scalar-tag cast)
+                                     default-dtype))
           io (extract-io body idx [out])]
       ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
       ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
@@ -717,9 +724,33 @@
                   expression (map vector arrays parameters)))
         expressions))
 
+(defn- canonicalize-scalar-folds
+  [expression default-dtype]
+  (walk/postwalk
+   (fn [form]
+     (if (par/par-reduce-form? form)
+       (let [{:keys [acc init idx bound body elem-type]}
+             (par/extract-par-reduce-info form)
+             fold-dtype (dtype/canon (or elem-type default-dtype :double))
+             algebra (when (and (symbol? acc) (symbol? idx))
+                       (try
+                         (scan/certify {:acc acc :init init :lambda body} fold-dtype)
+                         (catch clojure.lang.ExceptionInfo _ nil)))]
+         (if (and (symbol? acc) (symbol? idx) (dialect/scalar-literal? init))
+           (list 'fold
+                 (cond-> {:accumulator acc :index idx :identity init :dtype fold-dtype
+                          :extent bound
+                          :association (if algebra :implementation-defined :ordered)}
+                   algebra (assoc :algebra algebra))
+                 (dialect/lambda-form [acc idx] [body]))
+           form))
+       form))
+   expression))
+
 (defn- map-equation
   [description]
-  (let [{:keys [id index extent locals casts bodies inputs results]} description
+  (let [{:keys [id index extent locals casts bodies inputs results elem-type]} description
+        fold-dtype (or elem-type (:result-dtype description) :double)
         expressions (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
         all-expressions (into (mapv :init locals) expressions)
         [pointwise stable] ((juxt filter remove) #(pointwise-input? all-expressions % index) inputs)
@@ -733,10 +764,14 @@
              (mapv (fn [{:keys [id dtype init]}]
                      (dialect/local-value
                       id dtype
-                      (util/subst-syms
-                       substitutions
-                       (first (elementize [init] arrays parameters index)))))))
-        body-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
+                      (canonicalize-scalar-folds
+                       (util/subst-syms
+                        substitutions
+                        (first (elementize [init] arrays parameters index)))
+                       fold-dtype)))))
+        body-results (mapv #(canonicalize-scalar-folds
+                             (util/subst-syms (zipmap captures capture-parameters) %)
+                             fold-dtype)
                            (elementize expressions arrays parameters index))]
     (list '= id results
           (list 'map {:index index :extent extent
