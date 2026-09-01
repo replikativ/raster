@@ -575,10 +575,13 @@ resident rewrite and typed-route opt-out are deleted. The analyzed front end now
 TypedSOAC subset directly. Certified inclusive and exclusive scans also cross the same typed
 algorithm and scheduled-program boundary, retaining explicit destination, result-layout, and
 graph-owned temporary-storage contracts. Migration is complete when hardware-costed multi-consumer
-fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted. Nested reductions
-inside a retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
-regions through its established scalar fallback; this is an explicit scheduling boundary rather
-than a loss of semantic facts.
+fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted.
+Nested scalar folds inside a retained map are now explicit typed scalar-region terms. Monoid-shaped
+folds carry an `AssociativeScan` certificate and an implementation-defined association contract, so
+the JVM may select its multi-accumulator SIMD reduction. General recurrences carry an ordered
+association contract and lower to an exact scalar loop. Portable C-family emission consumes the same
+term as a sequential fold; future subgroup/workgroup schedules must be selected from its certificate
+rather than rediscovering a reduction from source spelling.
 
 ### 3.3 Schedule and transform IR
 
@@ -967,9 +970,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    the same device-stripped Abstract Machine into this decision, and a missing machine retains the
    typed materialization boundary rather than speculating about duplicated work.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
-   route, including resident block transfers. Nested-region JVM scheduling, reducing/atomic
-   scatter variants, the remaining parallel forms, calibrated whole-graph placement costs, and
-   deletion of the remaining graph/backend fallbacks remain.
+   route, including resident block transfers. The public flat `par/gather` spelling now canonicalizes
+   to that ordinary typed map: JVM scheduling recognizes an exact stable indirect read and selects
+   hardware `vgather`, while C-family targets emit the same SegMap. Kernel-local C names are fresh
+   with respect to the typed ABI, so an index buffer cannot shadow the launch coordinate. Strided
+   gather, reducing/atomic scatter variants, the remaining parallel forms, calibrated whole-graph
+   placement costs, and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

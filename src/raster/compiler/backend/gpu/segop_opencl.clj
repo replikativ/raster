@@ -43,6 +43,13 @@
 (defn- seg-idx [segop] (:name (segop/seg-space-reduced-dim (:space segop))))
 (defn- seg-bound [segop] (:bound (segop/seg-space-reduced-dim (:space segop))))
 
+(defn- fresh-c-local
+  "Choose a deterministic kernel-local C identifier that cannot shadow an ABI parameter."
+  [base symbols]
+  (let [occupied (set (map ce/c-symbol symbols))]
+    (first (remove occupied
+                   (cons base (map #(str base "_" %) (range)))))))
+
 ;; ================================================================
 ;; SegMap → OpenCL kernel
 ;; ================================================================
@@ -98,6 +105,7 @@
                                 (map #(str (scalar-ctype %) " " (ce/c-symbol %)) scalars))
         parameter-list (str/join ", "
                                  (remove empty? [pointer-params scalar-params "int _n_bound"]))
+        local-index (fresh-c-local "idx" (concat pointers scalars ['_n_bound]))
         array-symbols (set (map #(clojure.core/symbol (name %)) pointers))
         int-scalars (into #{idx} (filter #(= "int" (scalar-ctype %)) scalars))
         adapted-body (ce/adapt-casts-for-dtype body default-dtype)
@@ -105,7 +113,7 @@
                               ce/*scalar-type* default-ctype
                               ce/*idx-sym* idx
                               ce/*int-vars* (into ce/*int-vars* int-scalars)]
-                      (ce/emit-stmt adapted-body idx array-symbols "idx"))
+                      (ce/emit-stmt adapted-body idx array-symbols local-index))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         abi (kabi/validate!
              (vec (concat
@@ -123,8 +131,8 @@
                            default-dtype (map pointer-dtype pointers))
                     (ce/intrinsic-helper-sources body-source)
                     "__kernel void " kernel-name "(" parameter-list ") {\n"
-                    "    for (int idx = get_global_id(0); idx < _n_bound; "
-                    "idx += get_global_size(0)) {\n"
+                    "    for (int " local-index " = get_global_id(0); " local-index
+                    " < _n_bound; " local-index " += get_global_size(0)) {\n"
                     "        " body-source "\n"
                     "    }\n}\n")]
     (kabi/validate-source-signature! kernel-name source abi)
@@ -223,6 +231,8 @@
         all-params (str/join ", "
                              (remove empty?
                                      [arr-param-str out-param scl-param-str "int _n_bound"]))
+        local-index (fresh-c-local "idx"
+                                   (concat arr-params [out-sym] scl-params ['_n_bound]))
         ;; Emit body as C expression
         adapted-body (ce/adapt-casts-for-dtype body out-dtype)
         arr-sym-set (cond-> (set (map #(symbol (name %)) arr-params))
@@ -231,9 +241,9 @@
                            ce/*scalar-type* out-ctype
                            ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
-                   (ce/emit-expr adapted-body idx arr-sym-set))
+                   (ce/emit-expr adapted-body idx arr-sym-set local-index))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
-        scalar-body-str (str result-c-name "[idx] = " cast-str ";")
+        scalar-body-str (str result-c-name "[" local-index "] = " cast-str ";")
         ;; Affine-index vectorization (shared c_emit): a SegMap store is `out[idx] = f(..)`,
         ;; expressed here as the synthetic aset the vectorizer analyzes. The store target
         ;; is the literal `out` param (not c-symbol-mangled), so pass :store-name. nil ⇒
@@ -245,7 +255,7 @@
                       (ce/emit-vectorized-elementwise-loop
                        (list 'aset result-symbol idx
                              (if cast-fn (list cast-fn adapted-body) adapted-body))
-                       idx (conj arr-sym-set result-symbol) "idx" scalar-body-str
+                       idx (conj arr-sym-set result-symbol) local-index scalar-body-str
                        {:n-bound "_n_bound" :store-name result-c-name}))
         ;; pragmas cover the output dtype AND every input array's dtype
         scalar-dtype (fn [s]
@@ -281,7 +291,8 @@
                     "(" all-params ") {\n"
                     "    "
                     (or loop-region
-                        (str "for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
+                        (str "for (int " local-index " = get_global_id(0); " local-index
+                             " < _n_bound; " local-index " += get_global_size(0)) {\n"
                              "        " scalar-body-str "\n"
                              "    }"))
                     "\n}\n")
