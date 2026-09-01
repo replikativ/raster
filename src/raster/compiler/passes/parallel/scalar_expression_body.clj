@@ -8,7 +8,8 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.passes.parallel.patterns :as patterns]))
 
 (def ^:private cast-heads
   {'byte :byte, 'clojure.core/byte :byte
@@ -25,6 +26,34 @@
       (reduce (fn [result [id init]] (util/subst-syms {id init} result))
               result (reverse (partition 2 bindings))))
     expression))
+
+(defn- match-ordered-loop
+  "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
+  [expression]
+  (or
+   (some-> (patterns/match-reduce-loop expression) (assoc :inclusive? false))
+   (when-let [{:keys [kind index-sym acc-sym acc-init body-form bound]}
+              (patterns/normalize-loop expression)]
+     (when (and (= :reduce-loop kind)
+                (= :le (descriptor/comparison-kind
+                        (descriptor/semantic-op (second body-form)))))
+       (let [[_ _test then-branch else-expr] body-form
+             recur-form (patterns/find-recur-form then-branch)
+             recur-args (vec (rest recur-form))
+             index-update? #(= 1 (descriptor/affine-step % index-sym))
+             [update-expr index-update]
+             (cond
+               (and (= 2 (count recur-args)) (index-update? (second recur-args)))
+               [(first recur-args) (second recur-args)]
+
+               (and (= 2 (count recur-args)) (index-update? (first recur-args)))
+               [(second recur-args) (first recur-args)]
+
+               :else [nil nil])]
+         (when (and update-expr index-update)
+           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym
+            :bound-expr bound :else-expr else-expr :update-expr update-expr
+            :inclusive? true}))))))
 
 (defn make-lowerer
   "Build a scalar-expression lowerer.
@@ -59,7 +88,34 @@
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
                       {:reason :raster/bug :lower-index lower-index :decline decline!})))
-    (letfn [(lower [expression expected env]
+    (letfn [(cast-lowered [lowered target expression]
+              (let [target (dtype/canon target)]
+                (if (= target (:type lowered))
+                  lowered
+                  (let [source (dtype/canon (:type lowered))
+                        fp-source? (dtype/fp-dtype? source)
+                        fp-target? (dtype/fp-dtype? target)
+                        widening? (<= (dtype/bytes-of source) (dtype/bytes-of target))
+                        [rounding overflow]
+                        (cond
+                          (and fp-source? fp-target? widening?) [:exact :exact]
+                          (and fp-source? fp-target?) [:nearest-even :ieee]
+                          (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
+                          (and (not fp-source?) fp-target? (= :double target)
+                               (<= (dtype/bytes-of source) 4)) [:exact :exact]
+                          :else
+                          (decline! :cast-policy
+                                    "scalar cast has no portable exact policy"
+                                    {:expression expression :source source :target target}))
+                        id (fresh "cast")]
+                    {:operations (conj (:operations lowered)
+                                       (body/->ScalarCompute
+                                        (body/value id target)
+                                        (body/cast-expression (:result lowered) target
+                                                              rounding overflow)))
+                     :result id :type target}))))
+
+            (lower [expression expected env]
               (let [expression (inline-lets expression)
                     expected (canon-type expected)]
                 (cond
@@ -88,7 +144,7 @@
                     (let [id (fresh "load")]
                       {:operations [(body/->ScalarLoad
                                      (body/value id array-type) array
-                                     [(lower-index coordinate)] predicate
+                                     [(lower-index coordinate (set (keys env)))] predicate
                                      (when predicate (body/literal 0 array-type)) :cached)]
                        :result id :type array-type}))
 
@@ -97,28 +153,15 @@
                   (let [target (dtype/canon (get cast-heads (first expression)))
                         source-expected (dtype/canon (source-type (second expression) target env))
                         lowered (lower (second expression) source-expected env)]
-                    (if (= target (:type lowered))
-                      lowered
-                      (let [source (dtype/canon (:type lowered))
-                            fp-source? (dtype/fp-dtype? source)
-                            fp-target? (dtype/fp-dtype? target)
-                            widening? (<= (dtype/bytes-of source) (dtype/bytes-of target))
-                            [rounding overflow]
-                            (cond
-                              (and fp-source? fp-target? widening?) [:exact :exact]
-                              (and fp-source? fp-target?) [:nearest-even :ieee]
-                              (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
-                              :else
-                              (decline! :cast-policy
-                                        "scalar cast has no portable exact policy"
-                                        {:expression expression :source source :target target}))
-                            id (fresh "cast")]
-                        {:operations (conj (:operations lowered)
-                                           (body/->ScalarCompute
-                                            (body/value id target)
-                                            (body/cast-expression (:result lowered) target
-                                                                  rounding overflow)))
-                         :result id :type target})))
+                    (cast-lowered lowered target expression))
+
+                  (and (seq? expression)
+                       (= 'raster.numeric/oftype (descriptor/semantic-op expression))
+                       (= 2 (count (descriptor/call-args expression))))
+                  (let [value-expression (second (descriptor/call-args expression))
+                        source-expected (canon-type (source-type value-expression expected env))
+                        lowered (lower value-expression source-expected env)]
+                    (cast-lowered lowered expected expression))
 
                   (and (seq? expression) (= 'if (first expression)) (= 4 (count expression)))
                   (let [[_ condition then-expression else-expression] expression
@@ -142,6 +185,53 @@
                                   (body/->Yield [(:result else-value)]))
                             [(body/value result result-type)]))
                      :result result :type result-type})
+
+                  (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
+                  (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
+                                   inclusive?]}
+                           (match-ordered-loop expression)]
+                    (do
+                      (when (or (patterns/contains-sym? bound-expr index-sym)
+                                (patterns/contains-sym? bound-expr acc-sym)
+                                (not= else-expr acc-sym))
+                        (decline! :ordered-loop-shape
+                                  "ordered scalar loop requires an invariant upper bound and returns its carry"
+                                  {:expression expression :bound bound-expr
+                                   :index index-sym :accumulator acc-sym :exit else-expr}))
+                      (let [loop-index (fresh "loop-index")
+                            carry (fresh "loop-carry")
+                            result (fresh "loop-result")
+                            initial (lower acc-init expected env)
+                            loop-type (:type initial)
+                            update (util/subst-syms {index-sym loop-index acc-sym carry}
+                                                    update-expr)
+                            lowered (lower update loop-type
+                                           (assoc env loop-index :long carry loop-type))
+                            _ (when-not (= loop-type (:type lowered))
+                                (decline! :ordered-loop-dtype
+                                          "ordered scalar loop carry dtype must remain invariant"
+                                          {:expression expression :initial loop-type
+                                           :update (:type lowered)}))
+                            upper (lower-index bound-expr (set (keys env)))
+                            upper (if inclusive?
+                                    (body/expression :add upper
+                                                     (body/index-cast 1 :long :exact))
+                                    upper)
+                            loop (body/->ForLoop
+                                  (body/value loop-index :long)
+                                  (body/index-cast 0 :long :exact)
+                                  upper 1
+                                  [(body/->LoopArg (body/value carry loop-type)
+                                                   (:result initial))]
+                                  (conj (vec (:operations lowered))
+                                        (body/->Yield [(:result lowered)]))
+                                  [(body/value result loop-type)]
+                                  {:association :ordered})]
+                        {:operations (conj (vec (:operations initial)) loop)
+                         :result result :type loop-type}))
+                    (decline! :ordered-loop-shape
+                              "scalar loop is outside the canonical ordered carry form"
+                              {:expression expression}))
 
                   (seq? expression)
                   (let [operator (intrinsics/canonical (descriptor/semantic-op expression))

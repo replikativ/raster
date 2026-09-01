@@ -5,6 +5,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.core :refer [deftm]]
+            [raster.dl.attention :as attention]
             [raster.numeric]
             [raster.par]
             [raster.runtime.hardware :as hardware]))
@@ -89,6 +90,15 @@
     (catch clojure.lang.ExceptionInfo exception
       (ex-data exception))))
 
+(defn- nested-operations
+  [operations]
+  (mapcat (fn [operation]
+            (cons operation
+                  (concat (nested-operations (or (:operations operation) []))
+                          (nested-operations (or (:then-operations operation) []))
+                          (nested-operations (or (:else-operations operation) [])))))
+          operations))
+
 (deftest public-equation-first-compilation-emits-cuda-and-hip-source
   (doseq [[target program-dialect module-target]
           [[cuda-target :cuda-parallel :cuda-c]
@@ -138,6 +148,35 @@
                    (comp (filter #(= :output (:kind %))) (map :id))
                    (get-in kernel [:attributes :kernel-body :parameters]))))
       (is (empty? (:outputs linked)) "Void host semantics remain effect-only")
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-gqa-composition-emits-only-portable-c-family-kernels
+  (doseq [[target program-dialect module-target]
+          [[cuda-target :cuda-parallel :cuda-c]
+           [hip-target :hip-parallel :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'attention/gqa-causal-mha {:target target :dtype :float})
+          linked (equation-first/lower
+                  compilation
+                  [(float-array [1 0 0 1 1 1 1 -1])
+                   (float-array [1 0 0 1])
+                   (float-array [1 2 3 4])
+                   1 2 2 1 2])
+          kernels (:kernels compilation)
+          loops (for [kernel kernels
+                      operation (nested-operations
+                                 (get-in kernel [:attributes :kernel-body :operations]))
+                      :when (= "ForLoop" (some-> operation class .getSimpleName))]
+                  operation)]
+      (is (= program-dialect (get-in compilation [:emitted :dialect])))
+      (is (= 7 (count kernels)))
+      (is (every? #(= module-target (:target %)) kernels))
+      (is (every? #(get-in % [:attributes :kernel-body]) kernels))
+      (is (not-any? #(re-find #"__kernel|get_global_id|get_local_id" (:source %)) kernels))
+      (is (seq loops))
+      (is (every? #(= :ordered (get-in % [:attributes :association])) loops))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
+      (is (= 1 (count (:outputs linked))))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest uncovered-c-family-route-never-borrows-opencl-source

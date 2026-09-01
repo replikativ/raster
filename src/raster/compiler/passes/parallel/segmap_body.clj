@@ -85,8 +85,13 @@
         scalar-types (into {} (map (juxt identity scalar-dtype)) scalars)
         index-scope (conj (set scalars) index)
         index-types (assoc scalar-types index :long)
-        lower-index #(widen-index-expression
-                      (contraction-body/lower-index % index-scope) index-types)
+        lower-index (fn lower-index
+                      ([expression] (lower-index expression #{}))
+                      ([expression extra-scope]
+                       (widen-index-expression
+                        (contraction-body/lower-index
+                         expression (set/union index-scope extra-scope))
+                        index-types)))
         lowerer (scalar-expression/make-lowerer
                  {:array-types array-types :scalar-types scalar-types
                   :arrays (set inputs) :index-scope index-scope

@@ -864,6 +864,12 @@
            (<= (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
       (str "(" (target-type result-type) ")(" argument-source ")")
 
+      ;; Every signed 32-bit integer is exactly representable as IEEE f64.
+      (and (not source-fp?) result-fp? (= :double result-type)
+           (<= (dtype/bytes-of source-type) 4)
+           (= [:exact :exact] [rounding overflow]))
+      (str "(" (target-type result-type) ")(" argument-source ")")
+
       :else
       (throw (ex-info "C-family target cannot preserve this KernelBody cast policy"
                       {:reason :kernel-body-c-cast-policy
@@ -1655,7 +1661,7 @@
                    (map #(c-dialect/parameter-declaration
                           *scalar-dialect*
                           (cond-> % (contains? stable-reads (:id %))
-                            (assoc :restrict? true))
+                                  (assoc :restrict? true))
                           (get parameter-names (:id %)))
                         parameters))
          ") {\n"
