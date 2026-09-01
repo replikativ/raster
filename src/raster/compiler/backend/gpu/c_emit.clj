@@ -135,6 +135,10 @@
   defaulting to *scalar-type*. Loop and let* emitters seed it for their bodies."
   #{})
 
+(def ^:dynamic *scalar-var-types*
+  "Exact native C-family types for typed scalar parameters in the current kernel region."
+  {})
+
 (def ^:dynamic *vec-width*
   "When non-nil (2 or 4), the affine-index vectorizer is active and *scalar-type*
   refers to the ELEMENT type of the V-wide vectors being emitted. Only set inside
@@ -299,15 +303,13 @@
   "Dtype keyword → C type. Derived from the single faceted dtype/native-types."
   (dtype/backend-types :c))
 
-(defn scalar-native-type
-  "Native type for a kernel SCALAR param, for a kernel whose element type is
-   `ctype`. A DECLARED type wins authoritatively — float/double/half → `ctype`
-   (the kernel element type), int/long/byte → \"int\"; ONLY when the declared
-   type is unknown does the name-regex / :tag heuristic apply. Loud-over-silent:
-   a declared float named `step-size`/`max-len` must NOT be truncated to int by
-   the counter-name regex. Single source for the OpenCL/GLSL backends (was a
-   7-way-duplicated cond where only an explicit :int short-circuited)."
-  [sym scalar-types ctype]
+(defn scalar-parameter-dtype
+  "Canonical dtype for a kernel scalar parameter.
+
+   Retained compiler facts win authoritatively. Metadata and the legacy name heuristic are used
+   only when no declared fact exists. This function returns semantic dtype—not target spelling—so
+   emitters and host ABI construction cannot disagree or silently narrow :long/:byte to :int."
+  [sym scalar-types default-dtype]
   (let [sname (name sym)
         explicit (get scalar-types sym (get scalar-types (symbol sname)))
         m (meta sym)
@@ -317,17 +319,26 @@
         ;; for non-primitive hints. This is the reliable signal; the name regex is a
         ;; fragile last-resort heuristic for untagged locals (e.g. a scalar whose
         ;; binder the inliner alpha-renamed `nb`→`nb_α_7`, which the regex misses).
-        mtag (or (:raster.type/tag m) (:tag m))]
+        mtag (or (:raster.type/tag m) (:tag m))
+        declared (cond
+                   (keyword? explicit) (dtype/canon explicit)
+                   (symbol? explicit) (dtype/dtype-for-scalar-tag
+                                       (descriptor/cast-result-tag explicit)))
+        metadata-dtype (cond
+                         (keyword? mtag) (when (dtype/known? mtag) (dtype/canon mtag))
+                         (symbol? mtag) (dtype/dtype-for-scalar-tag
+                                         (descriptor/cast-result-tag mtag)))]
     (cond
-      (contains? #{:float :double :half} explicit) ctype
-      (contains? #{:int :long :byte} explicit) "int"
+      explicit (or declared
+                   (throw (ex-info "kernel scalar has an unknown declared dtype"
+                                   {:reason :kernel-scalar-dtype :symbol sym
+                                    :declared explicit})))
       ;; Stamped tag is authoritative — it OUTRANKS the name regex so a float named
       ;; `len`/`count` isn't truncated to int and an int renamed away from an int-ish
       ;; name still declares int.
-      (contains? #{'long 'int 'byte} mtag) "int"
-      (contains? #{'float 'double 'half} mtag) ctype
-      (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname) "int"
-      :else ctype)))
+      metadata-dtype metadata-dtype
+      (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname) :int
+      :else (dtype/canon default-dtype))))
 
 (defn fn-style-reduction-op?
   "True if a reduction op emits as a C function call `f(a,b)` (fmax/fmin) rather
@@ -503,6 +514,10 @@
     ;; Par loop index variable is always uint/int
      (and (symbol? expr) *idx-sym* (= (name expr) (name *idx-sym*)))
      "uint"
+
+    ;; Retained scalar ABI facts outrank the legacy integer-category set.
+     (and (symbol? expr) (contains? *scalar-var-types* expr))
+     (get *scalar-var-types* expr)
 
     ;; In-scope integer variable (loop counter / int-inferred binding)
      (and (symbol? expr) (contains? *int-vars* expr))

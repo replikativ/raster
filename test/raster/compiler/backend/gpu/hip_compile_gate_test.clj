@@ -55,6 +55,8 @@
    ["device-math"  '(raster.par/map! out i n double (Math/sin (aget a i)))              {}]
    ["abs-double"   '(raster.par/map! out i n double (Math/abs (aget a i)))              {}]
    ["clamp-double" '(raster.par/map! out i n double (Math/max (aget a i) (Math/min (aget b i) c))) {}]
+   ["long-scalar"  '(raster.par/map! out i n double (+ (aget a i) (* 0.0 iteration)))
+    {:scalar-types {'iteration :long}}]
    ["add-float"    '(raster.par/map! out i n float  (+ (aget a i) (aget b i)))          {:dtype :float}]
    ["fma-float"    '(raster.par/map! out i n float  (+ (* (aget a i) (aget b i)) (aget c i))) {:dtype :float}]])
 
@@ -95,7 +97,12 @@
       (is (str/includes? src "fabs(") "double abs → fabs (double overload)")
       (is (str/includes? src "fmax(") "double max → fmax")
       (is (not (str/includes? src "fabsf")) "no float-narrowing fabsf on a double kernel")
-      (is (not (str/includes? src "fmaxf")) "no float-narrowing fmaxf on a double kernel"))))
+      (is (not (str/includes? src "fmaxf")) "no float-narrowing fmaxf on a double kernel")))
+  (testing "declared 64-bit scalar ABI survives CUDA/HIP spelling"
+    (let [src (:source (hip/generate-par-map-kernel
+                        '(raster.par/map! out i n double (+ (aget a i) (* 0.0 iteration)))
+                        :scalar-types {'iteration :long}))]
+      (is (str/includes? src "long long iteration")))))
 ;; NOTE: par-hip's SoA and gpu-helper-call map-void guards (fail-loud throws) are defensive — they
 ;; fire only on a real SoA-typed container / a real inlinable deftm call, which need full type
 ;; metadata to construct and so aren't unit-triggered here; they are exercised by the resident

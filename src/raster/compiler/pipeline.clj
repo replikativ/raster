@@ -1448,7 +1448,7 @@
       (when (#{6 7} argc)
         (let [[_ kname out src index n stride] expr
               ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
-              ;; (scalar-native-type keys on the name, and the value-fn still evaluates
+              ;; (scalar-parameter-dtype keys on the name, and the value-fn still evaluates
               ;; the raw symbol — it is an int stride/index param either way).
               strip-cast (fn [x] (if (and (seq? x)
                                           (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
@@ -2142,7 +2142,7 @@
                            ;; replay — the zeros-like semantics of scatter-add's output.
                            :accumulator (when accumulator (keyword (name accumulator)))
                            :n-fn (expr->arg-fn all-params scalar-lets n-expr)
-                           ;; Type each scalar arg with the SAME `scalar-native-type` the kernel
+                           ;; Type each scalar arg with the SAME canonical scalar dtype the kernel
                            ;; DECLARATION uses (par_opencl), so the host arg encoding always matches
                            ;; the kernel's C param type — single source of truth. A deftm PARAM is in
                            ;; scalar-types; a HOISTED LOCAL scalar (e.g. `nb (quot in 32)`, not a
@@ -2151,11 +2151,10 @@
                            ;; like `nb` was declared `int` in the kernel but encoded `:float` on the
                            ;; host → float-bits into an int slot → garbage index → OOB → device-lost.
                            :scalar-specs (mapv (fn [s]
-                                                 (let [ct (c-emit/scalar-native-type
-                                                           s (:scalar-types gpu-param-types)
-                                                           (if (= effective-dtype :double) "double" "float"))]
-                                                   {:type (case ct "int" :int "double" :double :float)
-                                                    :value-fn (expr->arg-fn all-params scalar-lets s)}))
+                                                 {:type (c-emit/scalar-parameter-dtype
+                                                         s (:scalar-types gpu-param-types)
+                                                         effective-dtype)
+                                                  :value-fn (expr->arg-fn all-params scalar-lets s)})
                                                scalars)
                            :convention convention
                            :phase (keyword (str "gpu-step-" i))})))

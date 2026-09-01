@@ -12,7 +12,8 @@
 (defn- loop-program
   ([] (loop-program false))
   ([chained?]
-   (let [extent (av/tensor {:dtype :long :shape []})
+   (let [extent (av/tensor {:dtype :int :shape []})
+         trip-index (av/tensor {:dtype :long :shape []})
          scalar (av/tensor {:dtype :float :shape []})
          tensor (av/tensor {:dtype :float :shape '[n]})
          inner-tensor (av/tensor {:dtype :float :shape '[n-in]})
@@ -38,7 +39,7 @@
                               equations)
          body (soac/make
                (soac/default-program-facts
-                {:values {'iteration extent 'n-in extent 'alpha-in scalar
+                {:values {'iteration trip-index 'n-in extent 'alpha-in scalar
                           'u-in inner-tensor 'u-temporary inner-tensor
                           'u-next inner-tensor}
                  :inputs '[iteration n-in alpha-in u-in]
@@ -52,7 +53,7 @@
        {:outer 'alpha :parameter 'alpha-in}]
       [{:initial 'u0 :parameter 'u-in :result 'u-next :output 'u-final}]
       body
-      {'steps extent 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}))))
+      {'steps trip-index 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}))))
 
 (deftest structured-control-takes-the-shared-soac-schedule-vertical
   (let [scheduled (lower/schedule (loop-program) {:target-device :cpu:0 :dtype :float})
@@ -93,6 +94,8 @@
                    (:nodes emitted))))
       (is (every? #(re-find #"__kernel void graph_segmap" (:source %))
                   (map :operation (:nodes emitted))))
+      (is (some #(re-find #"long iteration" (:source %))
+                (map :operation (:nodes emitted))))
       (let [call (loop-call/make
                   scheduled emitted
                   {'u0 :initial-buffer 'u-final :output-buffer}
@@ -107,7 +110,7 @@
                (:buffers (loop-call/iteration-binding call 1))))
         (is (= {'u-in :scratch-buffer 'u-next :output-buffer}
                (:buffers (loop-call/iteration-binding call 2))))
-        (is (= {:type :int :value 2}
+        (is (= {:type :long :value 2}
                (get-in (loop-call/iteration-binding call 2)
                        [:scalar-values 'iteration])))
         (testing "a copied SegOp ID cannot hide a changed operation certificate"

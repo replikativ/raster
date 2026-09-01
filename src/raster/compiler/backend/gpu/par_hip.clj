@@ -51,9 +51,10 @@
 
 (defn- emit-body
   "Emit a par-form body as a CUDA-C expression string via the shared emitter under hip-config."
-  [body idx arr-params dtype]
+  [body idx arr-params dtype scalar-var-types]
   (binding [ce/*emit-config* ce/hip-config
-            ce/*scalar-type* (ctype dtype)]
+            ce/*scalar-type* (ctype dtype)
+            ce/*scalar-var-types* scalar-var-types]
     (ce/emit-expr (ce/adapt-casts-for-dtype body dtype)
                   idx (set (map #(symbol (name %)) arr-params)))))
 
@@ -72,11 +73,13 @@
         scl-params  (vec (sort-by name scalar-syms))
         arr-param-str (str/join ", " (map (fn [s] (str "const " ct "* __restrict__ " (ce/c-symbol s)))
                                           arr-params))
-        scl-type    (fn [s] (ce/scalar-native-type s scalar-types ct))
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
+        scl-type    (fn [s] (ctype (scalar-dtype s)))
+        scalar-var-types (into {} (map (juxt identity scl-type)) scl-params)
         scl-param-str (str/join ", " (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
         out-param   (str ct "* __restrict__ out")
         all-params  (str/join ", " (remove empty? [arr-param-str out-param scl-param-str "int _n_bound"]))
-        body-str    (emit-body body idx arr-params dtype)
+        body-str    (emit-body body idx arr-params dtype scalar-var-types)
         cast-str    (if cast (str "(" (name cast) ")(" body-str ")") body-str)
         source      (str "extern \"C\" __global__ void " kernel-name
                          "(" all-params ") {\n"
@@ -127,16 +130,20 @@
                                            (str c "* " (ce/c-symbol s))
                                            (str "const " c "* __restrict__ " (ce/c-symbol s)))))
                                      arr-params))
-        scl-type    (fn [s] (ce/scalar-native-type s scalar-types default-ct))
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
+        scl-type    (fn [s] (ctype (scalar-dtype s)))
+        scalar-var-types (into {} (map (juxt identity scl-type)) scl-params)
         scl-param-str (str/join ", " (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
         all-params  (str/join ", " (remove empty? [arr-param-str scl-param-str "int _n_bound"]))
         ;; map-void body is STATEMENTS (side effects), emitted via emit-stmt with *int-vars* seeded
         ;; from idx + declared-int scalar params — WITHOUT this a let-bound index infers the float
         ;; scalar-type and becomes a non-integer array subscript (compile error). Mirrors par_opencl.
         arr-syms    (set (map #(symbol (name %)) arr-params))
-        int-scalar-syms (into #{idx} (filter #(= "int" (scl-type %)) scl-params))
+        int-scalar-syms (into #{idx} (filter #(contains? #{:int :long :byte}
+                                                         (scalar-dtype %)) scl-params))
         body-str    (binding [ce/*emit-config* ce/hip-config
                               ce/*scalar-type* default-ct
+                              ce/*scalar-var-types* scalar-var-types
                               ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                       (ce/emit-stmt (ce/adapt-casts-for-dtype body dtype) idx arr-syms "idx"))
         source      (str "extern \"C\" __global__ void " kernel-name

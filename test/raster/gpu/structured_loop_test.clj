@@ -10,7 +10,8 @@
 
 (defn- scheduled-call
   [trip-count]
-  (let [extent (av/tensor {:dtype :long :shape []})
+  (let [extent (av/tensor {:dtype :int :shape []})
+        trip-index (av/tensor {:dtype :long :shape []})
         scalar (av/tensor {:dtype :float :shape []})
         tensor (av/tensor {:dtype :float :shape '[n]})
         inner-tensor (av/tensor {:dtype :float :shape '[n-in]})
@@ -21,7 +22,7 @@
                     (soac/lambda-form '[u-value alpha-value] '[(+ u-value alpha-value)])))
         body (soac/make
               (soac/default-program-facts
-               {:values {'iteration extent 'n-in extent 'alpha-in scalar
+               {:values {'iteration trip-index 'n-in extent 'alpha-in scalar
                          'u-in inner-tensor 'u-next inner-tensor}
                 :inputs '[n-in alpha-in u-in]
                 :equations {'advance (soac/default-equation-facts)}})
@@ -35,7 +36,7 @@
           {:outer 'alpha :parameter 'alpha-in}]
          [{:initial 'u0 :parameter 'u-in :result 'u-next :output 'u-final}]
          body
-         {'steps extent 'n extent 'alpha scalar 'u0 tensor 'u-final tensor})
+         {'steps trip-index 'n extent 'alpha scalar 'u0 tensor 'u-final tensor})
         scheduled (lower/schedule algorithm {:target-device :cpu:0 :dtype :float})
         emitted (opencl/generate-kernel-graph
                  (:graph scheduled) :scalar-types {'alpha-in :float})]

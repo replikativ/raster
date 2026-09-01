@@ -630,6 +630,12 @@ independent claims. Target emission may replace only each scheduled operation. E
 requires the pre/post-emission dataflow contracts to be identical. A copied operation ID is not an
 emission certificate.
 
+Scalar ABI dtypes are likewise semantic facts, not C-spelling inference. One canonical projection
+from retained dtype metadata drives OpenCL, CUDA/HIP, and host binding; target code generation maps
+that dtype to native syntax only afterward. In particular, a 64-bit loop induction value remains
+64-bit while an explicitly 32-bit array bound remains 32-bit, and runtime call construction checks
+both against the retained structured-loop AbstractValues.
+
 Functionalizing a mutating host loop is deliberately proof-gated. A relational host
 `AbstractValue` refinement records shape equalities exposed by typed length queries, clones,
 same-shaped allocation, and pure maps. A primitive copy becomes a loop-carried state transition

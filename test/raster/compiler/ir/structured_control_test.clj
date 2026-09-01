@@ -7,7 +7,8 @@
 
 (def ^:private tensor (av/tensor {:dtype :float :shape '[n]}))
 (def ^:private inner-tensor (av/tensor {:dtype :float :shape '[n-in]}))
-(def ^:private extent (av/tensor {:dtype :long :shape []}))
+(def ^:private extent (av/tensor {:dtype :int :shape []}))
+(def ^:private trip-index (av/tensor {:dtype :long :shape []}))
 (def ^:private scalar (av/tensor {:dtype :float :shape []}))
 
 (defn- fixture
@@ -23,12 +24,12 @@
                          u-value)])))
         body-facts
         (soac/default-program-facts
-         {:values {'iteration extent 'n-in extent 'alpha-in scalar
+         {:values {'iteration trip-index 'n-in extent 'alpha-in scalar
                    'u-in inner-tensor 'u-next inner-tensor}
           :inputs '[iteration n-in alpha-in u-in]
           :equations {'advance (soac/default-equation-facts)}})
         body-program (soac/make body-facts [body-equation] '[u-next])
-        outer-values {'steps extent 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}
+        outer-values {'steps trip-index 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}
         loop-facts {:id 'time-loop :effects #{}
                     :provenance {:source :rk4-like}
                     :attributes {:association :sequential}}

@@ -85,13 +85,9 @@
                          (and (read? symbol) (written? symbol)) :inout
                          (written? symbol) :output
                          :else :input))
-        scalar-ctype #(ce/scalar-native-type % scalar-types default-ctype)
-        scalar-dtype (fn [symbol]
-                       (case (scalar-ctype symbol)
-                         "int" :int
-                         "long" :long
-                         "double" :double
-                         "float" :float))
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types default-dtype)
+        scalar-ctype #(dt/ctype :opencl (scalar-dtype %))
+        scalar-var-types (into {} (map (juxt identity scalar-ctype)) scalars)
         pointer-params
         (str/join ", "
                   (map (fn [symbol]
@@ -111,6 +107,7 @@
         adapted-body (ce/adapt-casts-for-dtype body default-dtype)
         body-source (binding [ce/*emit-config* ce/opencl-config
                               ce/*scalar-type* default-ctype
+                              ce/*scalar-var-types* scalar-var-types
                               ce/*array-dtypes* array-types
                               ce/*idx-sym* idx
                               ce/*int-vars* (into ce/*int-vars* int-scalars)]
@@ -228,9 +225,10 @@
                                                   (arr-type s) "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        ;; Integer scalar params seed *int-vars* so index math stays integer
-        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
-        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
+        scl-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
+        scl-type #(dt/ctype :opencl (scl-dtype %))
+        scalar-var-types (into {} (map (juxt identity scl-type)) scl-params)
+        int-scalar-syms (set (filter #(dt/integral? (scl-dtype %)) scl-params))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -246,6 +244,7 @@
                       primary-inout? (conj result-symbol))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* out-ctype
+                           ce/*scalar-var-types* scalar-var-types
                            ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx arr-sym-set local-index))
@@ -257,6 +256,7 @@
         ;; scalar loop.
         loop-region (binding [ce/*emit-config* ce/opencl-config
                               ce/*scalar-type* out-ctype
+                              ce/*scalar-var-types* scalar-var-types
                               ce/*idx-sym* idx
                               ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                       (ce/emit-vectorized-elementwise-loop
@@ -265,12 +265,7 @@
                        idx (conj arr-sym-set result-symbol) local-index scalar-body-str
                        {:n-bound "_n_bound" :store-name result-c-name}))
         ;; pragmas cover the output dtype AND every input array's dtype
-        scalar-dtype (fn [s]
-                       (case (scl-type s)
-                         "int" :int
-                         "long" :long
-                         "double" :double
-                         "float" :float))
+        scalar-dtype scl-dtype
         abi (kabi/validate!
              (vec (concat
                    (map (fn [s]
@@ -356,11 +351,9 @@
                           (get array-types (symbol (name id)))
                           dtype))
         input-ctype #(dt/ctype :opencl (input-dtype %))
-        scalar-dtype (fn [id]
-                       (or (get scalar-types id)
-                           (get scalar-types (symbol (name id)))
-                           dtype))
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
         scalar-ctype #(dt/ctype :opencl (scalar-dtype %))
+        scalar-var-types (into {} (map (juxt identity scalar-ctype)) scalars)
         input-params (str/join ", "
                                (map #(str "__global const " (input-ctype %)
                                           "* restrict " (ce/c-symbol %))
@@ -375,6 +368,7 @@
         adapted-body (ce/adapt-casts-for-dtype body dtype)
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* default-ctype
+                           ce/*scalar-var-types* scalar-var-types
                            ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalars)]
                    (ce/emit-expr adapted-body idx (set inputs)))
@@ -533,10 +527,11 @@
                            (map (comp util/free-syms :bound) (segop/seg-space-dims space)))
         scalar-params (vec (sort-by name (clojure.set/union (:scalars segred) bound-syms)))
         scalar-types (merge (into {} (map (fn [s] [s :int]) bound-syms)) scalar-types)
-        default-ctype (dt/ctype :opencl (or (:dtype segred) :float))
-        scalar-ctype #(ce/scalar-native-type % scalar-types default-ctype)
-        scalar-dtype (fn [s] (case (scalar-ctype s)
-                               "int" :int "long" :long "double" :double "float" :float))
+        default-dtype (or (:dtype segred) :float)
+        default-ctype (dt/ctype :opencl default-dtype)
+        scalar-dtype #(ce/scalar-parameter-dtype % scalar-types default-dtype)
+        scalar-ctype #(dt/ctype :opencl (scalar-dtype %))
+        scalar-var-types (into {} (map (juxt identity scalar-ctype)) scalar-params)
         input-dtype #(get array-types % (get array-types (symbol (name %)) (:dtype segred)))
         input-ctype #(dt/ctype :opencl (input-dtype %))
         component-ctype #(dt/ctype :opencl (:dtype %))
@@ -554,6 +549,7 @@
         (fn [expr]
           (binding [ce/*emit-config* ce/opencl-config
                     ce/*scalar-type* default-ctype
+                    ce/*scalar-var-types* scalar-var-types
                     ce/*idx-sym* idx
                     ce/*int-vars* (into ce/*int-vars* int-vars)]
             (ce/emit-expr expr idx array-syms (ce/c-symbol idx))))
@@ -564,6 +560,7 @@
                 form (util/subst-syms substitutions (ce/normalize-array-prims form))]
             (binding [ce/*emit-config* ce/opencl-config
                       ce/*scalar-type* (dt/ctype :opencl dtype)
+                      ce/*scalar-var-types* scalar-var-types
                       ce/*idx-sym* idx
                       ce/*int-vars* (into ce/*int-vars* int-vars)]
               (ce/emit-expr (ce/adapt-casts-for-dtype form dtype) idx array-syms (ce/c-symbol idx)))))
@@ -759,15 +756,10 @@
            ctype (dt/ctype :opencl dtype)
            arr-params (vec (sort-by name (:inputs segred)))
            scl-params (vec (sort-by name (:scalars segred)))
-           int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k))))
-                                      scalar-types))
-           scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
-           scalar-dtype (fn [s]
-                          (case (scl-type s)
-                            "int" :int
-                            "long" :long
-                            "double" :double
-                            "float" :float))
+           scalar-dtype #(ce/scalar-parameter-dtype % scalar-types dtype)
+           scl-type #(dt/ctype :opencl (scalar-dtype %))
+           scalar-var-types (into {} (map (juxt identity scl-type)) scl-params)
+           int-scalar-syms (set (filter #(dt/integral? (scalar-dtype %)) scl-params))
         ;; Detect reduction op from lambda — unwrap let to find op, keep let for elem
            [let-bindings inner-body]
            (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
@@ -846,6 +838,7 @@
            elem-str (when adapted-elem
                       (binding [ce/*emit-config* ce/opencl-config
                                 ce/*scalar-type* ctype
+                                ce/*scalar-var-types* scalar-var-types
                                 ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                         (ce/emit-expr adapted-elem idx (set (map #(symbol (name %)) arr-params)) idx-c-name)))
         ;; Build kernel source
