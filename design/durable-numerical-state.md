@@ -180,6 +180,35 @@ Datahike lineage graph because none of those formats supplies the whole programm
 - Direct communication and durable checkpoint traffic contend for PCIe/NIC/storage bandwidth. The
   outer workload planner must schedule both, even though only the former is a collective/halo step.
 
+## Adaptive mesh composition
+
+`AMRWorkloadPlan` is the first checked composition of the three planes for adaptive scientific
+workloads. Its `RefinementHierarchy` owns semantic level and patch coordinates. Every patch binds
+one complete `NumericalStateManifest` field to one fully owned value in a certified
+`DistributedPlan`. Prolongation and restriction name exact aligned rectangles, compatible storage
+contracts, and explicit operator requirements; cross-device plans derive transfer byte counts from
+the source field dtype and retain field identities, access roles, and regions on the generated
+transfer and compute steps. The resulting AMR certificate embeds the complete durable-state
+certificate, hierarchy witness, operation expansions, routes, and distributed certificate/cost
+vector, so reusing a manifest identity cannot conceal changed content.
+
+The hierarchy does not contain content placements, store handles, buffers, communicators, or
+events. Conversely, the distributed plan does not reconstruct refinement meaning from transfer
+attributes. This outer composition allows Datahike to version a simulation state and selected
+certified plan while direct links carry hot patch data and Konserve-compatible tiers retain
+immutable checkpoint chunks.
+
+Version 1 is deliberately limited to cell-centred rectangular patches, adjacent-level operations,
+and one owned distributed value per patch. Its schema and `:hierarchy-only`/`:transfer-cycle` mode
+are load-bearing. A transfer cycle requires exactly one full-patch prolongation and restriction per
+refined patch. It proves alignment, non-overlap, a strict one-parent proper-nesting margin (without
+a physical-boundary exemption), durable coordinate identity, exact shard binding, and planning/
+certificate agreement. Declared operator requirements are not yet proofs of an executable numeric
+kernel. Conservative hyperbolic solvers require typed operator bodies, explicit time refinement,
+flux-register accumulation, reflux, and average-down ordering before Raster may claim a complete
+AMR step. The next demonstrator should make those contracts load-bearing in a 2-D shallow-water or
+finite-volume workload and checkpoint only changed patches.
+
 ## Workload-driven landing order
 
 1. Ratchet the existing RK4/PDE numerical oracle and remove its broad compound-kernel tolerance.
@@ -195,9 +224,9 @@ Datahike lineage graph because none of those formats supplies the whole programm
 7. Demonstrate a conservative 2-D shallow-water workload: mass/lake-at-rest/convergence oracles,
    chunk checkpoint, exact restore, branch to a changed parameter or boundary, and simulated
    multi-device halo overlap. Run local mmap in the hot loop; make MinIO/S3 an optional slow gate.
-8. Add AMR hierarchy values plus typed restriction, prolongation and reflux contracts; checkpoint
-   only changed tiles. Validate the same state machinery with a transformer training checkpoint
-   containing parameters, optimizer, RNG and data cursor.
+8. Extend the landed AMR hierarchy and typed prolongation/restriction schedule with subcycling and
+   reflux contracts; checkpoint only changed patches. Validate the same state machinery with a
+   transformer training checkpoint containing parameters, optimizer, RNG and data cursor.
 
 The laptop/CI loop remains hardware-independent: semantic certification, restore compatibility,
 storage fault injection, the distributed simulator and small numerical oracles run locally.
