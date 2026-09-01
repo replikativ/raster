@@ -59,13 +59,24 @@
              (descriptor/alloc-op? (descriptor/semantic-op expression)))
     (let [semantic-operation (descriptor/semantic-op expression)
           operation (operation-name expression)
-          length (first (descriptor/call-args expression))
+          arguments (descriptor/call-args expression)
           array-tag (or (get descriptor/alloc-sym->array-tag semantic-operation)
                         (get descriptor/alloc-sym->array-tag
                              (some-> operation symbol)))
-          allocation-dtype (dtype/dtype-for-array-tag array-tag)]
-      (when (and allocation-dtype length)
-        {:dtype allocation-dtype :extent length}))))
+          allocation-dtype (dtype/dtype-for-array-tag array-tag)
+          initialization (descriptor/allocation-initialization semantic-operation)]
+      (cond
+        (and allocation-dtype (= 1 (count arguments)))
+        {:dtype allocation-dtype :extent (first arguments)}
+
+        ;; Parametric allocators use the first argument only as a dtype exemplar. Their retained
+        ;; AbstractValue and final length are sufficient for host planning; no value dependency on
+        ;; the exemplar exists for :zero/:unspecified initialization.
+        (and (contains? #{:zero :unspecified} initialization)
+             (<= 2 (count arguments)))
+        {:source (first arguments) :extent (last arguments)}
+
+        :else nil))))
 
 (defn- canonical-extent
   [equalities extent]
@@ -117,6 +128,9 @@
 (defn- infer-value
   [state symbol expression default-dtype]
   (let [values (:values state)
+        retained-array-dtype
+        (or (some-> symbol types/sym-type-tag dtype/dtype-for-array-tag)
+            (some-> expression types/sym-type-tag dtype/dtype-for-array-tag))
         retained-scalar-dtype
         (or (some-> symbol types/sym-type-tag dtype/dtype-for-scalar-tag)
             (some-> expression types/sym-type-tag dtype/dtype-for-scalar-tag))
@@ -151,6 +165,7 @@
       alength-expression
       (let [state (assoc-in state [:values symbol]
                             (tensor (or cast-dtype
+                                        (get-in values [symbol :dtype])
                                         (dtype/dtype-for-scalar-tag 'int)) []))]
         (refine-array-extent state alength-array symbol))
 
@@ -164,10 +179,15 @@
 
       allocation
       (let [extent (or (shape-extent state (:extent allocation))
-                       (:extent allocation))]
-        (-> state
-            (retain-extent-equality (:extent allocation) extent)
-            (assoc-in [:values symbol] (tensor (:dtype allocation) [extent]))))
+                       (:extent allocation))
+            allocation-dtype (or (:dtype allocation)
+                                 (get-in values [(:source allocation) :dtype])
+                                 retained-array-dtype)]
+        (if allocation-dtype
+          (-> state
+              (retain-extent-equality (:extent allocation) extent)
+              (assoc-in [:values symbol] (tensor allocation-dtype [extent])))
+          state))
 
       (par/par-map-pure-form? expression)
       (let [{:keys [bound cast elem-type]} (par/extract-par-map-pure-info expression)
@@ -203,7 +223,10 @@
 
       (symbol? expression)
       (if-let [value (get values expression)]
-        (assoc-in state [:values symbol] value)
+        (cond-> (assoc-in state [:values symbol] value)
+          (and (= [] (:shape value))
+               (contains? #{:int :long} (dtype/canon (:dtype value))))
+          (assoc-in [:equalities expression] symbol))
         state)
 
       cast-dtype
@@ -241,12 +264,20 @@
         values (into {} (map (fn [[id value]] [id (normalize-value value)])) values)
         [_ bindings] source
         pairs (partition 2 bindings)]
-    (reduce (fn [state [symbol expression]]
-              (infer-value state symbol expression dtype))
-            {:values (merge seed-arrays seed-scalars values)
-             :equalities {}
-             :diagnostics []}
-            pairs)))
+    (let [analysis
+          (reduce (fn [state [symbol expression]]
+                    (infer-value state symbol expression dtype))
+                  {:values (merge seed-arrays seed-scalars values)
+                   :equalities {}
+                   :diagnostics []}
+                  pairs)]
+      (update analysis :values
+              (fn [values]
+                (into {}
+                      (map (fn [[id value]]
+                             [id (update value :shape
+                                         #(canonical-shape (:equalities analysis) %))]))
+                      values))))))
 
 (defn- zero-index?
   [expression]

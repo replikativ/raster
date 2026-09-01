@@ -470,15 +470,15 @@
         linked-plan (equation-first/lower compilation arguments)
         call (get-in linked-plan [:instances 0 :call])
         staging (program-runtime/staging-plan call :loop-free-mlp)
-        first-layer-rows (first (get-in semantic [:values 'b1 :shape]))
-        host-equation (first (filter #(true? (get-in % [:attributes :host-only]))
-                                     (get-in compilation [:scheduled :equations])))]
+        first-layer-rows (first (get-in semantic [:values 'b1 :shape]))]
     (is (= :typed-parallel (:dialect semantic)))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
+    (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
     (is (= 3 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
-    (is (= [first-layer-rows] (:operands host-equation))
-        "the second layer consumes the certified intermediate extent, not a device alength")
+    (is (= 2 (count (get-in compilation [:scheduled :equations])))
+        "pure host scalar/shape equations belong to the typed invocation plan")
+    (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
     (is (= 2 (count staging)))
     (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
         "program shape facts remain available when a later kernel has no ABI use for them")
@@ -596,7 +596,7 @@
     (is (= #{:state} (set (vals (link/instance-roles plan instance)))))
     (is (every? #(= 1 (count (:leaves %))) (vals (:values plan))))
     (is (false? (get-in remapped [:attributes :source-inspected])))
-    (is (= :program-link-graph-range
+    (is (= :program-link-value-contract
            (reason-of
             #(link/make
               {:id :undersized-rk4 :target :ocl:0

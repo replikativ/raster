@@ -1278,6 +1278,21 @@
               operation))))]
     (finalize-emitted-graph emitted :opencl-c scalar-types)))
 
+(defn- generate-fold-map-kernel-graph
+  [graph {:keys [scalar-types array-types]
+          :or {scalar-types {} array-types {}}}]
+  (let [array-types (graph-array-types graph array-types)
+        emitted
+        (kgraph/map-operations
+         graph
+         (fn [{:keys [operation]}]
+           (kart/certify-scheduled-operation
+            (generate-segfoldmap-kernel
+             operation :scalar-types scalar-types :array-types array-types
+             :kernel-name-prefix "graph_segmented_fold_map")
+            operation)))]
+    (finalize-emitted-graph emitted :opencl-c scalar-types)))
+
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
 
@@ -1300,6 +1315,11 @@
            (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
                    (:nodes graph)))
       (generate-reduction-kernel-graph graph opts)
+
+      (and (seq (:nodes graph))
+           (every? #(instance? raster.compiler.ir.segop.SegFoldMap (:operation %))
+                   (:nodes graph)))
+      (generate-fold-map-kernel-graph graph opts)
 
       :else
       (throw (ex-info "OpenCL backend has no target lowering for scheduled KernelGraph"

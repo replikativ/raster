@@ -22,7 +22,8 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
-            [raster.compiler.passes.scalar.effects :as effects]))
+            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.host-abstract-value :as host-av]))
 
 (defn- ordered-distinct
   [values]
@@ -196,13 +197,12 @@
           dimension
           (list (dtype/scalar-tag-for-dtype result-dtype) dimension))))))
 
-(defn- host-shape-equation?
-  [program-values program-inputs program-outputs equation]
+(defn- scalar-equation-expression
+  [equation]
   (let [algorithm (:algorithm equation)]
     (when (and (soac/program-form? algorithm)
                (empty? (:effects equation))
                (= 1 (count (:results equation)))
-               (not-any? (set (:results equation)) program-outputs)
                (= 1 (count (soac/equations algorithm))))
       (let [algorithm-equation (first (soac/equations algorithm))
             {:keys [kind captures lambda]} (soac/operation-parts algorithm-equation)
@@ -210,34 +210,44 @@
             expression (when (and (= 'scalar kind) (empty? locals)
                                   (= 1 (count body-results)))
                          (util/subst-syms (zipmap parameters captures)
-                                          (first body-results)))
-            source (shape-projection-source expression)]
-        (and source
-             (or (contains? program-inputs source)
-                 (certified-shape-dimension program-values source)))))))
+                                          (first body-results)))]
+        expression))))
 
-(defn- hoist-host-shape-equations
+(defn- host-invocation-equation?
+  [available program-outputs equation]
+  (let [expression (scalar-equation-expression equation)]
+    (and expression
+         (not-any? (set (:results equation)) program-outputs)
+         (set/subset? (set (:operands equation)) available)
+         (or (shape-projection-source expression)
+             (= :pure (effects/analyze-effect expression))))))
+
+(defn- hoist-host-invocation-equations
   [parallel-program]
-  (let [program-values (:values parallel-program)
-        program-inputs (set (:inputs parallel-program))
-        program-outputs (:outputs parallel-program)
-        [hoisted retained] ((juxt filter remove)
-                            #(host-shape-equation? program-values program-inputs program-outputs %)
-                            (:equations parallel-program))
-        hoisted (vec hoisted)
-        retained (vec retained)]
+  (let [program-outputs (:outputs parallel-program)
+        {:keys [hoisted retained]}
+        (reduce (fn [{:keys [available] :as state} equation]
+                  (if (host-invocation-equation? available program-outputs equation)
+                    (-> state
+                        (update :hoisted conj equation)
+                        (update :available into (:results equation)))
+                    (update state :retained conj equation)))
+                {:available (set (:inputs parallel-program))
+                 :hoisted [] :retained []}
+                (:equations parallel-program))]
     (if (empty? hoisted)
       parallel-program
-      (let [required (set (program/infer-inputs retained))
-            hoisted-results (vec (mapcat :results hoisted))
-            inputs (vec (distinct (concat (:inputs parallel-program)
-                                          (filter required hoisted-results))))]
+      (let [inputs (program/infer-inputs retained)
+            shape-equations (count (filter (comp shape-projection-source
+                                                 scalar-equation-expression)
+                                           hoisted))]
         (-> parallel-program
             (assoc :equations retained
                    :inputs inputs
                    :effects (reduce set/union #{} (map :effects retained)))
             (update :attributes assoc
-                    :invocation-shape-equations (count hoisted)))))))
+                    :invocation-scalar-equations (count hoisted)
+                    :invocation-shape-equations shape-equations))))))
 
 (defn- required-prefix-symbols
   [pairs roots]
@@ -252,17 +262,18 @@
         (if (= required required') required (recur required'))))))
 
 (defn- invocation-prefix
-  [parallel-program public-parameters]
+  [parallel-program public-parameters prefix-values]
   (let [source (:source parallel-program)]
     (when-not (and (seq? source) (contains? #{'let 'let*} (first source)))
       (fail! :structured-control-invocation-source
              "an analyzed TypedSOAC program requires a flat retained host source boundary"
              {:source source}))
     (let [program-values (:values parallel-program)
+          prefix-values (merge prefix-values program-values)
           public-inputs (set public-parameters)
           source-pairs (mapv (fn [[symbol expression]]
                                [symbol (canonicalize-shape-projection
-                                        program-values public-inputs symbol expression)])
+                                        prefix-values public-inputs symbol expression)])
                              (partition 2 (second source)))
           equation-sites (into #{} (keep (fn [equation]
                                            (when (= :binding (first (:site equation)))
@@ -271,7 +282,12 @@
           candidates (filterv (fn [[symbol _]]
                                 (not (contains? equation-sites symbol)))
                               source-pairs)
-          roots (set/difference (set (:inputs parallel-program))
+          shape-roots
+          (into #{}
+                (comp (mapcat (comp #(mapcat util/free-syms %) :shape val))
+                      (filter #(scalar-value? (get prefix-values %))))
+                program-values)
+          roots (set/difference (set/union (set (:inputs parallel-program)) shape-roots)
                                 (set public-parameters))
           required (required-prefix-symbols candidates roots)
           bindings (filterv (comp required first) candidates)
@@ -306,12 +322,13 @@
    direct parameters map by identity, while the transitive non-equation host prefix becomes typed
    ShapeProjection/ScalarCompute/allocation steps. Structured loops and loop-free algorithms can
    therefore share scheduling, emission, ProgramCall, LinkPlan, and runtime lowering."
-  [parallel-program {:keys [public-parameters active-params array-types scalar-types]}]
+  [parallel-program {:keys [public-parameters active-params array-types scalar-types]
+                     :as options}]
   (when-not (= :typed-soac (:dialect parallel-program))
     (fail! :structured-control-soac-promotion
            "loop-free promotion requires an analyzed :typed-soac ParallelProgram"
            {:dialect (:dialect parallel-program)}))
-  (let [parallel-program (hoist-host-shape-equations parallel-program)
+  (let [parallel-program (hoist-host-invocation-equations parallel-program)
         public-parameters (vec (or public-parameters active-params))
         _ (when-not (seq public-parameters)
             (fail! :structured-control-public-parameters
@@ -324,15 +341,76 @@
                                public-parameters)
         parallel-program (normalize-public-contracts parallel-program parameter-values)
         program-values (:values parallel-program)
-        prefix (invocation-prefix parallel-program public-parameters)
-        binding-values (into {} (map (fn [[symbol expression]]
-                                       (let [value (get program-values symbol)]
-                                         (when-not value
-                                           (fail! :structured-control-prefix-value
-                                                  "host-prefix binding has no retained AbstractValue"
-                                                  {:symbol symbol :expression expression}))
-                                         [symbol value]))
-                                     prefix))
+        host-values
+        (:values
+         (host-av/analyze
+          (:source parallel-program)
+          (assoc options :values program-values
+                 :array-types array-types :scalar-types scalar-types)))
+        ;; Host relational analysis is authoritative only where it genuinely refines the typed
+        ;; program (not where it merely chooses a different symbolic spelling). This supplies flat
+        ;; physical allocation extents while preserving logical N-D result shapes.
+        program-values
+        (reduce-kv (fn [values symbol host-value]
+                     (if-let [program-value (get values symbol)]
+                       (if-let [refined (av/merge-refinement program-value host-value)]
+                         (assoc values symbol refined)
+                         values)
+                       values))
+                   program-values host-values)
+        ;; Symbols that occur only as logical/physical dimensions are still typed values at the
+        ;; public invocation boundary. Declare their retained host facts in the program value
+        ;; table so emitted calls can certify N-D logical shapes against flattened storage without
+        ;; inventing an untyped shape environment in the linker.
+        shape-symbols (into #{} (mapcat (comp #(mapcat util/free-syms %) :shape val))
+                            program-values)
+        shape-values (into {} (filter (fn [[symbol value]]
+                                        (and (contains? shape-symbols symbol)
+                                             (scalar-value? value))))
+                           host-values)
+        program-values (merge shape-values program-values)
+        parallel-program (assoc parallel-program :values program-values)
+        prefix (invocation-prefix parallel-program public-parameters host-values)
+        binding-values
+        (into {}
+              (map (fn [[symbol expression]]
+                     (let [program-value (get program-values symbol)
+                           host-value (get host-values symbol)
+                           value (cond
+                                   ;; An exact lexical alias keeps one runtime storage identity.
+                                   ;; Its program-side symbolic shape remains authoritative and
+                                   ;; materialization later proves both symbolic extents resolve to
+                                   ;; the same concrete view before binding.
+                                   (and program-value host-value (symbol? expression))
+                                   program-value
+
+                                   (and program-value host-value)
+                                   (or (av/merge-refinement program-value host-value)
+                                       (when (av/storage-contract-compatible?
+                                              program-value host-value)
+                                         host-value)
+                                       (fail! :structured-control-prefix-value-conflict
+                                              "host and typed program facts disagree on a prefix value"
+                                              {:symbol symbol :expression expression
+                                               :program-value program-value
+                                               :host-value host-value}))
+                                   program-value program-value
+                                   host-value host-value)]
+                       (when-not value
+                         (fail! :structured-control-prefix-value
+                                "host-prefix binding has no retained AbstractValue"
+                                {:symbol symbol :expression expression}))
+                       [symbol value])))
+              prefix)
+        program-values
+        (reduce-kv (fn [values symbol value]
+                     (if-let [prior (get values symbol)]
+                       (if-let [refined (av/merge-refinement prior value)]
+                         (assoc values symbol refined)
+                         values)
+                       values))
+                   program-values binding-values)
+        parallel-program (assoc parallel-program :values program-values)
         promoted (assoc parallel-program :dialect :typed-parallel)
         plan (invocation/from-prefix
               {:id [:program-invocation (mapv :id (:equations parallel-program))]

@@ -115,6 +115,19 @@
     (is (= (select-keys external [:dtype :shape :logical-layout :representation])
            (select-keys copy [:dtype :shape :logical-layout :representation])))))
 
+(deftest parametric-allocation-uses-its-exemplar-dtype-and-explicit-extent
+  (let [input (av/tensor {:dtype :float :shape ['m] :representation {:kind :plain}})
+        allocation (with-meta
+                     '(.invk raster.arrays/zeros-like_m_floats_long-impl input n)
+                     {:raster.op/original 'raster.arrays/zeros-like})
+        analysis
+        (host-av/analyze
+         (list 'let* ['canonical-n 'n 'out allocation] 'out)
+         {:values {'input input}
+          :scalar-types {'n :long}})]
+    (is (= {:dtype :float :shape ['canonical-n]}
+           (select-keys (get-in analysis [:values 'out]) [:dtype :shape])))))
+
 (deftest malformed-input-contracts-fail-loud
   (testing "authoritative values must be AbstractValues"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected an AbstractValue"

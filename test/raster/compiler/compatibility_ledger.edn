@@ -34,14 +34,15 @@
               :fallback-reasons [] :declines {}}}
 
   :gqa-causal-mha-gpu
-  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true
-           :declines {}}
-   :fusion {:vertical 0 :horizontal 2 :iterations 3 :placements 0}
-   :lowering {:segops 7 :kernel-graphs 0 :structured-loops 0
-              :typed-reused 7 :typed-scalar-equations 12
-              :backend-reused 7 :backend-relowered 0 :fallback 0}
-   :emission {:kernel-count 7 :targets [:opencl-c] :strategies []
-              :fallback-reasons [] :declines {}}}
+  {:route {:semantic-dialect :typed-parallel
+           :scheduled-dialect :scheduled-parallel
+           :emitted-dialect :opencl-parallel
+           :fallback :none}
+   :lowering {:nodes 12 :values 12 :instances 1 :program-instances 1
+              :outputs 1 :driver-allocations 0}
+   :emission {:structured-loops-emitted 0
+              :typed-equations-emitted 7
+              :host-scalar-equations 0}}
 
   :heat-rhs-1d-jvm
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true
