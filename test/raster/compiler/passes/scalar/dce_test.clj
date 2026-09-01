@@ -67,6 +67,25 @@
       (is (= 0 (:bindings-removed stats))
           "effectful binding should be preserved"))))
 
+(deftest arraycopy-loop-mutation-preservation-test
+  (let [emt @#'dce/extract-mutation-targets]
+    (testing "System.arraycopy identifies only its destination as mutated"
+      (is (= '#{dst}
+             (emt '(java.lang.System/arraycopy src 0 dst 0 n)))))
+
+    (testing "an unused loop result survives when arraycopy updates a live destination"
+      (let [effect-sym (with-meta '_effect {:raster.effect/effectful true})
+            form (list 'let*
+                       ['u '(clojure.core/aclone input)
+                        effect-sym '(dotimes [step nsteps]
+                                      (java.lang.System/arraycopy tmp 0 u 0 n))
+                        'result '(clojure.core/aget u 0)]
+                       'result)
+            {:keys [form stats]} (dce/eliminate-dead-bindings form)
+            kept (set (take-nth 2 (second form)))]
+        (is (zero? (:bindings-removed stats)))
+        (is (contains? kept effect-sym))))))
+
 ;; ================================================================
 ;; Nested let* with partially dead bindings
 ;; ================================================================

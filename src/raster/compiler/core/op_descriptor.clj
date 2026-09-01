@@ -3,7 +3,8 @@
 
   Descriptors merge multiple compiler facets under one lookup point, e.g.:
     :buffer {:allocates? ... :in-place-arg ... :alloc-form ... :rewrite-fn ...}
-    :effects {:pure? ... :mutating? ... :primitive-mutation? ...}
+    :effects {:pure? ... :mutating? ... :primitive-mutation? ...
+              :mutation-target-arg ...}
     :device {:rule ...}
     :shape  {:dim-rule ...}
 
@@ -238,6 +239,17 @@
    buf-arg-idx is the 0-based index of the buffer argument."
   [op-sym mode buf-arg-idx]
   (register-op-descriptor! op-sym {:buffer-write {:mode mode :buf-arg-idx buf-arg-idx}}))
+
+;; JVM arraycopy is a primitive partial write, not a full-buffer overwrite.  Keep its mutation
+;; target in the effects facet instead of misusing :buffer-write (whose :overwrite mode permits
+;; whole-buffer reuse).  Both spellings occur across walked and normalized compiler forms.
+(doseq [op-sym '[System/arraycopy java.lang.System/arraycopy]]
+  (register-op-descriptor!
+   op-sym
+   {:effects {:pure? false
+              :mutating? true
+              :primitive-mutation? true
+              :mutation-target-arg 2}}))
 
 (defn get-buffer-write-mode
   "Return the buffer-write descriptor for op-sym, or nil."
@@ -717,14 +729,14 @@
    bodies rewritten here flow to emitters that read `:raster.type/tag` and `:raster.op/original`."
   [expr replace-fn]
   (letfn [(go [f]
-            (cond
-              (and (seq? f) (= 'quote (first f))) f
-              (seq? f) (or (when (aget-call? f) (replace-fn f))
-                           (with-meta (apply list (map go f)) (meta f)))
-              (vector? f) (with-meta (mapv go f) (meta f))
-              (map? f) (with-meta (into (empty f) (map (fn [[k v]] [(go k) (go v)])) f) (meta f))
-              (set? f) (with-meta (into (empty f) (map go) f) (meta f))
-              :else f))]
+              (cond
+                (and (seq? f) (= 'quote (first f))) f
+                (seq? f) (or (when (aget-call? f) (replace-fn f))
+                             (with-meta (apply list (map go f)) (meta f)))
+                (vector? f) (with-meta (mapv go f) (meta f))
+                (map? f) (with-meta (into (empty f) (map (fn [[k v]] [(go k) (go v)])) f) (meta f))
+                (set? f) (with-meta (into (empty f) (map go) f) (meta f))
+                :else f))]
     (go expr)))
 
 (defn rewrite-aget-indices

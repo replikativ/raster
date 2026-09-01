@@ -60,6 +60,13 @@
     :heat-rhs-1d-jvm
     (pipeline/compile-report #'pde/heat-rhs-1d! :dtype :double)
 
+    :heat-loss-rk4-gpu
+    (try
+      (pipeline/compile-report #'pde/heat-loss-rk4
+                               :target-device target :dtype :double)
+      (catch clojure.lang.ExceptionInfo exception
+        {:declined (select-keys (ex-data exception) [:reason :target-dialect])}))
+
     (throw (ex-info "compatibility ledger has no workload compiler"
                     {:workload id}))))
 
@@ -70,11 +77,13 @@
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
-             :heat-rhs-1d-jvm}
+             :heat-rhs-1d-jvm
+             :heat-loss-rk4-gpu}
            (set (keys workloads))))
     (doseq [[id expected] workloads]
-      (let [report (compile-workload id)]
-        (is (= expected (signature report))
+      (let [report (compile-workload id)
+            actual (if (:declined report) report (signature report))]
+        (is (= expected actual)
             (str "compiler compatibility changed for " id
                  "; improve the ledger downward or explain the new debt"))
         (when (= :heat-rhs-1d-jvm id)
