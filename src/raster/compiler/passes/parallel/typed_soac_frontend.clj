@@ -917,14 +917,19 @@
         elements (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
         results (->> (elementize expressions arrays elements index)
-                     (mapv #(util/subst-syms (zipmap captures capture-parameters) %)))]
+                     (mapv #(util/subst-syms (zipmap captures capture-parameters) %)))
+        algebra (scan/certify-reassociation
+                 {:acc (:accumulator component)
+                  :init (:neutral component)
+                  :lambda (first results)}
+                 (:dtype component))]
     (list '= id (vec (filter some? (reduction/results product)))
           (list 'reduce {:index index :extent extent
                          :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
                          :accumulators [(:accumulator component)]
                          :identities [(:neutral component)]
                          :dtypes [(:dtype component)]
-                         :algebra [(:algebra product)]}
+                         :algebra [algebra]}
                 arrays captures
                 (dialect/lambda-form
                  (vec (concat [(:accumulator component)] elements capture-parameters))
@@ -938,7 +943,12 @@
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         capture-parameters (capture-symbols (count captures))
         step-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
-                           (:results (reduction/fold-region product)))]
+                           (:results (reduction/fold-region product)))
+        algebra (scan/certify-reassociation
+                 {:acc (:accumulator component)
+                  :init (:neutral component)
+                  :lambda (first step-results)}
+                 (:dtype component))]
     (list '= id results
           (list 'segmented-reduce
                 {:segment-axes segment-axes
@@ -948,7 +958,7 @@
                  :accumulators [(:accumulator component)]
                  :identities [(:neutral component)]
                  :dtypes [(:dtype component)]
-                 :algebra [(:algebra product)]
+                 :algebra [algebra]
                  :result-transform result-transform}
                 [] captures
                 (dialect/lambda-form

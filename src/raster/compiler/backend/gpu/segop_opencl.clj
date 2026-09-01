@@ -731,7 +731,12 @@
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
-  (let [kernel-body-attempt
+  (let [_certified-plan
+        ;; Both emitters reassociate the fold. Prove the concrete scheduled scalar region before
+        ;; either route is selected; a KernelBody coverage decline must never become permission
+        ;; for the compatibility emitter to invent an algebra.
+        (segred-body/scalar-plan segred)
+        kernel-body-attempt
         (try
           {:artifact
            (generate-segred-kernel-body

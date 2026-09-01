@@ -14,10 +14,10 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
-(def ^:private associative-operators #{:+ :* :min :max})
 (def ^:private cast-heads
   {'byte :byte, 'clojure.core/byte :byte
    'int :int, 'clojure.core/int :int
@@ -52,46 +52,45 @@
       (recur (util/subst-syms (util/binding-env bindings) (first body))))
     expression))
 
-(defn- accumulator-use?
-  [accumulator expression]
-  (or (= accumulator expression)
-      (and (seq? expression)
-           (contains? (set (keys cast-heads)) (first expression))
-           (= 2 (count expression))
-           (= accumulator (second expression)))))
-
 (defn scalar-plan
   "Project one scalar SegRed into an explicit combine operator, identity and element expression."
   [segred]
   (let [{:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         expression (inline-scalar-bindings lambda)
-        operator (when (seq? expression)
-                   (intrinsics/canonical (descriptor/semantic-op expression)))
-        arguments (vec (when (seq? expression) (descriptor/call-args expression)))]
-    (when-not (and acc (some? init) (contains? associative-operators operator)
-                   (= 2 (count arguments)))
-      (decline! :scalar-combine
-                "KernelBody reduction requires a binary associative scalar combine"
-                {:segred-id (:id segred) :accumulator acc :identity init
-                 :operator operator :arguments arguments :lambda lambda}))
-    (let [[left right] arguments
-          left-accumulator? (accumulator-use? acc left)
-          right-accumulator? (accumulator-use? acc right)
-          element (if left-accumulator? right left)]
-      (when (= left-accumulator? right-accumulator?)
-        (decline! :accumulator-position
-                  "KernelBody reduction combine does not contain its accumulator exactly once"
-                  {:segred-id (:id segred) :accumulator acc :arguments arguments}))
-      {:operator operator :identity init :element element :accumulator acc})))
+        component (first (get-in segred [:reduction :components]))
+        dtype (:dtype component)
+        declared-algebra (get-in segred [:reduction :algebra])
+        declared (if (scan/associative-scan? declared-algebra)
+                   declared-algebra
+                   (first (:components declared-algebra)))
+        derived (try
+                  (scan/certify-reassociation
+                   {:acc acc :init init :lambda expression} dtype)
+                  (catch clojure.lang.ExceptionInfo exception
+                    (decline! :certified-monoid
+                              "KernelBody reduction requires a certified typed monoid"
+                              {:segred-id (:id segred) :certificate-error (ex-data exception)})))
+        operator (intrinsics/canonical (:combine derived))]
+    (when-not (scan/compatible-certificate? declared derived)
+      (decline! :certified-monoid
+                "scheduled reduction algebra disagrees with its concrete scalar region"
+                {:segred-id (:id segred) :declared declared :derived derived}))
+    {:operator operator :identity (:identity derived) :element (:element derived)
+     :accumulator acc}))
 
 (defn- literal-value
   [value]
-  (case value
-    Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
-    Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
-    Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
-    Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
-    value))
+  (if (and (seq? value)
+           (= 2 (count value))
+           (contains? cast-heads (first value))
+           (number? (second value)))
+    (second value)
+    (case value
+      Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
+      Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
+      Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
+      Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
+      value)))
 
 (defn launch-group-count
   "Translate SegRed's historical capped-grid expression into inspectable launch IR.

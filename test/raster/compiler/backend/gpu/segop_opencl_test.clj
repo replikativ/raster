@@ -168,7 +168,7 @@
     ;; Before the fix, op-args extraction took a0=acc a1=x and DROPPED y — emitting a
     ;; kernel that reduced with just x. A segmented reduce combine is binary (op acc elem).
     (is (thrown-with-msg?
-         Exception #"binary associative scalar combine"
+         Exception #"certified associative reduction"
          (segred-source '(+ acc (clojure.core/aget a j) (clojure.core/aget b j))))))
   (testing "the ordinary binary combine still lowers unchanged"
     (let [source (segred-source '(+ acc (clojure.core/aget a j)))]
@@ -180,7 +180,7 @@
     ;; The single-aset-void store-drop shape on the reduce side: (last bdy) silently dropped
     ;; the earlier body forms.
     (is (thrown-with-msg?
-         Exception #"single-expression let region"
+         Exception #"certified associative reduction"
          (segred-source '(let* [t (clojure.core/aget a j)] (+ acc t) (+ acc t)))))))
 
 (deftest segred-devirtualized-aget-lowers-to-subscript
