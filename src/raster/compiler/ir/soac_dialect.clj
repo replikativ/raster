@@ -902,6 +902,15 @@
           (fail! :typed-soac-reduce-results
                  "reduce result arity must equal accumulator arity"
                  {:equation equation-id :results results :accumulators accumulators}))
+        (doseq [[accumulator identity dtype certificate result]
+                (map vector accumulators (:identities attributes) (:dtypes attributes)
+                     (:algebra attributes) body-results)]
+          (let [derived (scan-ir/certify-reassociation
+                         {:acc accumulator :init identity :lambda result} dtype)]
+            (when-not (scan-ir/compatible-certificate? certificate derived)
+              (fail! :typed-soac-reduction-certificate
+                     "reduction algebra certificate disagrees with its scalar region"
+                     {:equation equation-id :declared certificate :derived derived}))))
         (when transform
           (let [operand-ids (set (map :value (:operands transform)))
                 scalar-ids (set (map :value (:scalars transform)))
@@ -936,6 +945,15 @@
           (fail! :typed-soac-segmented-reduce-results
                  "segmented-reduce result arity must equal accumulator arity"
                  {:equation equation-id :results results :accumulators accumulators}))
+        (doseq [[accumulator identity dtype certificate result]
+                (map vector accumulators (:identities attributes) (:dtypes attributes)
+                     (:algebra attributes) body-results)]
+          (let [derived (scan-ir/certify-reassociation
+                         {:acc accumulator :init identity :lambda result} dtype)]
+            (when-not (scan-ir/compatible-certificate? certificate derived)
+              (fail! :typed-soac-reduction-certificate
+                     "segmented-reduction algebra certificate disagrees with its scalar region"
+                     {:equation equation-id :declared certificate :derived derived}))))
         (when transform
           (let [operand-ids (set (map :value (:operands transform)))
                 scalar-ids (set (map :value (:scalars transform)))

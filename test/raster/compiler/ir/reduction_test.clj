@@ -5,6 +5,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.par :as par-ir]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -41,9 +42,20 @@
                    :index 'i :step-result '(+ acc (aget values i))})]
     (is (reduction/product-reduction? operator))
     (is (reduction/scalar? operator))
+    (is (scan/associative-scan? (:algebra operator)))
     (is (= [:double] (reduction/dtypes operator)))
     (is (= {:acc 'acc :init 0.0 :lambda '(+ acc (aget values i))}
            (reduction/scalar-op operator)))))
+
+(deftest scalar-parallel-reduction-requires-the-registered-typed-identity
+  (try
+    (reduction/scalar
+     {:accumulator 'acc :neutral 5.0 :dtype :double :result 'sum
+      :index 'i :step-result '(+ acc (aget values i))})
+    (is false "a non-identity init must not be duplicated across lanes and blocks")
+    (catch clojure.lang.ExceptionInfo exception
+      (is (= :reduction-nonidentity-init (:reason (ex-data exception))))
+      (is (= 0.0 (:identity (ex-data exception)))))))
 
 (deftest typed-product-validation-test
   (let [node (soac/par-form->soac '_ argmax-product-form 7 :dtype :float)

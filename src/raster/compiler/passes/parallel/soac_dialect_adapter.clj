@@ -12,6 +12,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]))
@@ -152,13 +153,18 @@
           capture-parameters (capture-symbols (count captures))
           body-results (->> (elementize expressions arrays element-parameters (:index product))
                             (mapv #(util/subst-syms (zipmap captures capture-parameters) %)))
+          algebra (scan/certify-reassociation
+                   {:acc (:accumulator component)
+                    :init (:neutral component)
+                    :lambda (first body-results)}
+                   (:dtype component))
           attributes {:index (:index product)
                       :extent (:bound node)
                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
                       :accumulators [(:accumulator component)]
                       :identities [(:neutral component)]
                       :dtypes [(:dtype component)]
-                      :algebra [(:algebra product)]}]
+                      :algebra [algebra]}]
       (list '= (:id node) (vec (filter some? (reduction/results product)))
             (list 'reduce attributes arrays captures
                   (dialect/lambda-form

@@ -4,7 +4,8 @@
    A scalar reduction is the one-component case.  Product reductions keep accumulator components,
    neutral values and step results in one ordered record so lowering cannot silently lose a value
    or guess its dtype.  The operator is semantic: segmentation and target schedules live in SOAC
-   and SegOp layers, while physical scratch is introduced only during scheduling/materialization.")
+   and SegOp layers, while physical scratch is introduced only during scheduling/materialization."
+  (:require [raster.compiler.ir.scan :as scan]))
 
 (defrecord ReductionComponent
            [id accumulator neutral dtype result attributes])
@@ -191,18 +192,28 @@
     step algebra attributes)))
 
 (defn scalar
-  "Construct the canonical one-component representation of `raster.par/reduce`."
+  "Construct the canonical, proof-carrying representation of `raster.par/reduce`.
+
+   Every scalar ProductReduction has parallel semantics, so its recurrence is certified here—the
+   single constructor boundary—rather than rediscovered by individual schedules or emitters."
   [{:keys [accumulator neutral dtype result index step-result algebra attributes]
     :or {algebra {} attributes {}}}]
-  (make {:components [{:id :value
-                       :accumulator accumulator
-                       :neutral neutral
-                       :dtype dtype
-                       :result result}]
-         :index index
-         :step (->ReductionRegion [] [step-result] {})
-         :algebra algebra
-         :attributes attributes}))
+  (let [derived (scan/certify-reassociation
+                 {:acc accumulator :init neutral :lambda step-result} dtype)
+        algebra (if (empty? algebra) derived algebra)]
+    (when-not (scan/compatible-certificate? algebra derived)
+      (throw (ex-info "scalar reduction algebra disagrees with its recurrence"
+                      {:reason :scalar-reduction-certificate-mismatch
+                       :declared algebra :derived derived})))
+    (make {:components [{:id :value
+                         :accumulator accumulator
+                         :neutral neutral
+                         :dtype dtype
+                         :result result}]
+           :index index
+           :step (->ReductionRegion [] [step-result] {})
+           :algebra algebra
+           :attributes attributes})))
 
 (defn scalar?
   [reduction]
