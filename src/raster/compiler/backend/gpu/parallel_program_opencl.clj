@@ -6,6 +6,7 @@
    scalar equations remain explicit host-only steps for the whole-program executor."
   (:require [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
@@ -94,37 +95,9 @@
              "scheduled equation has no supported retained algorithm"
              {:equation (:id equation) :algorithm algorithm}))))
 
-(defn- emitted-operation?
-  [operation]
-  (or (emitted-loop/emitted-loop? operation)
-      (emitted-equation/emitted-equation? operation)))
-
-(defn- emitted-boundary?
-  [equation algorithm]
-  (cond
-    (control/loop-program? algorithm)
-    (and (= 1 (count (:operations equation)))
-         (let [operation (first (:operations equation))]
-           (and (emitted-loop/emitted-loop? operation)
-                (= algorithm (:algorithm (:schedule (emitted-loop/validate! operation)))))))
-
-    (soac/program-form? algorithm)
-    (if (true? (get-in equation [:attributes :host-only]))
-      (empty? (:operations equation))
-      (and (= 1 (count (:operations equation)))
-           (let [operation (first (:operations equation))]
-             (and (emitted-equation/emitted-equation? operation)
-                  (= algorithm (:algorithm (emitted-equation/validate! operation)))))))
-
-    :else false))
-
 (defn validate-program!
   [parallel-program]
-  (when-not (= :opencl-parallel (:dialect parallel-program))
-    (fail! :opencl-parallel-dialect
-           "equation-first OpenCL emission requires :opencl-parallel"
-           {:dialect (:dialect parallel-program)}))
-  (program/validate! parallel-program emitted-operation? emitted-boundary?))
+  (emitted-program/validate! parallel-program))
 
 (defn emit-program
   "Emit every numerical equation directly and return its checked target program plus artifacts."
@@ -147,8 +120,8 @@
             :provenance (assoc (:provenance parallel-program)
                                :target-dialect :opencl-parallel)
             :attributes (:attributes parallel-program)
-            :operation? emitted-operation?
-            :algorithm? emitted-boundary?}))
+            :operation? emitted-program/emitted-operation?
+            :algorithm? emitted-program/emitted-boundary?}))
          graphs (keep (fn [equation]
                         (when-let [operation (first (:operations equation))]
                           (cond

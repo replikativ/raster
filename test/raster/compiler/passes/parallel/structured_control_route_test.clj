@@ -4,6 +4,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as graph]
@@ -17,7 +18,8 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.gpu.parallel-program :as program-runtime]))
 
 (defn- loop-decomposition
   []
@@ -257,3 +259,136 @@
                (reason-of #(program-opencl/validate-program!
                             (assoc-in program [:equations 0 :operations]
                                       [suffix-operation])))))))))
+
+(defn- prepared-mixed-call
+  [trip-count]
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        emitted (:program (program-opencl/emit-program
+                           (assoc scheduled :source ::must-not-be-inspected) options))
+        loop-equation (first (:equations emitted))
+        carried (first (control/carried (:algorithm loop-equation)))
+        initial (:initial carried)
+        loop-output (:output carried)
+        result (first (:outputs emitted))
+        scalar (fn [id value]
+                 {:type (get-in emitted [:values id :dtype]) :value value})]
+    {:call
+     (program-call/make
+      emitted
+      {initial :initial loop-output :loop-output result :suffix-output}
+      {'steps (scalar 'steps trip-count)
+       'n (scalar 'n 64)}
+      (if (> trip-count 1) {loop-output :carry-scratch} {})
+      nil)
+     :loop-output loop-output
+     :result result}))
+
+(deftest emitted-program-stages-once-before-running-resident-equations
+  (let [{:keys [call loop-output result]} (prepared-mixed-call 3)
+        events (atom [])
+        outputs
+        (program-runtime/run-with!
+         call
+         {:bind! (fn [key _graph buffers scalars]
+                   (let [handle {:key key :buffers buffers :scalars scalars}]
+                     (swap! events conj [:bind handle])
+                     handle))
+          :run! (fn [handle] (swap! events conj [:run handle]))
+          :release! (fn [handle] (swap! events conj [:release handle]))})
+        bindings (mapv (comp :buffers second) (filter #(= :bind (first %)) @events))]
+    (is (= {result :suffix-output} outputs))
+    (is (= 4 (count bindings)))
+    (is (= [:bind :bind :bind :bind :run :run :run :run
+            :release :release :release :release]
+           (mapv first @events))
+        "all target graphs are staged before the first launch")
+    (is (= :loop-output (get (last bindings) loop-output)))
+    (is (= :suffix-output (get (last bindings) result)))
+    (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
+    (is (false? (get-in call [:attributes :source-inspected])))))
+
+(deftest zero-trip-program-feeds-the-initial-carry-to-its-suffix
+  (let [{:keys [call loop-output result]} (prepared-mixed-call 0)
+        plan (program-runtime/staging-plan call :execution)]
+    (is (= 1 (count plan)))
+    (is (= :initial (get-in plan [0 :buffers loop-output])))
+    (is (= :suffix-output (get-in plan [0 :buffers result])))))
+
+(deftest whole-program-staging-is-transactional
+  (let [call (:call (prepared-mixed-call 3))
+        events (atom [])
+        attempts (atom 0)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"staging failed"
+         (program-runtime/run-with!
+          call
+          {:bind! (fn [key & _]
+                    (if (= 3 (swap! attempts inc))
+                      (throw (ex-info "staging failed" {}))
+                      (let [handle [:handle key]]
+                        (swap! events conj [:bind handle])
+                        handle)))
+           :run! (fn [handle] (swap! events conj [:run handle]))
+           :release! (fn [handle] (swap! events conj [:release handle]))})))
+    (is (= [:bind :bind :release :release] (mapv first @events)))
+    (is (empty? (filter #(= :run (first %)) @events)))
+    (is (= (reverse (map second (take 2 @events)))
+           (map second (drop 2 @events))))))
+
+(deftest effect-free-host-scalars-are-evaluated-before-device-staging
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        base (:program (program-opencl/emit-program
+                        (assoc scheduled :source ::must-not-be-inspected) options))
+        loop-equation (first (:equations base))
+        answer-value (av/tensor {:dtype :long :shape []})
+        host-algorithm
+        (soac/make
+         (soac/default-program-facts
+          {:values {'steps (get-in base [:values 'steps]) 'answer answer-value}
+           :inputs '[steps]
+           :equations {'host-scalar (soac/default-equation-facts)}})
+         [(list '= 'host-scalar '[answer]
+                (list 'scalar {:dtypes [:long]} '[steps]
+                      (soac/lambda-form '[value] '[(unchecked-inc value)])))]
+         '[answer])
+        host-equation
+        (program/->ProgramEquation
+         [:host-scalar] [:test :host-scalar] nil '[steps] '[answer]
+         host-algorithm [] #{} {:source :test} {:host-only true})
+        emitted (-> base
+                    (assoc :values (assoc (:values base) 'answer answer-value))
+                    (assoc :equations [loop-equation host-equation])
+                    (assoc :outputs '[answer]))
+        carried (first (control/carried (:algorithm loop-equation)))
+        initial-id (:initial carried)
+        loop-output (:output carried)
+        result 'answer
+        scalar (fn [id value]
+                 {:type (get-in emitted [:values id :dtype]) :value value})
+        evaluations (atom [])
+        call
+        (program-call/make
+         emitted
+         {initial-id :initial loop-output :loop-output}
+         {'steps (scalar 'steps 2) 'n (scalar 'n 64)}
+         {loop-output :carry-scratch}
+         (fn [equation {:keys [operands]}]
+           (swap! evaluations conj [(:id equation) operands])
+           {result (scalar result (inc (get-in operands ['steps :value])))}))]
+    (is (true? (get-in host-equation [:attributes :host-only])))
+    (is (= 1 (count @evaluations)))
+    (is (= 3 (get-in call [:outputs result :value])))
+    (is (= 2 (count (program-runtime/staging-plan call :execution))))
+    (is (false? (get-in call [:attributes :source-inspected])))))
