@@ -294,8 +294,8 @@
         output-ids (set outputs)
         external-ids (set/union input-ids output-ids)
         operation-ids (reduce set/union #{}
-                              (map #(set/union (or (segop/segop-inputs %) #{})
-                                               (or (segop/segop-outputs %) #{}))
+                              (map #(set/union (set (or (segop/segop-inputs %) #{}))
+                                               (set (or (segop/segop-outputs %) #{})))
                                    segops))
         temporary-ids (set (keys temporaries))
         expected-temporaries (set/difference operation-ids external-ids)]
@@ -327,8 +327,8 @@
                              (ordered temporary-ids))
           nodes (loop [ops segops index 0 previous [] result []]
                   (if-let [op (first ops)]
-                    (let [ins (or (segop/segop-inputs op) #{})
-                          outs (or (segop/segop-outputs op) #{})
+                    (let [ins (set (or (segop/segop-inputs op) #{}))
+                          outs (set (or (segop/segop-outputs op) #{}))
                           uses (mapv #(operation-use ins outs %)
                                      (ordered (set/union ins outs)))
                           ;; A scheduled-node identity is not a SegOp identity. The position makes

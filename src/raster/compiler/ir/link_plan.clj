@@ -820,21 +820,60 @@
                        :leaves (:leaves link-value)})))
     (get nodes (get-in link-value [:leaves 0 :node]))))
 
+(defn- program-logical-elements
+  [nodes values call compiler-value abstract]
+  (let [scalar-values (:scalar-values call)
+        buffers (:buffers call)
+        resolve-dimension
+        (fn [dimension]
+          (cond
+            (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
+            (kgcall/resolve-integer scalar-values (second dimension))
+
+            (and (seq? dimension) (= 'extent (first dimension)) (= 2 (count dimension)))
+            (let [source-value (get buffers (second dimension) ::missing)]
+              (when (= ::missing source-value)
+                (throw (ex-info "logical program shape projects an unbound buffer extent"
+                                {:reason :program-link-shape-extent
+                                 :compiler-value compiler-value
+                                 :dimension dimension})))
+              (first (get-in (program-value-node! nodes values (:id call)
+                                                  (second dimension) source-value)
+                             [:view :shape])))
+
+            :else (kgcall/resolve-integer scalar-values dimension)))]
+    (try
+      (reduce (fn [elements dimension]
+                (Math/multiplyExact (long elements) (long (resolve-dimension dimension))))
+              1 (:shape abstract))
+      (catch Exception exception
+        (throw (ex-info "logical program buffer shape did not resolve at the LinkPlan boundary"
+                        {:reason :program-link-logical-shape
+                         :compiler-value compiler-value
+                         :shape (:shape abstract)}
+                        exception))))))
+
 (defn- validate-program-buffer-contracts!
   [nodes values {:keys [id call roles]}]
   (let [program-values (get-in call [:program :values])]
     (doseq [[compiler-value value-id] (:buffers call)]
       (let [expected (get program-values compiler-value)
             link-value (get values value-id)
-            node (program-value-node! nodes values id compiler-value value-id)]
+            node (program-value-node! nodes values id compiler-value value-id)
+            logical-elements (when expected
+                               (program-logical-elements nodes values call
+                                                         compiler-value expected))
+            physical-elements (shape-elements (get-in node [:view :shape]))]
         (when-not (and expected
-                       (= (count (:shape expected)) (count (get-in node [:view :shape])))
-                       (av/storage-contract-compatible? expected (:abstract link-value)))
+                       (av/storage-contract-compatible? expected (:abstract link-value))
+                       (= logical-elements physical-elements))
           (throw (ex-info "emitted program buffer differs from its logical LinkValue contract"
                           {:reason :program-link-value-contract :instance id
                            :compiler-value compiler-value :value value-id
                            :expected expected :actual (:abstract link-value)
-                           :physical-shape (get-in node [:view :shape])})))
+                           :logical-elements logical-elements
+                           :physical-shape (get-in node [:view :shape])
+                           :physical-elements physical-elements})))
         (when (and (= :constant (get roles compiler-value))
                    (not= :constant (:role node)))
           (throw (ex-info "a constant program binding requires a constant LinkValue"

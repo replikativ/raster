@@ -150,11 +150,15 @@
                  {:step id :region (:region step)})))
 
       (buffer-allocation? step)
-      (when-not (and (buffer-value? value)
-                     (contains? #{:zero :unspecified} (:initialization step)))
-        (fail! :invocation-buffer-allocation
-               "buffer allocation must retain a recognized fresh-allocation contract"
-               {:step id :initialization (:initialization step) :value value}))
+      (let [shape-symbols (into #{} (mapcat util/free-syms) (:shape value))]
+        (when-not (and (buffer-value? value)
+                       (contains? #{:zero :unspecified} (:initialization step))
+                       (= shape-symbols (set (map :symbol (:operands step)))))
+          (fail! :invocation-buffer-allocation
+                 "buffer allocation operands must exactly close its typed shape contract"
+                 {:step id :initialization (:initialization step) :value value
+                  :shape-symbols shape-symbols
+                  :operands (mapv :symbol (:operands step))})))
 
       (buffer-clone? step)
       (let [source-value (get values (:source step))]
@@ -263,19 +267,30 @@
                (symbol? (first (descriptor/call-args expression))))
       (first (descriptor/call-args expression)))))
 
+(defn- allocation-operands
+  [value environment]
+  (->> (:shape value)
+       (mapcat #(referenced-operands % environment))
+       (reduce (fn [operands operand]
+                 (if (some #(= (:symbol %) (:symbol operand)) operands)
+                   operands
+                   (conj operands operand)))
+               [])))
+
 (defn- prefix-step
   [plan-id ordinal symbol expression value environment]
   (let [id (binding-id plan-id ordinal symbol)
-        operands (referenced-operands expression environment)
         operation (descriptor/semantic-op expression)
         initialization (descriptor/allocation-initialization operation)]
     (cond
       (shape-source expression)
-      (let [source-symbol (shape-source expression)]
+      (let [operands (referenced-operands expression environment)
+            source-symbol (shape-source expression)]
         (->ShapeProjection id symbol operands (get environment source-symbol) 0 value))
 
       (= :copy initialization)
-      (let [source-symbol (some-> expression descriptor/call-args first unwrap-casts)]
+      (let [operands (referenced-operands expression environment)
+            source-symbol (some-> expression descriptor/call-args first unwrap-casts)]
         (when-not (symbol? source-symbol)
           (fail! :invocation-clone-source
                  "copy allocation requires one lexical source value"
@@ -283,14 +298,17 @@
         (->BufferClone id symbol operands (get environment source-symbol) value))
 
       initialization
-      (->BufferAllocation id symbol operands initialization value)
+      (->BufferAllocation id symbol (allocation-operands value environment)
+                          initialization value)
 
       (symbol? expression)
-      (->ValueAlias id symbol operands (get environment expression) value)
+      (->ValueAlias id symbol (referenced-operands expression environment)
+                    (get environment expression) value)
 
       (scalar-value? value)
-      (->ScalarCompute id symbol operands
-                       (soac/lambda-form (mapv :symbol operands) [expression]) value)
+      (let [operands (referenced-operands expression environment)]
+        (->ScalarCompute id symbol operands
+                         (soac/lambda-form (mapv :symbol operands) [expression]) value))
 
       :else
       (fail! :invocation-prefix-unsupported

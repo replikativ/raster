@@ -82,6 +82,17 @@
     (is (identical? (first (:inputs scheduled)) (first (:outputs scheduled))))
     (is (= :read-write (get-in scheduled [:nodes 0 :uses 0 :access])))))
 
+(deftest ordered-output-vectors-retain-write-access
+  (let [operation (segop/->SegFoldMap
+                   10 (segop/make-seg-space 'segment 'nsegments)
+                   'index 'width [] [0.0] #{'values} ['out] #{}
+                   (segop/->KernelGrid 1 32 0) [:float] :no-write-alias)
+        scheduled (graph/from-segops [operation]
+                                     {:inputs #{'values} :outputs #{'out} :dtype :float})]
+    (is (= :write (->> scheduled :nodes first :uses
+                       (filter #(= 'out (:buffer %))) first :access))
+        "ordered tuple outputs are value collections, not associative-set indices")))
+
 (deftest target-emission-cannot-change-the-scheduled-dataflow-contract
   (let [operation (segop/->SegMap
                    9 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)

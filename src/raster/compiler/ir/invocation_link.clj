@@ -25,16 +25,29 @@
   (and (map? value) (keyword? (:type value)) (contains? value :value)))
 
 (defn- scalar-number
-  [scalars id]
-  (let [scalar (get scalars id)]
+  [scalars value-id storage-id]
+  (let [scalar (get scalars value-id)]
     (when-not (and (typed-scalar? scalar) (integer? (:value scalar)))
       (fail! :invocation-link-shape-scalar
              "program storage shape requires an integral typed scalar"
-             {:value id :scalar scalar :available (set (keys scalars))}))
+             {:storage-value storage-id :shape-value value-id
+              :scalar scalar :available (set (keys scalars))}))
     (long (:value scalar))))
 
+(defn- invocation-shape-scalars
+  [materialized]
+  (let [plan (:plan materialized)
+        values (:values materialized)]
+    (reduce (fn [environment {:keys [id symbol]}]
+              (let [value (get values id)]
+                (if (typed-scalar? value)
+                  (assoc environment symbol value)
+                  environment)))
+            {}
+            (concat (:parameters plan) (:steps plan)))))
+
 (defn- concrete-shape
-  [abstract scalars buffers storage]
+  [id abstract scalars buffers storage]
   (mapv
    (fn [dimension]
      (let [dimension (if (and (seq? dimension) (= 'value (first dimension))
@@ -45,7 +58,7 @@
            (cond
              (integer? dimension) (long dimension)
              (or (symbol? dimension) (vector? dimension) (keyword? dimension))
-             (scalar-number scalars dimension)
+             (scalar-number scalars dimension id)
              (and (seq? dimension) (= 'extent (first dimension)) (= 2 (count dimension)))
              (let [source-id (get buffers (second dimension))
                    source (get storage source-id)]
@@ -57,7 +70,7 @@
              :else
              (fail! :invocation-link-shape-expression
                     "program storage shape is not a canonical integer/value/extent expression"
-                    {:dimension dimension :shape (:shape abstract)}))]
+                    {:value-id id :dimension dimension :shape (:shape abstract)}))]
        (when (neg? resolved)
          (fail! :invocation-link-shape-negative
                 "program storage dimensions must be non-negative"
@@ -97,14 +110,39 @@
   (if-let [token (get-in state [:buffers compiler-value])]
     [state token]
     (let [token (storage-id invocation-id kind compiler-value)
-          shape (concrete-shape abstract scalars (:buffers state) (:storage state))]
+          shape (concrete-shape compiler-value abstract scalars
+                                (:buffers state) (:storage state))]
       [(-> state
            (assoc-in [:buffers compiler-value] token)
            (add-storage token compiler-value abstract shape nil :unspecified))
        token])))
 
+(defn- graph-buffer-access
+  [graph id]
+  (let [roles (into #{}
+                    (keep (fn [buffer] (when (= id (:id buffer)) (:role buffer))))
+                    (concat (:inputs graph) (:outputs graph)))]
+    (cond
+      (contains? roles :inout) :read-write
+      (and (contains? roles :input) (contains? roles :output)) :read-write
+      (contains? roles :input) :read
+      (contains? roles :output) :write
+      :else nil)))
+
+(defn- write-before-read-inputs
+  [parallel-program compiler-values]
+  (into #{}
+        (keep (fn [id]
+                (let [first-access
+                      (some (fn [equation]
+                              (when-let [operation (first (:operations equation))]
+                                (graph-buffer-access (:graph operation) id)))
+                            (:equations parallel-program))]
+                  (when (= :write first-access) id))))
+        compiler-values))
+
 (defn- add-materialized-inputs
-  [state materialized program-values]
+  [state materialized program-values overwrite-inputs]
   (reduce-kv
    (fn [state compiler-value buffer]
      (let [token (:id buffer)
@@ -113,14 +151,18 @@
          (fail! :invocation-link-program-input
                 "materialized buffer names a value absent from the emitted program"
                 {:compiler-value compiler-value}))
-       (when (= :zero (:initialization buffer))
+       (when (and (= :zero (:initialization buffer))
+                  (not (contains? overwrite-inputs compiler-value)))
          (fail! :invocation-link-zero-initializer
                 "zero-initialized program storage requires an explicit initializer schedule"
                 {:compiler-value compiler-value :storage token :shape (:shape buffer)}))
-       (-> state
-           (assoc-in [:buffers compiler-value] token)
-           (add-storage token compiler-value expected (:shape buffer)
-                        (:source buffer) (:initialization buffer)))))
+       (let [initialization (if (contains? overwrite-inputs compiler-value)
+                              :unspecified
+                              (:initialization buffer))]
+         (-> state
+             (assoc-in [:buffers compiler-value] token)
+             (add-storage token compiler-value expected (:shape buffer)
+                          (:source buffer) initialization)))))
    state (:program-buffers materialized)))
 
 (defn- lower-loop-storage
@@ -148,7 +190,8 @@
          (if in-place?
            state
            (let [scratch-token (storage-id invocation-id :loop-alternate output)
-                 shape (concrete-shape output-abstract scalars (:buffers state) (:storage state))]
+                 shape (concrete-shape output output-abstract scalars
+                                       (:buffers state) (:storage state))]
              (-> state
                  (assoc-in [:loop-scratch output] scratch-token)
                  (add-storage scratch-token output output-abstract shape nil :unspecified))))))
@@ -194,12 +237,20 @@
                    {:invocation-inputs (:program-inputs invocation-plan)
                     :program-inputs (:inputs parallel-program)}))
         scalars (:program-scalars materialized)
+        shape-scalars (merge (invocation-shape-scalars materialized) scalars)
+        overwrite-inputs (write-before-read-inputs parallel-program
+                                                   (keys (:program-buffers materialized)))
         initial (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
-                                         materialized (:values parallel-program))
+                                         materialized (:values parallel-program)
+                                         overwrite-inputs)
         realized (reduce #(lower-equation-storage %1 invocation-id %2
-                                                  (:values parallel-program) scalars)
+                                                  (:values parallel-program) shape-scalars)
                          initial (:equations parallel-program))
-        call (program-call/make parallel-program (:buffers realized) scalars
+        call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
+        ;; Shape-only invocation scalars are part of the physical program contract even when no
+        ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
+        ;; element-equivalent to flattened result storage at the LinkPlan boundary.
+        call (program-call/make parallel-program (:buffers realized) call-scalars
                                 (:loop-scratch realized) evaluate-host)
         resident-outputs (into [] (remove (comp typed-scalar? val)) (:outputs call))
         output-tokens (set (map val resident-outputs))

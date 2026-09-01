@@ -71,8 +71,15 @@
                              :target-device target :dtype :float)
 
     :gqa-causal-mha-gpu
-    (pipeline/compile-report #'attention/gqa-causal-mha
-                             :target-device target :dtype :float)
+    (let [compilation (equation-first/compile
+                       #'attention/gqa-causal-mha {:target target :dtype :float})
+          plan (equation-first/lower
+                compilation
+                [(float-array [1 0 0 1 1 1 1 -1])
+                 (float-array [1 0 0 1])
+                 (float-array [1 2 3 4])
+                 1 2 2 1 2])]
+      (equation-first-signature compilation plan))
 
     :heat-rhs-1d-jvm
     (pipeline/compile-report #'pde/heat-rhs-1d! :dtype :double)
@@ -101,7 +108,7 @@
       (let [report (compile-workload id)
             actual (cond
                      (:declined report) report
-                     (= :heat-loss-rk4-gpu id) report
+                     (contains? #{:gqa-causal-mha-gpu :heat-loss-rk4-gpu} id) report
                      :else (signature report))]
         (is (= expected actual)
             (str "compiler compatibility changed for " id
