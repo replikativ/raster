@@ -86,6 +86,9 @@
     (testing "OpenCL C preserves mixed local products and portable NaN comparison"
       (is (str/includes? (first sources) "__local float shared_0"))
       (is (str/includes? (first sources) "__local int shared_1"))
+      (is (every? #(str/includes? % "shared_0[lid]") sources))
+      (is (every? #(str/includes? % "shared_0[(lid + stride)]") sources))
+      (is (every? #(not (str/includes? % "_u005b_")) sources))
       (is (str/includes? (first sources) "for (int col = lid"))
       (is (str/includes? (first sources) "barrier(CLK_LOCAL_MEM_FENCE)"))
       (is (every? #(not (str/includes? % "boolean(")) sources))
