@@ -91,8 +91,17 @@
       (is (= :block-local (:phase (first segops))))
       (is (pos? (:shared-mem-bytes (:grid (first segops)))))
       ;; Phase 2: cross-block
-      (is (instance? raster.compiler.ir.segop.SegRed (second segops)))
-      (is (= :cross-block (:phase (second segops)))))))
+      (let [phase-two (second segops)
+            partials (first (:inputs phase-two))
+            index (get-in phase-two [:space :dims 0 :name])
+            {:keys [acc lambda]} (segop/scalar-reduce-op phase-two)]
+        (is (instance? raster.compiler.ir.segop.SegRed phase-two))
+        (is (= :cross-block (:phase phase-two)))
+        (is (= (list 'clojure.core/+ acc
+                     (list 'clojure.core/aget partials index))
+               lambda)
+            "the scheduled second phase reduces its partial buffer, not the original element body")
+        (is (not (contains? (:inputs phase-two) 'a)))))))
 
 (deftest lower-reduce-single-phase-test
   (testing "Small constant reduce lowers to a single SegRed"

@@ -1193,9 +1193,8 @@
                     (emit-node node) (:operation node))))]
     (finalize-emitted-graph emitted :opencl-c)))
 
-(defn- generate-elementwise-kernel-graph
-  [graph {:keys [scalar-types array-types]
-          :or {scalar-types {} array-types {}}}]
+(defn- graph-array-types
+  [graph array-types]
   (let [declared-array-types
         (into {}
               (map (juxt :id :dtype))
@@ -1207,8 +1206,13 @@
                   :when (and supplied (not= supplied declared))]
             (throw (ex-info "kernel graph buffer dtype differs from target emission facts"
                             {:reason :kernel-graph-buffer-dtype
-                             :buffer id :declared declared :supplied supplied})))
-        array-types (merge array-types declared-array-types)
+                             :buffer id :declared declared :supplied supplied})))]
+    (merge array-types declared-array-types)))
+
+(defn- generate-elementwise-kernel-graph
+  [graph {:keys [scalar-types array-types]
+          :or {scalar-types {} array-types {}}}]
+  (let [array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
          graph
@@ -1239,6 +1243,27 @@
             operation)))]
     (finalize-emitted-graph emitted :opencl-c)))
 
+(defn- generate-reduction-kernel-graph
+  [graph {:keys [scalar-types array-types]
+          :or {scalar-types {} array-types {}}}]
+  (let [array-types (graph-array-types graph array-types)
+        emitted
+        (kgraph/map-operations
+         graph
+         (fn [{:keys [id operation]}]
+           (let [outputs (vec (:outputs operation))]
+             (when-not (= 1 (count outputs))
+               (throw (ex-info "scalar SegRed graph node requires exactly one scheduled output"
+                               {:reason :kernel-graph-reduction-output
+                                :target :opencl-c :node id :outputs outputs})))
+             (kart/certify-scheduled-operation
+              (generate-segred-kernel
+               operation (first outputs)
+               :dtype (:dtype operation)
+               :scalar-types scalar-types :array-types array-types)
+              operation))))]
+    (finalize-emitted-graph emitted :opencl-c)))
+
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
 
@@ -1256,6 +1281,11 @@
                         (instance? raster.compiler.ir.segop.SegStencil (:operation %)))
                    (:nodes graph)))
       (generate-elementwise-kernel-graph graph opts)
+
+      (and (seq (:nodes graph))
+           (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
+                   (:nodes graph)))
+      (generate-reduction-kernel-graph graph opts)
 
       :else
       (throw (ex-info "OpenCL backend has no target lowering for scheduled KernelGraph"

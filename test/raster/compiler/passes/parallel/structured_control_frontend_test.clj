@@ -65,6 +65,36 @@
       (is (lower/scheduled-loop? scheduled))
       (is (not-any? #{'scratch} (map :id (:inputs graph)))))))
 
+(deftest expanded-copy-helper-may-return-its-mutated-carry
+  (let [source (loop-source 'n)
+        bindings (second source)
+        dotimes (nth bindings 7)
+        copy-expression (last dotimes)
+        returning-copy (apply list (concat (butlast dotimes)
+                                           [(list 'do copy-expression 'u)]))
+        source (apply list 'let* (assoc bindings 7 returning-copy) (drop 2 source))
+        {:keys [loop copy-certificate typed-body-source]}
+        (frontend/form->structured-loop source options)]
+    (is (= loop (control/validate! loop)))
+    (is (= {:source 'rstr_loop_value_1 :destination 'u :extent 'n :dtype :double}
+           copy-certificate))
+    (is (not-any? #{'java.lang.System/arraycopy}
+                  (tree-seq coll? seq typed-body-source))
+        "the physical state transition is not retained as numerical body work")))
+
+(deftest fresh-prefix-allocation-may-flow-through-a-lexical-alias
+  (let [source (loop-source 'n)
+        source (update-bindings
+                source #(vec (concat (subvec % 0 4)
+                                     ['scratch-storage (nth % 5)
+                                      'scratch 'scratch-storage]
+                                     (subvec % 6))))
+        {:keys [loop write-certificates]}
+        (frontend/form->structured-loop source options)]
+    (is (= loop (control/validate! loop)))
+    (is (= [{:destination 'scratch :extent 'n :dtype :double :kind :stencil}]
+           write-certificates))))
+
 (deftest unsupported-or-ambiguous-state-transitions-decline-or-fail-exactly
   (testing "a partial copy is not silently interpreted as a loop carry"
     (is (nil? (frontend/form->structured-loop (loop-source '(dec n)) options))))

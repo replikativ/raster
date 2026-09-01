@@ -665,8 +665,30 @@
                 {:kind :scalar :id id :sym symbol :expr expression})))
         (range) pairs))
 
+(defn- canonical-extent
+  [equalities values extent]
+  (loop [extent extent seen #{}]
+    (let [wrapped? (and (seq? extent) (= 'value (first extent)) (= 2 (count extent)))
+          inner (if wrapped? (second extent) extent)
+          normalized (descriptor/unwrap-int-cast inner)
+          array (alength-array normalized)
+          proved-shape (when array (:shape (get values array)))
+          proved-extent (when (= 1 (count proved-shape)) (first proved-shape))
+          next (or proved-extent
+                   (get equalities normalized)
+                   (get equalities inner)
+                   (when-not (= inner normalized) normalized)
+                   extent)]
+      (cond
+        (or (= next extent) (contains? seen next)) extent
+        ;; `(value compound-id)` is an unambiguous dimension reference. Once relational facts
+        ;; prove that compound value equal to a proper dimension, the wrapper has served its
+        ;; purpose and must not survive as a distinct shape.
+        (and wrapped? (= next inner)) extent
+        :else (recur next (conj seen extent))))))
+
 (defn- normalize-extents
-  [descriptions]
+  [descriptions shape-equalities values]
   (:descriptions
    (reduce
     (fn [{:keys [extents scalar-representatives] :as state} description]
@@ -674,11 +696,13 @@
         :scalar
         (let [expression (:expr description)
               array (alength-array expression)
+              proved-extent (canonical-extent shape-equalities values expression)
               representative (cond
                                (and array (contains? extents array)) (get extents array)
                                (symbol? expression)
                                (get scalar-representatives expression expression)
                                (integer? expression) expression
+                               (not= proved-extent expression) proved-extent
                                :else (:sym description))]
           (-> state
               (update :descriptions conj
@@ -689,9 +713,11 @@
         (:map :scatter :stencil :reduce :scan)
         (let [extent (descriptor/unwrap-int-cast (:extent description))
               array (alength-array extent)
+              proved-extent (canonical-extent shape-equalities values extent)
               extent' (cond
                         (and array (contains? extents array)) (get extents array)
                         (symbol? extent) (get scalar-representatives extent extent)
+                        (not= proved-extent extent) proved-extent
                         :else extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
@@ -1194,20 +1220,25 @@
                    results result-dtypes)))))
 
 (defn- merge-value
-  [values id contract]
-  (if-let [prior (get values id)]
-    (let [unknown-shape? (fn [value]
-                           (= [(list 'unknown-dimension id)] (:shape value)))
-          same-nonshape-contract? (= (dissoc prior :shape) (dissoc contract :shape))]
-      (cond
-        (= prior contract) values
-        (and same-nonshape-contract? (unknown-shape? prior)) (assoc values id contract)
-        (and same-nonshape-contract? (unknown-shape? contract)) values
-        :else
-        (fail! :source-value-conflict
-               "source bindings imply incompatible AbstractValues for one logical value"
-               {:id id :first prior :second contract})))
-    (assoc values id contract)))
+  ([values id contract] (merge-value values id contract {}))
+  ([values id contract shape-equalities]
+   (if-let [prior (get values id)]
+     (let [unknown-shape? (fn [value]
+                            (= [(list 'unknown-dimension id)] (:shape value)))
+           same-nonshape-contract? (= (dissoc prior :shape) (dissoc contract :shape))
+           equivalent-shape?
+           (= (mapv #(canonical-extent shape-equalities values %) (:shape prior))
+              (mapv #(canonical-extent shape-equalities values %) (:shape contract)))]
+       (cond
+         (= prior contract) values
+         (and same-nonshape-contract? equivalent-shape?) (assoc values id contract)
+         (and same-nonshape-contract? (unknown-shape? prior)) (assoc values id contract)
+         (and same-nonshape-contract? (unknown-shape? contract)) values
+         :else
+         (fail! :source-value-conflict
+                "source bindings imply incompatible AbstractValues for one logical value"
+                {:id id :first prior :second contract})))
+     (assoc values id contract))))
 
 (defn form->program
   "Construct and validate TypedSOAC directly from a closed let form.
@@ -1215,12 +1246,13 @@
    Returns nil when any binding is outside the certified source subset. Type/effect/value
    contradictions throw ExceptionInfo because falling through after accepting them would hide a
    compiler correctness defect."
-  [source {:keys [dtype array-types scalar-types values]
-           :or {dtype :double array-types {} scalar-types {} values {}}}]
+  [source {:keys [dtype array-types scalar-types values shape-equalities]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
-          descriptions (normalize-extents (source-descriptions pairs dtype))]
+          descriptions (normalize-extents (source-descriptions pairs dtype)
+                                          shape-equalities values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (supported-descriptions? descriptions))
@@ -1299,12 +1331,13 @@
                                    (:result-storage description))))
                     equation-descriptions)
               inferred-values (reduce (fn [contracts equation]
-                                        (reduce-kv merge-value contracts
+                                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
                                                    (equation-values equation dtype array-types'
                                                                     scalar-types
                                                                     contracts)))
                                       destination-values equations)
-              values (reduce-kv merge-value inferred-values values)
+              values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
+                                inferred-values values)
               equation-facts
               (into {}
                     (map (fn [description]

@@ -14,10 +14,31 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
+
+(deftest two-phase-reduction-graph-emits-its-explicit-scheduled-dataflow
+  (let [source '(let* [result (raster.par/reduce acc 0.0 i n
+                                                  (+ acc (clojure.core/aget a i)))]
+                      result)
+        options {:dtype :double :array-types {'a :double}
+                 :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :double {'a :double} options))
+        algorithm (get-in typed [:equations 0 :algorithm])
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        graph (equation-graph/make algorithm scheduled)
+        emitted (sg/generate-kernel-graph
+                 graph :array-types {'a :double} :scalar-types {'n :long})
+        [phase-one phase-two] (mapv :operation (:nodes emitted))
+        partials (first (:inputs (second (mapv :operation (:nodes graph)))))]
+    (is (= 2 (count (:nodes emitted))))
+    (is (every? kart/kernel-artifact? [phase-one phase-two]))
+    (is (str/includes? (:source phase-two) (str (name partials) "[")))
+    (is (not (re-find #"\ba\[" (:source phase-two)))
+        "the cross-block target kernel must not resurrect the original reduction body")))
 
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
@@ -147,7 +168,7 @@
     ;; Before the fix, op-args extraction took a0=acc a1=x and DROPPED y — emitting a
     ;; kernel that reduced with just x. A segmented reduce combine is binary (op acc elem).
     (is (thrown-with-msg?
-         Exception #"only a binary \(op acc elem\) combine"
+         Exception #"binary associative scalar combine"
          (segred-source '(+ acc (clojure.core/aget a j) (clojure.core/aget b j))))))
   (testing "the ordinary binary combine still lowers unchanged"
     (let [source (segred-source '(+ acc (clojure.core/aget a j)))]
@@ -159,7 +180,7 @@
     ;; The single-aset-void store-drop shape on the reduce side: (last bdy) silently dropped
     ;; the earlier body forms.
     (is (thrown-with-msg?
-         Exception #"multi-statement body"
+         Exception #"single-expression let region"
          (segred-source '(let* [t (clojure.core/aget a j)] (+ acc t) (+ acc t)))))))
 
 (deftest segred-devirtualized-aget-lowers-to-subscript

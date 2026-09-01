@@ -7,6 +7,7 @@
    analysis proves a complete same-dtype state copy."
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
@@ -106,9 +107,19 @@
       state)
     state))
 
+(defn- retain-extent-equality
+  [state expression extent]
+  (let [normalized (descriptor/unwrap-int-cast expression)]
+    (cond-> state
+      (not= normalized extent) (assoc-in [:equalities normalized] extent)
+      (not= expression normalized) (assoc-in [:equalities expression] extent))))
+
 (defn- infer-value
   [state symbol expression default-dtype]
   (let [values (:values state)
+        retained-scalar-dtype
+        (or (some-> symbol types/sym-type-tag dtype/dtype-for-scalar-tag)
+            (some-> expression types/sym-type-tag dtype/dtype-for-scalar-tag))
         cast-dtype (scalar-cast-dtype expression)
         inner (when (and cast-dtype (= 1 (count (descriptor/call-args expression))))
                 (first (descriptor/call-args expression)))
@@ -152,38 +163,43 @@
         state)
 
       allocation
-      (assoc-in state [:values symbol]
-                (tensor (:dtype allocation)
-                        [(or (shape-extent state (:extent allocation))
-                             (:extent allocation))]))
+      (let [extent (or (shape-extent state (:extent allocation))
+                       (:extent allocation))]
+        (-> state
+            (retain-extent-equality (:extent allocation) extent)
+            (assoc-in [:values symbol] (tensor (:dtype allocation) [extent]))))
 
       (par/par-map-pure-form? expression)
       (let [{:keys [bound cast elem-type]} (par/extract-par-map-pure-info expression)
             cast-dtype (some-> cast descriptor/cast-result-tag
                                dtype/dtype-for-scalar-tag)
-            elem-type (some-> elem-type dtype/canon)]
+            elem-type (some-> elem-type dtype/canon)
+            extent (or (shape-extent state bound) bound)]
         (when (and elem-type cast-dtype (not= elem-type cast-dtype))
           (throw (ex-info "parallel map element type disagrees with its explicit cast"
                           {:reason :host-abstract-value-pmap-dtype
                            :element-type elem-type :cast-dtype cast-dtype
                            :expression expression})))
-        (assoc-in state [:values symbol]
-                  (tensor (or elem-type cast-dtype default-dtype)
-                          [(or (shape-extent state bound) bound)])))
+        (-> state
+            (retain-extent-equality bound extent)
+            (assoc-in [:values symbol]
+                      (tensor (or elem-type cast-dtype default-dtype) [extent]))))
 
       destination-write
       (let [{:keys [bound cast elem-type]} destination-write
             cast-dtype (some-> cast descriptor/cast-result-tag
                                dtype/dtype-for-scalar-tag)
-            elem-type (some-> elem-type dtype/canon)]
+            elem-type (some-> elem-type dtype/canon)
+            extent (or (shape-extent state bound) bound)]
         (when (and elem-type cast-dtype (not= elem-type cast-dtype))
           (throw (ex-info "parallel write element type disagrees with its explicit cast"
                           {:reason :host-abstract-value-write-dtype
                            :element-type elem-type :cast-dtype cast-dtype
                            :expression expression})))
-        (assoc-in state [:values symbol]
-                  (tensor (or elem-type cast-dtype default-dtype)
-                          [(or (shape-extent state bound) bound)])))
+        (-> state
+            (retain-extent-equality bound extent)
+            (assoc-in [:values symbol]
+                      (tensor (or elem-type cast-dtype default-dtype) [extent]))))
 
       (symbol? expression)
       (if-let [value (get values expression)]
@@ -192,6 +208,12 @@
 
       cast-dtype
       (assoc-in state [:values symbol] (tensor cast-dtype []))
+
+      retained-scalar-dtype
+      ;; The walker/TypedClojure result type is authoritative. We deliberately do not inspect the
+      ;; operator here: this pass propagates retained contracts and relational shapes; it is not a
+      ;; second scalar type-inference engine.
+      (assoc-in state [:values symbol] (tensor retained-scalar-dtype []))
 
       :else state)))
 
