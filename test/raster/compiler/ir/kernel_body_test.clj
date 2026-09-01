@@ -51,6 +51,15 @@
     (is (= :in-bounds (:mask guard)))
     (is (= matrix (:instruction (nth (:operations loop-op) 2))))))
 
+(deftest kernel-buffer-shapes-retain-symbolic-launch-arithmetic
+  (let [extent (launch/ceil-div 'n 256)
+        kernel (-> (minimal-body)
+                   (assoc-in [:parameters 0 :shape] [extent])
+                   (assoc-in [:parameters 0 :layout]
+                             (layout/row-major [extent] :half)))]
+    (is (= kernel (body/validate! kernel)))
+    (is (= extent (get-in kernel [:parameters 0 :shape 0])))))
+
 (deftest the-verifier-refuses-implicit-or-incompatible-kernel-semantics
   (testing "opaque list arithmetic cannot hide in coordinates"
     (let [kernel (minimal-body)

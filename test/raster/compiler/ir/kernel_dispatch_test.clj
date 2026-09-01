@@ -440,8 +440,9 @@
        #'raster.gpu.core/rt-resolve-soft soft-resolver}
       (fn []
         (gpu/bind-step! session step {} {'x x-view 'out out-view})
-        (is (= 1 (count @slices)) "the non-zero OpenCL range is one owned cl_mem sub-buffer")
-        (is (= 1 (count (get-in @session [:prepared :view-step :owned-view-buffers]))))
+        (is (= 2 (count @slices))
+            "both partial OpenCL ranges are owned cl_mem sub-buffers, including a zero-origin prefix")
+        (is (= 2 (count (get-in @session [:prepared :view-step :owned-view-buffers]))))
         (gpu/release-prepared! session :view-step)
         (is (= 1 (count @destroyed)))
         (is (= @slices @freed) "view handles follow the bound step lifetime")

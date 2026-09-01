@@ -60,7 +60,8 @@
    operands with explicit scalar lambda parameters, so stable value IDs never leak into lexical
    expression binding. Lambda regions have one typed, ordered local-SSA spine. A local initializer
    may reference parameters, the map index, and earlier locals; results may reference all locals.
-   This represents shared scalar work once without smuggling type inference into an emitter."
+   This represents shared scalar work once without smuggling type inference into an emitter.
+   Scan results use the same result-storage relation when materialized into caller-owned buffers."
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
@@ -1286,7 +1287,7 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter 'stencil 'segmented-reduce
+      (when-not (contains? #{'map 'scatter 'stencil 'segmented-reduce 'scan
                              'product-reduce 'segmented-fold-map} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"
@@ -1303,7 +1304,7 @@
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]
-        (when (and (contains? #{'stencil 'segmented-fold-map} kind)
+        (when (and (contains? #{'stencil 'segmented-fold-map 'scan} kind)
                    (seq (set/intersection
                          (set destinations)
                          (set (get-in (operation-parts equation)

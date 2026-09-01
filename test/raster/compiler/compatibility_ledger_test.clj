@@ -1,6 +1,7 @@
 (ns raster.compiler.compatibility-ledger-test
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is use-fixtures]]
+            [raster.arrays]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
@@ -9,10 +10,20 @@
             [raster.nn :as nn]
             [raster.ode.pde :as pde]
             [raster.quant.kernels-k :as qk]
+            [raster.core :refer [deftm]]
+            [raster.numeric]
+            [raster.par]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private ledger-path "test/raster/compiler/compatibility_ledger.edn")
 (def ^:private target :ze:compatibility-ledger)
+
+(deftm prefix-sum-gpu
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/scan output accumulator (float 0.0) index n float
+                     (raster.numeric/+ accumulator
+                                       (raster.arrays/aget input index)))))
 
 (use-fixtures
   :once
@@ -92,6 +103,13 @@
                  1 2 2 1 2])]
       (equation-first-signature compilation plan))
 
+    :prefix-sum-gpu
+    (let [compilation (equation-first/compile
+                       #'prefix-sum-gpu {:target target :dtype :float})
+          plan (equation-first/lower
+                compilation [(float-array [1 2 3 4]) 4])]
+      (equation-first-signature compilation plan))
+
     :heat-rhs-1d-jvm
     (pipeline/compile-report #'pde/heat-rhs-1d! :dtype :double)
 
@@ -112,6 +130,7 @@
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
+             :prefix-sum-gpu
              :heat-rhs-1d-jvm
              :heat-loss-rk4-gpu}
            (set (keys workloads))))
@@ -122,6 +141,7 @@
                      (contains? #{:symbolic-dense-contraction-gpu
                                   :q4k-dp4a-rows-gpu
                                   :gqa-causal-mha-gpu
+                                  :prefix-sum-gpu
                                   :heat-loss-rk4-gpu} id) report
                      :else (signature report))]
         (is (= expected actual)

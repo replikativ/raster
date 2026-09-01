@@ -339,6 +339,7 @@
   (when-not (and (vector? shape) (seq shape)
                  (every? #(or (value-id? %)
                               (and (integer? %) (pos? %))
+                              (launch/dimension-expression? %)
                               (and (record-kind?
                                     "raster.compiler.ir.kernel_body.IndexExpr" %)
                                    (expression? %)))

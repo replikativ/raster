@@ -158,6 +158,11 @@
       (is (= 'scan (dialect/operation-kind equation)))
       (is (= :inclusive (get-in (dialect/operation-parts equation) [:attributes :mode])))
       (is (= '{result target} (get-in (dialect/facts program) [:equations 0 :aliases])))
+      (is (= ['target] (dialect/physical-results program equation)))
+      (is (= [{:destination 'target :access :write :host-return :buffer}]
+             (dialect/result-storage program 0)))
+      (is (empty? (get-in (dialect/operation-parts equation)
+                          [:attributes :attributes :stable-array-captures])))
       (is (= #{:memory/write} (:effects (dialect/facts program))))))
 
   (testing "exclusive scan is the same certified operation with a distinct result mode"

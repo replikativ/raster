@@ -555,9 +555,13 @@
               (set/difference (util/free-syms init) (:inputs io)
                               (set [symbol out acc idx])
                               descriptor/aget-ops descriptor/aset-ops)]
-          (merge {:kind :scan :id id :sym symbol :index idx :extent bound :mode mode
+          (merge {:kind :scan :id id :sym symbol :results [symbol]
+                  :index idx :extent bound :mode mode
                   :primary-out out :accumulator acc :identity init :dtype scan-dtype
-                  :algebra algebra :body body}
+                  :algebra algebra :body body
+                  :result-storage [{:destination out :access :write
+                                    :host-return :buffer}]
+                  :host-binding symbol}
                  (update io :scalars set/union identity-scalars)))))
 
     (par/par-map-void-form? expression)
@@ -780,7 +784,9 @@
                 (and (seq (:segment-axes description)) (seq (:folds description))
                      (every? (comp symbol? :destination)
                              (:result-storage description)))
-                :scan (symbol? (:primary-out description))
+                :scan (and (= 1 (count (:result-storage description)))
+                           (= (:primary-out description)
+                              (get-in description [:result-storage 0 :destination])))
                 false))
             descriptions)))
 
@@ -1043,7 +1049,9 @@
   [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
   (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
-        stable (conj (set stable) primary-out)
+        ;; The caller-owned destination is physical result storage, not a value read by the
+        ;; functional scan. Keeping it out of captures prevents a false read/alias contract.
+        stable (set stable)
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         elements (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -1376,17 +1384,11 @@
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [destination (when (= :scan (:kind description))
-                                               (:primary-out description))
-                                 storage (:result-storage description)]
+                           (let [storage (:result-storage description)]
                              [(:id description)
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
                                         :source-binding-id (:id description)})
-                                destination
-                                (assoc :effects #{:memory/write}
-                                       :aliases {(:sym description) destination}
-                                       :attributes {:destination destination})
                                 storage
                                 (assoc :effects #{:memory/write}
                                        :aliases (into {}
