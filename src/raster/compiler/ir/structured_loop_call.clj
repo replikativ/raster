@@ -69,10 +69,17 @@
                                 "symbolic trip-count binding differs from its retained dtype"
                                 {:value trip-count :expected expected :actual (:type value)})))
                      (:value value)))]
-    (when-not (and (integer? resolved) (not (neg? resolved)))
-      (fail! :structured-loop-trip-count "loop trip count must resolve non-negative"
+    (when-not (integer? resolved)
+      (fail! :structured-loop-trip-count "loop trip count must resolve to an integer"
              {:resolved resolved}))
-    (long resolved)))
+    (let [semantics (get-in (control/facts algorithm)
+                            [:attributes :trip-count-semantics])]
+      (cond
+        (not (neg? resolved)) (long resolved)
+        (= :clamp-nonnegative semantics) 0
+        :else
+        (fail! :structured-loop-trip-count "loop trip count must resolve non-negative"
+               {:resolved resolved :semantics semantics})))))
 
 (defn- scalar-binding
   [slots id expected-dtype value]

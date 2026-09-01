@@ -70,6 +70,37 @@
     (is (= ['n] (get-in analysis [:values 'y :shape])))
     (is (nil? (get-in analysis [:values 'unknown])))))
 
+(deftest complete-parallel-writes-retain-their-destination-contract
+  (let [source
+        '(let* [n (int (clojure.core/alength u))
+                written (raster.par/stencil! scratch [u] 1 :dirichlet double i n
+                                             (clojure.core/aget u i))]
+               written)
+        input (av/tensor {:dtype :double :shape ['extent] :representation {:kind :plain}})
+        analysis (host-av/analyze source {:values {'u input 'scratch input}})
+        expression (nth (second source) 3)]
+    (is (= ['n] (get-in analysis [:values 'written :shape])))
+    (is (= {:destination 'scratch :extent 'n :dtype :double :kind :stencil}
+           (host-av/full-array-write analysis 'written expression)))
+    (testing "a partial destination iteration space has no complete-write proof"
+      (is (nil? (host-av/full-array-write
+                 analysis 'written (apply list (assoc (vec expression) 7 '(dec n)))))))))
+
+(deftest source-shaped-allocation-has-fresh-ownership
+  (let [external (av/tensor {:dtype :double :shape ['n] :ownership :external
+                             :effects #{:memory/read}
+                             :attributes {:source :caller}})
+        analysis (host-av/analyze
+                  '(let* [copy (clojure.core/aclone input)] copy)
+                  {:values {'input external}})
+        copy (get-in analysis [:values 'copy])]
+    (is (nil? (:ownership copy))
+        "the relational pass clears caller ownership; allocation assigns physical ownership later")
+    (is (= #{} (:effects copy)))
+    (is (= {} (:attributes copy)))
+    (is (= (select-keys external [:dtype :shape :logical-layout :representation])
+           (select-keys copy [:dtype :shape :logical-layout :representation])))))
+
 (deftest malformed-input-contracts-fail-loud
   (testing "authoritative values must be AbstractValues"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expected an AbstractValue"

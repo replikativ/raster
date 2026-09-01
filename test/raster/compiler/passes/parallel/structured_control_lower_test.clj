@@ -145,3 +145,27 @@
               {})]
     (is (= 0 (:trip-count call)))
     (is (= {'u-final :initial-buffer} (:outputs call)))))
+
+(deftest dotimes-derived-loop-clamps-a-negative-runtime-bound-to-zero
+  (let [program (loop-program)
+        program (control/make
+                 (assoc-in (control/facts program)
+                           [:attributes :trip-count-semantics]
+                           :clamp-nonnegative)
+                 (control/loop-index program)
+                 (control/invariants program)
+                 (control/carried program)
+                 (control/body program)
+                 (control/outer-values program))
+        scheduled (lower/schedule program {:target-device :cpu:0 :dtype :float})
+        emitted (opencl/generate-kernel-graph
+                 (:graph scheduled) :scalar-types {'alpha-in :float 'iteration :long})
+        call (loop-call/make
+              scheduled emitted
+              {'u0 :initial-buffer 'u-final :unused-output-buffer}
+              {'steps {:type :long :value -3}
+               'n {:type :int :value 64}
+               'alpha {:type :float :value 0.25}}
+              {})]
+    (is (zero? (:trip-count call)))
+    (is (= {'u-final :initial-buffer} (:outputs call)))))
