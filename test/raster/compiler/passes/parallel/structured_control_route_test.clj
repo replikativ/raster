@@ -407,7 +407,13 @@
     (is (= ["StructuredLoopCall" "EvaluatedHostEquation" "EmittedEquationCall"]
            (mapv #(-> % class .getSimpleName) (:steps call)))
         "the real emitted workload must cross the checked runtime-call boundary")
-    (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))))
+    (is (= (set (:outputs emitted-program)) (set (keys (:outputs call)))))
+    (let [sources (program-call/buffer-identities call)
+          mapping (zipmap sources (mapv #(vector :rk4-storage %)
+                                        (range (count sources))))
+          remapped (program-call/map-buffers call mapping)]
+      (is (every? (set (vals mapping)) (vals (:outputs remapped)))
+          "the rank-zero GPU reduction result remains resident storage during remapping"))))
 
 (defn- prepared-mixed-call
   ([trip-count]
@@ -491,7 +497,7 @@
                   (catch clojure.lang.ExceptionInfo exception exception))))))))
 
 (deftest emitted-program-call-is-a-native-link-plan-instance
-  (let [{:keys [call]} (prepared-mixed-call 0)
+  (let [{:keys [call]} (prepared-mixed-call 3)
         sources (program-call/buffer-identities call)
         mapping (zipmap sources (mapv #(vector :program-value %)
                                       (range (count sources))))
@@ -520,7 +526,25 @@
     (is (link/link-plan? plan))
     (is (= #{:state} (set (vals (link/instance-roles plan instance)))))
     (is (every? #(= 1 (count (:leaves %))) (vals (:values plan))))
-    (is (false? (get-in remapped [:attributes :source-inspected])))))
+    (is (false? (get-in remapped [:attributes :source-inspected])))
+    (is (= :program-link-graph-range
+           (reason-of
+            #(link/make
+              {:id :undersized-rk4 :target :ocl:0
+               :nodes (mapv (fn [node]
+                              (link/node {:id (:id node) :dtype (get-in node [:view :dtype])
+                                          :shape [1] :device :ocl:0 :role :state}))
+                            nodes)
+               :values values :instances [instance] :outputs [output-id]}))))))
+
+(deftest scheduled-loop-consumers-read-physical-result-storage
+  (let [graph (-> (prepared-mixed-call 1) :call :steps first :graph)
+        [producer consumer] (:nodes graph)]
+    (is (= '[rstr_loop_carry_4] (mapv :id (:inputs graph))))
+    (is (= '[scratch] (mapv :id (:temporaries graph))))
+    (is (some #(and (= 'scratch (:buffer %)) (= :read (:access %))) (:uses consumer)))
+    (is (= [(:id producer)] (:dependencies consumer)))
+    (is (not-any? #(= 'rstr_loop_value_0 (:buffer %)) (:uses consumer)))))
 
 (deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
   (let [{:keys [call]} (prepared-mixed-call 9)
