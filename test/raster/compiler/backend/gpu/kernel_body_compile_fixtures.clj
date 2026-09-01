@@ -69,12 +69,13 @@
   [dialect]
   (let [form (with-meta
                '(raster.par/reduce acc 0.0 i n
-                                   (+ acc (* scale (clojure.core/aget values i))))
+                                   (+ acc (* (double scale)
+                                             (clojure.core/aget values i))))
                {:raster.type/elem-type :float})
         node (soac/par-form->soac 'result form 901 :dtype :float)
         operation (first (soac-lower/lower-reduce node nil :dtype :float))]
     (segop-emit/generate-segred-kernel-body
-     operation nil :dtype :float :scalar-types {'scale :float}
+     operation nil :dtype :float :scalar-types {'scale :double}
      :target-dialect dialect :kernel-name-prefix "workgroup_reduce")))
 
 (defn- contraction-artifact
