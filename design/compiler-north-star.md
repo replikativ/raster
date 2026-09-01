@@ -904,6 +904,18 @@ handles remain runtime resources. An outer `WorkloadPlan` may handle admission, 
 deadlines, retries, checkpoints and safe reallocation for dynamic services; it selects certified
 compiled variants rather than injecting service policy into SOAC or kernel IR.
 
+The first executable part of that bridge now exists for point-to-point schedules. A rectangular
+`DeviceMesh` is embedded in a directed topology whose devices declare memory capacity and whose
+links declare bandwidth and latency. Concrete `AbstractValue` shapes carry either exact replication
+or one-axis partitioning; certification proves full coverage, absence of gaps/overlaps, ownership,
+and placement in the mesh. Ordered compute and transfer steps form a fail-loud dependency DAG.
+Its analytic simulator serializes compute per device and transfers per directed link, while allowing
+the two resource classes to overlap, and reports makespan, per-device peak memory, link bytes, and
+total transferred bytes. The re-derived certificate contains those costs and shard/route witnesses.
+This is deliberately a planning model: measured costs may replace analytic durations, and Datahike
+may retain its immutable plan/measurement history, but driver buffers, communicators, and events do
+not enter the IR. Collective agreement and halo regions are the next semantic extension.
+
 The first distributed target should be data-parallel training with explicit gradient all-reduce,
 followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
 Pipeline and expert parallelism should wait until the value, sharding, communication and failure
