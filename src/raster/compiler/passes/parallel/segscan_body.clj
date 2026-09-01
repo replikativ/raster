@@ -14,7 +14,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.contraction-body :as contraction-body]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn- decline!
@@ -146,7 +146,7 @@
         (fn lower-index
           ([form] (lower-index form #{}))
           ([form extra-scope]
-           (contraction-body/lower-index form (set/union index-scope extra-scope))))
+           (index-expression/lower form (set/union index-scope extra-scope) decline!)))
         lowerer (scalar-expression/make-lowerer
                  {:array-types array-types :scalar-types scalar-types
                   :arrays (set pointer-ids) :index-scope index-scope

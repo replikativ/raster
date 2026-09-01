@@ -11,7 +11,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.contraction-body :as contraction-body]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn- decline!
@@ -94,8 +94,8 @@
                       ([expression] (lower-index expression #{}))
                       ([expression extra-scope]
                        (widen-index-expression
-                        (contraction-body/lower-index
-                         expression (set/union index-scope extra-scope))
+                        (index-expression/lower
+                         expression (set/union index-scope extra-scope) decline!)
                         index-value-types)))
         segment-count (lower-index segment-count-source)
         map-extent (lower-index (:bound mapped-dim))

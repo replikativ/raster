@@ -103,9 +103,11 @@
                           (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
                           (and (not fp-source?) fp-target? (= :double target)
                                (<= (dtype/bytes-of source) 4)) [:exact :exact]
+                          (and (not fp-source?) fp-target?)
+                          [:nearest-even (if (= :half target) :ieee :exact)]
                           :else
                           (decline! :cast-policy
-                                    "scalar cast has no portable exact policy"
+                                    "scalar cast has no portable rounding and overflow policy"
                                     {:expression expression :source source :target target}))
                         id (fresh "cast")]
                     {:operations (conj (:operations lowered)
@@ -262,7 +264,10 @@
                                              (dtype/canon
                                               (or (source-type (first arguments) :int env) :int))
                                              expected)
-                              lowered (mapv #(lower % operand-type env) arguments)
+                              lowered (mapv #(cast-lowered
+                                              (lower % operand-type env)
+                                              operand-type expression)
+                                            arguments)
                               result-type (if comparison? :predicate operand-type)
                               _ (when-not (every? #(= operand-type (:type %)) lowered)
                                   (decline! :operand-dtype

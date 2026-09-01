@@ -870,6 +870,26 @@
            (= [:exact :exact] [rounding overflow]))
       (str "(" (target-type result-type) ")(" argument-source ")")
 
+      ;; Integral-to-floating precision loss is explicit. OpenCL conversion builtins preserve the
+      ;; requested rounding; CUDA/HIP expose the corresponding signed integer RN intrinsics.
+      (and (not source-fp?) result-fp? (= :nearest-even rounding)
+           (= (if (= :half result-type) :ieee :exact) overflow))
+      (if (c-dialect/opencl? *scalar-dialect*)
+        (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
+             "(" argument-source ")")
+        (case [source-type result-type]
+          [:byte :float] (str "(float)(" argument-source ")")
+          [:byte :double] (str "(double)(" argument-source ")")
+          [:int :float] (str "__int2float_rn(" argument-source ")")
+          [:int :double] (str "(double)(" argument-source ")")
+          [:long :float] (str "__ll2float_rn(" argument-source ")")
+          [:long :double] (str "__ll2double_rn(" argument-source ")")
+          (throw (ex-info "CUDA/HIP cannot preserve this integral-to-floating policy"
+                          {:reason :kernel-body-c-cast-policy
+                           :dialect (:id *scalar-dialect*)
+                           :source-type source-type :result-type result-type
+                           :rounding rounding :overflow overflow}))))
+
       :else
       (throw (ex-info "C-family target cannot preserve this KernelBody cast policy"
                       {:reason :kernel-body-c-cast-policy

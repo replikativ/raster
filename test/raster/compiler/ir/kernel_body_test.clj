@@ -294,6 +294,13 @@
           [(body/->ScalarCompute
             (body/value 'bad :long)
             (body/cast-expression (body/literal 1 :int) :long :up :exact))]))))
+  (testing "integral-to-floating conversion states its precision loss"
+    (is (body/kernel-body?
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'converted :float)
+            (body/cast-expression (body/literal 1 :long)
+                                  :float :nearest-even :exact))]))))
   (testing "floating conversions cannot silently request integer wrapping"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"policies disagree"
