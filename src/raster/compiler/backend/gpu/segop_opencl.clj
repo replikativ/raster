@@ -577,12 +577,12 @@
                      (emit-result element result (:dtype component) {}) ";"))
               components (:results element) elem-names)
         combine-lines
-        (fn [left-names right-names destination-names]
+        (fn [left-exprs right-exprs destination-names]
           (let [substitutions
                 (into {}
-                      (mapcat (fn [[[left right] left-name right-name]]
-                                [[left (symbol left-name)] [right (symbol right-name)]])
-                              (map vector (:parameters combine) left-names right-names)))]
+                      (mapcat (fn [[[left right] left-expr right-expr]]
+                                [[left left-expr] [right right-expr]])
+                              (map vector (:parameters combine) left-exprs right-exprs)))]
             (mapv (fn [component result destination]
                     (str (component-ctype component) " " destination " = "
                          (emit-result combine result (:dtype component) substitutions) ";"))
@@ -599,15 +599,19 @@
                               (str (component-ctype component) " " acc-name " = "
                                    (product-neutral-c (:neutral component) (:dtype component)) ";"))
                             components acc-names)
-        first-combine (combine-lines acc-names elem-names next-names)
+        first-combine (combine-lines (mapv symbol acc-names)
+                                     (mapv symbol elem-names)
+                                     next-names)
         assign-next (mapv #(str % " = " %2 ";") acc-names next-names)
         shared-decls (mapv (fn [component shared]
                              (str "__local " (component-ctype component) " " shared
                                   "[" block-size "];"))
                            components shared-names)
         shared-store (mapv #(str % "[lid] = " %2 ";") shared-names acc-names)
-        tree-left (mapv #(str % "[lid]") shared-names)
-        tree-right (mapv #(str % "[lid + stride]") shared-names)
+        tree-left (mapv #(list 'clojure.core/aget (symbol %) 'lid) shared-names)
+        tree-right (mapv #(list 'clojure.core/aget (symbol %)
+                                (list 'clojure.core/+ 'lid 'stride))
+                         shared-names)
         tree-next (mapv #(str "tree_next_" %) (range (count components)))
         tree-combine (combine-lines tree-left tree-right tree-next)
         tree-store (mapv #(str % "[lid] = " %2 ";") shared-names tree-next)
