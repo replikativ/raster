@@ -941,6 +941,14 @@ GPU-initiated transports such as NVSHMEM are interchangeable execution backends,
 semantic memory model. Datahike may retain durable topology, plan, measurement and decision history;
 it does not replace hot-path allocation or communication.
 
+Durable numerical state follows the same separation. A certified storage-neutral
+`NumericalStateManifest` binds logical `AbstractValue` fields to immutable content-addressed chunks,
+lineage, numerical compatibility and provenance. Store placement remains a runtime decision: a
+local mmap/Konserve or LMDB frontend may be backed by S3, Ceph, a parallel filesystem or an
+institutional archive. Datahike publishes the semantic state only after required durability
+receipts; direct fabrics still move hot halos, gradients and activations. See
+[`durable-numerical-state.md`](durable-numerical-state.md).
+
 ## 7. Reflection, structural self-modification, and learning
 
 Raster can make reflection unusually powerful because Clojure data is a natural
