@@ -90,9 +90,13 @@
                                  (zipmap scheduled-indices (repeat :long))
                                  scalar-types)
         segment-count-source (segop/seg-space-num-segments-expr space)
-        lower-index #(widen-index-expression
-                      (contraction-body/lower-index % index-scope)
-                      index-value-types)
+        lower-index (fn lower-index
+                      ([expression] (lower-index expression #{}))
+                      ([expression extra-scope]
+                       (widen-index-expression
+                        (contraction-body/lower-index
+                         expression (set/union index-scope extra-scope))
+                        index-value-types)))
         segment-count (lower-index segment-count-source)
         map-extent (lower-index (:bound mapped-dim))
         total-elements (body/expression :mul segment-count map-extent)

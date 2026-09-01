@@ -22,6 +22,7 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.core :refer [deftm]]
+            [raster.dl.attention :as dl-attention]
             [raster.numeric]
             [raster.par]
             [raster.runtime.hardware :as hardware]))
@@ -188,7 +189,9 @@
       (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
-                 #'public-c-family-map {:target device-id :dtype :float}))))))
+                 #'public-c-family-map {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 
 (defn- write-artifact!
   [directory suffix label artifact]
