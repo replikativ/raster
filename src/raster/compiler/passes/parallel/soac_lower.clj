@@ -211,11 +211,12 @@
               :algorithm-equation equation-id)])))
 
 (defn lower-typed-scatter
-  "Lower one unique-destination TypedSOAC scatter to an explicit-store SegMap.
+  "Lower one proof-carrying TypedSOAC scatter to an explicit-store SegMap.
 
    The SegMap has no implicit primary result store (`out-sym` is nil); its typed scalar region
-   contains every conditional indexed write. Physical destinations remain both inputs and outputs
-   because an indexed update preserves unselected elements."
+   contains every conditional indexed write or certified atomic contribution. Physical
+   destinations remain both inputs and outputs because an indexed update preserves unselected
+   elements."
   [program device-id & {:keys [dtype] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))]
@@ -250,22 +251,37 @@
                               {:reason :typed-soac-scatter-subset :equation equation-id
                                :results results :writes writes
                                :physical-results physical-results})))
+          conflict (:conflict attributes)
+          reducing? (soac-dialect/reducing-scatter-conflict? conflict)
+          result-dtype (or (:dtype (get-in facts [:values (first results)])) dtype :double)
           statements
           (mapv (fn [destination {:keys [destination-index predicate value]}]
-                  (let [store (list 'clojure.core/aset destination destination-index value)]
+                  (let [destination (if reducing?
+                                      (with-meta destination
+                                        {:raster.type/tag
+                                         (dtype/scalar-tag-for-dtype result-dtype)
+                                         :tag (dtype/scalar-tag-for-dtype result-dtype)})
+                                      destination)
+                        store (if reducing?
+                                (list 'raster.par/atomic-add!
+                                      destination destination-index value)
+                                (list 'clojure.core/aset destination destination-index value))]
                     (if (contains? #{true 1} predicate) store (list 'if predicate store))))
                 physical-results writes)
           body (materialize-region-locals locals (list* 'do statements))
           stable (set (get-in attributes [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable captures))
-          result-dtype (or (:dtype (get-in facts [:values (first results)])) dtype :double)
           node (assoc (soac/->SoacMap equation-id nil (:index attributes)
                                       (:extent attributes) nil body
                                       (into (set arrays) stable)
                                       (set physical-results) scalar-captures)
-                      :elem-type result-dtype :pure? false)]
+                      :elem-type result-dtype :pure? false
+                      :write-conflict (if reducing? :reduce :unique)
+                      :conflict-contract conflict)]
       (mapv #(assoc % :algorithm-dialect :typed-soac
-                    :algorithm-equation equation-id)
+                    :algorithm-equation equation-id
+                    :write-conflict (if reducing? :reduce :unique)
+                    :conflict-contract conflict)
             (lower-map node device-id :dtype result-dtype)))))
 
 (defn typed-reduce-program?

@@ -111,6 +111,7 @@
         adapted-body (ce/adapt-casts-for-dtype body default-dtype)
         body-source (binding [ce/*emit-config* ce/opencl-config
                               ce/*scalar-type* default-ctype
+                              ce/*array-dtypes* array-types
                               ce/*idx-sym* idx
                               ce/*int-vars* (into ce/*int-vars* int-scalars)]
                       (ce/emit-stmt adapted-body idx array-symbols local-index))
@@ -129,7 +130,10 @@
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas
                            default-dtype (map pointer-dtype pointers))
-                    (ce/intrinsic-helper-sources body-source)
+                    (when (and (= :reduce (:write-conflict segmap))
+                               (= :float default-dtype))
+                      "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n")
+                    (ce/helper-sources body-source)
                     "__kernel void " kernel-name "(" parameter-list ") {\n"
                     "    for (int " local-index " = get_global_id(0); " local-index
                     " < _n_bound; " local-index " += get_global_size(0)) {\n"
@@ -144,13 +148,16 @@
       :launch (klaunch/spec {:workgroup-size [256]
                              :group-count [(klaunch/ceil-div bound 256)]})
       :temporaries []
-      :effects {:kind :side-effect-map :write-conflict :unique}
+      :effects {:kind (if (= :reduce (:write-conflict segmap))
+                        :reducing-scatter :side-effect-map)
+                :write-conflict (or (:write-conflict segmap) :unique)}
       :provenance {:dialect :segmap :segop-id (:id segmap)}
       :attributes {:array-params pointers
                    :scalar-params scalars
                    :written-arrays (vec (sort-by name outputs))
                    :array-types array-types
                    :dtype default-dtype
+                   :conflict-contract (:conflict-contract segmap)
                    :explicit-stores true}})))
 
 (defn generate-segmap-kernel
@@ -286,7 +293,7 @@
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
                     ;; registry intrinsics this body calls (e.g. rstr_dp4a) must be DEFINED
-                    (ce/intrinsic-helper-sources scalar-body-str)
+                    (ce/helper-sources scalar-body-str)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    "
@@ -384,7 +391,7 @@
                         scalars)
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas dtype (map input-dtype inputs))
-                    (ce/intrinsic-helper-sources body-str)
+                    (ce/helper-sources body-str)
                     "__kernel void " kernel-name "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; "
                     "idx += get_global_size(0)) {\n"
@@ -2087,7 +2094,7 @@
              (codegen/extension-pragmas out-dtype dtype)
                  ;; registry-driven, not `(intrinsics/descriptor 'dp4a)`: define every intrinsic
                  ;; helper this body actually calls — the same scan every other emitter uses
-             (ce/intrinsic-helper-sources nest)
+             (ce/helper-sources nest)
              "__kernel void " kernel-name "(" params ") {\n"
              "    int seg = get_global_id(0);\n"
              "    if (seg >= _nseg) return;\n"

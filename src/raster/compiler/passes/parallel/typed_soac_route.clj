@@ -191,29 +191,47 @@
             result-dtypes (mapv #(:dtype (get values %)) results)
             casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
             writes (mapv dialect/write-parts bodies)
+            conflict (:conflict attributes)
+            reducing? (dialect/reducing-scatter-conflict? conflict)
+            host-returns (mapv :host-return storage)
             _ (when-not (and (= (count results) (count writes) (count physical-results))
                              (every? some? writes)
                              (every? some? casts)
-                             (= #{:effect} (set (map :host-return storage))))
+                             (every? #{:effect :buffer} host-returns))
                 (throw (ex-info "the production scatter route requires typed effect writes"
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results
                                  :storage storage :writes writes :dtypes result-dtypes})))
             statements
-            (mapv (fn [destination cast {:keys [destination-index predicate value]}]
-                    (let [store (list 'clojure.core/aset destination destination-index
-                                      (list cast value))]
+            (mapv (fn [destination result-dtype cast
+                       {:keys [destination-index predicate value]}]
+                    (let [destination (with-meta destination
+                                        {:raster.type/tag
+                                         (dtype/scalar-tag-for-dtype result-dtype)
+                                         :tag (dtype/scalar-tag-for-dtype result-dtype)})
+                          typed-value (list cast value)
+                          store (if reducing?
+                                  (list 'raster.par/atomic-add!
+                                        destination destination-index typed-value)
+                                  (list 'clojure.core/aset destination destination-index
+                                        typed-value))]
                       (if (contains? #{true 1} predicate) store (list 'if predicate store))))
-                  physical-results casts writes)
-            source (with-meta
-                     (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                           (materialize-region region-locals (list* 'do statements)))
-                     {:raster.type/elem-type (first result-dtypes)})]
+                  physical-results result-dtypes casts writes)
+            effect-source (with-meta
+                            (list 'raster.par/map-void! (:index attributes)
+                                  (:extent attributes)
+                                  (materialize-region region-locals (list* 'do statements)))
+                            {:raster.type/elem-type (first result-dtypes)})
+            effect-binding (clojure.core/symbol (str "scatter_effect__" equation-id))
+            buffer-return? (= [:buffer] host-returns)]
         {:equation-id equation-id
          :placement placement
-         :pairs [[host-binding source]]
-         :site [:binding host-binding]
-         :source source})
+         :pairs (if buffer-return?
+                  [[effect-binding effect-source]
+                   [host-binding (first physical-results)]]
+                  [[host-binding effect-source]])
+         :site [:binding (if buffer-return? effect-binding host-binding)]
+         :source effect-source})
 
       stencil
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])

@@ -573,6 +573,21 @@
                   (do (swap! stats update :fallback inc)
                       (par/expand-par-gather! form))))
 
+              ;; Explicit-store maps consume their scheduled scalar region even when there is no
+              ;; legal SIMD schedule. This keeps reducing-scatter algebra attached to the same
+              ;; SegMap while executing an exact sequential read/modify/write loop on the JVM.
+              (par/par-map-void-form? form)
+              (let [dtype (or (:raster.type/elem-type (meta form)) :double)
+                    scheduled (take-bound
+                               #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                     (nil? (:out-sym %)))
+                               dtype)]
+                (if-let [scalar-form (some-> scheduled segop-simd/compile-effect-segmap)]
+                  (do (swap! stats update :scalar-effect-maps (fnil inc 0))
+                      scalar-form)
+                  (do (swap! stats update :fallback inc)
+                      (par/expand-par-map-void! form))))
+
               ;; Correctness boundary for a parallel primitive without a JVM SIMD schedule.
               ;; In particular, a typed segmented contraction projects back to par/contract for
               ;; host execution. Generic sequence recursion would leave its free/contract axis

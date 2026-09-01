@@ -20,7 +20,9 @@
                (region [(let-value local :dtype init-expr) ...]
                        [result-expr ...]))))
         (= equation-id [result ...]
-           (scatter {:index i :extent n :conflict :unique} [array ...] [capture ...]
+           (scatter {:index i :extent n
+                     :conflict :unique-or-proof-carrying-reduction}
+             [array ...] [capture ...]
              (lambda [element ... capture-parameter ...]
                (region [(let-value local :dtype init-expr) ...]
                        [(write destination-index predicate value) ...]))))
@@ -130,10 +132,39 @@
        (extent? (:extent value))
        (or (nil? (:attributes value)) (map? (:attributes value)))))
 
+(def ^:private scatter-accumulator '%scatter-accumulator)
+(def ^:private scatter-contribution '%scatter-contribution)
+
+(defn reducing-scatter-conflict
+  "Build the canonical proof-carrying conflict contract for a reducing scatter.
+
+  The current atomic schedules accept commutative scalar monoids.  Keeping the certificate in the
+  functional IR distinguishes an update contribution from a unique destination store and prevents
+  an emitter from inventing reassociation legality from a function name."
+  [operator dtype]
+  (let [dtype (dtype/canon dtype)
+        identity (descriptor/typed-reduce-identity operator dtype)
+        algebra (scan-ir/certify
+                 {:acc scatter-accumulator :init identity
+                  :lambda (list operator scatter-accumulator scatter-contribution)}
+                 dtype)]
+    {:kind :reduce :operator (:combine algebra) :identity identity
+     :dtype dtype :algebra algebra}))
+
+(defn reducing-scatter-conflict?
+  [value]
+  (and (map? value)
+       (= :reduce (:kind value))
+       (contains? #{:int :float} (:dtype value))
+       (try
+         (= value (reducing-scatter-conflict (:operator value) (:dtype value)))
+         (catch clojure.lang.ExceptionInfo _ false))))
+
 (defn scatter-attributes?
   [value]
   (and (map-attributes? value)
-       (= :unique (:conflict value))))
+       (or (= :unique (:conflict value))
+           (reducing-scatter-conflict? (:conflict value)))))
 
 (defn stencil-attributes?
   "Attributes for a boundary-aware neighborhood map.

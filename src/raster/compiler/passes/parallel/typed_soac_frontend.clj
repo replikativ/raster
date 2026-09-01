@@ -258,9 +258,36 @@
                     destinations)}
                io)))))
 
+(defn- reducing-scatter-description
+  [id symbol out values indices extent operator default-dtype]
+  (let [index (clojure.core/symbol (str "scatter_i__" id))
+        contribution (list 'clojure.core/aget values index)
+        destination-index (list 'clojure.core/aget indices index)
+        elem-type (dtype/canon default-dtype)
+        io (extract-io (list 'do contribution destination-index) index [out])]
+    (merge {:kind :scatter :id id :sym symbol :index index :extent extent
+            :results [symbol] :locals [] :casts [nil] :bodies [contribution]
+            :write-indices [destination-index] :predicates [1]
+            :conflict (dialect/reducing-scatter-conflict operator elem-type)
+            :effect-only? false :host-binding symbol :elem-type elem-type
+            :result-storage [{:destination out :access :read-write
+                              :host-return :buffer}]
+            :source-operation :reducing-scatter}
+           io)))
+
 (defn- operation-description
   [id symbol expression default-dtype]
   (cond
+    (par/par-scatter-form? expression)
+    (let [{:keys [out src index n stride]} (par/extract-par-scatter-info expression)]
+      (when-not stride
+        (reducing-scatter-description id symbol out src index n '+ default-dtype)))
+
+    (par/par-reduce-by-key-form? expression)
+    (let [{:keys [out keys vals n op]} (par/extract-par-reduce-by-key-info expression)]
+      (when (contains? #{'+ 'clojure.core/+} op)
+        (reducing-scatter-description id symbol out vals keys n op default-dtype)))
+
     ;; A flat gather is semantically an ordinary dense map with one pointwise index input and one
     ;; stable, indirectly-read data input.  Keep it in that small functional vocabulary; the JVM
     ;; scheduler may later select hardware vgather from the typed scalar region, while GPU targets
@@ -705,7 +732,9 @@
                               (every? (comp symbol? :destination)
                                       (:result-storage description))))
                 :scatter (and (seq (:result-storage description))
-                              (= :unique (:conflict description))
+                              (or (= :unique (:conflict description))
+                                  (dialect/reducing-scatter-conflict?
+                                   (:conflict description)))
                               (every? (comp symbol? :destination)
                                       (:result-storage description)))
                 :stencil (and (= 1 (count (:result-storage description)))
