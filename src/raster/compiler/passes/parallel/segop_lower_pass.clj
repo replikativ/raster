@@ -284,6 +284,8 @@
                                                algorithm device-id :dtype dtype)}
                              scatter {:operations (soac-lower/lower-typed-scatter
                                                    algorithm device-id :dtype dtype)}
+                             stencil {:operations (soac-lower/lower-typed-stencil
+                                                   algorithm device-id :dtype dtype)}
                              reduce {:operations (soac-lower/lower-typed-reduce
                                                   algorithm device-id :dtype dtype)}
                              segmented-reduce

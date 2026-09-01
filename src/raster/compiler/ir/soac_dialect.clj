@@ -63,6 +63,7 @@
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -127,6 +128,24 @@
   [value]
   (and (map-attributes? value)
        (= :unique (:conflict value))))
+
+(defn stencil-attributes?
+  "Attributes for a boundary-aware neighborhood map.
+
+   The first production schedule certifies a radius-one domain and Dirichlet boundaries.
+   Neighborhood arrays remain explicit stable captures, so the scalar region sees whole tensors
+   and retains its shifted indices rather than pretending they are pointwise elements."
+  [value]
+  (and (map-attributes? value)
+       (= 1 (:radius value))
+       (= :dirichlet (:boundary value))
+       (vector? (:dtypes value))
+       (= 1 (count (:dtypes value)))
+       (let [component-dtype (first (:dtypes value))]
+         (and (keyword? component-dtype)
+              (contains? #{:float :double} component-dtype)
+              (dtype/known? component-dtype)
+              (= component-dtype (dtype/canon component-dtype))))))
 
 (defn reduce-attributes?
   [value]
@@ -327,6 +346,7 @@
              [sa scalar-attributes?]
              [ma map-attributes?]
              [xa scatter-attributes?]
+             [sta stencil-attributes?]
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
              [pra product-reduce-attributes?]
@@ -357,6 +377,7 @@
              (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (scatter ?xa [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (stencil ?sta [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (product-reduce ?pra [(?:* ?id:array)] [(?:* ?id:capture)]
@@ -517,6 +538,73 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :dialect :typed-soac))))
 
+(def ^:private stencil-index-casts
+  '#{byte short int long clojure.core/byte clojure.core/short clojure.core/int clojure.core/long})
+
+(defn- unwrap-stencil-index-cast
+  [expression]
+  (loop [expression expression]
+    (if (and (seq? expression) (= 2 (count expression))
+             (contains? stencil-index-casts (first expression)))
+      (recur (second expression))
+      expression)))
+
+(defn- stencil-index-offset
+  "Return the constant offset of one admitted affine stencil index, or nil.
+
+   The initial typed stencil contract deliberately admits only `i`, `i + c`, `c + i`, and
+   `i - c`. This keeps the radius proof semantic and target-independent; emitters never guess
+   whether an arbitrary index expression remains inside the guarded neighborhood."
+  [index expression]
+  (let [expression (unwrap-stencil-index-cast expression)]
+    (cond
+    (= index expression) 0
+
+    (and (seq? expression) (= 3 (count expression))
+         (contains? '#{+ clojure.core/+} (first expression)))
+    (let [[_ left right] expression
+          left (unwrap-stencil-index-cast left)
+          right (unwrap-stencil-index-cast right)]
+      (cond
+        (and (= index left) (integer? right)) right
+        (and (integer? left) (= index right)) left
+        :else nil))
+
+    (and (seq? expression) (= 3 (count expression))
+         (contains? '#{- clojure.core/-} (first expression))
+         (= index (unwrap-stencil-index-cast (second expression)))
+         (integer? (unwrap-stencil-index-cast (nth expression 2))))
+    (- (unwrap-stencil-index-cast (nth expression 2)))
+
+    :else nil)))
+
+(defn- validate-stencil-neighborhood!
+  [equation-id attributes captures parameters body-results]
+  (let [stable-ids (set (get-in attributes [:attributes :stable-array-captures]))
+        capture-parameters (take-last (count captures) parameters)
+        stable-parameters (->> (map vector captures capture-parameters)
+                               (keep (fn [[capture parameter]]
+                                       (when (contains? stable-ids capture) parameter)))
+                               set)
+        index (:index attributes)
+        radius (:radius attributes)]
+    (doseq [body body-results
+            form (tree-seq coll? seq body)
+            :when (descriptor/aget-call? form)]
+      (let [array-parameter (descriptor/aget-array-sym form)
+            _ (when-not (contains? stable-parameters array-parameter)
+                (fail! :typed-soac-stencil-array-role
+                       "every stencil array load must read an explicit stable tensor capture"
+                       {:equation equation-id :array-parameter array-parameter
+                        :stable-parameters stable-parameters :load form}))
+            index-expression (descriptor/aget-index form)
+            offset (stencil-index-offset index index-expression)]
+        (when (or (nil? offset) (> (abs (long offset)) radius))
+          (fail! :typed-soac-stencil-index
+                 "stencil tensor loads require a constant affine index inside the declared radius"
+                 {:equation equation-id :index index :index-expression index-expression
+                  :radius radius :load form}))))))
+
 (defn- validate-equation!
   [equation]
   (let [[_ equation-id results operation] equation
@@ -555,7 +643,7 @@
         (fail! :typed-soac-region-binders
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
-      (when (and (contains? #{'map 'scatter 'reduce 'segmented-reduce
+      (when (and (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
                               'product-reduce 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
@@ -593,7 +681,7 @@
                 :arrays arrays
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
-                          (contains? #{'map 'scatter 'reduce 'segmented-reduce
+                          (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
                                       'product-reduce 'scan} kind)
                           (conj (:index attributes))
                           (contains? #{'segmented-reduce 'product-reduce} kind)
@@ -634,6 +722,23 @@
         (fail! :typed-soac-scatter-write
                "scatter results must be explicit conditional indexed writes"
                {:equation equation-id :results body-results}))
+
+      stencil
+      (do
+        (when-not (and (= 1 result-count)
+                       (= 1 (count body-results))
+                       (empty? arrays)
+                       (seq (get-in attributes [:attributes :stable-array-captures])))
+          (fail! :typed-soac-stencil-boundary
+                 "stencil requires one result, whole-tensor stable captures, and no pointwise operands"
+                 {:equation equation-id :results results :arrays arrays
+                  :stable-array-captures
+                  (get-in attributes [:attributes :stable-array-captures])}))
+        (validate-stencil-neighborhood! equation-id attributes captures parameters body-results)
+        (when (some write-form? body-results)
+          (fail! :typed-soac-stencil-write
+                 "stencil interior regions must be pure scalar expressions"
+                 {:equation equation-id :results body-results})))
 
       reduce
       (let [accumulators (:accumulators attributes)]
@@ -812,6 +917,27 @@
                    "scatter results require tensor storage contracts"
                    {:equation equation-id :id id :value value}))))
 
+      stencil
+      (let [result-dtype (first (:dtypes attributes))]
+        (doseq [id stable-array-captures
+                :let [value (get values id)]]
+          (when (and value
+                     (not (and (= :tensor (:kind value))
+                               (= result-dtype (:dtype value)))))
+            (fail! :typed-soac-stencil-input-type
+                   "the first stencil schedule requires homogeneous tensor element dtypes"
+                   {:equation equation-id :id id :value value :dtype result-dtype})))
+        (doseq [id results]
+          (let [value (get values id)]
+            (when (and value
+                       (not (and (= :tensor (:kind value))
+                                 (= (extent-shape extent) (:shape value))
+                                 (= result-dtype (:dtype value)))))
+              (fail! :typed-soac-stencil-result-type
+                     "stencil results must match the complete domain and declared dtype"
+                     {:equation equation-id :id id :value value
+                      :extent extent :dtype result-dtype})))))
+
       reduce
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
         (let [value (get values id)]
@@ -868,7 +994,8 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter 'segmented-reduce 'product-reduce} kind)
+      (when-not (contains? #{'map 'scatter 'stencil 'segmented-reduce
+                             'product-reduce} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"
                {:equation equation-id :operation kind :storage storage}))
@@ -884,6 +1011,18 @@
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]
+        (when (and (= 'stencil kind)
+                   (seq (set/intersection
+                         (set destinations)
+                         (set (get-in (operation-parts equation)
+                                     [:attributes :attributes :stable-array-captures])))))
+          (fail! :typed-soac-stencil-alias
+                 "stencil output storage must not alias a stable neighborhood input"
+                 {:equation equation-id
+                  :destinations destinations
+                  :stable-array-captures
+                  (get-in (operation-parts equation)
+                          [:attributes :attributes :stable-array-captures])}))
         (when-not (= (count destinations) (count (distinct destinations)))
           (fail! :typed-soac-result-storage-alias
                  "one pointwise equation may write each physical destination only once"

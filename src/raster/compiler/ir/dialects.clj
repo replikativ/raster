@@ -521,8 +521,8 @@
                                   (= 4 (count operation)))
                          (nth operation 3))]
               (and (seq? body)
-                   (contains? #{'scalar 'map 'scatter 'reduce 'segmented-reduce
-                                'product-reduce 'scan}
+                   (contains? #{'scalar 'map 'scatter 'stencil 'reduce
+                                'segmented-reduce 'product-reduce 'scan}
                               (first body)))))
           (fn [_ algorithm]
             (= algorithm (soac-dialect/validate! algorithm))))

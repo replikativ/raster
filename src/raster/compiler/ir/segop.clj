@@ -9,6 +9,7 @@
     SegMap  — element-wise parallel map (grid-stride loop)
     SegRed  — parallel reduction (single or two-phase)
     SegScan — parallel prefix scan (single or three-stage)
+    SegStencil — boundary-aware neighborhood map
 
   Each SegOp carries a KernelGrid with pre-computed launch config
   based on raster.runtime.hardware device properties."
@@ -51,6 +52,22 @@
             dtype        ;; :double | :float — element type
             out-sym      ;; sym — output array symbol (for aset target)
             cast-fn])    ;; sym | nil — cast function for aset (e.g. 'float)
+
+(defrecord SegStencil
+           [id           ;; int — from the TypedSOAC equation
+            space        ;; one-dimensional SegSpace over the complete output domain
+            level        ;; SegLevel
+            lambda       ;; scalar interior expression; index is the physical output coordinate
+            inputs       ;; #{sym} — stable neighborhood arrays
+            outputs      ;; #{sym} — exactly one caller-owned destination
+            scalars      ;; #{sym} — scalar parameters used by lambda/extent
+            grid         ;; KernelGrid
+            dtype        ;; output element dtype
+            out-sym      ;; caller-owned destination
+            radius       ;; positive integer neighborhood radius
+            boundary     ;; certified boundary policy keyword
+            cast-fn      ;; scalar result cast
+            aliasing])   ;; :no-write-alias — neighborhood inputs must not alias destination
 
 (defrecord SegRed
            [id          ;; int
@@ -104,6 +121,7 @@
   [x]
   (and x
        (contains? #{"raster.compiler.ir.segop.SegMap"
+                    "raster.compiler.ir.segop.SegStencil"
                     "raster.compiler.ir.segop.SegRed"
                     "raster.compiler.ir.segop.SegScan"}
                   (.getName (class x)))))

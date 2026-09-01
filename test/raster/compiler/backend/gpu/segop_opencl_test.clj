@@ -7,7 +7,8 @@
    let*-rewrap dropped the metadata, so the devirtualized shape fell through
    to a broken gpufn_aget helper call (qlinear-k) while the typed shape
    emitted x[i] (decoder-gpu)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -17,6 +18,36 @@
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
+
+(deftest typed-stencil-emits-a-guarded-typed-artifact
+  (let [source '(let* [result
+                        (raster.par/stencil!
+                         du [u] 1 :dirichlet double i n
+                         (* alpha inv-dx2
+                            (+ (clojure.core/aget u (clojure.core/- i 1))
+                               (* -2.0 (clojure.core/aget u i))
+                               (clojure.core/aget u (clojure.core/+ i 1)))))]
+                       result)
+        typed (-> (typed-route/attempt
+                   source :double {'du :double 'u :double}
+                   {:scalar-types {'n :long 'alpha :double 'inv-dx2 :double}})
+                  :program :equations first :algorithm)
+        scheduled (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
+        artifact (sg/generate-segstencil-kernel
+                  scheduled
+                  :array-types {'du :double 'u :double}
+                  :scalar-types {'n :long 'alpha :double 'inv-dx2 :double})
+        source (:source artifact)
+        guard-position (str/index-of source "if (idx < 1 || idx >= _n_bound - 1)")
+        first-load-position (str/index-of source "u[")]
+    (is (kart/kernel-artifact? artifact))
+    (is (= '[u du alpha inv-dx2 _n_bound] (mapv :name (:abi artifact))))
+    (is (= [:input :output :scalar :scalar :scalar] (mapv :kind (:abi artifact))))
+    (is (= [:double :double :double :double :int] (mapv :dtype (:abi artifact))))
+    (is (= :no-write-alias (get-in artifact [:abi 0 :aliasing])))
+    (is (= {:kind :stencil :boundary :dirichlet :radius 1} (:effects artifact)))
+    (is (and guard-position first-load-position (< guard-position first-load-position))
+        "the boundary test must dominate every neighborhood read")))
 
 (defn- segred-source [body-expr]
   (let [form (list 'raster.par/reduce 'acc 0.0 'j 'n body-expr)

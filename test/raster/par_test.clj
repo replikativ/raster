@@ -424,19 +424,6 @@
 ;; GPU kernel generation tests (OpenCL source, no device needed)
 ;; ================================================================
 
-(deftest stencil-kernel-source-generation
-  (testing "Stencil kernel generates valid OpenCL C source"
-    (require '[raster.compiler.backend.gpu.par-opencl :as pocl])
-    (let [gen (resolve 'raster.compiler.backend.gpu.par-opencl/generate-par-stencil-kernel)
-          form '(raster.par/stencil! out [a] 1 :dirichlet float i n
-                                     (+ (aget a (- i 1)) (aget a (+ i 1))))
-          kernel (gen form :dtype :float)]
-      (is (string? (:source kernel)))
-      (is (clojure.string/includes? (:source kernel) "__kernel void"))
-      (is (clojure.string/includes? (:source kernel) "idx < 1 || idx >= _n_bound - 1"))
-      (is (= 'out (:out-param kernel)))
-      (is (= 1 (:radius kernel))))))
-
 (deftest scatter-kernel-source-generation
   (testing "Scatter kernel generates valid OpenCL C source"
     (require '[raster.compiler.backend.gpu.par-opencl :as pocl])
@@ -471,16 +458,29 @@
 ;; Opencl-pass dispatch tests (verify pipeline integration)
 ;; ================================================================
 
+(defn- scheduled-stencil-program
+  [form]
+  (let [route (requiring-resolve
+               'raster.compiler.passes.parallel.typed-soac-route/attempt)
+        lower (requiring-resolve
+               'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+        source (list 'let* ['result form] 'result)
+        routed (:program (route source :float {'out :float 'a :float}
+                                  {:scalar-types {'n :long}}))]
+    (:form (lower routed {:target-device :ze:0 :dtype :float}))))
+
 (deftest opencl-pass-stencil-dispatch
-  (testing "opencl-pass dispatches stencil to GPU kernel"
+  (testing "opencl-pass consumes the verified stencil schedule"
     (try (require '[raster.compiler.backend.gpu.par-opencl :as pocl]) (catch Exception _))
     (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
       (let [form '(raster.par/stencil! out [a] 1 :dirichlet float i n
                                        (+ (aget a (- i 1)) (aget a (+ i 1))))
-            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)]
+            result (pass (scheduled-stencil-program form)
+                         :device-id :ze:0 :dtype :float :min-elements 0)]
         (is (pos? (count (:kernels result))))
         (is (seq? (:form result)))
-        (is (= 1 (get-in result [:stats :ze-maps])))))))
+        (is (= 1 (get-in result [:stats :ze-maps])))
+        (is (= 1 (get-in result [:stats :segop-reused])))))))
 
 (deftest opencl-pass-scatter-dispatch
   (testing "opencl-pass dispatches scatter to GPU kernel"
@@ -500,12 +500,24 @@
         (is (pos? (count (:kernels result))))
         (is (seq? (:form result)))))))
 
-(deftest opencl-pass-fallback-small-stencil
-  (testing "opencl-pass falls back for small stencil"
+(deftest opencl-pass-keeps-the-scheduled-small-stencil
+  (testing "a small constant extent changes launch policy, not semantic lowering"
     (try (require '[raster.compiler.backend.gpu.par-opencl :as pocl]) (catch Exception _))
     (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
       (let [form '(raster.par/stencil! out [a] 1 :dirichlet float i 100
                                        (+ (aget a (- i 1)) (aget a (+ i 1))))
-            result (pass form :device-id :ze:0 :dtype :float :min-elements 4096)]
-        (is (zero? (count (:kernels result))))
-        (is (= 1 (get-in result [:stats :fallback])))))))
+            result (pass (scheduled-stencil-program form)
+                         :device-id :ze:0 :dtype :float :min-elements 4096)]
+        (is (= 1 (count (:kernels result))))
+        (is (= 1 (get-in result [:stats :segop-reused])))
+        (is (zero? (get-in result [:stats :fallback])))))))
+
+(deftest opencl-pass-rejects-an-unscheduled-radius-one-stencil
+  (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+    (try
+      (pass '(raster.par/stencil! out [a] 1 :dirichlet float i n
+                                  (+ (aget a (- i 1)) (aget a (+ i 1))))
+            :device-id :ze:0 :dtype :float :min-elements 0)
+      (is false "raw stencil source must not bypass the TypedSOAC proof")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :unscheduled-stencil (:reason (ex-data exception))))))))

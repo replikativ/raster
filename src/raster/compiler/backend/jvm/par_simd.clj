@@ -215,18 +215,18 @@
 ;; SIMD code generation for parallel stencil
 ;; ================================================================
 
-(defn compile-par-stencil
-  "Compile a raster.par/stencil! form to SIMD S-expression.
+(defn- compile-stencil-info
+  "Compile verified stencil fields to a SIMD S-expression.
   For 1D radius-1 stencils: load 3 overlapping vectors at offsets
   (i-1), i, (i+1), compute body using vector ops, store result.
   Scalar tail for remaining elements.
   Returns SIMD S-expression, or nil if unsupported."
-  [form & {:keys [elem-type]}]
-  (let [{:keys [out in-arrays radius boundary cast idx bound body] :as info}
-        (par/extract-par-stencil-info form)
+  [{:keys [out in-arrays radius boundary cast idx bound body] :as info}
+   & {:keys [elem-type]}]
+  (let [
         elem-type (or elem-type (:elem-type info) (cast->elem-type cast) (out-sym->elem-type out))
         {:keys [species-expr from-array broadcast cast-fn]} (get simd-type-info elem-type)]
-    (when (and out idx bound body (= radius 1))
+    (when (and out idx bound body (= radius 1) (= :dirichlet boundary))
       ;; Collect arrays and scalars from body
       (when (simd-able-expr? body idx)
         (let [arr-syms (collect-array-loads body idx)
@@ -235,16 +235,24 @@
               lanes-sym (gensym "lanes__")
               n-sym (gensym "n__")
               j-sym (gensym "j__")
+              vec-tag (case elem-type
+                        :double 'jdk.incubator.vector.DoubleVector
+                        :float 'jdk.incubator.vector.FloatVector)
+              tag-vec (fn [value]
+                        (if (instance? clojure.lang.IObj value)
+                          (vary-meta value assoc :tag vec-tag)
+                          value))
               ;; For each array, generate 3 vector symbols: left, center, right
               arr-shifted-syms
               (into {} (map (fn [s]
-                              [s {:left (gensym (str "v_" (name s) "_left_"))
-                                  :center (gensym (str "v_" (name s) "_center_"))
-                                  :right (gensym (str "v_" (name s) "_right_"))}])
+                              [s {:left (tag-vec (gensym (str "v_" (name s) "_left_")))
+                                  :center (tag-vec (gensym (str "v_" (name s) "_center_")))
+                                  :right (tag-vec (gensym (str "v_" (name s) "_right_")))}])
                             arr-syms))
               ;; Scalar broadcast symbols
               scalar-vec-syms (into {}
-                                    (map (fn [s] [(symbol (name s)) (gensym (str "sv_" (name s) "_"))])
+                                    (map (fn [s] [(symbol (name s))
+                                                  (tag-vec (gensym (str "sv_" (name s) "_")))])
                                          scalar-syms))
               scalar-broadcast-bindings (vec (mapcat (fn [[s sv]]
                                                        [sv (list broadcast species-sym (list cast-fn s))])
@@ -253,7 +261,7 @@
               ;; We rewrite the body to replace (aget arr (- i 1)) with left vector,
               ;; (aget arr i) with center, (aget arr (+ i 1)) with right
               ;; Build a custom emit that handles offset-indexed agets
-              simd-result-sym (gensym "vresult__")
+              simd-result-sym (tag-vec (gensym "vresult__"))
               ;; Load bindings for shifted arrays
               load-bindings (vec (mapcat
                                   (fn [s]
@@ -269,7 +277,8 @@
                 (cond
                   ;; (aget arr i) → center vector
                   (and (seq? expr) (descriptor/aget-op? (first expr))
-                       (= 3 (count expr)) (= idx (nth expr 2)))
+                       (= 3 (count expr))
+                       (= idx (descriptor/unwrap-int-cast (nth expr 2))))
                   (let [arr (second expr)]
                     (:center (get arr-shifted-syms (symbol (name arr)))))
 
@@ -277,8 +286,10 @@
                   (and (seq? expr) (descriptor/aget-op? (first expr))
                        (= 3 (count expr))
                        (let [idx-expr (nth expr 2)]
-                         (and (seq? idx-expr) (= '- (first idx-expr))
-                              (= idx (second idx-expr)) (= 1 (nth idx-expr 2)))))
+                         (and (seq? idx-expr)
+                              (contains? #{'- 'clojure.core/-} (first idx-expr))
+                              (= idx (descriptor/unwrap-int-cast (second idx-expr)))
+                              (= 1 (descriptor/unwrap-int-cast (nth idx-expr 2))))))
                   (let [arr (second expr)]
                     (:left (get arr-shifted-syms (symbol (name arr)))))
 
@@ -286,19 +297,21 @@
                   (and (seq? expr) (descriptor/aget-op? (first expr))
                        (= 3 (count expr))
                        (let [idx-expr (nth expr 2)]
-                         (and (seq? idx-expr) (= '+ (first idx-expr))
-                              (= idx (second idx-expr)) (= 1 (nth idx-expr 2)))))
+                         (and (seq? idx-expr)
+                              (contains? #{'+ 'clojure.core/+} (first idx-expr))
+                              (= idx (descriptor/unwrap-int-cast (second idx-expr)))
+                              (= 1 (descriptor/unwrap-int-cast (nth idx-expr 2))))))
                   (let [arr (second expr)]
                     (:right (get arr-shifted-syms (symbol (name arr)))))
 
                   ;; Number → broadcast
                   (number? expr)
-                  (list broadcast species-sym (list cast-fn expr))
+                  (tag-vec (list broadcast species-sym (list cast-fn expr)))
 
                   ;; Symbol → look up in scalar env
                   (symbol? expr)
                   (or (get scalar-vec-syms (symbol (name expr)))
-                      (list broadcast species-sym (list cast-fn expr)))
+                      (tag-vec (list broadcast species-sym (list cast-fn expr))))
 
                   ;; Primitive cast — transparent
                   (and (seq? expr) (contains? #{'double 'float} (first expr)) (= 2 (count expr)))
@@ -307,29 +320,32 @@
                   ;; Binary op
                   (and (seq? expr) (= 3 (count expr)) (contains? simd-binary-ops (first expr)))
                   (let [method (simd-binary-ops (first expr))]
-                    (list method (rewrite-body (nth expr 1)) (rewrite-body (nth expr 2))))
+                    (tag-vec
+                     (list method (rewrite-body (nth expr 1)) (rewrite-body (nth expr 2)))))
 
                   ;; Unary direct method
                   (and (seq? expr) (= 2 (count expr)) (contains? simd-unary-ops (first expr)))
                   (let [method (simd-unary-ops (first expr))]
-                    (list method (rewrite-body (second expr))))
+                    (tag-vec (list method (rewrite-body (second expr)))))
 
                   ;; Unary lanewise
                   (and (seq? expr) (= 2 (count expr)) (contains? simd-lanewise-unary-ops (first expr)))
                   (let [op-const (simd-lanewise-unary-ops (first expr))]
-                    (list '.lanewise (rewrite-body (second expr)) op-const))
+                    (tag-vec (list '.lanewise (rewrite-body (second expr)) op-const)))
 
                   ;; Ternary (fma)
                   (and (seq? expr) (= 4 (count expr)) (contains? simd-ternary-ops (first expr)))
                   (let [method (simd-ternary-ops (first expr))]
-                    (list method (rewrite-body (nth expr 1))
-                          (rewrite-body (nth expr 2))
-                          (rewrite-body (nth expr 3))))
+                    (tag-vec
+                     (list method (rewrite-body (nth expr 1))
+                           (rewrite-body (nth expr 2))
+                           (rewrite-body (nth expr 3)))))
 
                   ;; N-ary + or *
-                  (and (seq? expr) (> (count expr) 3) (contains? #{'+ '*} (first expr)))
+                  (and (seq? expr) (> (count expr) 3)
+                       (contains? #{'+ '* 'clojure.core/+ 'clojure.core/*} (first expr)))
                   (let [method (simd-binary-ops (first expr))]
-                    (clojure.core/reduce (fn [a b] (list method a b))
+                    (clojure.core/reduce (fn [a b] (tag-vec (list method a b)))
                                          (map rewrite-body (rest expr))))
 
                   :else nil))
@@ -346,9 +362,13 @@
                          lanes-sym (list '.length species-sym)
                          n-sym (list 'int bound)]
                   (list 'do
+                        (par/stencil-alias-guard-form out in-arrays)
+                        (list 'if (ix<= n-sym 0)
+                              out
+                              (list 'do
                 ;; Fill boundary elements with boundary value
-                        (list 'clojure.core/aset out 0 (or boundary 0.0))
-                        (list 'clojure.core/aset out (ix- n-sym 1) (or boundary 0.0))
+                        (list 'clojure.core/aset out 0 0.0)
+                        (list 'clojure.core/aset out (ix- n-sym 1) 0.0)
                 ;; SIMD interior loop: [radius, n-radius) with vector width steps
                         (if (seq scalar-broadcast-bindings)
                           (list 'let* (vec scalar-broadcast-bindings)
@@ -373,7 +393,21 @@
                                             (list 'if (list '< j-sym (list '- n-sym radius))
                                                   (list 'do scalar-aset
                                                         (list 'recur (list 'inc j-sym)))
-                                                  out)))))))))))))
+                                                  out)))))))))))))))
+
+(defn compile-segstencil
+  "Compile a scheduled SegStencil without recovering fields from source syntax."
+  [segstencil]
+  (compile-stencil-info
+   {:out (:out-sym segstencil)
+    :in-arrays (vec (sort-by name (:inputs segstencil)))
+    :radius (:radius segstencil)
+    :boundary (:boundary segstencil)
+    :cast (:cast-fn segstencil)
+    :idx (:name (segop/seg-space-reduced-dim (:space segstencil)))
+    :bound (:bound (segop/seg-space-reduced-dim (:space segstencil)))
+    :body (:lambda segstencil)
+    :elem-type (:dtype segstencil)}))
 
 ;; ================================================================
 ;; Pipeline pass: SIMD optimization
@@ -500,11 +534,30 @@
 
               ;; raster.par/stencil!
               (par/par-stencil-form? form)
-              (if-let [simd-form (compile-par-stencil form)]
-                (do (swap! stats update :simd-stencils (fnil inc 0))
-                    simd-form)
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-stencil! form)))
+              (let [{:keys [cast elem-type radius]} (par/extract-par-stencil-info form)
+                    stencil-dtype (or elem-type (cast->elem-type cast) :double)
+                    scheduled (take-bound
+                               #(instance? raster.compiler.ir.segop.SegStencil %)
+                               stencil-dtype)
+                    simd-form (when scheduled (compile-segstencil scheduled))]
+                (cond
+                  simd-form
+                  (do (swap! stats update :simd-stencils (fnil inc 0))
+                      simd-form)
+
+                  scheduled
+                  (do (swap! stats update :fallback inc)
+                      (par/expand-par-stencil! form))
+
+                  (= 1 radius)
+                  (throw (ex-info "radius-one stencil source has no verified TypedSOAC schedule"
+                                  {:reason :unscheduled-stencil
+                                   :target-dialect :jvm-simd
+                                   :form form}))
+
+                  :else
+                  (do (swap! stats update :fallback inc)
+                      (par/expand-par-stencil! form))))
 
               ;; raster.par/gather → hardware vgather (flat 4-arg form only)
               (par/par-gather-form? form)
