@@ -351,6 +351,9 @@
     (and (seq? form) (= 'raster.par/product-reduce! (first form)))
     (expand-par-forms (macroexpand-1 form))
 
+    (and (seq? form) (= 'raster.par/segmented-fold-map! (first form)))
+    (expand-par-forms (macroexpand-1 form))
+
     ;; contract = an annotated redomap; the CPU/correctness fallback is its macro expansion
     ;; (a sequential dotimes over the free space of a per-tuple reduce over the contract axis).
     ;; Delegating to macroexpand-1 keeps ONE source of truth (the raster.par/contract macro).
@@ -410,6 +413,7 @@
                     'raster.par/contract 'par/contract
                     'raster.par/reduce 'par/reduce
                     'raster.par/product-reduce! 'par/product-reduce!
+                    'raster.par/segmented-fold-map! 'par/segmented-fold-map!
                     'raster.par/reduce-into 'par/reduce-into
                     'raster.par/scan 'par/scan
                     'raster.par/scan-exclusive 'par/scan-exclusive
@@ -463,6 +467,12 @@
   [form]
   (and (seq? form)
        (contains? #{'raster.par/product-reduce! 'par/product-reduce!} (first form))))
+
+(defn par-segmented-fold-map-form?
+  "Check if a form is an ordered segmented fold followed by a dense map."
+  [form]
+  (and (seq? form)
+       (contains? #{'raster.par/segmented-fold-map! 'par/segmented-fold-map!} (first form))))
 
 (defn par-stencil-form?
   "Check if a form is a raster.par/stencil! parallel stencil."
@@ -645,6 +655,39 @@
                    element-bindings' (vec element-results') combine-parameters'
                    combine-bindings' (vec combine-results') algebra')))})
 
+        ;; segmented-fold-map!: segment/map indices and fold accumulators are lexical binders.
+        ;; A completed accumulator is visible to every later fold and to the final map.
+        (par-segmented-fold-map-form? form)
+        (let [[_ outputs segment-axes idx map-extent folds map-results] form
+              segment-indices (mapv first segment-axes)
+              accumulators (mapv first folds)
+              scoped (vec (concat segment-indices [idx] accumulators))
+              inner (vec (concat (mapcat (fn [fold] [(nth fold 3) (nth fold 4)]) folds)
+                                 map-results))
+              outer (vec (concat outputs (map second segment-axes) [map-extent]
+                                 (mapcat (fn [[_ identity dtype _ _]] [identity dtype])
+                                         folds)))]
+          {:scoped-syms scoped :inner-exprs inner :outer-exprs outer
+           :rebuild
+           (fn [scoped' inner' outer']
+             (let [nsegments (count segment-indices)
+                   nfolds (count folds)
+                   [segment-indices' scoped-rest] (split-at nsegments scoped')
+                   idx' (first scoped-rest)
+                   accumulators' (vec (rest scoped-rest))
+                   [fold-inner map-results'] (split-at (* 2 nfolds) inner')
+                   fold-inner (partition 2 fold-inner)
+                   [outputs' outer-rest] (split-at (count outputs) outer')
+                   [segment-bounds' outer-rest] (split-at nsegments outer-rest)
+                   map-extent' (first outer-rest)
+                   fold-fields (partition 2 (rest outer-rest))
+                   folds' (mapv (fn [acc [identity dtype] [extent step]]
+                                  [acc identity dtype extent step])
+                                accumulators' fold-fields fold-inner)]
+               (pl form head (vec outputs')
+                   (mapv vector segment-indices' segment-bounds')
+                   idx' map-extent' folds' (vec map-results'))))})
+
         ;; scan / scan-exclusive: (head out acc init idx bound cast body)
         (or (= n "scan") (= n "scan-exclusive"))
         (let [[_ out acc init idx bound cast body] form]
@@ -717,6 +760,19 @@
        :combine-bindings (vec combine-bindings)
        :combine-results (vec combine-results)
        :algebra algebra})))
+
+(defn extract-par-segmented-fold-map-info
+  "Extract the ordered structural fields of `raster.par/segmented-fold-map!`."
+  [form]
+  (when (par-segmented-fold-map-form? form)
+    (let [[_ outputs segment-axes idx map-extent folds map-results] form]
+      {:outputs (vec outputs)
+       :segment-axes (vec segment-axes)
+       :idx idx
+       :map-extent map-extent
+       :folds (vec folds)
+       :map-results (vec map-results)
+       :elem-type (:raster.type/elem-type (meta form))})))
 
 (defn extract-par-map2-info
   "Extract structured info from a par/map2! form.

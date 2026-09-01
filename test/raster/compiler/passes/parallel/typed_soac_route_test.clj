@@ -575,6 +575,40 @@
            (mapv :kind (:abi kernel))))
     (is (re-find #"__global float\* restrict [uv]" (:source kernel)))))
 
+(deftest typed-horizontal-fusion-combines-distinct-materialized-write-boundaries
+  (let [source '(let* [u (raster.par/map! u-out i n float
+                                           (* (clojure.core/aget a i) 2.0))
+                       v (raster.par/map! v-out j n float
+                                           (+ (clojure.core/aget b j) 1.0))]
+                      [u v])
+        {:keys [program stats]}
+        (route/attempt source :float
+                       {'a :float 'b :float 'u-out :float 'v-out :float}
+                       {:scalar-types {'n :int}})
+        projected (:source program)
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'a :float 'b :float
+                                           'u-out :float 'v-out :float}
+                             :scalar-types {'n :int}}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        parallel-forms (filter #(and (seq? %)
+                                     (contains? #{'raster.par/map! 'raster.par/map-void!}
+                                                (first %)))
+                               (tree-seq coll? seq projected))]
+    (is (= 1 (:horizontal stats)))
+    (is (= 1 (count parallel-forms))
+        "host projection must not resurrect either original producer")
+    (is (= 1 (count (:equations program))))
+    (is (= 1 (count (:kernels emitted))))
+    (is (= 1 (get-in emitted [:stats :segop-reused])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))
+    (is (= #{'u-out 'v-out}
+           (set (map :destination
+                     (get-in program [:equations 0 :attributes :result-storage])))))))
+
 (deftest effect-only-tuple-map-lowers-to-one-explicit-multi-output-segmap
   (let [source
         '(let* [effect

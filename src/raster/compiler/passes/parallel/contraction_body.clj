@@ -60,6 +60,20 @@
            (= 2 (count expression)))
       (lower-index (second expression) scope)
 
+      (and (seq? expression)
+           (descriptor/increment-op? (descriptor/semantic-op expression))
+           (= 1 (count (descriptor/call-args expression))))
+      (body/expression :add
+                       (lower-index (first (descriptor/call-args expression)) scope)
+                       1)
+
+      (and (seq? expression)
+           (descriptor/decrement-op? (descriptor/semantic-op expression))
+           (= 1 (count (descriptor/call-args expression))))
+      (body/expression :sub
+                       (lower-index (first (descriptor/call-args expression)) scope)
+                       1)
+
       (seq? expression)
       (let [operator (get index-operators (descriptor/semantic-op expression))
             arguments (vec (descriptor/call-args expression))]

@@ -117,6 +117,12 @@
   [attributes]
   (mapv (comp first extent-shape second) (:segment-axes attributes)))
 
+(defn segmented-fold-map-result-shape
+  "Canonical dense output shape of an ordered segmented fold-map."
+  [attributes]
+  (conj (segmented-reduce-result-shape attributes)
+        (first (extent-shape (:extent attributes)))))
+
 (defn map-attributes?
   [value]
   (and (map? value)
@@ -299,6 +305,35 @@
          (map? (:algebra value))
          (true? (get-in value [:algebra :associative?])))))
 
+(defn fold-attributes?
+  "Attributes of one sequential, loop-carried fold inside a segmented fold-map."
+  [value]
+  (and (map? value)
+       (symbol? (:accumulator value))
+       (scalar-literal? (:identity value))
+       (keyword? (:dtype value))
+       (dtype/known? (:dtype value))
+       (= (:dtype value) (dtype/canon (:dtype value)))
+       (or (extent? (:extent value)) (seq? (:extent value)))
+       (= :ordered (:association value))))
+
+(defn segmented-fold-map-attributes?
+  "Attributes for independent segments containing dependent ordered folds and a final dense map."
+  [value]
+  (let [axes (:segment-axes value)
+        indices (mapv first axes)]
+    (and (map-attributes? value)
+         (vector? axes) (seq axes)
+         (every? #(and (vector? %) (= 2 (count %))
+                       (symbol? (first %)) (extent? (second %)))
+                 axes)
+         (= (count indices) (count (distinct indices)))
+         (not (contains? (set indices) (:index value)))
+         (= :ordered (:association value))
+         (vector? (:dtypes value)) (seq (:dtypes value))
+         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
+                 (:dtypes value)))))
+
 (defn scan-attributes?
   "Attributes for a certified scan dialect operation. The explicit mode is load-bearing because
    inclusive and exclusive scans have different observable result layouts."
@@ -350,6 +385,8 @@
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
              [pra product-reduce-attributes?]
+             [fa fold-attributes?]
+             [sfma segmented-fold-map-attributes?]
              [ca scan-attributes?]
              [dt keyword?]
              [facts program-facts?])
@@ -373,6 +410,9 @@
   (Lambda [l :enforce]
           (lambda [(?:* ?sym:parameter)] ?r))
 
+  (Fold [f :enforce]
+        (fold ?fa ?l))
+
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
@@ -382,6 +422,8 @@
              (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (product-reduce ?pra [(?:* ?id:array)] [(?:* ?id:capture)]
                              ?l:element ?l:combine)
+             (segmented-fold-map ?sfma [(?:* ?id:array)] [(?:* ?id:capture)]
+                                 [(?:+ f)] ?l)
              (scan ?ca [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
   (Equation [q :enforce]
@@ -425,8 +467,11 @@
    the parallel segment space followed by the innermost reduction extent."
   [equation]
   (let [{:keys [kind attributes]} (operation-parts equation)]
-    (if (contains? #{'segmented-reduce 'product-reduce} kind)
-      (conj (mapv second (:segment-axes attributes)) (:extent attributes))
+    (if (contains? #{'segmented-reduce 'product-reduce 'segmented-fold-map} kind)
+      (into (conj (mapv second (:segment-axes attributes)) (:extent attributes))
+            (when (= 'segmented-fold-map kind)
+              (map #(get-in % [:attributes :extent])
+                   (:folds (operation-parts equation)))))
       (if-let [extent (:extent attributes)] [extent] []))))
 
 (defn operation-parts
@@ -443,6 +488,14 @@
       (let [[_ attributes arrays captures element-lambda combine-lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures
          :element-lambda element-lambda :combine-lambda combine-lambda})
+
+      (= 'segmented-fold-map kind)
+      (let [[_ attributes arrays captures folds map-lambda] operation]
+        {:kind kind :attributes attributes :arrays arrays :captures captures
+         :folds (mapv (fn [[_ fold-attributes fold-lambda]]
+                        {:attributes fold-attributes :lambda fold-lambda})
+                      folds)
+         :map-lambda map-lambda})
 
       :else
       (let [[_ attributes arrays captures lambda] operation]
@@ -608,10 +661,13 @@
 (defn- validate-equation!
   [equation]
   (let [[_ equation-id results operation] equation
-        {:keys [kind attributes arrays captures lambda element-lambda combine-lambda]}
+        {:keys [kind attributes arrays captures lambda element-lambda combine-lambda
+                folds map-lambda]}
         (operation-parts equation)
         product? (= 'product-reduce kind)
-        {:keys [parameters locals body-results]} (lambda-parts (or lambda element-lambda))
+        fold-map? (= 'segmented-fold-map kind)
+        {:keys [parameters locals body-results]}
+        (lambda-parts (or lambda element-lambda map-lambda))
         component-count (when product? (count (:component-ids attributes)))
         result-count (count results)]
     (when-not (distinct-vector? results)
@@ -644,7 +700,7 @@
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
       (when (and (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
-                              'product-reduce 'scan} kind)
+                              'product-reduce 'segmented-fold-map 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
                "a scalar-region local cannot shadow its operation index"
@@ -659,7 +715,8 @@
         (fail! :typed-soac-local-dtype
                "scalar-region locals require a supported JVM scalar dtype"
                {:equation equation-id :local local :dtype dtype})))
-    (when (and (seq locals) (not (contains? #{'map 'scatter 'product-reduce} kind)))
+    (when (and (seq locals)
+               (not (contains? #{'map 'scatter 'product-reduce 'segmented-fold-map} kind)))
       (fail! :typed-soac-region-operation
              "typed local SSA is not admitted in this operation's scalar region"
              {:equation equation-id :operation kind :locals locals}))
@@ -667,9 +724,11 @@
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
              {:equation equation-id :results result-count :components component-count
               :body-results (count body-results)}))
-    (let [expected-parameter-count (+ (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
+    (let [expected-parameter-count (+ (cond
+                                        (contains? #{'reduce 'segmented-reduce 'scan} kind)
                                         (count (:accumulators attributes))
-                                        0)
+                                        fold-map? (count folds)
+                                        :else 0)
                                       (count arrays)
                                       (count captures))]
       (when-not (= expected-parameter-count (count parameters))
@@ -682,9 +741,10 @@
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
                           (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
-                                      'product-reduce 'scan} kind)
+                                      'product-reduce 'segmented-fold-map 'scan} kind)
                           (conj (:index attributes))
-                          (contains? #{'segmented-reduce 'product-reduce} kind)
+                          (contains? #{'segmented-reduce 'product-reduce
+                                      'segmented-fold-map} kind)
                           (into (map first (:segment-axes attributes))))
           final-bound
           (reduce (fn [bound {:keys [id init] :as local}]
@@ -843,6 +903,88 @@
                    "product-reduce combine must be a closed scalar binary operator"
                    {:equation equation-id :expression expression :unbound unbound}))))
 
+      segmented-fold-map
+      (let [fold-attributes (mapv :attributes folds)
+            accumulators (mapv :accumulator fold-attributes)
+            segment-indices (set (map first (:segment-axes attributes)))
+            capture-count (count captures)
+            map-parameters parameters
+            capture-parameters (vec (take-last capture-count map-parameters))
+            iteration-index (:index attributes)]
+        (when-not (= (count results) (count (:dtypes attributes)))
+          (fail! :typed-soac-segmented-fold-map-results
+                 "segmented-fold-map result arity must equal its declared result dtype arity"
+                 {:equation equation-id :results results :dtypes (:dtypes attributes)}))
+        (when (seq arrays)
+          (fail! :typed-soac-segmented-fold-map-array-role
+                 "the initial ordered schedule uses whole-tensor stable captures, not pointwise arrays"
+                 {:equation equation-id :arrays arrays}))
+        (when-not (= (count accumulators) (count (distinct accumulators)))
+          (fail! :typed-soac-segmented-fold-map-accumulators
+                 "ordered fold accumulators must be distinct"
+                 {:equation equation-id :accumulators accumulators}))
+        (when-not (= accumulators
+                     (subvec map-parameters 0 (count accumulators)))
+          (fail! :typed-soac-segmented-fold-map-map-parameters
+                 "the final map must receive completed folds, pointwise elements, and captures in order"
+                 {:equation equation-id :parameters map-parameters
+                  :accumulators accumulators :arrays arrays :captures captures}))
+        (doseq [[ordinal {:keys [attributes lambda]}] (map-indexed vector folds)]
+          (let [{fold-parameters :parameters fold-locals :locals
+                 fold-results :body-results} (lambda-parts lambda)
+                prior (subvec accumulators 0 ordinal)
+                expected (vec (concat [(:accumulator attributes)] prior capture-parameters))
+                bound (set/union (set fold-parameters) segment-indices
+                                 #{iteration-index})
+                final-bound
+                (reduce (fn [bound {:keys [id init] :as local}]
+                          (when-not (and (keyword? (:dtype local))
+                                         (dtype/known? (:dtype local))
+                                         (= (:dtype local) (dtype/canon (:dtype local)))
+                                         (:scalar-tag (dtype/info (:dtype local))))
+                            (fail! :typed-soac-local-dtype
+                                   "ordered fold locals require canonical scalar dtypes"
+                                   {:equation equation-id :fold ordinal :local local}))
+                          (let [unbound (util/free-syms init bound)]
+                            (when (or (contains? bound id) (seq unbound))
+                              (fail! :typed-soac-segmented-fold-map-fold-local
+                                     "ordered fold locals may reference only its lexical boundary and earlier locals"
+                                     {:equation equation-id :fold ordinal :local local
+                                      :unbound unbound}))
+                            (conj bound id)))
+                        bound fold-locals)]
+            (let [unbound-extent
+                  (set/difference (util/free-syms (:extent attributes))
+                                  (set/union segment-indices (set captures)))]
+              (when (seq unbound-extent)
+                (fail! :typed-soac-segmented-fold-map-fold-extent
+                       "ordered fold extents may reference only segment axes and explicit captures"
+                       {:equation equation-id :fold ordinal :extent (:extent attributes)
+                        :unbound unbound-extent})))
+            (when-not (= fold-parameters expected)
+              (fail! :typed-soac-segmented-fold-map-fold-parameters
+                     "each ordered fold must receive its accumulator, prior fold results, and captures"
+                     {:equation equation-id :fold ordinal :parameters fold-parameters
+                      :expected expected}))
+            (when-not (= 1 (count fold-results))
+              (fail! :typed-soac-segmented-fold-map-fold-result
+                     "each ordered fold must yield exactly one next accumulator"
+                     {:equation equation-id :fold ordinal :results fold-results}))
+            (when (some write-form? fold-results)
+              (fail! :typed-soac-segmented-fold-map-fold-write
+                     "ordered folds are pure scalar regions"
+                     {:equation equation-id :fold ordinal :results fold-results}))
+            (let [unbound (binding [util/*shadowing-locals* (set accumulators)]
+                            (util/free-syms (first fold-results) final-bound))]
+              (when (seq unbound)
+                (fail! :typed-soac-segmented-fold-map-fold-closure
+                       "ordered fold steps may not reference future folds or implicit state"
+                       {:equation equation-id :fold ordinal :unbound unbound})))))
+        (when (some write-form? body-results)
+          (fail! :typed-soac-segmented-fold-map-map-write
+                 "the final fold-map region must yield pure scalar results"
+                 {:equation equation-id :results body-results})))
+
       scan
       (let [accumulators (:accumulators attributes)]
         (when-not (= accumulators (vec (take (count accumulators) parameters)))
@@ -974,6 +1116,19 @@
                      {:equation equation-id :id id :value value
                       :component-dtype dtype :segment-axes (:segment-axes attributes)})))))
 
+      segmented-fold-map
+      (let [result-shape (segmented-fold-map-result-shape attributes)]
+        (doseq [[id result-dtype] (map vector results (:dtypes attributes))]
+          (let [value (get values id)]
+            (when (and value
+                       (not (and (= :tensor (:kind value))
+                                 (= result-shape (:shape value))
+                                 (= result-dtype (:dtype value)))))
+              (fail! :typed-soac-segmented-fold-map-result-type
+                     "segmented-fold-map results must cover the complete segment/map space"
+                     {:equation equation-id :id id :value value
+                      :shape result-shape :dtype result-dtype})))))
+
       scan
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
         (let [value (get values id)]
@@ -995,7 +1150,7 @@
         storage (result-storage program-facts equation-id)]
     (when storage
       (when-not (contains? #{'map 'scatter 'stencil 'segmented-reduce
-                             'product-reduce} kind)
+                             'product-reduce 'segmented-fold-map} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"
                {:equation equation-id :operation kind :storage storage}))
@@ -1011,13 +1166,13 @@
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]
-        (when (and (= 'stencil kind)
+        (when (and (contains? #{'stencil 'segmented-fold-map} kind)
                    (seq (set/intersection
                          (set destinations)
                          (set (get-in (operation-parts equation)
                                      [:attributes :attributes :stable-array-captures])))))
-          (fail! :typed-soac-stencil-alias
-                 "stencil output storage must not alias a stable neighborhood input"
+          (fail! :typed-soac-stable-read-alias
+                 "a stable tensor input must not alias this operation's output storage"
                  {:equation equation-id
                   :destinations destinations
                   :stable-array-captures
@@ -1176,14 +1331,16 @@
                           {} (:values source-facts))
         equation-forms
         (mapv (fn [[equals equation-id results :as equation]]
-                (let [{:keys [kind attributes arrays captures lambda element-lambda combine-lambda]}
+                (let [{:keys [kind attributes arrays captures lambda element-lambda combine-lambda
+                              folds map-lambda]}
                       (operation-parts equation)
                       attributes (cond-> attributes
                                    (seq (get-in attributes
                                                 [:attributes :stable-array-captures]))
                                    (update-in [:attributes :stable-array-captures]
                                               #(mapv rename %)))
-                      attributes (if (contains? #{'segmented-reduce 'product-reduce} kind)
+                      attributes (if (contains? #{'segmented-reduce 'product-reduce
+                                                  'segmented-fold-map} kind)
                                    (-> attributes
                                        (update :segment-axes
                                                #(mapv (fn [[index extent]]
@@ -1209,6 +1366,17 @@
                                   product-reduce
                                   (list kind attributes (mapv rename arrays)
                                         (mapv rename captures) element-lambda combine-lambda)
+
+                                  segmented-fold-map
+                                  (list kind attributes (mapv rename arrays)
+                                        (mapv rename captures)
+                                        (mapv (fn [{:keys [attributes lambda]}]
+                                                (list 'fold
+                                                      (update attributes :extent
+                                                              #(util/subst-syms value-map %))
+                                                      lambda))
+                                              folds)
+                                        map-lambda)
 
                                   (list kind attributes (mapv rename arrays)
                                         (mapv rename captures) lambda))]

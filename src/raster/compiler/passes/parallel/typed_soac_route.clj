@@ -40,18 +40,21 @@
 
 (defn- scalar-region
   [equation]
-  (let [{:keys [attributes arrays captures lambda element-lambda]}
-        (dialect/operation-parts equation)
-        {:keys [locals body-results]} (dialect/lambda-parts (or lambda element-lambda))
-        {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
-        substitutions
-        (into (zipmap capture-parameters captures)
-              (map (fn [parameter array]
-                     [parameter (list 'clojure.core/aget array (:index attributes))])
-                   elements arrays))]
-    {:locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
-                   locals)
-     :bodies (mapv #(util/subst-syms substitutions %) body-results)}))
+  (let [{:keys [kind attributes arrays captures lambda element-lambda]}
+        (dialect/operation-parts equation)]
+    (if (= 'segmented-fold-map kind)
+      {:locals [] :bodies []}
+      (let [{:keys [locals body-results]}
+            (dialect/lambda-parts (or lambda element-lambda))
+            {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
+            substitutions
+            (into (zipmap capture-parameters captures)
+                  (map (fn [parameter array]
+                         [parameter (list 'clojure.core/aget array (:index attributes))])
+                       elements arrays))]
+        {:locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
+                       locals)
+         :bodies (mapv #(util/subst-syms substitutions %) body-results)}))))
 
 (defn- materialize-region
   [locals body]
@@ -120,11 +123,12 @@
               storage (dialect/result-storage (dialect/facts program) equation-id)
               physical-results (dialect/physical-results (dialect/facts program) equation)
               host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
+              host-bindings (or (get-in placement-facts [:attributes :host-bindings])
+                                {result host-binding})
               host-returns (set (map :host-return storage))
               _ (when (and storage
                            (not (or (= #{:effect} host-returns)
-                                    (and (= 1 (count storage))
-                                         (= #{:buffer} host-returns)))))
+                                    (= #{:buffer} host-returns))))
                   (throw (ex-info "stored map results require one coherent host return contract"
                                   {:reason :typed-soac-production-subset
                                    :equation equation-id :storage storage})))
@@ -164,7 +168,12 @@
           {:equation-id equation-id
            :placement placement
            :pairs (if storage
-                    [[host-binding source]]
+                    (into [[host-binding source]]
+                          (keep (fn [[logical destination]]
+                                  (let [binding (get host-bindings logical)]
+                                    (when (and binding (not= binding host-binding))
+                                      [binding destination])))
+                                (map vector results physical-results)))
                     (conj (mapv #(allocation-pair values % (:extent attributes)) results)
                           [effect source]))
            :site [:binding (if storage host-binding effect)]
@@ -258,6 +267,16 @@
          :site [:binding host-binding]
          :source source})
 
+      segmented-fold-map
+      (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            source (projection/segmented-fold-map-form program equation)]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding source]]
+         :site [:binding host-binding]
+         :source source})
+
       scan
       (let [result (first results)
             mode (:mode attributes)
@@ -311,6 +330,11 @@
         original-pairs (vec (partition 2 bindings))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
+        realized-host-symbols
+        (into #{} (mapcat (fn [equation]
+                            (keep (fn [[symbol _]] (when (symbol? symbol) symbol))
+                                  (:pairs equation))))
+              realized)
         physical-destinations
         (into #{}
               (mapcat (fn [[_ equation-facts]]
@@ -321,8 +345,12 @@
               (:equations (dialect/facts program)))
         host-bindings
         (required-host-bindings
-         (keep-indexed (fn [id pair]
-                         (when (empty? (get by-placement id)) pair))
+         (keep-indexed (fn [_ [symbol :as pair]]
+                         ;; A fused equation may be placed at a later constituent while
+                         ;; defining a host symbol whose original source pair occurred earlier.
+                         ;; That symbol is globally realized; retaining its old pair would execute
+                         ;; the producer twice and bypass the fused schedule.
+                         (when-not (contains? realized-host-symbols symbol) pair))
                        original-pairs)
          (set/union physical-destinations
                     (into #{} (mapcat util/free-syms) body)))
@@ -338,6 +366,7 @@
                ;; leaves CPU-C/JVM materialization with an unbound destination and also loses a
                ;; resident scratch allocation before GPU extraction.
                (when (and (contains? host-bindings symbol)
+                          (not (contains? realized-host-symbols symbol))
                           (empty? (get by-placement id)))
                  [original-pair])
                (mapcat :pairs (get by-placement id)))))
@@ -404,7 +433,8 @@
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
            (if (not-any? #(contains? #{:map :scatter :stencil :reduce
-                                       :segmented-reduce :product-reduce :scan}
+                                       :segmented-reduce :product-reduce
+                                       :segmented-fold-map :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

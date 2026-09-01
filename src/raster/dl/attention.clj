@@ -1111,28 +1111,31 @@
                                                 acc))]
                                     (/ dot (n/oftype dot (n/sqrt (double head-dim)))))
                                   0.0)))]
-         ;; kernel 2: per query row — mx/Z over the ≤i scores, write normalized weights
-         (raster.par/map-void! bi (clojure.core/* batch seq-len)
-                               (let [b (quot bi seq-len)
-                                     i (rem bi seq-len)
-                                     roff (clojure.core/+ (clojure.core/* b ss) (clojure.core/* i seq-len))
-                                     mx (loop [j 0 mm -1.0e38]
-                                          (if (<= j i)
-                                            (recur (inc j) (n/max mm (aget scores (clojure.core/+ roff j))))
-                                            mm))
-                                     sum (loop [j 0 s 0.0]
-                                           (if (<= j i)
-                                             (recur (inc j) (+ s (m/exp (- (aget scores (clojure.core/+ roff j)) mx))))
-                                             s))
-                                     inv (/ 1.0 sum)]
-                                 (loop [j 0]
-                                   (if (< j seq-len)
-                                     (do (if (<= j i)
-                                           (aset W (clojure.core/+ roff j)
-                                                 (* (m/exp (- (aget scores (clojure.core/+ roff j)) mx)) inv))
-                                           (aset W (clojure.core/+ roff j) 0.0))
-                                         (recur (inc j)))
-                                     nil))))
+         ;; kernel 2: a generic ordered segmented fold-map. Rows are independent parallel
+         ;; segments; max and denominator are dependent ordered folds; the final dense map writes
+         ;; both the visible softmax and explicit causal zeroes. Attention is not a compiler op.
+         (raster.par/segmented-fold-map!
+          [W] [[b batch] [i seq-len]] j seq-len
+          [[mx -1.0e38 :element (clojure.core/inc i)
+            (n/max mx
+                   (aget scores
+                         (clojure.core/+ (clojure.core/* b ss)
+                                         (clojure.core/* i seq-len) j)))]
+           [sum 0.0 :element (clojure.core/inc i)
+            (+ sum
+               (m/exp
+                (- (aget scores
+                         (clojure.core/+ (clojure.core/* b ss)
+                                         (clojure.core/* i seq-len) j))
+                   mx)))]]
+          [(if (<= j i)
+             (/ (m/exp
+                 (- (aget scores
+                          (clojure.core/+ (clojure.core/* b ss)
+                                          (clojure.core/* i seq-len) j))
+                    mx))
+                sum)
+             0.0)])
          W)))
 
 (deftm batched-causal-attn-dw

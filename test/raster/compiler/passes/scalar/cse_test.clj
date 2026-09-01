@@ -23,6 +23,18 @@
           {:keys [stats]} (cse/cse-let form)]
       (is (= 0 (:cse-aliases stats))))))
 
+(deftest fresh-allocations-are-removable-but-not-commonable
+  (testing "devirtualized pure allocators retain distinct mutable identities"
+    (let [allocation
+          (with-meta
+            '(.invk raster.arrays/zeros-like_m_floats_long-impl exemplar n)
+            {:raster.op/original 'raster.arrays/zeros-like
+             :raster.type/tag 'floats :tag 'floats})
+          form (list 'let* ['q allocation 'k allocation] '[q k])
+          {:keys [form stats]} (cse/cse-let form)]
+      (is (= 0 (:cse-aliases stats)))
+      (is (= allocation (second (second (partition 2 (second form)))))))))
+
 (deftest no-cse-for-different-exprs-test
   (testing "different expressions stay independent"
     (let [{:keys [stats]} (cse/cse-let '(let* [a (Math/sin x) b (Math/cos x)] (+ a b)))]

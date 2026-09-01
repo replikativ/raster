@@ -573,12 +573,22 @@
 
 (def increment-ops
   "All symbol variants recognized as increment."
-  #{'inc 'unchecked-inc 'clojure.core/inc 'clojure.core/unchecked-inc})
+  #{'inc 'unchecked-inc 'unchecked-inc-int
+    'clojure.core/inc 'clojure.core/unchecked-inc 'clojure.core/unchecked-inc-int})
 
 (defn increment-op?
   "True if sym is an increment operation."
   [sym]
   (contains? increment-ops sym))
+
+(def decrement-ops
+  "All symbol variants recognized as decrement."
+  #{'dec 'unchecked-dec 'unchecked-dec-int
+    'clojure.core/dec 'clojure.core/unchecked-dec 'clojure.core/unchecked-dec-int})
+
+(defn decrement-op?
+  [sym]
+  (contains? decrement-ops sym))
 
 (defn semantic-op
   "The semantic operator of a call form. For a walker-devirtualized

@@ -352,15 +352,25 @@
 
 (defn c-symbol
   "Convert a Clojure symbol name to a valid C identifier.
-  Appends _ suffix for C/GLSL/OpenCL reserved word collisions."
+  Appends _ suffix for C/GLSL/OpenCL reserved word collisions. Non-ASCII and
+  otherwise unsupported characters are escaped by Unicode code point so alpha-
+  renamed Clojure binders remain portable across OpenCL, CUDA, and HIP without
+  collapsing distinct source identities."
   [sym]
-  (let [s (-> (name sym)
-              (str/replace "-" "_")
-              (str/replace "*" "_star_")
-              (str/replace "/" "_slash_")
-              (str/replace "?" "_p")
-              (str/replace "!" "_b")
-              (str/replace "'" "_prime"))]   ; Clojure allows ' in symbols (a', x'); C does not
+  (let [source (-> (name sym)
+                   (str/replace "-" "_")
+                   (str/replace "*" "_star_")
+                   (str/replace "/" "_slash_")
+                   (str/replace "?" "_p")
+                   (str/replace "!" "_b")
+                   (str/replace "'" "_prime")) ; Clojure allows ' in symbols; C does not.
+        ascii? (fn [ch]
+                 (or (= ch \_)
+                     (<= (int \a) (int ch) (int \z))
+                     (<= (int \A) (int ch) (int \Z))
+                     (<= (int \0) (int ch) (int \9))))
+        s (apply str (map #(if (ascii? %) (str %) (format "_u%04x_" (int %))) source))
+        s (if (and (seq s) (Character/isDigit ^char (first s))) (str "_" s) s)]
     (if (contains? c-reserved-words s)
       (str s "_")
       s)))

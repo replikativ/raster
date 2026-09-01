@@ -1717,6 +1717,31 @@
                   (mapv #(resolve-dispatch-walk % combine-result-env) combine-results)
                   algebra)]
       (if-let [m (meta expr)] (with-meta r m) r))
+    ;; segmented-fold-map!: each ordered accumulator is visible to later folds and the final map.
+    (and (symbol? (first expr))
+         (contains? #{'raster.par/segmented-fold-map! 'par/segmented-fold-map!} (first expr)))
+    (let [[head outputs segment-axes idx map-extent folds map-results] expr
+          index-env (into (assoc env idx 'long)
+                          (map (fn [[segment _]] [segment 'long]) segment-axes))
+          [fold-env folds']
+          (reduce (fn [[current result] [acc init dtype extent step]]
+                    (let [init' (resolve-dispatch-walk init current)
+                          tag (or (case dtype
+                                    :float 'float :double 'double :int 'int :long 'long nil)
+                                  (inf/infer-arg-tag init' current))
+                          step-env (cond-> current tag (assoc acc tag))]
+                      [(cond-> current tag (assoc acc tag))
+                       (conj result [acc init' dtype
+                                     (resolve-dispatch-walk extent current)
+                                     (resolve-dispatch-walk step step-env)])]))
+                  [index-env []] folds)
+          r (list head outputs
+                  (mapv (fn [[segment bound]]
+                          [segment (resolve-dispatch-walk bound env)])
+                        segment-axes)
+                  idx (resolve-dispatch-walk map-extent env) (vec folds')
+                  (mapv #(resolve-dispatch-walk % fold-env) map-results))]
+      (if-let [m (meta expr)] (with-meta r m) r))
     ;; Qualified symbol call: try dispatch resolution then recurse into args
     (and (symbol? (first expr)) (namespace (first expr)))
     (let [;; First recurse into args so nested calls get resolved

@@ -15,7 +15,8 @@
   Common array operations are provided as deftm wrappers that use
   broadcast/reduce! internally and participate in typed dispatch."
   (:refer-clojure :exclude [aget aset alength aclone reduce map pmap])
-  (:require [raster.core :refer [deftm broadcast reduce!]] ;; broadcast/reduce! are typed-macro stubs; scan defined locally
+  (:require [clojure.walk :as walk]
+            [raster.core :refer [deftm broadcast reduce!]] ;; broadcast/reduce! are typed-macro stubs; scan defined locally
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.numeric :as n]
             [raster.compiler.ir.par :as ir.par]))
@@ -200,6 +201,72 @@
         segmented (clojure.core/reduce (fn [body [segment bound]]
                                          `(dotimes [~segment (int ~bound)] ~body))
                                        fold (reverse segment-axes))]
+    `(do ~segmented nil)))
+
+(defmacro segmented-fold-map!
+  "Ordered folds followed by a dense map, independently for every segment.
+
+  Form:
+    (segmented-fold-map! outputs
+      [[segment-index segment-bound] ...]
+      index map-extent
+      [[accumulator identity dtype fold-extent step] ...]
+      [map-result ...])
+
+  Fold `n` may reference the completed results of folds `0..n-1`. `:element` denotes the
+  surrounding tensor element dtype; the typed frontend resolves it before scheduling.  The
+  interpreted fallback preserves the declared fold order exactly. Accelerator schedules may
+  parallelize segments, but must not reassociate an ordered fold.
+
+  The result buffers are dense row-major tensors with shape
+  `[segment-bound ... map-extent]`. This is a general row-statistics primitive: softmax,
+  normalization and ragged scientific reductions are applications, not compiler operations."
+  [outputs segment-axes idx-sym map-extent folds map-results]
+  (assert (and (vector? outputs) (seq outputs) (every? symbol? outputs))
+          "segmented-fold-map!: outputs must be a non-empty symbol vector")
+  (assert (and (vector? segment-axes) (seq segment-axes)
+               (every? #(and (vector? %) (= 2 (count %)) (symbol? (first %)))
+                       segment-axes))
+          "segmented-fold-map!: segment axes must be [[index bound] ...]")
+  (assert (symbol? idx-sym) "segmented-fold-map!: map index must be a symbol")
+  (assert (and (vector? folds) (seq folds)
+               (every? #(and (vector? %) (= 5 (count %)) (symbol? (first %))) folds))
+          "segmented-fold-map!: folds must be [[acc identity dtype extent step] ...]")
+  (assert (= (count outputs) (count map-results))
+          "segmented-fold-map!: outputs and map results must have equal arity")
+  (let [flat-index
+        (clojure.core/reduce
+         (fn [flat [index bound]] `(+ (* ~flat (long ~bound)) ~index))
+         0 (conj (vec segment-axes) [idx-sym map-extent]))
+        cast-result
+        (fn [dtype value]
+          (if-let [cast (get {:float `float :double `double :int `int :long `long
+                              :byte `byte}
+                             dtype)]
+            `(~cast ~value)
+            value))
+        stores (mapv (fn [output result]
+                       `(clojure.core/aset ~output ~flat-index ~result))
+                     outputs map-results)
+        mapped `(dotimes [~idx-sym (int ~map-extent)] ~@stores)
+        folded
+        (clojure.core/reduce
+         (fn [body [acc identity dtype fold-extent step]]
+           (let [fold-index (gensym "fold_index__")
+                 folded-value (gensym "fold_value__")]
+             `(let [~folded-value
+                    (loop [~fold-index (long 0) ~acc ~identity]
+                      (if (< ~fold-index (long ~fold-extent))
+                        (recur (unchecked-inc ~fold-index)
+                               ~(cast-result dtype
+                                             (walk/postwalk-replace {idx-sym fold-index} step)))
+                        ~acc))]
+                (let [~acc ~folded-value] ~body))))
+         mapped (reverse folds))
+        segmented (clojure.core/reduce
+                   (fn [body [segment bound]]
+                     `(dotimes [~segment (int ~bound)] ~body))
+                   folded (reverse segment-axes))]
     `(do ~segmented nil)))
 
 (defmacro contract

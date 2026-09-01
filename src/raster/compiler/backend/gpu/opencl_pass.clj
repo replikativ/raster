@@ -585,6 +585,24 @@
                   k (register-kernel! kernel :ze-reduces)]
               (emit-map-void-invocation k device-id))
 
+            ;; Ordered segmented fold-map. The source spelling is only a host fallback; GPU
+            ;; emission must consume the bound TypedSOAC SegFoldMap and its verified KernelBody.
+            (par/par-segmented-fold-map-form? form)
+            (if-let [scheduled (take-bound-segop
+                                stats :segfoldmap
+                                #(and (instance? raster.compiler.ir.segop.SegFoldMap %)
+                                      (= :typed-soac (:algorithm-dialect %))))]
+              (let [kernel (segop-cl/generate-segfoldmap-kernel
+                            scheduled
+                            :workgroup-size (or (get-in scheduled [:grid :block-size]) 256)
+                            :scalar-types top-scalar-types
+                            :array-types top-array-types)
+                    k (register-kernel! kernel :ze-maps)]
+                (emit-map-void-invocation k device-id))
+              (throw (ex-info "GPU fold-map source has no verified TypedSOAC schedule"
+                              {:reason :unscheduled-segmented-fold-map
+                               :target-dialect :opencl :form form})))
+
             ;; === Specialized forms — delegate to legacy generators ===
 
             ;; par/map-void!
