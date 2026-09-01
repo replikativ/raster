@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
@@ -42,10 +43,25 @@
 
 (defn- scalar-forms
   [expression]
-  (let [expression (scalar-expression/inline-lets expression)]
-    (if (and (seq? expression) (= 'do (first expression)))
-      (vec (rest expression))
-      [expression])))
+  (if (and (seq? expression) (= 'do (first expression)))
+    (vec (rest expression))
+    [expression]))
+
+(defn- scalar-region
+  "Separate the typed top-level local bindings from a SegMap result region.
+
+   TypedSOAC materialization annotates every local ID with its scalar dtype. Keeping these
+   bindings explicit lets KernelBody preserve sharing across several result stores."
+  [expression]
+  (if (and (seq? expression)
+           (contains? #{'let 'let* 'clojure.core/let} (first expression)))
+    (let [[_ bindings & body] expression]
+      (when-not (= 1 (count body))
+        (decline! :local-region-shape
+                  "map scalar local region requires one result expression"
+                  {:expression expression :body-count (count body)}))
+      {:bindings (vec (partition 2 bindings)) :result (first body)})
+    {:bindings [] :result expression}))
 
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
@@ -66,7 +82,11 @@
         index (:name (first dimensions))
         bound (:bound (first dimensions))
         inputs (vec (sort-by name (:inputs segmap)))
-        outputs (vec (sort-by name (:outputs segmap)))
+        primary-output (:out-sym segmap)
+        outputs (if primary-output
+                  (vec (concat (sort-by name (disj (:outputs segmap) primary-output))
+                               [primary-output]))
+                  (vec (sort-by name (:outputs segmap))))
         scalars (vec (sort-by name (:scalars segmap)))
         _ (when (seq (set/intersection (set inputs) (set outputs)))
             (decline! :inout-storage
@@ -97,14 +117,31 @@
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate :map-active
                   :id-prefix "map" :decline! decline!})
-        forms (scalar-forms (:lambda segmap))
-        primary-output (:out-sym segmap)
+        {:keys [bindings result]} (scalar-region (:lambda segmap))
+        base-environment (assoc scalar-types index :long)
+        local-state
+        (reduce
+         (fn [{:keys [substitutions operations environment]} [id init]]
+           (let [tag (or (:raster.type/tag (meta id)) (:tag (meta id)))
+                 local-type (some-> tag dtype/dtype-for-scalar-tag dtype/canon)
+                 _ (when-not local-type
+                     (decline! :local-dtype
+                               "map scalar local is missing its TypedSOAC dtype"
+                               {:operation (:id segmap) :local id :metadata (meta id)}))
+                 init (util/subst-syms substitutions init)
+                 lowered ((:lower lowerer) init local-type environment)]
+             {:substitutions (assoc substitutions id (:result lowered))
+              :operations (into operations (:operations lowered))
+              :environment (assoc environment (:result lowered) (:type lowered))}))
+         {:substitutions {} :operations [] :environment base-environment}
+         bindings)
+        forms (scalar-forms (util/subst-syms (:substitutions local-state) result))
         explicit-forms (if primary-output (pop forms) forms)
         primary-form (when primary-output (peek forms))
         _ (when (and primary-output (empty? forms))
             (decline! :missing-result "map result has no scalar expression"
                       {:operation (:id segmap) :output primary-output}))
-        environment (assoc scalar-types index :long)
+        environment (:environment local-state)
         lower-store
         (fn [form]
           (when-not (descriptor/aset-call? form)
@@ -126,7 +163,8 @@
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))
         scalar-operations
-        (vec (concat explicit-operations
+        (vec (concat (:operations local-state)
+                     explicit-operations
                      (:operations primary-lowered)
                      (when primary-output
                        [(body/->ScalarStore primary-output [index]
