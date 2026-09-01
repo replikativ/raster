@@ -22,7 +22,8 @@
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.numeric :refer [+ - * / < > <= >= == zero? pos? neg? max min abs mod rem]]
             [raster.math :as m]
-            [raster.numeric :as n]))
+            [raster.numeric :as n]
+            [raster.par]))
 
 ;; ================================================================
 ;; SGD
@@ -52,17 +53,18 @@
                             eps :- T t :- Long] :- (Array T)
                        (let [bc1 (- 1.0 (n/pow beta1 t))
                              bc2 (- 1.0 (n/pow beta2 t))]
-                         (dotimes [i n]
-                           (let [g (aget grad i)
-                                 m-new (+ (* beta1 (aget m i)) (* (- 1.0 beta1) g))
-                                 v-new (+ (* beta2 (aget v i)) (* (- 1.0 beta2) (* g g)))
-                                 m-hat (/ m-new bc1)
-                                 v-hat (/ v-new bc2)]
-                             (aset m i m-new)
-                             (aset v i v-new)
-                             (aset param i
-                                   (- (aget param i)
-                                      (* lr (/ m-hat (+ (n/sqrt v-hat) eps)))))))
+                         (raster.par/map-void!
+                          i n
+                          (let [g (aget grad i)
+                                m-new (+ (* beta1 (aget m i)) (* (- 1.0 beta1) g))
+                                v-new (+ (* beta2 (aget v i)) (* (- 1.0 beta2) (* g g)))
+                                m-hat (/ m-new bc1)
+                                v-hat (/ v-new bc2)]
+                            (aset m i m-new)
+                            (aset v i v-new)
+                            (aset param i
+                                  (- (aget param i)
+                                     (* lr (/ m-hat (+ (n/sqrt v-hat) eps)))))))
                          param)))
 
 ;; ================================================================
@@ -76,18 +78,19 @@
                         :- (Array T)
                         (let [bc1 (- 1.0 (n/pow beta1 t))
                               bc2 (- 1.0 (n/pow beta2 t))]
-                          (dotimes [i n]
-                            (let [g (aget grad i)
-                                  m-new (+ (* beta1 (aget m i)) (* (- 1.0 beta1) g))
-                                  v-new (+ (* beta2 (aget v i)) (* (- 1.0 beta2) (* g g)))
-                                  m-hat (/ m-new bc1)
-                                  v-hat (/ v-new bc2)
-            ;; weight decay applied to param directly
-                                  p-decayed (* (aget param i) (- 1.0 (* lr weight-decay)))]
-                              (aset m i m-new)
-                              (aset v i v-new)
-                              (aset param i
-                                    (- p-decayed (* lr (/ m-hat (+ (n/sqrt v-hat) eps)))))))
+                          (raster.par/map-void!
+                           i n
+                           (let [g (aget grad i)
+                                 m-new (+ (* beta1 (aget m i)) (* (- 1.0 beta1) g))
+                                 v-new (+ (* beta2 (aget v i)) (* (- 1.0 beta2) (* g g)))
+                                 m-hat (/ m-new bc1)
+                                 v-hat (/ v-new bc2)
+             ;; weight decay applied to param directly
+                                 p-decayed (* (aget param i) (- 1.0 (* lr weight-decay)))]
+                             (aset m i m-new)
+                             (aset v i v-new)
+                             (aset param i
+                                   (- p-decayed (* lr (/ m-hat (+ (n/sqrt v-hat) eps)))))))
                           param)))
 
 ;; ================================================================

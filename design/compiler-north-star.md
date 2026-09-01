@@ -126,12 +126,22 @@ guarded indexed store remain visible to scheduling and ABI construction. Shared 
 explicit ordered local-SSA spine inside the tuple map's scalar region; each definition has a dtype
 retained from walker/TypedClojure facts, and local binders never become fake program inputs.
 Validation proves definition order and lexical closure, and the front end expands locals only for
-dependency analysis so a local cannot hide sibling write/read ordering. JVM and GPU lowering both
+I/O discovery. A direct sibling-destination read still preserves imperative store ordering and
+declines the functional tuple map, while a typed local may snapshot any destination before the
+store sequence and safely feed several results. JVM and GPU lowering both
 materialize the same typed spine once around all tuple results. Vertical and horizontal fusion
 alpha-rename and compose these regions while preserving definition order; a typed producer-result
 bridge is introduced only when reuse requires it, so fusion does not duplicate scalar work. Flat
 resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
 mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
+
+Adam and AdamW use this effect-map contract directly: gradient is a read-only operand, parameter
+and moment buffers are typed inout storage, and the bias-corrected moment snapshots form one local
+SSA spine evaluated before all three writes. Each optimizer lowers as one certified resident
+kernel with zero compiler allocation or compatibility fallback. The C-family vector fast path
+currently declines multi-store lexical regions rather than inlining a snapshot past a state write;
+vector KernelBody lowering of local SSA is the remaining schedule improvement, not a second
+optimizer-specific semantic path.
 
 Boundary-aware scientific stencils now enter that same direct vertical as a distinct functional
 `stencil` equation. The equation keeps whole neighborhood tensors as stable captures, proves every
