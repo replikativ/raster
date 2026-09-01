@@ -739,6 +739,13 @@
             :scalar-types scalar-types :array-types array-types :target-dialect target-dialect)}
           (catch clojure.lang.ExceptionInfo exception
             (when-not (segred-body/declined? exception) (throw exception))
+            (when (get-in segred [:reduction :attributes :result-region])
+              (throw (ex-info
+                      "completed-reduction transforms require verified KernelBody lowering"
+                      (assoc (ex-data exception)
+                             :reason :segred-result-transform-lowering
+                             :fallback :none)
+                      exception)))
             {:decline (ex-data exception)}))]
     (or
      (:artifact kernel-body-attempt)

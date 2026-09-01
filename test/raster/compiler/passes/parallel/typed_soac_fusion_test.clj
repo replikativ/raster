@@ -352,3 +352,39 @@
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
     (is (= 2 (count (dialect/equations result))))))
+
+(deftest completed-reduction-fuses-a-pure-scalar-consumer
+  (let [program
+        (frontend/form->program
+         '(let* [total (raster.par/reduce acc 0.0 i n
+                                           (+ acc (clojure.core/aget x i)))
+                 ^double scaled (* ^double total ^double scale)]
+            scaled)
+         {:dtype :double
+          :array-types {'x :double}
+          :scalar-types {'scale :double}})
+        fold-before (-> program dialect/equations first typed-fusion/equation-info :body-results)
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations result))
+        operation (dialect/operation-parts equation)
+        transform (get-in operation [:attributes :result-transform])
+        transform-region (dialect/lambda-parts (:lambda transform))
+        remapped (dialect/remap-values result {'scale 'gain})
+        remapped-attributes (:attributes (dialect/operation-parts
+                                          (first (dialect/equations remapped))))]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= 'reduce (:kind operation)))
+    (is (= '[scaled] (nth equation 2)))
+    (is (= '[scaled] (dialect/outputs result)))
+    (is (= '#{n scale x} (set (:inputs (dialect/facts result)))))
+    (is (= fold-before (:body-results (dialect/lambda-parts (:lambda operation))))
+        "the scalar epilogue must never enter the element or partial-reduction fold")
+    (is (= [] (:operands transform)))
+    (is (= '[scale] (mapv :value (:scalars transform))))
+    (is (not-any? #{'total} (flatten (:body-results transform-region))))
+    (is (= '[gain] (mapv :value (get-in remapped-attributes
+                                        [:result-transform :scalars]))))
+    (is (not (contains? remapped-attributes :segment-axes))
+        "remapping a full reduction must not invent segmented axes")
+    (is (= result (dialect/validate! result)))))

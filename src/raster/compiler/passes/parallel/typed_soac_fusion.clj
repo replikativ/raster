@@ -395,10 +395,9 @@
 
 (defn- transfer-result-boundary
   "Keep `producer-id`'s fused provenance, but make the consumer's observable store its boundary."
-  [facts producer-id consumer-id]
+  [facts producer-id consumer-id fused-kind]
   (let [consumer (get-in facts [:equations consumer-id])
-        facts (remove-equation-fact facts consumer-id producer-id
-                                    :segmented-reduce-result-map)
+        facts (remove-equation-fact facts consumer-id producer-id fused-kind)
         producer (get-in facts [:equations producer-id])
         boundary-attributes (select-keys (:attributes consumer)
                                          [:result-storage :host-binding])
@@ -427,6 +426,103 @@
                   (assoc :inputs inputs)
                   (update :values select-keys live-values))]
     (dialect/make facts equations (dialect/outputs program))))
+
+(defn- reduce-result-scalar-transform
+  "Translate a pure scalar consumer into a transform applied once to a completed reduction.
+
+   The reduction result becomes the transform accumulator. Every other consumer capture remains
+   an explicitly typed uniform scalar. A full reduction has no result axes, so this rule never
+   invents tensor indexing."
+  [program producer consumer]
+  (let [produced (first (:results producer))
+        accumulator (first (get-in producer [:attributes :accumulators]))
+        {:keys [capture-parameters]} (parameter-parts consumer)
+        bindings (mapv vector (:captures consumer) capture-parameters)
+        consumed (filterv #(= produced (first %)) bindings)
+        scalar-bindings (filterv #(not= produced (first %)) bindings)
+        substitutions
+        (into {}
+              (map (fn [[value parameter]]
+                     [parameter (if (= value produced) accumulator value)]))
+              bindings)
+        expression (util/subst-syms substitutions (first (:body-results consumer)))
+        scalars (mapv (fn [[value _]]
+                        {:value value :dtype (value-scalar-dtype program value)})
+                      scalar-bindings)
+        result-dtype (value-scalar-dtype program (first (:results consumer)))]
+    (when (and (= 1 (count consumed))
+               (every? :dtype scalars)
+               result-dtype)
+      (dialect/make-result-transform
+       {:accumulator accumulator
+        :expression expression
+        :operands []
+        :scalars scalars
+        :result-dtype result-dtype}))))
+
+(defn- reduce-result-scalar-candidate
+  [program]
+  (let [equations (dialect/equations program)
+        infos (mapv equation-info equations)
+        uses (value-use-counts program)]
+    (first
+     (for [producer-index (range (dec (count infos)))
+           :let [consumer-index (inc producer-index)
+                 producer (nth infos producer-index)
+                 consumer (nth infos consumer-index)
+                 produced (first (:results producer))
+                 transform (reduce-result-scalar-transform program producer consumer)]
+           :when (= :reduce (:kind producer))
+           :when (= :scalar (:kind consumer))
+           :when (= 1 (count (:results producer)) (count (:body-results producer))
+                    (count (:results consumer)) (count (:body-results consumer)))
+           :when (= 1 (count (get-in producer [:attributes :accumulators])))
+           :when (nil? (get-in producer [:attributes :result-transform]))
+           :when (empty? (:locals consumer))
+           :when (= 1 (get uses produced 0))
+           :when (not (contains? (set (dialect/outputs program)) produced))
+           :when (= (first (get-in producer [:attributes :dtypes]))
+                    (value-scalar-dtype program (first (:results consumer))))
+           :when (fusible-equation? program (:id producer))
+           :when (fusible-equation? program (:id consumer))
+           :when transform]
+       {:producer-index producer-index :consumer-index consumer-index
+        :producer producer :consumer consumer :transform transform}))))
+
+(defn- fuse-reduce-result-scalar-once
+  [program]
+  (when-let [{:keys [producer-index consumer-index producer consumer transform]}
+             (reduce-result-scalar-candidate program)]
+    (let [producer-parameters (parameter-parts producer)
+          transform-values (mapv :value (:scalars transform))
+          fresh-transform-parameters
+          (mapv #(symbol (str "%fused-result-scalar" %)) (range (count transform-values)))
+          canonical (canonical-operands
+                     (:arrays producer) (:elements producer-parameters)
+                     (vec (concat (:captures producer) transform-values))
+                     (vec (concat (:capture-parameters producer-parameters)
+                                  fresh-transform-parameters))
+                     (:locals producer) (:body-results producer))
+          updated (assoc producer
+                         :results (:results consumer)
+                         :attributes (assoc (:attributes producer) :result-transform transform)
+                         :arrays (:arrays canonical)
+                         :captures (:captures canonical)
+                         :parameters (vec (concat (:accumulators producer-parameters)
+                                                  (:elements canonical)
+                                                  (:capture-parameters canonical)))
+                         :locals (:locals canonical)
+                         :body-results (:body-results canonical))
+          equations (-> (dialect/equations program)
+                        (assoc producer-index (emit-equation updated))
+                        (->> (keep-indexed (fn [index equation]
+                                             (when-not (= index consumer-index) equation)))
+                             vec))
+          facts (-> (transfer-result-boundary (dialect/facts program)
+                                              (:id producer) (:id consumer)
+                                              :reduce-result-scalar)
+                    (update-in [:values (first (:results consumer))] assoc :shape []))]
+      (rebuild-boundary program facts equations))))
 
 (defn- single-write-boundary?
   [facts equation-id result destination]
@@ -599,7 +695,8 @@
                                              (when-not (= index consumer-index) equation)))
                              vec))
           facts (-> (transfer-result-boundary (dialect/facts program)
-                                              (:id producer) (:id consumer))
+                                              (:id producer) (:id consumer)
+                                              :segmented-reduce-result-map)
                     (update-in [:values (first (:results consumer))]
                                assoc
                                :shape (dialect/segmented-reduce-result-shape
@@ -877,18 +974,20 @@
          (recur (fuse-vertical-candidate program candidate)
                 (inc vertical) horizontal (inc iterations)
                 (remember-placement placements (:placement candidate)))
-         (if-let [fused (fuse-segmented-reduce-result-map-once program)]
+         (if-let [fused (fuse-reduce-result-scalar-once program)]
            (recur fused (inc vertical) horizontal (inc iterations) placements)
-           (if-let [fused (fuse-horizontal-once program)]
-             (recur fused vertical (inc horizontal) (inc iterations) placements)
-             (let [placements
-                   (reduce remember-placement placements
-                           (map :placement
-                                (filter (comp not :fuse? :placement) candidates)))
-                   [program ordered-placements] (attach-placement-facts program placements)
-                   stats {:vertical vertical
-                          :horizontal horizontal
-                          :iterations (inc iterations)}]
-               [program (cond-> stats
-                          (seq ordered-placements)
-                          (assoc :placements ordered-placements))]))))))))
+           (if-let [fused (fuse-segmented-reduce-result-map-once program)]
+             (recur fused (inc vertical) horizontal (inc iterations) placements)
+             (if-let [fused (fuse-horizontal-once program)]
+               (recur fused vertical (inc horizontal) (inc iterations) placements)
+               (let [placements
+                     (reduce remember-placement placements
+                             (map :placement
+                                  (filter (comp not :fuse? :placement) candidates)))
+                     [program ordered-placements] (attach-placement-facts program placements)
+                     stats {:vertical vertical
+                            :horizontal horizontal
+                            :iterations (inc iterations)}]
+                 [program (cond-> stats
+                            (seq ordered-placements)
+                            (assoc :placements ordered-placements))])))))))))

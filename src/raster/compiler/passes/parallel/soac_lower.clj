@@ -25,6 +25,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]))
 
 (declare lower-reduce)
@@ -331,6 +332,8 @@
           stable-array-captures (set (get-in attributes
                                              [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable-array-captures captures))
+          result-region
+          (scalar-region-lower/from-typed-result-transform (:result-transform attributes))
           operator (reduction/scalar
                     {:accumulator accumulator
                      :neutral (first (:identities attributes))
@@ -339,7 +342,8 @@
                      :index index
                      :step-result step-result
                      :algebra (or (first (:algebra attributes)) {})
-                     :attributes {:source :typed-soac :equation equation-id}})
+                     :attributes (cond-> {:source :typed-soac :equation equation-id}
+                                   result-region (assoc :result-region result-region))})
           node (cond-> (soac/->SoacReduce equation-id result operator []
                                           (:extent attributes)
                                           (into (set arrays) stable-array-captures)
@@ -776,15 +780,26 @@
         :two-phase
         (let [level-1 (segop/->SegLevel :block :virtual)
               partials-sym (gensym "partials_")
+              phase-1-reduction (update reduction :attributes dissoc :result-region)
+              result-region (get-in reduction [:attributes :result-region])
+              fold-symbols (reduce set/union #{}
+                                   (map util/free-syms
+                                        (cond-> (vec (get-in reduction [:step :results]))
+                                          map-lambda (conj map-lambda))))
+              fold-scalars (if result-region
+                             (set/intersection (set (:scalars soac)) fold-symbols)
+                             (:scalars soac))
               phase-1 (segop/->SegRed (:id soac) space level-1
-                                      reduction map-lambda
+                                      phase-1-reduction map-lambda
                                       (:inputs soac)
                                       #{partials-sym}
-                                      (:scalars soac)
+                                      fold-scalars
                                       grid-1 :block-local nil
                                       dtype)
               phase-2-idx (gensym "j_")
-              phase-2-space (segop/make-seg-space phase-2-idx (:num-blocks grid-1))
+              phase-2-bound (segred-body/launch-group-count
+                             (:num-blocks grid-1) bound (:block-size grid-1))
+              phase-2-space (segop/make-seg-space phase-2-idx phase-2-bound)
               grid-2 (single-block-grid grid-1)
               level-2 (segop/->SegLevel :block :none)
               {:keys [operator identity accumulator]} (segred-body/scalar-plan phase-1)
@@ -793,6 +808,7 @@
                            :min 'clojure.core/min
                            :max 'clojure.core/max} operator)
               component (first (:components reduction))
+              result-scalars (set (drop 1 (:parameters result-region)))
               phase-2-reduction
               (reduction/scalar
                {:accumulator accumulator
@@ -805,11 +821,11 @@
                 :algebra (:algebra reduction)
                 :attributes (assoc (:attributes reduction)
                                    :physical-phase :cross-block)})
-              phase-2 (segop/->SegRed (+ (:id soac) 1000)
+              phase-2 (segop/->SegRed [:reduction-phase (:id soac) :cross-block]
                                       phase-2-space level-2
                                       phase-2-reduction nil
                                       #{partials-sym} #{(:sym soac)}
-                                      #{} grid-2 :cross-block nil
+                                      result-scalars grid-2 :cross-block nil
                                       dtype)]
           [phase-1 phase-2])))))
 

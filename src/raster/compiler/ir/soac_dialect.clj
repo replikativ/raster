@@ -184,6 +184,8 @@
               (dtype/known? component-dtype)
               (= component-dtype (dtype/canon component-dtype))))))
 
+(declare lambda-form result-transform?)
+
 (defn reduce-attributes?
   [value]
   (and (map-attributes? value)
@@ -199,9 +201,10 @@
           (count (:dtypes value))
           (count (:algebra value)))
        (every? keyword? (:dtypes value))
-       (every? map? (:algebra value))))
-
-(declare lambda-form)
+       (every? map? (:algebra value))
+       (or (nil? (:result-transform value))
+           (and (= 1 (count (:accumulators value)))
+                (result-transform? (:result-transform value))))))
 
 (defn result-transform?
   "A typed scalar transform applied once to a completed reduction result.
@@ -889,7 +892,8 @@
                  {:equation equation-id :results body-results})))
 
       reduce
-      (let [accumulators (:accumulators attributes)]
+      (let [accumulators (:accumulators attributes)
+            transform (:result-transform attributes)]
         (when-not (= accumulators (vec (take (count accumulators) parameters)))
           (fail! :typed-soac-reduce-accumulators
                  "reduce accumulator parameters must lead the lambda in declared order"
@@ -897,7 +901,29 @@
         (when-not (= result-count (count accumulators))
           (fail! :typed-soac-reduce-results
                  "reduce result arity must equal accumulator arity"
-                 {:equation equation-id :results results :accumulators accumulators})))
+                 {:equation equation-id :results results :accumulators accumulators}))
+        (when transform
+          (let [operand-ids (set (map :value (:operands transform)))
+                scalar-ids (set (map :value (:scalars transform)))
+                transform-ids (set/union operand-ids scalar-ids)
+                {:keys [parameters body-results]} (lambda-parts (:lambda transform))
+                unbound (util/free-syms (first body-results) (set parameters))]
+            (when-not (set/subset? transform-ids (set captures))
+              (fail! :typed-soac-result-transform-captures
+                     "reduce result transforms require explicit capture values"
+                     {:equation equation-id :transform-captures transform-ids
+                      :captures captures}))
+            ;; A full reduction has no remaining result axes with which to address a tensor.
+            ;; Tensor epilogues belong to segmented reductions; this scalar boundary accepts only
+            ;; uniform captures until an explicit scalar-load schedule exists.
+            (when (seq operand-ids)
+              (fail! :typed-soac-reduce-result-transform-operands
+                     "full-reduction result transforms cannot address tensor operands"
+                     {:equation equation-id :operands operand-ids}))
+            (when (seq unbound)
+              (fail! :typed-soac-result-transform-expression
+                     "result-transform expressions may reference only their typed region boundary"
+                     {:equation equation-id :unbound unbound :transform transform})))))
 
       segmented-reduce
       (let [accumulators (:accumulators attributes)
@@ -1434,20 +1460,20 @@
                                               #(mapv rename %)))
                       attributes (if (contains? #{'segmented-reduce 'product-reduce
                                                   'segmented-fold-map} kind)
-                                   (-> attributes
-                                       (update :segment-axes
-                                               #(mapv (fn [[index extent]]
-                                                        [index (if (value-id? extent)
-                                                                 (rename extent) extent)]) %))
-                                       (cond-> (:result-transform attributes)
-                                         (update-in [:result-transform :operands]
-                                                    #(mapv (fn [operand]
-                                                             (update operand :value rename)) %))
-                                         (:result-transform attributes)
-                                         (update-in [:result-transform :scalars]
-                                                    #(mapv (fn [scalar]
-                                                             (update scalar :value rename)) %))))
+                                   (update attributes :segment-axes
+                                           #(mapv (fn [[index extent]]
+                                                    [index (if (value-id? extent)
+                                                             (rename extent) extent)]) %))
                                    attributes)
+                      attributes (cond-> attributes
+                                   (:result-transform attributes)
+                                   (update-in [:result-transform :operands]
+                                              #(mapv (fn [operand]
+                                                       (update operand :value rename)) %))
+                                   (:result-transform attributes)
+                                   (update-in [:result-transform :scalars]
+                                              #(mapv (fn [scalar]
+                                                       (update scalar :value rename)) %)))
                       attributes (if (= 'scalar kind)
                                    attributes
                                    (update attributes :extent

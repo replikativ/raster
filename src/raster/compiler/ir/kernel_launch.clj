@@ -155,7 +155,12 @@
                       {:field field :axis axis :value value :dimensions dimensions}))))
   dimensions)
 
-(defn- launch-expression?
+(defn dimension-expression?
+  "Whether `x` is legal as one symbolic launch dimension.
+
+   Unlike `expression?`, this excludes arbitrary opaque leaves: callers must wrap runtime compiler
+   values with `runtime-value` so scheduled extents cannot smuggle source S-expressions into an
+   emitted ABI."
   [x]
   (or (and (integer? x) (pos? x))
       (runtime-value? x)
@@ -173,9 +178,11 @@
     (throw (ex-info "launch contract must be a LaunchSpec" {:launch spec :actual (type spec)})))
   (let [{:keys [workgroup-size group-count shared-memory-bytes]} spec]
     (dimension-vector! "launch specification" :workgroup-size workgroup-size
-                       launch-expression? "a positive integer or explicit runtime expression")
+                       dimension-expression?
+                       "a positive integer or explicit runtime expression")
     (dimension-vector! "launch specification" :group-count group-count
-                       launch-expression? "a positive integer or explicit runtime expression")
+                       dimension-expression?
+                       "a positive integer or explicit runtime expression")
     (when-not (= (count workgroup-size) (count group-count))
       (throw (ex-info "launch workgroup and group-count dimensionality must match"
                       {:workgroup-size workgroup-size :group-count group-count})))
