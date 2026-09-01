@@ -157,6 +157,61 @@
               :algorithm-dialect :typed-soac
               :algorithm-equation equation-id)])))
 
+(defn lower-typed-segmented-fold-map
+  "Lower one ordered segmented fold-map to a single semantic SegFoldMap.
+
+   The operation remains target-neutral: segments are parallel, folds are explicitly ordered,
+   and the final map covers the complete per-segment extent. A later schedule makes loop/control
+   structure and launch geometry concrete in KernelBody."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)
+        equation (first (soac-dialect/equations program))
+        [_ equation-id results] equation
+        {:keys [kind attributes arrays captures folds map-lambda]}
+        (soac-dialect/operation-parts equation)
+        facts (soac-dialect/facts program)
+        physical-results (soac-dialect/physical-results facts equation)
+        stable (set (get-in attributes [:attributes :stable-array-captures]))
+        accumulators (mapv #(get-in % [:attributes :accumulator]) folds)
+        map-region (soac-dialect/lambda-parts map-lambda)
+        capture-parameters (vec (drop (count accumulators) (:parameters map-region)))
+        substitutions (zipmap capture-parameters captures)
+        lowered-folds
+        (mapv (fn [{:keys [attributes lambda]}]
+                (let [{:keys [locals body-results]} (soac-dialect/lambda-parts lambda)]
+                  (assoc attributes
+                         :locals (mapv #(update % :init
+                                                (fn [init]
+                                                  (util/subst-syms substitutions init)))
+                                       locals)
+                         :step (util/subst-syms substitutions (first body-results)))))
+              folds)
+        map-results (mapv #(util/subst-syms substitutions %)
+                          (:body-results map-region))
+        result-dtypes (:dtypes attributes)]
+    (when-not (and (= 1 (count (soac-dialect/equations program)))
+                   (= 'segmented-fold-map kind) (empty? arrays)
+                   (= (count results) (count physical-results) (count map-results)
+                      (count result-dtypes)))
+      (throw (ex-info "typed fold-map lowering requires one closed ordered equation"
+                      {:reason :typed-soac-segmented-fold-map-subset
+                       :equation equation-id :kind kind :results results
+                       :physical-results physical-results})))
+    (let [dims (conj (mapv (fn [[index bound]] {:name index :bound bound})
+                           (:segment-axes attributes))
+                     {:name (:index attributes) :bound (:extent attributes)})
+          space (segop/make-seg-space-nd dims)
+          segment-count (segop/seg-space-num-segments-expr space)
+          result-dtype (or (first result-dtypes) dtype)
+          grid (phase-grid :map device-id segment-count result-dtype)]
+      [(assoc (segop/->SegFoldMap
+               equation-id space (:index attributes) (:extent attributes)
+               lowered-folds map-results stable (vec physical-results)
+               (set/difference (set captures) stable) grid result-dtypes
+               :no-write-alias)
+              :algorithm-dialect :typed-soac
+              :algorithm-equation equation-id)])))
+
 (defn lower-typed-scatter
   "Lower one unique-destination TypedSOAC scatter to an explicit-store SegMap.
 

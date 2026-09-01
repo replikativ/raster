@@ -16,6 +16,8 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
 (defn- reduction-artifact
@@ -74,6 +76,48 @@
         kernel-body (:kernel-body (register-tiled-body/lower facts {}))]
     (body-emit/emit-scalar-kernel
      "register_tiled_contraction" kernel-body {:target-dialect dialect})))
+
+(defn- segmented-fold-map-artifact
+  [dialect]
+  (let [source
+        '(let* [effect
+                (raster.par/segmented-fold-map!
+                 [out] [[segment nsegments]] index width
+                 [[maximum -1.0E38 :float width
+                   (clojure.core/max
+                    maximum
+                    (clojure.core/aget values
+                                       (clojure.core/+ (clojure.core/* segment width) index)))]
+                  [denominator 0.0 :float width
+                   (clojure.core/+
+                    denominator
+                    (Math/exp
+                     (clojure.core/-
+                      (clojure.core/aget
+                       values (clojure.core/+ (clojure.core/* segment width) index))
+                      maximum)))]]
+                 [(clojure.core//
+                   (Math/exp
+                    (clojure.core/-
+                     (clojure.core/aget
+                      values (clojure.core/+ (clojure.core/* segment width) index))
+                     maximum))
+                   denominator)])]
+               effect)
+        program (:program
+                 (typed-route/attempt
+                  source :float {'values :float 'out :float}
+                  {:scalar-types {'nsegments :int 'width :int}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'values :float 'out :float}
+                             :scalar-types {'nsegments :int 'width :int}}))
+        operation (first (:operations (first (:equations scheduled))))]
+    (segop-emit/generate-segfoldmap-kernel
+     operation :target-dialect dialect :kernel-name-prefix "segmented_fold_map"
+     :array-types {'values :float 'out :float}
+     :scalar-types {'nsegments :int 'width :int})))
 
 (defn- problem []
   (attention/make
@@ -148,6 +192,8 @@
                             (reduction-artifact dialect))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
+           (write-artifact! directory suffix "segmented-fold-map"
+                            (segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
            (write-source! directory suffix "workgroup-memory"

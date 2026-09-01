@@ -294,6 +294,9 @@
                              product-reduce
                              {:operations (soac-lower/lower-typed-product-reduce
                                            algorithm device-id :dtype dtype)}
+                             segmented-fold-map
+                             {:operations (soac-lower/lower-typed-segmented-fold-map
+                                           algorithm device-id :dtype dtype)}
                              scan (soac-lower/lower-typed-scan
                                    algorithm device-id :dtype dtype
                                    :array-types (:array-types opts)))

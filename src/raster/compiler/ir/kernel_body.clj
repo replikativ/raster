@@ -19,6 +19,7 @@
 (defrecord IndexBinding [id source axis])
 (defrecord IndexCompute [id expression])
 (defrecord IndexExpr [op arguments])
+(defrecord IndexCast [argument dtype overflow])
 (defrecord Predicate [op arguments])
 (defrecord Mask [id predicates])
 (defrecord Fragment [id dtype shape layout])
@@ -99,6 +100,11 @@
     (throw (ex-info "kernel index expression has an unsupported operation"
                     {:operation op :arguments arguments})))
   (->IndexExpr op (vec arguments)))
+
+(defn index-cast
+  "Construct an explicit integral representation conversion for index arithmetic."
+  [argument target-dtype overflow]
+  (->IndexCast argument target-dtype overflow))
 
 (defn predicate
   "Construct an explicit target-neutral bounds predicate."
@@ -212,6 +218,10 @@
 (defn- expression? [value]
   (cond
     (or (integer? value) (value-id? value)) true
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" value)
+    (and (contains? #{:int :long} (dtype/canon (:dtype value)))
+         (contains? cast-overflow-policies (:overflow value))
+         (expression? (:argument value)))
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (and (contains? index-ops (:op value))
          (seq (:arguments value))
@@ -222,6 +232,8 @@
   (cond
     (value-id? value) #{value}
     (integer? value) #{}
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" value)
+    (expression-references (:argument value))
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (reduce into #{} (map expression-references (:arguments value)))
     :else #{}))
@@ -1041,17 +1053,48 @@
 
 (defn- expression-info!
   [expression values]
-  (let [infos (mapv #(typed-info! values % "index expression")
-                    (expression-references expression))
-        types (set (map :type infos))]
-    (when-not (every? #{:int :long} types)
-      (throw (ex-info "index expression references a non-integral SSA value"
-                      {:reason :kernel-body-index-dtype :expression expression :types types})))
-    (when (> (count types) 1)
-      (throw (ex-info "index expression mixes integral widths without an explicit conversion"
-                      {:reason :kernel-body-index-dtype :expression expression :types types})))
-    {:type (or (first types) :int)
-     :uniformity (join-uniformity infos)}))
+  (cond
+    (integer? expression)
+    {:type :int :uniformity all-uniform}
+
+    (value-id? expression)
+    (typed-info! values expression "index expression")
+
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" expression)
+    (let [source (expression-info! (:argument expression) values)
+          target (dtype/canon (:dtype expression))]
+      (when-not (contains? #{:int :long} target)
+        (throw (ex-info "index conversion target must be integral"
+                        {:reason :kernel-body-index-cast-dtype
+                         :expression expression :target target})))
+      (when-not (contains? cast-overflow-policies (:overflow expression))
+        (throw (ex-info "index conversion requires an explicit overflow policy"
+                        {:reason :kernel-body-index-cast-overflow
+                         :expression expression :overflow (:overflow expression)})))
+      (when-not (and (= :exact (:overflow expression))
+                     (or (= (:type source) target)
+                         (and (= :int (:type source)) (= :long target))))
+        (throw (ex-info "the portable index IR currently permits only exact widening conversions"
+                        {:reason :kernel-body-index-cast-semantics
+                         :expression expression :source (:type source) :target target
+                         :overflow (:overflow expression)})))
+      {:type target :uniformity (:uniformity source)})
+
+    (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
+    (let [infos (mapv #(expression-info! % values) (:arguments expression))
+          types (set (map :type infos))]
+      (when-not (every? #{:int :long} types)
+        (throw (ex-info "index expression references a non-integral SSA value"
+                        {:reason :kernel-body-index-dtype :expression expression :types types})))
+      (when (> (count types) 1)
+        (throw (ex-info "index expression mixes integral widths without an explicit conversion"
+                        {:reason :kernel-body-index-dtype :expression expression :types types})))
+      {:type (or (first types) :int)
+       :uniformity (join-uniformity infos)})
+
+    :else
+    (throw (ex-info "unsupported kernel index expression"
+                    {:reason :kernel-body-index-expression :expression expression}))))
 
 (defn- expression-uniformity
   [expression values]
@@ -1954,7 +1997,11 @@
                          :subgroup subgroup-uniform
                          :lane lane-varying)
                        (expression-uniformity (:expression idx) values))]
-                 (assoc values (:id idx) {:type :int :uniformity uniformity})))
+                 (assoc values (:id idx)
+                        {:type (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                                 :int
+                                 (:type (expression-info! (:expression idx) values)))
+                         :uniformity uniformity})))
              (into {}
                    (map (fn [parameter]
                           [(:id parameter)

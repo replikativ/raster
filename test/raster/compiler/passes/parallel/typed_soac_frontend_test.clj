@@ -362,7 +362,7 @@
                     :scalar-types {'n :long}})
           (is false "an aliased output invalidates stable neighborhood reads")
           (catch clojure.lang.ExceptionInfo exception
-            (is (= :typed-soac-stencil-alias (:reason (ex-data exception))))))))))
+            (is (= :typed-soac-stable-read-alias (:reason (ex-data exception))))))))))
 
 (deftest explicit-contraction-result-transform-stays-in-typed-soac
   (let [transform {:acc 'acc

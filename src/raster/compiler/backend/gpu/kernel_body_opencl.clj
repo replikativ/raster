@@ -28,7 +28,17 @@
       (str/replace #"[^A-Za-z0-9_]" "_")
       (str/replace #"^[^A-Za-z_]" "_$0")))
 
-(declare emit-index-expression)
+(declare emit-index-expression target-type)
+
+(defn- index-expression-dtype
+  [expression types]
+  (cond
+    (integer? expression) :int
+    (value-id? expression) (get types expression :int)
+    (record-kind? "IndexCast" expression) (dtype/canon (:dtype expression))
+    (record-kind? "IndexExpr" expression)
+    (or (some-> (:arguments expression) first (index-expression-dtype types)) :int)
+    :else :int))
 
 (defn- emit-infix [operator arguments env]
   (str "(" (str/join (str " " operator " ")
@@ -39,6 +49,10 @@
   (cond
     (number? expression) (str expression)
     (value-id? expression) (or (get env expression) (target-name expression))
+    (record-kind? "IndexCast" expression)
+    (str "("
+         (target-type (:dtype expression))
+         ")(" (emit-index-expression (:argument expression) env) ")")
     (record-kind? "IndexExpr" expression)
     (let [arguments (:arguments expression)]
       (case (:op expression)
@@ -183,6 +197,8 @@
   (cond
     (value-id? expression) #{expression}
     (number? expression) #{}
+    (record-kind? "IndexCast" expression)
+    (expression-references (:argument expression))
     (record-kind? "IndexExpr" expression)
     (reduce into #{} (map expression-references (:arguments expression)))
     :else #{}))
@@ -1553,7 +1569,11 @@
         names (reduce (fn [env index]
                         (assoc env (:id index) (scalar-local-name (:id index))))
                       (merge parameter-names allocation-names) indices)
-        types (reduce (fn [env index] (assoc env (:id index) :int))
+        types (reduce (fn [env index]
+                        (assoc env (:id index)
+                               (if (record-kind? "IndexBinding" index)
+                                 :int
+                                 (index-expression-dtype (:expression index) env))))
                       (into {}
                             (map (fn [parameter]
                                    [(:id parameter) (dtype/canon (:dtype parameter))])
@@ -1610,7 +1630,7 @@
                             (get-in kernel-body [:schedule :subgroup-size]))
                            ";"))
                      (indent-lines
-                      1 (str "int " name " = "
+                      1 (str (target-type (get types (:id index))) " " name " = "
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
         storage-declarations (concat parameters (:allocations kernel-body))

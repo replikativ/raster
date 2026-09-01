@@ -28,6 +28,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -395,6 +396,52 @@
       :provenance {:dialect :segstencil :segop-id (:id segstencil)}
       :attributes {:array-params inputs :scalar-params scalars :out-param out
                    :dtype dtype :aliasing :no-write-alias}})))
+
+(defn generate-segfoldmap-kernel
+  "Schedule and emit one ordered SegFoldMap through the shared scalar KernelBody dialect."
+  [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
+                 :or {kernel-name-prefix "segmented_fold_map"
+                      target-dialect :opencl-intel workgroup-size 256
+                      scalar-types {} array-types {}}}]
+  (let [{:keys [kernel-body segment-count]}
+        (segfoldmap-body/lower segfoldmap
+                              {:workgroup-size workgroup-size
+                               :scalar-types scalar-types :array-types array-types})
+        parameters (:parameters kernel-body)
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        parameter-names (into {}
+                              (map (fn [parameter]
+                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
+                              parameters)
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+        abi (body-abi/project-contracts
+             (mapv (fn [{:keys [id kind dtype role]}]
+                     (kabi/slot id kind dtype :c-name (get parameter-names id)
+                                :role (if (= id '_nseg) :bound role)))
+                   parameters)
+             kernel-body)
+        arguments (mapv (fn [parameter]
+                          (if (= '_nseg (:id parameter)) segment-count (:id parameter)))
+                        parameters)]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments arguments
+      :launch (:launch kernel-body)
+      :temporaries []
+      :effects {:kind :segmented-fold-map :association :ordered}
+      :target (kernel-body-c-dialect/target
+               (kernel-body-c-dialect/resolve! target-dialect))
+      :provenance {:dialect :kernel-body :source-dialect :segfoldmap
+                   :segop-id (:id segfoldmap)}
+      :attributes {:kernel-body kernel-body
+                   :array-params (vec (concat (:inputs segfoldmap) (:outputs segfoldmap)))
+                   :scalar-params (vec (:scalars segfoldmap))
+                   :dtype (first (:dtypes segfoldmap))
+                   :aliasing :no-write-alias}})))
 
 ;; ================================================================
 ;; SegRed → OpenCL kernel (two-phase reduction)

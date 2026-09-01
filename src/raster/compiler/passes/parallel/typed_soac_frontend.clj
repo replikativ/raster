@@ -374,9 +374,56 @@
          :element-locals element-locals :combine-locals combine-locals
          :effect-only? true :host-binding symbol :result-storage storage}))
 
+    (par/par-segmented-fold-map-form? expression)
+    (let [{:keys [outputs segment-axes idx map-extent folds map-results elem-type]}
+          (par/extract-par-segmented-fold-map-info expression)
+          fold-dtype (fn [declared]
+                       (dtype/canon (if (= :element declared)
+                                      (or elem-type default-dtype :double)
+                                      declared)))
+          normalized-folds
+          (mapv (fn [[accumulator identity declared-dtype extent step]]
+                  {:accumulator accumulator :identity identity
+                   :dtype (fold-dtype declared-dtype) :extent extent :step step})
+                folds)
+          all-expressions (vec (concat (map :step normalized-folds) map-results))
+          inputs (reduce set/union #{} (map par/collect-aget-arrays all-expressions))
+          binders (set (concat (map first segment-axes) [idx]
+                               (map :accumulator normalized-folds)))
+          output-set (set outputs)
+          scalar-uses
+          (reduce set/union #{}
+                  (map util/free-syms
+                       (concat (map second segment-axes) [map-extent]
+                               (map :extent normalized-folds)
+                               (map :identity normalized-folds)
+                               all-expressions)))
+          scalars (set/difference scalar-uses inputs output-set binders
+                                  descriptor/aget-ops descriptor/aset-ops
+                                  #{'do 'let 'let* 'if 'double 'float 'int 'long})
+          results (mapv #(effect-result-id id %) (range (count outputs)))
+          result-dtype (dtype/canon (or elem-type default-dtype :double))]
+      (when (and (seq outputs) (= (count outputs) (count map-results))
+                 (every? symbol? outputs) (seq segment-axes) (seq normalized-folds)
+                 (every? #(and (dtype/known? (:dtype %))
+                               (= (:dtype %) (dtype/canon (:dtype %))))
+                         normalized-folds))
+        {:kind :segmented-fold-map :id id :sym symbol
+         :segment-axes segment-axes :index idx :extent map-extent
+         :folds normalized-folds :map-results map-results
+         :results results :result-dtypes (vec (repeat (count outputs) result-dtype))
+         :inputs inputs :outputs output-set :scalars scalars
+         :effect-only? true :host-binding symbol
+         :result-storage (mapv (fn [output]
+                                 {:destination output :access :write :host-return :effect})
+                               outputs)}))
+
     (par/par-reduce-form? expression)
     (let [{:keys [acc init idx bound body elem-type]} (par/extract-par-reduce-info expression)
-          io (extract-io body idx [symbol] :accumulator acc)]
+          io (extract-io body idx [symbol] :accumulator acc)
+          identity-scalars
+          (set/difference (util/free-syms init) (:inputs io)
+                          (set [symbol acc idx]) descriptor/aget-ops descriptor/aset-ops)]
       (merge {:kind :reduce :id id :sym symbol :index idx :extent bound
               :product (reduction/scalar
                         ;; The walker stamps contextual FP narrowing on the par form.  Without
@@ -385,7 +432,7 @@
                         {:accumulator acc :neutral init :dtype (or elem-type :double)
                          :result symbol :index idx :step-result body
                          :attributes {:source :raster.par/reduce}})}
-             io))
+             (update io :scalars set/union identity-scalars)))
 
     (and (seq? expression) (= 'raster.par/contract (first expression)))
     (let [facts (contraction-facts/contraction-facts
@@ -444,11 +491,16 @@
       ;; value/view identity before it can be SSA. Keep that uncommon compatibility form outside
       ;; the typed route instead of pretending the destination is both an input and a definition.
       (when-not (= symbol out)
-        (let [algebra (scan/certify {:acc acc :init init :lambda body :out out} scan-dtype)]
+        (let [algebra (scan/certify {:acc acc :init init :lambda body :out out} scan-dtype)
+              io (extract-io body idx [out] :accumulator acc)
+              identity-scalars
+              (set/difference (util/free-syms init) (:inputs io)
+                              (set [symbol out acc idx])
+                              descriptor/aget-ops descriptor/aset-ops)]
           (merge {:kind :scan :id id :sym symbol :index idx :extent bound :mode mode
                   :primary-out out :accumulator acc :identity init :dtype scan-dtype
                   :algebra algebra :body body}
-                 (extract-io body idx [out] :accumulator acc)))))
+                 (update io :scalars set/union identity-scalars)))))
 
     (par/par-map-void-form? expression)
     (let [{:keys [idx bound body elem-type]}
@@ -475,6 +527,7 @@
     (or (par/par-scan-form? expression) (par/par-scan-exclusive-form? expression))
     (nth expression 5)
     (par/par-stencil-form? expression) (nth expression 7)
+    (par/par-segmented-fold-map-form? expression) (nth expression 4)
     (par/par-map-void-form? expression) (nth expression 2)
     :else nil))
 
@@ -488,6 +541,7 @@
                    (or (par/par-scan-form? expression)
                        (par/par-scan-exclusive-form? expression)) 5
                    (par/par-stencil-form? expression) 7
+                   (par/par-segmented-fold-map-form? expression) 4
                    (par/par-map-void-form? expression) 2)]
     (when position
       (with-meta (apply list (assoc (vec expression) position extent)) (meta expression)))))
@@ -502,31 +556,42 @@
   (if (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[head bindings & body] source
           pairs (vec (partition 2 bindings))
-          normalized
-          (mapcat
-           (fn [ordinal [symbol expression]]
+          {:keys [normalized]}
+          (reduce
+           (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
              (let [extent (parallel-extent expression)
                    canonical-extent (some-> extent descriptor/unwrap-int-cast)]
                (cond
                  (nil? extent)
-                 [[symbol expression]]
+                 (update state :normalized conj [symbol expression])
 
                  ;; Integral casts are representation noise, not new semantic dimensions.
                  ;; Keeping their underlying value identity also prevents one array from
                  ;; acquiring incompatible [n] and [(long n)] shapes across operations.
                  (dialect/extent? canonical-extent)
-                 [[symbol (replace-parallel-extent expression canonical-extent)]]
+                 (update state :normalized conj
+                         [symbol (replace-parallel-extent expression canonical-extent)])
 
                  (provably-pure-scalar? canonical-extent)
-                 (let [extent-id (with-meta
-                                   (clojure.core/symbol (str "rstr_extent_" ordinal))
-                                   {:tag 'long :raster.type/tag 'long})]
-                   [[extent-id canonical-extent]
-                    [symbol (replace-parallel-extent expression extent-id)]])
+                 (if-let [extent-id (get compound-extents canonical-extent)]
+                   ;; Equal pure extent expressions are one SSA value. Besides avoiding
+                   ;; redundant scalar work, this exposes equal launch geometry to the
+                   ;; general horizontal-fusion rule (for example two same-shaped views).
+                   (update state :normalized conj
+                           [symbol (replace-parallel-extent expression extent-id)])
+                   (let [extent-id (with-meta
+                                     (clojure.core/symbol (str "rstr_extent_" ordinal))
+                                     {:tag 'long :raster.type/tag 'long})]
+                     (-> state
+                         (assoc-in [:compound-extents canonical-extent] extent-id)
+                         (update :normalized into
+                                 [[extent-id canonical-extent]
+                                  [symbol (replace-parallel-extent expression extent-id)]]))))
 
                  :else
-                 [[symbol expression]])))
-           (range) pairs)]
+                 (update state :normalized conj [symbol expression]))))
+           {:normalized [] :compound-extents {}}
+           (map-indexed vector pairs))]
       (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
     source))
 
@@ -596,7 +661,7 @@
   [descriptions]
   (reduce set/union #{}
           (map #(if (contains? #{:map :scatter :stencil :reduce :segmented-reduce
-                                 :product-reduce :scan} (:kind %))
+                                 :product-reduce :segmented-fold-map :scan} (:kind %))
                   (:outputs %) #{})
                descriptions)))
 
@@ -625,6 +690,10 @@
                                      (seq (:result-components description))
                                      (every? (comp symbol? :destination)
                                              (:result-storage description)))
+                :segmented-fold-map
+                (and (seq (:segment-axes description)) (seq (:folds description))
+                     (every? (comp symbol? :destination)
+                             (:result-storage description)))
                 :scan (symbol? (:primary-out description))
                 false))
             descriptions)))
@@ -809,6 +878,43 @@
                  (dialect/emit-locals combine-locals)
                  (:results combine-region))))))
 
+(defn- segmented-fold-map-equation
+  [{:keys [id segment-axes index extent folds map-results inputs scalars results
+           result-dtypes]}]
+  (let [accumulator-set (set (map :accumulator folds))
+        stable (vec (sort-by pr-str inputs))
+        ;; Accumulator names are lexical across the complete ordered fold chain,
+        ;; never implicit external captures. Removing every accumulator here makes
+        ;; a reference to a later fold remain unbound and lets dialect validation
+        ;; reject it instead of silently changing its meaning into a scalar input.
+        captures (vec (sort-by pr-str
+                               (remove accumulator-set
+                                       (distinct (concat stable scalars)))))
+        capture-parameters (capture-symbols (count captures))
+        substitutions (zipmap captures capture-parameters)
+        accumulators (mapv :accumulator folds)
+        fold-forms
+        (mapv (fn [ordinal {:keys [accumulator identity dtype extent step]}]
+                (list 'fold
+                      {:accumulator accumulator :identity identity :dtype dtype
+                       :extent extent :association :ordered}
+                      (dialect/lambda-form
+                       (vec (concat [accumulator] (subvec accumulators 0 ordinal)
+                                    capture-parameters))
+                       [(util/subst-syms substitutions step)])))
+              (range) folds)
+        map-lambda
+        (dialect/lambda-form
+         (vec (concat accumulators capture-parameters))
+         (mapv #(util/subst-syms substitutions %) map-results))]
+    (list '= id results
+          (list 'segmented-fold-map
+                {:segment-axes segment-axes :index index :extent extent
+                 :association :ordered :dtypes result-dtypes
+                 :attributes {:stable-array-captures stable
+                              :source-operation :raster.par/segmented-fold-map!}}
+                [] captures fold-forms map-lambda))))
+
 (defn- scan-equation
   [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
   (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
@@ -863,12 +969,14 @@
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
         operations (filter #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
-                                         :product-reduce :scan} (:kind %)) descriptions)
+                                         :product-reduce :segmented-fold-map :scan} (:kind %))
+                           descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter :stencil) (:results %)
                                               :scan [(:sym %)]
                                               :segmented-reduce (:results %)
                                               :product-reduce (:results %)
+                                              :segmented-fold-map (:results %)
                                               (:outputs %))
                                            operations))
         terminal-operation-definitions
@@ -877,6 +985,7 @@
                         :scan [(:sym %)]
                         :segmented-reduce (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
+                        :segmented-fold-map (if (:effect-only? %) [] (:results %))
                         (:outputs %))
                      operations))
         scalar-definitions
@@ -932,6 +1041,20 @@
         {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
         extent (:extent attributes)
         dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
+        dimension-value
+        (fn [id]
+          ;; A shape dimension is integral, but its representation is an ABI fact:
+          ;; GPU launch/scalar parameters are commonly :int while JVM-derived extents
+          ;; may be :long.  Preserve the already-known or declared scalar contract and
+          ;; use :long only when no upstream type information exists.
+          (or (get known-values id)
+              (when-let [declared (declared-type scalar-types id)]
+                (tensor-value declared []))
+              (when-let [declared (and (symbol? id)
+                                       (dtype/dtype-for-scalar-tag
+                                        (types/sym-type-tag id)))]
+                (tensor-value declared []))
+              (tensor-value :long [])))
         stable (set (get-in attributes [:attributes :stable-array-captures]))
         result-dtypes (case kind
                         scalar (:dtypes attributes)
@@ -940,10 +1063,11 @@
                         segmented-reduce (:dtypes attributes)
                         product-reduce (mapv #((:dtypes attributes) %)
                                              (:result-components attributes))
+                        segmented-fold-map (:dtypes attributes)
                         scan (:dtypes attributes)
                         (map scatter) (map #(value-dtype % default-dtype array-types) results))]
     (merge
-     (into {} (map (fn [id] [id (tensor-value :long [])])) dimension-ids)
+     (into {} (map (fn [id] [id (dimension-value id)])) dimension-ids)
      (into {} (map (fn [id] [id (tensor-value (value-dtype id default-dtype array-types)
                                               (dialect/extent-shape extent))]) arrays))
      (if (= 'scalar kind)
@@ -958,7 +1082,7 @@
                           [id value]))) captures)
        (into {} (map (fn [id]
                        [id (or (when (contains? dimension-ids id)
-                                 (tensor-value :long []))
+                                 (dimension-value id))
                                (get known-values id)
                                (if (or (contains? stable id)
                                        (contains? array-types id)
@@ -978,6 +1102,8 @@
                                          (dialect/segmented-reduce-result-shape attributes)
                                          product-reduce
                                          (dialect/segmented-reduce-result-shape attributes)
+                                         segmented-fold-map
+                                         (dialect/segmented-fold-map-result-shape attributes)
                                          scan (dialect/scan-result-shape attributes)
                                          scatter [(list 'unknown-dimension id)]
                                          (dialect/extent-shape extent)))])
@@ -1016,13 +1142,15 @@
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
               (filterv #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
-                                     :product-reduce :scan} (:kind %)) descriptions)
+                                     :product-reduce :segmented-fold-map :scan} (:kind %))
+                       descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :scatter (scatter-equation %)
                                                :stencil (stencil-equation %)
                                                :reduce (reduce-equation %)
                                                :segmented-reduce (segmented-reduce-equation %)
                                                :product-reduce (product-reduce-equation %)
+                                               :segmented-fold-map (segmented-fold-map-equation %)
                                                :scan (scan-equation %))
                                         operation-descriptions)
               outputs (terminal-results descriptions body)
@@ -1040,7 +1168,7 @@
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
                           (:map :scatter :stencil :reduce :segmented-reduce
-                           :product-reduce :scan)
+                           :product-reduce :segmented-fold-map :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
@@ -1050,6 +1178,8 @@
                                         :reduce (reduce-equation description)
                                         :segmented-reduce (segmented-reduce-equation description)
                                         :product-reduce (product-reduce-equation description)
+                                        :segmented-fold-map
+                                        (segmented-fold-map-equation description)
                                         :scan (scan-equation description)))
                               (update :equation-descriptions conj description))))
                       {:equations [] :equation-descriptions [] :scalar-dtypes {}}

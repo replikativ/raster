@@ -163,6 +163,39 @@
     (with-meta form {:raster.type/elem-type
                      ((:dtypes attributes) (first result-components))})))
 
+(defn segmented-fold-map-form
+  "Spell one validated ordered fold-map in Raster's interpreted host vocabulary."
+  [program equation]
+  (let [program (dialect/validate! program)
+        [_ equation-id results] equation
+        {:keys [kind attributes captures folds map-lambda]}
+        (dialect/operation-parts equation)
+        physical-results (dialect/physical-results program equation)
+        map-region (dialect/lambda-parts map-lambda)
+        accumulators (mapv #(get-in % [:attributes :accumulator]) folds)
+        capture-parameters (vec (drop (count accumulators) (:parameters map-region)))
+        substitutions (zipmap capture-parameters captures)
+        _ (when-not (and (= 'segmented-fold-map kind)
+                         (= (count results) (count physical-results)
+                            (count (:body-results map-region))))
+            (throw (ex-info "fold-map projection requires aligned logical and physical results"
+                            {:reason :typed-soac-segmented-fold-map-projection
+                             :equation equation-id :kind kind :results results
+                             :physical-results physical-results})))
+        source-folds
+        (mapv (fn [{:keys [attributes lambda]}]
+                (let [{:keys [body-results]} (dialect/lambda-parts lambda)]
+                  [(:accumulator attributes) (:identity attributes) (:dtype attributes)
+                   (:extent attributes)
+                   (util/subst-syms substitutions (first body-results))]))
+              folds)
+        form (list 'raster.par/segmented-fold-map!
+                   physical-results (:segment-axes attributes)
+                   (:index attributes) (:extent attributes) source-folds
+                   (mapv #(util/subst-syms substitutions %)
+                         (:body-results map-region)))]
+    (with-meta form {:raster.type/elem-type (first (:dtypes attributes))})))
+
 (defn stencil-form
   "Spell one validated stencil equation in Raster's interpreted host vocabulary."
   [program equation]

@@ -69,6 +69,20 @@
             cast-fn      ;; scalar result cast
             aliasing])   ;; :no-write-alias — neighborhood inputs must not alias destination
 
+(defrecord SegFoldMap
+           [id           ;; equation identity
+            space        ;; parallel segment space; one work item owns one segment
+            index        ;; ordered fold/final-map index symbol
+            extent       ;; complete final-map width
+            folds        ;; ordered [{:accumulator :identity :dtype :extent :step} ...]
+            map-results  ;; pure final values aligned with outputs
+            inputs       ;; stable whole-tensor reads
+            outputs      ;; ordered caller-owned dense destinations, aligned with map results
+            scalars      ;; extent/index scalar parameters
+            grid         ;; portable one-work-item-per-segment launch plan
+            dtypes       ;; final output dtypes
+            aliasing])   ;; :no-write-alias — stable reads are distinct from destinations
+
 (defrecord SegRed
            [id          ;; int
             space       ;; SegSpace
@@ -122,6 +136,7 @@
   (and x
        (contains? #{"raster.compiler.ir.segop.SegMap"
                     "raster.compiler.ir.segop.SegStencil"
+                    "raster.compiler.ir.segop.SegFoldMap"
                     "raster.compiler.ir.segop.SegRed"
                     "raster.compiler.ir.segop.SegScan"}
                   (.getName (class x)))))
@@ -146,7 +161,7 @@
   [operation]
   (if (instance? SegContract operation)
     #{(get-in operation [:facts :out])}
-    (or (:outputs operation) #{})))
+    (set (or (:outputs operation) #{}))))
 
 (defn operation-scalars
   "Scalar shape operands of a scheduled operation.

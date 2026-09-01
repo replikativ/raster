@@ -74,6 +74,20 @@
                                 :element-lambda element-lambda
                                 :combine-lambda combine-lambda}))))
 
+(def ^:private segmented-fold-map-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (segmented-fold-map ?attributes [??arrays] [??captures]
+                                              [??folds] ?map-lambda))
+                      (success {:kind :segmented-fold-map
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :folds folds
+                                :map-lambda map-lambda}))))
+
 (def ^:private scatter-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -146,10 +160,11 @@
                     (reduce-equation-rule equation)
                     (segmented-reduce-equation-rule equation)
                     (product-reduce-equation-rule equation)
+                    (segmented-fold-map-equation-rule equation)
                     (scan-equation-rule equation)])]
-    (let [{:keys [lambda element-lambda]} (dialect/operation-parts equation)]
+    (let [{:keys [lambda element-lambda map-lambda]} (dialect/operation-parts equation)]
       (merge (dissoc matched :local-definitions)
-             (dialect/lambda-parts (or lambda element-lambda))))))
+             (dialect/lambda-parts (or lambda element-lambda map-lambda))))))
 
 (defn- equation-references
   [equation]
@@ -246,6 +261,72 @@
          ;; Alias-aware fusion can be added once legality is proved. Until then, equation results
          ;; are treated as fresh SSA values and any explicit alias contract declines fusion.
          (empty? (:aliases facts)))))
+
+(declare remove-equation-fact)
+
+(defn- horizontal-boundary
+  "Return the proven write boundary of a horizontally fusible map, or nil.
+
+   Pure SSA maps have an empty boundary. Materialized maps are also safe when
+   every result has one distinct, dense unique-write destination. This is the
+   alias-aware case produced by buffer fusion; it must remain explicit because
+   combining two such maps combines their effects rather than erasing them."
+  [program info]
+  (let [equation-facts (get-in (dialect/facts program) [:equations (:id info)])
+        effects (:effects equation-facts)
+        aliases (:aliases equation-facts)
+        storage (vec (get-in equation-facts [:attributes :result-storage]))
+        destinations (mapv :destination storage)
+        expected-aliases (zipmap (:results info) destinations)]
+    (cond
+      (and (empty? effects) (empty? aliases) (empty? storage))
+      {:storage [] :destinations #{} :host-bindings {}}
+
+      (and (= #{:memory/write} effects)
+           (= (count (:results info)) (count (:body-results info)) (count storage))
+           (every? #(and (= :write (:access %))
+                         (contains? #{:buffer :effect} (:host-return %))
+                         (symbol? (:destination %)))
+                   storage)
+           (= (count destinations) (count (distinct destinations)))
+           (= expected-aliases aliases))
+      (let [saved (get-in equation-facts [:attributes :host-bindings])
+            singular (get-in equation-facts [:attributes :host-binding])
+            buffer-results (map first
+                                (filter (fn [[_ result-storage]]
+                                          (= :buffer (:host-return result-storage)))
+                                        (map vector (:results info) storage)))]
+        {:storage storage
+         :destinations (set destinations)
+         :host-bindings
+         (or saved
+             (when (seq buffer-results)
+               (into {}
+                     (map-indexed (fn [index result]
+                                    [result (if (zero? index) singular result)]))
+                     buffer-results))
+             {})})
+
+      :else nil)))
+
+(defn- merge-horizontal-facts
+  [facts left right left-boundary right-boundary]
+  (let [facts (remove-equation-fact facts (:id right) (:id left) :horizontal-map)
+        left-facts (get-in facts [:equations (:id left)])
+        storage (vec (concat (:storage left-boundary) (:storage right-boundary)))
+        host-bindings (merge (:host-bindings left-boundary)
+                             (:host-bindings right-boundary))
+        aliases (merge (zipmap (:results left) (map :destination (:storage left-boundary)))
+                       (zipmap (:results right) (map :destination (:storage right-boundary))))
+        effects (if (seq storage) #{:memory/write} #{})]
+    (-> facts
+        (assoc-in [:equations (:id left) :effects] effects)
+        (assoc-in [:equations (:id left) :aliases] aliases)
+        (assoc-in [:equations (:id left) :attributes]
+                  (cond-> (:attributes left-facts)
+                    (seq storage) (assoc :result-storage storage
+                                         :host-bindings host-bindings)
+                    (empty? storage) (dissoc :result-storage :host-binding :host-bindings))))))
 
 (defn- value-scalar-dtype
   "Return the canonical scalar dtype carried by one logical tensor value, or nil.
@@ -677,28 +758,37 @@
            right-index (range (inc left-index) (count infos))
            :let [left (nth infos left-index)
                  right (nth infos right-index)
+                 left-boundary (horizontal-boundary program left)
+                 right-boundary (horizontal-boundary program right)
                  left-results (set (:results left))
                  right-results (set (:results right))
                  left-uses (set (concat (:arrays left) (:captures left)))
                  right-uses (set (concat (:arrays right) (:captures right)
                                          [(:extent (:attributes right))]))]
            :when (= :map (:kind left) (:kind right))
+           :when left-boundary
+           :when right-boundary
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))
            :when (empty? (set/intersection left-results right-uses))
            :when (empty? (set/intersection right-results left-uses))
+           :when (empty? (set/intersection (:destinations left-boundary)
+                                           (:destinations right-boundary)))
+           :when (empty? (set/intersection (:destinations left-boundary) right-uses))
+           :when (empty? (set/intersection (:destinations right-boundary) left-uses))
            ;; Moving the right equation to the left's position must not move it before an
            ;; intervening producer. Program inputs have no producer index and are always ready.
            :when (every? (fn [value]
                            (let [index (get producer-index value)]
                              (or (nil? index) (< index left-index))))
                          right-uses)
-           :when (fusible-equation? program (:id left))
-           :when (fusible-equation? program (:id right))]
-       {:left-index left-index :right-index right-index :left left :right right}))))
+           ]
+       {:left-index left-index :right-index right-index :left left :right right
+        :left-boundary left-boundary :right-boundary right-boundary}))))
 
 (defn- fuse-horizontal-once
   [program]
-  (when-let [{:keys [left-index right-index left right]} (horizontal-candidate program)]
+  (when-let [{:keys [left-index right-index left right left-boundary right-boundary]}
+             (horizontal-candidate program)]
     (let [left (freshen-parameters left "left")
           right (freshen-parameters right "right")
           left-parameters (parameter-parts left)
@@ -738,8 +828,8 @@
                         (->> (keep-indexed (fn [index equation]
                                              (when-not (= index right-index) equation)))
                              vec))
-          facts (remove-equation-fact (dialect/facts program) (:id right) (:id left)
-                                      :horizontal-map)]
+          facts (merge-horizontal-facts (dialect/facts program) left right
+                                        left-boundary right-boundary)]
       (rebuild-boundary program facts equations))))
 
 (defn- placement-key

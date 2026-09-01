@@ -14,7 +14,9 @@
   (testing "Question mark to _p"
     (is (= "nil_p" (ce/c-symbol 'nil?))))
   (testing "Combined"
-    (is (= "has_value_p" (ce/c-symbol 'has-value?)))))
+    (is (= "has_value_p" (ce/c-symbol 'has-value?))))
+  (testing "Unicode alpha-renamed binders are portable C identifiers"
+    (is (= "y__u03b1__42" (ce/c-symbol 'y_α_42)))))
 
 (deftest shared-emit-expr-test
   (testing "Number literals"

@@ -8,6 +8,7 @@
    The raster context pre-registers raster.numeric and raster.math vars
    as :pure so beichte doesn't need to analyze their source each time."
   (:require [beichte.core :as b]
+            [clojure.walk :as walk]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
@@ -125,6 +126,23 @@
   [v]
   (b/analyze-var v @raster-context))
 
+(defn- semantic-calls
+  "Restore walker-devirtualized calls to the source-level operation recorded in
+   their metadata before handing the expression to Beichte.  `.invk` is Raster
+   dispatch IR, not a Clojure call Beichte can resolve; the carried
+   :raster.op/original identity is the authoritative semantic seam.  Unknown
+   `.invk` forms deliberately remain unchanged and therefore classify
+   conservatively."
+  [expr]
+  (walk/postwalk
+   (fn [node]
+     (if (and (seq? node) (= '.invk (first node)))
+       (if-let [operation (descriptor/semantic-op node)]
+         (with-meta (apply list operation (descriptor/call-args node)) (meta node))
+         node)
+       node))
+   expr))
+
 (defn descriptor
   "Return the effect descriptor for a compiler IR expression.
 
@@ -137,8 +155,9 @@
   (if (not (seq? expr))
     {:effect :pure :flags #{}}
     (try
-      (let [locals (collect-locals expr)
-            result (b/analyze-full expr @raster-context locals)]
+      (let [semantic-expr (semantic-calls expr)
+            locals (collect-locals semantic-expr)
+            result (b/analyze-full semantic-expr @raster-context locals)]
         (if (map? result)
           (update result :flags #(or % #{}))
           {:effect (or result :io) :flags #{}}))

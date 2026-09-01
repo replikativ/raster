@@ -208,6 +208,14 @@
                resolved (if (and (symbol? head) (namespace head))
                           (resolve-aliased-symbol head (:source-ns ctx))
                           head)]
+           (= 'raster.par/segmented-fold-map! resolved)))
+    :par-segmented-fold-map
+
+    (and (seq? form)
+         (let [head (first form)
+               resolved (if (and (symbol? head) (namespace head))
+                          (resolve-aliased-symbol head (:source-ns ctx))
+                          head)]
            (= 'raster.par/scan resolved)))
     :par-scan
 
@@ -1011,6 +1019,43 @@
           (vec walked-combine-bindings)
           (mapv #(walk % combine-result-env) combine-results)
           algebra)))
+
+(defmethod walk-form :par-segmented-fold-map
+  [form ctx]
+  (let [[_ outputs segment-axes idx-sym map-extent folds map-results] form
+        dtype-tag {:float 'float :double 'double :int 'int :long 'long :byte 'byte}
+        index-env (reduce (fn [env [segment _]] (ctx-assoc-type env segment 'long))
+                          (ctx-assoc-type ctx idx-sym 'long)
+                          segment-axes)
+        [fold-env walked-folds]
+        (reduce (fn [[env result] [acc identity component-dtype extent step]]
+                  (let [walked-identity (walk identity env)
+                        tag (or (get dtype-tag component-dtype)
+                                (when (= :element component-dtype)
+                                  (get dtype-tag (:element-dtype ctx)))
+                                (inf/hint-tag acc)
+                                (inf/infer-arg-tag walked-identity (:type-env env)))
+                        fold-ctx (cond-> env tag (ctx-assoc-type acc tag))
+                        walked-step (walk step fold-ctx)]
+                    [(cond-> env tag (ctx-assoc-type acc tag))
+                     (conj result [acc walked-identity component-dtype
+                                   (walk extent env) walked-step])]))
+                [index-env []] folds)
+        hinted-outputs
+        (mapv (fn [out]
+                (if-let [tag (and (symbol? out) (ctx-get-tag ctx out))]
+                  (stamp-type-meta out tag)
+                  out))
+              outputs)
+        result (list 'raster.par/segmented-fold-map!
+                     hinted-outputs
+                     (mapv (fn [[segment bound]] [segment (walk bound ctx)]) segment-axes)
+                     idx-sym (walk map-extent ctx) (vec walked-folds)
+                     (mapv #(walk % fold-env) map-results))
+        element-dtype (:element-dtype ctx)]
+    (if element-dtype
+      (with-meta result {:raster.type/elem-type element-dtype})
+      result)))
 
 (defmethod walk-form :par-scan [form ctx]
   (let [[_ out-sym acc-sym init-expr i-sym bound-expr cast-fn body-expr] form
