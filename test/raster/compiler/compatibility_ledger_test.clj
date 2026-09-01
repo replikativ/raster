@@ -73,6 +73,10 @@
              :heat-rhs-1d-jvm}
            (set (keys workloads))))
     (doseq [[id expected] workloads]
-      (is (= expected (signature (compile-workload id)))
-          (str "compiler compatibility changed for " id
-               "; improve the ledger downward or explain the new debt")))))
+      (let [report (compile-workload id)]
+        (is (= expected (signature report))
+            (str "compiler compatibility changed for " id
+                 "; improve the ledger downward or explain the new debt"))
+        (when (= :heat-rhs-1d-jvm id)
+          (is (= 1 (get-in report [:pass-stats :backend-applied-stats :simd-stencils]))
+              "the scientific stencil must consume its scheduled SegStencil exactly once"))))))

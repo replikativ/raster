@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.ode.pde :as pde]
             [raster.ode.core :as ode]
+            [raster.compiler.pipeline :as pipeline]
             [raster.arrays :refer [aget aset alength aclone]]))
 
 ;; ================================================================
@@ -27,6 +28,27 @@
       (is (< (Math/abs (- (aget du 1) 1.0)) 1e-10))
       ;; du[3] = 1*(1-0+0)/1 = 1
       (is (< (Math/abs (- (aget du 3) 1.0)) 1e-10)))))
+
+(deftest compiled-heat-rhs-1d-uses-the-scheduled-stencil
+  (let [compiled (pipeline/compile-aot #'pde/heat-rhs-1d! :dtype :double)]
+    (doseq [n [0 1 2 3 11 19]]
+      (testing (str "domain size " n)
+        (let [u (double-array (map #(+ (* 0.25 % %) (Math/sin (double %)))
+                                   (range n)))
+              original (vec u)
+              du (double-array (repeat n Double/NaN))
+              expected (vec (for [i (range n)]
+                              (if (or (zero? i) (= i (dec n)))
+                                0.0
+                                (* 0.75 1.25
+                                   (+ (original (dec i))
+                                      (* -2.0 (original i))
+                                      (original (inc i)))))))]
+          (compiled du u 0.75 1.25)
+          (is (= original (vec u)) "the stable neighborhood input is not modified")
+          (is (every? true?
+                      (map #(<= (Math/abs (- (double %1) (double %2))) 1.0e-12)
+                           expected (vec du)))))))))
 
 (deftest heat-1d-convergence-test
   (testing "1D heat equation convergence (Gaussian IC, error decreases with refinement)"

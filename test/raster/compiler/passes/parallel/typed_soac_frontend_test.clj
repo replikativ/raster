@@ -312,6 +312,44 @@
         (is (= :typed-soac-product-reduce-combine-closure
                (:reason (ex-data exception))))))))
 
+(deftest boundary-stencil-is-a-direct-typed-scheduled-operation
+  (let [source
+        '(let* [result
+                (raster.par/stencil!
+                 du [u] 1 :dirichlet double i n
+                 (* alpha inv-dx2
+                    (+ (clojure.core/aget u (clojure.core/- i 1))
+                       (* -2.0 (clojure.core/aget u i))
+                       (clojure.core/aget u (clojure.core/+ i 1)))))]
+               result)
+        options {:dtype :double
+                 :array-types {'du :double 'u :double}
+                 :scalar-types {'n :long 'alpha :double 'inv-dx2 :double}}
+        program (frontend/form->program source options)
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        routed (route/attempt source :double (:array-types options)
+                              {:scalar-types (:scalar-types options)})
+        scheduled
+        ((requiring-resolve
+          'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+         (:program routed) {:target-device :cpu:0 :dtype :double})
+        stencil (-> scheduled :form :equations first :operations first)]
+    (is (= 'stencil (:kind operation)))
+    (is (= {:radius 1 :boundary :dirichlet :dtype :double}
+           (select-keys (assoc (:attributes operation)
+                               :dtype (first (get-in operation [:attributes :dtypes])))
+                        [:radius :boundary :dtype])))
+    (is (= '[u] (get-in operation [:attributes :attributes :stable-array-captures])))
+    (is (= ['du] (dialect/physical-results program equation)))
+    (is (= :analyzed-source (get-in routed [:stats :front-end])))
+    (is (instance? raster.compiler.ir.segop.SegStencil stencil))
+    (is (= #{'u} (:inputs stencil)))
+    (is (= #{'du} (:outputs stencil)))
+    (is (= #{'alpha 'inv-dx2} (:scalars stencil)))
+    (is (= :no-write-alias (:aliasing stencil)))
+    (is (= :typed-soac (:algorithm-dialect stencil)))))
+
 (deftest explicit-contraction-result-transform-stays-in-typed-soac
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/+ acc (clojure.core/aget bias j))

@@ -50,9 +50,10 @@
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
   (the typed-dispatch system already knows these — we read them instead of letting the emitter
-  guess from parameter names). Scalar params: long/int→:int, double/float→:float. Array params:
-  the tag's element dtype, with float-family (float/double) mapped to the KERNEL dtype (a single-
-  precision kernel reads float buffers regardless of a parametric (All [T]) param's default).
+  guess from parameter names). Scalar params: long/int→:int, floating scalars specialize to the
+  selected kernel dtype. Array params: the tag's element dtype, with float-family (float/double)
+  mapped to the KERNEL dtype (a single-precision kernel reads float buffers regardless of a
+  parametric (All [T]) param's default).
   Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
   opencl-pass reads. ONE derivation, both compile paths."
   [params tags dtype]
@@ -60,7 +61,7 @@
     {:scalar-types (into {} (keep (fn [[p t]]
                                     (case (dtype/dtype-for-scalar-tag t)
                                       (:long :int) [p :int]
-                                      (:double :float) [p :float]
+                                      (:double :float) [p dtype]
                                       nil))
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]
@@ -646,14 +647,24 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-stencil! form))
-                (let [kernel (legacy/generate-par-stencil-kernel form
-                                                                 :dtype dtype :device-id device-id
-                                                                 :scalar-types top-scalar-types)
-                      k (register-kernel! kernel :ze-maps)
-                      {:keys [out]} (par/extract-par-stencil-info form)]
-                  (list 'raster.gpu.ze-runtime/invoke-registered-kernel
-                        (:kernel-name k) (vec (:array-params k))
-                        out (vec (:scalar-params k)) bound))))
+                (let [scheduled (take-bound-segop
+                                 stats :segstencil
+                                 #(and (instance? raster.compiler.ir.segop.SegStencil %)
+                                       (= :typed-soac (:algorithm-dialect %))))]
+                  (if scheduled
+                    (let [kernel (segop-cl/generate-segstencil-kernel
+                                  scheduled :scalar-types top-scalar-types
+                                  :array-types top-array-types)
+                          k (register-kernel! kernel :ze-maps)]
+                      (emit-map-invocation k device-id))
+                    (let [kernel (legacy/generate-par-stencil-kernel
+                                  form :dtype dtype :device-id device-id
+                                  :scalar-types top-scalar-types)
+                          k (register-kernel! kernel :ze-maps)
+                          {:keys [out]} (par/extract-par-stencil-info form)]
+                      (list 'raster.gpu.ze-runtime/invoke-registered-kernel
+                            (:kernel-name k) (vec (:array-params k))
+                            out (vec (:scalar-params k)) bound))))))
 
             ;; par/scatter!
             (par/par-scatter-form? form)

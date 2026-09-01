@@ -162,3 +162,30 @@
               (:algebra attributes))]
     (with-meta form {:raster.type/elem-type
                      ((:dtypes attributes) (first result-components))})))
+
+(defn stencil-form
+  "Spell one validated stencil equation in Raster's interpreted host vocabulary."
+  [program equation]
+  (let [program (dialect/validate! program)
+        [_ equation-id results] equation
+        {:keys [kind attributes arrays captures lambda]} (dialect/operation-parts equation)
+        physical-results (dialect/physical-results program equation)
+        {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
+        substitutions (zipmap parameters captures)
+        result-dtype (first (:dtypes attributes))
+        cast (dtype/scalar-tag-for-dtype result-dtype)
+        body (util/subst-syms substitutions (first body-results))
+        body (if (and (seq? body) (= cast (first body)) (= 2 (count body)))
+               (second body)
+               body)
+        stable (vec (get-in attributes [:attributes :stable-array-captures]))
+        _ (when-not (and (= 'stencil kind) (empty? arrays) (empty? locals)
+                         (= 1 (count results)) (= 1 (count physical-results)))
+            (throw (ex-info "stencil projection requires one closed scalar result"
+                            {:reason :typed-soac-stencil-projection
+                             :equation equation-id :kind kind :results results
+                             :physical-results physical-results})))
+        form (list 'raster.par/stencil! (first physical-results) stable
+                   (:radius attributes) (:boundary attributes) cast
+                   (:index attributes) (:extent attributes) body)]
+    (with-meta form {:raster.type/elem-type result-dtype})))

@@ -206,6 +206,105 @@
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-soac-syntax (:reason (ex-data exception))))))))))
 
+(defn- stencil-program
+  []
+  (let [double-tensor (av/tensor {:dtype :double :shape '[n]})
+        scalar-double (av/tensor {:dtype :double :shape []})
+        storage [{:destination 'du :access :write :host-return :buffer}]
+        equation
+        (list '= 'stencil-0 '[result]
+              (list 'stencil
+                    {:index 'i :extent 'n :radius 1 :boundary :dirichlet
+                     :dtypes [:double]
+                     :attributes {:stable-array-captures '[u]}}
+                    [] '[alpha u]
+                    (dialect/lambda-form
+                     '[a input]
+                     '[(double (* a (+ (clojure.core/aget input (- i 1))
+                                       (* -2.0 (clojure.core/aget input i))
+                                       (clojure.core/aget input (+ i 1)))))])))
+        equation-facts (assoc (dialect/default-equation-facts)
+                              :effects #{:memory/write}
+                              :aliases '{result du}
+                              :attributes {:result-storage storage
+                                           :host-binding 'result})
+        facts (dialect/default-program-facts
+               {:values {'n extent 'u double-tensor 'du double-tensor
+                         'alpha scalar-double 'result double-tensor}
+                :inputs '[alpha n u]
+                :equations {'stencil-0 equation-facts}
+                :effects #{:memory/write}})]
+    (dialect/make facts [equation] '[result])))
+
+(deftest stencil-domain-and-storage-contracts-are-validated
+  (let [program (stencil-program)
+        equation (first (dialect/equations program))
+        [_ attributes arrays captures lambda] (nth equation 3)
+        facts (dialect/facts program)]
+    (is (= program (dialect/validate! program)))
+    (is (= '[du] (dialect/physical-results program equation)))
+    (is (= {:accumulators [] :elements [] :capture-parameters '[a input]}
+           (dialect/parameter-layout equation)))
+    (testing "radius and boundary policy are part of typed syntax"
+      (doseq [bad-attributes [(assoc attributes :radius 0)
+                              (assoc attributes :boundary :periodic)]]
+        (try
+          (dialect/make facts
+                        [(list '= 'stencil-0 '[result]
+                               (list 'stencil bad-attributes arrays captures lambda))]
+                        '[result])
+          (is false "unsupported stencil domains must fail syntax validation")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-syntax (:reason (ex-data exception))))))))
+    (testing "the materialized result dtype agrees with the stencil equation"
+      (try
+        (dialect/make
+         (assoc-in facts [:values 'result] (av/tensor {:dtype :float :shape '[n]}))
+         [equation] '[result])
+        (is false "a result dtype mismatch must fail at the TypedSOAC boundary")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-stencil-result-type (:reason (ex-data exception)))))))
+    (testing "shifted loads remain closed over explicit tensor captures"
+      (let [bad-lambda (dialect/lambda-form
+                        '[a input]
+                        '[(+ a (clojure.core/aget missing (- i 1)))])]
+        (try
+          (dialect/make facts
+                        [(list '= 'stencil-0 '[result]
+                               (list 'stencil attributes arrays captures bad-lambda))]
+                        '[result])
+          (is false "an unbound neighborhood array must not enter a scalar region")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-unbound-scalar (:reason (ex-data exception))))))))
+    (testing "every tensor load is affine and inside the declared radius"
+      (doseq [bad-index '[(+ i 2) (* i 1)]]
+        (let [bad-lambda (dialect/lambda-form
+                          '[a input]
+                          [(list '+ 'a (list 'clojure.core/aget 'input bad-index))])]
+          (try
+            (dialect/make facts
+                          [(list '= 'stencil-0 '[result]
+                                 (list 'stencil attributes arrays captures bad-lambda))]
+                          '[result])
+            (is false "an unproved neighborhood index must not reach scheduling")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :typed-soac-stencil-index (:reason (ex-data exception)))))))))
+    (testing "value remapping preserves the tensor/storage boundary and rejects collisions"
+      (let [remapped (dialect/remap-values
+                      program {'u [:argument :u] 'du [:storage :du]
+                               'result [:result :stencil]})
+            remapped-equation (first (dialect/equations remapped))]
+        (is (= [[:storage :du]]
+               (dialect/physical-results remapped remapped-equation)))
+        (is (= [[:argument :u]]
+               (get-in (dialect/operation-parts remapped-equation)
+                       [:attributes :attributes :stable-array-captures]))))
+      (try
+        (dialect/remap-values program {'u :same 'du :same})
+        (is false "two physical identities cannot collapse during remapping")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-remap-collision (:reason (ex-data exception)))))))))
+
 (deftest pure-scalar-shape-equations-are-ordered-typed-ssa
   (let [program
         (dialect/make

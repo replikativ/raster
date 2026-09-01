@@ -239,6 +239,15 @@
              (= 2 (count idx-expr))
              (= idx-sym (second idx-expr)))
         [arr nil]
+        ;; (- i offset) — affine neighborhood read to the left. Keep this in the
+        ;; shared scheduled SIMD analyzer; source-shaped stencil recognition is
+        ;; not an independent type/access-pattern truth.
+        (and (seq? idx-expr)
+             (contains? #{'- 'clojure.core/-} (first idx-expr))
+             (= 3 (count idx-expr))
+             (= idx-sym (descriptor/unwrap-int-cast (second idx-expr)))
+             (expr-free-of? (nth idx-expr 2) idx-sym))
+        [arr (list 'clojure.core/- 0 (nth idx-expr 2))]
         ;; (aget arr (+ base j)) — affine with base offset
         (seq? idx-expr)
         (when-let [base (extract-affine-base idx-expr idx-sym)]
@@ -312,7 +321,7 @@
          (simd-able? (nth expr 2) idx-sym)
          (simd-able? (nth expr 3) idx-sym))
     (and (seq? expr) (> (count expr) 3)
-         (contains? #{'+ '*} (first expr)))
+         (contains? #{'+ '* 'clojure.core/+ 'clojure.core/*} (first expr)))
     (every? #(simd-able? % idx-sym) (rest expr))
     (and (seq? expr) (contains? #{'let 'let*} (first expr)))
     (let [[_ bindings & body] expr

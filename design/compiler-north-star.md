@@ -133,6 +133,15 @@ bridge is introduced only when reuse requires it, so fusion does not duplicate s
 resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
 mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
 
+Boundary-aware scientific stencils now enter that same direct vertical as a distinct functional
+`stencil` equation. The equation keeps whole neighborhood tensors as stable captures, proves every
+load to be a constant affine offset within its declared radius, and separates the logical result
+from caller-owned output storage. It lowers mechanically to `SegStencil`; JVM SIMD consumes the
+scheduled value without reparsing source, while OpenCL emits a typed ordered ABI whose guarded
+Dirichlet branch dominates all neighborhood reads. The first SIMD schedule supports radius one;
+wider neighborhoods and multidimensional tiling remain schedule extensions, not new semantic
+operators or emitter-side pattern registries.
+
 The first architectural correction is therefore:
 
 > SOAC, scheduled kernel graph, and kernel IR must be first-class program values,

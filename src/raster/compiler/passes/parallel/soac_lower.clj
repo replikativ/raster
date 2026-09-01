@@ -120,6 +120,43 @@
                     :algorithm-equation equation-id)
             (lower-map node device-id :dtype result-dtype)))))
 
+(defn lower-typed-stencil
+  "Lower one validated boundary-aware TypedSOAC stencil to a scheduled SegStencil."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)
+        equation (first (soac-dialect/equations program))
+        [_ equation-id results] equation
+        {:keys [kind attributes arrays captures lambda]}
+        (soac-dialect/operation-parts equation)
+        {:keys [parameters locals body-results]} (soac-dialect/lambda-parts lambda)
+        facts (soac-dialect/facts program)
+        physical-results (soac-dialect/physical-results facts equation)
+        stable (set (get-in attributes [:attributes :stable-array-captures]))
+        result-dtype (or (first (:dtypes attributes)) dtype)
+        cast-fn (dtype/scalar-tag-for-dtype result-dtype)
+        substitutions (zipmap parameters captures)
+        body (util/subst-syms substitutions (first body-results))
+        body (if (and (seq? body) (= cast-fn (first body)) (= 2 (count body)))
+               (second body)
+               body)]
+    (when-not (and (= 'stencil kind) (= 1 (count (soac-dialect/equations program)))
+                   (= 1 (count results)) (= 1 (count physical-results))
+                   (empty? arrays) (empty? locals))
+      (throw (ex-info "typed stencil lowering requires one closed stencil equation"
+                      {:reason :typed-soac-stencil-subset :equation equation-id
+                       :kind kind :results results :physical-results physical-results})))
+    (let [bound (:extent attributes)
+          space (segop/make-seg-space (:index attributes) bound)
+          level (segop/->SegLevel :thread :virtual)
+          grid (phase-grid :map device-id bound result-dtype)]
+      [(assoc (segop/->SegStencil
+               equation-id space level body stable #{(first physical-results)}
+               (set/difference (set captures) stable) grid result-dtype
+               (first physical-results) (:radius attributes) (:boundary attributes) cast-fn
+               :no-write-alias)
+              :algorithm-dialect :typed-soac
+              :algorithm-equation equation-id)])))
+
 (defn lower-typed-scatter
   "Lower one unique-destination TypedSOAC scatter to an explicit-store SegMap.
 

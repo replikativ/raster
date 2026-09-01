@@ -89,6 +89,21 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private stencil-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (stencil ?attributes [??arrays] [??captures]
+                                   (lambda [??parameters]
+                                           (region [??local-definitions] [??body-results]))))
+                      (success {:kind :stencil
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :local-definitions local-definitions
+                                :body-results body-results}))))
+
 (def ^:private scalar-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -127,6 +142,7 @@
                    [(scalar-equation-rule equation)
                     (map-equation-rule equation)
                     (scatter-equation-rule equation)
+                    (stencil-equation-rule equation)
                     (reduce-equation-rule equation)
                     (segmented-reduce-equation-rule equation)
                     (product-reduce-equation-rule equation)

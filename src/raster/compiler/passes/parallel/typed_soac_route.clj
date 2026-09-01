@@ -202,6 +202,16 @@
          :site [:binding host-binding]
          :source source})
 
+      stencil
+      (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            source (projection/stencil-form program equation)]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding source]]
+         :site [:binding host-binding]
+         :source source})
+
       reduce
       (let [result (first results)
             accumulator (first (:accumulators attributes))
@@ -393,8 +403,8 @@
                (if resident-reductions?
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :scatter :reduce :segmented-reduce
-                                       :product-reduce :scan}
+           (if (not-any? #(contains? #{:map :scatter :stencil :reduce
+                                       :segmented-reduce :product-reduce :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

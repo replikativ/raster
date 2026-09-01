@@ -287,6 +287,28 @@
                 :elem-type elem-type}
                io)))
 
+    (par/par-stencil-form? expression)
+    (let [{:keys [out in-arrays radius boundary cast idx bound body elem-type]}
+          (par/extract-par-stencil-info expression)
+          io (extract-io body idx [out])
+          stencil-inputs (set/union (set in-arrays) (:inputs io))
+          result-dtype (or elem-type
+                           (dtype/dtype-for-scalar-tag cast)
+                           default-dtype)]
+      (when (and (symbol? out)
+                 (every? symbol? in-arrays)
+                 (integer? radius) (pos? radius)
+                 (= :dirichlet boundary)
+                 (empty? (par/collect-aset-arrays body)))
+        (merge {:kind :stencil :id id :sym symbol :results [symbol]
+                :index idx :extent bound :radius radius :boundary boundary
+                :casts [cast] :bodies [body] :inputs stencil-inputs
+                :outputs #{out} :result-dtype (dtype/canon result-dtype)
+                :result-storage [{:destination out :access :write
+                                  :host-return :buffer}]
+                :host-binding symbol}
+               (dissoc io :inputs :outputs))))
+
     (par/par-map2-form? expression)
     (let [{:keys [out1 out2 idx bound cast body1 body2 elem-type]}
           (par/extract-par-map2-info expression)]
@@ -452,6 +474,7 @@
     (par/par-reduce-form? expression) (nth expression 4)
     (or (par/par-scan-form? expression) (par/par-scan-exclusive-form? expression))
     (nth expression 5)
+    (par/par-stencil-form? expression) (nth expression 7)
     (par/par-map-void-form? expression) (nth expression 2)
     :else nil))
 
@@ -464,6 +487,7 @@
                    (par/par-reduce-form? expression) 4
                    (or (par/par-scan-form? expression)
                        (par/par-scan-exclusive-form? expression)) 5
+                   (par/par-stencil-form? expression) 7
                    (par/par-map-void-form? expression) 2)]
     (when position
       (with-meta (apply list (assoc (vec expression) position extent)) (meta expression)))))
@@ -543,7 +567,7 @@
                                                  expression representative)))
               (assoc-in [:scalar-representatives (:sym description)] representative)))
 
-        (:map :scatter :reduce :scan)
+        (:map :scatter :stencil :reduce :scan)
         (let [extent (descriptor/unwrap-int-cast (:extent description))
               array (alength-array extent)
               extent' (cond
@@ -552,7 +576,7 @@
                         :else extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
-            (contains? #{:map :scatter :scan} (:kind description'))
+            (contains? #{:map :scatter :stencil :scan} (:kind description'))
             (assoc-in [:extents (:sym description')] extent')))
 
         (update state :descriptions conj description)))
@@ -571,7 +595,7 @@
 (defn- physical-output-symbols
   [descriptions]
   (reduce set/union #{}
-          (map #(if (contains? #{:map :scatter :reduce :segmented-reduce
+          (map #(if (contains? #{:map :scatter :stencil :reduce :segmented-reduce
                                  :product-reduce :scan} (:kind %))
                   (:outputs %) #{})
                descriptions)))
@@ -591,6 +615,9 @@
                               (= :unique (:conflict description))
                               (every? (comp symbol? :destination)
                                       (:result-storage description)))
+                :stencil (and (= 1 (count (:result-storage description)))
+                              (symbol? (get-in description
+                                               [:result-storage 0 :destination])))
                 :reduce true
                 :segmented-reduce (and (seq (:segment-axes description))
                                        (symbol? (get-in description [:result-storage 0 :destination])))
@@ -682,6 +709,23 @@
                 arrays captures
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms writes)))))
+
+(defn- stencil-equation
+  [{:keys [id index extent radius boundary inputs scalars results result-dtype casts bodies]}]
+  (let [stable (vec (sort-by pr-str inputs))
+        captures (vec (sort-by pr-str (distinct (concat stable scalars))))
+        parameters (capture-symbols (count captures))
+        substitutions (zipmap captures parameters)
+        body (util/subst-syms substitutions (first bodies))
+        cast (first casts)]
+    (list '= id results
+          (list 'stencil
+                {:index index :extent extent :radius radius :boundary boundary
+                 :dtypes [result-dtype]
+                 :attributes {:stable-array-captures stable
+                              :source-operation :raster.par/stencil!}}
+                [] captures
+                (dialect/lambda-form parameters [(if cast (list cast body) body)])))))
 
 (defn- reduce-equation
   [{:keys [id extent inputs scalars product]}]
@@ -818,10 +862,10 @@
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
-        operations (filter #(contains? #{:map :scatter :reduce :segmented-reduce
+        operations (filter #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
                                          :product-reduce :scan} (:kind %)) descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
-                                              (:map :scatter) (:results %)
+                                              (:map :scatter :stencil) (:results %)
                                               :scan [(:sym %)]
                                               :segmented-reduce (:results %)
                                               :product-reduce (:results %)
@@ -829,7 +873,7 @@
                                            operations))
         terminal-operation-definitions
         (set (mapcat #(case (:kind %)
-                        (:map :scatter) (if (:effect-only? %) [] (:results %))
+                        (:map :scatter :stencil) (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
                         :segmented-reduce (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
@@ -891,6 +935,7 @@
         stable (set (get-in attributes [:attributes :stable-array-captures]))
         result-dtypes (case kind
                         scalar (:dtypes attributes)
+                        stencil (:dtypes attributes)
                         reduce (:dtypes attributes)
                         segmented-reduce (:dtypes attributes)
                         product-reduce (mapv #((:dtypes attributes) %)
@@ -970,10 +1015,11 @@
                  (seq descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
-              (filterv #(contains? #{:map :scatter :reduce :segmented-reduce
+              (filterv #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
                                      :product-reduce :scan} (:kind %)) descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :scatter (scatter-equation %)
+                                               :stencil (stencil-equation %)
                                                :reduce (reduce-equation %)
                                                :segmented-reduce (segmented-reduce-equation %)
                                                :product-reduce (product-reduce-equation %)
@@ -993,12 +1039,14 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :scatter :reduce :segmented-reduce :product-reduce :scan)
+                          (:map :scatter :stencil :reduce :segmented-reduce
+                           :product-reduce :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
                                         :map (map-equation description)
                                         :scatter (scatter-equation description)
+                                        :stencil (stencil-equation description)
                                         :reduce (reduce-equation description)
                                         :segmented-reduce (segmented-reduce-equation description)
                                         :product-reduce (product-reduce-equation description)
