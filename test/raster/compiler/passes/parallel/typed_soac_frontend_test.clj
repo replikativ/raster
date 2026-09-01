@@ -241,7 +241,7 @@
     (is (= 'segmented-reduce (:kind operation)))
     (is (= '[[i m] [j n]] (get-in operation [:attributes :segment-axes])))
     (is (= '[m n k] (dialect/operation-extents equation)))
-    (is (= [{:destination 'C :access :write :host-return :effect}]
+    (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 0 :attributes :result-storage])))
     (is (= '[m n] (:shape (get-in (dialect/facts program)
                                   [:values (first (nth equation 2))]))))
