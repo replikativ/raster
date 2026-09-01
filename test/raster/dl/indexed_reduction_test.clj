@@ -41,6 +41,8 @@
                                  [target (pipeline/compile-gpu-program
                                           #'ops/argmax-rows! target :dtype :float)]))
                           [:ocl:0 :ze:0])
+        report (pipeline/compile-report
+                #'ops/argmax-rows! :target-device :ocl:0 :dtype :float)
         descriptor (get descriptors :ocl:0)
         allocs (:allocs descriptor)
         steps (:steps descriptor)
@@ -60,6 +62,14 @@
       (is (= :segmented-workgroup-tree
              (get-in steps [0 :artifact :attributes :schedule :strategy]))))
     (testing "the typed product reduction is one resident scheduled step"
+      (is (= {:backend :opencl
+              :source-dialect :typed-soac
+              :typed-validated true
+              :declines []}
+             (:route report)))
+      (is (= 1 (get-in report [:lowering :typed-reused])))
+      (is (zero? (get-in report [:lowering :backend-relowered])))
+      (is (zero? (get-in report [:lowering :fallback])))
       (is (= [:map-void] (mapv :convention steps)))
       (is (= 1 (count steps)))
       (is (= ['values 'indices]

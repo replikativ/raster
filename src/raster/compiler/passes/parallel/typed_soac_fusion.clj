@@ -60,6 +60,20 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private product-reduce-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (product-reduce ?attributes [??arrays] [??captures]
+                                          ?element-lambda ?combine-lambda))
+                      (success {:kind :product-reduce
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :element-lambda element-lambda
+                                :combine-lambda combine-lambda}))))
+
 (def ^:private scatter-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -115,10 +129,11 @@
                     (scatter-equation-rule equation)
                     (reduce-equation-rule equation)
                     (segmented-reduce-equation-rule equation)
+                    (product-reduce-equation-rule equation)
                     (scan-equation-rule equation)])]
-    (let [lambda (:lambda (dialect/operation-parts equation))]
+    (let [{:keys [lambda element-lambda]} (dialect/operation-parts equation)]
       (merge (dissoc matched :local-definitions)
-             (dialect/lambda-parts lambda)))))
+             (dialect/lambda-parts (or lambda element-lambda))))))
 
 (defn- equation-references
   [equation]

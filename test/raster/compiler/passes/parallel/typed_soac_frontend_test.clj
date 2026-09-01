@@ -239,6 +239,79 @@
     (is (= :typed-soac (get-in (-> scheduled :form :equations first)
                                [:attributes :algorithm-dialect])))))
 
+(deftest product-reduction-keeps-discarded-components-out-of-ssa-results
+  (let [expression
+        '(raster.par/product-reduce!
+          [nil indices]
+          [[best-value -1.0e38 :float] [best-index 2147483647 :int]]
+          [[row nrows]] col width
+          []
+          [(clojure.core/aget values (clojure.core/+ (clojure.core/* row width) col))
+           (int col)]
+          [[left-value right-value] [left-index right-index]]
+          []
+          [(if (> right-value left-value) right-value left-value)
+           (if (> right-value left-value) right-index left-index)]
+          {:associative? true :commutative? true})
+        source (list 'let* ['effect expression] 'effect)
+        options {:dtype :float
+                 :array-types {'values :float 'indices :int}
+                 :scalar-types {'nrows :long 'width :long}}
+        program (frontend/form->program source options)
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        routed (route/attempt source :float (:array-types options)
+                              {:scalar-types (:scalar-types options)})
+        scheduled
+        ((requiring-resolve
+          'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+         (:program routed) {:target-device :ocl:0 :dtype :float})
+        product (-> scheduled :form :equations first :operations first)
+        remapped (dialect/remap-values program {'values [:binding 'values]})
+        remapped-operation (dialect/operation-parts
+                            (first (dialect/equations remapped)))]
+    (is (= 'product-reduce (:kind operation)))
+    (is (= [1] (get-in operation [:attributes :result-components])))
+    (is (= [:float :int] (get-in operation [:attributes :dtypes])))
+    (is (= 1 (count (nth equation 2)))
+        "the winning value remains an algebra component but is not a fake SSA output")
+    (is (= ['indices] (dialect/physical-results program equation)))
+    (is (= program (dialect/validate! program)))
+    (is (= :analyzed-source (get-in routed [:stats :front-end])))
+    (is (instance? raster.compiler.ir.segop.SegRed product))
+    (is (= :product (:phase product)))
+    (is (= [:float :int] (reduction/dtypes (:reduction product))))
+    (is (= #{'indices} (:outputs product)))
+    (is (= :typed-soac (:algorithm-dialect product)))
+    (is (some #{[:binding 'values]} (:captures remapped-operation)))
+    (is (= (:element-lambda operation) (:element-lambda remapped-operation)))
+    (is (= (:combine-lambda operation) (:combine-lambda remapped-operation)))
+    (is (= remapped (dialect/validate! remapped)))))
+
+(deftest product-reduction-combine-is-a-closed-scalar-region
+  (let [expression
+        '(raster.par/product-reduce!
+          [nil indices]
+          [[best-value -1.0e38 :float] [best-index 2147483647 :int]]
+          [[row nrows]] col width
+          []
+          [(clojure.core/aget values (clojure.core/+ (clojure.core/* row width) col))
+           (int col)]
+          [[left-value right-value] [left-index right-index]]
+          []
+          [row (if (> right-value left-value) right-index left-index)]
+          {:associative? true :commutative? true})]
+    (try
+      (frontend/form->program
+       (list 'let* ['effect expression] 'effect)
+       {:dtype :float
+        :array-types {'values :float 'indices :int}
+        :scalar-types {'nrows :long 'width :long}})
+      (is false "a segment-axis capture must not enter the binary combine algebra")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-soac-product-reduce-combine-closure
+               (:reason (ex-data exception))))))))
+
 (deftest explicit-contraction-result-transform-stays-in-typed-soac
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/+ acc (clojure.core/aget bias j))

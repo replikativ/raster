@@ -244,6 +244,42 @@
              (and (= 1 (count (:accumulators value)))
                   (result-transform? (:result-transform value)))))))
 
+(defn product-reduce-attributes?
+  "Attributes for an associative segmented product reduction.
+
+   `:result-components` aligns the equation's materialized result vector with component ordinals;
+   omitted ordinals participate in the algebra but require no output storage. The element and
+   combine regions remain explicit operation children rather than opaque attribute payloads."
+  [value]
+  (let [axes (:segment-axes value)
+        component-ids (:component-ids value)
+        component-count (count component-ids)
+        result-components (:result-components value)
+        indices (mapv first axes)]
+    (and (map-attributes? value)
+         (vector? axes) (seq axes)
+         (every? #(and (vector? %) (= 2 (count %))
+                       (symbol? (first %)) (extent? (second %)))
+                 axes)
+         (= (count indices) (count (distinct indices)))
+         (not (contains? (set indices) (:index value)))
+         (vector? component-ids) (pos? component-count)
+         (= component-count (count (distinct component-ids)))
+         (vector? (:accumulators value))
+         (= component-count (count (:accumulators value)))
+         (every? symbol? (:accumulators value))
+         (= component-count (count (distinct (:accumulators value))))
+         (vector? (:identities value))
+         (vector? (:dtypes value))
+         (= component-count (count (:identities value)) (count (:dtypes value)))
+         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
+                 (:dtypes value))
+         (vector? result-components) (seq result-components)
+         (= (count result-components) (count (distinct result-components)))
+         (every? #(and (integer? %) (<= 0 %) (< % component-count)) result-components)
+         (map? (:algebra value))
+         (true? (get-in value [:algebra :associative?])))))
+
 (defn scan-attributes?
   "Attributes for a certified scan dialect operation. The explicit mode is load-bearing because
    inclusive and exclusive scans have different observable result layouts."
@@ -293,6 +329,7 @@
              [xa scatter-attributes?]
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
+             [pra product-reduce-attributes?]
              [ca scan-attributes?]
              [dt keyword?]
              [facts program-facts?])
@@ -322,6 +359,8 @@
              (scatter ?xa [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (product-reduce ?pra [(?:* ?id:array)] [(?:* ?id:capture)]
+                             ?l:element ?l:combine)
              (scan ?ca [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
   (Equation [q :enforce]
@@ -365,7 +404,7 @@
    the parallel segment space followed by the innermost reduction extent."
   [equation]
   (let [{:keys [kind attributes]} (operation-parts equation)]
-    (if (= 'segmented-reduce kind)
+    (if (contains? #{'segmented-reduce 'product-reduce} kind)
       (conj (mapv second (:segment-axes attributes)) (:extent attributes))
       (if-let [extent (:extent attributes)] [extent] []))))
 
@@ -374,9 +413,17 @@
   [equation]
   (let [operation (nth equation 3)
         kind (first operation)]
-    (if (= 'scalar kind)
+    (cond
+      (= 'scalar kind)
       (let [[_ attributes captures lambda] operation]
         {:kind kind :attributes attributes :arrays [] :captures captures :lambda lambda})
+
+      (= 'product-reduce kind)
+      (let [[_ attributes arrays captures element-lambda combine-lambda] operation]
+        {:kind kind :attributes attributes :arrays arrays :captures captures
+         :element-lambda element-lambda :combine-lambda combine-lambda})
+
+      :else
       (let [[_ attributes arrays captures lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
 
@@ -451,8 +498,8 @@
 (defn parameter-layout
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]
-  (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
-        parameters (:parameters (lambda-parts lambda))
+  (let [{:keys [kind attributes arrays captures lambda element-lambda]} (operation-parts equation)
+        parameters (:parameters (lambda-parts (or lambda element-lambda)))
         accumulator-count (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
                             (count (:accumulators attributes)) 0)
         array-count (count arrays)
@@ -473,8 +520,11 @@
 (defn- validate-equation!
   [equation]
   (let [[_ equation-id results operation] equation
-        {:keys [kind attributes arrays captures lambda]} (operation-parts equation)
-        {:keys [parameters locals body-results]} (lambda-parts lambda)
+        {:keys [kind attributes arrays captures lambda element-lambda combine-lambda]}
+        (operation-parts equation)
+        product? (= 'product-reduce kind)
+        {:keys [parameters locals body-results]} (lambda-parts (or lambda element-lambda))
+        component-count (when product? (count (:component-ids attributes)))
         result-count (count results)]
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"
@@ -505,7 +555,8 @@
         (fail! :typed-soac-region-binders
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
-      (when (and (contains? #{'map 'scatter 'reduce 'segmented-reduce 'scan} kind)
+      (when (and (contains? #{'map 'scatter 'reduce 'segmented-reduce
+                              'product-reduce 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
                "a scalar-region local cannot shadow its operation index"
@@ -520,13 +571,14 @@
         (fail! :typed-soac-local-dtype
                "scalar-region locals require a supported JVM scalar dtype"
                {:equation equation-id :local local :dtype dtype})))
-    (when (and (seq locals) (not (contains? #{'map 'scatter} kind)))
+    (when (and (seq locals) (not (contains? #{'map 'scatter 'product-reduce} kind)))
       (fail! :typed-soac-region-operation
-             "typed local SSA is currently admitted only in map/scatter scalar regions"
+             "typed local SSA is not admitted in this operation's scalar region"
              {:equation equation-id :operation kind :locals locals}))
-    (when-not (= result-count (count body-results))
+    (when-not (= (if product? component-count result-count) (count body-results))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
-             {:equation equation-id :results result-count :body-results (count body-results)}))
+             {:equation equation-id :results result-count :components component-count
+              :body-results (count body-results)}))
     (let [expected-parameter-count (+ (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
                                         (count (:accumulators attributes))
                                         0)
@@ -541,9 +593,10 @@
                 :arrays arrays
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
-                          (contains? #{'map 'scatter 'reduce 'segmented-reduce 'scan} kind)
+                          (contains? #{'map 'scatter 'reduce 'segmented-reduce
+                                      'product-reduce 'scan} kind)
                           (conj (:index attributes))
-                          (= 'segmented-reduce kind)
+                          (contains? #{'segmented-reduce 'product-reduce} kind)
                           (into (map first (:segment-axes attributes))))
           final-bound
           (reduce (fn [bound {:keys [id init] :as local}]
@@ -632,6 +685,58 @@
               (fail! :typed-soac-result-transform-expression
                      "result-transform expressions may reference only their typed region boundary"
                      {:equation equation-id :unbound unbound :transform transform})))))
+
+      product-reduce
+      (let [result-components (:result-components attributes)
+            {combine-parameters :parameters
+             combine-locals :locals
+             combine-results :body-results}
+            (lambda-parts combine-lambda)]
+        (when (some write-form? body-results)
+          (fail! :typed-soac-product-reduce-element-write
+                 "product-reduce element results must be pure scalar values"
+                 {:equation equation-id :results body-results}))
+        (when-not (= result-count (count result-components))
+          (fail! :typed-soac-product-reduce-results
+                 "product-reduce results must align with materialized component ordinals"
+                 {:equation equation-id :results results
+                  :result-components result-components}))
+        (when-not (and (= (* 2 component-count) (count combine-parameters))
+                       (every? symbol? combine-parameters)
+                       (= (count combine-parameters) (count (distinct combine-parameters))))
+          (fail! :typed-soac-product-reduce-combine-parameters
+                 "product-reduce combine requires one distinct ordered left/right pair per component"
+                 {:equation equation-id :components component-count
+                  :parameters combine-parameters}))
+        (let [combine-bound
+              (loop [bound (set combine-parameters)
+                     [local & remaining] combine-locals]
+                (if-not local
+                  bound
+                  (let [{:keys [id dtype init]} local
+                        unbound (util/free-syms init bound)]
+                    (when-not (and (symbol? id) (keyword? dtype) (dtype/known? dtype)
+                                   (= dtype (dtype/canon dtype))
+                                   (:scalar-tag (dtype/info dtype)))
+                      (fail! :typed-soac-local-dtype
+                             "product-reduce combine locals require canonical scalar dtypes"
+                             {:equation equation-id :local local}))
+                    (when (or (contains? bound id) (seq unbound))
+                      (fail! :typed-soac-product-reduce-combine-local
+                             "combine locals may reference only component pairs and earlier locals"
+                             {:equation equation-id :local local :unbound unbound}))
+                    (recur (conj bound id) remaining))))]
+          (when-not (= component-count (count combine-results))
+            (fail! :typed-soac-product-reduce-combine-results
+                   "product-reduce combine result arity must equal component arity"
+                   {:equation equation-id :components component-count
+                    :results combine-results}))
+          (doseq [expression combine-results
+                  :let [unbound (util/free-syms expression combine-bound)]
+                  :when (seq unbound)]
+            (fail! :typed-soac-product-reduce-combine-closure
+                   "product-reduce combine must be a closed scalar binary operator"
+                   {:equation equation-id :expression expression :unbound unbound}))))
 
       scan
       (let [accumulators (:accumulators attributes)]
@@ -729,6 +834,20 @@
                      {:equation equation-id :id id :value value
                       :segment-axes (:segment-axes attributes) :dtype dtype})))))
 
+      product-reduce
+      (let [result-shape (segmented-reduce-result-shape attributes)
+            result-dtypes (mapv #((:dtypes attributes) %)
+                                (:result-components attributes))]
+        (doseq [[id dtype] (map vector results result-dtypes)]
+          (let [value (get values id)]
+            (when (and value
+                       (not (and (= :tensor (:kind value)) (= result-shape (:shape value))
+                                 (= dtype (:dtype value)))))
+              (fail! :typed-soac-product-reduce-result-type
+                     "product-reduce results must match their component dtype and segment space"
+                     {:equation equation-id :id id :value value
+                      :component-dtype dtype :segment-axes (:segment-axes attributes)})))))
+
       scan
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
         (let [value (get values id)]
@@ -749,9 +868,9 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter 'segmented-reduce} kind)
+      (when-not (contains? #{'map 'scatter 'segmented-reduce 'product-reduce} kind)
         (fail! :typed-soac-result-storage-operation
-               "physical result storage is valid only for map/scatter/segmented-reduce equations"
+               "physical result storage is valid only for writing tensor operations"
                {:equation equation-id :operation kind :storage storage}))
       (when-not (and (vector? storage)
                      (= (count results) (count storage))
@@ -918,13 +1037,14 @@
                           {} (:values source-facts))
         equation-forms
         (mapv (fn [[equals equation-id results :as equation]]
-                (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
+                (let [{:keys [kind attributes arrays captures lambda element-lambda combine-lambda]}
+                      (operation-parts equation)
                       attributes (cond-> attributes
                                    (seq (get-in attributes
                                                 [:attributes :stable-array-captures]))
                                    (update-in [:attributes :stable-array-captures]
                                               #(mapv rename %)))
-                      attributes (if (= 'segmented-reduce kind)
+                      attributes (if (contains? #{'segmented-reduce 'product-reduce} kind)
                                    (-> attributes
                                        (update :segment-axes
                                                #(mapv (fn [[index extent]]
@@ -939,11 +1059,20 @@
                                                     #(mapv (fn [scalar]
                                                              (update scalar :value rename)) %))))
                                    attributes)
-                      operation (if (= 'scalar kind)
+                      attributes (if (= 'scalar kind)
+                                   attributes
+                                   (update attributes :extent
+                                           #(if (value-id? %) (rename %) %)))
+                      operation (case kind
+                                  scalar
                                   (list kind attributes (mapv rename captures) lambda)
-                                  (list kind (update attributes :extent
-                                                     #(if (value-id? %) (rename %) %))
-                                        (mapv rename arrays) (mapv rename captures) lambda))]
+
+                                  product-reduce
+                                  (list kind attributes (mapv rename arrays)
+                                        (mapv rename captures) element-lambda combine-lambda)
+
+                                  (list kind attributes (mapv rename arrays)
+                                        (mapv rename captures) lambda))]
                   (list equals equation-id (mapv rename results) operation)))
               (equations program))
         rename-aliases

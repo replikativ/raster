@@ -131,6 +131,21 @@
     (is (= 'java.util.Random (inf/infer-arg-tag '(java.util.Random.) {})))
     (is (= 'Foo (inf/infer-arg-tag '(Foo. 1 2) {})))))
 
+(deftest infer-arg-tag-accepts-rich-walker-environments-test
+  (testing "symbols and primitive array reads retain walker-owned type facts"
+    (let [env {'values {:tag 'floats}
+               'objects {:tag 'objects :element 'double}
+               'row {:tag 'long}}]
+      (is (= 'long (inf/infer-arg-tag 'row env)))
+      (is (= 'float
+             (inf/infer-arg-tag '(clojure.core/aget values row) env)))
+      (is (= 'double
+             (inf/infer-arg-tag '(clojure.core/aget objects row) env)))))
+  (testing "the compact late-pass environment remains supported"
+    (is (= 'float
+           (inf/infer-arg-tag '(clojure.core/aget values row)
+                              {'values 'floats 'row 'long})))))
+
 ;; ================================================================
 ;; trace-inference
 ;; ================================================================
