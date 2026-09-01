@@ -15,6 +15,7 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
+            [raster.compiler.ir.structured-loop-call :as loop-call]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-route :as route]
@@ -370,7 +371,7 @@
       (is (identical? (get-in materialized [:values (:id alias)])
                       (get-in materialized [:values (:source alias)]))))
     (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))
-                                           (:parameters invocation-plan))))
+                                            (:parameters invocation-plan))))
           narrowed (first (filter #(some (fn [operand]
                                            (= public-nsteps (:value operand)))
                                          (:operands %))
@@ -461,6 +462,32 @@
     (is (= :suffix-output (get (last bindings) result)))
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
+
+(deftest emitted-program-buffer-remapping-is-total-and-alias-stable
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        sources (vec (distinct (concat (vals (:buffers call))
+                                       (vals (:loop-scratch call)))))
+        mapping (zipmap sources (mapv #(vector :link-value %) (range (count sources))))
+        remapped (program-call/map-buffers call mapping)
+        loop-step (first (:steps remapped))]
+    (is (= (set (vals mapping))
+           (set (concat (vals (:buffers remapped))
+                        (vals (:loop-scratch remapped))))))
+    (is (= (:scalar-values call) (:scalar-values remapped)))
+    (is (= (:program call) (:program remapped)))
+    (doseq [iteration (range 3)]
+      (is (every? (set (vals mapping))
+                  (vals (:buffers (loop-call/iteration-binding loop-step iteration))))))
+    (is (= :emitted-program-buffer-remap-missing
+           (:reason
+            (ex-data
+             (try (program-call/map-buffers call {})
+                  (catch clojure.lang.ExceptionInfo exception exception))))))
+    (is (= :emitted-program-buffer-remap-collision
+           (:reason
+            (ex-data
+             (try (program-call/map-buffers call (constantly :same-storage))
+                  (catch clojure.lang.ExceptionInfo exception exception))))))))
 
 (deftest structured-loop-staging-is-bounded-by-carry-rotation-not-trip-count
   (let [{:keys [call]} (prepared-mixed-call 9)
