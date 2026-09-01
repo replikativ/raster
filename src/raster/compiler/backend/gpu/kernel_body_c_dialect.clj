@@ -129,7 +129,7 @@
          (when (or uses-half? uses-double? uses-subgroups?) "\n"))
     (str "#include <stdint.h>\n#include <math.h>\n"
          (case (:id dialect)
-           :cuda "#include <cuda_fp16.h>\n"
+           :cuda "#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n"
            :hip (str "#include <hip/hip_runtime.h>\n"
                      "#include <hip/hip_fp16.h>\n"))
          "\n")))
@@ -137,6 +137,13 @@
 (defn entry-prefix
   [dialect]
   (if (opencl? dialect) "__kernel void " "extern \"C\" __global__ void "))
+
+(defn helper-source
+  "Add only the target-language qualifier to registry-owned scalar helper definitions."
+  [dialect source]
+  (if (or (empty? source) (opencl? dialect))
+    source
+    (str/replace source #"(?m)^inline " "__device__ __forceinline__ ")))
 
 (defn workgroup-arena-declaration
   "Spell one statically sized, explicitly aligned workgroup-memory arena."

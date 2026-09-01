@@ -96,6 +96,7 @@
     (segop/->SegMap id space
                     (segop/->SegLevel :thread :virtual)
                     body                ; map lambda = the element expression
+                    nil
                     inputs
                     #{out}
                     (set/difference bound-syms arrays #{out})

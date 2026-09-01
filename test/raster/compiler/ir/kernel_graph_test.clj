@@ -74,7 +74,7 @@
 (deftest in-place-dataflow-retains-one-buffer-identity
   (let [operation (segop/->SegMap
                    9 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
-                   '(inc (aget state i)) #{'state} #{'state} #{}
+                   '(inc (aget state i)) nil #{'state} #{'state} #{}
                    (segop/->KernelGrid 1 32 0) :float 'state nil)
         scheduled (graph/from-segops [operation]
                                      {:inputs #{'state} :outputs #{'state} :dtype :float})]
@@ -96,7 +96,7 @@
 (deftest target-emission-cannot-change-the-scheduled-dataflow-contract
   (let [operation (segop/->SegMap
                    9 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
-                   '(inc (aget values i)) #{'values} #{'out} #{}
+                   '(inc (aget values i)) nil #{'values} #{'out} #{}
                    (segop/->KernelGrid 1 32 0) :float 'out nil)
         scheduled (graph/from-segops [operation]
                                      {:inputs #{'values} :outputs #{'out} :dtype :float})

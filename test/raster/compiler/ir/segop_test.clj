@@ -37,7 +37,7 @@
           level (segop/->SegLevel :thread :none)
           grid (segop/->KernelGrid 1 256 0)
           seg-map (segop/->SegMap 0 space level '(* (aget a i) 2.0)
-                                  #{'a} #{'out} #{} grid
+                                  nil #{'a} #{'out} #{} grid
                                   :double 'out nil)]
       (is (segop/segop? seg-map))
       (is (segop/segop-node? (segop/->SegContract 1 {} :double :ze:0)))

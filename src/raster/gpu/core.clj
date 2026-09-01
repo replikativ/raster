@@ -146,6 +146,8 @@
         result (par-opencl scheduled
                            :device-id device-id
                            :dtype dtype
+                           :array-types array-types
+                           :scalar-types scalar-types
                            :min-elements min-elements)]
     (doseq [k (:kernels result)]
       (register! (:kernel-name k) k))

@@ -108,19 +108,33 @@
    ;; little-endian in each i32 — the scalar int8-MAC primitive (semantic op
    ;; raster.par/dp4a, JVM reference impl in raster.par). ONE canonical entry;
    ;; every backend spelling lives HERE as data:
-   ;;   :c    — portable helper name; :c-helper-src is its OpenCL/C source
-   ;;           (as_char4 idiom, pattern-matched to hardware dp4a by IGC/NV/AMD)
+   ;;   :c    — portable helper name; :c-helper-src is valid OpenCL C, CUDA C++, HIP C++,
+   ;;           and ordinary C. Physical instruction selection remains a target-lowering concern.
    ;;   :cuda/:hip (Phase B) — __dp4a / __builtin_amdgcn_sdot4 go HERE, not in
    ;;           an emitter table
    ;;   :wasm — :scalar-lanes (shift/mask lane extraction; emitter-local emit fn)
    ;; The VECTOR schedules (AVX2 maddubs, wasm i32x4.dot) are :wi8-dot above.
    :dp4a {:arity 3 :kind :dp4a
           :c {:fn "rstr_dp4a"}
+          :target-helper-src
+          {:cuda (str "__device__ __forceinline__ int rstr_dp4a(int a, int b, int acc) {\n"
+                      "    return __dp4a(a, b, acc);\n"
+                      "}\n")
+           :hip (str "__device__ __forceinline__ int rstr_dp4a(int a, int b, int acc) {\n"
+                     "    return __ockl_sdot4(a, b, acc, false);\n"
+                     "}\n")}
           :c-helper-src (str "inline int rstr_dp4a(int a, int b, int acc) {\n"
-                             "    char4 va = as_char4(a);\n"
-                             "    char4 vb = as_char4(b);\n"
-                             "    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y\n"
-                             "               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;\n"
+                             "    unsigned int ua = (unsigned int)a;\n"
+                             "    unsigned int ub = (unsigned int)b;\n"
+                             "    int a0 = (int)(ua & 255u); a0 = a0 < 128 ? a0 : a0 - 256;\n"
+                             "    int a1 = (int)((ua >> 8) & 255u); a1 = a1 < 128 ? a1 : a1 - 256;\n"
+                             "    int a2 = (int)((ua >> 16) & 255u); a2 = a2 < 128 ? a2 : a2 - 256;\n"
+                             "    int a3 = (int)((ua >> 24) & 255u); a3 = a3 < 128 ? a3 : a3 - 256;\n"
+                             "    int b0 = (int)(ub & 255u); b0 = b0 < 128 ? b0 : b0 - 256;\n"
+                             "    int b1 = (int)((ub >> 8) & 255u); b1 = b1 < 128 ? b1 : b1 - 256;\n"
+                             "    int b2 = (int)((ub >> 16) & 255u); b2 = b2 < 128 ? b2 : b2 - 256;\n"
+                             "    int b3 = (int)((ub >> 24) & 255u); b3 = b3 < 128 ? b3 : b3 - 256;\n"
+                             "    return acc + a0*b0 + a1*b1 + a2*b2 + a3*b3;\n"
                              "}\n")
           :wasm :scalar-lanes}
    ;; broader elementary set — all wasm via composition/polynomial (see

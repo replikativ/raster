@@ -150,7 +150,8 @@
       (is (empty? (:allocs descriptor))))
     (testing "every output element lowers through one target-neutral map"
       (is (= [:map-void] (mapv :convention (:steps descriptor))))
-      (is (= :segmap (get-in step [:artifact :provenance :dialect])))
+      (is (= :kernel-body (get-in step [:artifact :provenance :dialect])))
+      (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
       (is (= '[indices src out width _n_bound] (mapv :name (:abi step))))
       (is (= [:int :float :float :int :int] (mapv :dtype (:abi step))))
       (is (= 'rstr_extent_0 (last (get-in step [:artifact :arguments])))

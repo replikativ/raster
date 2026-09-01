@@ -99,11 +99,10 @@
                     (list 'clojure.core/aset secondary-result index
                           (list cast secondary-body))))
                 (rest results) (rest physical-results) (rest bodies))
-          body (materialize-region-locals
-                locals
-                (if (seq secondary-stores)
-                  (list* 'do (concat secondary-stores [(first bodies)]))
-                  (first bodies)))
+          scalar-result (if (seq secondary-stores)
+                          (list* 'do (concat secondary-stores [(first bodies)]))
+                          (first bodies))
+          body (materialize-region-locals locals scalar-result)
           stable-array-captures (set (get-in attributes
                                              [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable-array-captures captures))
@@ -115,7 +114,8 @@
                                       (into (set arrays) stable-array-captures)
                                       (set physical-results)
                                       scalar-captures)
-                      :sym physical-result :elem-type result-dtype :pure? (nil? storage))]
+                      :sym physical-result :elem-type result-dtype :pure? (nil? storage)
+                      :scalar-region {:locals locals :result scalar-result})]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
             (lower-map node device-id :dtype result-dtype)))))
@@ -270,7 +270,8 @@
                                 (list 'clojure.core/aset destination destination-index value))]
                     (if (contains? #{true 1} predicate) store (list 'if predicate store))))
                 physical-results writes)
-          body (materialize-region-locals locals (list* 'do statements))
+          scalar-result (list* 'do statements)
+          body (materialize-region-locals locals scalar-result)
           stable (set (get-in attributes [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable captures))
           node (assoc (soac/->SoacMap equation-id nil (:index attributes)
@@ -278,6 +279,7 @@
                                       (into (set arrays) stable)
                                       (set physical-results) scalar-captures)
                       :elem-type result-dtype :pure? false
+                      :scalar-region {:locals locals :result scalar-result}
                       :write-conflict (if reducing? :reduce :unique)
                       :conflict-contract conflict)]
       (mapv #(assoc % :algorithm-dialect :typed-soac
@@ -708,6 +710,7 @@
         cast-fn (:cast-fn soac)]
     [(segop/->SegMap (:id soac) space level
                      (:lambda soac)
+                     (:scalar-region soac)
                      (:inputs soac) (soac-outputs* soac)
                      (:scalars soac) grid
                      dtype out-sym cast-fn)]))
@@ -916,6 +919,7 @@
             stage-3 (segop/->SegMap (+ (:id description) 3000)
                                     carry-space level-3
                                     carry-lambda
+                                    nil
                                     #{out-sym totals-sym}
                                     #{out-sym}
                                     #{} grid-3

@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-body :as kernel-body]
@@ -226,14 +227,28 @@
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
                                          :dtype :float :min-elements 0)
         kernel-source (:source (first (:kernels emitted)))
+        operation (first (:operations (first (:equations scheduled))))
+        portable (segop-opencl/generate-segmap-kernel-body
+                  operation
+                  :array-types {'x :float 'a :float 'b :float})
+        portable-source (:source portable)
         jvm (par-simd/simd-pass scheduled :min-elements 1)
         execute (eval (list 'fn '[x a b n] (:form jvm)))
         x (float-array [1.0 2.0 3.0 4.0])
         a (float-array 4)
         b (float-array 4)]
-    (is (= 1 (count (re-seq #"x\[idx\]" kernel-source)))
+    (is (= 1 (count (re-seq #"x\[" kernel-source)))
         "the shared producer is emitted once, not projected into both results")
-    (is (re-find #"float rstr_local_0" kernel-source))
+    (is (= :kernel-body (get-in (first (:kernels emitted))
+                                [:attributes :emission-route])))
+    (is (= [:float :float] (mapv :dtype (get-in operation [:scalar-region :locals])))
+        "SegMap scheduling retains TypedSOAC local dtypes as data, not symbol metadata")
+    (is (= 1 (count (re-seq #"x\[" portable-source)))
+        "KernelBody retains the same typed local instead of duplicating its load")
+    (is (= 1 (count (filter #(and (= "ScalarCompute" (some-> % class .getSimpleName))
+                                  (= :* (get-in % [:expression :op])))
+                            (get-in portable [:attributes :kernel-body :operations]))))
+        "the shared square is one scalar SSA definition")
     (is (nil? (execute x a b 4)))
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [4.0 9.0 16.0 25.0] (mapv double b)))))

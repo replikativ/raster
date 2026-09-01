@@ -1900,14 +1900,17 @@
    the staged-contraction emitter prepended the helper — hardcoded as `(intrinsics/descriptor
    'dp4a)`. Every other kernel that used the intrinsic compiled to `use of undeclared identifier
    'rstr_dp4a'`. One registry scan replaces the per-emitter, per-intrinsic special case."
-  [body-str]
-  (->> intrinsics/table
-       (keep (fn [[_ {:keys [c c-helper-src]}]]
-               (when (and c-helper-src (:fn c)
+  ([body-str]
+   (intrinsic-helper-sources body-str nil))
+  ([body-str target-dialect]
+   (->> intrinsics/table
+       (keep (fn [[_ {:keys [c c-helper-src target-helper-src]}]]
+               (let [helper-src (or (get target-helper-src target-dialect) c-helper-src)]
+                 (when (and helper-src (:fn c)
                           (re-find (re-pattern (str "\\b" (java.util.regex.Pattern/quote (:fn c)) "\\(")) body-str))
-                 c-helper-src)))
+                   helper-src))))
        distinct
-       (str/join "\n")))
+       (str/join "\n"))))
 
 (defn helper-sources
   "Target helper definitions required by an already-emitted C-family body."

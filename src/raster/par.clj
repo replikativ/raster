@@ -559,8 +559,7 @@
 
 (deftm ^:no-inline dp4a
   "4-way int8 dot-accumulate. `a` and `b` each pack four signed int8 lanes into an int32,
-  little-endian (lane 0 = low byte), exactly as `as_char4` reinterprets memory on a
-  little-endian device. Returns `acc + Σ_i lane_i(a)·lane_i(b)`.
+  little-endian (lane 0 = low byte). Returns `acc + Σ_i lane_i(a)·lane_i(b)`.
 
   This is the JVM/reference impl of the `rstr_dp4a` primitive: in a deftm/par body the
   GPU and CPU-C backends lower a `(par/dp4a a b acc)` call to `rstr_dp4a(a, b, acc)` (a
@@ -568,7 +567,9 @@
   Intel/CUDA `__dp4a`, AMD `sdot4`). The masked extraction below is sign-correct
   regardless of how the int sign-extends into the JVM long.
 
-  A `deftm`, not a `defn`, so the walker STAMPS its Long result type. As a plain defn it had no
+  A `deftm`, not a `defn`, so the walker stamps its Integer result type. The target primitive and
+  packed operands are int32; the JVM reference explicitly wraps to the same representation instead
+  of exposing an accidental 64-bit result. As a plain defn it had no
   declared return type, every let-bound `(par/dp4a …)` intermediate reached the GPU fixpoint
   edge untagged, and the typedness census (correctly) refused the program — `bind-decode!` on
   gemma-3-270m failed with `14 non-exempt untagged binding(s) {raster.par/dp4a 14}` from the
@@ -577,16 +578,17 @@
   intrinsics registry (`:dp4a` → `rstr_dp4a`), which the `:raster.op/original` stamp preserves,
   so emission is unchanged. Do not exempt dp4a from the census instead: the census exists to
   catch exactly the narrowing class an untyped integer accumulate can hide."
-  [a :- Long, b :- Long, acc :- Long] :- Long
+  [a :- Long, b :- Long, acc :- Long] :- Integer
   (let [a (long (unchecked-int a)) b (long (unchecked-int b))
         sx (fn ^long [^long x ^long sh]
              (let [v (bit-and (unsigned-bit-shift-right x sh) 0xFF)]
                (if (>= v 128) (- v 256) v)))]
-    (+ (long acc)
-       (* (sx a 0) (sx b 0))
-       (* (sx a 8) (sx b 8))
-       (* (sx a 16) (sx b 16))
-       (* (sx a 24) (sx b 24)))))
+    (unchecked-int
+     (+ (long acc)
+        (* (sx a 0) (sx b 0))
+        (* (sx a 8) (sx b 8))
+        (* (sx a 16) (sx b 16))
+        (* (sx a 24) (sx b 24))))))
 
 (defmacro rng-fill!
   "Fill a long array with splitmix64 pseudo-random seeds.
