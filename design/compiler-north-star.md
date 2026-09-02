@@ -1128,7 +1128,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
    memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
    C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC
-   reconstruction is deleted. Additional atomic monoids, privatized histogram schedules, nested
+   reconstruction is deleted. Direct JVM and GPU compatibility entry points use one middle-end
+   singleton adapter that attempts analyzed-source→TypedSOAC first and falls back only for an exact
+   structured source-admission decline. Scheduled SegMap storage selects the runtime marker from
+   the emitted ABI: dense single-result maps remain value-producing, while unique scatters and
+   fused multi-result maps use the general effect marker without reconstructing destination facts
+   from source. Additional atomic monoids, privatized histogram schedules, nested
    structured C/SIMD sites, the remaining parallel forms, calibrated whole-graph placement costs,
    and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a

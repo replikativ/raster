@@ -84,28 +84,26 @@
         (is (some? (:reason d)) "the missing rule")
         (is (some? (:fallback d)) "and what happens instead — a stated outcome, not an absence")))))
 
-(deftest offset-map-is-refused-before-segop-lowering
+(deftest direct-offset-map-enters-the-typed-boundary-before-compatibility
   (let [source '(raster.par/map! out i n :offset base float (aget x i))
-        r (slp/segop-lower-pass
-           (list 'let* ['result source] 'result)
-           {:target-device :ze:0
-            :dtype :float
-            :array-types {'out :float 'x :float}
-            :scalar-types {'n :long 'base :long}})
-        d (first (get-in r [:stats :segops-declined]))]
-    (testing "the middle end records exactly why it cannot represent the write"
-      (is (zero? (get-in r [:stats :segops-lowered])))
-      (is (= :soac (:stage d)))
-      (is (= :offset-map-requires-indexed-store (:reason d))))
-    (testing "the GPU boundary fails loudly instead of emitting an out[i] kernel"
-      (try
-        ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-         source :dtype :float :device-id :ze:0 :min-elements 0)
-        (is false "an offset map must remain illegal until typed scatter lowering exists")
-        (catch clojure.lang.ExceptionInfo e
-          (is (= :illegal-op-remains (:reason (ex-data e))))
-          (is (= :offset-map-requires-indexed-store (:missing-rule (ex-data e))))
-          (is (= :none (:fallback (ex-data e)))))))))
+        opts {:target-device :ze:0
+              :dtype :float
+              :array-types {'out :float 'x :float}
+              :scalar-types {'n :long 'base :long}}
+        scheduled (with-redefs [soac/par-form->soac
+                                (fn [& _]
+                                  (throw (AssertionError. "legacy SOAC was constructed")))]
+                    (slp/schedule-single-operation 'out source opts))
+        operation (first (:operations scheduled))
+        emitted ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+                 source :dtype :float :device-id :ze:0 :min-elements 0)]
+    (is (some? (:algorithm scheduled)))
+    (is (= :typed-soac (get-in operation [:algorithm-dialect])))
+    (is (= :unique (:write-conflict operation)))
+    (let [kernel-source (:source (first (:kernels emitted)))]
+      (is (re-find #"\[\(base \+ idx\)\]" kernel-source))
+      (is (not (re-find #"inout_result\[idx\] =" kernel-source))
+          "a unique scatter must not acquire a second implicit dense store"))))
 
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion
@@ -164,30 +162,23 @@
                                          (fn [] (throw (NullPointerException.
                                                         "implementation bug")))))))))))
 
-(deftest map-is-a-full-conversion-with-no-legacy-emitter
-  (testing "a missing SegMap rule leaves an illegal op and cannot silently change code generators"
+(deftest direct-map-is-a-full-typed-conversion-with-no-legacy-emitter
+  (testing "the direct adapter does not need compatibility SOAC lowering for an admitted map"
     (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
-      (try
-        ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-         '(raster.par/map! out i n float (clojure.core/aget a i))
-         :dtype :float :min-elements 0)
-        (is false "an unlowered map must fail full conversion")
-        (catch clojure.lang.ExceptionInfo e
-          (is (= :illegal-op-remains (:reason (ex-data e))))
-          (is (= :segop (:target-dialect (ex-data e))))
-          (is (= :none (:fallback (ex-data e))))
-          (is (= :none (get-in (ex-data e) [:decline :fallback]))))))))
+      (let [compiled ((requiring-resolve
+                       'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+                      '(raster.par/map! out i n float (clojure.core/aget a i))
+                      :dtype :float :min-elements 0)]
+        (is (= 1 (get-in compiled [:stats :ze-maps])))
+        (is (= 1 (get-in compiled [:stats :segop-relowered])))))))
 
-(deftest reduction-is-a-full-conversion-with-no-legacy-emitter
-  (testing "a missing SegRed rule leaves an illegal op and cannot silently change code generators"
+(deftest direct-reduction-is-a-full-typed-conversion-with-no-legacy-emitter
+  (testing "the direct adapter does not need compatibility SOAC lowering for an admitted reduction"
     (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
-      (try
-        ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-         '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
-         :dtype :float :min-elements 0)
-        (is false "an unlowered reduction must fail full conversion")
-        (catch clojure.lang.ExceptionInfo e
-          (is (= :illegal-op-remains (:reason (ex-data e))))
-          (is (= :segop (:target-dialect (ex-data e))))
-          (is (= :none (:fallback (ex-data e))))
-          (is (= :none (get-in (ex-data e) [:decline :fallback]))))))))
+      (let [compiled ((requiring-resolve
+                       'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+                      '(raster.par/reduce acc 0.0 i n
+                                          (+ acc (clojure.core/aget a i)))
+                      :dtype :float :min-elements 0)]
+        (is (= 1 (get-in compiled [:stats :ze-reduces])))
+        (is (= 1 (get-in compiled [:stats :segop-relowered])))))))
