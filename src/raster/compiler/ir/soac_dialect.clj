@@ -27,6 +27,13 @@
                (region [(let-value local :dtype init-expr) ...]
                        [(write destination-index predicate value) ...]))))
         (= equation-id [result ...]
+           (effect-map {:index i :extent n :dtypes [:float ...]}
+             [array ...] [capture ...] [destination ...]
+             (lambda [element ... capture-parameter ... destination-parameter ...]
+               (effect-region [(let-value local :dtype init-expr) ...]
+                 [(effect destination-parameter conflict destination-index predicate value)
+                  ...]))))
+        (= equation-id [result ...]
            (reduce {:index i :extent n
                     :accumulators [acc ...] :identities [zero ...]
                     :dtypes [:float ...] :algebra [{} ...]}
@@ -61,6 +68,10 @@
    expression binding. Lambda regions have one typed, ordered local-SSA spine. A local initializer
    may reference parameters, the map index, and earlier locals; results may reference all locals.
    This represents shared scalar work once without smuggling type inference into an emitter.
+   Ordered effect maps are the conservative boundary for imperative parallel work: each physical
+   destination is explicit, every effect carries either an injectivity proof or a checked
+   commutative-reduction contract, and source order is retained within a logical work item. They
+   are not treated as pure maps or admitted to algebraic fusion without a later effect proof.
    Scan results use the same result-storage relation when materialized into caller-owned buffers."
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :as dialect
@@ -166,6 +177,24 @@
   (and (map-attributes? value)
        (or (= :unique (:conflict value))
            (reducing-scatter-conflict? (:conflict value)))))
+
+(defn effect-conflict?
+  "A race-freedom contract for one ordered effect destination.
+
+   `:unique` certifies injective writes across logical work items. Reduction effects reuse the
+   same checked commutative-monoid certificate as typed scatter; the effect order is retained only
+   within a work item and does not invent a cross-item order."
+  [value]
+  (or (= :unique value) (reducing-scatter-conflict? value)))
+
+(defn effect-map-attributes?
+  [value]
+  (and (map-attributes? value)
+       (vector? (:dtypes value))
+       (seq (:dtypes value))
+       (every? #(and (keyword? %) (dtype/known? %)
+                     (= % (dtype/canon %)))
+               (:dtypes value))))
 
 (defn stencil-attributes?
   "Attributes for a boundary-aware neighborhood map.
@@ -423,6 +452,8 @@
              [sa scalar-attributes?]
              [ma map-attributes?]
              [xa scatter-attributes?]
+             [ema effect-map-attributes?]
+             [ec effect-conflict?]
              [sta stencil-attributes?]
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
@@ -444,14 +475,24 @@
           (.invk ?sym:impl (?:* s:args))
           (& (?sym:f (?:* s:args)) (? _ seq?)))
 
+  (Effect [e :enforce]
+          (effect ?sym:destination ?ec:conflict
+                  ?s:destination-index ?s:predicate ?s:value))
+
   (Local [d :enforce]
          (let-value ?sym:binding ?dt ?s:init))
 
   (Region [r :enforce]
           (region [(?:* d)] [(?:+ s)]))
 
+  (EffectRegion [er :enforce]
+                (effect-region [(?:* d)] [(?:+ e)]))
+
   (Lambda [l :enforce]
           (lambda [(?:* ?sym:parameter)] ?r))
+
+  (EffectLambda [el :enforce]
+                (lambda [(?:* ?sym:parameter)] ?er))
 
   (Fold [f :enforce]
         (fold ?fa ?l))
@@ -460,6 +501,8 @@
              (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (scatter ?xa [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (effect-map ?ema [(?:* ?id:array)] [(?:* ?id:capture)]
+                         [(?:+ ?id:destination)] ?el)
              (stencil ?sta [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
@@ -540,6 +583,11 @@
                       folds)
          :map-lambda map-lambda})
 
+      (= 'effect-map kind)
+      (let [[_ attributes arrays captures destinations lambda] operation]
+        {:kind kind :attributes attributes :arrays arrays :captures captures
+         :destinations destinations :lambda lambda})
+
       :else
       (let [[_ attributes arrays captures lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
@@ -555,6 +603,18 @@
     (let [[_ destination-index predicate written-value] value]
       {:destination-index destination-index :predicate predicate :value written-value})))
 
+(defn effect-form?
+  "Whether a typed ordered-effect region item has canonical syntax."
+  [value]
+  (and (seq? value) (= 'effect (first value)) (= 6 (count value))))
+
+(defn effect-parts
+  [value]
+  (when (effect-form? value)
+    (let [[_ destination conflict destination-index predicate written-value] value]
+      {:destination destination :conflict conflict
+       :destination-index destination-index :predicate predicate :value written-value})))
+
 (defn local-value
   "Construct one explicitly typed scalar-region SSA definition."
   [id dtype init]
@@ -564,6 +624,18 @@
   "Construct the canonical scalar region used by every TypedSOAC lambda."
   [locals results]
   (list 'region (vec locals) (vec results)))
+
+(defn effect-lambda-region
+  "Construct a canonical ordered-effect region."
+  [locals effects]
+  (list 'effect-region (vec locals) (vec effects)))
+
+(defn effect-lambda-form
+  "Construct a canonical TypedSOAC ordered-effect lambda."
+  ([parameters effects]
+   (effect-lambda-form parameters [] effects))
+  ([parameters locals effects]
+   (list 'lambda (vec parameters) (effect-lambda-region locals effects))))
 
 (defn lambda-form
   "Construct a canonical TypedSOAC lambda, with an optional ordered local-SSA spine."
@@ -634,16 +706,21 @@
 (defn parameter-layout
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]
-  (let [{:keys [kind attributes arrays captures lambda element-lambda]} (operation-parts equation)
+  (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
+        (operation-parts equation)
         parameters (:parameters (lambda-parts (or lambda element-lambda)))
         accumulator-count (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
                             (count (:accumulators attributes)) 0)
         array-count (count arrays)
         accumulator-end accumulator-count
-        element-end (+ accumulator-end array-count)]
-    {:accumulators (subvec parameters 0 accumulator-end)
-     :elements (subvec parameters accumulator-end element-end)
-     :capture-parameters (subvec parameters element-end)}))
+        element-end (+ accumulator-end array-count)
+        capture-end (+ element-end (count captures))]
+    (cond-> {:accumulators (subvec parameters 0 accumulator-end)
+             :elements (subvec parameters accumulator-end element-end)
+             :capture-parameters (subvec parameters element-end capture-end)}
+      (seq destinations)
+      (assoc :destination-parameters
+             (subvec parameters capture-end (+ capture-end (count destinations)))))))
 
 (defn- distinct-vector?
   [value]
@@ -738,7 +815,7 @@
 (defn- validate-equation!
   [equation]
   (let [[_ equation-id results operation] equation
-        {:keys [kind attributes arrays captures lambda element-lambda combine-lambda
+        {:keys [kind attributes arrays captures destinations lambda element-lambda combine-lambda
                 folds map-lambda]}
         (operation-parts equation)
         product? (= 'product-reduce kind)
@@ -750,13 +827,20 @@
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"
              {:equation equation-id :results results}))
-    (doseq [[field ids] [[:arrays arrays] [:captures captures]]]
+    (doseq [[field ids] [[:arrays arrays] [:captures captures]
+                         [:destinations (or destinations [])]]]
       (when-not (distinct-vector? ids)
         (fail! :typed-soac-operands "SOAC operands must be ordered and distinct"
                {:equation equation-id :field field :ids ids})))
     (when (seq (set/intersection (set arrays) (set captures)))
       (fail! :typed-soac-operand-role "one value cannot be both an element input and a capture"
              {:equation equation-id :arrays arrays :captures captures}))
+    (when (seq (set/intersection (set destinations)
+                                 (set (concat arrays captures))))
+      (fail! :typed-soac-operand-role
+             "an effect destination cannot also be an element input or stable capture"
+             {:equation equation-id :arrays arrays :captures captures
+              :destinations destinations}))
     (let [stable-array-captures (get-in attributes [:attributes :stable-array-captures] [])]
       (when-not (and (distinct-vector? stable-array-captures)
                      (set/subset? (set stable-array-captures) (set captures)))
@@ -776,7 +860,7 @@
         (fail! :typed-soac-region-binders
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
-      (when (and (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
+      (when (and (contains? #{'map 'scatter 'effect-map 'stencil 'reduce 'segmented-reduce
                               'product-reduce 'segmented-fold-map 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
@@ -793,11 +877,13 @@
                "scalar-region locals require a supported JVM scalar dtype"
                {:equation equation-id :local local :dtype dtype})))
     (when (and (seq locals)
-               (not (contains? #{'map 'scatter 'product-reduce 'segmented-fold-map} kind)))
+               (not (contains? #{'map 'scatter 'effect-map
+                                 'product-reduce 'segmented-fold-map} kind)))
       (fail! :typed-soac-region-operation
              "typed local SSA is not admitted in this operation's scalar region"
              {:equation equation-id :operation kind :locals locals}))
-    (when-not (= (if product? component-count result-count) (count body-results))
+    (when-not (or (= 'effect-map kind)
+                  (= (if product? component-count result-count) (count body-results)))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
              {:equation equation-id :results result-count :components component-count
               :body-results (count body-results)}))
@@ -807,7 +893,8 @@
                                         fold-map? (count folds)
                                         :else 0)
                                       (count arrays)
-                                      (count captures))]
+                                      (count captures)
+                                      (count destinations))]
       (when-not (= expected-parameter-count (count parameters))
         (fail! :typed-soac-lambda-arity
                "lambda parameters must cover accumulators, elements and captures in order"
@@ -817,7 +904,7 @@
                 :arrays arrays
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
-                          (contains? #{'map 'scatter 'stencil 'reduce 'segmented-reduce
+                          (contains? #{'map 'scatter 'effect-map 'stencil 'reduce 'segmented-reduce
                                       'product-reduce 'segmented-fold-map 'scan} kind)
                           (conj (:index attributes))
                           (contains? #{'segmented-reduce 'product-reduce
@@ -863,9 +950,13 @@
                "parallel scalar-region work must use an explicit TypedSOAC term"
                {:equation equation-id :form form}))
       (doseq [body body-results
-              expression (if (= 'scatter kind)
-                           (vals (write-parts body))
-                           [body])
+              expression (cond
+                           (= 'scatter kind) (vals (write-parts body))
+                           (= 'effect-map kind)
+                           (let [{:keys [destination destination-index predicate value]}
+                                 (effect-parts body)]
+                             [destination destination-index predicate value])
+                           :else [body])
               :let [unbound (util/free-syms expression final-bound)]
               :when (seq unbound)]
         (fail! :typed-soac-unbound-scalar
@@ -889,6 +980,42 @@
         (fail! :typed-soac-scatter-write
                "scatter results must be explicit conditional indexed writes"
                {:equation equation-id :results body-results}))
+
+      effect-map
+      (let [destination-count (count destinations)
+            destination-parameters (vec (take-last destination-count parameters))
+            destination-set (set destination-parameters)
+            effects (mapv effect-parts body-results)
+            by-destination (group-by :destination effects)]
+        (when-not (= result-count destination-count (count (:dtypes attributes)))
+          (fail! :typed-soac-effect-results
+                 "effect-map results, physical destinations, and dtypes must align"
+                 {:equation equation-id :results results :destinations destinations
+                  :dtypes (:dtypes attributes)}))
+        (when-not (every? some? effects)
+          (fail! :typed-soac-effect-form
+                 "effect-map regions contain only canonical ordered effects"
+                 {:equation equation-id :effects body-results}))
+        (when-not (= destination-set (set (keys by-destination)))
+          (fail! :typed-soac-effect-destinations
+                 "every declared effect destination must be referenced through its lambda parameter"
+                 {:equation equation-id :destination-parameters destination-parameters
+                  :used (vec (keys by-destination))}))
+        (doseq [[ordinal destination-parameter dtype]
+                (map vector (range) destination-parameters (:dtypes attributes))
+                :let [contracts (set (map :conflict (get by-destination destination-parameter)))] ]
+          (when-not (= 1 (count contracts))
+            (fail! :typed-soac-effect-conflict
+                   "one effect destination requires one uniform cross-work-item conflict contract"
+                   {:equation equation-id :destination destination-parameter
+                    :contracts contracts}))
+          (let [contract (first contracts)]
+            (when (and (reducing-scatter-conflict? contract)
+                       (not= dtype (:dtype contract)))
+              (fail! :typed-soac-effect-conflict-dtype
+                     "a reduction effect contract must match its destination dtype"
+                     {:equation equation-id :destination destination-parameter
+                      :ordinal ordinal :dtype dtype :contract contract})))))
 
       stencil
       (do
@@ -1212,6 +1339,17 @@
                    "scatter results require tensor storage contracts"
                    {:equation equation-id :id id :value value}))))
 
+      effect-map
+      (doseq [[id result-dtype] (map vector results (:dtypes attributes))]
+        (let [value (get values id)]
+          (when (and value
+                     (not (and (= :tensor (:kind value))
+                               (= result-dtype (:dtype value)))))
+            (fail! :typed-soac-effect-result-type
+                   "effect-map results require tensor storage with the declared dtype"
+                   {:equation equation-id :id id :value value
+                    :dtype result-dtype}))))
+
       stencil
       (let [result-dtype (first (:dtypes attributes))]
         (doseq [id stable-array-captures
@@ -1302,7 +1440,7 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter 'stencil 'segmented-reduce 'scan
+      (when-not (contains? #{'map 'scatter 'effect-map 'stencil 'segmented-reduce 'scan
                              'product-reduce 'segmented-fold-map} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"
@@ -1319,6 +1457,13 @@
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]
+        (when (and (= 'effect-map kind)
+                   (not= destinations (:destinations (operation-parts equation))))
+          (fail! :typed-soac-effect-storage
+                 "effect-map destinations must equal its ordered physical storage contract"
+                 {:equation equation-id :operation-destinations
+                  (:destinations (operation-parts equation))
+                  :storage-destinations destinations}))
         (when (and (contains? #{'stencil 'segmented-fold-map 'scan} kind)
                    (seq (set/intersection
                          (set destinations)
@@ -1484,8 +1629,8 @@
                           {} (:values source-facts))
         equation-forms
         (mapv (fn [[equals equation-id results :as equation]]
-                (let [{:keys [kind attributes arrays captures lambda element-lambda combine-lambda
-                              folds map-lambda]}
+                (let [{:keys [kind attributes arrays captures destinations lambda
+                              element-lambda combine-lambda folds map-lambda]}
                       (operation-parts equation)
                       attributes (cond-> attributes
                                    (seq (get-in attributes
@@ -1530,6 +1675,11 @@
                                                       lambda))
                                               folds)
                                         map-lambda)
+
+                                  effect-map
+                                  (list kind attributes (mapv rename arrays)
+                                        (mapv rename captures) (mapv rename destinations)
+                                        lambda)
 
                                   (list kind attributes (mapv rename arrays)
                                         (mapv rename captures) lambda))]

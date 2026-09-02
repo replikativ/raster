@@ -88,7 +88,96 @@
         (dialect/make (update facts :values dissoc 'b) [equation] [])
         (is false "unknown physical storage must fail")
         (catch clojure.lang.ExceptionInfo exception
-          (is (= :typed-soac-result-storage-value (:reason (ex-data exception)))))))))
+              (is (= :typed-soac-result-storage-value (:reason (ex-data exception)))))))))
+
+(deftest ordered-effect-map-has-explicit-destinations-and-conflict-proofs
+  (let [indices (av/tensor {:dtype :int :shape '[n]})
+        scalar-slot (av/tensor {:dtype :float :shape '[1]})
+        left-result [:ordered-effect 0 0]
+        total-result [:ordered-effect 0 1]
+        reduction (dialect/reducing-scatter-conflict '+ :float)
+        storage [{:destination 'out :access :write :host-return :effect}
+                 {:destination 'total :access :read-write :host-return :effect}]
+        effects [(list 'effect 'out-destination :unique
+                       '(clojure.core/aget index-buffer i) true 'element)
+                 (list 'effect 'total-destination reduction 0 true 'element)]
+        equation
+        (list '= 'effect-0 [left-result total-result]
+              (list 'effect-map
+                    {:index 'i :extent 'n :dtypes [:float :float]
+                     :attributes {:stable-array-captures '[indices]}}
+                    '[x] '[indices] '[out total]
+                    (dialect/effect-lambda-form
+                     '[element index-buffer out-destination total-destination]
+                     effects)))
+        equation-facts
+        (assoc (dialect/default-equation-facts)
+               :effects #{:memory/write}
+               :aliases {left-result 'out total-result 'total}
+               :attributes {:result-storage storage})
+        facts
+        (dialect/default-program-facts
+         {:values {'n extent 'x tensor 'indices indices 'out tensor 'total scalar-slot
+                   left-result tensor total-result scalar-slot}
+          :inputs '[n x indices]
+          :equations {'effect-0 equation-facts}
+          :effects #{:memory/write}})
+        program (dialect/make facts [equation] [])
+        remapped (dialect/remap-values
+                  program {'out [:storage :out] 'total [:storage :total]
+                           'x [:input :x] 'indices [:input :indices]})
+        remapped-equation (first (dialect/equations remapped))]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= '[x indices] (dialect/operation-inputs equation)))
+    (is (= {:accumulators [] :elements '[element]
+            :capture-parameters '[index-buffer]
+            :destination-parameters '[out-destination total-destination]}
+           (dialect/parameter-layout equation)))
+    (is (= ['out 'total] (dialect/physical-results program equation)))
+    (is (= [[:storage :out] [:storage :total]]
+           (:destinations (dialect/operation-parts remapped-equation))))
+    (is (= program (dialect/validate! program)))
+    (testing "operation destinations cannot drift from physical result storage"
+      (let [[_ attrs arrays captures _destinations lambda] (nth equation 3)
+            bad-equation
+            (list '= 'effect-0 [left-result total-result]
+                  (list 'effect-map attrs arrays captures '[total out] lambda))]
+        (try
+          (dialect/make facts [bad-equation] [])
+          (is false "destination order must have one authority")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-effect-storage (:reason (ex-data exception))))))))
+    (testing "one destination cannot mix unique and reduction effects"
+      (let [[_ attrs arrays captures destinations lambda] (nth equation 3)
+            {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
+            mixed-effects (conj body-results
+                                (list 'effect 'out-destination reduction 0 true 1.0))
+            bad-equation
+            (list '= 'effect-0 [left-result total-result]
+                  (list 'effect-map attrs arrays captures destinations
+                        (dialect/effect-lambda-form
+                         parameters (dialect/emit-locals locals) mixed-effects)))]
+        (try
+          (dialect/make facts [bad-equation] [])
+          (is false "mixed destination conflicts must fail")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-effect-conflict (:reason (ex-data exception))))))))
+    (testing "reduction conflict dtype must match destination dtype"
+      (let [[_ attrs arrays captures destinations lambda] (nth equation 3)
+            bad-reduction (dialect/reducing-scatter-conflict '+ :int)
+            effects [(list 'effect 'out-destination :unique 0 true 1.0)
+                     (list 'effect 'total-destination bad-reduction 0 true 1)]
+            bad-equation
+            (list '= 'effect-0 [left-result total-result]
+                  (list 'effect-map attrs arrays captures destinations
+                        (dialect/effect-lambda-form
+                         (:parameters (dialect/lambda-parts lambda)) effects)))]
+        (try
+          (dialect/make facts [bad-equation] [])
+          (is false "reduction dtype drift must fail")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-effect-conflict-dtype
+                   (:reason (ex-data exception))))))))))
 
 (deftest scalar-region-locals-are-explicit-typed-and-ordered-ssa
   (let [equation
