@@ -131,6 +131,14 @@
                   {:operations [] :result expression
                    :type (canon-type (:type expression))}
 
+                  (and (= :predicate expected) (number? expression))
+                  (if (contains? #{0 1} expression)
+                    {:operations [] :result (body/literal (= 1 expression) :predicate)
+                     :type :predicate}
+                    (decline! :predicate-literal
+                              "numeric predicates must use the canonical zero/one encoding"
+                              {:expression expression}))
+
                   (number? expression)
                   {:operations [] :result (body/literal expression expected) :type expected}
 

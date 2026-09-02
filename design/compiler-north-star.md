@@ -130,9 +130,11 @@ Pointwise maps that read and write their caller-owned destination stay on this s
 typed equation records read/write destination access, and GPU lowering emits that storage exactly
 once as a `KernelABI` `:inout` pointer with semantic role `:result`. Physical access and functional
 identity are therefore orthogonal: resident and staged binders derive transfers from ABI kind,
-while composition identifies the returned value by role. OpenCL and Level Zero staged maps also
-use target-specific invocation markers selected by the emitter, rather than leaking a Level Zero
-runtime call into an OpenCL program.
+while composition identifies the returned value by role. The portable schedule admits an inout
+map only when every destination read uses the same logical element index as its write; shifted or
+indirect reads still require a stencil, scatter, or ordered schedule. OpenCL and Level Zero staged
+maps also use target-specific invocation markers selected by the emitter, rather than leaking a
+Level Zero runtime call into an OpenCL program.
 
 Effect-only pointwise maps now use the same orthogonal contract for several outputs. `map2!` and
 independent multi-store `map-void!` bodies become one tuple-valued TypedSOAC `map`: fresh logical
@@ -144,9 +146,12 @@ map-void bodies retain the compatibility generator. The front end refuses duplic
 uncontracted scatter indices, sibling write/read ordering, and atomics. A destination wrapped in
 `par/unique-index` carries an explicit caller proof of conflict freedom into a TypedSOAC `scatter`;
 the marker is consumed before scalar lowering, while the checked read/write storage contract and
-guarded indexed store remain visible to scheduling and ABI construction. Shared scalar work now remains one
-explicit ordered local-SSA spine inside the tuple map's scalar region; each definition has a dtype
-retained from walker/TypedClojure facts, and local binders never become fake program inputs.
+guarded indexed store remain visible to scheduling and ABI construction. Shared scalar work now
+remains one explicit ordered local-SSA spine inside the tuple map's scalar region; nested lexical
+scopes are alpha-renamed into that spine, each definition has a dtype retained from
+walker/TypedClojure facts, and local binders never become fake program inputs. Closed-core integer
+`case*` dispatch is projected into exact typed conditional expressions before scheduling; hash
+dispatch maps and switch metadata never reach KernelBody or a target emitter.
 Validation proves definition order and lexical closure, and the front end expands locals only for
 I/O discovery. A direct sibling-destination read still preserves imperative store ordering and
 declines the functional tuple map, while a typed local may snapshot any destination before the
