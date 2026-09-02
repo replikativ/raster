@@ -51,30 +51,31 @@
       (is (string? (:source kernel)))
       ;; OpenCL-specific syntax
       (is (str/includes? (:source kernel) "__kernel void"))
-      (is (str/includes? (:source kernel) "get_global_id(0)"))
-      (is (str/includes? (:source kernel) "get_global_size(0)"))
+      (is (str/includes? (:source kernel) "get_group_id(0)"))
+      (is (str/includes? (:source kernel) "get_local_id(0)"))
       (is (str/includes? (:source kernel) "__global const double* restrict"))
-      (is (str/includes? (:source kernel) "__global double* restrict out"))
+      (is (str/includes? (:source kernel) "__global double* out"))
       ;; Must NOT have CUDA syntax
       (is (not (str/includes? (:source kernel) "blockIdx")))
       (is (not (str/includes? (:source kernel) "__global__")))
       (is (not (str/includes? (:source kernel) "extern \"C\"")))
       ;; Check parameter lists
-      (is (= 2 (count (kart/attribute kernel :array-params))))
+      (is (= 3 (count (kart/attribute kernel :array-params))))
       (is (= '[a b out _n_bound] (mapv :name (:abi kernel))))
       (is (= [:input :input :output :scalar] (mapv :kind (:abi kernel))))
       (is (= '[a b out n] (:arguments kernel)))
       (is (= :double (kart/attribute kernel :dtype)))
-      (is (= :segmap (get-in kernel [:provenance :dialect])))
+      (is (= :kernel-body (get-in kernel [:provenance :dialect])))
+      (is (= :kernel-body (kart/attribute kernel :emission-route)))
       (is (= [256] (get-in kernel [:launch :workgroup-size]))))))
 
 (deftest generate-segmap-kernel-scalar-test
   (testing "Map with scalar parameter"
     (let [form '(raster.par/map! out i n double (* alpha (aget a i)))
-          kernel (emitted-map form)]
+          kernel (emitted-map form :scalar-types {'alpha :double 'n :int})]
       (is (kart/kernel-artifact? kernel))
       (is (str/includes? (:source kernel) "alpha"))
-      (is (= 1 (count (kart/attribute kernel :array-params))))
+      (is (= 2 (count (kart/attribute kernel :array-params))))
       (is (= '[a out alpha _n_bound] (mapv :name (:abi kernel))))
       (is (= [:double :double :double :int] (mapv :dtype (:abi kernel)))))))
 
@@ -222,7 +223,9 @@
 (deftest opencl-pass-reduce-test
   (testing "par/reduce gets replaced with the ordered registered reduction marker"
     (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
-          form (list 'raster.par/reduce 'acc 0.0 'i 'n (list '+ 'acc product))
+          form (with-meta
+                 (list 'raster.par/reduce 'acc 0.0 'i 'n (list '+ 'acc product))
+                 {:raster.type/elem-type :float})
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
       (is (= 1 (:ze-reduces (:stats result))))
@@ -234,8 +237,10 @@
              (mapv :name (:abi (first (:kernels result))))))))
   (testing "reduce-into supplies its resident result at the same ordered ABI slot"
     (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
-          form (list 'raster.par/reduce-into 'obuf 'acc 0.0 'i 'n
-                     (list '+ 'acc product))
+          form (with-meta
+                 (list 'raster.par/reduce-into 'obuf 'acc 0.0 'i 'n
+                       (list '+ 'acc product))
+                 {:raster.type/elem-type :float})
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
       (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel

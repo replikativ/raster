@@ -21,11 +21,10 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
-            [raster.compiler.ir.soac]
-            [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.runtime.hardware :as hw]
             [clojure.set :as set]))
 
@@ -361,8 +360,6 @@
     (max 8 (* 2 (int (hw/simd-lanes :cpu:0 :double))))
     (catch Exception _ 8)))
 
-(def ^:private segop-id-counter (atom 0))
-
 (def ^:dynamic *bound-segops*
   "SegOps owned by the ParallelProgram equation currently being transformed, or nil for direct
    S-expression callers. Consumption is dtype-guarded."
@@ -401,7 +398,11 @@
                                     dtype (or (:elem-type par-info)
                                               (cast->elem-type (:cast par-info))
                                               (out-sym->elem-type (:out par-info))
-                                              :double)]
+                                              :double)
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     (:out par-info) form
+                                     {:target-device :cpu:0 :dtype dtype})]
                                 (when (System/getProperty "raster.debug.simd-dtype")
                                   (binding [*out* *err*]
                                     (println "[par-simd] compatibility dtype=" dtype
@@ -411,11 +412,7 @@
                                              " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
                                                              (:tag (meta (:out par-info)))))))
                                 (swap! stats update :segop-relowered (fnil inc 0))
-                                (let [soac (raster.compiler.ir.soac/par-form->soac
-                                            (:out par-info) form (swap! segop-id-counter inc))
-                                      segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                              soac :cpu:0 :dtype dtype)]
-                                  (first segops)))
+                                (first (:operations scheduled)))
                               ;; A structured unsupported-form refusal may fall back to scalar code.
                               ;; Raw implementation exceptions must escape, as on the GPU boundary.
                               (catch clojure.lang.ExceptionInfo _ nil))))
@@ -424,13 +421,12 @@
                             (try
                               (let [par-info (par/extract-par-reduce-info form)
                                     dtype (or (:elem-type par-info) :double)
-                                    sym (gensym "red_")]
+                                    sym (gensym "red_")
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     sym form {:target-device :cpu:0 :dtype dtype})]
                                 (swap! stats update :segop-relowered (fnil inc 0))
-                                (let [soac (raster.compiler.ir.soac/par-form->soac
-                                            sym form (swap! segop-id-counter inc) :dtype dtype)
-                                      segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                              soac :cpu:0 :dtype dtype)]
-                                  (first segops)))
+                                (first (:operations scheduled)))
                               (catch clojure.lang.ExceptionInfo _ nil))))
           transform
           (fn transform [form]

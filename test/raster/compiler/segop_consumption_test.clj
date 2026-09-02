@@ -12,6 +12,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
@@ -58,7 +59,8 @@
             lower-soac — observable because compute-launch-params asks the descriptor for THAT id"
     (let [calls (atom [])
           orig raster.compiler.passes.parallel.soac-lower/lower-soac]
-      (with-redefs [raster.compiler.passes.parallel.soac-lower/lower-soac
+      (with-redefs [typed-frontend/form->program (fn [& _] nil)
+                    raster.compiler.passes.parallel.soac-lower/lower-soac
                     (fn [soac device-id & opts] (swap! calls conj device-id) (apply orig soac :ze:0 opts))]
         (op/opencl-pass map-form :device-id :ze:1 :dtype :double :min-elements 0))
       (is (= [:ze:1] @calls) (str "lower-soac was called with " @calls ", not the pass's device-id")))))
@@ -117,7 +119,8 @@
 
 (deftest jvm-simd-does-not-turn-an-implementation-bug-into-scalar-fallback
   (testing "an unstructured re-lowering exception is a compiler bug, not an unsupported SIMD form"
-    (with-redefs [soac/par-form->soac
+    (with-redefs [typed-frontend/form->program (fn [& _] nil)
+                  soac/par-form->soac
                   (fn [& _] (throw (NullPointerException. "simulated SIMD lowering bug")))]
       (is (thrown-with-msg? NullPointerException #"simulated SIMD lowering bug"
                             (run-simd map-form))))))

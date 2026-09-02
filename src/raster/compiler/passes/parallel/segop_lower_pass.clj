@@ -18,6 +18,7 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
 
@@ -480,9 +481,36 @@
    only for public backend APIs that are invoked directly in tests or tools, keeping all source
    interpretation in the middle end rather than duplicating `par-form->soac` inside emitters."
   [result-id source opts]
-  (let [host-source (list 'let* [result-id source] result-id)
-        {scheduled :form stats :stats} (segop-lower-pass host-source opts)
-        equation (program/equation-for-binding scheduled result-id source)]
+  (let [;; Imperative map callers commonly pass the destination as their nominal result ID. Give
+        ;; the host result its own value identity so the typed frontend can represent the declared
+        ;; result-to-storage alias without conflating it with the caller-owned buffer.
+        physical-map-output (when (par/par-map-form? source)
+                              (:out (par/extract-par-map-info source)))
+        host-result (if (= result-id physical-map-output)
+                      (gensym "direct_parallel_result_")
+                      result-id)
+        host-source (list 'let* [host-result source] host-result)
+        typed-candidate
+        (try
+          (typed-frontend/form->program
+           (typed-frontend/normalize-source host-source)
+           {:dtype (or (:dtype opts) :double)
+            :array-types (:array-types opts)
+            :scalar-types (:scalar-types opts)})
+          (catch clojure.lang.ExceptionInfo exception
+            (when-not (typed-frontend/source-decline? exception)
+              (throw exception))
+            nil))
+        ;; The compatibility return value exposes one operation, not a mini-program. Source
+        ;; normalization may introduce host scalar equations (notably a hoisted compound extent);
+        ;; using only the parallel equation would leave those SSA values unbound in the caller.
+        ;; Keep such sites on compatibility lowering until this API returns the complete envelope.
+        typed (when (= 1 (count (soac-dialect/equations typed-candidate))) typed-candidate)
+        {scheduled :form stats :stats}
+        (segop-lower-pass (if typed (typed-route/program-envelope typed) host-source) opts)
+        ;; Compound extents may introduce a preceding host-scalar equation. Select the one
+        ;; scheduled parallel equation rather than assuming it is first in program order.
+        equation (some #(when (seq (:operations %)) %) (:equations scheduled))]
     {:program scheduled
      :equation equation
      :operations (:operations equation)

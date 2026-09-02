@@ -9,7 +9,6 @@
    par form vocabulary but produce different target code."
   (:require [clojure.set :as set]
             [raster.compiler.ir.par :as par]
-            [raster.compiler.ir.soac]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -19,7 +18,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.passes.parallel.soac-lower]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -68,8 +67,6 @@
                                    (when-let [dt (dtype/dtype-for-array-tag t)]
                                      [p (if (#{:float :double} dt) dtype dt)]))
                                  (map vector params tags)))}))
-
-(def ^:private segop-id-counter (atom 0))
 
 (def ^:private fatal-reasons
   "A violated invariant is not \"the SegOp path does not cover this form\". Letting one fall through
@@ -132,15 +129,19 @@
    available; otherwise re-lowered here with the REAL `device-id` (it was `:ze:0` hardcoded) and
    counted as `:segop-relowered`. SegMap is a full conversion: a missing rule is an illegal
    operation, never permission to select a second emitter."
-  [stats form dtype device-id]
+  [stats form dtype device-id scalar-types array-types]
   (or (take-bound-segop stats :segmap #(instance? raster.compiler.ir.segop.SegMap %))
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segmap form dtype :none
                              #(let [par-info (par/extract-par-map-info form)
-                                    soac (raster.compiler.ir.soac/par-form->soac
-                                          (:out par-info) form (swap! segop-id-counter inc))]
-                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     (:out par-info) form
+                                     {:target-device (or device-id :ze:0)
+                                      :dtype (or dtype :double)
+                                      :scalar-types scalar-types
+                                      :array-types array-types})]
+                                (first (:operations scheduled))))
               (let [decline (last (:segop-declined @stats))]
                 (throw (ex-info "par/map! remains illegal after full SegOp conversion"
                                 {:reason :illegal-op-remains
@@ -154,16 +155,18 @@
 (defn- par->segred
   "The SegRed for a par/reduce form. Reduction is a FULL conversion: absence is an illegal
    operation at the SegOp boundary, never permission to select a second emitter."
-  [stats form dtype device-id]
+  [stats form dtype device-id scalar-types array-types]
   (or (take-bound-segop stats :segred #(instance? raster.compiler.ir.segop.SegRed %))
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segred form dtype :none
                              #(let [sym (gensym "red_")
-                                    soac (raster.compiler.ir.soac/par-form->soac
-                                          sym form (swap! segop-id-counter inc)
-                                          :dtype (or dtype :double))]
-                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     sym form {:target-device (or device-id :ze:0)
+                                               :dtype (or dtype :double)
+                                               :scalar-types scalar-types
+                                               :array-types array-types})]
+                                (first (:operations scheduled))))
               (let [decline (last (:segop-declined @stats))]
                 (throw (ex-info "par/reduce remains illegal after full SegOp conversion"
                                 {:reason :illegal-op-remains
@@ -428,17 +431,27 @@
 
             ;; === par/map! — SegOp path ===
             (par/par-map-form? form)
-            (let [{:keys [bound out]} (par/extract-par-map-info form)]
+            (let [{:keys [bound]} (par/extract-par-map-info form)]
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
-                (let [segmap (par->segmap stats form dtype device-id)
-                      kernel (segop-cl/generate-segmap-kernel
-                              segmap out
+                (let [segmap (par->segmap stats form dtype device-id
+                                          top-scalar-types top-array-types)
+                      ;; Physical storage and effects come exclusively from the scheduled SegMap.
+                      ;; A dense map has one logical result; an offset map is an explicit-store
+                      ;; unique scatter and therefore uses the effect-only ABI/marker.
+                      kernel (segop-cl/generate-scheduled-segmap-kernel
+                              segmap
                               :dtype dtype :scalar-types top-scalar-types
                               :array-types (merge top-array-types (:array-types (meta form))))
-                      k (register-kernel! kernel :ze-maps)]
-                  (emit-map-invocation k device-id))))
+                      k (register-kernel! kernel :ze-maps)
+                      result-count (count (filter #(= :result (:role %)) (:abi k)))]
+                  ;; The compatibility map marker models exactly one returned buffer. A fused
+                  ;; multi-output map and an effect-only scatter are both already fully described
+                  ;; by the artifact ABI, so use the general resident-effect marker for them.
+                  (if (= 1 result-count)
+                    (emit-map-invocation k device-id)
+                    (emit-map-void-invocation k device-id)))))
 
             ;; === par/contract — tensor contraction, routed through the DPAS legality gate ===
             ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX
@@ -556,7 +569,8 @@
             ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
             (par/par-reduce-into-form? form)
             (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info form)
-                  segred (par->segred stats reduce-form dtype device-id)
+                  segred (par->segred stats reduce-form dtype device-id
+                                      top-scalar-types top-array-types)
                   kernel (segop-cl/generate-segred-kernel
                           segred out-buf :dtype dtype :scalar-types top-scalar-types
                           :array-types top-array-types)
@@ -569,7 +583,8 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce form))
-                (let [segred (par->segred stats form dtype device-id)
+                (let [segred (par->segred stats form dtype device-id
+                                          top-scalar-types top-array-types)
                       kernel (segop-cl/generate-segred-kernel
                               segred nil :dtype dtype :scalar-types top-scalar-types
                               :array-types top-array-types)
@@ -579,7 +594,8 @@
             ;; Typed segmented product reduction. The portable schedule is one deterministic
             ;; workgroup tree per segment; mixed result components remain separate ABI buffers.
             (par/par-product-reduce-form? form)
-            (let [segred (par->segred stats form dtype device-id)
+            (let [segred (par->segred stats form dtype device-id
+                                      top-scalar-types top-array-types)
                   kernel (segop-cl/generate-product-reduction-kernel
                           segred :scalar-types top-scalar-types :array-types top-array-types)
                   k (register-kernel! kernel :ze-reduces)]

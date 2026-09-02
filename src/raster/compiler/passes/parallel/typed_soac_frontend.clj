@@ -25,6 +25,30 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :front-end :analyzed-source))))
 
+(def source-decline-reasons
+  "Structured analysis failures that mean source lies outside the closed TypedSOAC subset."
+  #{:unsupported-scalar-binding
+    :source-value-conflict
+    :scan-dtype-unsupported
+    :scan-not-associative
+    :scan-not-elementwise
+    :scan-element-impure-or-unknown
+    :scan-nonidentity-init
+    :reduction-dtype-unsupported
+    :reduction-not-associative
+    :reduction-not-elementwise
+    :reduction-element-impure-or-unknown
+    :reduction-nonidentity-init
+    :typed-soac-production-subset
+    :typed-soac-stable-read-alias
+    :typed-soac-syntax
+    :typed-soac-unbound-scalar
+    :typed-soac-unknown-value})
+
+(defn source-decline?
+  [exception]
+  (contains? source-decline-reasons (:reason (ex-data exception))))
+
 (defn- extract-io
   [body index outputs & {:keys [accumulator]}]
   (let [inputs (par/collect-aget-arrays body)

@@ -233,8 +233,8 @@
                      (tree-seq seq? seq form)))
           "No par forms should remain"))))
 
-(deftest offset-map-falls-back-with-correct-destination-indices
-  (testing "a compatibility refusal retains out[base+i] semantics on the JVM"
+(deftest direct-offset-map-uses-the-shared-typed-schedule
+  (testing "a direct backend call retains out[base+i] semantics through shared scheduling"
     (let [source '(let* [out (double-array [99.0 99.0 99.0 99.0 99.0 99.0])
                          x (double-array [10.0 11.0 12.0])
                          base 2
@@ -242,7 +242,10 @@
                         (raster.par/map! out i n :offset base double (aget x i)))
           {:keys [form stats]} (par-simd/simd-pass source :min-elements 0)
           result (eval form)]
-      (is (= 1 (:fallback stats)))
+      (is (= 1 (:fallback stats))
+          "the typed unique-scatter has no JVM vector-store schedule yet")
+      (is (= 1 (:segop-relowered stats))
+          "the direct API records its one middle-end compatibility scheduling request")
       (is (= [99.0 99.0 10.0 11.0 12.0 99.0] (vec result))))))
 
 ;; ================================================================

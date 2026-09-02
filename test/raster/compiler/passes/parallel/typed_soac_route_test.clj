@@ -769,7 +769,9 @@
     (is (nil? (get-in jvm [:stats :segop-relowered])))
     (is (= [:input :input :output :output :scalar]
            (mapv :kind (:abi kernel))))
-    (is (re-find #"__global float\* restrict [uv]" (:source kernel)))))
+    (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+    (is (re-find #"__global float\* [uv]" (:source kernel))
+        "the scheduled multi-result body, not the single-result compatibility emitter, owns storage")))
 
 (deftest typed-horizontal-fusion-combines-distinct-materialized-write-boundaries
   (let [source '(let* [u (raster.par/map! u-out i n float

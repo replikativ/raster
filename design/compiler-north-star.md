@@ -65,8 +65,9 @@ SSA-like result IDs, `AbstractValue` contracts, effects, diagnostics, and proven
 GPU and JVM backends consume the recorded operations; the source expression is retained only to
 reconstruct scalar host control around them. The `:segop-lowered` validator performs a full
 operation/type legality check, and source equality invalidates an equation after a backend-local
-rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
-path.
+rewrite. Direct calls to a backend may still request explicit, counted compatibility scheduling,
+but that request now crosses the shared SegOp middle-end boundary; JVM and OpenCL emitters no
+longer construct legacy SOAC nodes themselves.
 
 The typed map/reduction vertical is now production-routed for supported programs whether or not a
 fusion fires. Unsupported source remains deliberately unfused for compatibility lowering; it can
@@ -1127,7 +1128,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
    memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
    C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC
-   reconstruction is deleted. Additional atomic monoids, privatized histogram schedules, nested
+   reconstruction is deleted. Direct JVM and GPU compatibility entry points use one middle-end
+   singleton adapter that attempts analyzed-source→TypedSOAC first and falls back only for an exact
+   structured source-admission decline. Scheduled SegMap storage selects the runtime marker from
+   the emitted ABI: dense single-result maps remain value-producing, while unique scatters and
+   fused multi-result maps use the general effect marker without reconstructing destination facts
+   from source. Additional atomic monoids, privatized histogram schedules, nested
    structured C/SIMD sites, the remaining parallel forms, calibrated whole-graph placement costs,
    and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
