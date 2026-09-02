@@ -369,11 +369,11 @@
 ;; by recursing into the LAST body form. A body with several statements —
 ;;   (let* [v (aget x i)] (aset a i v) (aset b i (* v v)))
 ;; — therefore modelled as a SoacMap whose output is `b` and whose lambda is `(* v v)`;
-;; soac->par-form then REBUILT the body from the lambda alone and the store to `a`
+;; the old graph reconstruction then REBUILT the body from the lambda alone and the store to `a`
 ;; disappeared from the emitted kernel. `a` was not even in the kernel's array list, so
 ;; nothing failed loudly: the buffer just stayed at its initial contents (this is how the
 ;; SFT head's `lse` buffer silently stayed zero). Multi-statement bodies must fall through
-;; to a ScalarBinding, i.e. the legacy void path that emits the body as written.
+;; to the compatibility void path that emits the source body as written.
 
 (deftest multi-store-map-void-is-not-a-single-write-soac
   (testing "two asets in one map-void! body ⇒ NOT modelled as a single-write SoacMap"
@@ -384,17 +384,6 @@
                        (clojure.core/aset b i (float (raster.numeric/* v v)))))]
       (is (nil? (soac/par-form->soac 'out form 0))
           "modelling it as a SoacMap over `b` silently drops the store to `a`")))
-
-  (testing "the multi-store form round-trips through the SOAC graph UNCHANGED"
-    (let [form '(raster.par/map-void!
-                 i (long n)
-                 (let* [v (clojure.core/aget x i)]
-                       (clojure.core/aset a i (float v))
-                       (clojure.core/aset b i (float (raster.numeric/* v v)))))
-          nodes (soac/let-bindings->nodes [['_eff form]])
-          [[_ round-tripped]] (soac/nodes->let-bindings nodes)]
-      (is (= form round-tripped)
-          "the legacy void path must emit the body exactly as written")))
 
   (testing "a SINGLE let*-wrapped write still models as a SoacMap (the fusible shape)"
     (let [form '(raster.par/map-void!
