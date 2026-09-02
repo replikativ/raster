@@ -721,6 +721,23 @@
                (scalar-body-operations (:operations operation)))))
    operations))
 
+(defn- scalar-expressions
+  [value]
+  (when (record-kind? "ScalarExpr" value)
+    (cons value (mapcat scalar-expressions (:arguments value)))))
+
+(defn- trapping-arithmetic-requirements
+  [operations]
+  (->> operations
+       (filter #(record-kind? "ScalarCompute" %))
+       (mapcat #(scalar-expressions (:expression %)))
+       (keep (fn [expression]
+               (when (= :trap (get-in expression [:options :overflow]))
+                 [(intrinsics/canonical (:op expression))
+                  (dtype/canon (:result-type expression))])))
+       distinct
+       (sort-by pr-str)))
+
 (defn- scalar-defined-ids
   [operations]
   (mapcat
@@ -914,13 +931,11 @@
         (str "(" (target-type operand-type) ")((" unsigned-type ")(" (first arguments)
              ") " (:op lowering) " (" unsigned-type ")(" (second arguments) "))"))
 
-      ;; The target-neutral dialect can retain trapping source semantics before every C-family
-      ;; target has a checked-arithmetic helper. Never weaken a requested trap to C signed UB.
+      ;; A checked helper first proves representability in unsigned arithmetic.  It only evaluates
+      ;; the signed operation on the safe branch, so the check itself cannot introduce C signed UB.
       (= :trap overflow-policy)
-      (throw (ex-info "C-family target has no trapping integer arithmetic lowering"
-                      {:reason :kernel-body-c-intrinsic-overflow
-                       :dialect (:id *scalar-dialect*) :operation op
-                       :operand-type operand-type :overflow overflow-policy}))
+      (str (c-dialect/trapping-arithmetic-name *scalar-dialect* op operand-type)
+           "(" (str/join ", " arguments) ")")
 
       ;; The shared C descriptor uses the floating spelling. OpenCL integer min/max are distinct
       ;; overloads, so target spelling must retain the verified operand dtype.
@@ -1694,7 +1709,12 @@
         helper-source
         (c-dialect/helper-source
          *scalar-dialect*
-         (str (when (and (c-dialect/opencl? *scalar-dialect*)
+         (str (apply str
+                     (map (fn [[operation type]]
+                            (c-dialect/trapping-arithmetic-helper-source
+                             *scalar-dialect* operation type))
+                          (trapping-arithmetic-requirements operations)))
+              (when (and (c-dialect/opencl? *scalar-dialect*)
                          (str/includes? operation-source "atomic_add_float("))
                 ce/opencl-atomic-add-float-helper)
               (ce/intrinsic-helper-sources operation-source

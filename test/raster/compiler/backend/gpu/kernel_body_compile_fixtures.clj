@@ -315,6 +315,10 @@
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "trapping-arithmetic"
+                          (body-emit/emit-scalar-kernel
+                           "trapping_arithmetic" (body-fixtures/trapping-arithmetic-body)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "swizzled-workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "swizzled_workgroup_memory"

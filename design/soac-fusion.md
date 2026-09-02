@@ -103,9 +103,10 @@ models can refine a choice, while the typed program and numerical oracle constra
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain
    `:wrap` in scalar `KernelBody` SSA and C-family targets execute them through the corresponding
    unsigned representation. KernelBody now distinguishes `:trap` from compiler-certified
-   `:no-overflow`; C-family targets fail loudly for the former until checked helpers land, and only
-   locally proved schedule arithmetic uses the latter. Add range proofs for source-derived address
-   algebra before admitting ordinary integral operations for indexing, routing, and quantization.
+   `:no-overflow`; CUDA/HIP use checked target-trap helpers for the former, OpenCL targets decline
+   it because the language has no standard trap primitive, and only locally proved schedule
+   arithmetic uses the latter. Add range proofs for source-derived address algebra before admitting
+   ordinary integral operations for indexing, routing, and quantization.
 4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
    block movement without turning layouts into semantic tensor operators.
 5. Add independent numerical/property tests across aliases, mutation, fan-out, empty extents,

@@ -135,20 +135,23 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
-(defn- integer-arithmetic-kernel-body [overflow]
-  (body/make
-   {:id [:integer-arithmetic-test overflow]
-    :parameters [(body/->KernelParameter 'a :scalar :long [] nil nil :left)
-                 (body/->KernelParameter 'b :scalar :long [] nil nil :right)
-                 (body/->KernelParameter 'out :output :long [1] :global
-                                         (layout/row-major [1] :long) :result)]
-    :operations [(body/->ScalarCompute
-                  (body/value 'sum :long)
-                  (body/scalar-expression :+ :long ['a 'b] {:overflow overflow}))
-                 (body/->ScalarStore 'out [0] 'sum nil)]
-    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
-    :provenance {:dialect :test}
-    :attributes {:kind :scalar}}))
+(defn- integer-arithmetic-kernel-body
+  ([overflow]
+   (integer-arithmetic-kernel-body overflow :+ :long))
+  ([overflow operation type]
+   (body/make
+    {:id [:integer-arithmetic-test overflow operation type]
+     :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :left)
+                  (body/->KernelParameter 'b :scalar type [] nil nil :right)
+                  (body/->KernelParameter 'out :output type [1] :global
+                                          (layout/row-major [1] type) :result)]
+     :operations [(body/->ScalarCompute
+                   (body/value 'result type)
+                   (body/scalar-expression operation type ['a 'b] {:overflow overflow}))
+                  (body/->ScalarStore 'out [0] 'result nil)]
+     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+     :provenance {:dialect :test}
+     :attributes {:kind :scalar}})))
 
 (defn- wrapping-arithmetic-kernel-body []
   (integer-arithmetic-kernel-body :wrap))
@@ -318,14 +321,43 @@
                     (integer-arithmetic-kernel-body :no-overflow)
                     {:target-dialect target})]
         (is (str/includes? source "rstr_a + rstr_b")
-            "a proved in-range operation may use the target's signed instruction"))
+            "a proved in-range operation may use the target's signed instruction"))))
+  (testing "OpenCL C declines a contract for which the language has no standard trap primitive"
+    (doseq [target [:opencl-portable :opencl-intel]]
       (try
         (opencl/emit-scalar-kernel
          "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
          {:target-dialect target})
         (is false "trapping arithmetic must not silently become signed target overflow")
         (catch clojure.lang.ExceptionInfo exception
-          (is (= :kernel-body-c-intrinsic-overflow (:reason (ex-data exception)))))))))
+          (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))
+              (name target))))))
+  (doseq [[target compiler trap-spelling]
+          [[:cuda "nvcc" "asm volatile(\"trap;\")"]
+           [:hip "hipcc" "__builtin_trap()"]]]
+    (testing (str (name target) " checked helpers")
+      (doseq [[operation operation-name guard]
+              [[:+ "add" "~(ua ^ ub) & (ua ^ ur)"]
+               [:- "sub" "(ua ^ ub) & (ua ^ ur)"]
+               [:* "mul" "ma > (limit / mb)"]]
+              type [:byte :int :long]]
+        (let [source (opencl/emit-scalar-kernel
+                      "trapping_arithmetic"
+                      (integer-arithmetic-kernel-body :trap operation type)
+                      {:target-dialect target})
+              helper-name (str "rstr_trap_" operation-name "_"
+                               ({:byte "i8" :int "i32" :long "i64"} type))]
+          (is (str/includes? source (str helper-name "(rstr_a, rstr_b)")))
+          (is (str/includes? source guard))
+          (is (str/includes? source trap-spelling))
+          (is (= 2 (count (re-seq (re-pattern (str helper-name "\\(")) source)))
+              "one checked definition accompanies one typed call")))
+      (when (command-available? compiler)
+        (let [source (opencl/emit-scalar-kernel
+                      "trapping_arithmetic" (fixtures/trapping-arithmetic-body)
+                      {:target-dialect target})
+              {:keys [exit err]} (compile-c-family-source target source)]
+          (is (zero? exit) err))))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]
