@@ -107,20 +107,16 @@
       (is (not (re-find #"inout_result\[idx\] =" kernel-source))
           "a unique scatter must not acquire a second implicit dense store"))))
 
-(deftest direct-single-operation-does-not-drop-hoisted-scalar-equations
+(deftest direct-single-operation-refuses-to-drop-hoisted-scalar-equations
   (let [source '(raster.par/map! out i (* n stride) float (aget x i))
-        scheduled (slp/schedule-single-operation
-                   'out source
-                   {:dtype :float
-                    :array-types {'out :float 'x :float}
-                    :scalar-types {'n :long 'stride :long}})
-        operation (first (:operations scheduled))]
-    (is (nil? (:algorithm scheduled))
-        "the one-operation compatibility API cannot return a typed mini-program with host equations")
-    (is (= '(* n stride) (-> operation :space :dims first :bound)))
-    (is (not-any? #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
-                  (flatten operation))
-        "a hoisted SSA extent must never escape without its defining equation")))
+        opts {:dtype :float
+              :array-types {'out :float 'x :float}
+              :scalar-types {'n :long 'stride :long}}]
+    (try
+      (slp/schedule-single-operation 'out source opts)
+      (is false "a singleton projection must not discard its typed host prefix")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :direct-operation-requires-program (:reason (ex-data exception))))))))
 
 (deftest direct-mini-program-preserves-hoisted-scalar-equations
   (let [source '(raster.par/gather out x indices n stride)
@@ -141,6 +137,28 @@
            (-> operation :space :dims first :bound)))
     (is (some? (:source program))
         "the direct backend receives executable host control, not a source-free algorithm")))
+
+(deftest direct-backends-consume-the-complete-typed-mini-program
+  (let [source '(raster.par/map! out i (* n stride) float (aget x i))
+        opts [:dtype :float :min-elements 0
+              :array-types {'out :float 'x :float}
+              :scalar-types {'n :long 'stride :long}]
+        [gpu jvm]
+        (with-redefs [soac/par-form->soac
+                      (fn [& _]
+                        (throw (AssertionError. "legacy SOAC was constructed")))]
+          [(apply (requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+                  source :device-id :ze:0 opts)
+           (apply (requiring-resolve 'raster.compiler.backend.jvm.par-simd/simd-pass)
+                  source opts)])]
+    (doseq [{:keys [form stats]} [gpu jvm]]
+      (is (= :typed-soac (get-in stats [:direct-scheduling :route])))
+      (is (= 1 (get-in stats [:direct-scheduling :typed-scalar-equations])))
+      (is (some #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
+                (take-nth 2 (second form)))
+          "the hoisted extent remains an executable binding in the backend form"))
+    (is (zero? (get-in gpu [:stats :fallback])))
+    (is (zero? (get-in jvm [:stats :fallback])))))
 
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion

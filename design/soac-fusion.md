@@ -97,7 +97,9 @@ models can refine a choice, while the typed program and numerical oracle constra
    and specialized block-movement compatibility coverage with direct typed equations and schedules.
    RNG fill is now an ordinary typed map with wrapping SplitMix64 scalar SSA.
 2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
-   beta-reduce away type contracts.
+   beta-reduce away type contracts. Direct compound map extents now retain their typed host-scalar
+   prefix through GPU and JVM entry points; a singleton SegOp projection explicitly refuses such a
+   mini-program rather than falling back to legacy source lowering.
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain
    `:wrap` in scalar `KernelBody` SSA and C-family targets execute them through the corresponding
    unsigned representation; add `trap` and proved-no-overflow contracts before admitting ordinary

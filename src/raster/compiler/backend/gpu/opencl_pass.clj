@@ -18,6 +18,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -302,7 +303,12 @@
                  (and (par/par-gather-form? form)
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
-                      (:stride (par/extract-par-scatter-info form)))))
+                      (:stride (par/extract-par-scatter-info form)))
+                 ;; A compound source extent normalizes to a preceding typed scalar equation. It
+                 ;; cannot be projected as a closed SegMap without losing that SSA definition.
+                 (and (par/par-map-form? form)
+                      (not (soac-dialect/extent?
+                            (:bound (par/extract-par-map-info form)))))))
         direct-schedule
         (cond
           (and (nil? supplied-program) (form/binding-form? form))
