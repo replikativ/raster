@@ -12,17 +12,30 @@
    says to bind. This suite pins that every strategy stays consistent, and that the validator
    actually rejects each historical shape."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.passes.parallel.contract-route :as route]
-            [raster.compiler.passes.parallel.par-fusion :as pf]))
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.passes.parallel.contract-route :as route]))
 
 (defn- mm [m n k]
   (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
         (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
               (list 'aget 'B (list '+ (list '* 'l n) 'j)))))
 
-(defn- fused [mbody]
-  (let [b ['C (mm 128 256 64) 'out (list 'raster.par/map! 'out 't (* 128 256) nil mbody)]]
-    (second (:bindings (pf/fuse-contract-map b [])))))
+(defn- with-epilogue [epilogue]
+  (let [contract (assoc (vec (mm 128 256 64)) 1 'out)]
+    (apply list (concat contract [:epilogue epilogue]))))
+
+(def ^:private epilogues
+  {:activation {:acc 'acc :expr '(raster.math/exp acc) :dtype :float}
+   :bias {:acc 'acc :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
+          :operands [{:sym 'bias :dtype :float :map (axis-map/of-axes '[[j 256]])}]
+          :dtype :float}
+   :resid {:acc 'acc :expr '(raster.numeric/+ acc
+                                              (clojure.core/aget R (+ (* i 256) j)))
+           :operands [{:sym 'R :dtype :float :map (axis-map/of-axes '[[i 128] [j 256]])}]
+           :dtype :float}
+   :rowscale {:acc 'acc :expr '(raster.numeric/* acc (clojure.core/aget rs i))
+              :operands [{:sym 'rs :dtype :float :map (axis-map/of-axes '[[i 128]])}]
+              :dtype :float}})
 
 ;; ── every strategy's descriptor matches the kernel it describes ───────────────────────
 (deftest every-strategy-descriptor-is-consistent
@@ -36,8 +49,8 @@
     (is (= :portable-segred
            (:strategy (route/route-contraction
                        '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
-                          (* (aget A (+ (* (+ (* b 4) i) 5) l))
-                             (aget B (+ (* (+ (* b 5) l) 3) j))))
+                                             (* (aget A (+ (* (+ (* b 4) i) 5) l))
+                                                (aget B (+ (* (+ (* b 5) l) 3) j))))
                        :dtype :double))))
     ;; The source template remains an explicit correctness fallback only where no physical
     ;; operand layout can be proven (these deliberately unbound gather coordinates model that).
@@ -56,19 +69,13 @@
                                                            (* (aget A (+ (* i 8) l)) (aget B (+ (* l 4) j))))
                                      :dtype :byte)))))
   (testing "fused epilogues, including the operand-carrying shapes"
-    (doseq [[label body] [[:activation (list 'raster.math/exp (list 'aget 'C 't))]
-                          [:bias  (list 'raster.numeric/+ (list 'aget 'C 't)
-                                        (list 'aget 'bias (list 'mod 't 256)))]
-                          [:resid (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't))]
-                          [:rowscale (list 'raster.numeric/* (list 'aget 'C 't)
-                                           (list 'aget 'rs (list 'quot 't 256)))]]]
-      (is (= :dpas (:strategy (route/route-contraction (fused body) :dtype :half)))
+    (doseq [[label epilogue] epilogues]
+      (is (= :dpas (:strategy (route/route-contraction (with-epilogue epilogue) :dtype :half)))
           (str label " descriptor must validate")))))
 
 ;; ── the validator rejects each historical bug shape ──────────────────────────────────
 (deftest validator-rejects-the-bugs-that-actually-happened
-  (let [good (route/route-contraction (fused (list 'raster.numeric/+ (list 'aget 'C 't)
-                                                   (list 'aget 'bias (list 'mod 't 256))))
+  (let [good (route/route-contraction (with-epilogue (:bias epilogues))
                                       :dtype :half)]
     (testing "bug 2: dropping the epilogue's operand under-describes the kernel"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"pointer params"

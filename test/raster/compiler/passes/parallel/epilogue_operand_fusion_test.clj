@@ -9,7 +9,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.ir.axis-map :as am]
-            [raster.compiler.passes.parallel.par-fusion :as pf]
+            [raster.compiler.passes.parallel.typed-contraction-test-support :as typed-contract]
             [raster.compiler.passes.parallel.contract-route :as route]))
 
 (def ^:private M 128)
@@ -22,15 +22,18 @@
               (list 'aget 'B (list '+ (list '* 'l N) 'j)))))
 
 (defn- fuse [mbody]
-  (let [b ['C (mm) 'out (list 'raster.par/map! 'out 't (* M N) nil mbody)]]
-    (when-let [r (pf/fuse-contract-map b [])]
-      (let [fused (second (:bindings r))]
-        {:form fused :epilogue (:epilogue (apply hash-map (drop 5 fused)))}))))
+  (typed-contract/fuse-result-map
+   (mm) 'out (* M N) mbody
+   :array-types '{A :float B :float C :float out :float bias :float R :float rs :float}))
 
-(defn- store-line [fused]
-  (let [r (route/route-contraction fused :dtype :half)]
-    {:store (some #(when (str/includes? % "C[row*N+col] =") (str/trim %))
-                  (str/split-lines (:source r)))
+(defn- dpas-form [{:keys [form epilogue]}]
+  ;; The result transform computes in FP32 while the contraction stores FP16. Keep the transform
+  ;; discovered by TypedSOAC, and let the FP16 contraction route derive its own algebra certificate.
+  (apply list (concat (take 5 form) [:epilogue epilogue])))
+
+(defn- emitted-epilogue [fused]
+  (let [r (route/route-contraction (dpas-form fused) :dtype :half)]
+    {:source (:source r)
      :epi-ops (:epilogue-operands r)
      :declares (fn [sym] (str/includes? (:source r) (str "restrict " sym)))}))
 
@@ -52,25 +55,25 @@
 (deftest operand-carrying-epilogues-fuse-with-correct-indices
   (testing "per-column bias: operand map is [j], emitted index is bias[col]"
     (let [f (fuse (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'bias (list 'mod 't N))))
-          {:keys [store epi-ops declares]} (store-line (:form f))]
+          {:keys [source epi-ops declares]} (emitted-epilogue f)]
       (is (= '[bias] (mapv :sym (:operands (:epilogue f)))))
       (is (= (am/of-axes [['j N]]) (:map (first (:operands (:epilogue f))))))
-      (is (re-find #"bias\[[^]]*col" store))
+      (is (re-find #"bias\[[^]]*col" source))
       (is (= '[bias] epi-ops) "the descriptor must surface the extra kernel arg")
       (is (declares "bias") "…and the signature must declare it")))
   (testing "elementwise residual: full map, emitted index is R[row*N+col]"
     (let [f (fuse (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't)))
-          {:keys [store epi-ops]} (store-line (:form f))]
+          {:keys [source epi-ops]} (emitted-epilogue f)]
       (is (= (am/of-axes [['i M] ['j N]]) (:map (first (:operands (:epilogue f))))))
-      (is (re-find (re-pattern (str "R\\[[^]]*row[^]]*" N "[^]]*col")) store))
+      (is (re-find (re-pattern (str "R\\[[^]]*row[^]]*" N "[^]]*col")) source))
       (is (= '[R] epi-ops))))
   (testing "per-row scale: operand map is [i], emitted index is rs[row]"
     (let [f (fuse (list 'raster.numeric/* (list 'aget 'C 't) (list 'aget 'rs (list 'quot 't N))))
-          {:keys [store]} (store-line (:form f))]
-      (is (re-find #"rs\[[^]]*row" store))))
+          {:keys [source]} (emitted-epilogue f)]
+      (is (re-find #"rs\[[^]]*row" source))))
   (testing "an activation-only body still fuses, with no operands"
     (let [f (fuse (list 'raster.math/exp (list 'aget 'C 't)))
-          {:keys [epi-ops]} (store-line (:form f))]
+          {:keys [epi-ops]} (emitted-epilogue f)]
       (is (empty? (:operands (:epilogue f))))
       (is (empty? epi-ops)))))
 
@@ -101,7 +104,7 @@
           Bd (float-array (map #(float (* 0.05 (- (mod % 5) 2))) (range (* K N))))
           biasd (float-array (map #(float (* 0.02 (- (mod % 9) 4))) (range N)))
           run (fn [mbody extra]
-                (let [fused (:form (fuse mbody))
+                (let [fused (dpas-form (fuse mbody))
                       r (route/route-contraction fused :dtype :half)
                       out (mkbuf (* M N) :half)]
                   (reg! (:kernel-name r) {:source (:source r) :dtype :half})
@@ -126,5 +129,5 @@
 ;; — valid C, wrong number, silent — and no substitution mechanism can resolve it, because the spec
 ;; keeps one symbol namespace for three C-level roles (operand arrays and scalars become kernel
 ;; params; free axes become store-slot locals). The fix is `:operand-shadows-free-axis` in
-;; epilogue-legal?, plus a matching DECLINE in fuse-contract-map so fusion backs off to two kernels
+;; epilogue-legal?, plus a matching TypedSOAC decline so fusion backs off to two kernels
 ;; rather than the emitter throwing on a program that compiles today.

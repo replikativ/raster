@@ -15,7 +15,7 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
-            [raster.compiler.passes.parallel.par-fusion :as par-fusion]))
+            [raster.compiler.pipeline :as pipeline]))
 
 (def ^:private map-form
   '(let* [o (raster.par/map! O i 8192 nil (clojure.core/* (clojure.core/aget X i) 2.0))] o))
@@ -123,15 +123,22 @@
                             (run-simd map-form))))))
 
 (deftest fused-reduction-crosses-typed-soac-and-both-scheduled-backends
-  (let [source '(let* [tmp (raster.par/map! TMP i n nil
-                                            (* (clojure.core/aget X i)
-                                               (clojure.core/aget X i)))
+  (let [source '(let* [tmp (raster.par/pmap i n double
+                                            (double
+                                             ^double
+                                             (* (clojure.core/aget X i)
+                                                (clojure.core/aget X i))))
                        total (raster.par/reduce acc 0.0 j n
-                                                (+ acc (clojure.core/aget TMP j)))]
+                                                (+ acc (clojure.core/aget tmp j)))]
                       total)
-        fused (:form (par-fusion/par-fusion-pass source))
-        gpu-program (lowered fused)
-        cpu-program (lowered-cpu fused :double)
+        schedule (fn [target]
+                   (:form
+                    (pipeline/schedule-parallel-form
+                     source {:target-device target :dtype :double
+                             :array-types {'X :double}
+                             :scalar-types {'n :long}})))
+        gpu-program (schedule :ze:0)
+        cpu-program (schedule :cpu:0)
         equation (first (:equations gpu-program))
         gpu (run gpu-program)
         simd (run-simd cpu-program)
@@ -139,7 +146,7 @@
     (testing "fusion is preserved as a typed functional algorithm in the common envelope"
       (is (= 1 (count (:equations gpu-program))))
       (is (some? (:algorithm equation)))
-      (is (not-any? #{'TMP 'tmp} (flatten (:algorithm equation))))
+      (is (not-any? #{'tmp} (flatten (:algorithm equation))))
       (is (= :typed-soac (:algorithm-dialect (first (:operations equation))))))
     (testing "JVM SIMD consumes the SegRed derived from that algorithm"
       (is (= 1 (get-in simd [:stats :segop-reused])))

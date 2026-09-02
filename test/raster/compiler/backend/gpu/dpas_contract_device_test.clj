@@ -6,8 +6,10 @@
    tolerance. Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.passes.parallel.contract-route :as route]
+            [raster.compiler.passes.parallel.typed-contraction-test-support :as typed-contract]
             [raster.compiler.backend.gpu.segop-opencl :as sco])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -229,29 +231,33 @@
 
 ;; ── Q3: the fusion pass DISCOVERS the epilogue (contract → elementwise map ⇒ one kernel) ──
 (deftest fusion-pass-discovers-contract-epilogue
-  (let [pf (requiring-resolve 'raster.compiler.passes.parallel.par-fusion/fuse-contract-map)
-        route (requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
+  (let [route (requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
         M 128 N 128 K 64
         mm (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                  (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
                        (list 'aget 'B (list '+ (list '* 'l N) 'j))))
-        bindings ['C mm
-                  'out (list 'raster.par/map! 'out 't (* M N) nil
-                             (list 'raster.math/exp (list 'aget 'C 't)))]]
+        fuse (fn [body]
+               (typed-contract/fuse-result-map
+                mm 'out (* M N) body
+                :array-types '{A :float B :float C :float out :float R :float bias :float}))]
     (testing "contract + elementwise map collapse into ONE contract carrying an :epilogue"
-      (let [r (pf bindings [])
-            fused (second (:bindings r))
+      (let [r (fuse (list 'raster.math/exp (list 'aget 'C 't)))
+            fused (:form r)
             opts (apply hash-map (drop 5 fused))]
-        (is (= 1 (:fused r)))
-        (is (= 2 (count (:bindings r))) "4 bindings → 2: the intermediate is gone")
+        (is (= 1 (get-in r [:stats :vertical])))
+        (is (= 1 (count (dialect/equations (:program r))))
+            "the intermediate equation is gone")
         (is (= 'raster.par/contract (first fused)))
         (is (= 'out (second fused)) "the fused contraction writes the map's target directly")
         (is (some? (:epilogue opts)))
         (is (= (list 'raster.math/exp (:acc (:epilogue opts))) (:expr (:epilogue opts)))
             "the map body becomes the epilogue, with (aget C t) → the accumulator")))
     (testing "the routed descriptor reports the fusion and splices it into the store"
-      (let [fused (second (:bindings (pf bindings [])))
-            r (route fused :dtype :half)]
+      (let [fused (fuse (list 'raster.math/exp (list 'aget 'C 't)))
+            contract (apply list (concat (take 5 (:form fused))
+                                         [:epilogue (:epilogue fused)]))
+            r (route contract :dtype :half)]
+        (is (= :dpas (:strategy r)))
         (is (:fused-epilogue r))
         (is (re-find #"exp\(.*acc00\.s0" (:source r))
             "the epilogue must appear in the STORE slot, not a second kernel")))
@@ -260,13 +266,9 @@
       ;; index is decomposed into the contraction's free axes, so bias/residual/row-scale fuse.
       ;; See epilogue-operand-fusion-test for the full matrix; here we only pin that it no longer
       ;; refuses, so the two suites cannot drift apart.
-      (let [resid ['C mm
-                   'out (list 'raster.par/map! 'out 't (* M N) nil
-                              (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't)))]]
-        (is (some? (pf resid [])) "an elementwise residual operand fuses")))
+      (is (some? (fuse (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't))))
+          "an elementwise residual operand fuses"))
     (testing "REFUSAL that remains valid: an operand index we cannot decompose"
-      (let [bad ['C mm
-                 'out (list 'raster.par/map! 'out 't (* M N) nil
-                            (list 'raster.numeric/+ (list 'aget 'C 't)
-                                  (list 'aget 'bias (list 'mod 't 7))))]]
-        (is (nil? (pf bad [])) "an unrecognized stride must refuse, never guess")))))
+      (is (nil? (fuse (list 'raster.numeric/+ (list 'aget 'C 't)
+                            (list 'aget 'bias (list 'mod 't 7)))))
+          "an unrecognized stride must refuse, never guess"))))
