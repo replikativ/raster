@@ -13,7 +13,6 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.passes.parallel.contract-route :as route]
             [raster.core :refer [deftm]]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
@@ -71,13 +70,17 @@
   (let [contract (bias-epilogue-contract)
         compiled (compile-form contract)
         kernel (first (:kernels compiled))
+        dispatch (first (:dispatches compiled))
         marker (-> compiled :form second second)]
     (is (= :dpas (kart/attribute kernel :strategy)))
     (is (= '[A B out M N K bias] (mapv :name (:abi kernel))))
     (is (= [:input :input :output :scalar :scalar :scalar :input]
            (mapv :kind (:abi kernel))))
-    (testing "values appear in exactly the same order as ABI slots"
-      (is (= '[A B out 128 256 64 bias] (nth marker 2))))))
+    (testing "the selected artifact preserves its complete ABI while dispatch binds dynamic inputs"
+      (is (= '[A B out 128 256 64 bias] (:arguments kernel)))
+      (is (= 'raster.compiler.pipeline/invoke-scheduled-executable! (first marker)))
+      (is (= (:arguments (kdispatch/default-alternative dispatch)) (nth marker 3)))
+      (is (= '[A B out bias] (nth marker 3))))))
 
 (deftest codegen-only-routing-facts-remain-legal-and-observable
   (let [dp4a '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
@@ -91,8 +94,8 @@
       (is (= :int8x4 (kart/attribute kernel :packed)))
       (is (= [:byte :byte] (mapv :dtype (take 2 (:abi kernel)))))
       (is (= [:int :int] (mapv :kernel-dtype (take 2 (:abi kernel))))))
-    (testing "the ordinary two-input descriptor still emits the production marker"
-      (is (= 'raster.gpu.ze-runtime/invoke-registered-contraction!
+    (testing "the ordinary descriptor emits the production scheduled-executable boundary"
+      (is (= 'raster.compiler.pipeline/invoke-scheduled-executable!
              (-> compiled :form second second first))))))
 
 (deftest epilogue-scalars-occupy-their-real-signature-position
@@ -102,9 +105,13 @@
                                      :scalars [{:sym 'alpha :dtype :float}]}])
         compiled (compile-form contract)
         kernel (first (:kernels compiled))
+        dispatch (first (:dispatches compiled))
         marker (-> compiled :form second second)]
     (is (= '[A B C M N K alpha] (mapv :name (:abi kernel))))
-    (is (= '[A B C 128 256 64 alpha] (nth marker 2)))))
+    (is (= '[A B C 128 256 64 alpha] (:arguments kernel)))
+    (is (= 'raster.compiler.pipeline/invoke-scheduled-executable! (first marker)))
+    (is (= (:arguments (kdispatch/default-alternative dispatch)) (nth marker 3)))
+    (is (= '[A B C alpha] (nth marker 3)))))
 
 (deftest non-argument-pre-steps-remain-fail-loud
   (let [base {:strategy :probe
@@ -113,14 +120,13 @@
               :array-params '[A]
               :dtype :double :out-dtype :double :out-elems 1
               :wg [1 1] :grid [1 1] :scalar-args []}
-        contract (mm 1 1 1)]
-    (let [value [{:op :transpose}]
-          data (with-redefs [route/route-contraction
-                             (fn [& _] (assoc base :pre-steps value))]
-                 (thrown-data #(compile-form contract)))]
-      (is (= :raster/fatal (:reason data)))
-      (is (= [:pre-steps] (:unsupported-fields data)))
-      (is (= {:pre-steps value} (:unsupported-values data))))))
+        value [{:op :transpose}]
+        data (thrown-data
+              #((var op/ensure-contraction-marker-expressible!)
+                (assoc base :pre-steps value)))]
+    (is (= :raster/fatal (:reason data)))
+    (is (= [:pre-steps] (:unsupported-fields data)))
+    (is (= {:pre-steps value} (:unsupported-values data)))))
 
 (deftest runtime-rejects-an-abi-value-count-mismatch-before-touching-the-driver
   (let [kernel-name (str "abi_count_probe_" (gensym))

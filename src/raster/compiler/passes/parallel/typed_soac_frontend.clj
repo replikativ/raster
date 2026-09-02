@@ -739,48 +739,54 @@
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
    so the same expression remains visible to JVM materialization and runtime specialization."
   [source]
-  (if (and (seq? source) (contains? #{'let 'let*} (first source)))
-    (let [[head bindings & body] source
-          pairs (vec (partition 2 bindings))
-          {:keys [normalized]}
-          (reduce
-           (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
-             (let [expression (canonicalize-strided-indexed-operation ordinal expression)
-                   extent (parallel-extent expression)
-                   canonical-extent (some-> extent descriptor/unwrap-int-cast)]
-               (cond
-                 (nil? extent)
-                 (update state :normalized conj [symbol expression])
+  ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
+  ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
+  ;; deliberately requires one logical definition per value. Use the shared scope-aware
+  ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
+  ;; operation-description would disconnect host materialization from the semantic equation.
+  (let [source (util/uniquify-rebindings source)]
+    (if (and (seq? source) (contains? #{'let 'let*} (first source)))
+      (let [[head bindings & body] source
+            pairs (vec (partition 2 bindings))
+            {:keys [normalized]}
+            (reduce
+             (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
+               (let [expression (canonicalize-strided-indexed-operation ordinal expression)
+                     extent (parallel-extent expression)
+                     canonical-extent (some-> extent descriptor/unwrap-int-cast)]
+                 (cond
+                   (nil? extent)
+                   (update state :normalized conj [symbol expression])
 
-                 ;; Integral casts are representation noise, not new semantic dimensions.
-                 ;; Keeping their underlying value identity also prevents one array from
-                 ;; acquiring incompatible [n] and [(long n)] shapes across operations.
-                 (dialect/extent? canonical-extent)
-                 (update state :normalized conj
-                         [symbol (replace-parallel-extent expression canonical-extent)])
-
-                 (provably-pure-scalar? canonical-extent)
-                 (if-let [extent-id (get compound-extents canonical-extent)]
-                   ;; Equal pure extent expressions are one SSA value. Besides avoiding
-                   ;; redundant scalar work, this exposes equal launch geometry to the
-                   ;; general horizontal-fusion rule (for example two same-shaped views).
+                   ;; Integral casts are representation noise, not new semantic dimensions.
+                   ;; Keeping their underlying value identity also prevents one array from
+                   ;; acquiring incompatible [n] and [(long n)] shapes across operations.
+                   (dialect/extent? canonical-extent)
                    (update state :normalized conj
-                           [symbol (replace-parallel-extent expression extent-id)])
-                   (let [extent-id (with-meta
-                                     (clojure.core/symbol (str "rstr_extent_" ordinal))
-                                     {:tag 'long :raster.type/tag 'long})]
-                     (-> state
-                         (assoc-in [:compound-extents canonical-extent] extent-id)
-                         (update :normalized into
-                                 [[extent-id canonical-extent]
-                                  [symbol (replace-parallel-extent expression extent-id)]]))))
+                           [symbol (replace-parallel-extent expression canonical-extent)])
 
-                 :else
-                 (update state :normalized conj [symbol expression]))))
-           {:normalized [] :compound-extents {}}
-           (map-indexed vector pairs))]
-      (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
-    source))
+                   (provably-pure-scalar? canonical-extent)
+                   (if-let [extent-id (get compound-extents canonical-extent)]
+                     ;; Equal pure extent expressions are one SSA value. Besides avoiding
+                     ;; redundant scalar work, this exposes equal launch geometry to the
+                     ;; general horizontal-fusion rule (for example two same-shaped views).
+                     (update state :normalized conj
+                             [symbol (replace-parallel-extent expression extent-id)])
+                     (let [extent-id (with-meta
+                                       (clojure.core/symbol (str "rstr_extent_" ordinal))
+                                       {:tag 'long :raster.type/tag 'long})]
+                       (-> state
+                           (assoc-in [:compound-extents canonical-extent] extent-id)
+                           (update :normalized into
+                                   [[extent-id canonical-extent]
+                                    [symbol (replace-parallel-extent expression extent-id)]]))))
+
+                   :else
+                   (update state :normalized conj [symbol expression]))))
+             {:normalized [] :compound-extents {}}
+             (map-indexed vector pairs))]
+        (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+      source)))
 
 (defn- alength-array
   [expression]
