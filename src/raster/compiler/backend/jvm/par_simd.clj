@@ -5,8 +5,9 @@
   Compiles raster.par/reduce → SIMD horizontal reduction with 4 accumulators.
 
   Scheduled programs consume their checked SegOps and treat the retained dtype as authoritative.
-  Direct source callers use an explicit counted compatibility lowering; fusion belongs exclusively
-  to the typed functional middle end.
+  Typed direct source programs enter that same whole-program boundary when given a dtype; untyped
+  source callers retain an explicit counted compatibility lowering. Fusion belongs exclusively to
+  the typed functional middle end.
 
   Supports:
     - Arithmetic: +, -, *, /
@@ -374,7 +375,9 @@
 
   Options:
     :simd? — enable/disable SIMD (default true)
-    :min-elements — minimum elements for SIMD (default 8)"
+    :min-elements — minimum elements for SIMD (default 8)
+    :dtype — authoritative element dtype; enables whole-program direct scheduling
+    :array-types/:scalar-types/:values — optional retained compiler facts for that scheduling"
   [form & {:keys [simd? min-elements dtype scalar-types array-types values abstract-machine]
            :or {simd? true min-elements nil}}]
   (if-not simd?
