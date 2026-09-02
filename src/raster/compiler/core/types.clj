@@ -27,6 +27,23 @@
    'short   Short
    'char    Character})
 
+(defn literal-tag
+  "Primitive source-language tag for a literal value, or nil.
+
+   This is the shared non-contextual fact. Monomorphizing consumers may deliberately narrow a
+   floating literal later, but checked casts and typed scalar IR must start from the source value's
+   own JVM type."
+  [value]
+  (cond
+    (integer? value) 'long
+    (instance? Float value) 'float
+    (instance? Double value) 'double
+    (string? value) 'String
+    (boolean? value) 'boolean
+    (keyword? value) 'clojure.lang.Keyword
+    (char? value) 'char
+    :else nil))
+
 (def primitive-array-info
   "Primitive array type tag -> array class."
   {'doubles (Class/forName "[D")

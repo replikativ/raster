@@ -518,6 +518,17 @@
                   rt (or (signature-result-tag head arg-tags)  ; signature first
                          (descriptor/result-tag head arg-tags))]
               (if rt (vary-meta result assoc :raster.type/tag rt) result))
+            ;; Bare scalar arithmetic has already been typed by the central rewritten-form
+            ;; inference used for overload resolution. Retain that result on the analyzed form so
+            ;; TypedSOAC/KernelBody consumers do not reconstruct promotion from operand widths.
+            ;; This adds no operator/type table: descriptor/scalar-op? and infer-rewritten-tag are
+            ;; the existing authoritative classification and typing seam.
+            (and (symbol? head)
+                 (descriptor/scalar-op? head)
+                 (not (descriptor/cast-op? head)))
+            (if-let [rt (inf/infer-rewritten-tag result nil type-env)]
+              (vary-meta result assoc :raster.type/tag rt)
+              result)
             ;; Primitive cast — (double x), (float x), etc.
             (contains? types/primitive-info head)
             (vary-meta result assoc :raster.type/tag head)

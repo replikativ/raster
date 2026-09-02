@@ -221,7 +221,8 @@
 
 (deftest opencl-pass-reduce-test
   (testing "par/reduce gets replaced with the ordered registered reduction marker"
-    (let [form '(raster.par/reduce acc 0.0 i n (+ acc (* scale (aget a i))))
+    (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
+          form (list 'raster.par/reduce 'acc 0.0 'i 'n (list '+ 'acc product))
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
       (is (= 1 (:ze-reduces (:stats result))))
@@ -232,7 +233,9 @@
       (is (= '[a output scale _n_bound]
              (mapv :name (:abi (first (:kernels result))))))))
   (testing "reduce-into supplies its resident result at the same ordered ABI slot"
-    (let [form '(raster.par/reduce-into obuf acc 0.0 i n (+ acc (* scale (aget a i))))
+    (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
+          form (list 'raster.par/reduce-into 'obuf 'acc 0.0 'i 'n
+                     (list '+ 'acc product))
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
       (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
@@ -242,7 +245,8 @@
              (mapv :name (:abi (first (:kernels result)))))))))
 
 (deftest opencl-pass-full-contraction-reduction-uses-ordered-marker
-  (let [form '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i)))
+  (let [product (with-meta '(* (aget A i) (aget B i)) {:raster.type/tag 'float})
+        form (list 'raster.par/contract 'O [] '[[i 8]] product)
         result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float)
         kernel (first (:kernels result))]
     (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel

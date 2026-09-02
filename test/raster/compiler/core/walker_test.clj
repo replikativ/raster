@@ -96,6 +96,15 @@
             [_ init] (first bindings)]
         (is (= 'raster.numeric/+ (:raster.op/original (meta init))))))))
 
+(deftest bare-scalar-arithmetic-retains-the-central-inferred-result-type
+  (let [mixed (wb '(clojure.core/* (double scale) (clojure.core/aget x i))
+                  {'scale 'double 'x 'floats 'i 'long})
+        uniform (wb '(clojure.core/+ left right) {'left 'float 'right 'float})]
+    (is (= 'double (:raster.type/tag (meta mixed))))
+    (is (= 'float (:raster.type/tag (meta uniform))))
+    (is (nil? (:raster.op/original (meta mixed)))
+        "retaining an inferred type does not pretend that a bare core call was devirtualized")))
+
 (deftest walk-nested-let-test
   (testing "nested let bindings are walked"
     (let [walked (wb '(let [a (raster.numeric/+ x y)

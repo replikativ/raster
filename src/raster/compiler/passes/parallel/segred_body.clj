@@ -6,11 +6,12 @@
    padding, workgroup scratch, a barrier-separated binary tree, and one partial result per
    workgroup. Scalar expressions become typed SSA operations; target emitters never recover either
    the algorithm or schedule from Clojure source spelling. Unsupported scalar regions decline
-   structurally to the established emitter."
+   explicitly; scheduled graphs have no source-shaped target fallback."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -18,13 +19,6 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
-
-(def ^:private cast-heads
-  {'byte :byte, 'clojure.core/byte :byte
-   'int :int, 'clojure.core/int :int
-   'long :long, 'clojure.core/long :long
-   'float :float, 'clojure.core/float :float
-   'double :double, 'clojure.core/double :double})
 
 (defn- decline!
   [rule message data]
@@ -37,10 +31,31 @@
   [exception]
   (= :segred-kernel-body-declined (:reason (ex-data exception))))
 
+(defn- retained-expression-dtype
+  "Read the walker/TypedClojure result fact carried by a scalar expression.
+
+   This is intentionally not an inference rule: if a retained tag is present but outside the
+   portable scalar vocabulary, the scheduled reduction declines."
+  [expression]
+  (when (instance? clojure.lang.IObj expression)
+    (when-let [tag (types/sym-type-tag expression)]
+      (or (when (and (keyword? tag) (dtype/known? tag)) (dtype/canon tag))
+          (dtype/dtype-for-scalar-tag tag)
+          (decline! :scalar-result-dtype
+                    "KernelBody reduction cannot project the retained scalar result type"
+                    {:expression expression :retained-tag tag})))))
+
+(defn- source-value-dtype
+  [expression]
+  (or (retained-expression-dtype expression)
+      (when (number? expression)
+        (some-> expression types/literal-tag dtype/dtype-for-scalar-tag))))
+
 (defn- inline-scalar-bindings
   [expression]
   (if (and (seq? expression) (contains? #{'let 'let*} (first expression)))
     (let [[_ bindings & body] expression
+          pairs (vec (partition 2 bindings))
           initializers (vec (take-nth 2 (rest bindings)))]
       (when-not (= 1 (count body))
         (decline! :multi-expression-let
@@ -50,6 +65,14 @@
         (decline! :effectful-scalar-binding
                   "KernelBody scalar reduction cannot inline effectful scalar bindings"
                   {:expression expression}))
+      (doseq [[binding init] pairs
+              :let [binding-dtype (some-> binding types/sym-type-tag
+                                          dtype/dtype-for-scalar-tag)]
+              :when (and binding-dtype (not= binding-dtype (source-value-dtype init)))]
+        (decline! :typed-scalar-binding-conversion
+                  "KernelBody reduction cannot erase a typed scalar binding conversion"
+                  {:binding binding :binding-dtype binding-dtype :initializer init
+                   :initializer-dtype (source-value-dtype init)}))
       (recur (util/subst-syms (util/binding-env bindings) (first body))))
     expression))
 
@@ -57,7 +80,7 @@
   [value]
   (if (and (seq? value)
            (= 2 (count value))
-           (contains? cast-heads (first value))
+           (descriptor/cast-op? (first value))
            (number? (second value)))
     (second value)
     (case value
@@ -150,34 +173,32 @@
         [:nearest-even (if (= :half target) :ieee :exact)])
 
       (and (dtype/fp-dtype? source) (dtype/integral? target))
-      [:toward-zero :saturate]
+      (decline! :checked-scalar-cast
+                "KernelBody reduction cannot preserve a checked floating-to-integral cast"
+                {:source-dtype source :target-dtype target})
 
       (and (dtype/integral? source) (dtype/integral? target))
-      [:exact :wrap]
+      (if (< (dtype/bytes-of source) (dtype/bytes-of target))
+        [:exact :exact]
+        (decline! :checked-scalar-cast
+                  "KernelBody reduction cannot preserve a checked narrowing integral cast"
+                  {:source-dtype source :target-dtype target}))
 
       :else
       (decline! :scalar-cast
                 "KernelBody reduction has no explicit numerical cast policy"
                 {:source-dtype source :target-dtype target}))))
 
-(defn- promoted-dtype
-  [types]
-  (let [types (mapv dtype/canon types)
-        floating (filterv dtype/fp-dtype? types)
-        candidates (if (seq floating) floating types)]
-    (when-not (and (seq candidates) (every? dtype/known? candidates))
-      (decline! :scalar-promotion
-                "KernelBody reduction cannot promote unknown scalar dtypes"
-                {:types types}))
-    (apply max-key dtype/bytes-of candidates)))
-
 (defn lower-element-operations
   "Lower a scalar reduction element into typed SSA. coordinate-lower may translate a verified
    source-level flat array index into KernelBody index arithmetic; without it, this retains the
-   pointwise full-reduction contract. Mixed scalar arithmetic is widened explicitly and the final
-   element is narrowed to the accumulator dtype before it enters the certified monoid."
+   pointwise full-reduction contract. Mixed scalar arithmetic requires the walker/TypedClojure
+   result dtype retained on that expression. The lowered element must already match the certified
+   accumulator dtype; this pass never invents a final narrowing conversion. A typed region owner
+   may provide `declared-result-dtype` for the outer expression only; nested calls still require
+   their own retained facts."
   [expression {:keys [index coordinate dtype arrays scalars scalar-types coordinate-lower
-                      load-predicate load-other]}]
+                      load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         operations (atom [])
         counter (atom 0)
@@ -197,11 +218,16 @@
                             (body/cast-expression value target rounding overflow))
                            result target)))))
 
-            (lower [expression]
+            (lower [expression declared-dtype]
               (let [expression (inline-scalar-bindings expression)]
                 (cond
                   (number? expression)
-                  {:value (body/literal expression dtype) :dtype dtype}
+                  (if-let [literal-dtype (some-> expression types/literal-tag
+                                                 dtype/dtype-for-scalar-tag)]
+                    {:value (body/literal expression literal-dtype) :dtype literal-dtype}
+                    (decline! :scalar-literal-dtype
+                              "KernelBody reduction requires a primitive numeric literal"
+                              {:expression expression :class (class expression)}))
 
                   (symbol? expression)
                   (if (contains? scalars expression)
@@ -234,16 +260,38 @@
                               :cached)
                              result dtype)))
 
-                  (and (seq? expression) (contains? cast-heads (first expression))
+                  (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
-                  (cast! (lower (second expression)) (get cast-heads (first expression)))
+                  (let [target (dtype/dtype-for-scalar-tag
+                                (descriptor/cast-result-tag (first expression)))]
+                    ;; Clojure's integral casts are checked. KernelBody can describe a trapping
+                    ;; conversion, but the current C-family emitters intentionally reject it.
+                    ;; Refuse the source construct here instead of silently changing it to the
+                    ;; backend's wrap or saturate conversion.
+                    (when (dtype/integral? target)
+                      (decline! :checked-scalar-cast
+                                "portable reduction lowering cannot yet emit checked integral casts"
+                                {:expression expression :target-dtype target}))
+                    (cast! (lower (second expression) nil) target))
 
                   (seq? expression)
                   (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
                         intrinsic (intrinsics/descriptor operator)
                         arguments (vec (descriptor/call-args expression))
-                        typed-inputs (mapv lower arguments)
-                        result-dtype (promoted-dtype (mapv :dtype typed-inputs))]
+                        retained-dtype (or (retained-expression-dtype expression)
+                                           (some-> declared-dtype dtype/canon))
+                        _ (when-not retained-dtype
+                            (decline! :scalar-result-dtype
+                                      "scalar arithmetic requires its retained walker/TypedClojure result dtype"
+                                      {:expression expression :operator operator}))
+                        typed-inputs (mapv #(lower % nil) arguments)
+                        input-dtypes (mapv :dtype typed-inputs)
+                        result-dtype retained-dtype]
+                    (when (dtype/integral? result-dtype)
+                      (decline! :integral-scalar-arithmetic
+                                "portable reduction value arithmetic requires explicit overflow semantics"
+                                {:expression expression :operator operator
+                                 :result-dtype result-dtype}))
                     (when-not (and intrinsic
                                    (= (:arity intrinsic) (count arguments))
                                    (intrinsics/accepts-scalar-dtype? operator result-dtype)
@@ -263,7 +311,12 @@
                   (decline! :scalar-expression
                             "KernelBody element expression has an unsupported value"
                             {:expression expression :type (type expression)}))))]
-      (let [result (cast! (lower expression) dtype)]
+      (let [result (lower expression declared-result-dtype)]
+        (when-not (= dtype (:dtype result))
+          (decline! :element-result-dtype
+                    "KernelBody reduction element must match its certified accumulator dtype"
+                    {:expression expression :element-dtype (:dtype result)
+                     :accumulator-dtype dtype}))
         {:operations @operations :result (:value result)}))))
 (defn lower
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
@@ -312,6 +365,10 @@
         (lower-element-operations
          element
          {:index index :coordinate element-index :dtype dtype
+          ;; SegRed's certified scalar region declares the dtype of its outer element value. This
+          ;; authorizes only that result; nested calls still need retained walker/TypedClojure
+          ;; facts in lower-element-operations.
+          :declared-result-dtype dtype
           :arrays (set arrays) :scalars (set scalars)
           :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
           :coordinate-lower

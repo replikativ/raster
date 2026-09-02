@@ -127,6 +127,11 @@
         {:keys [operations result]}
         (segred-body/lower-element-operations
          element {:index reduced-index :coordinate reduced-index :dtype dtype
+                  ;; The verified contraction region declares the product result dtype even when
+                  ;; a synthetic surface fixture carries no walker metadata on its outer call.
+                  ;; This fact applies only to the region result; nested scalar calls remain typed
+                  ;; by their own retained source facts.
+                  :declared-result-dtype dtype
                   :arrays (set arrays) :scalars (set scalars)
                   :coordinate-lower element-coordinate-lower
                   :load-predicate active-mask

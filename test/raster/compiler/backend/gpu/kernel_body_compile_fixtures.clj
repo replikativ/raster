@@ -67,10 +67,12 @@
 
 (defn- reduction-artifact
   [dialect]
-  (let [form (with-meta
-               '(raster.par/reduce acc 0.0 i n
-                                   (+ acc (* (double scale)
-                                             (clojure.core/aget values i))))
+  (let [product (with-meta
+                  '(* (double scale) (clojure.core/aget values i))
+                  {:raster.type/tag 'double})
+        form (with-meta
+               (list 'raster.par/reduce 'acc 0.0 'i 'n
+                     (list '+ 'acc (list 'float product)))
                {:raster.type/elem-type :float})
         node (soac/par-form->soac 'result form 901 :dtype :float)
         operation (first (soac-lower/lower-reduce node nil :dtype :float))]

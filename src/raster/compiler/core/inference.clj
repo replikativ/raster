@@ -427,18 +427,8 @@
 ;; Literal type inference
 ;; ================================================================
 
-(def ^:private literal-type-tags
-  ;; Use instance? checks instead of float? (which is true for both Float and Double)
-  [[integer?                       'long]
-   [#(instance? Float %)           'float]
-   [#(instance? Double %)          'double]
-   [string?                        'String]
-   [boolean?                       'boolean]
-   [keyword?                       'clojure.lang.Keyword]
-   [char?                          'char]])
-
 (defn literal-tag [form]
-  (some (fn [[pred tag]] (when (pred form) tag)) literal-type-tags))
+  (types/literal-tag form))
 
 (defn floating-literal-tag
   "Type tag for a literal `form`, narrowing a bare floating (Double) literal to

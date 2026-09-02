@@ -7,7 +7,6 @@
    Once an operation is accepted, all value, effect and provenance facts are made explicit before
    fusion or scheduling sees it."
   (:require [clojure.set :as set]
-            [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -843,7 +842,7 @@
 
 (defn- canonicalize-scalar-folds
   [expression default-dtype]
-  (walk/postwalk
+  (util/postwalk-preserving-meta
    (fn [form]
      (if (par/par-reduce-form? form)
        (let [{:keys [acc init idx bound body elem-type]}
@@ -854,12 +853,14 @@
                          (scan/certify {:acc acc :init init :lambda body} fold-dtype)
                          (catch clojure.lang.ExceptionInfo _ nil)))]
          (if (and (symbol? acc) (symbol? idx) (dialect/scalar-literal? init))
-           (list 'fold
-                 (cond-> {:accumulator acc :index idx :identity init :dtype fold-dtype
-                          :extent bound
-                          :association (if algebra :implementation-defined :ordered)}
-                   algebra (assoc :algebra algebra))
-                 (dialect/lambda-form [acc idx] [body]))
+           (util/remake
+            form
+            'fold
+            (cond-> {:accumulator acc :index idx :identity init :dtype fold-dtype
+                     :extent bound
+                     :association (if algebra :implementation-defined :ordered)}
+              algebra (assoc :algebra algebra))
+            (dialect/lambda-form [acc idx] [body]))
            form))
        form))
    expression))
