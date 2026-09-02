@@ -366,6 +366,25 @@
       (with-meta (apply list children) m)
       (apply list children))))
 
+(defn postwalk-preserving-meta
+  "Bottom-up tree rewrite that preserves metadata on every rebuilt collection.
+
+   Quoted data is opaque. A replacement returned by `f` keeps its own metadata; metadata from the
+   replaced node is not incorrectly transferred onto a semantically different value."
+  [f expression]
+  (letfn [(go [form]
+            (f
+             (cond
+               (and (seq? form) (= 'quote (first form))) form
+               (seq? form) (remake-from form (map go form))
+               (vector? form) (with-meta (mapv go form) (meta form))
+               (map? form) (with-meta
+                             (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
+                             (meta form))
+               (set? form) (with-meta (into (empty form) (map go) form) (meta form))
+               :else form)))]
+    (go expression)))
+
 (defn call-head
   "Extract the head symbol from a call expression.
    Handles both direct calls (f x y) and .invk calls (.invk obj x y)."

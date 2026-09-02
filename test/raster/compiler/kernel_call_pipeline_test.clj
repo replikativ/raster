@@ -19,7 +19,7 @@
 (deftm resident-kernel-call-reduce
   [x :- (Array float) out :- (Array float) scale :- Double n :- Long] :- Void
   (let [sum (raster.par/reduce acc 0.0 i n
-                               (+ acc (* scale (ra/aget x i))))]
+                               (+ acc (float (* scale (ra/aget x i)))))]
     (raster.par/map-void! j n
                           (ra/aset out j (* (ra/aget x j) sum)))))
 

@@ -223,7 +223,7 @@
               [padded-in :int] [width :int] [_n_bound :int]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) padded-kernels))
         "the adapter changes layout indexing without changing the two-phase Q8_K representation")
-    (is (every? #(re-find #"col < .*width" (:source %)) padded-kernels)
+    (is (every? #(re-find #"col\).*<.*width" (:source %)) padded-kernels)
         "both phases guard dense-row reads and synthesize the padding region")
     (is (= 1 (count projection-kernels)))
     (is (= {:backend :opencl

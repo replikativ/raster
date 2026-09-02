@@ -302,8 +302,10 @@
       (is (re-find #"a\[" src)))))
 
 (deftest segred-emits-complete-ordered-typed-abi
-  (let [form (with-meta '(raster.par/reduce acc 0.0 i n
-                                            (+ (float acc) (* scale (clojure.core/aget a i))))
+  (let [product (with-meta '(* scale (clojure.core/aget a i))
+                  {:raster.type/tag 'float})
+        form (with-meta (list 'raster.par/reduce 'acc 0.0 'i 'n
+                              (list '+ (list 'float 'acc) product))
                {:raster.type/elem-type :float})
         s (soac/par-form->soac 'result form 0)
         segred (first (lower/lower-reduce s nil))
@@ -347,9 +349,12 @@
     (is (nil? (get-in artifact [:attributes :kernel-body-decline])))))
 
 (deftest mixed-floating-reduction-arithmetic-is-explicit-typed-ssa
-  (let [form (with-meta
-               '(raster.par/reduce acc 0.0 i n
-                                   (+ acc (* (double scale) (clojure.core/aget a i))))
+  (let [product (with-meta
+                  '(* (double scale) (clojure.core/aget a i))
+                  {:raster.type/tag 'double})
+        form (with-meta
+               (list 'raster.par/reduce 'acc 0.0 'i 'n
+                     (list '+ 'acc (list 'float product)))
                {:raster.type/elem-type :float})
         node (soac/par-form->soac 'result form 88 :dtype :float)
         operation (first (lower/lower-reduce node :ze:0 :dtype :float))
@@ -369,6 +374,45 @@
     (is (= :double (some #(when (= 'scale (:name %)) (:kernel-dtype %))
                          (:abi artifact))))
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))))
+
+(deftest reduction-scalar-typing-declines-uncertified-language-semantics
+  (let [options {:index 'i :coordinate 'element-index :dtype :float
+                 :arrays #{'a} :scalars #{'scale 'counter}
+                 :scalar-types {'scale :double 'counter :long}}
+        decline (fn [expression]
+                  (try
+                    (segred-body/lower-element-operations expression options)
+                    nil
+                    (catch clojure.lang.ExceptionInfo exception
+                      (ex-data exception))))]
+    (testing "mixed arithmetic needs its retained walker/TypedClojure result fact"
+      (is (= :scalar-result-dtype
+             (:missing-rule
+              (decline '(* scale (clojure.core/aget a i)))))))
+    (testing "even uniform Float operands do not identify clojure.core versus typed arithmetic"
+      (is (= :scalar-result-dtype
+             (:missing-rule
+              (decline '(* (clojure.core/aget a i)
+                           (clojure.core/aget a i)))))))
+    (testing "checked integral casts are not reinterpreted as wrap or saturation"
+      (is (= :checked-scalar-cast (:missing-rule (decline '(int scale)))))
+      (is (= :checked-scalar-cast (:missing-rule (decline '(byte 128))))))
+    (testing "integral value arithmetic waits for an explicit overflow contract"
+      (is (= :integral-scalar-arithmetic
+             (:missing-rule
+              (decline (with-meta '(+ counter 1) {:raster.type/tag 'long}))))))
+    (testing "literal and expression results cannot be silently narrowed to the accumulator"
+      (is (= {:missing-rule :element-result-dtype :element-dtype :double}
+             (select-keys (decline 0.1) [:missing-rule :element-dtype])))
+      (is (= :element-result-dtype
+             (:missing-rule
+              (decline (with-meta '(* scale (clojure.core/aget a i))
+                         {:raster.type/tag 'double}))))))
+    (testing "beta reduction cannot erase a typed local conversion"
+      (let [local (with-meta 'local {:raster.type/tag 'float})]
+        (is (= :typed-scalar-binding-conversion
+               (:missing-rule
+                (decline (list 'let* [local 0.1] (list 'double local))))))))))
 
 ;; ================================================================
 ;; Horizontally-fused multi-output SegMap: the SECONDARY output (written

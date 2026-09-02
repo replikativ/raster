@@ -40,6 +40,23 @@
     (is (= :analyzed-source
            (get-in (route/attempt source :float {'x :float}) [:stats :front-end])))))
 
+(deftest scalar-result-types-survive-elementization-and-vertical-fusion
+  (let [product (with-meta
+                  '(* (clojure.core/aget x i) 2.0)
+                  {:raster.type/tag 'float})
+        source (list 'let*
+                     (vector 'mapped (list 'raster.par/pmap 'i 'n 'float product)
+                             'total '(raster.par/reduce acc 0.0 j n
+                                                       (+ acc (clojure.core/aget mapped j))))
+                     'total)
+        routed (route/attempt source :float {'x :float})
+        products (filter #(and (seq? %) (= '* (first %)))
+                         (tree-seq coll? seq (get-in routed [:program :equations])))]
+    (is (= 1 (get-in routed [:stats :vertical])))
+    (is (seq products))
+    (is (every? #(= 'float (:raster.type/tag (meta %))) products)
+        "source type proofs remain attached after aget substitution and index rewriting")))
+
 (deftest compound-parallel-extents-become-typed-scalar-ssa
   (let [source '(let* [step (raster.par/map! target i
                                              (clojure.core/* nrows width)
