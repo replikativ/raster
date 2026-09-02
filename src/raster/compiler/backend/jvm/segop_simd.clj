@@ -973,12 +973,16 @@
           j-sym (gensym "effect_i__")
           {:keys [locals effects]} (:scalar-region segmap)
           effect-statement
-          (fn [{:keys [destination conflict destination-index predicate value]}]
+          (fn [{:keys [destination dtype conflict destination-index predicate value]}]
             (let [reduction? (soac-dialect/reducing-scatter-conflict? conflict)
-                  destination (if reduction?
-                                (let [tag (dtype/scalar-tag-for-dtype (:dtype conflict))]
-                                  (with-meta destination {:tag tag :raster.type/tag tag}))
+                  destination-dtype (or dtype (when reduction? (:dtype conflict)))
+                  scalar-tag (when destination-dtype
+                               (dtype/scalar-tag-for-dtype destination-dtype))
+                  destination (if destination-dtype
+                                (with-meta destination
+                                  {:tag scalar-tag :raster.type/tag scalar-tag})
                                 destination)
+                  value (if scalar-tag (list scalar-tag value) value)
                   store (if reduction?
                           (list 'raster.par/atomic-add! destination destination-index value)
                           (list 'clojure.core/aset destination destination-index value))]

@@ -27,7 +27,8 @@
                (region [(let-value local :dtype init-expr) ...]
                        [(write destination-index predicate value) ...]))))
         (= equation-id [result ...]
-           (effect-map {:index i :extent n :dtypes [:float ...]}
+           (effect-map {:index i :extent n :dtypes [:float ...]
+                        :iteration-order :independent-or-sequential}
              [array ...] [capture ...] [destination ...]
              (lambda [element ... capture-parameter ... destination-parameter ...]
                (effect-region [(let-value local :dtype init-expr) ...]
@@ -182,14 +183,15 @@
   "A race-freedom contract for one ordered effect destination.
 
    `:unique` certifies injective writes across logical work items. Reduction effects reuse the
-   same checked commutative-monoid certificate as typed scatter; the effect order is retained only
-   within a work item and does not invent a cross-item order."
+   same checked commutative-monoid certificate as typed scatter. `:ordered` permits conflicts only
+   when the enclosing effect map requires source-order iteration."
   [value]
-  (or (= :unique value) (reducing-scatter-conflict? value)))
+  (or (contains? #{:unique :ordered} value) (reducing-scatter-conflict? value)))
 
 (defn effect-map-attributes?
   [value]
   (and (map-attributes? value)
+       (contains? #{:independent :sequential} (:iteration-order value))
        (vector? (:dtypes value))
        (seq (:dtypes value))
        (every? #(and (keyword? %) (dtype/known? %)
@@ -986,7 +988,8 @@
             destination-parameters (vec (take-last destination-count parameters))
             destination-set (set destination-parameters)
             effects (mapv effect-parts body-results)
-            by-destination (group-by :destination effects)]
+            by-destination (group-by :destination effects)
+            iteration-order (:iteration-order attributes)]
         (when-not (= result-count destination-count (count (:dtypes attributes)))
           (fail! :typed-soac-effect-results
                  "effect-map results, physical destinations, and dtypes must align"
@@ -996,6 +999,12 @@
           (fail! :typed-soac-effect-form
                  "effect-map regions contain only canonical ordered effects"
                  {:equation equation-id :effects body-results}))
+        (when (and (= :independent iteration-order)
+                   (some #(= :ordered (:conflict %)) effects))
+          (fail! :typed-soac-effect-iteration-order
+                 "conflicting effects require sequential logical iteration"
+                 {:equation equation-id :iteration-order iteration-order
+                  :effects body-results}))
         (when-not (= destination-set (set (keys by-destination)))
           (fail! :typed-soac-effect-destinations
                  "every declared effect destination must be referenced through its lambda parameter"

@@ -425,10 +425,26 @@
                                           (when destination-type
                                             (dialect/reducing-scatter-conflict
                                              reduction-op destination-type))
-                                          (= index (:index store)) :unique)]
+                                          (= index (:index store)) :unique
+                                          :else :ordered)]
                            (assoc store :effect-conflict contract
                                         :destination-dtype destination-type)))
                        stores)
+          ;; One physical destination has one cross-item contract. If any ordinary store may
+          ;; collide, its otherwise-unique siblings must join the same sequential contract. A
+          ;; reduction mixed with an ordered overwrite remains unsupported: those are distinct
+          ;; operations and must not be blurred into one conflict certificate.
+          stores (reduce (fn [current [_ grouped]]
+                           (let [contracts (set (map :effect-conflict grouped))]
+                             (if (and (contains? contracts :ordered)
+                                      (set/subset? contracts #{:unique :ordered}))
+                               (mapv (fn [store]
+                                       (if (= (:out (first grouped)) (:out store))
+                                         (assoc store :effect-conflict :ordered)
+                                         store))
+                                     current)
+                               current)))
+                         stores (group-by :out stores))
           effect-contracts (mapv :effect-conflict stores)
           uniform-conflict (when (= 1 (count (set effect-contracts)))
                              (first effect-contracts))
@@ -438,10 +454,14 @@
                             (dialect/reducing-scatter-conflict? uniform-conflict)))
           ordered? (and (not dense-pointwise?) (not scatter?) (= :effect host-return)
                         (every? some? effect-contracts)
-                        (ordered-effects-safe? locals stores)
                         (every? (fn [[_ grouped]]
                                   (= 1 (count (set (map :effect-conflict grouped)))))
                                 (group-by :out stores)))
+          iteration-order (when ordered?
+                            (if (or (some #(= :ordered (:effect-conflict %)) stores)
+                                    (not (ordered-effects-safe? locals stores)))
+                              :sequential
+                              :independent))
           destinations (if ordered?
                          (vec (distinct (map :out stores)))
                          (mapv :out stores))
@@ -466,6 +486,7 @@
                            (mapv #(select-keys % [:out :index :predicate :value :cast
                                                   :effect-conflict])
                                  stores))
+                :iteration-order iteration-order
                 :result-dtypes (when ordered? result-dtypes)
                 :effect-only? (= :effect host-return)
                 :host-binding symbol :elem-type elem-type
@@ -1120,7 +1141,7 @@
                         (count (:result-dtypes description)))
                      (every? (comp symbol? :destination) (:result-storage description))
                      (every? (fn [{:keys [effect-conflict]}]
-                               (or (= :unique effect-conflict)
+                               (or (contains? #{:unique :ordered} effect-conflict)
                                    (dialect/reducing-scatter-conflict? effect-conflict)))
                              (:effects description)))
     :stencil (and (= 1 (count (:result-storage description)))
@@ -1298,7 +1319,8 @@
                                      local-forms writes)))))
 
 (defn- effect-map-equation
-  [{:keys [id index extent locals inputs scalars results result-storage effects result-dtypes]}]
+  [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
+           result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
         destination-set (set destinations)
         all-expressions (vec (concat (map :init locals)
@@ -1331,6 +1353,7 @@
     (list '= id results
           (list 'effect-map
                 {:index index :extent extent :dtypes result-dtypes
+                 :iteration-order iteration-order
                  :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
                 arrays captures destinations
                 (dialect/effect-lambda-form

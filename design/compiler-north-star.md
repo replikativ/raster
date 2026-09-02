@@ -169,18 +169,20 @@ directly to one `SegMap`; unique effects lower to `ScalarStore`, reductions lowe
 and guarded effects retain structured `IfRegion` control in the common `KernelBody`. The same body
 and ordered ABI emit as portable OpenCL, CUDA, and HIP. Fusion treats this operation as a
 conservative boundary until an effect-aware rule proves that moving or combining it preserves the
-declared memory order. Source selection remains gated on proving indirect-write uniqueness rather
-than inferring it from a workload or variable name. Closed typed source can now form this boundary
-for mixed unique and reducing effects, with per-destination dtypes and conflict certificates; JVM
-execution and OpenCL/CUDA/HIP emission consume the same scheduled region. Typed locals are
-pre-effect snapshots, while a direct read after a sibling write still declines.
+declared memory order. Source selection never infers indirect-write uniqueness from a workload or
+variable name. Closed typed source forms parallel effect maps only from explicit uniqueness or
+reduction certificates; unproved ordinary conflicts instead carry `:ordered` and
+`:iteration-order :sequential`. That schedule keeps the semantic extent and ABI unchanged, launches
+one work item, and emits an explicit source-order `KernelBody.ForLoop` on OpenCL/CUDA/HIP. JVM
+execution consumes the same ordered region. Typed locals are pre-effect snapshots, while direct
+reads after sibling writes are legal only in the sequential schedule.
 
 This proof boundary exposed a pre-existing firms-ABM race rather than hiding it: active IDs are
 sampled with replacement, so two decision lanes may write the same agent state and cannot carry a
 `unique-index` certificate. The semantics-preserving production route is a resident ordered queue
-loop (or, later, grouping by agent followed by one ordered lane per group). A single-thread/device
-ordered-iteration schedule is therefore explicit remaining coverage; parallel `effect-map` is not
-permission to assert workload-specific uniqueness.
+loop (or, later, grouping by agent followed by one ordered lane per group). The target-neutral
+ordered-iteration schedule now represents that route; parallel `effect-map` remains unavailable
+without a real conflict-freedom certificate.
 
 Adam and AdamW use the functional tuple-map storage contract directly: gradient is a read-only operand, parameter
 and moment buffers are typed inout storage, and the bias-corrected moment snapshots form one local

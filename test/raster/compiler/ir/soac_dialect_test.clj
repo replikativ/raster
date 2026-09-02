@@ -105,6 +105,7 @@
         (list '= 'effect-0 [left-result total-result]
               (list 'effect-map
                     {:index 'i :extent 'n :dtypes [:float :float]
+                     :iteration-order :independent
                      :attributes {:stable-array-captures '[indices]}}
                     '[x] '[indices] '[out total]
                     (dialect/effect-lambda-form
@@ -137,6 +138,29 @@
     (is (= [[:storage :out] [:storage :total]]
            (:destinations (dialect/operation-parts remapped-equation))))
     (is (= program (dialect/validate! program)))
+    (testing "ordered conflicts require a sequential iteration contract"
+      (let [[_ attrs arrays captures destinations lambda] (nth equation 3)
+            {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
+            ordered-effects (assoc body-results 0
+                                   (list 'effect 'out-destination :ordered
+                                         '(clojure.core/aget index-buffer i) true 'element))
+            ordered-lambda (dialect/effect-lambda-form
+                            parameters (dialect/emit-locals locals) ordered-effects)
+            independent-equation
+            (list '= 'effect-0 [left-result total-result]
+                  (list 'effect-map attrs arrays captures destinations ordered-lambda))
+            sequential-equation
+            (list '= 'effect-0 [left-result total-result]
+                  (list 'effect-map (assoc attrs :iteration-order :sequential)
+                        arrays captures destinations ordered-lambda))]
+        (try
+          (dialect/make facts [independent-equation] [])
+          (is false "an independent schedule must not accept a conflicting store")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-effect-iteration-order (:reason (ex-data exception))))))
+        (is (= 'effect-map
+               (dialect/operation-kind (first (dialect/equations
+                                               (dialect/make facts [sequential-equation] []))))))))
     (testing "operation destinations cannot drift from physical result storage"
       (let [[_ attrs arrays captures _destinations lambda] (nth equation 3)
             bad-equation

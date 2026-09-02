@@ -324,6 +324,7 @@
           (into #{} (keep (fn [{:keys [destination access]}]
                             (when (= :read-write access) destination)))
                 result-storage)
+          destination-dtypes (zipmap physical-results (:dtypes attributes))
           _ (when-not (= destinations physical-results)
               (throw (ex-info "typed effect-map destination storage changed after validation"
                               {:reason :raster/bug :equation equation-id
@@ -343,6 +344,8 @@
                   (let [{:keys [destination conflict destination-index predicate value]}
                         (soac-dialect/effect-parts effect)]
                     {:destination (util/subst-syms substitutions destination)
+                     :dtype (get destination-dtypes
+                                 (util/subst-syms substitutions destination))
                      :conflict conflict
                      :destination-index (util/subst-syms substitutions destination-index)
                      :predicate (util/subst-syms substitutions predicate)
@@ -357,11 +360,13 @@
                                                        effects)))])
                         physical-results))
           result-dtype (or (:dtype (get values (first results))) dtype :double)
+          iteration-order (:iteration-order attributes)
           description {:id equation-id
                        :bound (:extent attributes)
                        :idx (:index attributes)
                        :lambda nil
-                       :scalar-region {:locals locals :effects effects}
+                       :scalar-region {:locals locals :effects effects
+                                       :iteration-order iteration-order}
                        :inputs (into (into (set arrays) stable) read-write-destinations)
                        :outputs (set physical-results)
                        :scalars scalar-captures
@@ -371,6 +376,7 @@
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id
                     :write-conflict :ordered-effects
+                    :effect-iteration-order iteration-order
                     :write-conflicts write-conflicts)
             (lower-map-description description device-id :dtype result-dtype)))))
 
