@@ -162,6 +162,16 @@ bridge is introduced only when reuse requires it, so fusion does not duplicate s
 resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
 mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
 
+Mixed kernels whose lane performs both unique writes and certified reductions use a distinct
+typed `effect-map`, rather than disguising ordered mutation as a tuple-valued functional map. Its
+ordered destinations, predicates, local SSA and per-destination conflict certificates schedule
+directly to one `SegMap`; unique effects lower to `ScalarStore`, reductions lower to `AtomicRMW`,
+and guarded effects retain structured `IfRegion` control in the common `KernelBody`. The same body
+and ordered ABI emit as portable OpenCL, CUDA, and HIP. Fusion treats this operation as a
+conservative boundary until an effect-aware rule proves that moving or combining it preserves the
+declared memory order. Source selection remains gated on proving indirect-write uniqueness rather
+than inferring it from a workload or variable name.
+
 Adam and AdamW use this effect-map contract directly: gradient is a read-only operand, parameter
 and moment buffers are typed inout storage, and the bias-corrected moment snapshots form one local
 SSA spine evaluated before all three writes. Each optimizer lowers as one certified resident

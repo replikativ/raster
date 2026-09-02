@@ -27,6 +27,10 @@ contractions represented as segmented reductions, and scalar equations needed to
 shape/value dependencies. It also defines a conservative ordered effect-map boundary for kernels
 that mix unique writes and certified atomic reductions. Each destination and conflict proof is
 explicit; effect maps remain non-fusible until an effect-aware rule proves a transformation.
+The GPU schedule projects their ordered local SSA and guarded effects directly into one `SegMap`:
+unique effects become `ScalarStore`, checked reduction effects become `AtomicRMW`, and predicates
+become structured `IfRegion` nodes. OpenCL, CUDA, and HIP therefore consume the same verified
+`KernelBody`; the operation is not reconstructed as source-level mutation in an emitter.
 
 Fusion iterates three general transformations to a fixpoint:
 
@@ -82,9 +86,10 @@ models can refine a choice, while the typed program and numerical oracle constra
 
 ## Remaining work
 
-1. Replace remaining compatibility operation coverage (active-ID narrowing, collect/atomics, and
-   specialized block movement) with direct typed equations and schedules. RNG fill is now an
-   ordinary typed map with wrapping SplitMix64 scalar SSA.
+1. Select the ordered effect-map from closed typed source for remaining mixed unique-write/atomic
+   workloads, requiring explicit uniqueness and reduction proofs. Replace active-ID narrowing and
+   specialized block-movement compatibility coverage with direct typed equations and schedules.
+   RNG fill is now an ordinary typed map with wrapping SplitMix64 scalar SSA.
 2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
    beta-reduce away type contracts.
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain

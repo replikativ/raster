@@ -301,6 +301,9 @@
                                                 scheduling-algorithm device-id :dtype dtype)}
                               scatter {:operations (soac-lower/lower-typed-scatter
                                                     scheduling-algorithm device-id :dtype dtype)}
+                              effect-map
+                              {:operations (soac-lower/lower-typed-effect-map
+                                            scheduling-algorithm device-id :dtype dtype)}
                               stencil {:operations (soac-lower/lower-typed-stencil
                                                     scheduling-algorithm device-id :dtype dtype)}
                               reduce {:operations (soac-lower/lower-typed-reduce

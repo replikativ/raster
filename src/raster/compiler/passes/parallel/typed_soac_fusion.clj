@@ -104,6 +104,22 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private effect-map-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (effect-map ?attributes [??arrays] [??captures] [??destinations]
+                            (lambda [??parameters]
+                              (effect-region [??local-definitions] [??body-results]))))
+                      (success {:kind :effect-map
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :destinations destinations
+                                :local-definitions local-definitions
+                                :body-results body-results}))))
+
 (def ^:private stencil-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -157,6 +173,7 @@
                    [(scalar-equation-rule equation)
                     (map-equation-rule equation)
                     (scatter-equation-rule equation)
+                    (effect-map-equation-rule equation)
                     (stencil-equation-rule equation)
                     (reduce-equation-rule equation)
                     (segmented-reduce-equation-rule equation)
