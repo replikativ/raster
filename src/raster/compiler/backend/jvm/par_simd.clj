@@ -21,6 +21,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
@@ -374,17 +375,28 @@
   Options:
     :simd? — enable/disable SIMD (default true)
     :min-elements — minimum elements for SIMD (default 8)"
-  [form & {:keys [simd? min-elements] :or {simd? true min-elements nil}}]
+  [form & {:keys [simd? min-elements dtype scalar-types array-types values abstract-machine]
+           :or {simd? true min-elements nil}}]
   (if-not simd?
     (let [p (when (parallel-program/parallel-program? form)
               (parallel-program/validate! form segop/segop-node?))
           source (if p (parallel-program/source-form p) form)]
       {:form (par/expand-par-forms source) :stats {:simd? false}})
-    (let [parallel-program (when (parallel-program/parallel-program? form)
+    (let [supplied-program (when (parallel-program/parallel-program? form)
                              (parallel-program/validate! form segop/segop-node?))
+          direct-schedule
+          (when (and (nil? supplied-program) dtype (form/binding-form? form))
+            (segop-lower-pass/schedule-source-program
+             form {:target-device :cpu:0 :dtype dtype
+                   :scalar-types scalar-types :array-types array-types
+                   :values values :abstract-machine abstract-machine}))
+          parallel-program (or supplied-program (:program direct-schedule))
           source-form (if parallel-program (parallel-program/source-form parallel-program) form)
           min-elements (or min-elements (effective-min-elements))
-          stats (atom {:simd-maps 0 :simd-reduces 0 :fallback 0 :fused 0 :skipped-small 0})
+          stats (atom (cond-> {:simd-maps 0 :simd-reduces 0 :fallback 0
+                               :fused 0 :skipped-small 0}
+                        direct-schedule
+                        (assoc :direct-scheduling (:stats direct-schedule))))
             ;; Scheduled SegOps own their checked dtype. Only the raw compatibility door derives a
             ;; dtype from source syntax, because it has no typed equation to consume.
           take-bound (fn [pred]

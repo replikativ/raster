@@ -27,7 +27,7 @@
 (defn- run [form] (op/opencl-pass form :device-id :ze:0 :dtype :double :min-elements 0))
 (defn- lowered-cpu [form dtype]
   (:form (slp/segop-lower-pass form {:target-device :cpu:0 :dtype dtype})))
-(defn- run-simd [form] (par-simd/simd-pass form :min-elements 0))
+(defn- run-simd [form] (par-simd/simd-pass form :min-elements 0 :dtype :double))
 (defn- norm [src] (str/replace (str src) #"_\d{3,}" "_N"))
 
 (deftest a-lowered-binding-is-consumed-not-relowered
@@ -66,14 +66,21 @@
         compiled (op/opencl-pass
                   form :device-id :ze:0 :dtype :double :min-elements 0
                   :array-types {'X :double} :scalar-types {'n :long})
-        kernel (first (:kernels compiled))]
+        kernel (first (:kernels compiled))
+        simd (par-simd/simd-pass
+              form :dtype :double :min-elements 0
+              :array-types {'X :double} :scalar-types {'n :long})]
     (is (= 1 (count (:kernels compiled))))
     (is (= 1 (get-in compiled [:stats :ze-reduces])))
     (is (= 1 (get-in compiled [:stats :segop-reused])))
     (is (nil? (get-in compiled [:stats :segop-relowered])))
     (is (= :typed-soac (get-in compiled [:stats :direct-scheduling :route])))
     (is (not (str/includes? (:source kernel) "TMP"))
-        "the direct backend must not rematerialize a fused semantic intermediate")))
+        "the direct backend must not rematerialize a fused semantic intermediate")
+    (is (= 1 (get-in simd [:stats :simd-reduces])))
+    (is (= 1 (get-in simd [:stats :segop-reused])))
+    (is (nil? (get-in simd [:stats :segop-relowered])))
+    (is (= :typed-soac (get-in simd [:stats :direct-scheduling :route])))))
 
 (deftest the-fallback-uses-the-real-device-id
   (testing "re-lowering used `:ze:0` hardcoded. A registered non-:ze:0 target must reach
