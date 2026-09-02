@@ -312,6 +312,32 @@
                      (empty? (:aliases equation-facts)))))
             (subvec equations (inc left-index) right-index))))
 
+(defn- equation-source-binding-ids
+  [facts equation-id]
+  (let [equation-facts (get-in facts [:equations equation-id])
+        constituents (vals (get-in equation-facts [:attributes :fusion/constituents]))]
+    (into #{}
+          (keep #(get-in % [:provenance :source-binding-id]))
+          (conj (vec constituents) equation-facts))))
+
+(defn- host-barrier-free?
+  "Whether two equations belong to the same certified source island.
+
+   Opaque host bindings remain in ParallelProgram control, not in the functional SOAC dialect.
+   Their source positions are nevertheless compiler facts and prohibit motion, recomputation or
+   fusion across them."
+  [program left right]
+  (let [facts (dialect/facts program)
+        barriers (set (get-in facts [:attributes :host-binding-ids]))]
+    (if (empty? barriers)
+      true
+      (let [positions (set/union (equation-source-binding-ids facts (:id left))
+                                 (equation-source-binding-ids facts (:id right)))]
+        (and (seq positions)
+             (let [lower (apply min positions)
+                   upper (apply max positions)]
+               (not-any? #(< lower % upper) barriers)))))))
+
 (declare remove-equation-fact)
 
 (defn- horizontal-boundary
@@ -535,6 +561,7 @@
                     (value-scalar-dtype program (first (:results consumer))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
+           :when (host-barrier-free? program producer consumer)
            :when transform]
        {:producer-index producer-index :consumer-index consumer-index
         :producer producer :consumer consumer :transform transform}))))
@@ -706,6 +733,7 @@
            :when (empty? (set/intersection
                           #{consumed-destination consumer-destination}
                           (set (map :value (:operands transform)))))
+           :when (host-barrier-free? program producer consumer)
            :when transform]
        {:producer-index producer-index :consumer-index consumer-index
         :producer producer :consumer consumer :transform transform}))))
@@ -798,6 +826,7 @@
            :when (pos? (get uses produced 0))
            :when (some #{produced} (:arrays consumer))
            :when (reorder-barrier-free? program producer-index consumer-index)
+           :when (host-barrier-free? program producer consumer)
            :when (fusible-equation? program (:id producer))
            :when (vertical-consumer-boundary program producer consumer)
            :let [placement-witness (producer-placement-witness
@@ -936,6 +965,7 @@
            :when (empty? (set/intersection (:destinations left-boundary) right-uses))
            :when (empty? (set/intersection (:destinations right-boundary) left-uses))
            :when (reorder-barrier-free? program left-index right-index)
+           :when (host-barrier-free? program left right)
            ;; Moving the right equation to the left's position must not move it before an
            ;; intervening producer. Program inputs have no producer index and are always ready.
            :when (every? (fn [value]

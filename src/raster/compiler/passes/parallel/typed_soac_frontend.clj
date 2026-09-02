@@ -752,11 +752,16 @@
                   (:outputs %) #{})
                descriptions)))
 
+(defn- contains-parallel-form?
+  [expression]
+  (boolean (some par/par-form? (tree-seq coll? seq expression))))
+
 (defn- supported-description?
   [physical-outputs description]
   (case (:kind description)
-    :scalar (or (provably-pure-scalar? (:expr description))
-                (generated-scaffolding? description physical-outputs))
+    :scalar (and (not (contains-parallel-form? (:expr description)))
+                 (or (provably-pure-scalar? (:expr description))
+                     (generated-scaffolding? description physical-outputs)))
     :map (or (:pure? description)
              (and (seq (:result-storage description))
                   (every? (comp symbol? :destination) (:result-storage description))))
@@ -783,7 +788,12 @@
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (physical-output-symbols descriptions)]
-    (every? #(supported-description? physical-outputs %) descriptions)))
+    ;; Ordinary host scalar bindings are opaque control/dataflow boundaries around TypedSOAC
+    ;; islands. Unsupported parallel operations still decline: executing those through a second
+    ;; lowering route inside one program would duplicate semantics.
+    (every? #(or (= :scalar (:kind %))
+                 (supported-description? physical-outputs %))
+            descriptions)))
 
 (defn coverage-decline
   "Describe the exact source bindings that prevent admission to the closed TypedSOAC subset.
@@ -1153,16 +1163,22 @@
                         :segmented-fold-map (if (:effect-only? %) [] (:results %))
                         (:outputs %))
                      operations))
+        typed-scalars (filter #(and (= :scalar (:kind %))
+                                    (supported-description? physical-outputs %))
+                              descriptions)
+        host-scalars (filter #(and (= :scalar (:kind %))
+                                   (not (supported-description? physical-outputs %)))
+                             descriptions)
         scalar-definitions
         (set (keep #(when (and (= :scalar (:kind %))
+                               (supported-description? physical-outputs %)
                                (not (generated-scaffolding? % physical-outputs)))
                       (:sym %))
                    descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
         operation-uses (set (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
-                                    (mapcat #(when (= :scalar (:kind %))
-                                               (util/free-syms (:expr %)))
-                                            descriptions)))
+                                    (mapcat #(util/free-syms (:expr %)) typed-scalars)))
+        host-uses (set (mapcat #(util/free-syms (:expr %)) host-scalars))
         body-uses (set (mapcat util/free-syms body))
         ;; Destination-writing source forms return the destination buffer, while TypedSOAC names
         ;; the fresh logical result produced by that write. Preserve the public return by
@@ -1186,6 +1202,7 @@
         (into #{} (keep destination-results) body-uses)]
     (vec (sort-by pr-str
                   (set/union (set/difference terminal-operation-definitions operation-uses)
+                             (set/intersection operation-definitions host-uses)
                              (set/intersection all-definitions body-uses)
                              returned-destination-results)))))
 
@@ -1194,6 +1211,7 @@
   (let [physical-outputs (physical-output-symbols descriptions)
         by-symbol (into {}
                         (keep #(when (and (= :scalar (:kind %))
+                                          (supported-description? physical-outputs %)
                                           (not (generated-scaffolding? % physical-outputs)))
                                  [(:sym %) %]))
                         descriptions)
@@ -1317,9 +1335,10 @@
      (assoc values id contract))))
 
 (defn form->program
-  "Construct and validate TypedSOAC directly from a closed let form.
+  "Construct and validate TypedSOAC islands directly from a let form.
 
-   Returns nil when any binding is outside the certified source subset. Type/effect/value
+   Opaque scalar host bindings are retained as ordered barriers around the functional equations.
+   Returns nil when a parallel binding is outside the certified source subset. Type/effect/value
    contradictions throw ExceptionInfo because falling through after accepting them would hide a
    compiler correctness defect."
   [source {:keys [dtype array-types scalar-types values shape-equalities]
@@ -1331,11 +1350,16 @@
                                           shape-equalities values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
+                 (some #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
+                                      :product-reduce :segmented-fold-map :scan}
+                                    (:kind %))
+                       descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
               (filterv #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
                                      :product-reduce :segmented-fold-map :scan} (:kind %))
                        descriptions)
+              physical-outputs (physical-output-symbols descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :scatter (scatter-equation %)
                                                :stencil (stencil-equation %)
@@ -1433,9 +1457,17 @@
                                                     (:host-binding description)}))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
+              host-binding-ids
+              (->> descriptions
+                   (keep #(when (and (= :scalar (:kind %))
+                                     (not (supported-description?
+                                           physical-outputs %)))
+                            (:id %)))
+                   vec)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
-                      :attributes {:source-dialect :closed-clojure}})]
+                      :attributes {:source-dialect :closed-clojure
+                                   :host-binding-ids host-binding-ids}})]
           (dialect/make facts equations outputs))))))

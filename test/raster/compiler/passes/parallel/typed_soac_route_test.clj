@@ -367,20 +367,60 @@
     (is (= '[y z] (-> hardware-guided :program :equations first :results)))
     (is (= '[y z] (get-in hardware-guided [:program :outputs])))))
 
-(deftest effectful-host-binding-reports-why-it-keeps-the-compatibility-route
+(deftest effectful-host-binding-delimits-certified-typed-islands
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        side (println y)
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       z)
-        result (route/attempt source :float)]
-    (is (nil? (:program result)))
-    (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
-    (is (= [{:id 1
-             :binding 'side
-             :kind :scalar
-             :operation 'println
-             :reason :uncertified-host-scalar}]
-           (get-in result [:declined :bindings])))))
+        {:keys [program stats]} (route/attempt source :float {'x :float})
+        source-pairs (partition 2 (second (:source program)))
+        lowered (segop-lower/segop-lower-pass program {:dtype :float})]
+    (is (= :typed-soac (:dialect program)))
+    (is (= '[y z] (:outputs program))
+        "y crosses the typed/host boundary and therefore remains materialized")
+    (is (nil? (get-in program [:values 'side]))
+        "opaque host values do not pretend to be functional TypedSOAC values")
+    (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (= 2 (count (:equations program))))
+    (is (= 2 (get-in lowered [:stats :typed-soac-reused]))
+        "both sides of the host barrier stay on the shared typed schedule vertical")
+    (is (zero? (:vertical stats))
+        "the dependent maps cannot fuse across an opaque host effect")
+    (is (= '(println y) (some #(when (= 'side (first %)) (second %)) source-pairs)))))
+
+(deftest opaque-host-binding-also-blocks-horizontal-code-motion
+  (let [source '(let* [left (raster.par/pmap i n float
+                                              (+ (clojure.core/aget a i) 1.0))
+                       side (println :between-kernels)
+                       right (raster.par/pmap j n float
+                                               (* (clojure.core/aget b j) 2.0))]
+                      [left right])
+        {:keys [program stats]}
+        (route/attempt source :float {'a :float 'b :float})]
+    (is (= 2 (count (:equations program))))
+    (is (zero? (:horizontal stats)))
+    (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (some #{'println} (flatten (:source program))))))
+
+(deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
+  (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
+
+(deftest nested-compatibility-parallel-work-is-an-opaque-host-barrier
+  (let [source '(let* [mapped (raster.par/pmap i n double
+                                                (* (clojure.core/aget x i) 2.0))
+                       mean (let* [total (raster.par/reduce
+                                          acc 0.0 j n
+                                          (+ acc (clojure.core/aget mapped j)))]
+                                   (/ total (double n)))]
+                      mean)
+        {:keys [program stats]} (route/attempt source :double {'x :double})]
+    (is (= :typed-soac (:dialect program)))
+    (is (= 1 (count (:equations program))))
+    (is (= '[mapped] (:outputs program))
+        "the typed result consumed by compatibility host work stays materialized")
+    (is (= [1] (get-in program [:attributes :host-binding-ids])))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (:typed-validated stats))))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
