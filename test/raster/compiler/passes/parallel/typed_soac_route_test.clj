@@ -14,6 +14,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -25,7 +26,7 @@
 (defn- scalar-stores
   [artifact]
   (filterv #(= "raster.compiler.ir.kernel_body.ScalarStore"
-                (.getName (class %)))
+               (.getName (class %)))
            (get-in artifact [:attributes :kernel-body :operations])))
 
 (def ^:private map-map
@@ -51,7 +52,7 @@
                                                        (clojure.core/aget x i)))))
           mapped (raster.par/pmap j n float (* (clojure.core/aget shared j) 2.0))
           reduced (raster.par/reduce acc 0.0 k n
-                                      (+ acc (clojure.core/aget shared k)))]
+                                     (+ acc (clojure.core/aget shared k)))]
          [mapped reduced]))
 
 (deftest production-route-retains-hardware-costed-placement-witnesses
@@ -259,14 +260,14 @@
   (let [source '(let* [result
                        (raster.par/map! out i n float
                                         (loop* [j 0 acc (float 0.0)]
-                                          (if (< (long j) (long width))
-                                            (let* [value
-                                                   (clojure.core/aget
-                                                    x (+ (* (long i) (long width))
-                                                         (long j)))]
-                                              (recur (inc (long j))
-                                                     (+ (float acc) (float value))))
-                                            acc)))]
+                                               (if (< (long j) (long width))
+                                                 (let* [value
+                                                        (clojure.core/aget
+                                                         x (+ (* (long i) (long width))
+                                                              (long j)))]
+                                                       (recur (inc (long j))
+                                                              (+ (float acc) (float value))))
+                                                 acc)))]
                       result)
         typed (:program
                (route/attempt source :float {'x :float 'out :float}
@@ -390,10 +391,10 @@
 
 (deftest opaque-host-binding-also-blocks-horizontal-code-motion
   (let [source '(let* [left (raster.par/pmap i n float
-                                              (+ (clojure.core/aget a i) 1.0))
+                                             (+ (clojure.core/aget a i) 1.0))
                        side (println :between-kernels)
                        right (raster.par/pmap j n float
-                                               (* (clojure.core/aget b j) 2.0))]
+                                              (* (clojure.core/aget b j) 2.0))]
                       [left right])
         {:keys [program stats]}
         (route/attempt source :float {'a :float 'b :float})]
@@ -407,11 +408,11 @@
 
 (deftest nested-compatibility-parallel-work-is-an-opaque-host-barrier
   (let [source '(let* [mapped (raster.par/pmap i n double
-                                                (* (clojure.core/aget x i) 2.0))
+                                               (* (clojure.core/aget x i) 2.0))
                        mean (let* [total (raster.par/reduce
                                           acc 0.0 j n
                                           (+ acc (clojure.core/aget mapped j)))]
-                                   (/ total (double n)))]
+                                  (/ total (double n)))]
                       mean)
         {:keys [program stats]} (route/attempt source :double {'x :double})]
     (is (= :typed-soac (:dialect program)))
@@ -434,9 +435,9 @@
 (deftest route-distinguishes-source-coverage-from-compiler-contradictions
   (testing "an uncertified recurrence is an explicit source coverage decline"
     (let [source '(let* [result (raster.par/scan target h 0.0 i n float
-                                                  (Math/tanh
-                                                   (+ h (clojure.core/aget x i))))]
-                         result)]
+                                                 (Math/tanh
+                                                  (+ h (clojure.core/aget x i))))]
+                        result)]
       (is (= :scan-not-associative
              (get-in (route/attempt source :float {'x :float 'target :float})
                      [:declined :reason])))))
@@ -449,8 +450,8 @@
              (get-in (route/attempt '(let* [x 1] x) :float) [:declined :reason])))))
   (testing "a contradiction after TypedSOAC construction is never compatibility fallback"
     (let [source '(let* [result (raster.par/pmap i n float
-                                                  (clojure.core/aget x i))]
-                         result)
+                                                 (clojure.core/aget x i))]
+                        result)
           typed (frontend/form->program source {:dtype :float :array-types {'x :float}})]
       (with-redefs [frontend/form->program (fn [& _] typed)
                     fusion/fusion-fixpoint
@@ -587,7 +588,7 @@
 
 (deftest typed-map-scan-fuses-before-the-shared-scan-schedule
   (let [source '(let* [mapped (raster.par/pmap i n float
-                                                (* (clojure.core/aget x i) 2.0))
+                                               (* (clojure.core/aget x i) 2.0))
                        result (raster.par/scan out acc 0.0 j n float
                                                (+ acc (clojure.core/aget mapped j)))]
                       result)
@@ -741,9 +742,9 @@
 
 (deftest typed-horizontal-fusion-combines-distinct-materialized-write-boundaries
   (let [source '(let* [u (raster.par/map! u-out i n float
-                                           (* (clojure.core/aget a i) 2.0))
+                                          (* (clojure.core/aget a i) 2.0))
                        v (raster.par/map! v-out j n float
-                                           (+ (clojure.core/aget b j) 1.0))]
+                                          (+ (clojure.core/aget b j) 1.0))]
                       [u v])
         {:keys [program stats]}
         (route/attempt source :float
@@ -840,9 +841,9 @@
 (deftest typed-contraction-schedule-view-retains-body-scalars
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
-                       (* alpha
-                          (clojure.core/aget A (+ (* i k) l))
-                          (clojure.core/aget B (+ (* l n) j))))]
+                                          (* alpha
+                                             (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
                step)
         {:keys [form]}
         (pipeline/schedule-parallel-form
@@ -857,8 +858,8 @@
 (deftest gpu-emission-consumes-the-scheduled-typed-contraction
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
-                       (* (clojure.core/aget A (+ (* i k) l))
-                          (clojure.core/aget B (+ (* l n) j))))]
+                                          (* (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
                step)
         {:keys [form stats]}
         (pipeline/schedule-parallel-form
@@ -870,23 +871,32 @@
         directly-routed
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
-                        (throw (ex-info "typed routing reparsed source" {})))]
+                        (throw (ex-info "typed routing reparsed source" {})))
+                      contract-lower/contract-form->segred
+                      (fn [& _]
+                        (throw (ex-info "typed routing rebuilt its scheduled SegRed" {})))]
           (contract-route/route-typed-contraction
-           algorithm (:id operation) (:schedule operation)
+           algorithm operation
            :dtype :float :desc {}))
         candidate-routes
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
-                        (throw (ex-info "candidate routing reparsed source" {})))]
+                        (throw (ex-info "candidate routing reparsed source" {})))
+                      contract-lower/contract-form->segred
+                      (fn [& _]
+                        (throw (ex-info "candidate routing rebuilt its scheduled SegRed" {})))]
           (contract-route/route-typed-contraction-candidates!
-           algorithm (:id operation) (:schedule operation)
+           algorithm operation
            :dtype :float :desc {}))
         emitted
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
-                        (throw (ex-info "typed emission reparsed source" {})))]
+                        (throw (ex-info "typed emission reparsed source" {})))
+                      contract-lower/contract-form->segred
+                      (fn [& _]
+                        (throw (ex-info "typed emission rebuilt its scheduled SegRed" {})))]
           (opencl-pass/opencl-pass form :device-id :ocl:0
-                                     :dtype :float :min-elements 0))]
+                                   :dtype :float :min-elements 0))]
     (is (= :typed-soac (:source-dialect stats)))
     (is (instance? raster.compiler.ir.segop.SegRed operation))
     (is (= :contraction (:phase operation)))
@@ -899,7 +909,7 @@
                   (:declines candidate-routes)))
     (try
       (contract-route/route-static-typed-contraction-dispatch
-       algorithm (:id operation) (:schedule operation)
+       algorithm operation
        :dtype :float :desc {})
       (is false "a static dispatch must not bake runtime-dependent contraction dimensions")
       (catch clojure.lang.ExceptionInfo exception
@@ -907,29 +917,35 @@
                (:reason (ex-data exception))))))
     (try
       (contract-route/route-typed-contraction
-       algorithm (:id operation) (:schedule operation) :dtype :double :desc {})
+       algorithm operation :dtype :double :desc {})
       (is false "a route dtype that disagrees with the typed equation must fail")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :typed-contraction-dtype (:reason (ex-data exception))))))
     (try
       (contract-route/route-typed-contraction
-       algorithm (:id operation) (assoc (:schedule operation) :strategy :workgroup-tree)
+       algorithm (assoc operation :phase :segmented) :dtype :float :desc {})
+      (is false "a SegRed from another scheduled phase must fail the typed seam")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-contraction-phase (:reason (ex-data exception))))))
+    (try
+      (contract-route/route-typed-contraction
+       algorithm (assoc operation :schedule (assoc (:schedule operation) :strategy :workgroup-tree))
        :dtype :float :desc {})
       (is false "a non-contraction reduction schedule must fail")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :typed-contraction-schedule (:reason (ex-data exception))))))
     (try
       (contract-route/route-typed-contraction
-       algorithm (:id operation)
-       (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+       algorithm (assoc operation :schedule
+                        (assoc-in (:schedule operation) [:tuning-space :families] [:matrix]))
        :dtype :float :desc {})
       (is false "a pinned family that cannot lower the equation must fail")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :no-legal-contraction-family (:reason (ex-data exception))))))
     (try
       (contract-route/route-typed-contraction-candidates!
-       algorithm (:id operation)
-       (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+       algorithm (assoc operation :schedule
+                        (assoc-in (:schedule operation) [:tuning-space :families] [:matrix]))
        :dtype :float :desc {})
       (is false "candidate enumeration must fail when every enabled family declines")
       (catch clojure.lang.ExceptionInfo exception
@@ -951,8 +967,8 @@
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]
-                       (* (clojure.core/aget A (+ (* i 128) l))
-                          (clojure.core/aget B (+ (* l 128) j))))]
+                                          (* (clojure.core/aget A (+ (* i 128) l))
+                                             (clojure.core/aget B (+ (* l 128) j))))]
                step)
         {:keys [form]}
         (pipeline/schedule-parallel-form
@@ -966,16 +982,16 @@
         select-family
         (fn [family]
           (contract-route/route-typed-contraction
-           algorithm (:id operation)
-           (assoc-in (:schedule operation) [:tuning-space :families] [family])
+           algorithm (assoc operation :schedule
+                            (assoc-in (:schedule operation) [:tuning-space :families] [family]))
            :dtype :half :desc descriptor))
         candidates
         (contract-route/route-typed-contraction-candidates!
-         algorithm (:id operation) (:schedule operation)
+         algorithm operation
          :dtype :half :desc descriptor)
         dispatch
         (contract-route/route-static-typed-contraction-dispatch
-         algorithm (:id operation) (:schedule operation)
+         algorithm operation
          :dtype :half :desc descriptor)
         alternatives (:alternatives dispatch)
         emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
@@ -1042,8 +1058,8 @@
     (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]
       (try
         (contract-route/route-typed-contraction
-         algorithm (:id operation)
-         (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+         algorithm (assoc operation :schedule
+                          (assoc-in (:schedule operation) [:tuning-space :families] [:matrix]))
          :dtype :half :desc descriptor)
         (is false "a routed leaf outside the pinned schedule family must be rejected")
         (catch clojure.lang.ExceptionInfo exception
@@ -1053,8 +1069,8 @@
     (doseq [families [[] [:unknown]]]
       (try
         (contract-route/route-typed-contraction
-         algorithm (:id operation)
-         (assoc-in (:schedule operation) [:tuning-space :families] families)
+         algorithm (assoc operation :schedule
+                          (assoc-in (:schedule operation) [:tuning-space :families] families))
          :dtype :half :desc descriptor)
         (is false "an empty or unknown candidate family must fail")
         (catch clojure.lang.ExceptionInfo exception
@@ -1071,8 +1087,8 @@
         contract (apply list
                         (concat
                          '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
-                           (* (clojure.core/aget A (+ (* i 128) l))
-                              (clojure.core/aget B (+ (* l 128) j))))
+                                               (* (clojure.core/aget A (+ (* i 128) l))
+                                                  (clojure.core/aget B (+ (* l 128) j))))
                          [:epilogue transform]))
         source (list 'let* ['step contract] 'step)
         {:keys [form stats]}
@@ -1086,8 +1102,9 @@
                     :grf-bytes-per-lane 256 :subgroup-size 16
                     :max-workgroup-size 1024 :shared-local-memory 131072}
         routed (contract-route/route-typed-contraction
-                algorithm (:id operation)
-                (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+                algorithm (assoc operation :schedule
+                                 (assoc-in (:schedule operation)
+                                           [:tuning-space :families] [:matrix]))
                 :dtype :half :desc descriptor)
         emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
                   (opencl-pass/opencl-pass form :device-id :ocl:0

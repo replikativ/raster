@@ -483,7 +483,7 @@
                   (when bound-sr
                     (try
                       (croute/route-static-typed-contraction-dispatch
-                       typed-algorithm (:id bound-sr) (:schedule bound-sr)
+                       typed-algorithm bound-sr
                        :dtype dtype :tile (:tile schedule) :desc target-desc)
                       (catch clojure.lang.ExceptionInfo exception
                         (let [reason (:reason (ex-data exception))]
@@ -528,7 +528,7 @@
                 (let [r (ensure-contraction-marker-expressible!
                          (if bound-sr
                            (croute/route-typed-contraction
-                            typed-algorithm (:id bound-sr) (:schedule bound-sr)
+                            typed-algorithm bound-sr
                             :dtype dtype :tile (:tile schedule) :desc target-desc)
                            (croute/route-contraction
                             ;; A compatibility equation routes from its verified facts. Without a

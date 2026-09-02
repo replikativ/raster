@@ -29,6 +29,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
@@ -289,10 +290,10 @@
    consume the same scheduled body vocabulary.  Quantization remains an operand/decode concern,
    not a buffer-ownership or graph-composition concern."
   [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id
-                           candidate-families]
+                           candidate-families scheduled-operation]
                     :or {dtype :half prefer-peak? false}}]
   (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
-        contract-form (or contract-form (:form contract-facts))
+        contract-form (or contract-form (:form contract-facts) (cf/surface-form contract-facts))
         _ (when-not (and (cf/facts? contract-facts) contract-form)
             (throw (ex-info "contraction routing requires verified facts and a target spelling"
                             {:reason :contraction-route-input
@@ -394,7 +395,8 @@
       ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
       ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
         (zero? n-free)
-        (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
+        (let [sr (or scheduled-operation
+                     (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts))
               k (sco/generate-segred-kernel sr out-sym :dtype dtype)
               attrs (:attributes k)
               red-bound (second (first contract-axes))]
@@ -442,7 +444,8 @@
                              :families candidate-families
                              :declines (when (and (= 2 n-free) (= 1 n-contract))
                                          (::declines (tensorize-plan)))})))
-          (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
+          (let [sr (or scheduled-operation
+                       (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts))
                 portable (contraction-schedule/plan-portable-body contract-facts sr desc)
                 emitted (when (:ok portable)
                           (sco/generate-contraction-kernel-body (:body portable)))
@@ -495,45 +498,92 @@
                        :allowed contraction-families})))
     families))
 
-(defn route-typed-contraction
-  "Route one scheduled scalar TypedSOAC contraction without exposing a source-form or facts adapter
-   to the backend.
+(defn- scheduled-typed-contraction-context
+  "Validate that one scheduled SegRed is the physical schedule for its TypedSOAC equation.
 
-   The validated equation is the semantic input. `schedule` certifies that SegOp scheduling chose
-   the contraction candidate family; this target route then selects and verifies the concrete
-   matrix, register-tiled or portable leaf against the device descriptor. The temporary verified
-   contraction facts remain private to this migration adapter until those leaves accept the typed
-   reduction and operand maps directly."
-  [program operation-id schedule & options]
+   This is the typed semantic/schedule seam. The immutable equation id joins the two dialects;
+   dtype, iteration space, physical operands and result storage are checked here so target routing
+   cannot accept a SegRed borrowed from another equation."
+  [program operation]
   (let [program (soac-dialect/validate! program)
-        schedule (reduction/validate-schedule! schedule)
-        _ (when-not (= :hardware-contraction-candidates (:strategy schedule))
-            (throw (ex-info "typed contraction requires a contraction candidate schedule"
-                            {:reason :typed-contraction-schedule
-                             :operation operation-id :schedule schedule})))
-        families (validated-typed-contraction-families schedule operation-id)
+        _ (when-not (instance? raster.compiler.ir.segop.SegRed operation)
+            (throw (ex-info "typed contraction route requires a scheduled SegRed"
+                            {:reason :typed-contraction-operation :operation operation})))
+        operation-id (:id operation)
         equation (or (some #(when (= operation-id (second %)) %)
                            (soac-dialect/equations program))
                      (throw (ex-info "typed contraction program lacks its scheduled equation"
                                      {:reason :typed-contraction-equation
                                       :operation operation-id})))
         components (typed-projection/segmented-reduce-contract-components program equation)
+        facts (cf/from-components components)
         equation-dtype (:dtype components)
+        expected-space (conj (:free-axes facts) (:flat-contract-axis facts))
+        actual-space (mapv (juxt :name :bound) (get-in operation [:space :dims]))
+        transform-inputs (set (map :sym (get-in facts [:epilogue :operands])))
+        expected-inputs (into transform-inputs (map :sym) (:operands facts))
+        expected-outputs #{(:out facts)}
+        schedule (reduction/validate-schedule! (:schedule operation))]
+    (when-not (= :contraction (:phase operation))
+      (throw (ex-info "typed contraction SegRed has the wrong phase"
+                      {:reason :typed-contraction-phase
+                       :operation operation-id :phase (:phase operation)})))
+    (when-not (= equation-dtype (:dtype operation))
+      (throw (ex-info "typed contraction SegRed dtype disagrees with its equation"
+                      {:reason :typed-contraction-operation-dtype
+                       :operation operation-id :equation-dtype equation-dtype
+                       :operation-dtype (:dtype operation)})))
+    (when-not (= expected-space actual-space)
+      (throw (ex-info "typed contraction SegRed iteration space disagrees with its equation"
+                      {:reason :typed-contraction-space
+                       :operation operation-id :expected expected-space :actual actual-space})))
+    (when-not (and (= expected-inputs (segop/operation-inputs operation))
+                   (= expected-outputs (segop/operation-outputs operation)))
+      (throw (ex-info "typed contraction SegRed storage boundary disagrees with its equation"
+                      {:reason :typed-contraction-storage
+                       :operation operation-id
+                       :expected-inputs expected-inputs
+                       :actual-inputs (segop/operation-inputs operation)
+                       :expected-outputs expected-outputs
+                       :actual-outputs (segop/operation-outputs operation)})))
+    {:program program
+     :operation operation
+     :operation-id operation-id
+     :equation equation
+     :components components
+     :facts facts
+     :dtype equation-dtype
+     :schedule schedule}))
+
+(defn route-typed-contraction
+  "Route one scheduled scalar TypedSOAC contraction from its algorithm and exact SegRed.
+
+   The equation is the semantic input and the supplied SegRed is the already-applied schedule.
+   Target routing selects and verifies the concrete matrix, register-tiled or portable leaf without
+   re-lowering a generated host form into a second SegRed."
+  [program operation & options]
+  (let [{:keys [program operation-id facts dtype schedule]}
+        (scheduled-typed-contraction-context program operation)
+        _ (when-not (= :hardware-contraction-candidates (:strategy schedule))
+            (throw (ex-info "typed contraction requires a contraction candidate schedule"
+                            {:reason :typed-contraction-schedule
+                             :operation operation-id :schedule schedule})))
+        families (validated-typed-contraction-families schedule operation-id)
         options (apply hash-map options)
         _ (when (and (contains? options :dtype)
-                     (not= equation-dtype (:dtype options)))
+                     (not= dtype (:dtype options)))
             (throw (ex-info "typed contraction route dtype disagrees with its equation"
                             {:reason :typed-contraction-dtype
                              :operation operation-id
-                             :equation-dtype equation-dtype
+                             :equation-dtype dtype
                              :route-dtype (:dtype options)})))
-        facts (cf/from-components components)
         routed (try
                  (apply route-contraction nil
                         (mapcat identity
                                 (assoc options
-                                       :dtype equation-dtype
+                                       :dtype dtype
                                        :facts facts
+                                       :scheduled-operation operation
                                        :candidate-families families
                                        :operation-id operation-id)))
                  (catch clojure.lang.ExceptionInfo exception
@@ -579,15 +629,16 @@
    reported as failures. Different physical ABIs are permitted here because offline compile-time
    selection measures each candidate independently; a runtime KernelDispatch requires a later
    common-interface normalization."
-  [program operation-id schedule & options]
-  (let [schedule (reduction/validate-schedule! schedule)
+  [program operation & options]
+  (let [operation-id (:id operation)
+        schedule (reduction/validate-schedule! (:schedule operation))
         families (validated-typed-contraction-families schedule operation-id)
         results
         (mapv
          (fn [family]
            (let [pinned (assoc-in schedule [:tuning-space :families] [family])]
              (try
-               (-> (apply route-typed-contraction program operation-id pinned options)
+               (-> (apply route-typed-contraction program (assoc operation :schedule pinned) options)
                    (assoc :family family)
                    (assoc :candidate-schedule pinned)
                    (update :declines #(candidate-declines family %)))
@@ -610,9 +661,9 @@
 
 (defn route-typed-contraction-candidates!
   "Emit typed contraction candidates or fail when no enabled family has a legal target leaf."
-  [program operation-id schedule & options]
+  [program operation & options]
   (let [result (apply route-typed-contraction-candidates
-                      program operation-id schedule options)]
+                      program operation options)]
     (if (seq (:candidates result))
       result
       (throw (ex-info "no executable typed contraction candidates"
@@ -786,10 +837,12 @@
    portable kernels can therefore compete through the existing KernelDispatch tuning machinery.
    Runtime-dependent private dimensions are refused until they have a common public ABI rather
    than silently baking one sample."
-  [program operation-id schedule & options]
-  (let [{:keys [candidates] :as routed}
+  [program operation & options]
+  (let [operation-id (:id operation)
+        schedule (reduction/validate-schedule! (:schedule operation))
+        {:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
-               program operation-id schedule options)
+               program operation options)
         candidates (mapv #(static-private-scalars! % operation-id) candidates)
         {:keys [abi arguments]} (common-logical-interface candidates operation-id)
         default-strategy (:strategy (first candidates))

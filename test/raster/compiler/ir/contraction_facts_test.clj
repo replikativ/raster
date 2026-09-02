@@ -56,10 +56,11 @@
                                     :roles :dims :opts :dtype])))
     (is (= (select-keys (cf/scalar-reduction-view parsed) [:neutral :combine :dtype])
            (select-keys (cf/scalar-reduction-view components) [:neutral :combine :dtype])))
-    (is (= (:form components)
-           (cf/surface-form {:out 'out :free-axes '[[i 4] [j 6]]
-                             :contract-axes '[[blk 4] [t 32]] :body body
-                             :opts (array-map :init 0 :combine 'clojure.core/+)})))))
+    (is (nil? (:form components))
+        "typed semantic facts do not carry a generated compatibility program")
+    (is (= (form :init 0 :combine 'clojure.core/+)
+           (cf/surface-form components))
+        "a remaining compatibility leaf projects syntax explicitly at its own boundary")))
 
 (deftest a-stage-list-cannot-supply-the-axes-it-is-checked-against
   (testing "the form's contract axes are independent of its :stages — the two are separate slots,
@@ -128,7 +129,7 @@
       (is (= :layout (:reason (cf/check-layout nt (:dpas cf/leaf-layouts))))))
     (testing "the two rows differ ONLY in the col operand's axis order"
       (is (= [:free0 :contract0] (get-in cf/leaf-layouts [:dpas :row])
-                                 (get-in cf/leaf-layouts [:dp4a :row])))
+             (get-in cf/leaf-layouts [:dp4a :row])))
       (is (= [:contract0 :free1] (get-in cf/leaf-layouts [:dpas :col])))
       (is (= [:free1 :contract0] (get-in cf/leaf-layouts [:dp4a :col]))))))
 
@@ -149,7 +150,7 @@
     (let [three (cf/contraction-facts
                  (list 'raster.par/contract 'C [['i 4] ['j 6]] [['l 8]]
                        (list 'raster.numeric/* (list 'aget 'A 'l) (list 'aget 'B 'l)
-                                               (list 'aget 'D 'l))))]
+                             (list 'aget 'D 'l))))]
       (is (= :operand-count (:reason (cf/check-layout three (:dpas cf/leaf-layouts)))))))
   (testing "check-layout refuses a hand-built map — it requires real facts"
     (is (thrown? clojure.lang.ExceptionInfo

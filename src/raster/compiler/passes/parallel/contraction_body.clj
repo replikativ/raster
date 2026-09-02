@@ -8,6 +8,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
@@ -60,8 +61,20 @@
         result-region (scalar-region-lower/make-region result-transform)
         transform-operands (vec (:operands result-transform))
         transform-scalars (vec (:scalars result-transform))
-        arrays (vec (sort-by name (:inputs segred)))
-        scalars (vec (sort-by name (:scalars segred)))
+        core-operand-ids (set (map :sym (:operands contract-facts)))
+        axes (concat (:free-axes contract-facts) (:contract-axes contract-facts))
+        axis-indices (set (map first axes))
+        core-symbols (reduce set/union #{}
+                             (map util/free-syms
+                                  (conj (mapv second axes) (:body contract-facts))))
+        core-scalar-ids (set/difference core-symbols core-operand-ids axis-indices
+                                        #{(:out contract-facts)})
+        ;; The scheduled TypedSOAC operation exposes its complete physical boundary, including
+        ;; result-transform captures. Core contraction loads and epilogue loads have different
+        ;; layout/dtype rules, so partition those roles from the verified facts instead of
+        ;; rebuilding a narrower SegRed from a generated host form.
+        arrays (vec (sort-by name (set/intersection (:inputs segred) core-operand-ids)))
+        scalars (vec (sort-by name (set/intersection (:scalars segred) core-scalar-ids)))
         transform-only-operands
         (filterv #(not (contains? (set arrays) (:sym %))) transform-operands)
         transform-only-scalars
