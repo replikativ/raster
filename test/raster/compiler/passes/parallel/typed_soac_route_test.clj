@@ -545,6 +545,25 @@
     (is (= 1 (count (:temporaries graph))))
     (parallel-program/validate! scheduled segop/segop-node?)))
 
+(deftest typed-map-scan-fuses-before-the-shared-scan-schedule
+  (let [source '(let* [mapped (raster.par/pmap i n float
+                                                (* (clojure.core/aget x i) 2.0))
+                       result (raster.par/scan out acc 0.0 j n float
+                                               (+ acc (clojure.core/aget mapped j)))]
+                      result)
+        {:keys [program stats]} (route/attempt source :float {'x :float 'out :float})
+        lowered (segop-lower/segop-lower-pass
+                 program {:dtype :float :target-device :ocl:0
+                          :array-types {'x :float 'out :float}})
+        equation (first (:equations (:form lowered)))]
+    (is (= 1 (:vertical stats)))
+    (is (= 1 (count (:equations program))))
+    (is (not-any? #{'mapped} (flatten (:source program))))
+    (is (= 1 (get-in lowered [:stats :kernel-graphs-lowered])))
+    (is (= [:intra-block :block-scan nil]
+           (mapv :phase (:operations equation))))
+    (parallel-program/validate! (:form lowered) segop/segop-node?)))
+
 (deftest typed-inclusive-scan-target-lowers-to-one-executable-dispatch
   (let [typed (:program (route/attempt inclusive-scan :float
                                        {'x :float 'out :float}))

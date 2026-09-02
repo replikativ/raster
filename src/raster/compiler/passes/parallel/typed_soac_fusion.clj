@@ -3,7 +3,7 @@
 
    The pattern library recognizes the compact equation grammar. Raster code performs the legality
    checks and fact-table updates explicitly; failed candidates leave the immutable program intact.
-   This first slice covers map→map, map→reduce and horizontal map fusion."
+   This first slice covers map→map, map→reduce, map→scan and horizontal map fusion."
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :refer [from-dialect]]
             [pattern.r3.core :refer [rule success]]
@@ -262,6 +262,40 @@
          ;; Alias-aware fusion can be added once legality is proved. Until then, equation results
          ;; are treated as fresh SSA values and any explicit alias contract declines fusion.
          (empty? (:aliases facts)))))
+
+(defn- scan-write-boundary
+  "Return the one proven destination of a vertically fusible scan, or nil.
+
+   A scan is functional in its logical result but effectful at its resident buffer boundary.
+   Map→scan fusion keeps that boundary in place; accepting only this exact contract prevents a
+   generic effect exception from weakening fusion legality."
+  [program info]
+  (when (= :scan (:kind info))
+    (let [equation-facts (get-in (dialect/facts program) [:equations (:id info)])
+          storage (vec (get-in equation-facts [:attributes :result-storage]))
+          destination (:destination (first storage))
+          result (first (:results info))]
+      (when (and (= 1 (count (:results info)) (count (:body-results info)) (count storage))
+                 (= #{:memory/write} (:effects equation-facts))
+                 (symbol? destination)
+                 (= [{:destination destination :access :write :host-return :buffer}] storage)
+                 (= {result destination} (:aliases equation-facts))
+                 (= result (get-in equation-facts [:attributes :host-binding])))
+        {:destination destination :storage storage}))))
+
+(defn- vertical-consumer-boundary
+  "Prove the boundary retained at a vertically fused consumer.
+
+   Pure consumers have no physical boundary. Scans retain their exact, single destination write.
+   No other effectful or aliasing consumer is admitted here."
+  [program producer consumer]
+  (or (when (fusible-equation? program (:id consumer)) {:kind :pure})
+      (when-let [boundary (scan-write-boundary program consumer)]
+        (let [destination (:destination boundary)
+              reads (set (concat (:arrays producer) (:captures producer)
+                                 (:arrays consumer) (:captures consumer)))]
+          (when-not (contains? reads destination)
+            (assoc boundary :kind :scan-write))))))
 
 (defn- reorder-barrier-free?
   "Whether moving or recomputing work between two equation positions preserves memory order.
@@ -751,13 +785,13 @@
            :when (= :map (:kind producer))
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
-           :when (contains? #{:map :reduce} (:kind consumer))
+           :when (contains? #{:map :reduce :scan} (:kind consumer))
            ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
-           ;; therefore compose vertically into another map; the established local-free
-           ;; map->reduce rule remains available until reduction regions admit typed locals.
+           ;; therefore compose vertically into another map; reduction and scan consumers remain
+           ;; local-free until their regions admit typed locals.
            :when (or (= :map (:kind consumer))
                      (and (empty? (:locals producer)) (empty? (:locals consumer))))
-           :when (or (= :reduce (:kind consumer))
+           :when (or (contains? #{:reduce :scan} (:kind consumer))
                      (and (empty? (:locals producer)) (empty? (:locals consumer)))
                      (some? (value-scalar-dtype program produced)))
            :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
@@ -765,7 +799,7 @@
            :when (some #{produced} (:arrays consumer))
            :when (reorder-barrier-free? program producer-index consumer-index)
            :when (fusible-equation? program (:id producer))
-           :when (fusible-equation? program (:id consumer))
+           :when (vertical-consumer-boundary program producer consumer)
            :let [placement-witness (producer-placement-witness
                                     program infos uses producer produced abstract-machine)]]
        {:producer-index producer-index :consumer-index consumer-index
@@ -843,10 +877,12 @@
                          :locals (:locals canonical)
                          :body-results (:body-results canonical))
           updated
-          (if (= :reduce (:kind updated))
+          (if (contains? #{:reduce :scan} (:kind updated))
             (let [{:keys [accumulators identities dtypes]} (:attributes updated)
                   algebra (mapv (fn [accumulator identity component-dtype result]
-                                  (scan/certify-reassociation
+                                  ((if (= :scan (:kind updated))
+                                     scan/certify
+                                     scan/certify-reassociation)
                                    {:acc accumulator :init identity :lambda result}
                                    component-dtype))
                                 accumulators identities dtypes (:body-results updated))]

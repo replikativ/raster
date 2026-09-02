@@ -60,6 +60,55 @@
     (is (= 'reduce (first (nth (first (dialect/equations typed-result)) 3))))
     (is (not-any? #{'y} (flatten (dialect/equations typed-result))))))
 
+(deftest map-scan-fusion-preserves-the-certified-resident-boundary
+  (doseq [[source mode result-shape]
+          [['(let* [mapped (raster.par/pmap i n float
+                                             (* (clojure.core/aget x i) 2.0))
+                    result (raster.par/scan out acc 0.0 j n float
+                                            (+ acc (clojure.core/aget mapped j)))]
+                   result)
+            :inclusive '[n]]
+           ['(let* [mapped (raster.par/pmap i n float
+                                             (* (clojure.core/aget x i) 2.0))
+                    result (raster.par/scan-exclusive out acc 0.0 j n float
+                                                      (+ acc (clojure.core/aget mapped j)))]
+                   result)
+            :exclusive '[(clojure.core/inc n)]]]]
+    (let [program (frontend/form->program source
+                                          {:dtype :float
+                                           :array-types {'x :float 'out :float}})
+          mapped-id (first (nth (first (dialect/equations program)) 2))
+          [result stats] (typed-fusion/fusion-fixpoint program)
+          equation (first (dialect/equations result))
+          operation (dialect/operation-parts equation)
+          result-id (first (nth equation 2))
+          equation-facts (get-in (dialect/facts result) [:equations (second equation)])]
+      (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+      (is (= 1 (count (dialect/equations result))))
+      (is (= 'scan (:kind operation)))
+      (is (= mode (get-in operation [:attributes :mode])))
+      (is (= '[x] (:arrays operation)))
+      (is (= result-shape (get-in (dialect/facts result) [:values result-id :shape])))
+      (is (= #{:memory/write} (:effects equation-facts)))
+      (is (= {result-id 'out} (:aliases equation-facts)))
+      (is (= [{:destination 'out :access :write :host-return :buffer}]
+             (get-in equation-facts [:attributes :result-storage])))
+      (is (not-any? #{mapped-id} (flatten (dialect/equations result))))
+      (is (= result (dialect/validate! result))))))
+
+(deftest map-scan-fusion-declines-an-aliased-destination-read
+  (let [source '(let* [mapped (raster.par/pmap i n float
+                                                (* (clojure.core/aget x i) 2.0))
+                       result (raster.par/scan x acc 0.0 j n float
+                                               (+ acc (clojure.core/aget mapped j)))]
+                      result)
+        program (frontend/form->program source {:dtype :float :array-types {'x :float}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= 2 (count (dialect/equations result)))
+        "materializing the map preserves its complete read before the scan mutates x")))
+
 (deftest horizontal-map-fusion-matches-current-graph
   (let [{:keys [legacy-result typed-result typed-stats]}
         (differential-fusion horizontal-map-pairs '[u v])
