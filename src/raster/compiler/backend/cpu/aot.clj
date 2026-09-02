@@ -27,6 +27,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -68,6 +69,18 @@
          (get *length-syms* (alength-arg expression) expression)
          expression))
      operation)))
+
+(defn- compatibility-segop
+  "Schedule an uncovered nested C host site at the shared middle-end boundary.
+
+   Structured-control equations do not yet survive into every monolithic C loop. Until that
+   coverage lands, this explicit adapter preserves existing SIMD performance without restoring
+   backend-local SOAC construction."
+  [record-class result-id source ct]
+  (let [dtype (get {"float" :float "double" :double} ct :double)
+        scheduled (segop-lower-pass/schedule-single-operation
+                   result-id source {:target-device :cpu:0 :dtype dtype})]
+    (first (filter #(.isInstance ^Class record-class %) (:operations scheduled)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -343,7 +356,9 @@
                     ;; unscheduled compatibility form remains correct through scalar expansion;
                     ;; the C backend never reparses it into another semantic operation.
                     (par/par-reduce-form? init)
-                    (or (when-let [sr (bound-segop raster.compiler.ir.segop.SegRed)]
+                    (or (when-let [sr (or (bound-segop raster.compiler.ir.segop.SegRed)
+                                          (compatibility-segop raster.compiler.ir.segop.SegRed
+                                                               sym init ct))]
                           (when-let [{:keys [includes helpers block]}
                                      (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
                             (when *simd-preamble*
@@ -369,7 +384,9 @@
 
     ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
     (and (seq? form) (par/par-map-form? form))
-    (or (when-let [sm (bound-segop raster.compiler.ir.segop.SegMap)]
+    (or (when-let [sm (or (bound-segop raster.compiler.ir.segop.SegMap)
+                          (compatibility-segop raster.compiler.ir.segop.SegMap
+                                               (gensym "c_map_") form ct))]
           (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm (csimd/active-isa) array-syms)]
             (when *simd-preamble* (swap! *simd-preamble* conj includes))
             block))
