@@ -354,6 +354,48 @@
 (defn- operation-description
   [id symbol expression default-dtype]
   (cond
+    ;; SplitMix64 is pointwise scalar algebra, not a semantic parallel primitive. Preserve the
+    ;; public convenience operation's fixed-width ABI here, then expose an ordinary typed map to
+    ;; fusion and scheduling. Wrapping arithmetic remains explicit in the scalar source and is
+    ;; retained by scalar-expression-body when a schedule becomes KernelBody SSA.
+    (par/par-rng-fill-form? expression)
+    (let [{:keys [seeds n base-seed]} (par/extract-par-rng-fill-info expression)
+          typed-symbol (fn [value tag]
+                         (if (symbol? value)
+                           (with-meta value (merge (meta value)
+                                                  {:tag tag :raster.type/tag tag}))
+                           value))
+          extent (typed-symbol (descriptor/unwrap-int-cast n) 'int)
+          base (typed-symbol (descriptor/unwrap-int-cast base-seed) 'long)
+          index (with-meta (clojure.core/symbol (str "rstr_rng_index_" id))
+                  {:tag 'long :raster.type/tag 'long})
+          local (fn [name]
+                  (with-meta (clojure.core/symbol (str "rstr_rng_" name "_" id))
+                    {:tag 'long :raster.type/tag 'long}))
+          state (local "state")
+          s1 (local "s1")
+          s2 (local "s2")
+          s3 (local "s3")
+          s4 (local "s4")
+          s5 (local "s5")
+          locals [{:id state :dtype :long
+                   :init (list 'unchecked-add base
+                               (list 'unchecked-multiply (list 'long index) par/SM-GAMMA))}
+                  {:id s1 :dtype :long
+                   :init (list 'bit-xor state
+                               (list 'unsigned-bit-shift-right state 30))}
+                  {:id s2 :dtype :long :init (list 'unchecked-multiply s1 par/SM-MIX1)}
+                  {:id s3 :dtype :long
+                   :init (list 'bit-xor s2 (list 'unsigned-bit-shift-right s2 27))}
+                  {:id s4 :dtype :long :init (list 'unchecked-multiply s3 par/SM-MIX2)}
+                  {:id s5 :dtype :long
+                   :init (list 'bit-xor s4 (list 'unsigned-bit-shift-right s4 31))}]]
+      {:kind :map :id id :sym symbol :results [symbol]
+       :index index :extent extent :locals locals :casts [nil] :bodies [s5]
+       :inputs #{} :outputs #{seeds} :scalars (set (filter symbol? [base]))
+       :result-storage [{:destination seeds :access :write :host-return :buffer}]
+       :host-binding symbol :elem-type :long :source-operation :raster.par/rng-fill!})
+
     (par/par-scatter-form? expression)
     (let [{:keys [out src index n stride]} (par/extract-par-scatter-info expression)]
       (when-not stride
@@ -670,6 +712,7 @@
 (defn- parallel-extent
   [expression]
   (cond
+    (par/par-rng-fill-form? expression) (:n (par/extract-par-rng-fill-info expression))
     (par/par-map-pure-form? expression) (nth expression 2)
     (par/par-map-form? expression) (nth expression 3)
     (par/par-map2-form? expression) (nth expression 4)
@@ -684,6 +727,7 @@
 (defn- replace-parallel-extent
   [expression extent]
   (let [position (cond
+                   (par/par-rng-fill-form? expression) 2
                    (par/par-map-pure-form? expression) 2
                    (par/par-map-form? expression) 3
                    (par/par-map2-form? expression) 4

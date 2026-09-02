@@ -3284,34 +3284,6 @@
     output-array))
 
 ;; ================================================================
-;; RNG fill kernel invocation (splitmix64 parallel seed generation)
-;; ================================================================
-
-(defn invoke-registered-rng-fill-kernel
-  "Invoke a compiled rng-fill kernel to fill a seeds buffer on-device.
-  Generates n splitmix64 seeds from base-seed + i*golden_ratio in parallel.
-
-  kernel-name: registered rng-fill kernel
-  seeds-buf:   DeviceBuffer (long, n elements) or JVM long-array
-  n:           number of seeds to generate
-  base-seed:   scalar long seed from which per-element seeds are derived"
-  [^String kernel-name seeds-buf n ^long base-seed]
-  (let [{:keys [kernel-handle workgroup-size]} (ensure-kernel-loaded! kernel-name)
-        n (long n)
-        wg (long (or workgroup-size 256))
-        groups (long (Math/ceil (/ (double n) (double wg))))
-        seeds-seg (if (device-buffer? seeds-buf)
-                    (:segment ^DeviceBuffer seeds-buf)
-                    (let [ab (* n 8)
-                          seg (ensure-seg kernel-name :seeds-buf ab)
-                          src (MemorySegment/ofArray seeds-buf)]
-                      (MemorySegment/copy src 0 seg 0 ab)
-                      seg))]
-    (launch! kernel-handle groups wg
-             [seeds-seg {:type :int :value (int n)} {:type :long :value base-seed}])
-    seeds-buf))
-
-;; ================================================================
 ;; Active-ids kernel invocation (splitmix64 random index generation)
 ;; ================================================================
 

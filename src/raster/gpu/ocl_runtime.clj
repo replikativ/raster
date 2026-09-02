@@ -1250,34 +1250,6 @@
                            a))]
           full-arr)))))
 
-(defn invoke-registered-rng-fill-kernel
-  "Invoke a compiled rng-fill kernel. Same interface as ze_runtime."
-  [^String kernel-name seeds-buf n ^long base-seed]
-  (ensure-init!)
-  (let [{:keys [kernel-handle workgroup-size]
-         :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
-        {:keys [queue]} @state
-        n (long n)
-        wg (long workgroup-size)
-        global-size (* wg (long (Math/ceil (/ (double n) wg))))]
-    ;; Set args: ids-buf, n_active (reused as n), base_seed, n_agents (reused as n)
-    (set-kernel-arg-buffer! kernel-handle 0 (:cl-mem seeds-buf))
-    (set-kernel-arg-scalar! kernel-handle 1 {:type :int :value (int n)})
-    (set-kernel-arg-scalar! kernel-handle 2 {:type :long :value base-seed})
-
-    (let [arena (Arena/ofConfined)]
-      (try
-        (let [global-seg (.allocate arena I64)
-              local-seg (.allocate arena I64)]
-          (.set global-seg I64 0 (long global-size))
-          (.set local-seg I64 0 (long wg))
-          (cl-call! "clEnqueueNDRangeKernel" @h-clEnqueueNDRangeKernel
-                    [queue kernel-handle (int 1) MemorySegment/NULL
-                     global-seg local-seg (int 0) MemorySegment/NULL MemorySegment/NULL])
-          (cl-call! "clFinish" @h-clFinish [queue]))
-        (finally (.close arena))))
-    (buffer->array seeds-buf)))
-
 (defn invoke-registered-active-ids-kernel
   "Invoke a compiled active-ids kernel. Same interface as ze_runtime."
   [^String kernel-name ids-buf n-active n-agents base-seed]

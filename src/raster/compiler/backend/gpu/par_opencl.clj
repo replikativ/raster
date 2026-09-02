@@ -555,38 +555,6 @@
                      {:name 'base-seed :type :long}]
      :active-ids? true}))
 
-(defn generate-par-rng-fill-kernel
-  "Generate an OpenCL kernel for raster.par/rng-fill! (splitmix64 per-element).
-  Each work-item computes: seeds[i] = splitmix64(base_seed + i * golden_ratio_64).
-  Fully parallel — no inter-thread communication needed.
-
-  Returns {:kernel-name str :source str :array-params ['seeds]
-           :scalar-params [{:name 'n :type :int} {:name 'base-seed :type :long}]
-           :rng-fill? true}."
-  [& {:keys [kernel-name device-id]
-      :or {kernel-name (str "par_rng_fill_" (gensym ""))}}]
-  (let [src (str "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n"
-                 "__kernel void " kernel-name
-                 "(__global long* seeds, int _n_bound, long base_seed) {\n"
-                 "  int i = get_global_id(0);\n"
-                 "  if (i >= _n_bound) return;\n"
-                 "  ulong state = (ulong)base_seed + (ulong)(long)i * (ulong)0x9e3779b97f4a7c15L;\n"
-                 "  state ^= state >> 30;\n"
-                 "  state *= (ulong)0xbf58476d1ce4e5b9L;\n"
-                 "  state ^= state >> 27;\n"
-                 "  state *= (ulong)0x94d049bb133111ebL;\n"
-                 "  state ^= state >> 31;\n"
-                 "  seeds[i] = (long)state;\n"
-                 "}\n")
-        spv-bytes (when device-id
-                    (compile-kernel-to-spirv src :device-id device-id))]
-    {:kernel-name kernel-name
-     :source src
-     :spv-bytes spv-bytes
-     :array-params ['seeds]
-     :scalar-params [{:name 'n :type :int} {:name 'base-seed :type :long}]
-     :rng-fill? true}))
-
 ;; ================================================================
 ;; Scatter kernel generator
 ;; ================================================================

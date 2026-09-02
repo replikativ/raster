@@ -277,7 +277,7 @@
 
    Uses full SegOp conversion for par/map! and par/reduce.
    Certified effect-only map-void forms consume their scheduled TypedSOAC SegMap; unsupported
-   bodies and the remaining stencil, scatter, rng, active-id and key-reduction forms retain
+   bodies and the remaining stencil, scatter, active-id and key-reduction forms retain
    explicit compatibility generators.
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
@@ -296,9 +296,10 @@
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
   (let [supplied-program (when (parallel-program/parallel-program? form)
                            (parallel-program/validate! form segop/segop-node?))
-        direct-strided-indexed?
+        direct-mini-program?
         (and (nil? supplied-program)
-             (or (and (par/par-gather-form? form)
+             (or (par/par-rng-fill-form? form)
+                 (and (par/par-gather-form? form)
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
                       (:stride (par/extract-par-scatter-info form)))))
@@ -309,7 +310,7 @@
            form {:target-device device-id :dtype dtype
                  :scalar-types scalar-types :array-types array-types})
 
-          direct-strided-indexed?
+          direct-mini-program?
           (segop-lower-pass/schedule-single-program
            (gensym "direct_indexed_result_") form
            {:target-device device-id :dtype dtype
@@ -674,14 +675,21 @@
                              :source form :target-dialect :kernel-graph
                              :fallback :none}))
 
-            ;; par/rng-fill!
+            ;; par/rng-fill! is a source convenience for an ordinary typed map. This branch only
+            ;; projects the scheduled artifact back into the direct backend's compatibility call.
             (par/par-rng-fill-form? form)
-            (let [{:keys [seeds n base-seed]} (par/extract-par-rng-fill-info form)
-                  k (register-kernel!
-                     (legacy/generate-par-rng-fill-kernel)
-                     :ze-maps)]
-              (list 'raster.gpu.ze-runtime/invoke-registered-rng-fill-kernel
-                    (:kernel-name k) seeds n base-seed))
+            (if-let [scheduled (take-bound-segop
+                                stats :segmap
+                                #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                      (= :typed-soac (:algorithm-dialect %))))]
+              (let [kernel (segop-cl/generate-scheduled-segmap-kernel
+                            scheduled :dtype (:dtype scheduled)
+                            :scalar-types top-scalar-types :array-types top-array-types)
+                    k (register-kernel! kernel :ze-maps)]
+                (emit-map-invocation k device-id))
+              (throw (ex-info "GPU RNG fill source has no verified TypedSOAC map schedule"
+                              {:reason :unscheduled-rng-fill
+                               :target-dialect :kernel-body :form form :fallback :none})))
 
             ;; par/active-ids!
             (par/par-active-ids-form? form)

@@ -55,6 +55,58 @@
                                      (+ acc (clojure.core/aget shared k)))]
          [mapped reduced]))
 
+(deftest rng-fill-is-an-ordinary-typed-map
+  (let [source '(let* [result (raster.par/rng-fill! seeds n base-seed)] result)
+        {:keys [program stats]}
+        (route/attempt source :long {'seeds :long}
+                       {:scalar-types {'n :int 'base-seed :long}})
+        algorithm (get-in program [:equations 0 :algorithm])
+        equation (first (dialect/equations algorithm))
+        operation (dialect/operation-parts equation)
+        locals (:locals (dialect/lambda-parts (:lambda operation)))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :long :target-device :ze:0}))
+        segmap (first (get-in scheduled [:equations 0 :operations]))
+        emitted (segop-opencl/generate-scheduled-segmap-kernel
+                 segmap :dtype :long
+                 :array-types {'seeds :long}
+                 :scalar-types {'n :int 'base-seed :long})]
+    (is (= :typed-soac (:route stats)))
+    (is (= 'map (:kind operation))
+        "RNG is scalar algebra in the existing functional map vocabulary")
+    (is (= 6 (count locals)))
+    (is (= [:long :long :long :long :long :long] (mapv :dtype locals)))
+    (is (= #{:wrap}
+           (into #{}
+                 (keep #(when (= "ScalarCompute" (some-> % class .getSimpleName))
+                          (get-in % [:expression :options :overflow])))
+                 (get-in emitted [:attributes :kernel-body :operations])))
+        "unchecked SplitMix arithmetic remains explicit after scheduling")
+    (is (re-find #"\(ulong\).* \* \(ulong\)" (:source emitted)))
+    (is (not (re-find #"par_rng_fill" (:source emitted)))))
+  (testing "the direct backend API enters the same complete typed mini-program"
+    (let [{:keys [kernels form]}
+          (opencl-pass/opencl-pass
+           '(raster.par/rng-fill! seeds n base-seed)
+           :dtype :long :min-elements 1
+           :array-types {'seeds :long}
+           :scalar-types {'n :int 'base-seed :long})]
+      (is (= 1 (count kernels)))
+      (is (re-find #"\(ulong\).* \* \(ulong\)" (:source (first kernels))))
+      (is (some #{'raster.gpu.ze-runtime/invoke-registered-kernel} (flatten form)))
+      (is (not-any? #{'raster.gpu.ze-runtime/invoke-registered-rng-fill-kernel}
+                    (flatten form)))))
+  (testing "the primitive signature casts emitted by macro expansion are canonicalized"
+    (let [{:keys [program]}
+          (route/attempt
+           '(let* [result (raster.par/rng-fill! seeds (int n) (long base-seed))]
+                  result)
+           :long {'seeds :long})
+          algorithm (get-in program [:equations 0 :algorithm])
+          operation (dialect/operation-parts (first (dialect/equations algorithm)))]
+      (is (= ['base-seed] (:captures operation)))
+      (is (= 'n (get-in operation [:attributes :extent]))))))
+
 (deftest production-route-retains-hardware-costed-placement-witnesses
   (let [poor (route/attempt expensive-fanout :float {'x :float}
                             {:abstract-machine {:ridge {:float 2.0}}})
