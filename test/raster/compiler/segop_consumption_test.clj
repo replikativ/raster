@@ -94,26 +94,26 @@
           (is (= 1 (:segop-reused st)))
           (is (nil? (:segop-relowered st))))))))
 
-(deftest jvm-simd-refuses-a-bound-segop-with-the-wrong-dtype
-  (testing "the backend re-lowers when its locally derived dtype disagrees with the boundary;
-            consuming the float SegOp as a double SIMD operation would silently change semantics"
+(deftest jvm-simd-treats-the-scheduled-dtype-as-authoritative
+  (testing "the scheduled operation retains the compiler's dtype even when compatibility source
+            lacks enough metadata to re-infer it"
     (let [st (:stats (run-simd (lowered-cpu map-form :float)))]
       (is (= 1 (:simd-maps st)))
-      (is (= 1 (:segop-relowered st)))
-      (is (nil? (:segop-reused st))))))
+      (is (= 1 (:segop-reused st)))
+      (is (nil? (:segop-relowered st))))))
 
-(deftest jvm-simd-invalidates-segops-when-it-fuses-after-lowering
-  (testing "a fused expression cannot consume the second input map's now-stale SegOp"
+(deftest jvm-simd-does-not-repeat-fusion-after-scheduling
+  (testing "typed fusion is the sole fusion authority; the backend consumes both scheduled maps"
     (let [form '(let* [tmp-step (raster.par/map! TMP i 8192 nil
                                                  (clojure.core/* (clojure.core/aget X i) 2.0))
                        out-step (raster.par/map! O j 8192 nil
                                                  (clojure.core/+ (clojure.core/aget TMP j) 1.0))]
                       out-step)
           st (:stats (run-simd (lowered-cpu form :double)))]
-      (is (= 1 (:fused st)))
-      (is (= 1 (:simd-maps st)))
-      (is (= 1 (:segop-relowered st)) "the fused lambda gets a fresh SegOp")
-      (is (nil? (:segop-reused st)) "neither pre-fusion SegOp certifies the fused lambda"))))
+      (is (zero? (:fused st)))
+      (is (= 2 (:simd-maps st)))
+      (is (= 2 (:segop-reused st)))
+      (is (nil? (:segop-relowered st))))))
 
 (deftest jvm-simd-does-not-turn-an-implementation-bug-into-scalar-fallback
   (testing "an unstructured re-lowering exception is a compiler bug, not an unsupported SIMD form"

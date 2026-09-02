@@ -4,9 +4,9 @@
   Compiles raster.par/map! → Java Vector API (DoubleVector) loop + scalar tail.
   Compiles raster.par/reduce → SIMD horizontal reduction with 4 accumulators.
 
-  Unlike the pattern-based simd.clj, this module works directly from the
-  parallel form structure — no fragile pattern matching needed. The
-  parallel form guarantees the operation is element-wise/reducible.
+  Scheduled programs consume their checked SegOps and treat the retained dtype as authoritative.
+  Direct source callers use an explicit counted compatibility lowering; fusion belongs exclusively
+  to the typed functional middle end.
 
   Supports:
     - Arithmetic: +, -, *, /
@@ -107,67 +107,6 @@
       longs :long
       ints :int
       nil)))
-
-;; ================================================================
-;; Fusion of consecutive parallel maps
-;; ================================================================
-
-(defn fuse-consecutive-maps
-  "Fuse consecutive raster.par/map! bindings in a let* form.
-  Returns a new binding vector with fused maps, or nil if no fusion."
-  [bindings-vec]
-  (let [pairs (vec (partition 2 bindings-vec))
-        n (count pairs)]
-    (when (>= n 2)
-      (loop [i 0 result [] fused? false]
-        (if (>= i n)
-          (when fused?
-            (vec (mapcat identity result)))
-          (if (>= (inc i) n)
-            (recur (inc i) (conj result (nth pairs i)) fused?)
-            (let [[sym1 expr1] (nth pairs i)
-                  [sym2 expr2] (nth pairs (inc i))]
-              (if (and (par/par-map-form? expr1)
-                       (par/par-map-form? expr2))
-                (let [info1 (par/extract-par-map-info expr1)
-                      info2 (par/extract-par-map-info expr2)
-                      tmp-sym (:out info1)
-                      ;; Check if expr2's body references tmp (via aget or direct symbol ref)
-                      refs-tmp? (letfn [(has-ref? [f]
-                                          (cond
-                                            (= f tmp-sym) true
-                                            (seq? f) (some has-ref? f)
-                                            (vector? f) (some has-ref? f)
-                                            :else false))]
-                                  (has-ref? (:body info2)))]
-                  (if refs-tmp?
-                    ;; Fuse: inline body1 into body2 where tmp is aget'd
-                    (let [inline-body (clojure.walk/postwalk
-                                       (fn [f]
-                                         (if (and (seq? f)
-                                                  (descriptor/aget-op? (first f))
-                                                  (= 3 (count f))
-                                                  (let [arr (second f)]
-                                                    (= (name tmp-sym) (name (if (symbol? arr) arr '_not_)))))
-                                           ;; Replace (aget tmp i) with body1 (adjusted index)
-                                           (let [body1-adj (clojure.walk/postwalk
-                                                            (fn [g] (if (= g (:idx info1)) (:idx info2) g))
-                                                            (:body info1))]
-                                             body1-adj)
-                                           f))
-                                       (:body info2))
-                          fused-expr (list 'raster.par/map! (:out info2) (:idx info2) (:bound info2)
-                                           (:cast info2) inline-body)
-                          ;; The ParallelProgram equation describes expr2 before body1 was inlined.
-                          ;; Its source-equality certificate will reject fused-expr and select the
-                          ;; counted backend re-lowering path.
-                          fused-sym sym2]
-                      ;; Skip sym1 binding (tmp is eliminated), replace sym2 with fused
-                      (recur (+ i 2) (conj result [fused-sym fused-expr]) true))
-                    ;; Not fusable — keep both
-                    (recur (inc i) (conj result (nth pairs i)) fused?)))
-                ;; Not both par maps
-                (recur (inc i) (conj result (nth pairs i)) fused?)))))))))
 
 ;; ================================================================
 ;; JIT isolation: lift nested SIMD let* for separate compilation
@@ -432,7 +371,8 @@
 (defn simd-pass
   "Pipeline pass: walk an S-expression, replace raster.par/* forms with SIMD code.
 
-  Stats tracked: {:simd-maps N :simd-reduces N :fallback N :fused N :skipped-small N}
+  Stats tracked: {:simd-maps N :simd-reduces N :fallback N :fused 0 :skipped-small N}.
+  The retained zero-valued :fused field keeps reporting stable after deletion of backend fusion.
 
   Options:
     :simd? — enable/disable SIMD (default true)
@@ -448,52 +388,50 @@
           source-form (if parallel-program (parallel-program/source-form parallel-program) form)
           min-elements (or min-elements (effective-min-elements))
           stats (atom {:simd-maps 0 :simd-reduces 0 :fallback 0 :fused 0 :skipped-small 0})
-            ;; Equation SegOps are consumed only when the dtype matches what this backend derives,
-            ;; so program consumption cannot silently change the SIMD element type.
-          take-bound (fn [pred dtype]
-                       (when-let [so (first (filter #(and (pred %) (= dtype (:dtype %))) *bound-segops*))]
+            ;; Scheduled SegOps own their checked dtype. Only the raw compatibility door derives a
+            ;; dtype from source syntax, because it has no typed equation to consume.
+          take-bound (fn [pred]
+                       (when-let [so (first (filter pred *bound-segops*))]
                          (swap! stats update :segop-reused (fnil inc 0))
                          so))
           par->segmap (fn [form]
-                        (try
-                          (let [par-info (par/extract-par-map-info form)
-                                dtype (or (:elem-type par-info)
-                                          (cast->elem-type (:cast par-info))
-                                          (out-sym->elem-type (:out par-info))
-                                          :double)]
-                            (when (System/getProperty "raster.debug.simd-dtype")
-                              (binding [*out* *err*]
-                                (println "[par-simd] dtype=" dtype
-                                         " out=" (:out par-info)
-                                         " cast=" (:cast par-info)
-                                         " from-meta=" (:elem-type par-info)
-                                         " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
-                                                         (:tag (meta (:out par-info)))))))
-                            (or (take-bound #(instance? raster.compiler.ir.segop.SegMap %) dtype)
-                                (do (swap! stats update :segop-relowered (fnil inc 0))
-                                    (let [soac (raster.compiler.ir.soac/par-form->soac
-                                                (:out par-info) form (swap! segop-id-counter inc))
-                                          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                                  soac :cpu:0 :dtype dtype)]
-                                      (first segops)))))
-                          ;; A structured unsupported-form refusal may fall back to scalar code.
-                          ;; Raw implementation exceptions must escape, as on the GPU boundary.
-                          (catch clojure.lang.ExceptionInfo _ nil)))
+                        (or (take-bound #(instance? raster.compiler.ir.segop.SegMap %))
+                            (try
+                              (let [par-info (par/extract-par-map-info form)
+                                    dtype (or (:elem-type par-info)
+                                              (cast->elem-type (:cast par-info))
+                                              (out-sym->elem-type (:out par-info))
+                                              :double)]
+                                (when (System/getProperty "raster.debug.simd-dtype")
+                                  (binding [*out* *err*]
+                                    (println "[par-simd] compatibility dtype=" dtype
+                                             " out=" (:out par-info)
+                                             " cast=" (:cast par-info)
+                                             " from-meta=" (:elem-type par-info)
+                                             " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
+                                                             (:tag (meta (:out par-info)))))))
+                                (swap! stats update :segop-relowered (fnil inc 0))
+                                (let [soac (raster.compiler.ir.soac/par-form->soac
+                                            (:out par-info) form (swap! segop-id-counter inc))
+                                      segops (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                              soac :cpu:0 :dtype dtype)]
+                                  (first segops)))
+                              ;; A structured unsupported-form refusal may fall back to scalar code.
+                              ;; Raw implementation exceptions must escape, as on the GPU boundary.
+                              (catch clojure.lang.ExceptionInfo _ nil))))
           par->segred (fn [form]
-                        (try
-                          (let [par-info (par/extract-par-reduce-info form)
-                                dtype (or (:elem-type par-info)
-                                          :double)
-                                sym (gensym "red_")
-                                bound (take-bound #(instance? raster.compiler.ir.segop.SegRed %) dtype)]
-                            (or bound
-                                (do (swap! stats update :segop-relowered (fnil inc 0))
-                                    (let [soac (raster.compiler.ir.soac/par-form->soac
-                                                sym form (swap! segop-id-counter inc) :dtype dtype)
-                                          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                                  soac :cpu:0 :dtype dtype)]
-                                      (first segops)))))
-                          (catch clojure.lang.ExceptionInfo _ nil)))
+                        (or (take-bound #(instance? raster.compiler.ir.segop.SegRed %))
+                            (try
+                              (let [par-info (par/extract-par-reduce-info form)
+                                    dtype (or (:elem-type par-info) :double)
+                                    sym (gensym "red_")]
+                                (swap! stats update :segop-relowered (fnil inc 0))
+                                (let [soac (raster.compiler.ir.soac/par-form->soac
+                                            sym form (swap! segop-id-counter inc) :dtype dtype)
+                                      segops (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                              soac :cpu:0 :dtype dtype)]
+                                  (first segops)))
+                              (catch clojure.lang.ExceptionInfo _ nil))))
           transform
           (fn transform [form]
             (cond
@@ -534,11 +472,9 @@
 
               ;; raster.par/stencil!
               (par/par-stencil-form? form)
-              (let [{:keys [cast elem-type radius]} (par/extract-par-stencil-info form)
-                    stencil-dtype (or elem-type (cast->elem-type cast) :double)
+              (let [{:keys [radius]} (par/extract-par-stencil-info form)
                     scheduled (take-bound
-                               #(instance? raster.compiler.ir.segop.SegStencil %)
-                               stencil-dtype)
+                               #(instance? raster.compiler.ir.segop.SegStencil %))
                     simd-form (when scheduled (compile-segstencil scheduled))]
                 (cond
                   simd-form
@@ -577,11 +513,9 @@
               ;; legal SIMD schedule. This keeps reducing-scatter algebra attached to the same
               ;; SegMap while executing an exact sequential read/modify/write loop on the JVM.
               (par/par-map-void-form? form)
-              (let [dtype (or (:raster.type/elem-type (meta form)) :double)
-                    scheduled (take-bound
+              (let [scheduled (take-bound
                                #(and (instance? raster.compiler.ir.segop.SegMap %)
-                                     (nil? (:out-sym %)))
-                               dtype)]
+                                     (nil? (:out-sym %))))]
                 (if-let [scalar-form (some-> scheduled segop-simd/compile-effect-segmap)]
                   (do (swap! stats update :scalar-effect-maps (fnil inc 0))
                       scalar-form)
@@ -603,33 +537,28 @@
                    ;; this intentionally expands raster.par macros at the correctness boundary.
                    #(and (symbol? %) (.startsWith (name %) "."))))
 
-              ;; let/let* — check for fusable consecutive maps
+              ;; let/let* — typed fusion has already made every legal fusion decision before
+              ;; scheduling. A backend-local source rewrite would invalidate that certificate and
+              ;; force the JVM emitter to invent a second, less-checked schedule.
               (and (seq? form) (contains? #{'let 'let*} (first form)))
               (let [[let-sym bindings & body] form
-                    ;; Try fusion first
-                    fused-bindings (fuse-consecutive-maps bindings)]
-                (if fused-bindings
-                  (do (swap! stats update :fused inc)
-                      (transform (list* let-sym (vec fused-bindings) body)))
-                  ;; No fusion — recurse into bindings and body
-                  ;; transform handles par forms via SegOp uniformly
-                  (let [pairs (partition 2 bindings)
-                        new-bindings (vec (mapcat (fn [[s e]]
-                                                    [s (binding [*bound-segops*
-                                                                 (when parallel-program
-                                                                   (parallel-program/operations-for-binding
-                                                                    parallel-program s e))]
-                                                         (transform e))])
-                                                  pairs))
-                        new-body (doall
-                                  (map (fn [expr]
-                                         (binding [*bound-segops*
-                                                   (when parallel-program
-                                                     (parallel-program/operations-for-source
-                                                      parallel-program expr))]
-                                           (transform expr)))
-                                       body))]
-                    (list* let-sym new-bindings new-body))))
+                    pairs (partition 2 bindings)
+                    new-bindings (vec (mapcat (fn [[s e]]
+                                                [s (binding [*bound-segops*
+                                                             (when parallel-program
+                                                               (parallel-program/operations-for-binding
+                                                                parallel-program s e))]
+                                                     (transform e))])
+                                              pairs))
+                    new-body (doall
+                              (map (fn [expr]
+                                     (binding [*bound-segops*
+                                               (when parallel-program
+                                                 (parallel-program/operations-for-source
+                                                  parallel-program expr))]
+                                       (transform expr)))
+                                   body))]
+                (list* let-sym new-bindings new-body))
 
               ;; do block — recurse explicitly (not via generic seq, for clarity)
               (and (seq? form) (= 'do (first form)))
