@@ -1134,7 +1134,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    and the backend consumes the following scheduled SegMap without reconstructing either fact.
    A raw binding program handed directly to the GPU backend likewise enters this whole-program
    adapter once, preserving cross-equation typed facts instead of independently scheduling each
-   child operation.
+   child operation. The JVM SIMD direct entry does the same when its caller supplies an
+   authoritative dtype; untyped compatibility calls remain counted rather than guessing types in
+   the backend.
    Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
    memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
    C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC

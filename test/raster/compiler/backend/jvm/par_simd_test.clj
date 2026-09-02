@@ -240,12 +240,14 @@
                          base 2
                          n 3]
                         (raster.par/map! out i n :offset base double (aget x i)))
-          {:keys [form stats]} (par-simd/simd-pass source :min-elements 0)
+          {:keys [form stats]} (par-simd/simd-pass source :min-elements 0 :dtype :double)
           result (eval form)]
       (is (= 1 (:fallback stats))
           "the typed unique-scatter has no JVM vector-store schedule yet")
       (is (= 1 (:segop-relowered stats))
-          "the direct API records its one middle-end compatibility scheduling request")
+          "the production typed route explicitly declines the missing JVM indexed-store schedule")
+      (is (= :offset-map-requires-indexed-store
+             (get-in stats [:direct-scheduling :segops-declined 0 :reason])))
       (is (= [99.0 99.0 10.0 11.0 12.0 99.0] (vec result))))))
 
 ;; ================================================================
