@@ -30,6 +30,8 @@
 
 (declare lower-reduce)
 (declare lower-map)
+(declare lower-reduce-description)
+(declare lower-map-description)
 (declare lower-scan-description)
 (declare scan-kernel-graph-description)
 (declare phase-grid)
@@ -108,17 +110,21 @@
           scalar-captures (set (remove stable-array-captures captures))
           result-dtype (or (:dtype (get values result))
                            dtype :double)
-          storage (soac-dialect/result-storage facts equation-id)
           physical-result (first physical-results)
-          node (assoc (soac/->SoacMap equation-id result index (:extent attributes) nil body
-                                      (into (set arrays) stable-array-captures)
-                                      (set physical-results)
-                                      scalar-captures)
-                      :sym physical-result :elem-type result-dtype :pure? (nil? storage)
-                      :scalar-region {:locals locals :result scalar-result})]
+          description {:id equation-id
+                       :bound (:extent attributes)
+                       :idx index
+                       :lambda body
+                       :scalar-region {:locals locals :result scalar-result}
+                       :inputs (into (set arrays) stable-array-captures)
+                       :outputs (set physical-results)
+                       :scalars scalar-captures
+                       :elem-type result-dtype
+                       :out-sym physical-result
+                       :cast-fn nil}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-map node device-id :dtype result-dtype)))))
+            (lower-map-description description device-id :dtype result-dtype)))))
 
 (defn lower-typed-stencil
   "Lower one validated boundary-aware TypedSOAC stencil to a scheduled SegStencil."
@@ -274,19 +280,22 @@
           body (materialize-region-locals locals scalar-result)
           stable (set (get-in attributes [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable captures))
-          node (assoc (soac/->SoacMap equation-id nil (:index attributes)
-                                      (:extent attributes) nil body
-                                      (into (set arrays) stable)
-                                      (set physical-results) scalar-captures)
-                      :elem-type result-dtype :pure? false
-                      :scalar-region {:locals locals :result scalar-result}
-                      :write-conflict (if reducing? :reduce :unique)
-                      :conflict-contract conflict)]
+          description {:id equation-id
+                       :bound (:extent attributes)
+                       :idx (:index attributes)
+                       :lambda body
+                       :scalar-region {:locals locals :result scalar-result}
+                       :inputs (into (set arrays) stable)
+                       :outputs (set physical-results)
+                       :scalars scalar-captures
+                       :elem-type result-dtype
+                       :out-sym nil
+                       :cast-fn nil}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id
                     :write-conflict (if reducing? :reduce :unique)
                     :conflict-contract conflict)
-            (lower-map node device-id :dtype result-dtype)))))
+            (lower-map-description description device-id :dtype result-dtype)))))
 
 (defn typed-reduce-program?
   "Whether a validated one-equation TypedSOAC program is the scalar reduction vertical currently
@@ -346,14 +355,19 @@
                      :algebra (or (first (:algebra attributes)) {})
                      :attributes (cond-> {:source :typed-soac :equation equation-id}
                                    result-region (assoc :result-region result-region))})
-          node (cond-> (soac/->SoacReduce equation-id result operator []
-                                          (:extent attributes)
-                                          (into (set arrays) stable-array-captures)
-                                          results scalar-captures)
-                 accumulator-dtype (assoc :elem-type accumulator-dtype))]
+          description {:id equation-id
+                       :sym result
+                       :reduction operator
+                       :segment-axes []
+                       :bound (:extent attributes)
+                       :idx index
+                       :inputs (into (set arrays) stable-array-captures)
+                       :outputs (set results)
+                       :scalars scalar-captures
+                       :elem-type accumulator-dtype}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-reduce node device-id :dtype accumulator-dtype)))))
+            (lower-reduce-description description device-id :dtype accumulator-dtype)))))
 
 (defn typed-segmented-reduce-program?
   "Whether a validated one-equation TypedSOAC program is a general segmented reduction."
@@ -523,13 +537,19 @@
           inputs (into (set arrays) stable)
           scalars (set/difference (set captures) stable)
           output-dtype (or (first (:dtypes attributes)) dtype :double)
-          node (cond-> (soac/->SoacReduce equation-id (first results) operator
-                                          (:segment-axes attributes) (:extent attributes)
-                                          inputs (vec (keep :result components)) scalars)
-                 output-dtype (assoc :elem-type output-dtype))]
+          description {:id equation-id
+                       :sym (first results)
+                       :reduction operator
+                       :segment-axes (:segment-axes attributes)
+                       :bound (:extent attributes)
+                       :idx (:index attributes)
+                       :inputs inputs
+                       :outputs (set (keep :result components))
+                       :scalars scalars
+                       :elem-type output-dtype}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-reduce node device-id :dtype output-dtype)))))
+            (lower-reduce-description description device-id :dtype output-dtype)))))
 
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."
@@ -684,6 +704,33 @@
      :elem-type (:elem-type node)
      :map-lambda nil}))
 
+(defn- legacy-map-description
+  [node]
+  {:id (:id node)
+   :bound (:bound node)
+   :idx (soac/soac-idx node)
+   :lambda (:lambda node)
+   :scalar-region (:scalar-region node)
+   :inputs (or (:inputs node) #{})
+   :outputs (or (soac-outputs* node) #{})
+   :scalars (or (:scalars node) #{})
+   :elem-type (:elem-type node)
+   :out-sym (:sym node)
+   :cast-fn (:cast-fn node)})
+
+(defn- legacy-reduce-description
+  [node]
+  {:id (:id node)
+   :sym (:sym node)
+   :reduction (reduction-info node)
+   :segment-axes (or (:segment-axes node) [])
+   :bound (:bound node)
+   :idx (soac/soac-idx node)
+   :inputs (or (:inputs node) #{})
+   :outputs (or (soac-outputs* node) #{(:sym node)})
+   :scalars (or (:scalars node) #{})
+   :elem-type (:elem-type node)})
+
 ;; ================================================================
 ;; Map lowering
 ;; ================================================================
@@ -691,19 +738,23 @@
 (defn lower-map
   "Lower a compatibility SoacMap to one SegMap with grid-stride virtualization."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
-  (let [dtype (or (:elem-type soac) dtype)
-        bound (:bound soac)
-        idx (soac/soac-idx soac)
+  (lower-map-description (legacy-map-description soac) device-id :dtype dtype))
+
+(defn- lower-map-description
+  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [dtype (or (:elem-type description) dtype)
+        bound (:bound description)
+        idx (:idx description)
         space (segop/make-seg-space idx bound)
         level (segop/->SegLevel :thread :virtual)
         grid (phase-grid :map device-id bound dtype)
-        out-sym (:sym soac)
-        cast-fn (:cast-fn soac)]
-    [(segop/->SegMap (:id soac) space level
-                     (:lambda soac)
-                     (:scalar-region soac)
-                     (:inputs soac) (soac-outputs* soac)
-                     (:scalars soac) grid
+        out-sym (:out-sym description)
+        cast-fn (:cast-fn description)]
+    [(segop/->SegMap (:id description) space level
+                     (:lambda description)
+                     (:scalar-region description)
+                     (:inputs description) (:outputs description)
+                     (:scalars description) grid
                      dtype out-sym cast-fn)]))
 
 ;; ================================================================
@@ -723,15 +774,19 @@
 
   Returns a vector of SegRed records (1 or 2 elements)."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
-  (let [reduction (reduction-info soac)
+  (lower-reduce-description (legacy-reduce-description soac) device-id :dtype dtype))
+
+(defn- lower-reduce-description
+  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [reduction (:reduction description)
         product? (some? (:combine reduction))
-        dtype (or (first (map :dtype (:components reduction))) (:elem-type soac) dtype)
-        bound (:bound soac)
-        idx (soac/soac-idx soac)
+        dtype (or (first (map :dtype (:components reduction))) (:elem-type description) dtype)
+        bound (:bound description)
+        idx (:idx description)
         map-lambda nil
         space (segop/make-seg-space-nd
                (conj (mapv (fn [[name axis-bound]] {:name name :bound axis-bound})
-                           (or (:segment-axes soac) []))
+                           (:segment-axes description))
                      {:name idx :bound bound}))
         planned-grid (phase-grid :reduce device-id bound dtype)
         product-grid-info (when product? (product-grid device-id planned-grid reduction))
@@ -754,20 +809,20 @@
                            :slm-budget (:slm-budget product-grid-info)}})))
         execution (execution-plan/reduce-execution bound grid-1)]
     (if product?
-      [(segop/->SegRed (:id soac) space (segop/->SegLevel :block :virtual)
-                       reduction map-lambda (:inputs soac)
-                       (set (filter symbol? (or (:outputs soac) []))) (:scalars soac)
+      [(segop/->SegRed (:id description) space (segop/->SegLevel :block :virtual)
+                       reduction map-lambda (:inputs description)
+                       (set (filter symbol? (:outputs description))) (:scalars description)
                        grid-1 :product product-schedule dtype)]
       (case (:strategy execution)
         :single
-        [(segop/->SegRed (:id soac)
+        [(segop/->SegRed (:id description)
                          space
                          (segop/->SegLevel :block :none)
                          reduction
                          map-lambda
-                         (:inputs soac)
-                         (or (soac-outputs* soac) #{(:sym soac)})
-                         (:scalars soac)
+                         (:inputs description)
+                         (:outputs description)
+                         (:scalars description)
                          (single-block-grid grid-1)
                          :single nil
                          dtype)]
@@ -782,11 +837,11 @@
                                         (cond-> (vec (get-in reduction [:step :results]))
                                           map-lambda (conj map-lambda))))
               fold-scalars (if result-region
-                             (set/intersection (set (:scalars soac)) fold-symbols)
-                             (:scalars soac))
-              phase-1 (segop/->SegRed (:id soac) space level-1
+                             (set/intersection (set (:scalars description)) fold-symbols)
+                             (:scalars description))
+              phase-1 (segop/->SegRed (:id description) space level-1
                                       phase-1-reduction map-lambda
-                                      (:inputs soac)
+                                      (:inputs description)
                                       #{partials-sym}
                                       fold-scalars
                                       grid-1 :block-local nil
@@ -809,17 +864,17 @@
                {:accumulator accumulator
                 :neutral identity
                 :dtype (:dtype component)
-                :result (:sym soac)
+                :result (:sym description)
                 :index phase-2-idx
                 :step-result (list combine-op accumulator
                                    (list 'clojure.core/aget partials-sym phase-2-idx))
                 :algebra (:algebra reduction)
                 :attributes (assoc (:attributes reduction)
                                    :physical-phase :cross-block)})
-              phase-2 (segop/->SegRed [:reduction-phase (:id soac) :cross-block]
+              phase-2 (segop/->SegRed [:reduction-phase (:id description) :cross-block]
                                       phase-2-space level-2
                                       phase-2-reduction nil
-                                      #{partials-sym} #{(:sym soac)}
+                                      #{partials-sym} #{(:sym description)}
                                       result-scalars grid-2 :cross-block nil
                                       dtype)]
           [phase-1 phase-2])))))

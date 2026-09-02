@@ -1,10 +1,12 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
@@ -159,6 +161,43 @@
                                   {:scalar-types {'n :long}})
                    [:stats :front-end])))))
 
+(deftest typed-map-reduce-and-scatter-lower-without-compatibility-records
+  (let [map-program
+        (frontend/form->program
+         '(let* [result (raster.par/pmap i n float (clojure.core/aget x i))]
+                result)
+         {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        reduce-program
+        (frontend/form->program
+         '(let* [result (raster.par/reduce acc 0.0 i n
+                                           (+ acc (clojure.core/aget x i)))]
+                result)
+         {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        scatter-program
+        (frontend/form->program
+         '(let* [effect
+                 (raster.par/map-void!
+                  i n
+                  (clojure.core/aset out
+                                     (raster.par/unique-index
+                                      (clojure.core/aget indices i))
+                                     (clojure.core/aget x i)))]
+                effect)
+         {:dtype :float
+          :array-types {'indices :int 'x :float 'out :float}
+          :scalar-types {'n :long}})
+        reject (fn [& _]
+                 (throw (ex-info "typed lowering constructed a compatibility SOAC record" {})))
+        [mapped reduced scattered]
+        (with-redefs [legacy-soac/->SoacMap reject
+                      legacy-soac/->SoacReduce reject]
+          [(first (soac-lower/lower-typed-map map-program :ocl:0 :dtype :float))
+           (first (soac-lower/lower-typed-reduce reduce-program :ocl:0 :dtype :float))
+           (first (soac-lower/lower-typed-scatter scatter-program :ocl:0 :dtype :float))])]
+    (is (instance? raster.compiler.ir.segop.SegMap mapped))
+    (is (instance? raster.compiler.ir.segop.SegRed reduced))
+    (is (instance? raster.compiler.ir.segop.SegMap scattered))))
+
 (deftest parallel-semantics-enter-only-their-exact-typed-operation
   (testing "a certified inclusive scan is represented directly, with destination facts"
     (let [program (frontend/form->program
@@ -296,9 +335,15 @@
         routed (route/attempt source :float (:array-types options)
                               {:scalar-types (:scalar-types options)})
         scheduled
-        ((requiring-resolve
-          'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
-         (:program routed) {:target-device :ocl:0 :dtype :float})
+        (with-redefs [legacy-soac/->SoacMap
+                      (fn [& _]
+                        (throw (ex-info "typed product reduction constructed SoacMap" {})))
+                      legacy-soac/->SoacReduce
+                      (fn [& _]
+                        (throw (ex-info "typed product reduction constructed SoacReduce" {})))]
+          ((requiring-resolve
+            'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+           (:program routed) {:target-device :ocl:0 :dtype :float}))
         product (-> scheduled :form :equations first :operations first)
         remapped (dialect/remap-values program {'values [:binding 'values]})
         remapped-operation (dialect/operation-parts
