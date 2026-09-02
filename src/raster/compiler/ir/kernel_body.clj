@@ -77,6 +77,7 @@
 (def ^:private special-scalar-ops #{:cast :select :isnan})
 (def ^:private cast-rounding-policies #{:toward-zero :nearest-even :up :down :exact})
 (def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact :ieee})
+(def ^:private arithmetic-overflow-policies #{:wrap :trap :no-overflow})
 (def ^:private collective-kinds #{:reduce :broadcast})
 (def ^:private workgroup-memory-spaces #{:workgroup})
 (def ^:private barrier-semantics #{:acquire-release})
@@ -1063,17 +1064,22 @@
       (let [arity (:arity intrinsic)
             kind (:kind intrinsic)
             operand-type (same-types! "scalar intrinsic" infos)
-            wrapping? (= {:overflow :wrap} options)]
+            integral? (contains? #{:byte :int :long} operand-type)
+            overflow-op? (contains? #{:+ :- :*} canonical-op)
+            arithmetic-overflow? (and integral? overflow-op?)
+            overflow-policy (:overflow options)]
         (when-not (= arity (count infos))
           (throw (ex-info "scalar intrinsic arity mismatch"
                           {:operation canonical-op :expected arity :actual (count infos)})))
-        (when (and (seq options) (not wrapping?))
-          (throw (ex-info "scalar intrinsic does not accept unspecified lowering options"
-                          {:operation canonical-op :options options})))
-        (when (and wrapping?
-                   (not (and (contains? #{:+ :- :*} canonical-op)
-                             (contains? #{:byte :int :long} operand-type))))
-          (throw (ex-info "wrapping overflow is only defined for integral add, subtract, and multiply"
+        (when (and arithmetic-overflow? (seq options)
+                   (not (and (= #{:overflow} (set (keys options)))
+                             (contains? arithmetic-overflow-policies overflow-policy))))
+          (throw (ex-info "integral arithmetic has an unsupported explicit overflow contract"
+                          {:reason :kernel-body-intrinsic-overflow
+                           :operation canonical-op :operand-type operand-type
+                           :options options})))
+        (when (and (seq options) (not arithmetic-overflow?))
+          (throw (ex-info "overflow contracts are only defined for integral add, subtract, and multiply"
                           {:reason :kernel-body-intrinsic-overflow
                            :operation canonical-op :operand-type operand-type
                            :options options})))

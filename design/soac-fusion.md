@@ -102,8 +102,10 @@ models can refine a choice, while the typed program and numerical oracle constra
    mini-program rather than falling back to legacy source lowering.
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain
    `:wrap` in scalar `KernelBody` SSA and C-family targets execute them through the corresponding
-   unsigned representation; add `trap` and proved-no-overflow contracts before admitting ordinary
-   integral scalar algebra for indexing, RNG, and quantization.
+   unsigned representation. KernelBody now distinguishes `:trap` from compiler-certified
+   `:no-overflow`; C-family targets fail loudly for the former until checked helpers land, and only
+   locally proved schedule arithmetic uses the latter. Add range proofs for source-derived address
+   algebra before admitting ordinary integral operations for indexing, routing, and quantization.
 4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
    block movement without turning layouts into semantic tensor operators.
 5. Add independent numerical/property tests across aliases, mutation, fan-out, empty extents,

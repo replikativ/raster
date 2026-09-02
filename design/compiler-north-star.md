@@ -240,7 +240,11 @@ bindings, direct calls check resident ranges, and graph/link binding retains its
 overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from integral
 wrap/saturate/trap policies. Unchecked integral add/subtract/multiply retain an explicit wrapping
 policy in scalar SSA, and the shared C-family lowering performs those operations in the
-same-width unsigned representation rather than relying on undefined signed overflow. Whole-kernel
+same-width unsigned representation rather than relying on undefined signed overflow. Scalar SSA
+also distinguishes a compiler-certified `:no-overflow` operation from a semantic `:trap`; C-family
+targets emit the former as signed arithmetic and explicitly reject the latter until checked target
+helpers land. Schedule-local scan extent subtraction is the first proved operation. Source-derived
+address algebra is not blanket-certified: it still awaits AxisMap/range proofs. Whole-kernel
 workgroup allocations now have static typed shapes, named
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
 accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are
