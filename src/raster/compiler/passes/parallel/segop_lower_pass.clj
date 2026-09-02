@@ -15,9 +15,9 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.soac-dialect-adapter :as soac-adapter]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
 
@@ -94,10 +94,10 @@
                           ;; equation; do not smuggle executable host forms into the typed dialect.
                           (soac-dialect/extent? (:bound legacy-node)))
               algorithm (when typed?
-                          (soac-adapter/legacy-nodes->program
-                           [legacy-node] {:outputs (:outputs legacy-node)
-                                          :dtype (or dtype :double)
-                                          :array-types array-types}))
+                          (typed-frontend/form->program
+                           (list 'let* [sym form] sym)
+                           {:dtype (or dtype :double)
+                            :array-types array-types}))
               segops (attempt #(if algorithm
                                  (soac-lower/lower-typed-reduce
                                   algorithm (or device-id :cpu:0) :dtype (or dtype :double))

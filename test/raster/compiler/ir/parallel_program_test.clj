@@ -54,6 +54,8 @@
                                          ['n 'values])))
     (is (seq (:operations equation)))
     (is (soac-dialect/program-form? (:algorithm equation)))
+    (is (= :analyzed-source
+           (get-in (soac-dialect/facts (:algorithm equation)) [:provenance :front-end])))
     (is (= (:operands equation) (:inputs (soac-dialect/facts (:algorithm equation)))))
     (is (= (:results equation) (soac-dialect/outputs (:algorithm equation))))
     (is (= '[n] (get-in (soac-dialect/facts (:algorithm equation))
