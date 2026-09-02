@@ -299,7 +299,12 @@
                                               operand-type expression)
                                             arguments)
                               result-type (if comparison? :predicate operand-type)
-                              overflow (intrinsics/source-overflow-policy semantic-operation)
+                              integral-arithmetic?
+                              (and (contains? #{:byte :int :long} operand-type)
+                                   (contains? #{:+ :- :*} operator))
+                              overflow (when integral-arithmetic?
+                                         (or (intrinsics/source-overflow-policy semantic-operation)
+                                             :trap))
                               options (cond-> {} overflow (assoc :overflow overflow))
                               _ (when-not (every? #(= operand-type (:type %)) lowered)
                                   (decline! :operand-dtype

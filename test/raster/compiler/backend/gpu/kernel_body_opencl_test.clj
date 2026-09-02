@@ -313,6 +313,21 @@
         (is (not (str/includes? source "rstr_a + rstr_b"))
             "signed target arithmetic must not weaken modulo-2^N semantics")))))
 
+(deftest checked-source-arithmetic-retains-trapping-semantics
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {} :scalar-types {'a :long 'b :long} :arrays #{}
+                  :index-scope #{} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        checked ((:lower lowerer) '(+ a b) :long {'a :long 'b :long})
+        unchecked ((:lower lowerer) '(unchecked-add a b) :long {'a :long 'b :long})]
+    (is (= {:overflow :trap}
+           (get-in checked [:operations 0 :expression :options])))
+    (is (= {:overflow :wrap}
+           (get-in unchecked [:operations 0 :expression :options])))
+    (is (= :long (:type checked)))))
+
 (deftest explicit-signed-overflow-contracts-reach-the-target-boundary
   (doseq [target [:opencl-portable :cuda :hip]]
     (testing (name target)

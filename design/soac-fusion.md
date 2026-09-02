@@ -100,13 +100,14 @@ models can refine a choice, while the typed program and numerical oracle constra
    beta-reduce away type contracts. Direct compound map extents now retain their typed host-scalar
    prefix through GPU and JVM entry points; a singleton SegOp projection explicitly refuses such a
    mini-program rather than falling back to legacy source lowering.
-3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain
-   `:wrap` in scalar `KernelBody` SSA and C-family targets execute them through the corresponding
-   unsigned representation. KernelBody now distinguishes `:trap` from compiler-certified
+3. Finish explicit integer arithmetic semantics. Ordinary typed source add/subtract/multiply now
+   retain `:trap`, while unchecked variants retain `:wrap` in scalar `KernelBody` SSA; C-family
+   targets execute wrapping operations through the corresponding unsigned representation.
+   KernelBody distinguishes `:trap` from compiler-certified
    `:no-overflow`; CUDA/HIP use checked target-trap helpers for the former, OpenCL targets decline
    it because the language has no standard trap primitive, and only locally proved schedule
-   arithmetic uses the latter. Add range proofs for source-derived address algebra before admitting
-   ordinary integral operations for indexing, routing, and quantization.
+   arithmetic uses the latter. Add range proofs for source-derived address algebra, migrate the
+   remaining schedule constructors, then make an omitted integral overflow policy invalid IR.
 4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
    block movement without turning layouts into semantic tensor operators.
 5. Add independent numerical/property tests across aliases, mutation, fan-out, empty extents,
