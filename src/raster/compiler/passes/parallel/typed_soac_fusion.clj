@@ -263,6 +263,21 @@
          ;; are treated as fresh SSA values and any explicit alias contract declines fusion.
          (empty? (:aliases facts)))))
 
+(defn- reorder-barrier-free?
+  "Whether moving or recomputing work between two equation positions preserves memory order.
+
+   TypedSOAC values are SSA, but physical destination writes are not yet memory SSA. Until read and
+   write footprints participate in dependence analysis, any intervening effect or alias contract
+   is a hard fusion barrier."
+  [program left-index right-index]
+  (let [equations (dialect/equations program)
+        facts (dialect/facts program)]
+    (every? (fn [equation]
+              (let [equation-facts (get-in facts [:equations (second equation)])]
+                (and (empty? (:effects equation-facts))
+                     (empty? (:aliases equation-facts)))))
+            (subvec equations (inc left-index) right-index))))
+
 (declare remove-equation-fact)
 
 (defn- horizontal-boundary
@@ -748,6 +763,7 @@
            :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
            :when (pos? (get uses produced 0))
            :when (some #{produced} (:arrays consumer))
+           :when (reorder-barrier-free? program producer-index consumer-index)
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
            :let [placement-witness (producer-placement-witness
@@ -883,6 +899,7 @@
                                            (:destinations right-boundary)))
            :when (empty? (set/intersection (:destinations left-boundary) right-uses))
            :when (empty? (set/intersection (:destinations right-boundary) left-uses))
+           :when (reorder-barrier-free? program left-index right-index)
            ;; Moving the right equation to the left's position must not move it before an
            ;; intervening producer. Program inputs have no producer index and are always ready.
            :when (every? (fn [value]
