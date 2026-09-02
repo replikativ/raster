@@ -9,7 +9,7 @@
    later, the BlkRegTiling-style tiling pass consume this SegRed. A contraction is
    represented like a fused map→reduce: the product (map body) lives in the reduce
    combine's element slot `(+ acc <product>)`, so `map-lambda` is nil — matching how a
-   `SoacReduce` fuses its map into the canonical reduction operator."
+   a typed segmented reduction fuses its map into the canonical reduction operator."
   (:require [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.par :as ir-par]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -18,7 +18,7 @@
 
 (defn flatten-contract-axes
   "Flatten n≥1 contract axes into ONE innermost reduced dim (the A0 convention, endorsed by
-   Futhark's single-width Screma). Returns [k-sym k-bound body'] where k-sym is the single
+   Futhark's single-width reduction SOAC). Returns [k-sym k-bound body'] where k-sym is the single
    flat reduced index, k-bound its extent (product of the contract bounds), and body' the
    `body` with each original contract index li substituted by its row-major decomposition of
    the flat index: li = (kflat / prod(bounds after i)) mod bound_i. For a single contract axis
@@ -79,7 +79,7 @@
   "Parse a 0-CONTRACT `(raster.par/contract out [[i mi] …] [] body)` form → a SegMap (a pure
    N-D map = outer product / broadcast / elementwise). The free axes ARE the map/output space
    (row-major, outer→inner); `body` is the map element. This is the empty-reduce projection of
-   the same contraction node (Futhark: a Map is a Screma with an empty reduce list; Dex: an
+   the same contraction node (Futhark: a Map is a SOAC with an empty reduce list; Dex: an
    outer product is a `for` with no accumulator)."
   [form & {:keys [id dtype grid] :or {id 0 dtype :double grid nil}}]
   (let [[_ out free-axes contract-axes body] form

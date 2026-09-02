@@ -120,7 +120,6 @@
   [node]
   (cond
     (soac/soac-reduce? node) []
-    (and (soac/screma? node) (seq (:reduces node)) (empty? (:scans node))) []
     ;; An imperative map/scan binding aliases a caller-provided output buffer. Its iteration domain
     ;; is not proof of the buffer's physical/logical extent (padded rows and strided views are common).
     :else (unknown-vector-shape)))

@@ -272,7 +272,7 @@
 (defmacro contract
   "Explicit tensor contraction (SOAC). Declares FREE (parallel/output) axes and
   CONTRACTED (reduced) axes separately — the reliable, unambiguous scheduling signal
-  that a `Screma`/`SegRed` carries as parallel-vs-reduction structure (vs a nested
+  that a typed segmented reduction carries as parallel-vs-reduction structure (vs a nested
   map+reduce where the reduce hides inside the map-lambda and must be recognized).
 
   Form: (raster.par/contract out [[i mi] [j mj] ...] [[k mk]] body)
@@ -290,7 +290,7 @@
   contracted axis of body. The COMPILER recognizes the `raster.par/contract` form
   directly (free/contract axes are explicit → no index-expr matching), lifting it to a
   segmented reduction the tiling pass consumes. This macro is the interpreted runtime
-  fallback; it is fully compositional because it lowers to a segmented Screma, so its
+  fallback; it is fully compositional because it enters a segmented TypedSOAC reduction, so its
   output fuses with downstream SOACs (epilogue) like any reduction.
 
   Example (C[m,n] = A[m,k]·B[k,n], row-major):

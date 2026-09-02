@@ -3,7 +3,7 @@
    with its own accumulator dtype.
 
    WHY THIS EXISTS. `flatten-contract-axes` collapses n≥2 contract axes into one flat reduced
-   dim (the A0 convention, Futhark's single-width Screma). That is right for dense contraction —
+   dim (the A0 convention, Futhark's single-width reduction SOAC). That is right for dense contraction —
    and it is exactly what block-quantized arithmetic cannot do. Every real int8/int4 format
    (GGUF q8_0/q4_0, k-quants, AWQ, and raster's own `backend/cpu/quant.clj`) computes
 
@@ -213,4 +213,3 @@
     (if (empty? factors)
       body
       (cons 'raster.numeric/* (cons body (vec factors))))))
-
