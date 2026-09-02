@@ -552,7 +552,7 @@
                                   (= 4 (count operation)))
                          (nth operation 3))]
               (and (seq? body)
-                   (contains? #{'scalar 'map 'scatter 'stencil 'reduce
+                   (contains? #{'scalar 'map 'scatter 'effect-map 'stencil 'reduce
                                 'segmented-reduce 'product-reduce 'segmented-fold-map 'scan}
                               (first body)))))
           (fn [_ algorithm]

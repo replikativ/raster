@@ -319,6 +319,11 @@
           facts (soac-dialect/facts program)
           values (:values facts)
           physical-results (soac-dialect/physical-results facts equation)
+          result-storage (soac-dialect/result-storage facts equation-id)
+          read-write-destinations
+          (into #{} (keep (fn [{:keys [destination access]}]
+                            (when (= :read-write access) destination)))
+                result-storage)
           _ (when-not (= destinations physical-results)
               (throw (ex-info "typed effect-map destination storage changed after validation"
                               {:reason :raster/bug :equation equation-id
@@ -357,7 +362,7 @@
                        :idx (:index attributes)
                        :lambda nil
                        :scalar-region {:locals locals :effects effects}
-                       :inputs (into (set arrays) stable)
+                       :inputs (into (into (set arrays) stable) read-write-destinations)
                        :outputs (set physical-results)
                        :scalars scalar-captures
                        :elem-type result-dtype

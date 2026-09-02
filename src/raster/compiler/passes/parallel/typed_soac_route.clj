@@ -40,25 +40,38 @@
 
 (defn- scalar-region
   [equation]
-  (let [{:keys [kind attributes arrays captures lambda element-lambda]}
+  (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
     (if (= 'segmented-fold-map kind)
       {:locals [] :bodies []}
       (let [{:keys [locals body-results]}
             (dialect/lambda-parts (or lambda element-lambda))
-            {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
+            {:keys [elements capture-parameters destination-parameters]}
+            (dialect/parameter-layout equation)
             substitutions
-            (into (zipmap capture-parameters captures)
+            (into (into (zipmap capture-parameters captures)
+                        (zipmap destination-parameters destinations))
                   (map (fn [parameter array]
                          [parameter (list 'clojure.core/aget array (:index attributes))])
-                       elements arrays))]
+                       elements arrays))
+            project-expression
+            (fn [expression]
+              (projection/scalar-folds->source
+               (util/subst-syms substitutions expression)))
+            project-body
+            (fn [body]
+              (if (= 'effect-map kind)
+                (let [{:keys [destination conflict destination-index predicate value]}
+                      (dialect/effect-parts body)]
+                  (list 'effect (get substitutions destination destination) conflict
+                        (project-expression destination-index)
+                        (project-expression predicate)
+                        (project-expression value)))
+                (project-expression body)))]
         {:locals (mapv #(update % :init (fn [init]
-                                          (projection/scalar-folds->source
-                                           (util/subst-syms substitutions init))))
+                                          (project-expression init)))
                        locals)
-         :bodies (mapv #(projection/scalar-folds->source
-                         (util/subst-syms substitutions %))
-                       body-results)}))))
+         :bodies (mapv project-body body-results)}))))
 
 (defn- materialize-region
   [locals body]
@@ -231,6 +244,51 @@
                    [host-binding (first physical-results)]]
                   [[host-binding effect-source]])
          :site [:binding (if buffer-return? effect-binding host-binding)]
+         :source effect-source})
+
+      effect-map
+      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
+            physical-results (dialect/physical-results (dialect/facts program) equation)
+            host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            result-dtypes (mapv #(:dtype (get values %)) results)
+            casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+            dtype-by-destination (zipmap physical-results result-dtypes)
+            cast-by-destination (zipmap physical-results casts)
+            effects (mapv dialect/effect-parts bodies)
+            _ (when-not (and (= (count results) (count physical-results)
+                                (count result-dtypes) (count casts))
+                             (every? some? effects) (every? some? casts)
+                             (= #{:effect} (set (map :host-return storage))))
+                (throw (ex-info "the production effect-map route requires typed effect storage"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results
+                                 :storage storage :effects effects :dtypes result-dtypes})))
+            statements
+            (mapv (fn [{:keys [destination conflict destination-index predicate value]}]
+                    (let [cast (get cast-by-destination destination)
+                          result-dtype (get dtype-by-destination destination)
+                          destination (with-meta destination
+                                        {:raster.type/tag
+                                         (dtype/scalar-tag-for-dtype result-dtype)
+                                         :tag (dtype/scalar-tag-for-dtype result-dtype)})
+                          typed-value (list cast value)
+                          store (if (dialect/reducing-scatter-conflict? conflict)
+                                  (list 'raster.par/atomic-add!
+                                        destination destination-index typed-value)
+                                  (list 'clojure.core/aset destination destination-index
+                                        typed-value))]
+                      (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+                  effects)
+            effect-source
+            (with-meta
+              (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                    (materialize-region region-locals (list* 'do statements)))
+              {:raster.type/elem-type (first result-dtypes)})]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding effect-source]]
+         :site [:binding host-binding]
          :source effect-source})
 
       stencil
@@ -489,7 +547,7 @@
                    (if resident-reductions?
                      (resident/realize typed-result)
                      [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-               (if (not-any? #(contains? #{:map :scatter :stencil :reduce
+               (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
                                            :segmented-reduce :product-reduce
                                            :segmented-fold-map :scan}
                                          (:kind (fusion/equation-info %)))

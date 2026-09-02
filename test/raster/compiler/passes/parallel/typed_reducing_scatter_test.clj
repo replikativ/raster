@@ -6,7 +6,8 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (def ^:private float-types
   {'out :float 'vals :float 'keys :int})
@@ -103,6 +104,20 @@
       (is (str/includes? kernel-source "atomic_add_float"))
       (is (str/includes? kernel-source " / stride"))
       (is (str/includes? kernel-source " % stride")))))
+
+(deftest local-allocation-retains-its-own-scatter-dtype
+  (let [source '(let* [out (clojure.core/float-array
+                            (clojure.core/* (long n) (long stride)))
+                       step (raster.par/scatter! out vals keys n stride)]
+                      step)
+        result (route/attempt source :double {'vals :float 'keys :int}
+                              {:scalar-types {'n :long 'stride :long}})
+        equation (-> result :program :equations second :algorithm dialect/equations first)
+        conflict (-> equation dialect/operation-parts :attributes :conflict)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= :reduce (:kind conflict)))
+    (is (= :float (:dtype conflict))
+        "the float-array declaration, not the default arithmetic dtype, owns storage type")))
 
 (deftest additive-effect-recognition-refuses-an-extra-destination-read
   (let [unsafe
