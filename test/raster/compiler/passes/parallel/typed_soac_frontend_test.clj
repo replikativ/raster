@@ -1,12 +1,10 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
-            [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
-            [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
@@ -16,17 +14,14 @@
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
 
-(deftest direct-front-end-matches-the-compatibility-projection-on-the-overlap
-  (let [[_ bindings] source
-        nodes (legacy/let-bindings->nodes (partition 2 bindings))
-        projected (adapter/legacy-nodes->program
-                   nodes {:outputs '[total] :dtype :float :array-types {'x :float}
-                          :include-scalar-bindings? true})
-        direct (frontend/form->program source {:dtype :float :array-types {'x :float}})]
-    (is (= (dialect/equations projected) (dialect/equations direct)))
-    (is (= (:values (dialect/facts projected)) (:values (dialect/facts direct))))
-    (is (= (:inputs (dialect/facts projected)) (:inputs (dialect/facts direct))))
-    (is (= (dialect/outputs projected) (dialect/outputs direct)))
+(deftest direct-front-end-builds-the-typed-map-reduction-program
+  (let [direct (frontend/form->program source {:dtype :float :array-types {'x :float}})
+        equations (dialect/equations direct)]
+    (is (= '[scalar map reduce] (mapv dialect/operation-kind equations)))
+    (is (= '[x] (:inputs (dialect/facts direct))))
+    (is (= '[total] (dialect/outputs direct)))
+    (is (= :float (:dtype (get-in (dialect/facts direct) [:values 'y]))))
+    (is (= :double (:dtype (get-in (dialect/facts direct) [:values 'total]))))
     (is (= :analyzed-source (get-in (dialect/facts direct) [:provenance :front-end])))
     (is (every? #(contains? (:provenance %) :source-binding-id)
                 (vals (:equations (dialect/facts direct)))))))
@@ -47,7 +42,7 @@
         source (list 'let*
                      (vector 'mapped (list 'raster.par/pmap 'i 'n 'float product)
                              'total '(raster.par/reduce acc 0.0 j n
-                                                       (+ acc (clojure.core/aget mapped j))))
+                                                        (+ acc (clojure.core/aget mapped j))))
                      'total)
         routed (route/attempt source :float {'x :float})
         products (filter #(and (seq? %) (= '* (first %)))
