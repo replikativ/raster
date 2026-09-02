@@ -24,6 +24,18 @@
       ;; n is the bound expression, not in scalars (scalars = free syms of lambda minus inputs/idx)
       (is (not (contains? (:scalars node) 'n))))))
 
+(deftest offset-map-cannot-lose-its-destination-base
+  (testing "the compatibility SoacMap has no indexed-store field, so accepting an offset map would
+            silently turn out[base+i] into out[i]"
+    (try
+      (soac/par-form->soac
+       'out '(raster.par/map! out i n :offset base float (aget x i)) 0)
+      (is false "an offset map must not enter the compatibility SOAC dialect")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :offset-map-requires-indexed-store (:reason (ex-data e))))
+        (is (= 'base (:offset (ex-data e))))
+        (is (= :typed-soac-scatter (:target-dialect (ex-data e))))))))
+
 (deftest par-reduce->soac-test
   (testing "Convert raster.par/reduce to SoacReduce"
     (let [expr '(raster.par/reduce acc 0.0 j n (+ acc (aget a j)))

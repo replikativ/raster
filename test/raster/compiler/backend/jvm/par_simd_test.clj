@@ -233,6 +233,18 @@
                      (tree-seq seq? seq form)))
           "No par forms should remain"))))
 
+(deftest offset-map-falls-back-with-correct-destination-indices
+  (testing "a compatibility refusal retains out[base+i] semantics on the JVM"
+    (let [source '(let* [out (double-array [99.0 99.0 99.0 99.0 99.0 99.0])
+                         x (double-array [10.0 11.0 12.0])
+                         base 2
+                         n 3]
+                        (raster.par/map! out i n :offset base double (aget x i)))
+          {:keys [form stats]} (par-simd/simd-pass source :min-elements 0)
+          result (eval form)]
+      (is (= 1 (:fallback stats)))
+      (is (= [99.0 99.0 10.0 11.0 12.0 99.0] (vec result))))))
+
 ;; ================================================================
 ;; From walked deftm body
 ;; ================================================================
