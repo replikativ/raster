@@ -1124,9 +1124,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    exact JVM or atomic OpenCL schedules. Strided gather and additive scatter flatten into the same
    algebra with one hoisted product extent; gather remains a map, while generic effect analysis
    proves the scatter update before target lowering selects sequential JVM updates or GPU atomics.
-   Additional atomic monoids, privatized histogram schedules, the remaining parallel forms,
-   calibrated whole-graph placement costs, preservation of scheduled equations through monolithic
-   C/SIMD emission, and deletion of the remaining graph/backend fallbacks remain.
+   Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
+   memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
+   C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC
+   reconstruction is deleted. Additional atomic monoids, privatized histogram schedules, nested
+   structured C/SIMD sites, the remaining parallel forms, calibrated whole-graph placement costs,
+   and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

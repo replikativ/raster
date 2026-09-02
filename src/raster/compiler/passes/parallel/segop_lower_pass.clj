@@ -472,3 +472,20 @@
          :stats (cond-> {:segops-lowered @lowered
                          :kernel-graphs-lowered @graphs-lowered}
                   (seq @declined) (assoc :segops-declined @declined))}))))
+
+(defn schedule-single-operation
+  "Run one direct-backend compatibility source form through the shared SegOp boundary.
+
+   Production compilation arrives with a ParallelProgram and never calls this adapter. It exists
+   only for public backend APIs that are invoked directly in tests or tools, keeping all source
+   interpretation in the middle end rather than duplicating `par-form->soac` inside emitters."
+  [result-id source opts]
+  (let [host-source (list 'let* [result-id source] result-id)
+        {scheduled :form stats :stats} (segop-lower-pass host-source opts)
+        equation (program/equation-for-binding scheduled result-id source)]
+    {:program scheduled
+     :equation equation
+     :operations (:operations equation)
+     :algorithm (:algorithm equation)
+     :diagnostics (:diagnostics scheduled)
+     :stats stats}))

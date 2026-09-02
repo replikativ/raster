@@ -25,8 +25,9 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
-            [raster.compiler.ir.soac :as soac]
-            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
 (def ^:dynamic *simd-preamble*
@@ -35,33 +36,51 @@
    the file header can prepend them exactly once."
   nil)
 
-(defonce ^:private segop-id (atom 0))
+(def ^:dynamic *scheduled-program*
+  "The certified ParallelProgram whose host source is being emitted as one C function."
+  nil)
 
-(defn- par-reduce->segred
-  "Build a SegRed from a raster.par/reduce form exactly as par_simd does
-   (extract-par-reduce-info → par-form->soac → lower-soac), so the C-SIMD emitter
-   consumes the SAME record the JVM path does. dtype is the kernel element type
-   (fallback when the form carries no :elem-type). nil on any failure."
-  [form dtype]
-  (try
-    (let [pi  (par/extract-par-reduce-info form)
-          dt  (or (:elem-type pi) dtype)
-          sym (gensym "red_")
-          sc  (soac/par-form->soac sym form (swap! segop-id inc) :dtype dt)]
-      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
-    (catch Exception _ nil)))
+(def ^:dynamic *bound-segops*
+  "Scheduled operations owned by the current host site. Source-only C normalization is allowed to
+   rewrite the host projection, but it cannot invent or reconstruct operations."
+  nil)
 
-(defn- par-map->segmap
-  "Build a SegMap from a raster.par/map! form (extract-par-map-info → par-form->soac
-   → lower-soac), the same construction par_simd uses. dtype falls back to the
-   kernel element type when the form carries no :elem-type. nil on any failure."
-  [form dtype]
-  (try
-    (let [pi (par/extract-par-map-info form)
-          dt (or (:elem-type pi) dtype)
-          sc (soac/par-form->soac (:out pi) form (swap! segop-id inc))]
-      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
-    (catch Exception _ nil)))
+(def ^:dynamic *length-syms*
+  "C ABI length parameters keyed by their source array symbol."
+  {})
+
+(declare alength-call? alength-arg)
+
+(defn- operations-at-site
+  [site]
+  (when *scheduled-program*
+    (:operations (some #(when (= site (:site %)) %)
+                       (:equations *scheduled-program*)))))
+
+(defn- bound-segop
+  [record-class]
+  (when-let [operation (first (filter #(.isInstance ^Class record-class %) *bound-segops*))]
+    ;; Host-source normalization turns alength into explicit ABI scalars after scheduling. Apply
+    ;; that same target expression legalization to the retained operation; its algebra, dtype,
+    ;; effects, and schedule remain untouched.
+    (walk/postwalk
+     (fn [expression]
+       (if (alength-call? expression)
+         (get *length-syms* (alength-arg expression) expression)
+         expression))
+     operation)))
+
+(defn- compatibility-segop
+  "Schedule an uncovered nested C host site at the shared middle-end boundary.
+
+   Structured-control equations do not yet survive into every monolithic C loop. Until that
+   coverage lands, this explicit adapter preserves existing SIMD performance without restoring
+   backend-local SOAC construction."
+  [record-class result-id source ct]
+  (let [dtype (get {"float" :float "double" :double} ct :double)
+        scheduled (segop-lower-pass/schedule-single-operation
+                   result-id source {:target-device :cpu:0 :dtype dtype})]
+    (first (filter #(.isInstance ^Class record-class %) (:operations scheduled)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -83,8 +102,12 @@
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
         opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
                :active-params active :param-env penv :source-ns source-ns}]
-    {:form (pl/run-passes raw pl/forward-passes opts)
-     :params active :param-env penv}))
+    (let [lowered (pl/run-passes raw pl/forward-passes opts)
+          program (when (parallel-program/parallel-program? lowered)
+                    (parallel-program/validate! lowered segop/segop-node?))]
+      {:form (if program (:source program) lowered)
+       :parallel-program program
+       :params active :param-env penv})))
 
 ;; ---------------------------------------------------------------------------
 ;; Form normalization for C emission.
@@ -324,38 +347,46 @@
         (str (clojure.string/join
               "\n  "
               (for [[sym init] pairs]
-                (cond
-                  (buffer-loop? init)
-                  ;; buffer-writing loop / nested compute — emit for side effects.
-                  (emit-host-stmt init array-syms ct)
-                  ;; a preserved par/reduce → C-SIMD block (or scalar fallback). Build
-                  ;; the SAME SegRed the JVM path uses and hand it to csimd; on nil
-                  ;; (not vectorizable) expand to the scalar loop and emit normally.
-                  (par/par-reduce-form? init)
-                  (or (when-let [sr (par-reduce->segred init (get {"float" :float} ct :double))]
-                        (when-let [{:keys [includes helpers block]}
-                                   (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
-                          (when *simd-preamble* (swap! *simd-preamble* conj (str includes helpers)))
-                          (str ct " " (ce/c-symbol sym) ";\n  " block)))
-                      (let [scalar (par/expand-par-reduce init)]
-                        (str (ce/decl-type scalar) " " (ce/c-symbol sym) " = "
-                             (emit-expr* scalar array-syms) ";")))
-                  ;; value binding (scalar or reduction) — declare with its tag type.
-                  :else
-                  (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
-                       (emit-expr* init array-syms) ";"))))
+                (binding [*bound-segops* (operations-at-site [:binding sym])]
+                  (cond
+                    (buffer-loop? init)
+                    ;; buffer-writing loop / nested compute — emit for side effects.
+                    (emit-host-stmt init array-syms ct)
+                    ;; A preserved par/reduce consumes only its certified scheduled SegRed. An
+                    ;; unscheduled compatibility form remains correct through scalar expansion;
+                    ;; the C backend never reparses it into another semantic operation.
+                    (par/par-reduce-form? init)
+                    (or (when-let [sr (or (bound-segop raster.compiler.ir.segop.SegRed)
+                                          (compatibility-segop raster.compiler.ir.segop.SegRed
+                                                               sym init ct))]
+                          (when-let [{:keys [includes helpers block]}
+                                     (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
+                            (when *simd-preamble*
+                              (swap! *simd-preamble* conj (str includes helpers)))
+                            (str ct " " (ce/c-symbol sym) ";\n  " block)))
+                        (let [scalar (par/expand-par-reduce init)]
+                          (str (ce/decl-type scalar) " " (ce/c-symbol sym) " = "
+                               (emit-expr* scalar array-syms) ";")))
+                    ;; value binding (scalar or reduction) — declare with its tag type.
+                    :else
+                    (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
+                         (emit-expr* init array-syms) ";")))))
              "\n  "
            ;; body: emit statement forms only. The function is void; the trailing
            ;; result value (a buffer symbol, or a vector [q scales] of them for a
            ;; multi-output kernel) is data for the host wrapper, NOT a C statement.
              (clojure.string/join
               "\n  "
-              (for [b body :when (not (or (symbol? b) (vector? b)))]
-                (emit-host-stmt b array-syms ct))))))
+              (for [[ordinal b] (map-indexed vector body)
+                    :when (not (or (symbol? b) (vector? b)))]
+                (binding [*bound-segops* (operations-at-site [:body ordinal])]
+                  (emit-host-stmt b array-syms ct)))))))
 
     ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
     (and (seq? form) (par/par-map-form? form))
-    (or (when-let [sm (par-map->segmap form (get {"float" :float} ct :double))]
+    (or (when-let [sm (or (bound-segop raster.compiler.ir.segop.SegMap)
+                          (compatibility-segop raster.compiler.ir.segop.SegMap
+                                               (gensym "c_map_") form ct))]
           (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm (csimd/active-isa) array-syms)]
             (when *simd-preamble* (swap! *simd-preamble* conj includes))
             block))
@@ -450,6 +481,7 @@
                          ce/*scalar-type* ct
                          ce/*int-vars* int-seed
                          *simd-preamble* simd-pre
+                         *length-syms* length-syms
                          csimd/*array-types* array-types]
                  (emit-host-stmt stripped array-syms ct))
         ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
@@ -533,7 +565,8 @@
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
   [f-var dtype & {:keys [simd?] :or {simd? false}}]
-  (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype :simd? simd?)
+  (let [{:keys [form parallel-program params param-env]}
+        (fused-scalar-form f-var dtype :simd? simd?)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
@@ -564,7 +597,9 @@
                                      buffers))
         local-set     (set (map first local-buffers))
         heap-buffers  (filterv #(not (local-set (first %))) buffers)
-        src (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers length-syms stripped)
+        src (binding [*scheduled-program* parallel-program]
+              (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
+                         length-syms stripped))
         so  (cpu/compile-source! src)
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))

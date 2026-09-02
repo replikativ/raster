@@ -949,11 +949,11 @@
   (let [target-device (:target-device opts)
         simd? (:simd? opts true)]
     (if (:keep-par-forms? opts)
-      ;; CPU-C SIMD path: leave par/map!/par/reduce forms INTACT (neither scalarize
-      ;; nor JVM-Vector-API lower) so the monolithic C backend can consume the same
-      ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
-      {:form (let [clean (strip-compound-markers form)]
-               (if (parallel-program/parallel-program? clean) (:source clean) clean))
+      ;; CPU-C SIMD path: retain the scheduled ParallelProgram envelope. Later host-only memory
+      ;; passes rewrite its source projection, while its certified equations remain authoritative
+      ;; for C-SIMD emission. Dropping to :source here used to force the C backend to reconstruct a
+      ;; second SegMap/SegRed from syntax.
+      {:form (strip-compound-markers form)
        :stats nil :backend :par-preserve}
       (case (device/select-runtime-backend target-device simd? nil)
         :cuda
@@ -1006,7 +1006,11 @@
   can freely merge different-size buffers.
   Returns {:form :stats}."
   [form _opts]
-  (resolve-alength/resolve-alength-pass form))
+  (if (parallel-program/parallel-program? form)
+    (let [{source :form :as result}
+          (resolve-alength/resolve-alength-pass (:source form))]
+      (assoc result :form (assoc form :source source)))
+    (resolve-alength/resolve-alength-pass form)))
 
 (defn- pass-mem-merge
   "Memory block merging: Futhark-style interference graph coloring.
@@ -1014,11 +1018,17 @@
   [form opts]
   (let [device-env (:device-env opts)
         params-set (set (:active-params opts))
+        program (when (parallel-program/parallel-program? form) form)
+        source (if program (:source program) form)
         ;; Auto-infer :hoistable on allocations whose sizes are param-derived
-        form (if (seq params-set)
-               (hoist/infer-hoistable form params-set)
-               form)]
-    (mem-merge/merge-memory-blocks form :device-env device-env)))
+        source (if (seq params-set)
+                 (hoist/infer-hoistable source params-set)
+                 source)
+        {merged :form :as result}
+        (mem-merge/merge-memory-blocks source :device-env device-env)]
+    (if program
+      (assoc result :form (assoc program :source merged))
+      result)))
 
 ;; ================================================================
 ;; Pass registry with typed arrows (=> From To)
