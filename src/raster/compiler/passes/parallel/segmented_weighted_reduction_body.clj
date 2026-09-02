@@ -16,7 +16,15 @@
   (body/literal value type))
 
 (defn- expr [op type & arguments]
-  (body/scalar-expression op type arguments))
+  ;; This pass owns a verified schedule: integral address/cursor arithmetic is derived from
+  ;; int-width route metadata, statically bounded capacities, or loop bounds over those values.
+  ;; Retain that proof explicitly instead of making the C-family emitter infer it from syntax.
+  (body/scalar-expression
+   op type arguments
+   (if (and (contains? #{:byte :int :long} type)
+            (contains? #{:+ :- :*} op))
+     {:overflow :no-overflow}
+     {})))
 
 (defn- select-expr [condition if-true if-false type]
   (body/scalar-expression :select type [condition if-true if-false]))

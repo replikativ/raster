@@ -1071,10 +1071,10 @@
         (when-not (= arity (count infos))
           (throw (ex-info "scalar intrinsic arity mismatch"
                           {:operation canonical-op :expected arity :actual (count infos)})))
-        (when (and arithmetic-overflow? (seq options)
+        (when (and arithmetic-overflow?
                    (not (and (= #{:overflow} (set (keys options)))
                              (contains? arithmetic-overflow-policies overflow-policy))))
-          (throw (ex-info "integral arithmetic has an unsupported explicit overflow contract"
+          (throw (ex-info "integral arithmetic requires exactly one overflow contract"
                           {:reason :kernel-body-intrinsic-overflow
                            :operation canonical-op :operand-type operand-type
                            :options options})))

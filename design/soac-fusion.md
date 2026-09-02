@@ -106,8 +106,9 @@ models can refine a choice, while the typed program and numerical oracle constra
    KernelBody distinguishes `:trap` from compiler-certified
    `:no-overflow`; CUDA/HIP use checked target-trap helpers for the former, OpenCL targets decline
    it because the language has no standard trap primitive, and only locally proved schedule
-   arithmetic uses the latter. Add range proofs for source-derived address algebra, migrate the
-   remaining schedule constructors, then make an omitted integral overflow policy invalid IR.
+   arithmetic uses the latter, and omitted integral overflow semantics are invalid KernelBody IR.
+   Continue moving source-derived address algebra into explicit AxisMap/range proofs rather than
+   certifying it from emitter syntax.
 4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
    block movement without turning layouts into semantic tensor operators.
 5. Add independent numerical/property tests across aliases, mutation, fan-out, empty extents,

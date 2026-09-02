@@ -57,6 +57,10 @@
                       "portable contraction body requires at least one free axis"
                       {:segred-id (:id segred)}))
         dtype (dtype/canon (:dtype segred))
+        _ (when (dtype/integral? dtype)
+            (decline! :integral-overflow-algebra
+                      "portable integer contraction requires explicit product and accumulation overflow contracts"
+                      {:dtype dtype :segred-id (:id segred)}))
         result-transform (:epilogue contract-facts)
         result-region (scalar-region-lower/make-region result-transform)
         transform-operands (vec (:operands result-transform))

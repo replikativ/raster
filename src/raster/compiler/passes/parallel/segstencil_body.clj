@@ -141,7 +141,8 @@
          (body/value right-limit :long)
          (body/scalar-expression
           :- :long [(body/cast-expression '_n_bound :long :exact :exact)
-                    (body/literal radius :long)]))
+                    (body/literal radius :long)]
+          {:overflow :no-overflow}))
         (body/->ScalarCompute
          (body/value left-interior :predicate)
          (body/scalar-expression :le :predicate

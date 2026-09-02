@@ -247,8 +247,9 @@ targets emit the former as signed arithmetic. CUDA and HIP lower the latter thro
 same-width unsigned predicates followed by PTX/LLVM target traps; OpenCL targets explicitly decline
 it because OpenCL C has no standard trap primitive. Schedule-local scan extent subtraction
 is the first proved operation. Source-derived address algebra is not blanket-certified: it still
-awaits AxisMap/range proofs, and schedule-produced integral expressions must be migrated before the
-verifier can reject every remaining omitted policy. Whole-kernel
+awaits AxisMap/range proofs. Scheduled attention and stencil bodies retain their own validated
+capacity/range proofs, and the KernelBody verifier rejects every omitted integral arithmetic
+policy. Whole-kernel
 workgroup allocations now have static typed shapes, named
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
 accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are

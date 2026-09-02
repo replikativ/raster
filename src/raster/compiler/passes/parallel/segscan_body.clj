@@ -117,6 +117,11 @@
                                                    :parameter)
                           scalar-ids)
                      [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
+    (when (dtype/integral? result-type)
+      (decline! :integral-overflow-algebra
+                "portable integer scan requires an explicit combine overflow contract"
+                {:phase phase :mode scan-mode :algebra scan-algebra
+                 :result-type result-type}))
     (when-not (and (contains? #{:single :intra-block :block-scan :carry-in} phase)
                    (contains? #{:inclusive :exclusive} scan-mode)
                    (scan/associative-scan? scan-algebra)

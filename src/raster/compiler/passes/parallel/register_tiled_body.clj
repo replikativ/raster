@@ -147,6 +147,10 @@
             (decline! :storage-dtype
                       "register-tiled schedule requires a known storage dtype"
                       {:dtype dtype}))
+        _ (when (dtype/integral? dtype)
+            (decline! :integral-overflow-contract
+                      "register-tiled integer contraction requires an explicit accumulation overflow algebra"
+                      {:dtype dtype :operation-id operation-id}))
         tile (select-tile tile descriptor dtype)
         {:keys [combine neutral]} (facts/scalar-reduction-view contract-facts)
         {:keys [block-m block-n block-k thread-m thread-n]} tile
