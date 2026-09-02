@@ -17,11 +17,9 @@
    structural condition is PROVEN or the matcher returns nil. Stage-2 gates any
    match numerically (bit-identical to the naive redomap) as a backstop.
 
-   Stage 1 = the loop-nest (Design A) matcher: a hand-written / lowered nested
-   `dotimes` matmul. A Screma-level lift (Design B, catches par/map+par/reduce
-   dense) reuses this same index/variance/extraction core."
+   Stage 1 is the loop-nest matcher for a hand-written or lowered nested
+   `dotimes` matmul. Typed contractions enter the shared scheduled matrix route directly."
   (:require [raster.compiler.passes.parallel.patterns :as pat]
-            [raster.compiler.ir.soac :as soac]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def ^:private canonical-add #{'+ 'clojure.core/+ 'raster.numeric/+})
@@ -169,57 +167,3 @@
         ;; result-sym = the do's tail buffer, unless the tail IS the store dotimes
         ;; itself (no explicit result) — then the output C is the result.
         (assoc d :result-sym (if (and (some? tail) (not= tail nest)) tail (:C d)))))))
-
-;; ── Design B: the Screma/SoacMap-level recognizer (the RESIDENT front door) ──────
-;; A par-form matmul `(par/map-void! ij (* m n) … (aset C ij <k-dot>))` lowers to ONE
-;; SoacMap whose lambda is the inner k-dot, with the outer (i,j) INLINED as
-;; (quot ij N)/(rem ij N) in the operand indices. Same tileable-redomap, different
-;; surface — reuses match-inner-dot + row-major variance via structural extraction.
-(def ^:private quot-ops #{'quot 'clojure.core/quot})
-(def ^:private rem-ops  #{'rem 'clojure.core/rem})
-
-(defn- add3 "(+-op a b) → [a b], else nil." [e]
-  (when (and (seq? e) (= 3 (count e)) (descriptor/addition-op? (first e))) (vec (rest e))))
-(defn- mul3 "(*-op a b) → [a b], else nil." [e]
-  (when (and (seq? e) (= 3 (count e)) (descriptor/multiplication-op? (first e))) (vec (rest e))))
-
-(defn- extract-m
-  "From a flat map bound = (* M N) and the recovered N, return M (the other factor), else nil."
-  [bound n]
-  (when-let [[a b] (mul3 bound)]
-    (cond (= b n) a (= a n) b)))
-
-(defn match-gemm-screma
-  "Match a flat par-form matmul SoacMap → {:variant :A :B :C :m :k :n :alpha :beta},
-   else nil. Recognizes the :nn shape (A row-major(quot idx N, p, K); B
-   row-major(p, rem idx N, N)); declines transposes/other shapes (sound — narrower,
-   never a false positive). CONSERVATIVE proven-or-nil: a false positive would emit a
-   tiled XMX kernel for a non-GEMM SoacMap (a silent miscompile). The descriptor is the
-   GEMM *schedule payload* — the resident pass attaches it as a `:gemm` facet on this
-   SoacMap (Design S), which then dispatches through the shared matrix-body scheduler while staying
-   a SOAC."
-  [node]
-  (when (and (instance? raster.compiler.ir.soac.SoacMap node)
-             (= 1 (count (:outputs node))))
-    (let [idx   (:idx node)
-          bound (:bound node)
-          c-sym (first (:outputs node))]
-      (when-let [{:keys [p k ga gb]} (match-inner-dot (:lambda node))]
-        (letfn [(quot-idx? [e n] (and (seq? e) (contains? quot-ops (first e)) (= 3 (count e))
-                                      (= idx (nth e 1)) (= n (nth e 2))))
-                (rem-idx?  [e n] (and (seq? e) (contains? rem-ops (first e)) (= 3 (count e))
-                                      (= idx (nth e 1)) (= n (nth e 2))))
-                (assign-nn [gA gB]
-                  ;; B index = (+ (* p N) (rem idx N)) — recover N, require the rem
-                  (when-let [[mulB colB] (add3 (:idx gB))]
-                    (when-let [[pB nB] (mul3 mulB)]
-                      (when (and (= p pB) (rem-idx? colB nB))
-                        ;; A index = (+ (* (quot idx N) K) p)
-                        (when-let [[mulA pA] (add3 (:idx gA))]
-                          (when (= p pA)
-                            (when-let [[rowA kA] (mul3 mulA)]
-                              (when (and (quot-idx? rowA nB) (= k kA))
-                                (when-let [m (extract-m bound nB)]
-                                  {:variant :nn :A (:arr gA) :B (:arr gB) :C c-sym
-                                   :m m :n nB :k k :alpha 1.0 :beta 0.0})))))))))]
-          (or (assign-nn ga gb) (assign-nn gb ga)))))))

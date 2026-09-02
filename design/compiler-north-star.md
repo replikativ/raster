@@ -532,7 +532,7 @@ operations. Its minimum useful family is:
 
 - map;
 - reduce and scan, including multiple results;
-- screma;
+- fused map/fold compositions;
 - histogram;
 - stream/chunked fold;
 - gather and scatter;
@@ -711,7 +711,7 @@ IR derives the pitch gate, occupancy decision, private conversion/transpose/part
 `KC`, and 1–3D launches from shape and schedule data. The resident binder supplies ABI values and
 binds ordinary graph calls; it does not assemble a GEMM algorithm. Constant-only layout/conversion
 nodes are hoisted by a graph-generic cacheable-transform rule. Remaining work is to originate the
-same graphs from the canonical contraction/Screma route, add vendor matrix-instruction leaves, and
+same graphs from the canonical typed contraction route, add vendor matrix-instruction leaves, and
 make measured shape tables override the analytic selector.
 
 ### 3.4 Scheduled kernel graph and kernel IR
@@ -1147,7 +1147,7 @@ completion gates remain useful for finding legacy paths that have not joined the
 | 1. Real SegOp boundary | Introduce a first-class program container for SOAC/SegOps; make lowering a full, fail-loud conversion; remove metadata-only and backend re-lowering for the migrated forms; validate operations and types, not only outer `let*`. | Map, reduction, scan, and one contraction travel through the same recorded dialect path on CPU and GPU; unsupported forms cannot silently bypass it. |
 | 2. Kernel ABI | Replace unordered symbol sets and hand-maintained signatures/binders with one ordered typed ABI; derive emission, binding, cache identity, and diagnostics from it. | Every production GPU invocation compares the emitted and bound ABI structurally; syntax/compile checks cover every emitted kernel. |
 | 3. Abstract values and operation interfaces | Add canonical shape/dtype/layout/placement/ownership/effect facts and operation rules; flatten/unflatten structured arguments with stable paths. | Passes no longer infer these facts from spellings or independent maps; differential type/effect tests cover nested and polymorphic shapes. |
-| 4. Scheduled contraction slice | Apply an explicit schedule to contraction/Screma; bring one GEMM family through kernel IR with masks, named operand layouts, and fusible epilogue. | The same algorithm selects scalar, tiled, DPAS/DP4A, and quant leaves by legal schedule; emitted results match the flat semantic oracle. |
+| 4. Scheduled contraction slice | Apply an explicit schedule to typed segmented contraction; bring one GEMM family through kernel IR with masks, named operand layouts, and fusible epilogue. | The same algorithm selects scalar, tiled, DPAS/DP4A, and quant leaves by legal schedule; emitted results match the flat semantic oracle. |
 | 5. Composable artifacts | Lift executable/session ownership, add foreign `DeviceArray` rebinding, graph linking/instantiation, parameter capture, events, and N-D trees. | Two compiled transformer subgraphs compose with zero host transfers; a full forward/VJP/update step is one resident artifact. |
 | 6. Closed tuning loop | Connect real device timing to schedule candidates and graph choices; make cache/provenance complete; wire or explicitly classify every schedule axis. | A cold compile tunes once, a warm compile reproduces the winner, numerical validation precedes timing, and the artifact explains why it won. |
 | 7. Workload-driven coverage | Add stream/hist/gather/scatter, masking/block views, atomics, layouts/staging, and quant formats as demanded by model/scientific kernels. | Coverage is measured through production lowering on a published workload corpus, with differential and device compile/run gates. |

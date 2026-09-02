@@ -1,7 +1,7 @@
 (ns raster.compiler.ir.segop
   "SegOp GPU IR — hardware-aware kernel representation.
 
-  Lowered from SOAC/Screma nodes, SegOps encode the concrete
+  Lowered from functional SOAC equations, SegOps encode the concrete
   GPU execution strategy: thread/block mapping, multi-phase
   decomposition (for reductions and scans), and launch parameters.
 

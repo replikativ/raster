@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.soac-lower
-  "SOAC/Screma → SegOp lowering with hardware-aware decisions.
+  "SOAC → SegOp lowering with hardware-aware decisions.
 
   Transforms high-level SOAC combinators into concrete GPU execution
   plans (SegOps) based on device capabilities:
@@ -524,8 +524,8 @@
           scalars (set/difference (set captures) stable)
           output-dtype (or (first (:dtypes attributes)) dtype :double)
           node (cond-> (soac/->SoacReduce equation-id (first results) operator
-                                           (:segment-axes attributes) (:extent attributes)
-                                           inputs (vec (keep :result components)) scalars)
+                                          (:segment-axes attributes) (:extent attributes)
+                                          inputs (vec (keep :result components)) scalars)
                  output-dtype (assoc :elem-type output-dtype))]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
@@ -658,23 +658,14 @@
      :slm-budget slm-budget
      :bytes-per-lane bytes-per-lane}))
 
-(defn- screma-map-lambda
-  [soac]
-  (when (soac/screma? soac)
-    (:map-lambda soac)))
-
 (defn- reduction-info
   [soac]
-  (if (soac/soac-reduce? soac)
-    (:reduction soac)
-    (first (:reduces soac))))
+  (:reduction soac))
 
 (defn- scan-op-info
   [soac]
-  (if (soac/soac-scan? soac)
-    {:acc (:acc soac) :init (:init soac)
-     :lambda (:lambda soac) :out (:out soac)}
-    (first (:scans soac))))
+  {:acc (:acc soac) :init (:init soac)
+   :lambda (:lambda soac) :out (:out soac)})
 
 (defn- legacy-scan-description
   [node]
@@ -691,14 +682,14 @@
      :outputs (or (soac-outputs* node) #{})
      :scalars (or (:scalars node) #{})
      :elem-type (:elem-type node)
-     :map-lambda (screma-map-lambda node)}))
+     :map-lambda nil}))
 
 ;; ================================================================
 ;; Map lowering
 ;; ================================================================
 
 (defn lower-map
-  "Lower a SoacMap/Screma-map to a single SegMap with grid-stride virtualization."
+  "Lower a compatibility SoacMap to one SegMap with grid-stride virtualization."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)
         bound (:bound soac)
@@ -720,7 +711,7 @@
 ;; ================================================================
 
 (defn lower-reduce
-  "Lower a SoacReduce/Screma-reduce to SegRed SegOps.
+  "Lower a compatibility SoacReduce to SegRed SegOps.
 
   Decision criteria:
     - n ≤ block-size → single-phase (one block does everything)
@@ -737,7 +728,7 @@
         dtype (or (first (map :dtype (:components reduction))) (:elem-type soac) dtype)
         bound (:bound soac)
         idx (soac/soac-idx soac)
-        map-lambda (screma-map-lambda soac)
+        map-lambda nil
         space (segop/make-seg-space-nd
                (conj (mapv (fn [[name axis-bound]] {:name name :bound axis-bound})
                            (or (:segment-axes soac) []))
@@ -838,7 +829,7 @@
 ;; ================================================================
 
 (defn lower-scan
-  "Lower a SoacScan/Screma-scan to SegScan SegOps.
+  "Lower a compatibility SoacScan to SegScan SegOps.
 
   Decision criteria:
     - n ≤ block-size → single-phase intra-block workgroup scan
@@ -982,23 +973,22 @@
                    :scan-algebra (get-in (first segops) [:scan-op :algebra])}})))
 
 (defn scan-soac?
-  "True when a SOAC/Screma node selects scan decomposition."
+  "True when a compatibility SOAC node selects scan decomposition."
   [node]
-  (or (soac/soac-scan? node)
-      (and (soac/screma? node) (seq (:scans node)) (empty? (:reduces node)))))
+  (soac/soac-scan? node))
 
 ;; ================================================================
 ;; Unified lowering dispatch
 ;; ================================================================
 
 (defn lower-soac
-  "Lower a SOAC/Screma node to one or more SegOps.
+  "Lower one compatibility SOAC node to one or more SegOps.
   Returns a vector of SegOp records.
 
   Dispatches on SOAC type:
-    SoacMap/Screma-pure-map → [SegMap]
-    SoacReduce/Screma-reduce → [SegRed SegRed] (two-phase)
-    SoacScan/Screma-scan → [SegScan SegScan SegMap] (three-stage)"
+    SoacMap → [SegMap]
+    SoacReduce → [SegRed SegRed] (two-phase)
+    SoacScan → [SegScan SegScan SegMap] (three-stage)"
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)]
     (cond
@@ -1006,22 +996,6 @@
       (throw (ex-info "Cannot lower nil: the preceding conversion produced no SOAC node"
                       {:reason :no-soac-node :target-dialect :segop}))
 
-      ;; Screma dispatch based on contents
-      (soac/screma? soac)
-      (cond
-        (and (empty? (:scans soac)) (empty? (:reduces soac)) (:map-lambda soac))
-        (lower-map soac device-id :dtype dtype)
-
-        (and (empty? (:scans soac)) (seq (:reduces soac)))
-        (lower-reduce soac device-id :dtype dtype)
-
-        (and (seq (:scans soac)) (empty? (:reduces soac)))
-        (lower-scan soac device-id :dtype dtype)
-
-        :else
-        (throw (ex-info "Complex Screma not yet supported for lowering" {:soac soac})))
-
-      ;; Direct SOAC dispatch
       ;; a contraction: record the facts for this target; the backend routes from them
       (soac/contract? soac)
       [(segop/->SegContract (:id soac) (:facts soac) dtype device-id)]
@@ -1037,14 +1011,3 @@
 
       :else
       (throw (ex-info "Unsupported SOAC type for lowering" {:soac soac})))))
-
-(defn lower-soac-nodes
-  "Lower all SOAC nodes from a fusion graph to SegOps.
-  Returns a map from original SOAC id to [SegOp ...] vector."
-  [nodes-map device-id & {:keys [dtype] :or {dtype :double}}]
-  (reduce-kv
-   (fn [acc id node]
-     (if (or (soac/soac? node) (soac/contract? node))
-       (assoc acc id (lower-soac node device-id :dtype dtype))
-       acc))
-   {} nodes-map))
