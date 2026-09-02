@@ -287,10 +287,10 @@
         (reducing-scatter-description id symbol out vals keys n op default-dtype)))
 
     ;; A flat gather is semantically an ordinary dense map with one pointwise index input and one
-    ;; stable, indirectly-read data input.  Keep it in that small functional vocabulary; the JVM
+    ;; stable, indirectly-read data input. Keep it in that small functional vocabulary; the JVM
     ;; scheduler may later select hardware vgather from the typed scalar region, while GPU targets
-    ;; consume the same SegMap.  The strided spelling needs a two-dimensional iteration space (or
-    ;; an explicitly hoisted product extent), so it remains outside this first exact migration.
+    ;; consume the same SegMap. normalize-source has already expressed a strided gather as the
+    ;; corresponding flattened map with one hoisted product extent.
     (par/par-gather-form? expression)
     (let [{:keys [out src index n stride]} (par/extract-par-gather-info expression)]
       (when-not stride
@@ -616,6 +616,34 @@
     (when position
       (with-meta (apply list (assoc (vec expression) position extent)) (meta expression)))))
 
+(defn- canonicalize-strided-gather
+  "Express a strided gather in the existing one-dimensional functional map algebra.
+
+   The flattened coordinate is split into row/component indices inside the scalar region. The
+   ordinary compound-extent normalization below then gives n*stride one stable scalar SSA value.
+   This keeps storage layout in index expressions instead of introducing an attention- or
+   gather-specific semantic operation."
+  [ordinal expression]
+  (if-let [{:keys [out src index n stride]}
+           (when (par/par-gather-form? expression)
+             (par/extract-par-gather-info expression))]
+    (if stride
+      (let [flat-index (clojure.core/symbol (str "rstr_gather_flat_" ordinal))
+            row-index (list 'clojure.core/quot flat-index stride)
+            component (list 'clojure.core/rem flat-index stride)
+            source-index (list 'clojure.core/+
+                               (list 'clojure.core/*
+                                     (list 'clojure.core/aget index row-index)
+                                     stride)
+                               component)]
+        (with-meta
+          (list 'raster.par/map! out flat-index
+                (list 'clojure.core/* n stride) nil
+                (list 'clojure.core/aget src source-index))
+          (meta expression)))
+      expression)
+    expression))
+
 (defn normalize-source
   "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
 
@@ -629,7 +657,8 @@
           {:keys [normalized]}
           (reduce
            (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
-             (let [extent (parallel-extent expression)
+             (let [expression (canonicalize-strided-gather ordinal expression)
+                   extent (parallel-extent expression)
                    canonical-extent (some-> extent descriptor/unwrap-int-cast)]
                (cond
                  (nil? extent)
