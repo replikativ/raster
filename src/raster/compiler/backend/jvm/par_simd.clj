@@ -26,6 +26,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.runtime.hardware :as hw]
             [clojure.set :as set]))
@@ -388,11 +389,21 @@
     (let [supplied-program (when (parallel-program/parallel-program? form)
                              (parallel-program/validate! form segop/segop-node?))
           direct-schedule
-          (when (and (nil? supplied-program) dtype (form/binding-form? form))
-            (segop-lower-pass/schedule-source-program
-             form {:target-device :cpu:0 :dtype dtype
-                   :scalar-types scalar-types :array-types array-types
-                   :values values :abstract-machine abstract-machine}))
+          (when (and (nil? supplied-program) dtype)
+            (cond
+              (form/binding-form? form)
+              (segop-lower-pass/schedule-source-program
+               form {:target-device :cpu:0 :dtype dtype
+                     :scalar-types scalar-types :array-types array-types
+                     :values values :abstract-machine abstract-machine})
+
+              (and (par/par-map-form? form)
+                   (not (soac-dialect/extent?
+                         (:bound (par/extract-par-map-info form)))))
+              (segop-lower-pass/schedule-single-program
+               (gensym "direct_parallel_result_") form
+               {:target-device :cpu:0 :dtype dtype
+                :scalar-types scalar-types :array-types array-types})))
           parallel-program (or supplied-program (:program direct-schedule))
           source-form (if parallel-program (parallel-program/source-form parallel-program) form)
           min-elements (or min-elements (effective-min-elements))

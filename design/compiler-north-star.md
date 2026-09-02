@@ -1164,6 +1164,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    scatter workloads. Direct strided gather and scatter now consume the complete typed
    mini-program: normalization's hoisted product extent remains an ordered host-scalar equation,
    and the backend consumes the following scheduled SegMap without reconstructing either fact.
+   Direct maps with compound extents use the same complete mini-program route on GPU and JVM. The
+   remaining singleton adapter accepts only a closed equation and fails with
+   `:direct-operation-requires-program` if a caller would discard a host-scalar prefix; it never
+   silently re-enters legacy SOAC to erase that dependency.
    A raw binding program handed directly to the GPU backend likewise enters this whole-program
    adapter once, preserving cross-equation typed facts instead of independently scheduling each
    child operation. The JVM SIMD direct entry does the same when its caller supplies an

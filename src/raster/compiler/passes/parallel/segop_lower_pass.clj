@@ -477,12 +477,7 @@
                          :kernel-graphs-lowered @graphs-lowered}
                   (seq @declined) (assoc :segops-declined @declined))}))))
 
-(defn schedule-single-operation
-  "Run one direct-backend compatibility source form through the shared SegOp boundary.
-
-   Production compilation arrives with a ParallelProgram and never calls this adapter. It exists
-   only for public backend APIs that are invoked directly in tests or tools, keeping all source
-   interpretation in the middle end rather than duplicating `par-form->soac` inside emitters."
+(defn- schedule-direct-program
   [result-id source opts]
   (let [;; Imperative map callers commonly pass the destination as their nominal result ID. Give
         ;; the host result its own value identity so the typed frontend can represent the declared
@@ -493,24 +488,12 @@
                       (gensym "direct_parallel_result_")
                       result-id)
         host-source (list 'let* [host-result source] host-result)
-        typed-candidate
-        (try
-          (typed-frontend/form->program
-           (typed-frontend/normalize-source host-source)
-           {:dtype (or (:dtype opts) :double)
-            :array-types (:array-types opts)
-            :scalar-types (:scalar-types opts)})
-          (catch clojure.lang.ExceptionInfo exception
-            (when-not (typed-frontend/source-decline? exception)
-              (throw exception))
-            nil))
-        ;; The compatibility return value exposes one operation, not a mini-program. Source
-        ;; normalization may introduce host scalar equations (notably a hoisted compound extent);
-        ;; using only the parallel equation would leave those SSA values unbound in the caller.
-        ;; Keep such sites on compatibility lowering until this API returns the complete envelope.
-        typed (when (= 1 (count (soac-dialect/equations typed-candidate))) typed-candidate)
+        typed-result
+        (typed-route/attempt
+         host-source (or (:dtype opts) :double) (:array-types opts)
+         {:scalar-types (:scalar-types opts)})
         {scheduled :form stats :stats}
-        (segop-lower-pass (if typed (typed-route/program-envelope typed) host-source) opts)
+        (segop-lower-pass (or (:program typed-result) host-source) opts)
         ;; Compound extents may introduce a preceding host-scalar equation. Select the one
         ;; scheduled parallel equation rather than assuming it is first in program order.
         equation (some #(when (seq (:operations %)) %) (:equations scheduled))]
@@ -519,30 +502,34 @@
      :operations (:operations equation)
      :algorithm (:algorithm equation)
      :diagnostics (:diagnostics scheduled)
-     :stats stats}))
+     :declined (:declined typed-result)
+     :stats (merge (:stats typed-result) stats)}))
+
+(defn schedule-single-operation
+  "Schedule one closed direct-backend operation through the shared typed boundary.
+
+   This projection is only valid when the operation has no preceding host equations. Callers whose
+   source normalization introduces scalar SSA (for example a compound extent) must consume
+   `schedule-single-program`; silently discarding that prefix would create an unbound kernel ABI."
+  [result-id source opts]
+  (let [scheduled (schedule-direct-program result-id source opts)
+        host-equations (filterv #(true? (get-in % [:attributes :host-only]))
+                                (get-in scheduled [:program :equations]))]
+    (when (seq host-equations)
+      (throw (ex-info "direct operation requires its complete scheduled program"
+                      {:reason :direct-operation-requires-program
+                       :source source
+                       :host-equations (mapv :id host-equations)})))
+    scheduled))
 
 (defn schedule-single-program
   "Run one direct-backend source form through the complete typed program boundary.
 
-   Unlike `schedule-single-operation`, this entry preserves host scalar equations introduced by
-   normalization and reconstructs their host bindings around the scheduled parallel equation.
-   Backends use it when a direct source spelling expands to a genuine mini-program rather than
-   pretending that the parallel operation is closed in isolation."
+   This entry preserves host scalar equations introduced by normalization and reconstructs their
+   host bindings around the scheduled parallel equation. Backends use it whenever a direct source
+   spelling may expand to a genuine mini-program."
   [result-id source opts]
-  (let [host-source (list 'let* [result-id source] result-id)
-        typed-result
-        (typed-route/attempt
-         host-source (or (:dtype opts) :double) (:array-types opts)
-         {:scalar-types (:scalar-types opts)})
-        {scheduled :form stats :stats}
-        (segop-lower-pass (or (:program typed-result) host-source) opts)
-        equation (some #(when (seq (:operations %)) %) (:equations scheduled))]
-    {:program scheduled
-     :equation equation
-     :operations (:operations equation)
-     :algorithm (:algorithm equation)
-     :diagnostics (:diagnostics scheduled)
-     :stats (merge (:stats typed-result) stats)}))
+  (schedule-direct-program result-id source opts))
 
 (defn schedule-source-program
   "Schedule a complete direct-backend binding form through the shared typed boundary.
