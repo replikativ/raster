@@ -39,9 +39,6 @@
             [raster.compiler.backend.intrinsics :as ix]
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
-            [raster.compiler.passes.parallel.par-fusion :as par-fusion]
-            [raster.compiler.ir.soac :as soac]
-            [raster.compiler.passes.parallel.soac-graph :as soac-graph]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
@@ -799,10 +796,24 @@
           (:declined structured)
           (assoc :structured-control-declined (:declined structured)))))))
 
+(defn- unfused-compatibility
+  "Keep unsupported source byte-for-byte while exposing why no certified fusion ran."
+  [form semantic]
+  {:form form
+   :stats (cond-> {:vertical 0 :horizontal 0 :iterations 0
+                   :compatibility-fusion :disabled}
+            (:declined semantic)
+            (assoc :typed-soac-declined (:declined semantic))
+            (:structured-control-declined semantic)
+            (assoc :typed-structured-control-declined
+                   (:structured-control-declined semantic)))})
+
 (defn- pass-soac-fuse
-  "SOAC graph-based fusion: vertical (map→map, map→reduce, map→scan),
-  horizontal (independent same-bound maps), iterated to fixpoint.
-  Falls back to par-fusion for non-let* forms.
+  "Certified TypedSOAC fusion: vertical and horizontal rules iterated to fixpoint.
+
+  Source outside the typed subset remains deliberately unfused for compatibility lowering. It
+  must not re-enter either historical, untyped fusion implementation: coverage debt may cost a
+  materialization, but may not weaken the compiler's legality boundary.
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
@@ -810,27 +821,7 @@
           semantic (semantic-program-attempt form opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
-        (let [[let-sym bindings-vec & body-exprs] form
-              pairs (vec (partition 2 bindings-vec))
-              nodes (soac/let-bindings->nodes pairs)
-              graph (soac-graph/build-fusion-graph nodes)
-          ;; Hardware-GUIDED fusion: project the target to an Abstract Machine so the
-          ;; vertical chooser can DECLINE unprofitable rematerialization (cost model,
-          ;; not a device — see soac-graph/vertical-fusion-profitable?). Only for GPU
-          ;; targets, where the locality gap is measured and over-fusion into monster
-          ;; kernels is the documented failure mode; CPU/no-target → am nil → the
-          ;; chooser is legality-only, byte-identical to before. Descriptor failure
-          ;; degrades to nil (no decline), never breaks compilation.
-              [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
-              new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
-              new-bindings (vec (mapcat identity new-pairs))]
-          {:form (list* let-sym new-bindings body-exprs)
-           :stats (cond-> stats
-                    (:declined semantic)
-                    (assoc :typed-soac-declined (:declined semantic))
-                    (:structured-control-declined semantic)
-                    (assoc :typed-structured-control-declined
-                           (:structured-control-declined semantic)))})))
+        (unfused-compatibility form semantic)))
     ;; A bare top-level parallel expression has no binding site for the direct SSA front end.
     ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
     ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
@@ -839,13 +830,7 @@
           semantic (semantic-program-attempt source opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
-        (let [fallback (par-fusion/par-fusion-pass form)]
-          (cond-> fallback
-            (:declined semantic)
-            (assoc-in [:stats :typed-soac-declined] (:declined semantic))
-            (:structured-control-declined semantic)
-            (assoc-in [:stats :typed-structured-control-declined]
-                      (:structured-control-declined semantic))))))))
+        (unfused-compatibility form semantic)))))
 
 (defn- register-gpu-kernels!
   "Register generated GPU kernels eagerly so they're available at eval time.
@@ -1228,11 +1213,11 @@
 (defn compile-aot
   "Compile a deftm var into an optimized forward function with buffer fusion.
 
-  Pipeline: walker → inline → DCE → buffer-fuse → par-fuse → backend
+  Pipeline: walker → inline → DCE → buffer-fuse → typed SOAC fusion → backend
             → mem-merge → hoist → eval
 
   Par forms from broadcast!/reduce! are preserved through the pipeline,
-  then fused (map→reduce, horizontal) by par-fusion, then optimized to
+  then fused by certified TypedSOAC rules, then optimized to
   SIMD, CUDA, or OpenCL by the selected backend. Remaining par forms
   fall back to sequential loops.
 
