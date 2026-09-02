@@ -238,15 +238,17 @@ sources. Uniform memory facts require an explicit body-level stable-read contrac
 KernelBody-to-ABI seam projects it to a no-write-alias precondition, artifacts reject equal compiler
 bindings, direct calls check resident ranges, and graph/link binding retains its stronger
 overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from integral
-wrap/saturate/trap policies. Unchecked integral add/subtract/multiply retain an explicit wrapping
-policy in scalar SSA, and the shared C-family lowering performs those operations in the
-same-width unsigned representation rather than relying on undefined signed overflow. Scalar SSA
-also distinguishes a compiler-certified `:no-overflow` operation from a semantic `:trap`; C-family
-targets emit the former as signed arithmetic. CUDA and HIP lower the latter through checked
-same-width unsigned predicates followed by PTX/LLVM target traps; OpenCL targets explicitly decline
-it because OpenCL C has no standard trap primitive. Schedule-local scan extent subtraction
+wrap/saturate/trap policies. Ordinary typed source integral add/subtract/multiply retain their
+checked semantics as `:trap`, while unchecked variants retain an explicit `:wrap` policy. The shared
+C-family lowering performs wrapping operations in the same-width unsigned representation rather
+than relying on undefined signed overflow. Scalar SSA also distinguishes a compiler-certified
+`:no-overflow` operation from a semantic `:trap`; C-family
+targets emit the former as signed arithmetic. CUDA, HIP, and Intel oneAPI OpenCL lower the latter
+through checked same-width unsigned predicates followed by a target trap. Portable OpenCL
+explicitly declines it because OpenCL C has no standard trap primitive. Schedule-local scan extent subtraction
 is the first proved operation. Source-derived address algebra is not blanket-certified: it still
-awaits AxisMap/range proofs. Whole-kernel
+awaits AxisMap/range proofs, and schedule-produced integral expressions must be migrated before the
+verifier can reject every remaining omitted policy. Whole-kernel
 workgroup allocations now have static typed shapes, named
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
 accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are

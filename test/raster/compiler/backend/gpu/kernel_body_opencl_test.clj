@@ -232,11 +232,13 @@
 
 (defn- compile-c-family-source
   [target source]
-  (let [suffix (case target :cuda ".cu" :hip ".hip")
+  (let [suffix (case target :opencl-intel ".cl" :cuda ".cu" :hip ".hip")
         source-file (java.io.File/createTempFile "raster-kernel-body-" suffix)
         output-file (str (.getAbsolutePath source-file) ".ptx")]
     (spit source-file source)
     (case target
+      :opencl-intel (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                              "-fsyntax-only" (.getAbsolutePath source-file))
       :cuda (shell/sh "nvcc" "-ptx" "-arch=sm_80" "-o" output-file
                       (.getAbsolutePath source-file))
       :hip (shell/sh "hipcc" "--offload-arch=gfx1100" "--genco"
@@ -313,6 +315,21 @@
         (is (not (str/includes? source "rstr_a + rstr_b"))
             "signed target arithmetic must not weaken modulo-2^N semantics")))))
 
+(deftest checked-source-arithmetic-retains-trapping-semantics
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {} :scalar-types {'a :long 'b :long} :arrays #{}
+                  :index-scope #{} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        checked ((:lower lowerer) '(+ a b) :long {'a :long 'b :long})
+        unchecked ((:lower lowerer) '(unchecked-add a b) :long {'a :long 'b :long})]
+    (is (= {:overflow :trap}
+           (get-in checked [:operations 0 :expression :options])))
+    (is (= {:overflow :wrap}
+           (get-in unchecked [:operations 0 :expression :options])))
+    (is (= :long (:type checked)))))
+
 (deftest explicit-signed-overflow-contracts-reach-the-target-boundary
   (doseq [target [:opencl-portable :cuda :hip]]
     (testing (name target)
@@ -322,18 +339,17 @@
                     {:target-dialect target})]
         (is (str/includes? source "rstr_a + rstr_b")
             "a proved in-range operation may use the target's signed instruction"))))
-  (testing "OpenCL C declines a contract for which the language has no standard trap primitive"
-    (doseq [target [:opencl-portable :opencl-intel]]
-      (try
-        (opencl/emit-scalar-kernel
-         "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
-         {:target-dialect target})
-        (is false "trapping arithmetic must not silently become signed target overflow")
-        (catch clojure.lang.ExceptionInfo exception
-          (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))
-              (name target))))))
+  (testing "portable OpenCL declines a contract for which the language has no standard trap"
+    (try
+      (opencl/emit-scalar-kernel
+       "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+       {:target-dialect :opencl-portable})
+      (is false "trapping arithmetic must not silently become signed target overflow")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))))))
   (doseq [[target compiler trap-spelling]
-          [[:cuda "nvcc" "asm volatile(\"trap;\")"]
+          [[:opencl-intel "clang" "__builtin_trap()"]
+           [:cuda "nvcc" "asm volatile(\"trap;\")"]
            [:hip "hipcc" "__builtin_trap()"]]]
     (testing (str (name target) " checked helpers")
       (doseq [[operation operation-name guard]

@@ -165,11 +165,11 @@
 (defn trapping-arithmetic-name
   "Name a checked signed-integer operation only when the target can terminate the invocation.
 
-  OpenCL C has no standard trap operation.  A portable OpenCL dialect must therefore decline this
-  contract instead of quietly depending on one vendor compiler's builtin or turning the operation
-  into undefined signed arithmetic."
+  OpenCL C has no standard trap operation.  The portable dialect therefore declines this contract
+  instead of quietly depending on a vendor builtin. Intel's oneAPI OpenCL compiler accepts
+  `__builtin_trap`; that target-specific dialect can preserve the same contract as HIP."
   [dialect operation type]
-  (when (opencl? dialect)
+  (when (= :opencl-portable (:id dialect))
     (throw (ex-info "OpenCL C has no portable trapping-arithmetic primitive"
                     {:reason :kernel-body-c-trap-unsupported
                      :dialect (:id dialect) :operation operation :type (dtype/canon type)})))
@@ -182,8 +182,9 @@
   "Emit one checked signed operation without first evaluating an overflowing signed expression.
 
   The predicates use same-width unsigned arithmetic.  Only after the predicate proves the result
-  representable does the helper evaluate the ordinary signed operation.  CUDA terminates with the
-  PTX trap instruction; HIP's Clang frontend lowers `__builtin_trap` to LLVM's target trap."
+  representable does the helper evaluate the ordinary signed operation. CUDA terminates with the
+  PTX trap instruction; HIP and Intel oneAPI OpenCL lower `__builtin_trap` through their Clang/LLVM
+  frontends."
   [dialect operation type]
   (let [type (dtype/canon type)
         signed-type (type-name dialect type)
@@ -192,7 +193,7 @@
         sign-bit (str "((" unsigned-type ")1 << " (dec (* 8 (dtype/bytes-of type))) ")")
         trap-source (case (:id dialect)
                       :cuda "asm volatile(\"trap;\");"
-                      :hip "__builtin_trap();")
+                      (:hip :opencl-intel) "__builtin_trap();")
         arithmetic ({:+ "+" :- "-" :* "*"} operation)]
     (when-not arithmetic
       (throw (ex-info "trapping arithmetic helper has no operation"
