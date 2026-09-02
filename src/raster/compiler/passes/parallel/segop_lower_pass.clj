@@ -490,16 +490,22 @@
                       (gensym "direct_parallel_result_")
                       result-id)
         host-source (list 'let* [host-result source] host-result)
-        typed (try
-                (typed-frontend/form->program
-                 (typed-frontend/normalize-source host-source)
-                 {:dtype (or (:dtype opts) :double)
-                  :array-types (:array-types opts)
-                  :scalar-types (:scalar-types opts)})
-                (catch clojure.lang.ExceptionInfo exception
-                  (when-not (typed-frontend/source-decline? exception)
-                    (throw exception))
-                  nil))
+        typed-candidate
+        (try
+          (typed-frontend/form->program
+           (typed-frontend/normalize-source host-source)
+           {:dtype (or (:dtype opts) :double)
+            :array-types (:array-types opts)
+            :scalar-types (:scalar-types opts)})
+          (catch clojure.lang.ExceptionInfo exception
+            (when-not (typed-frontend/source-decline? exception)
+              (throw exception))
+            nil))
+        ;; The compatibility return value exposes one operation, not a mini-program. Source
+        ;; normalization may introduce host scalar equations (notably a hoisted compound extent);
+        ;; using only the parallel equation would leave those SSA values unbound in the caller.
+        ;; Keep such sites on compatibility lowering until this API returns the complete envelope.
+        typed (when (= 1 (count (soac-dialect/equations typed-candidate))) typed-candidate)
         {scheduled :form stats :stats}
         (segop-lower-pass (if typed (typed-route/program-envelope typed) host-source) opts)
         ;; Compound extents may introduce a preceding host-scalar equation. Select the one

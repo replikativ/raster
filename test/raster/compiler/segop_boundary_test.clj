@@ -105,6 +105,21 @@
       (is (not (re-find #"inout_result\[idx\] =" kernel-source))
           "a unique scatter must not acquire a second implicit dense store"))))
 
+(deftest direct-single-operation-does-not-drop-hoisted-scalar-equations
+  (let [source '(raster.par/map! out i (* n stride) float (aget x i))
+        scheduled (slp/schedule-single-operation
+                   'out source
+                   {:dtype :float
+                    :array-types {'out :float 'x :float}
+                    :scalar-types {'n :long 'stride :long}})
+        operation (first (:operations scheduled))]
+    (is (nil? (:algorithm scheduled))
+        "the one-operation compatibility API cannot return a typed mini-program with host equations")
+    (is (= '(* n stride) (-> operation :space :dims first :bound)))
+    (is (not-any? #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
+                  (flatten operation))
+        "a hoisted SSA extent must never escape without its defining equation")))
+
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion
             decline would let the pipeline continue on the legacy path with the bug intact — the

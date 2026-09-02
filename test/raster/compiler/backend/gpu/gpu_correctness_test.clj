@@ -133,7 +133,7 @@
                '(raster.par/map! out i n double (clojure.core/+ (aget a i) (aget b i))))]
       (is (str/includes? src "a["))
       (is (str/includes? src "b["))
-      (is (str/includes? src "out["))))
+      (is (str/includes? src "out_["))))
   (testing "aset in void kernel → assignment"
     (let [src (map-void-kernel-src
                '(raster.par/map-void! i n
@@ -210,7 +210,7 @@
                                                  (clojure.core/* b (Math/pow (aget x i) beta)))))]
       (is (str/includes? src "pow("))
       (is (str/includes? src "x["))
-      (is (str/includes? src "out["))))
+      (is (str/includes? src "out_["))))
   (testing "Boolean predicate in if → C comparison"
     (let [src (map-void-kernel-src
                '(raster.par/map-void! i n
@@ -279,8 +279,10 @@
      (let [n 1024
            scale 0.75
            input (float-array (map #(float (/ (inc %) 1024.0)) (range n)))
-           form '(raster.par/reduce acc 0.0 i n
-                                    (+ acc (* scale (aget input i))))
+           form (with-meta
+                  '(raster.par/reduce acc 0.0 i n
+                                      (+ acc (* scale (aget input i))))
+                  {:raster.type/elem-type :float})
            compiled (opencl-pass/opencl-pass
                      form :device-id :ze:0 :dtype :float
                      :scalar-types {'scale :float 'n :int})
