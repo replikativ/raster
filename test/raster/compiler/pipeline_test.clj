@@ -87,6 +87,25 @@
       (is (not (contains? specs :peephole)))
       (is (not (contains? specs :par-fuse))))))
 
+(deftest uncertified-parallel-source-never-reenters-legacy-fusion
+  (let [source '(let* [step (raster.par/gather out src idx n stride)] step)
+        options {:dtype :float
+                 :array-types {'out :float 'src :float 'idx :int}
+                 :scalar-types {'n :long 'stride :long}}
+        result (#'pipeline/pass-soac-fuse source options)
+        bare '(raster.par/gather out src idx n stride)
+        bare-result (#'pipeline/pass-soac-fuse bare options)]
+    (testing "a binding-form coverage gap remains byte-for-byte unfused"
+      (is (= source (:form result)))
+      (is (= :disabled (get-in result [:stats :compatibility-fusion])))
+      (is (= :typed-soac-source-coverage
+             (get-in result [:stats :typed-soac-declined :reason])))
+      (is (= {:vertical 0 :horizontal 0 :iterations 0}
+             (select-keys (:stats result) [:vertical :horizontal :iterations]))))
+    (testing "a bare unsupported form also bypasses the historical recursive fusion pass"
+      (is (= bare (:form bare-result)))
+      (is (= :disabled (get-in bare-result [:stats :compatibility-fusion]))))))
+
 ;; ================================================================
 ;; Dialect validation
 ;; ================================================================
