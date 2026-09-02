@@ -704,7 +704,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private scalar-operation-kinds
-  #{"ScalarCompute" "ScalarLoad" "ScalarStore" "Yield" "IfRegion" "ForLoop"
+  #{"ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
     "PipelineYield" "PipelinedFor"
     "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
 
@@ -1189,6 +1189,21 @@
          (indent-lines depth assignment))
        context])
 
+    (record-kind? "AtomicRMW" operation)
+    (let [storage (get-in context [:storage (:buffer operation)])
+          base-name (get-in context [:names (or (some-> storage :view :buffer)
+                                                (:id storage))])
+          index (emit-storage-index storage (:coordinates operation) (:names context))
+          atomic-name (c-dialect/atomic-add-name *scalar-dialect* (:dtype storage))
+          statement (str atomic-name "(" base-name " + " index ", "
+                         (emit-scalar-value (:value operation) context) ");")]
+      [(if-let [predicate (emit-mask (:predicate operation) context)]
+         (str (indent-lines depth (str "if (" predicate ") {"))
+              (indent-lines (inc depth) statement)
+              (indent-lines depth "}"))
+         (indent-lines depth statement))
+       context])
+
     (record-kind? "IfRegion" operation)
     (let [results (:results operation)
           result-context (reduce add-value context results)
@@ -1659,10 +1674,14 @@
                       1 (str (target-type (get types (:id index))) " " name " = "
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
-        helper-source (c-dialect/helper-source
-                       *scalar-dialect*
-                       (ce/intrinsic-helper-sources operation-source
-                                                    (:id *scalar-dialect*)))
+        helper-source
+        (c-dialect/helper-source
+         *scalar-dialect*
+         (str (when (and (c-dialect/opencl? *scalar-dialect*)
+                         (str/includes? operation-source "atomic_add_float("))
+                ce/opencl-atomic-add-float-helper)
+              (ce/intrinsic-helper-sources operation-source
+                                           (:id *scalar-dialect*))))
         storage-declarations (concat parameters (:allocations kernel-body))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)

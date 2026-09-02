@@ -18,6 +18,10 @@
    'float :float, 'clojure.core/float :float
    'double :double, 'clojure.core/double :double})
 
+(defn- contains-indexed-load?
+  [expression]
+  (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
+
 (defn inline-lets
   "Inline a top-level scalar let region while preserving its already-typed expression tree."
   [expression]
@@ -149,11 +153,20 @@
                       (decline! :indexed-load
                                 "scalar loads require a declared typed stable tensor"
                                 {:expression expression :array array :array-types array-types}))
-                    (let [id (fresh "load")]
-                      {:operations [(body/->ScalarLoad
-                                     (body/value id array-type) array
-                                     [(lower-index coordinate (set (keys env)))] predicate
-                                     (when predicate (body/literal 0 array-type)) :cached)]
+                    (let [coordinate-value
+                          (when (contains-indexed-load? coordinate)
+                            (lower coordinate
+                                   (or (source-type coordinate :int env) :int) env))
+                          coordinate-expression
+                          (if coordinate-value
+                            (:result coordinate-value)
+                            (lower-index coordinate (set (keys env))))
+                          id (fresh "load")]
+                      {:operations (conj (vec (:operations coordinate-value))
+                                         (body/->ScalarLoad
+                                          (body/value id array-type) array
+                                          [coordinate-expression] predicate
+                                          (when predicate (body/literal 0 array-type)) :cached))
                        :result id :type array-type}))
 
                   (and (seq? expression) (contains? cast-heads (first expression))

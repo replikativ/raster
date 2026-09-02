@@ -30,6 +30,23 @@
 (defn collective-association [dialect] (:association dialect))
 (defn opencl? [dialect] (= :opencl (family dialect)))
 
+(defn atomic-add-name
+  "Spell a target atomic addition after KernelBody has fixed the update algebra and dtype."
+  [dialect element-dtype]
+  (let [element-dtype (dtype/canon element-dtype)]
+    (case (family dialect)
+      :opencl (case element-dtype
+                :int "atomic_add"
+                :float "atomic_add_float"
+                (throw (ex-info "OpenCL atomic add has no verified spelling for this dtype"
+                                {:reason :kernel-body-c-atomic-dtype
+                                 :dialect (:id dialect) :dtype element-dtype})))
+      (:cuda :hip) (if (contains? #{:int :float :double} element-dtype)
+                     "atomicAdd"
+                     (throw (ex-info "CUDA/HIP atomic add has no verified spelling for this dtype"
+                                     {:reason :kernel-body-c-atomic-dtype
+                                      :dialect (:id dialect) :dtype element-dtype}))))))
+
 (defn async-copy-mode
   "Report the physical lowering used for the target-neutral async dependency contract."
   [dialect]

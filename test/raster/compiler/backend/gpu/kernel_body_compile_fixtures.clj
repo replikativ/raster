@@ -65,6 +65,18 @@
       (raster.arrays/aget input (dec index))
       (raster.arrays/aget input (inc index))))))
 
+(deftm public-c-family-gather
+  "Public indirect-read map compiled by nvcc/hipcc without a physical device."
+  [input :- (Array float) indices :- (Array int) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/gather output input indices n)))
+
+(deftm public-c-family-scatter
+  "Public additive indexed write compiled by nvcc/hipcc without a physical device."
+  [input :- (Array float) indices :- (Array int) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/scatter! output input indices n)))
+
 (defn- reduction-artifact
   [dialect]
   (let [product (with-meta
@@ -217,6 +229,10 @@
                  #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-stencil {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-gather {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-scatter {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'contract/contract-mm {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

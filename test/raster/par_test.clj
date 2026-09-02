@@ -487,18 +487,44 @@
     (try (require '[raster.compiler.backend.gpu.par-opencl :as pocl]) (catch Exception _))
     (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
       (let [form '(raster.par/scatter! out src index 1000)
-            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)]
-        (is (pos? (count (:kernels result))))
-        (is (seq? (:form result)))))))
+            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)
+            kernel (first (:kernels result))]
+        (is (= 1 (count (:kernels result))))
+        (is (= 1 (get-in result [:stats :segop-relowered])))
+        (is (= :reducing-scatter (get-in kernel [:effects :kind])))
+        (is (= :reduce (get-in kernel [:effects :write-conflict])))
+        (is (some? (get-in kernel [:provenance :scheduled-operation])))
+        (is (clojure.string/includes? (:source kernel) "atomic_add_float"))
+        (is (= 'out (last (:form result))))))))
+
+(deftest opencl-pass-gather-dispatch
+  (testing "a flat gather is emitted as the scheduled typed map"
+    (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+      (let [form '(raster.par/gather out src index 1000)
+            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)
+            kernel (first (:kernels result))]
+        (is (= 1 (count (:kernels result))))
+        (is (= 1 (get-in result [:stats :segop-relowered])))
+        (is (= :elementwise-map (get-in kernel [:effects :kind])))
+        (is (= :kernel-body (get-in kernel [:provenance :dialect])))
+        (is (some? (get-in kernel [:provenance :scheduled-operation])))
+        (is (= 'raster.gpu.ze-runtime/invoke-registered-kernel
+               (first (:form result))))))))
 
 (deftest opencl-pass-reduce-by-key-dispatch
   (testing "opencl-pass dispatches reduce-by-key to GPU kernel"
     (try (require '[raster.compiler.backend.gpu.par-opencl :as pocl]) (catch Exception _))
     (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
       (let [form '(raster.par/reduce-by-key out keys vals 1000 +)
-            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)]
-        (is (pos? (count (:kernels result))))
-        (is (seq? (:form result)))))))
+            result (pass form :device-id :ze:0 :dtype :float :min-elements 0)
+            kernel (first (:kernels result))]
+        (is (= 1 (count (:kernels result))))
+        (is (= 1 (get-in result [:stats :segop-relowered])))
+        (is (= :reducing-scatter (get-in kernel [:effects :kind])))
+        (is (= :reduce (get-in kernel [:effects :write-conflict])))
+        (is (some? (get-in kernel [:provenance :scheduled-operation])))
+        (is (clojure.string/includes? (:source kernel) "atomic_add_float"))
+        (is (= 'out (last (:form result))))))))
 
 (deftest opencl-pass-keeps-the-scheduled-small-stencil
   (testing "a small constant extent changes launch policy, not semantic lowering"

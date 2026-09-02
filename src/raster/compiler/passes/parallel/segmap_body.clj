@@ -47,6 +47,10 @@
     (vec (rest expression))
     [expression]))
 
+(defn- contains-indexed-load?
+  [expression]
+  (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
+
 (defn- scalar-region
   "Read typed local SSA directly from a scheduled SegMap.
 
@@ -105,10 +109,16 @@
                   (vec (concat (sort-by name (disj (:outputs segmap) primary-output))
                                [primary-output]))
                   (vec (sort-by name (:outputs segmap))))
+        output-set (set outputs)
+        inout (set/intersection (set inputs) output-set)
+        read-only-inputs (vec (remove inout inputs))
         scalars (vec (sort-by name (:scalars segmap)))
-        _ (when (seq (set/intersection (set inputs) (set outputs)))
+        explicit-certified-write?
+        (and (nil? primary-output)
+             (contains? #{:unique :reduce} (:write-conflict segmap)))
+        _ (when (and (seq inout) (not explicit-certified-write?))
             (decline! :inout-storage
-                      "portable map stable reads must not alias writable results"
+                      "portable dense map stable reads must not alias writable results"
                       {:operation (:id segmap) :inputs inputs :outputs outputs}))
         default-dtype (dtype/canon (or (:dtype segmap) :float))
         array-dtype (fn [id]
@@ -163,20 +173,32 @@
         environment (:environment local-state)
         lower-store
         (fn [form]
-          (when-not (descriptor/aset-call? form)
-            (decline! :explicit-store
-                      "map side-effect region contains a non-store statement"
-                      {:operation (:id segmap) :statement form}))
-          (let [[array coordinate expression] (take-last 3 (descriptor/call-args form))
-                array (descriptor/aset-array-sym form)
-                _ (when-not (contains? (set outputs) array)
-                    (decline! :explicit-store-target
-                              "map store targets an undeclared result"
-                              {:operation (:id segmap) :statement form :target array}))
-                lowered ((:lower lowerer) expression (get array-types array) environment)]
-            (concat (:operations lowered)
-                    [(body/->ScalarStore array [(lower-index coordinate)]
-                                         (:result lowered) :map-active)])))
+          (let [atomic-add? (and (seq? form)
+                                 (= 'raster.par/atomic-add!
+                                    (descriptor/semantic-op form)))]
+            (when-not (or (descriptor/aset-call? form) atomic-add?)
+              (decline! :explicit-store
+                        "map side-effect region contains a non-store statement"
+                        {:operation (:id segmap) :statement form}))
+            (let [[array coordinate expression] (take-last 3 (descriptor/call-args form))
+                  array (if atomic-add? array (descriptor/aset-array-sym form))
+                  _ (when-not (contains? (set outputs) array)
+                      (decline! :explicit-store-target
+                                "map store targets an undeclared result"
+                                {:operation (:id segmap) :statement form :target array}))
+                  coordinate-value (when (contains-indexed-load? coordinate)
+                                     ((:lower lowerer) coordinate :long environment))
+                  coordinate-expression (if coordinate-value
+                                          (:result coordinate-value)
+                                          (lower-index coordinate))
+                  lowered ((:lower lowerer) expression (get array-types array) environment)]
+              (concat (:operations coordinate-value)
+                      (:operations lowered)
+                      [(if atomic-add?
+                         (body/->AtomicRMW array [coordinate-expression]
+                                           (:result lowered) :+ :map-active)
+                         (body/->ScalarStore array [coordinate-expression]
+                                             (:result lowered) :map-active))]))))
         explicit-operations (vec (mapcat lower-store explicit-forms))
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
@@ -195,9 +217,10 @@
               (map #(body/->KernelParameter
                      % :input (get array-types %) ['_n_bound] :global
                      (layout/row-major ['_n_bound] (get array-types %)) :operand)
-                   inputs)
+                   read-only-inputs)
               (map #(body/->KernelParameter
-                     % :output (get array-types %) ['_n_bound] :global
+                     % (if (contains? inout %) :inout :output)
+                     (get array-types %) ['_n_bound] :global
                      (layout/row-major ['_n_bound] (get array-types %)) :result)
                    outputs)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
@@ -207,7 +230,7 @@
      (body/make
       {:id [:segmap (:id segmap) :portable-one-item]
        :parameters parameters
-       :stable-reads (mapv body/stable-read inputs)
+       :stable-reads (mapv body/stable-read read-only-inputs)
        :indices [(body/->IndexBinding group-index :group 0)
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
@@ -228,4 +251,4 @@
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
        :attributes {:kind :portable-segmap :extent bound :no-write-alias true}})
-     :bound bound :inputs inputs :outputs outputs :scalars scalars}))
+     :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))
