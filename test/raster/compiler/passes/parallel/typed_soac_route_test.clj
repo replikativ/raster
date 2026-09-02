@@ -906,6 +906,9 @@
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
                         (throw (ex-info "typed routing reparsed source" {})))
+                      contraction-facts/surface-form
+                      (fn [& _]
+                        (throw (ex-info "typed routing manufactured source" {})))
                       contract-lower/contract-form->segred
                       (fn [& _]
                         (throw (ex-info "typed routing rebuilt its scheduled SegRed" {})))]
@@ -916,6 +919,9 @@
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
                         (throw (ex-info "candidate routing reparsed source" {})))
+                      contraction-facts/surface-form
+                      (fn [& _]
+                        (throw (ex-info "candidate routing manufactured source" {})))
                       contract-lower/contract-form->segred
                       (fn [& _]
                         (throw (ex-info "candidate routing rebuilt its scheduled SegRed" {})))]
@@ -926,6 +932,9 @@
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
                         (throw (ex-info "typed emission reparsed source" {})))
+                      contraction-facts/surface-form
+                      (fn [& _]
+                        (throw (ex-info "typed emission manufactured source" {})))
                       contract-lower/contract-form->segred
                       (fn [& _]
                         (throw (ex-info "typed emission rebuilt its scheduled SegRed" {})))]
@@ -998,6 +1007,20 @@
     (is (empty? (:dispatches emitted)))
     (is (= 1 (count (:kernels emitted))))))
 
+(deftest compatibility-contraction-without-source-or-schedule-fails-loud
+  (let [source '(raster.par/contract C [[i 8]] [[l 8]]
+                                       (* (clojure.core/aget A (+ (* i 8) l))
+                                          (clojure.core/aget B l)))
+        facts (dissoc (contraction-facts/contraction-facts source :dtype :float) :form)]
+    (try
+      (contract-route/route-contraction nil :dtype :float :facts facts)
+      (is false "a compatibility fallback must not reconstruct syntax implicitly")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :contraction-compatibility-form-required
+               (:reason (ex-data exception))))
+        (is (= :portable-segred (:leaf (ex-data exception))))
+        (is (= :none (:fallback (ex-data exception))))))))
+
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]
@@ -1013,32 +1036,43 @@
         descriptor {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
                     :grf-bytes-per-lane 256 :subgroup-size 16
                     :max-workgroup-size 1024 :shared-local-memory 131072}
+        without-surface
+        (fn [thunk]
+          (with-redefs [contraction-facts/surface-form
+                        (fn [& _]
+                          (throw (ex-info "ordinary typed family manufactured source" {})))]
+            (thunk)))
         select-family
         (fn [family]
-          (contract-route/route-typed-contraction
-           algorithm (assoc operation :schedule
-                            (assoc-in (:schedule operation) [:tuning-space :families] [family]))
-           :dtype :half :desc descriptor))
+          (without-surface
+           #(contract-route/route-typed-contraction
+             algorithm (assoc operation :schedule
+                              (assoc-in (:schedule operation) [:tuning-space :families] [family]))
+             :dtype :half :desc descriptor)))
         candidates
-        (contract-route/route-typed-contraction-candidates!
-         algorithm operation
-         :dtype :half :desc descriptor)
+        (without-surface
+         #(contract-route/route-typed-contraction-candidates!
+           algorithm operation
+           :dtype :half :desc descriptor))
         dispatch
-        (contract-route/route-static-typed-contraction-dispatch
-         algorithm operation
-         :dtype :half :desc descriptor)
+        (without-surface
+         #(contract-route/route-static-typed-contraction-dispatch
+           algorithm operation
+           :dtype :half :desc descriptor))
         alternatives (:alternatives dispatch)
-        emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
-                  (opencl-pass/opencl-pass form :device-id :ocl:0
-                                           :dtype :half :min-elements 0))
+        emitted (without-surface
+                 #(with-redefs [hardware/descriptor-for (constantly descriptor)]
+                    (opencl-pass/opencl-pass form :device-id :ocl:0
+                                             :dtype :half :min-elements 0)))
         emitted-dispatch (first (:dispatches emitted))
         measured-selector {:kind :fixed-strategy :strategy :portable-segred}
         measured-emitted
-        (with-redefs [hardware/descriptor-for (constantly descriptor)]
-          (opencl-pass/opencl-pass
-           form :device-id :ocl:0 :dtype :half :min-elements 0
-           :schedule {:typed-contraction
-                      {:measured-selectors {(:id emitted-dispatch) measured-selector}}}))
+        (without-surface
+         #(with-redefs [hardware/descriptor-for (constantly descriptor)]
+            (opencl-pass/opencl-pass
+             form :device-id :ocl:0 :dtype :half :min-elements 0
+             :schedule {:typed-contraction
+                        {:measured-selectors {(:id emitted-dispatch) measured-selector}}})))
         measured-dispatch (first (:dispatches measured-emitted))]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
