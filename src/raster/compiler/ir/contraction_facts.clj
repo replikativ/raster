@@ -133,17 +133,15 @@
 (defn from-components
   "Construct the sole verified contraction-facts value from explicit semantic components.
 
-   `form` is optional provenance/compatibility spelling. When absent it is generated mechanically;
-   no fact is inferred by parsing that spelling. Throws on malformed axes or an unverifiable
-   physical layout declaration."
+   `form` is optional provenance owned only by the source compatibility entry. Typed semantic
+   callers do not manufacture one: a target leaf that still consumes surface syntax must project
+   it explicitly at that leaf boundary. Throws on malformed axes or an unverifiable physical
+   layout declaration."
   [{:keys [out free-axes contract-axes body opts dtype form metadata]
     :or {opts {} dtype :double}}]
-  (let [form (or form (surface-form {:out out :free-axes free-axes
-                                     :contract-axes contract-axes :body body
-                                     :opts opts :metadata metadata}))
-        _ (when-not (symbol? out)
+  (let [_ (when-not (symbol? out)
             (throw (ex-info "contract output must be a symbol" {:reason :malformed-output
-                                                                 :out out})))
+                                                                :out out})))
         _ (when-not (vector? free-axes)
             (throw (ex-info "contract free-axes must be a vector" {:reason :malformed-free-axes})))
         _ (when-not (vector? contract-axes)
@@ -166,26 +164,26 @@
                     (into {} (map-indexed (fn [n [_ e]] [(keyword (str "contract" n)) e])) contract-axes))
         normalized (canonical-reduction-facts out contract-axes body opts dtype)]
     (merge
-     {facts-tag true
-      :form form
-      :out out
-      :free-axes (mapv vec free-axes)
-      :contract-axes (mapv vec contract-axes)
-      :n-free (count free-axes)
-      :n-contract (count contract-axes)
-      :body body
-      :operands terms
+     (cond-> {facts-tag true
+              :out out
+              :free-axes (mapv vec free-axes)
+              :contract-axes (mapv vec contract-axes)
+              :n-free (count free-axes)
+              :n-contract (count contract-axes)
+              :body body
+              :operands terms
       ;; Compatibility projections. New semantic and schedule passes consume :reduction; leaf
       ;; gates still read these until the contraction KernelBody vertical is complete.
-      :combine (get opts :combine '+)
-      :init (get opts :init 0.0)
-      :dtype dtype
-      :out-dtype (get opts :out-dtype)
-      :stages (:stages opts)
-      :epilogue (:epilogue opts)
-      :roles roles
-      :dims dims
-      :opts opts}
+              :combine (get opts :combine '+)
+              :init (get opts :init 0.0)
+              :dtype dtype
+              :out-dtype (get opts :out-dtype)
+              :stages (:stages opts)
+              :epilogue (:epilogue opts)
+              :roles roles
+              :dims dims
+              :opts opts}
+       form (assoc :form form))
      normalized)))
 
 (defn contraction-facts
