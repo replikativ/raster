@@ -6,9 +6,9 @@
    `opencl-pass` used to re-lower each form from scratch with `:ze:0` hardcoded. The equation is now
    consumed directly, with no binder metadata and no second lowering.
 
-   Now the stored SegOp is consumed; re-lowering is the fallback, with the real device-id, and
-   both paths are COUNTED (`:segop-reused` / `:segop-relowered`) so a form that bypasses the
-   pass's output shows up in the stats instead of silently taking a second path."
+   Now the stored SegOp is consumed. A raw binding form first enters the same whole-program typed
+   scheduler, while only bare compatibility expressions request singleton scheduling. Both paths
+   remain counted so bypasses are visible rather than silent."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
@@ -38,21 +38,42 @@
         (is (= 1 (:segop-reused st)) "…from the SegOp segop-lower attached")
         (is (nil? (:segop-relowered st)) "…and NOT re-lowered")))))
 
-(deftest an-unlowered-form-is-relowered-and-says-so
-  (testing "door C hands opencl-pass a walked body with no segop-lower pass run; the fallback
-            must still work — and must be VISIBLE, not a silent second path"
+(deftest an-unlowered-binding-form-is-scheduled-once-and-consumed
+  (testing "door C may hand opencl-pass a walked body with no prior middle-end pass; the backend
+            schedules the complete program once and then consumes its equations"
     (doseq [[label form] [["par/map!" map-form] ["par/reduce" reduce-form]]]
       (testing label
         (let [st (:stats (run form))]
-          (is (= 1 (:segop-relowered st)))
-          (is (nil? (:segop-reused st))))))))
+          (is (= 1 (:segop-reused st)))
+          (is (nil? (:segop-relowered st)))
+          (is (= :typed-soac (get-in st [:direct-scheduling :route]))))))))
 
 (deftest consuming-is-a-refactor-the-kernel-is-identical
-  (testing "same kernel source whether the SegOp was consumed or re-lowered — this is the
-            assertion that makes the switch safe"
+  (testing "same kernel source whether scheduling happened before or at backend entry"
     (doseq [form [map-form reduce-form]]
       (is (= (norm (:source (first (:kernels (run (lowered form))))))
              (norm (:source (first (:kernels (run form))))))))))
+
+(deftest direct-binding-scheduling-preserves-cross-equation-fusion
+  (let [form '(let* [tmp (raster.par/pmap i n double
+                                           (double
+                                            ^double
+                                            (* (clojure.core/aget X i)
+                                               (clojure.core/aget X i))))
+                      total (raster.par/reduce acc 0.0 j n
+                                               (+ acc (clojure.core/aget tmp j)))]
+                     total)
+        compiled (op/opencl-pass
+                  form :device-id :ze:0 :dtype :double :min-elements 0
+                  :array-types {'X :double} :scalar-types {'n :long})
+        kernel (first (:kernels compiled))]
+    (is (= 1 (count (:kernels compiled))))
+    (is (= 1 (get-in compiled [:stats :ze-reduces])))
+    (is (= 1 (get-in compiled [:stats :segop-reused])))
+    (is (nil? (get-in compiled [:stats :segop-relowered])))
+    (is (= :typed-soac (get-in compiled [:stats :direct-scheduling :route])))
+    (is (not (str/includes? (:source kernel) "TMP"))
+        "the direct backend must not rematerialize a fused semantic intermediate")))
 
 (deftest the-fallback-uses-the-real-device-id
   (testing "re-lowering used `:ze:0` hardcoded. A registered non-:ze:0 target must reach

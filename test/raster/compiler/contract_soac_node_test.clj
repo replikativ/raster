@@ -10,7 +10,6 @@
    downstream reads the facts; nothing re-derives them. `Dot` — one constructor and a unit test —
    is the dead representation this replaces."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.string :as str]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]
@@ -50,18 +49,18 @@
     (is (= :ze:0 (:device-id (first so))))))
 
 (deftest opencl-pass-consumes-the-segcontract
-  (let [run (fn [f] (op/opencl-pass f :device-id :ze:0 :dtype :double :min-elements 0))
-        norm #(str/replace (str %) #"_\d{3,}" "_N")]
+  (let [run (fn [f] (op/opencl-pass f :device-id :ze:0 :dtype :double :min-elements 0))]
     (testing "consumed after segop-lower — reused, not re-lowered — routing unchanged"
       (let [r (run (:form (slp/segop-lower-pass bound {:target-device :ze:0 :dtype :double})))]
         (is (= 1 (:segop-reused (:stats r))))
         (is (nil? (:segop-relowered (:stats r))))
         (is (= :regtiled (kart/attribute (first (:kernels r)) :strategy)))))
-    (testing "without segop-lower (door C): re-lowered and COUNTED"
-      (is (= 1 (:segop-relowered (:stats (run bound))))))
-    (testing "it is a refactor: identical kernel source both ways"
-      (is (= (norm (:source (first (:kernels (run (:form (slp/segop-lower-pass bound {:target-device :ze:0 :dtype :double})))))))
-             (norm (:source (first (:kernels (run bound))))))))))
+    (testing "without a prior pass, door C schedules the whole typed program once"
+      (let [r (run bound)]
+        (is (= 1 (:segop-reused (:stats r))))
+        (is (nil? (:segop-relowered (:stats r))))
+        (is (= :typed-soac (get-in r [:stats :direct-scheduling :route])))
+        (is (= :regtiled (kart/attribute (first (:kernels r)) :strategy)))))))
 
 (deftest the-cpu-path-still-compiles-and-is-numerically-right
   (testing "the production deftm through compile-aot on the JVM, against a scalar oracle"

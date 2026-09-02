@@ -540,3 +540,23 @@
      :algorithm (:algorithm equation)
      :diagnostics (:diagnostics scheduled)
      :stats (merge (:stats typed-result) stats)}))
+
+(defn schedule-source-program
+  "Schedule a complete direct-backend binding form through the shared typed boundary.
+
+   This non-cyclic middle-end entry is for backends that receive source without the ordinary
+   pipeline having run. Supported equations retain TypedSOAC algorithms and cross-equation scalar
+   dependencies; a structured source decline remains an explicit compatibility ParallelProgram."
+  [source opts]
+  (let [typed-result
+        (typed-route/attempt
+         source (or (:dtype opts) :double) (:array-types opts)
+         {:resident-reductions? (true? (:resident-reductions? opts))
+          :scalar-types (:scalar-types opts)
+          :values (:values opts)
+          :abstract-machine (:abstract-machine opts)})
+        {scheduled :form stats :stats}
+        (segop-lower-pass (or (:program typed-result) source) opts)]
+    {:program scheduled
+     :declined (:declined typed-result)
+     :stats (merge (:stats typed-result) stats)}))

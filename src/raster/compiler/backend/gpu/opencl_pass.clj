@@ -8,6 +8,7 @@
    This is the GPU counterpart of simd-pass — both consume the same
    par form vocabulary but produce different target code."
   (:require [clojure.set :as set]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -301,13 +302,19 @@
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
                       (:stride (par/extract-par-scatter-info form)))))
-        direct-program
-        (when direct-strided-indexed?
-          (:program
-           (segop-lower-pass/schedule-single-program
-            (gensym "direct_indexed_result_") form
-            {:target-device device-id :dtype dtype
-             :scalar-types scalar-types :array-types array-types})))
+        direct-schedule
+        (cond
+          (and (nil? supplied-program) (form/binding-form? form))
+          (segop-lower-pass/schedule-source-program
+           form {:target-device device-id :dtype dtype
+                 :scalar-types scalar-types :array-types array-types})
+
+          direct-strided-indexed?
+          (segop-lower-pass/schedule-single-program
+           (gensym "direct_indexed_result_") form
+           {:target-device device-id :dtype dtype
+            :scalar-types scalar-types :array-types array-types}))
+        direct-program (:program direct-schedule)
         parallel-program (or supplied-program direct-program)
         source-form (if parallel-program (parallel-program/source-form parallel-program) form)
         ;; Typed values supply dtypes; scheduled SegOps supply ABI roles. Logical rank cannot choose
@@ -333,9 +340,11 @@
         top-array-types (merge (or (:array-types program-types) {})
                                (or (:array-types (meta source-form)) {})
                                (or (:array-types (meta form)) {}) array-types)
-        stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
-                     :ze-structured-reductions 0 :kernel-graphs 0
-                     :fallback 0})
+        stats (atom (cond-> {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
+                             :ze-structured-reductions 0 :kernel-graphs 0
+                             :fallback 0}
+                      direct-schedule
+                      (assoc :direct-scheduling (:stats direct-schedule))))
         kernels (atom [])
         dispatches (atom [])
         target-desc (delay
