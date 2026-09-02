@@ -324,21 +324,30 @@
           elem-type (dtype/canon (or elem-type
                                      (dtype/dtype-for-scalar-tag cast)
                                      default-dtype))
-          io (extract-io body idx [out])]
-      ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
-      ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
-      ;; destination also needs distinct value/view identity before it can be SSA. A pointwise read
-      ;; of the destination is an explicit read/write operand; scheduling must retain it as one
-      ;; physical inout value rather than manufacturing separate aliased input/output pointers.
-      (when-not (or offset (= symbol out))
-        (merge {:kind :map :id id :sym symbol :results [symbol]
-                :index idx :extent bound :locals [] :casts [cast] :bodies [body]
-                :result-storage [{:destination out
-                                  :access (if (contains? (:inputs io) out) :read-write :write)
-                                  :host-return :buffer}]
-                :host-binding symbol
-                :elem-type elem-type}
-               io)))
+          write-index (when offset (list 'clojure.core/+ offset idx))
+          io (extract-io (if offset (list 'do write-index body) body) idx [out])]
+      ;; A binder with the same spelling as the caller-owned destination needs distinct value/view
+      ;; identity before it can be SSA. Every other offset map is an injective partial write:
+      ;; destination[base+i] is a typed unique scatter, not a map carrying an emitter-only offset.
+      ;; The destination is read/write because elements outside the slice remain observable.
+      (when-not (= symbol out)
+        (if offset
+          (merge {:kind :scatter :id id :sym symbol :results [symbol]
+                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :write-indices [write-index] :predicates [1] :conflict :unique
+                  :result-storage [{:destination out :access :read-write
+                                    :host-return :buffer}]
+                  :host-binding symbol :elem-type elem-type
+                  :source-operation :raster.par/map-offset}
+                 io)
+          (merge {:kind :map :id id :sym symbol :results [symbol]
+                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :result-storage [{:destination out
+                                    :access (if (contains? (:inputs io) out) :read-write :write)
+                                    :host-return :buffer}]
+                  :host-binding symbol
+                  :elem-type elem-type}
+                 io))))
 
     (par/par-stencil-form? expression)
     (let [{:keys [out in-arrays radius boundary cast idx bound body elem-type]}
@@ -1351,8 +1360,8 @@
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (some #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
-                                      :product-reduce :segmented-fold-map :scan}
-                                    (:kind %))
+                                     :product-reduce :segmented-fold-map :scan}
+                                   (:kind %))
                        descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
