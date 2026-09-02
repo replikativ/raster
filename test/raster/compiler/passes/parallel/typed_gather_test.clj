@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-gather-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.segop :as segop]
@@ -12,11 +13,15 @@
   '(let* [step (raster.par/gather out src idx n)]
          step))
 
+(def ^:private strided-source
+  '(let* [step (raster.par/gather out src idx n stride)]
+         step))
+
 (def ^:private array-types
   {'out :float 'src :float 'idx :int})
 
 (def ^:private scalar-types
-  {'n :long})
+  {'n :long 'stride :long})
 
 (defn- scheduled-program []
   (let [{:keys [program]} (route/attempt source :float array-types
@@ -67,3 +72,56 @@
       (is (= [:int :float :float :int] (mapv :dtype (:abi kernel))))
       (is (str/includes? kernel-source "src[idx[idx_0]]"))
       (is (not (str/includes? kernel-source "src[idx[idx]]"))))))
+
+(deftest strided-gather-is-a-flattened-typed-map
+  (let [{:keys [program stats]} (route/attempt strided-source :float array-types
+                                               {:scalar-types scalar-types})
+        scalar-equation (first (:equations program))
+        map-equation (second (:equations program))
+        algorithm (:algorithm map-equation)
+        operation (-> algorithm dialect/equations first dialect/operation-parts)
+        body (-> operation :lambda dialect/lambda-parts :body-results first)]
+    (is (= :typed-soac (:dialect program)))
+    (is (= :analyzed-source (:front-end stats)))
+    (is (= 'scalar (-> scalar-equation :algorithm dialect/equations first
+                       dialect/operation-parts :kind)))
+    (is (= 'map (:kind operation)))
+    (is (= (first (:results scalar-equation))
+           (get-in operation [:attributes :extent])))
+    (is (some #{'clojure.core/quot} (flatten body)))
+    (is (some #{'clojure.core/rem} (flatten body)))
+    (is (not-any? #{'raster.par/gather}
+                  (tree-seq coll? seq (:source program))))))
+
+(deftest strided-gather-reuses-one-schedule-across-jvm-and-gpu
+  (let [{:keys [program]} (route/attempt strided-source :float array-types
+                                         {:scalar-types scalar-types})
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :float :target-device :ocl:0
+                                   :array-types array-types :scalar-types scalar-types}))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        gpu (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                     :dtype :float :min-elements 0
+                                     :array-types array-types
+                                     :scalar-types scalar-types)
+        kernel-source (:source (first (:kernels gpu)))
+        evaluable-jvm-form (walk/postwalk
+                            #(if (symbol? %) (with-meta % nil) %)
+                            (:form jvm))
+        jvm-values (eval
+                    (list 'let* ['out (list 'float-array 4)
+                                 'src (list 'float-array [10.0 11.0 20.0 21.0 30.0 31.0])
+                                 'idx (list 'int-array [2 0])
+                                 'n 2
+                                 'stride 2]
+                          (list 'vec evaluable-jvm-form)))]
+    (testing "JVM consumes the typed map and honestly scalarizes the unsupported vector schedule"
+      (is (= 1 (get-in jvm [:stats :segop-reused])))
+      (is (nil? (get-in jvm [:stats :segop-relowered])))
+      (is (= 1 (get-in jvm [:stats :fallback])))
+      (is (= [30.0 31.0 10.0 11.0] jvm-values)))
+    (testing "GPU emits the same flattened scalar region"
+      (is (= 1 (get-in gpu [:stats :segop-reused])))
+      (is (zero? (get-in gpu [:stats :fallback])))
+      (is (str/includes? kernel-source " / stride"))
+      (is (str/includes? kernel-source " % stride")))))

@@ -88,12 +88,12 @@
       (is (not (contains? specs :par-fuse))))))
 
 (deftest uncertified-parallel-source-never-reenters-legacy-fusion
-  (let [source '(let* [step (raster.par/gather out src idx n stride)] step)
+  (let [source '(let* [step (raster.par/butterfly! re im i half wr wi base)] step)
         options {:dtype :float
-                 :array-types {'out :float 'src :float 'idx :int}
-                 :scalar-types {'n :long 'stride :long}}
+                 :array-types {'re :float 'im :float 'wr :float 'wi :float}
+                 :scalar-types {'half :long 'base :long}}
         result (#'pipeline/pass-soac-fuse source options)
-        bare '(raster.par/gather out src idx n stride)
+        bare '(raster.par/butterfly! re im i half wr wi base)
         bare-result (#'pipeline/pass-soac-fuse bare options)]
     (testing "a binding-form coverage gap remains byte-for-byte unfused"
       (is (= source (:form result)))
