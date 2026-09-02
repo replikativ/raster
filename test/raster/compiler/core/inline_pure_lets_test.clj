@@ -44,7 +44,7 @@
            (util/inline-pure-lets
             '(let* [a (raster.arrays/aget A i)
                     b (clojure.core/* a 2)]
-               (clojure.core/+ b 1))))))
+                   (clojure.core/+ b 1))))))
   (testing "binding-env exposes the same env for the caller that has already destructured"
     (is (= '{a (raster.arrays/aget A i) b (clojure.core/* (raster.arrays/aget A i) 2)}
            (util/binding-env '[a (raster.arrays/aget A i) b (clojure.core/* a 2)])))))
@@ -55,7 +55,7 @@
     (is (= '(clojure.core/+ 99 1)
            (util/inline-pure-lets
             '(let* [x (raster.arrays/aget A i)]
-               (let* [x 99] (clojure.core/+ x 1)))))))
+                   (let* [x 99] (clojure.core/+ x 1)))))))
   (testing "a name in an ARRAY position is likewise a binder-independent occurrence: substituting
             an array symbol must not be confused with substituting an index"
     (is (= '(raster.arrays/aget A (clojure.core/* 2 4))
@@ -64,7 +64,7 @@
   (testing "a par binder shadowing an inlined name alpha-renames rather than capturing"
     (let [r (util/inline-pure-lets
              '(let* [s (clojure.core/* n 2)]
-                (raster.par/map! O n (fn* [n] (clojure.core/+ n s)))))]
+                    (raster.par/map! O n (fn* [n] (clojure.core/+ n s)))))]
       (is (not= 'n (first (nth (nth r 3) 1)))
           "the fn* binder was renamed, so `s`'s reference to the OUTER n still resolves"))))
 
@@ -158,14 +158,14 @@
                       (catch clojure.lang.ExceptionInfo e
                         (:raster.compiler.backend.gpu.c-emit/bail (ex-data e)))))
           "vec-bail! is the refusal channel the enclosing try already catches")))
-  (testing "the SOAC lowerer returns nil (⇒ ScalarBinding ⇒ legacy void path) for an effectful
+  (testing "the SOAC lowerer returns nil (⇒ specialized void path) for an effectful
             let-wrapped write, instead of duplicating the effect into a SoacMap lambda"
     (let [sav (var-get (requiring-resolve 'raster.compiler.ir.soac/single-aset-void))]
       (is (nil? (sav '(let* [t (raster.arrays/aset SIDE 0 1.0)]
-                        (raster.arrays/aset OUT i t))
+                            (raster.arrays/aset OUT i t))
                      'i)))
       (is (some? (sav '(let* [g (raster.arrays/aget GATE i)]
-                         (raster.arrays/aset OUT i g))
+                             (raster.arrays/aset OUT i g))
                       'i))
           "…and the pure case is still recognized, so fusion is unchanged"))))
 

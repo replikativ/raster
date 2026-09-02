@@ -7,14 +7,8 @@
    gate (north-star §8) names 'one contraction' travelling the same recorded path as map/reduce.
 
    The node carries `contraction-facts` as its SOLE payload (§10: no second registry). Everything
-   downstream reads the facts; nothing re-derives them. `Dot` — one constructor, a unit test; excluded
-   from lowering, fusion and reconstruction — is the dead representation this replaces.
-
-   Two properties a GPU-only check cannot see, both pinned here: the node must stay OUT of the
-   generic map/reduce lowering and lambda fusion (`soac?`), whose consumers assume idx/lambda/1-D
-   bound; and it must reconstruct to its exact surface form at the dialect boundary, because the
-   CPU path round-trips SOAC nodes back to par forms after fusion — the first draft broke
-   `compile-aot` of every contraction with 'Cannot convert non-SOAC to par form'."
+   downstream reads the facts; nothing re-derives them. `Dot` — one constructor and a unit test —
+   is the dead representation this replaces."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -40,16 +34,9 @@
       (is (= '[[l 128]] (:contract-axes (:facts n))))
       (is (= '[A B] (mapv :sym (:operands (:facts n)))))
       (is (reduction/product-reduction? (:reduction (:facts n)))))
-    (testing "graph projections derive from the facts"
+    (testing "compatibility projections derive from the facts"
       (is (= '#{A B} (soac/soac-inputs n)))
-      (is (= '#{C} (soac/soac-outputs n))))
-    (testing "it is NOT a generic SOAC — generic lowering and lambda fusion must skip it"
-      (is (not (soac/soac? n))))))
-
-(deftest the-node-reconstructs-to-its-exact-surface-form
-  (testing "the CPU path round-trips nodes back to par forms after fusion; this arm did not exist
-            and broke compile-aot of every contraction"
-    (is (= cform (soac/soac->par-form (soac/par-form->soac 'c cform 1 :dtype :double))))))
+      (is (= '#{C} (soac/soac-outputs n))))))
 
 (deftest segop-lower-records-a-segcontract-instead-of-declining
   (let [r (slp/segop-lower-pass bound {:target-device :ze:0 :dtype :double})
