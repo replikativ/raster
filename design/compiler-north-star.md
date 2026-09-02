@@ -367,8 +367,9 @@ alpha-remapping, and general equations lower mechanically to canonical `SegRed` 
 constructing the former `SoacContract` record. Ordinary scalar `raster.par/contract` source now
 enters this equation directly; the operation is intentionally not a matmul node, so scientific
 contractions, batched reductions and attention-derived reductions share the same semantic
-vocabulary. Until the tensorization route consumes TypedSOAC itself, one shared mechanical
-component projection supplies host materialization and target routing. Ordinary typed contractions
+vocabulary. Target selection consumes the validated equation/facts together with its already
+scheduled `SegRed`; matrix, register-tiled and portable families do not reconstruct a source form
+or a second reduction operation. Ordinary typed contractions
 lower to a canonical `SegRed` whose `ReductionSchedule` records the hardware candidate families,
 workgroup search space and numerical constraints; the validated TypedSOAC equation remains attached
 to its `ProgramEquation`. Candidate families are executable constraints rather than diagnostics:
@@ -377,8 +378,9 @@ loudly when no enabled family can implement the equation. GPU routing derives it
 contraction facts from that equation behind a typed routing API and never reparses the walked source
 form; the OpenCL pipeline
 therefore knows only the typed program, stable operation ID and certified candidate schedule, not
-the projection used by compatibility leaves. Only host materialization and compatibility leaves
-request a generated surface spelling. A segmented reduction may now carry one typed scalar
+the projection used by compatibility leaves. Host materialization and the still-form-backed
+staged/quantized compatibility leaves request an explicit surface spelling locally; it is not a
+common routing invariant. A segmented reduction may now carry one typed scalar
 result-transform: its accumulator, expression, result dtype, tensor operands with axis maps/dtypes,
 and uniform scalar captures with dtypes are all verified at the equation boundary. Contraction
 epilogues expressed by that closed contract therefore stay on TypedSOAC and lower through the same

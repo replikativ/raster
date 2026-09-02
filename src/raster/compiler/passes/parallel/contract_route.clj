@@ -238,6 +238,19 @@
 
 (declare route-2free-1contract route-quant)
 
+(defn- compatibility-form!
+  "Require an explicit source/leaf spelling at a compatibility-only boundary.
+
+   Ordinary typed contraction families consume verified facts plus their scheduled SegRed and
+   must never pass through this gate. A leaf that still operates on surface syntax may project a
+   form explicitly before calling here; the common router does not manufacture one implicitly."
+  [contract-form leaf]
+  (or contract-form
+      (throw (ex-info "contraction compatibility leaf requires a surface form"
+                      {:reason :contraction-compatibility-form-required
+                       :leaf leaf
+                       :fallback :none}))))
+
 (def ^:private splice-capable-strategies
   "Strategies whose scheduled body or emitter has a typed store region and can honour an :epilogue.
    A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
@@ -280,9 +293,10 @@
 (defn route-contraction
   "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
 
-   `contract-form` may be nil when verified `:facts` are supplied. In that case any temporary
-   source-shaped spelling needed by a compatibility leaf is generated from those facts; routing
-   and legality never inspect the walked source form.
+   `contract-form` may be nil when verified `:facts` and a scheduled operation are supplied.
+   Ordinary typed matrix, register-tiled, portable and full-reduction routes need no source
+   spelling. Staged, SegMap and source fallbacks require one explicitly; the int8 compatibility
+   leaf performs its temporary projection locally until it consumes the typed scalar vocabulary.
 
    Canonical f16 products first become a target-neutral KernelBody and are then lowered by the
    OpenCL DPAS backend.  Unsupported shapes retain the portable register-tiled route.  Byte/int8
@@ -293,9 +307,9 @@
                            candidate-families scheduled-operation]
                     :or {dtype :half prefer-peak? false}}]
   (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
-        contract-form (or contract-form (:form contract-facts) (cf/surface-form contract-facts))
-        _ (when-not (and (cf/facts? contract-facts) contract-form)
-            (throw (ex-info "contraction routing requires verified facts and a target spelling"
+        contract-form (or contract-form (:form contract-facts))
+        _ (when-not (cf/facts? contract-facts)
+            (throw (ex-info "contraction routing requires verified facts"
                             {:reason :contraction-route-input
                              :facts contract-facts :form contract-form})))
         out-sym (:out contract-facts)
@@ -326,7 +340,7 @@
                             {:reason :contraction-candidate-families
                              :families candidate-families
                              :allowed contraction-families})))
-        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile
+        tensorize-plan (memoize #(route-2free-1contract out-sym dtype desc tile
                                                         epilogue contract-facts operation-id
                                                         candidate-families))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
@@ -342,7 +356,8 @@
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
         (and (seq stages) (> (count stages) 1))
-        (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+        (let [contract-form (compatibility-form! contract-form :staged-segred)
+              ;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
               _ (let [cmb (:combine (cf/scalar-reduction-view contract-facts))]
@@ -386,7 +401,12 @@
 
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
         (#{:byte :int8} dtype)
-        (route-quant contract-form out-sym n-free n-contract nseg prefer-peak?)
+        (route-quant
+         ;; Quant leaves still rewrite surface layout for the optional transpose pre-step. Keep
+         ;; that temporary projection local to the leaf instead of making syntax a common router
+         ;; invariant; ordinary typed contraction families never observe it.
+         (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :quant)
+         out-sym n-free n-contract nseg prefer-peak?)
 
       ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
@@ -396,7 +416,9 @@
       ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
         (zero? n-free)
         (let [sr (or scheduled-operation
-                     (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts))
+                     (cl/contract-form->segred
+                      (compatibility-form! contract-form :full-reduce)
+                      :dtype dtype :facts contract-facts))
               k (sco/generate-segred-kernel sr out-sym :dtype dtype)
               attrs (:attributes k)
               red-bound (second (first contract-axes))]
@@ -415,7 +437,8 @@
            :scalar-args [] :dims [1]})
 
         (zero? n-contract)
-        (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
+        (let [sm (cl/contract-form->segmap
+                  (compatibility-form! contract-form :segmap) :dtype dtype)
               {:keys [kernel-name source array-params scalar-params abi]}
               (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
           {:strategy :segmap
@@ -445,7 +468,9 @@
                              :declines (when (and (= 2 n-free) (= 1 n-contract))
                                          (::declines (tensorize-plan)))})))
           (let [sr (or scheduled-operation
-                       (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts))
+                       (cl/contract-form->segred
+                        (compatibility-form! contract-form :portable-segred)
+                        :dtype dtype :facts contract-facts))
                 portable (contraction-schedule/plan-portable-body contract-facts sr desc)
                 emitted (when (:ok portable)
                           (sco/generate-contraction-kernel-body (:body portable)))
@@ -934,7 +959,7 @@
    shape could express neither: a decline is usually LEGITIMATE (symbolic dims, a non-`+` combine and
    a non-product body are all perfectly good contractions that merely are not tiled-leaf shaped), and
    it is always worth REPORTING."
-  [contract-form out-sym dtype desc tile epilogue contract-facts operation-id candidate-families]
+  [out-sym dtype desc tile epilogue contract-facts operation-id candidate-families]
   (let [acc (volatile! [])
         note! (fn [d] (vswap! acc conj d) nil)
         matrix? (contains? candidate-families :matrix)
