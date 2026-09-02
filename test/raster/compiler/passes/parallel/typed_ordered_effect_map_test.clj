@@ -2,11 +2,13 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
-            [raster.compiler.passes.parallel.typed-soac-route :as route]))
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.par]))
 
 (def ^:private extent (av/tensor {:dtype :long :shape []}))
 (def ^:private vector-value (av/tensor {:dtype :float :shape '[n]}))
@@ -55,6 +57,20 @@
   [operation]
   (assoc-in operation [:space :flat-idx] 'thread-index))
 
+(def ^:private mixed-effect-source
+  '(let* [effect
+          (raster.par/map-void!
+           i n
+           (let* [^float previous
+                  (clojure.core/aget out (clojure.core/aget slots i))]
+             (do
+               (if (> (clojure.core/aget x i) 0.0)
+                 (clojure.core/aset
+                  out (raster.par/unique-index (clojure.core/aget slots i))
+                  (float (+ previous (clojure.core/aget x i)))))
+               (raster.par/atomic-add! total 0 (float (clojure.core/aget x i))))))]
+         effect))
+
 (deftest ordered-effects-lower-to-portable-kernelbody-control-and-atomics
   (let [program (effect-program)
         operation (first (soac-lower/lower-typed-effect-map
@@ -96,3 +112,35 @@
           (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))
           (is (some #(= "AtomicRMW" (some-> % class .getSimpleName)) operations))
           (is (str/includes? (:source artifact) atomic)))))))
+
+(deftest analyzed-source-selects-the-same-ordered-effect-schedule
+  (let [result (route/attempt mixed-effect-source :float
+                              {'x :float 'slots :int 'out :float 'total :float})
+        parallel-program (:program result)
+        typed-operation (-> parallel-program :equations first :algorithm
+                            dialect/equations first dialect/operation-kind)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          parallel-program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :dtype :float :target-dialect :opencl-portable
+                  :array-types {'x :float 'slots :int 'out :float 'total :float}
+                  :scalar-types {'n :long})
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x slots out total n] (:form jvm)))
+        x (float-array [-1.0 2.0 3.0])
+        out (float-array [10.0 20.0 30.0])
+        total (float-array 1)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= 'effect-map typed-operation))
+    (is (= :ordered-effects (:write-conflict operation)))
+    (is (= ['slots 'x 'out 'total]
+           (mapv :name (filterv #(not= :scalar (:kind %)) (:abi artifact)))))
+    (is (= [:input :input :inout :inout]
+           (mapv :kind (filterv #(not= :scalar (:kind %)) (:abi artifact)))))
+    (is (str/includes? (:source artifact) "atomic_add_float"))
+    (is (nil? (execute x (int-array [2 0 1]) out total 3)))
+    (is (= [12.0 23.0 30.0] (mapv double out)))
+    (is (= [4.0] (mapv double total)))
+    (is (= 1 (get-in jvm [:stats :segop-reused])))
+    (is (zero? (get-in jvm [:stats :fallback])))))

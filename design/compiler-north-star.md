@@ -170,9 +170,19 @@ and guarded effects retain structured `IfRegion` control in the common `KernelBo
 and ordered ABI emit as portable OpenCL, CUDA, and HIP. Fusion treats this operation as a
 conservative boundary until an effect-aware rule proves that moving or combining it preserves the
 declared memory order. Source selection remains gated on proving indirect-write uniqueness rather
-than inferring it from a workload or variable name.
+than inferring it from a workload or variable name. Closed typed source can now form this boundary
+for mixed unique and reducing effects, with per-destination dtypes and conflict certificates; JVM
+execution and OpenCL/CUDA/HIP emission consume the same scheduled region. Typed locals are
+pre-effect snapshots, while a direct read after a sibling write still declines.
 
-Adam and AdamW use this effect-map contract directly: gradient is a read-only operand, parameter
+This proof boundary exposed a pre-existing firms-ABM race rather than hiding it: active IDs are
+sampled with replacement, so two decision lanes may write the same agent state and cannot carry a
+`unique-index` certificate. The semantics-preserving production route is a resident ordered queue
+loop (or, later, grouping by agent followed by one ordered lane per group). A single-thread/device
+ordered-iteration schedule is therefore explicit remaining coverage; parallel `effect-map` is not
+permission to assert workload-specific uniqueness.
+
+Adam and AdamW use the functional tuple-map storage contract directly: gradient is a read-only operand, parameter
 and moment buffers are typed inout storage, and the bias-corrected moment snapshots form one local
 SSA spine evaluated before all three writes. Each optimizer lowers as one certified resident
 kernel with zero compiler allocation or compatibility fallback. The C-family vector fast path

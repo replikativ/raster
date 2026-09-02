@@ -703,3 +703,53 @@
                  (list 'let* ['effect (list 'raster.par/map-void! 'i 'n body)] 'effect)
                  {:dtype :float
                   :array-types {'x :float 'a :float 'b :float 'indices :int}}))))))
+
+(deftest mixed-unique-and-reduction-effects-enter-one-typed-effect-map
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (do
+                   (if (> (clojure.core/aget x i) 0.0)
+                     (clojure.core/aset
+                      out
+                      (raster.par/unique-index (clojure.core/aget slots i))
+                      (float (clojure.core/aget x i))))
+                   (raster.par/atomic-add! total 0 (float (clojure.core/aget x i)))
+                   (raster.par/atomic-add! count 0 (int 1))))]
+               effect)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'x :float 'slots :int 'out :float
+                                       'total :float 'count :int}})
+        equation (first (dialect/equations program))
+        {:keys [attributes destinations lambda]} (dialect/operation-parts equation)
+        {:keys [body-results]} (dialect/lambda-parts lambda)
+        effect-parts (mapv dialect/effect-parts body-results)]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= ['out 'total 'count] destinations))
+    (is (= [:float :float :int] (:dtypes attributes)))
+    (is (= [:unique :reduce :reduce]
+           (mapv #(if (= :unique (:conflict %))
+                    :unique (get-in % [:conflict :kind]))
+                 effect-parts)))
+    (is (= [:float :int]
+           (mapv #(get-in % [:conflict :dtype]) (rest effect-parts))))
+    (is (= [:write :read-write :read-write]
+           (mapv :access (dialect/result-storage program 0))))
+    (is (= [] (dialect/outputs program)))
+    (is (= program (dialect/validate! program)))))
+
+(deftest mixed-effects-still-require-an-explicit-indirect-write-proof
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (do
+                   (clojure.core/aset out (clojure.core/aget slots i)
+                                      (float (clojure.core/aget x i)))
+                   (raster.par/atomic-add! total 0 (float 1.0))))]
+               effect)]
+    (is (nil? (frontend/form->program
+               source {:dtype :float
+                       :array-types {'x :float 'slots :int 'out :float 'total :float}})))))

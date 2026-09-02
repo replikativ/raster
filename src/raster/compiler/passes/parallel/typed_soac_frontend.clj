@@ -73,6 +73,9 @@
 (def ^:private unique-index-ops
   '#{raster.par/unique-index unique-index})
 
+(def ^:private atomic-add-ops
+  '#{raster.par/atomic-add! atomic-add!})
+
 (defn- unique-index-expression
   "Return the inner destination expression when `expression` carries Raster's explicit
    uniqueness contract. The marker may be a direct source call or a walker-devirtualized call;
@@ -82,6 +85,12 @@
              (contains? unique-index-ops (descriptor/semantic-op expression))
              (= 1 (count (descriptor/call-args expression))))
     (first (descriptor/call-args expression))))
+
+(defn- atomic-add-call?
+  [expression]
+  (and (seq? expression)
+       (contains? atomic-add-ops (descriptor/semantic-op expression))
+       (= 3 (count (descriptor/call-args expression)))))
 
 (defn- same-symbol?
   [left right]
@@ -187,13 +196,14 @@
                    locals)
      :stores (mapv #(substitute-store renames %) stores)}))
 
-(defn- pointwise-region
-  "Recognize an ordered, pure local-SSA spine ending exclusively in indexed stores.
+(defn- store-region
+  "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
 
    Local types come only from retained walker/TypedClojure facts. Nested lexical scopes are
    alpha-renamed into one ordered SSA spine; missing local types decline because guessing them in
-   this source recognizer or a C emitter would make the region only nominally typed. Store
-   legality is checked separately after local dependencies are expanded for analysis."
+   this source recognizer or a C emitter would make the region only nominally typed. Direct stores
+   and atomic additions become data here; cross-work-item legality is checked separately after
+   local dependencies are expanded for analysis."
   [body index]
   (cond
     (and (seq? body) (form/let-head? (first body)))
@@ -201,7 +211,7 @@
       (when (and (even? (count bindings))
                  (seq nested-body)
                  (not-any? util/effectful? (take-nth 2 (rest bindings))))
-        (when-let [nested-region (pointwise-region (list* 'do nested-body) index)]
+        (when-let [nested-region (store-region (list* 'do nested-body) index)]
           (let [pairs (vec (partition 2 bindings))
                 typed (mapv (fn [[binding init]]
                               [binding init (retained-local-dtype binding init)])
@@ -227,8 +237,8 @@
     (and (seq? body) (= 'do (first body)))
     (let [expressions (vec (rest body))]
       (if (= 1 (count expressions))
-        (pointwise-region (first expressions) index)
-        (let [groups (mapv #(pointwise-region % index) expressions)]
+        (store-region (first expressions) index)
+        (let [groups (mapv #(store-region % index) expressions)]
           (when (and (seq groups) (every? some? groups)
                      (every? (comp empty? :locals) groups))
             {:locals [] :stores (vec (mapcat :stores groups))}))))
@@ -237,34 +247,45 @@
          (contains? #{'if 'clojure.core/if} (first body))
          (<= 3 (count body) 4))
     (let [[_ predicate then-expression else-expression] body
-          then-region (pointwise-region then-expression index)
-          else-region (when else-expression (pointwise-region else-expression index))]
+          then-region (store-region then-expression index)
+          else-region (when else-expression (store-region else-expression index))
+          aligned? (and else-region
+                        (= (mapv (juxt :out :index) (:stores then-region))
+                           (mapv (juxt :out :index) (:stores else-region))))]
       (when (and then-region
                  (empty? (:locals then-region))
                  (or (nil? else-expression)
-                     (and else-region (empty? (:locals else-region))))
-                 (or (nil? else-region)
-                     (= (mapv (juxt :out :index) (:stores then-region))
-                        (mapv (juxt :out :index) (:stores else-region)))))
+                     (and else-region (empty? (:locals else-region)))))
         {:locals []
          :stores
-         (mapv (fn [ordinal then-store]
-                 (let [else-store (when else-region (nth (:stores else-region) ordinal))]
-                   (if else-store
+         (if aligned?
+           (mapv (fn [ordinal then-store]
+                   (let [else-store (nth (:stores else-region) ordinal)]
                      (assoc then-store
                             :value (list 'if predicate (:value then-store) (:value else-store))
                             :predicate (list 'if predicate
                                              (:predicate then-store)
-                                             (:predicate else-store)))
-                     (update then-store :predicate
-                             #(if (contains? #{true 1} %)
-                                predicate
-                                (list 'if predicate % 0))))))
-               (range) (:stores then-region))}))
+                                             (:predicate else-store)))))
+                 (range) (:stores then-region))
+           (vec
+            (concat
+             (map (fn [store]
+                    (update store :predicate
+                            #(if (contains? #{true 1} %)
+                               predicate
+                               (list 'if predicate % 0))))
+                  (:stores then-region))
+             (map (fn [store]
+                    (update store :predicate
+                            #(let [else-predicate (list 'if predicate 0 1)]
+                               (if (contains? #{true 1} %)
+                                 else-predicate
+                                 (list 'if else-predicate % 0)))))
+                  (:stores else-region)))))}))
 
     (and (seq? body) (= 'case* (first body)))
     (when-let [conditional (integer-case-chain body)]
-      (pointwise-region conditional index))
+      (store-region conditional index))
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
@@ -282,7 +303,8 @@
                               (descriptor/aset-array-sym body) raw-index value))
               cast? (and (seq? value)
                          (contains? #{'float 'double 'int 'long
-                                      'clojure.core/float 'clojure.core/double}
+                                      'clojure.core/float 'clojure.core/double
+                                      'clojure.core/int 'clojure.core/long}
                                     (first value))
                          (= 2 (count value)))]
           {:locals []
@@ -295,6 +317,22 @@
                               contribution
                               (if cast? (second value) value))
                      :cast (when (and cast? (not contribution)) (first value))}]})))
+
+    (atomic-add-call? body)
+    (let [[destination raw-index raw-value] (descriptor/call-args body)
+          cast? (and (seq? raw-value)
+                     (contains? #{'float 'double 'int 'long
+                                  'clojure.core/float 'clojure.core/double
+                                  'clojure.core/int 'clojure.core/long}
+                                (first raw-value))
+                     (= 2 (count raw-value)))]
+      {:locals []
+       :stores [{:out destination
+                 :index (strip-index-cast raw-index)
+                 :reduction-op '+
+                 :predicate 1
+                 :value (if cast? (second raw-value) raw-value)
+                 :cast (when cast? (first raw-value))}]})
 
     :else nil))
 
@@ -316,6 +354,31 @@
                                  out)))
                  stores))))
 
+(defn- ordered-effects-safe?
+  "An ordered effect may not observe a sibling destination directly after stores begin.
+
+   Typed locals are evaluated before the effect sequence and may deliberately snapshot destination
+   state. Direct reads in coordinates, predicates, or values would instead make cross-work-item
+   ordering observable and require a stronger schedule than an effect map."
+  [locals stores]
+  (let [destinations (set (map :out stores))]
+    (and (seq stores)
+         (every? (fn [{:keys [index predicate value]}]
+                   (empty? (set/intersection
+                            destinations
+                            (par/collect-aget-arrays (list 'do index predicate value)))))
+                 stores)
+         ;; Locals are an ordered pre-effect SSA spine, so their reads are snapshots rather than
+         ;; sibling effect dependencies. Keep the argument explicit for this legality boundary.
+         (vector? locals))))
+
+(defn- destination-dtype
+  [array-types destination]
+  (or (get array-types destination)
+      (when (symbol? destination)
+        (or (get array-types (symbol (name destination)))
+            (dtype/dtype-for-scalar-tag (types/sym-type-tag destination))))))
+
 (defn- effect-result-id
   [equation-id ordinal]
   [:effect-map equation-id ordinal])
@@ -334,13 +397,13 @@
       :scalars (mapv #(-> % (assoc :value (:sym %)) (dissoc :sym)) (:scalars epilogue))
       :result-dtype (or (:dtype epilogue) :float)})))
 
-(defn- effect-map-description
+(defn- write-region-description
   [id symbol index extent {:keys [locals stores]} elem-type
-   & {:keys [host-return] :or {host-return :effect}}]
-  (when (and (seq stores) (independent-stores? locals stores)
-             (or (= :effect host-return) (= 1 (count stores))))
+   & {:keys [host-return array-types] :or {host-return :effect array-types {}}}]
+  (when (and (seq stores) (or (= :effect host-return) (= 1 (count stores))))
     (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
-          pointwise? (every? #(and (= index (:index %)) (nil? (:reduction-op %))) stores)
+          dense-pointwise? (every? #(and (= index (:index %)) (nil? (:reduction-op %))) stores)
+          pointwise? (and dense-pointwise? (independent-stores? locals stores))
           stores (if pointwise?
                    (mapv (fn [{:keys [out predicate value] :as store}]
                            (assoc store :value
@@ -353,13 +416,35 @@
                                           (list 'clojure.core/aget out index)))))
                          stores)
                    stores)
-          reduction-ops (set (keep :reduction-op stores))
-          conflict (cond
-                     (every? #(= :unique (:conflict %)) stores) :unique
-                     (and (= 1 (count reduction-ops))
-                          (every? :reduction-op stores))
-                     (dialect/reducing-scatter-conflict (first reduction-ops) elem-type))
-          destinations (mapv :out stores)
+          stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
+                         (let [destination-type (some-> (destination-dtype array-types out)
+                                                       dtype/canon)
+                               contract (cond
+                                          (= :unique conflict) :unique
+                                          reduction-op
+                                          (when destination-type
+                                            (dialect/reducing-scatter-conflict
+                                             reduction-op destination-type))
+                                          (= index (:index store)) :unique)]
+                           (assoc store :effect-conflict contract
+                                        :destination-dtype destination-type)))
+                       stores)
+          effect-contracts (mapv :effect-conflict stores)
+          uniform-conflict (when (= 1 (count (set effect-contracts)))
+                             (first effect-contracts))
+          scatter? (and (not pointwise?)
+                        (independent-stores? locals stores)
+                        (or (= :unique uniform-conflict)
+                            (dialect/reducing-scatter-conflict? uniform-conflict)))
+          ordered? (and (not dense-pointwise?) (not scatter?) (= :effect host-return)
+                        (every? some? effect-contracts)
+                        (ordered-effects-safe? locals stores)
+                        (every? (fn [[_ grouped]]
+                                  (= 1 (count (set (map :effect-conflict grouped)))))
+                                (group-by :out stores)))
+          destinations (if ordered?
+                         (vec (distinct (map :out stores)))
+                         (mapv :out stores))
           values (mapv :value stores)
           write-indices (mapv :index stores)
           predicates (mapv :predicate stores)
@@ -368,20 +453,31 @@
                      :scalars set/difference (set (map :id locals)))
           results (if (= :buffer host-return)
                     [symbol]
-                    (mapv #(effect-result-id id %) (range (count stores))))]
-      (when (or pointwise? (= :unique conflict)
-                (dialect/reducing-scatter-conflict? conflict))
-        (merge {:kind (if pointwise? :map :scatter)
+                    (mapv #(effect-result-id id %) (range (count destinations))))
+          result-dtypes (mapv #(some-> (destination-dtype array-types %) dtype/canon)
+                              destinations)]
+      (when (or pointwise? scatter? (and ordered? (every? some? result-dtypes)))
+        (merge {:kind (cond pointwise? :map scatter? :scatter :else :effect-map)
                 :id id :sym symbol :index index :extent extent
                 :results results :locals locals :bodies values :casts (mapv :cast stores)
                 :write-indices write-indices :predicates predicates
-                :conflict (when-not pointwise? conflict)
+                :conflict (when scatter? uniform-conflict)
+                :effects (when ordered?
+                           (mapv #(select-keys % [:out :index :predicate :value :cast
+                                                  :effect-conflict])
+                                 stores))
+                :result-dtypes (when ordered? result-dtypes)
                 :effect-only? (= :effect host-return)
                 :host-binding symbol :elem-type elem-type
                 :result-storage
                 (mapv (fn [destination]
                         {:destination destination
-                         :access (if (or (not pointwise?)
+                         :access (if (or scatter?
+                                         (and ordered?
+                                              (some #(and (= destination (:out %))
+                                                          (dialect/reducing-scatter-conflict?
+                                                           (:effect-conflict %)))
+                                                    stores))
                                          (contains? (:inputs io) destination))
                                    :read-write :write)
                          :host-return host-return})
@@ -406,7 +502,7 @@
            io)))
 
 (defn- operation-description
-  [id symbol expression default-dtype]
+  [id symbol expression default-dtype array-types]
   (cond
     ;; SplitMix64 is pointwise scalar algebra, not a semantic parallel primitive. Preserve the
     ;; public convenience operation's fixed-width ABI here, then expose an ordinary typed map to
@@ -548,11 +644,11 @@
     (par/par-map2-form? expression)
     (let [{:keys [out1 out2 idx bound cast body1 body2 elem-type]}
           (par/extract-par-map2-info expression)]
-      (effect-map-description id symbol idx bound
+      (write-region-description id symbol idx bound
                               {:locals []
                                :stores [{:out out1 :value body1 :cast cast}
                                         {:out out2 :value body2 :cast cast}]}
-                              elem-type))
+                              elem-type :array-types array-types))
 
     (par/par-product-reduce-form? expression)
     (let [{:keys [outputs components segment-axes idx bound element-bindings element-results
@@ -749,10 +845,11 @@
     (par/par-map-void-form? expression)
     (let [{:keys [idx bound body elem-type]}
           (par/extract-par-map-void-info expression)]
-      (when-let [region (pointwise-region body idx)]
-        (effect-map-description id symbol idx bound region
+      (when-let [region (store-region body idx)]
+        (write-region-description id symbol idx bound region
                                 (dtype/canon (or elem-type default-dtype))
-                                :host-return (or (::host-return (meta expression)) :effect))))
+                                :host-return (or (::host-return (meta expression)) :effect)
+                                :array-types array-types)))
 
     :else nil))
 
@@ -894,9 +991,9 @@
     (first (descriptor/call-args expression))))
 
 (defn- source-descriptions
-  [pairs default-dtype]
+  [pairs default-dtype array-types]
   (mapv (fn [id [symbol expression]]
-          (or (operation-description id symbol expression default-dtype)
+          (or (operation-description id symbol expression default-dtype array-types)
               (if (par/par-form? expression)
                 {:kind :unsupported :id id :sym symbol :expr expression}
                 {:kind :scalar :id id :sym symbol :expr expression})))
@@ -947,7 +1044,7 @@
                                                  expression representative)))
               (assoc-in [:scalar-representatives (:sym description)] representative)))
 
-        (:map :scatter :stencil :reduce :scan)
+        (:map :scatter :effect-map :stencil :reduce :scan)
         (let [extent (descriptor/unwrap-int-cast (:extent description))
               array (alength-array extent)
               proved-extent (canonical-extent shape-equalities values extent)
@@ -958,7 +1055,7 @@
                         :else extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
-            (contains? #{:map :scatter :stencil :scan} (:kind description'))
+            (contains? #{:map :scatter :effect-map :stencil :scan} (:kind description'))
             (assoc-in [:extents (:sym description')] extent')))
 
         (update state :descriptions conj description)))
@@ -977,7 +1074,7 @@
 (defn- physical-output-symbols
   [descriptions]
   (reduce set/union #{}
-          (map #(if (contains? #{:map :scatter :stencil :reduce :segmented-reduce
+          (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
                                  :product-reduce :segmented-fold-map :scan} (:kind %))
                   (:outputs %) #{})
                descriptions)))
@@ -999,6 +1096,15 @@
                   (or (= :unique (:conflict description))
                       (dialect/reducing-scatter-conflict? (:conflict description)))
                   (every? (comp symbol? :destination) (:result-storage description)))
+    :effect-map (and (seq (:effects description))
+                     (seq (:result-storage description))
+                     (= (count (:result-storage description))
+                        (count (:result-dtypes description)))
+                     (every? (comp symbol? :destination) (:result-storage description))
+                     (every? (fn [{:keys [effect-conflict]}]
+                               (or (= :unique effect-conflict)
+                                   (dialect/reducing-scatter-conflict? effect-conflict)))
+                             (:effects description)))
     :stencil (and (= 1 (count (:result-storage description)))
                   (symbol? (get-in description [:result-storage 0 :destination])))
     :reduce true
@@ -1030,12 +1136,12 @@
 
    This is diagnostic evidence only: it uses the same descriptions and admission predicate as
    form->program, so reporting cannot become a second legality implementation."
-  [source {:keys [dtype values shape-equalities]
-           :or {dtype :double values {} shape-equalities {}}}]
+  [source {:keys [dtype array-types values shape-equalities]
+           :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
-          descriptions (normalize-extents (source-descriptions pairs dtype)
+          descriptions (normalize-extents (source-descriptions pairs dtype array-types)
                                           shape-equalities values)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(supported-description? physical-outputs %) descriptions)
@@ -1053,6 +1159,7 @@
                             :scalar :uncertified-host-scalar
                             :map :unverified-map-effects
                             :scatter :unverified-scatter-conflict
+                            :effect-map :unverified-ordered-effects
                             :stencil :unverified-stencil-storage
                             :segmented-reduce :unverified-segmented-reduction
                             :product-reduce :unverified-product-reduction
@@ -1171,6 +1278,46 @@
                 arrays captures
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms writes)))))
+
+(defn- effect-map-equation
+  [{:keys [id index extent locals inputs scalars results result-storage effects result-dtypes]}]
+  (let [destinations (mapv :destination result-storage)
+        destination-set (set destinations)
+        all-expressions (vec (concat (map :init locals)
+                                     (mapcat (juxt :index :predicate :value) effects)))
+        semantic-inputs (set/difference (set inputs) destination-set)
+        [pointwise stable]
+        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
+        arrays (vec (sort-by pr-str pointwise))
+        captures (vec (sort-by pr-str (distinct (concat stable scalars))))
+        element-parameters (element-symbols (count arrays))
+        capture-parameters (capture-symbols (count captures))
+        destination-parameters (mapv #(symbol (str "%destination" %))
+                                     (range (count destinations)))
+        destination-substitutions (zipmap destinations destination-parameters)
+        substitutions (into (zipmap captures capture-parameters)
+                            destination-substitutions)
+        transform (fn [expression]
+                    (util/subst-syms
+                     substitutions
+                     (first (elementize [expression] arrays element-parameters index))))
+        local-forms (mapv (fn [{:keys [id dtype init]}]
+                            (dialect/local-value id dtype (transform init)))
+                          locals)
+        effect-forms
+        (mapv (fn [{:keys [out index predicate value cast effect-conflict]}]
+                (list 'effect (get destination-substitutions out)
+                      effect-conflict (transform index) (transform predicate)
+                      (transform (if cast (list cast value) value))))
+              effects)]
+    (list '= id results
+          (list 'effect-map
+                {:index index :extent extent :dtypes result-dtypes
+                 :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
+                arrays captures destinations
+                (dialect/effect-lambda-form
+                 (vec (concat element-parameters capture-parameters destination-parameters))
+                 local-forms effect-forms)))))
 
 (defn- stencil-equation
   [{:keys [id index extent radius boundary inputs scalars results result-dtype casts bodies]}]
@@ -1373,11 +1520,11 @@
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
-        operations (filter #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
+        operations (filter #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
                                          :product-reduce :segmented-fold-map :scan} (:kind %))
                            descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
-                                              (:map :scatter :stencil) (:results %)
+                                              (:map :scatter :effect-map :stencil) (:results %)
                                               :scan [(:sym %)]
                                               :segmented-reduce (:results %)
                                               :product-reduce (:results %)
@@ -1386,7 +1533,8 @@
                                            operations))
         terminal-operation-definitions
         (set (mapcat #(case (:kind %)
-                        (:map :scatter :stencil) (if (:effect-only? %) [] (:results %))
+                        (:map :scatter :effect-map :stencil)
+                        (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
                         :segmented-reduce (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
@@ -1499,6 +1647,7 @@
                                              (:result-components attributes))
                         segmented-fold-map (:dtypes attributes)
                         scan (:dtypes attributes)
+                        effect-map (:dtypes attributes)
                         (map scatter) (map #(value-dtype % default-dtype array-types) results))]
     (merge
      (into {} (map (fn [id] [id (dimension-value id)])) dimension-ids)
@@ -1539,7 +1688,7 @@
                                          segmented-fold-map
                                          (dialect/segmented-fold-map-result-shape attributes)
                                          scan (dialect/scan-result-shape attributes)
-                                         scatter [(list 'unknown-dimension id)]
+                                         (scatter effect-map) [(list 'unknown-dimension id)]
                                          (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 
@@ -1576,22 +1725,23 @@
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
-          descriptions (normalize-extents (source-descriptions pairs dtype)
+          descriptions (normalize-extents (source-descriptions pairs dtype array-types)
                                           shape-equalities values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
-                 (some #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
+                 (some #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
                                      :product-reduce :segmented-fold-map :scan}
                                    (:kind %))
                        descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
-              (filterv #(contains? #{:map :scatter :stencil :reduce :segmented-reduce
+              (filterv #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
                                      :product-reduce :segmented-fold-map :scan} (:kind %))
                        descriptions)
               physical-outputs (physical-output-symbols descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :scatter (scatter-equation %)
+                                               :effect-map (effect-map-equation %)
                                                :stencil (stencil-equation %)
                                                :reduce (reduce-equation %)
                                                :segmented-reduce (segmented-reduce-equation %)
@@ -1613,13 +1763,14 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :scatter :stencil :reduce :segmented-reduce
+                          (:map :scatter :effect-map :stencil :reduce :segmented-reduce
                                 :product-reduce :segmented-fold-map :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
                                         :map (map-equation description)
                                         :scatter (scatter-equation description)
+                                        :effect-map (effect-map-equation description)
                                         :stencil (stencil-equation description)
                                         :reduce (reduce-equation description)
                                         :segmented-reduce (segmented-reduce-equation description)

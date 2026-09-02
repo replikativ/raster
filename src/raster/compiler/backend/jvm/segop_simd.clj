@@ -14,7 +14,8 @@
    - Parse par forms (SegOp already has inputs/outputs/scalars/lambda)
    - Decide phase decomposition (SegOp already decided)
    - Collect arrays/scalars (SegOp already has them)"
-  (:require [raster.compiler.core.op-descriptor :as descriptor]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]
@@ -970,9 +971,36 @@
           bound (seg-bound segmap)
           n-sym (gensym "effect_n__")
           j-sym (gensym "effect_i__")
+          {:keys [locals effects]} (:scalar-region segmap)
+          effect-statement
+          (fn [{:keys [destination conflict destination-index predicate value]}]
+            (let [reduction? (soac-dialect/reducing-scatter-conflict? conflict)
+                  destination (if reduction?
+                                (let [tag (dtype/scalar-tag-for-dtype (:dtype conflict))]
+                                  (with-meta destination {:tag tag :raster.type/tag tag}))
+                                destination)
+                  store (if reduction?
+                          (list 'raster.par/atomic-add! destination destination-index value)
+                          (list 'clojure.core/aset destination destination-index value))]
+              (if (contains? #{true 1} predicate)
+                store
+                (list 'if predicate store))))
+          typed-region-body
+          (when (seq effects)
+            (let [statements (mapv effect-statement effects)
+                  body (list* 'do statements)]
+              (if (seq locals)
+                (list 'let*
+                      (vec (mapcat (fn [{:keys [id dtype init]}]
+                                     (let [tag (dtype/scalar-tag-for-dtype dtype)]
+                                       [(with-meta id {:raster.type/tag tag})
+                                        (list tag init)]))
+                                   locals))
+                      body)
+                body)))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
-                (bc/desugar-invk (:lambda segmap)))]
+                (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
       (list 'let* [n-sym (list 'int bound)]
             (list 'loop* [j-sym '(int 0)]
                   (list 'if (ix< j-sym n-sym)
