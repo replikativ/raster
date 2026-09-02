@@ -212,6 +212,13 @@
     ;; Imperative par/map! (with output buffer)
     (par/par-map-form? expr)
     (let [info (par/extract-par-map-info expr)
+          _ (when (:offset info)
+              (throw (ex-info "offset map requires an explicit indexed-store operation"
+                              {:reason :offset-map-requires-indexed-store
+                               :operation 'raster.par/map!
+                               :offset (:offset info)
+                               :target-dialect :typed-soac-scatter
+                               :fallback :scalar-expansion})))
           {:keys [inputs outputs scalars]}
           (extract-io (:body info) (:idx info) [(:out info)])
           elem-type (or (:elem-type info)

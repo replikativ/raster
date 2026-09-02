@@ -84,6 +84,29 @@
         (is (some? (:reason d)) "the missing rule")
         (is (some? (:fallback d)) "and what happens instead — a stated outcome, not an absence")))))
 
+(deftest offset-map-is-refused-before-segop-lowering
+  (let [source '(raster.par/map! out i n :offset base float (aget x i))
+        r (slp/segop-lower-pass
+           (list 'let* ['result source] 'result)
+           {:target-device :ze:0
+            :dtype :float
+            :array-types {'out :float 'x :float}
+            :scalar-types {'n :long 'base :long}})
+        d (first (get-in r [:stats :segops-declined]))]
+    (testing "the middle end records exactly why it cannot represent the write"
+      (is (zero? (get-in r [:stats :segops-lowered])))
+      (is (= :soac (:stage d)))
+      (is (= :offset-map-requires-indexed-store (:reason d))))
+    (testing "the GPU boundary fails loudly instead of emitting an out[i] kernel"
+      (try
+        ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+         source :dtype :float :device-id :ze:0 :min-elements 0)
+        (is false "an offset map must remain illegal until typed scatter lowering exists")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :illegal-op-remains (:reason (ex-data e))))
+          (is (= :offset-map-requires-indexed-store (:missing-rule (ex-data e))))
+          (is (= :none (:fallback (ex-data e)))))))))
+
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion
             decline would let the pipeline continue on the legacy path with the bug intact — the
