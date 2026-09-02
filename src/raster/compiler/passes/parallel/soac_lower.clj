@@ -706,17 +706,21 @@
 
 (defn- legacy-map-description
   [node]
-  {:id (:id node)
-   :bound (:bound node)
-   :idx (soac/soac-idx node)
-   :lambda (:lambda node)
-   :scalar-region (:scalar-region node)
-   :inputs (or (:inputs node) #{})
-   :outputs (or (soac-outputs* node) #{})
-   :scalars (or (:scalars node) #{})
-   :elem-type (:elem-type node)
-   :out-sym (:sym node)
-   :cast-fn (:cast-fn node)})
+  (let [outputs (or (soac-outputs* node) #{})]
+    {:id (:id node)
+     :bound (:bound node)
+     :idx (soac/soac-idx node)
+     :lambda (:lambda node)
+     :scalar-region (:scalar-region node)
+     :inputs (or (:inputs node) #{})
+     :outputs outputs
+     :scalars (or (:scalars node) #{})
+     :elem-type (:elem-type node)
+     ;; The compatibility node's :sym is the host binding result, not necessarily the physical
+     ;; store destination. Preserve the one declared output when it is unambiguous; consumers must
+     ;; never rediscover it by reparsing the source form.
+     :out-sym (if (= 1 (count outputs)) (first outputs) (:sym node))
+     :cast-fn (:cast-fn node)}))
 
 (defn- legacy-reduce-description
   [node]

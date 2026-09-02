@@ -530,6 +530,17 @@
              (catch clojure.lang.ExceptionInfo exception
                {:details (ex-data exception) :message (.getMessage exception)}))}))
 
+(defn valid-host-or-scheduled-program?
+  [value]
+  (or (valid-let*-ordered? value)
+      (valid-scheduled-program? value)))
+
+(defn validate-host-or-scheduled-program
+  [value]
+  (if (valid-scheduled-program? value)
+    :ok
+    (validate-let*-ordered value)))
+
 (defn valid-typed-soac-program?
   [value]
   (try
@@ -591,6 +602,9 @@
    :compound-detected [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :gpu-planned      [valid-let*-ordered? validate-let*-ordered]
    :dtype-remapped   [valid-let*-ordered? validate-let*-ordered]
-   :backend-applied  [valid-let*-ordered? validate-let*-ordered]
-   :alength-resolved [valid-let*-ordered? validate-let*-ordered]
-   :mem-merged       [valid-let*-ordered? validate-let*-ordered]})
+   ;; The ordinary JVM backend consumes the envelope and returns a host let*. Monolithic C/SIMD
+   ;; deliberately preserves scheduled equations around that same host projection through its
+   ;; source-only memory passes.
+   :backend-applied  [valid-host-or-scheduled-program? validate-host-or-scheduled-program]
+   :alength-resolved [valid-host-or-scheduled-program? validate-host-or-scheduled-program]
+   :mem-merged       [valid-host-or-scheduled-program? validate-host-or-scheduled-program]})

@@ -16,7 +16,8 @@
             [raster.arrays :as ra]
             [raster.par]
             [raster.math]
-            [raster.compiler.backend.cpu.aot :as aot]))
+            [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.ir.parallel-program :as parallel-program]))
 
 (defn- clang-available? []
   (try
@@ -167,6 +168,16 @@
 (deftm axpy-map [a :- (Array float) b :- (Array float) s :- Float n :- Long] :- (Array float)
   (let [y (float-array n)]
     (raster.par/map! y L n float (rn/+ (rn/* (ra/aget a L) s) (ra/aget b L)))))
+
+(deftest cpu-c-simd-retains-the-scheduled-program
+  (let [{:keys [form parallel-program]}
+        (aot/fused-scalar-form #'axpy-map :float :simd? true)
+        operation (-> parallel-program :equations first :operations first)]
+    (is (parallel-program/parallel-program? parallel-program))
+    (is (= form (:source parallel-program)))
+    (is (= "raster.compiler.ir.segop.SegMap" (.getName (class operation))))
+    (is (contains? (:outputs operation) (:out-sym operation))
+        "the scheduled store owns its physical destination before C emission")))
 
 (deftest cpu-c-simd-map
   (when (clang-available?)
