@@ -296,9 +296,18 @@
              :* :long [(body/literal Long/MAX_VALUE :long)
                        (body/literal 2 :long)]
              {:overflow :wrap}))]))))
+  (testing "trapping and compiler-proved arithmetic are distinct legal contracts"
+    (doseq [policy [:trap :no-overflow]]
+      (is (body/kernel-body?
+           (scalar-body
+            [(body/->ScalarCompute
+              (body/value (symbol (name policy)) :long)
+              (body/scalar-expression
+               :- :long [(body/literal 4 :long) (body/literal 2 :long)]
+               {:overflow policy}))])))))
   (testing "wrapping overflow is not a floating-point policy"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"wrapping overflow is only defined"
+         clojure.lang.ExceptionInfo #"overflow contracts are only defined"
          (scalar-body
           [(load-x)
            (body/->ScalarCompute
@@ -308,7 +317,7 @@
                                     {:overflow :wrap}))]))))
   (testing "wrapping overflow cannot annotate unrelated integral intrinsics"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"wrapping overflow is only defined"
+         clojure.lang.ExceptionInfo #"overflow contracts are only defined"
          (scalar-body
           [(body/->ScalarCompute
             (body/value 'bad :int)
@@ -848,7 +857,8 @@
                   (into [(body/->ScalarCompute
                           (body/value 'source-base :int)
                           (body/scalar-expression
-                           :+ :int ['group (body/literal 0 :int)]))]
+                           :+ :int ['group (body/literal 0 :int)]
+                           {:overflow :no-overflow}))]
                         (assoc (async-stage-operations) 0
                                (async-stage-copy ['source-base])))
                   options))))

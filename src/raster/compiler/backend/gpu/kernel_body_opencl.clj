@@ -904,15 +904,23 @@
         arguments (mapv #(emit-scalar-value % context) (:arguments expression))
         operand-type (scalar-value-type (first (:arguments expression)) (:types context))
         integral? (contains? #{:byte :int :long} operand-type)
-        wrapping? (= {:overflow :wrap} (:options expression))]
+        overflow-policy (get-in expression [:options :overflow])]
     (cond
       ;; C-family signed overflow is undefined. Preserve the verified modulo-2^N contract by
       ;; doing the arithmetic in the same-width unsigned representation and converting the bits
       ;; back to the expression's declared signed storage type.
-      wrapping?
+      (= :wrap overflow-policy)
       (let [unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* operand-type)]
         (str "(" (target-type operand-type) ")((" unsigned-type ")(" (first arguments)
              ") " (:op lowering) " (" unsigned-type ")(" (second arguments) "))"))
+
+      ;; The target-neutral dialect can retain trapping source semantics before every C-family
+      ;; target has a checked-arithmetic helper. Never weaken a requested trap to C signed UB.
+      (= :trap overflow-policy)
+      (throw (ex-info "C-family target has no trapping integer arithmetic lowering"
+                      {:reason :kernel-body-c-intrinsic-overflow
+                       :dialect (:id *scalar-dialect*) :operation op
+                       :operand-type operand-type :overflow overflow-policy}))
 
       ;; The shared C descriptor uses the floating spelling. OpenCL integer min/max are distinct
       ;; overloads, so target spelling must retain the verified operand dtype.

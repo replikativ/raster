@@ -289,7 +289,8 @@
             (body/scalar-expression :min :int
                                     [(body/literal workgroup-size :int)
                                      (body/scalar-expression :- :int
-                                                             ['_n_bound 'scan-base])]))
+                                                             ['_n_bound 'scan-base]
+                                                             {:overflow :no-overflow})]))
            (body/->ScalarLoad
             (body/value 'scan-chunk-last result-type) scratch
             [(body/expression :sub 'scan-chunk-remaining 1)]

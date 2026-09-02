@@ -135,20 +135,23 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
-(defn- wrapping-arithmetic-kernel-body []
+(defn- integer-arithmetic-kernel-body [overflow]
   (body/make
-   {:id :wrapping-arithmetic-test
+   {:id [:integer-arithmetic-test overflow]
     :parameters [(body/->KernelParameter 'a :scalar :long [] nil nil :left)
                  (body/->KernelParameter 'b :scalar :long [] nil nil :right)
                  (body/->KernelParameter 'out :output :long [1] :global
                                          (layout/row-major [1] :long) :result)]
     :operations [(body/->ScalarCompute
                   (body/value 'sum :long)
-                  (body/scalar-expression :+ :long ['a 'b] {:overflow :wrap}))
+                  (body/scalar-expression :+ :long ['a 'b] {:overflow overflow}))
                  (body/->ScalarStore 'out [0] 'sum nil)]
     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
+
+(defn- wrapping-arithmetic-kernel-body []
+  (integer-arithmetic-kernel-body :wrap))
 
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
@@ -306,6 +309,23 @@
                            (str "(" unsigned-type ")(rstr_a) + (" unsigned-type ")(rstr_b)")))
         (is (not (str/includes? source "rstr_a + rstr_b"))
             "signed target arithmetic must not weaken modulo-2^N semantics")))))
+
+(deftest explicit-signed-overflow-contracts-reach-the-target-boundary
+  (doseq [target [:opencl-portable :cuda :hip]]
+    (testing (name target)
+      (let [source (opencl/emit-scalar-kernel
+                    "proved_arithmetic"
+                    (integer-arithmetic-kernel-body :no-overflow)
+                    {:target-dialect target})]
+        (is (str/includes? source "rstr_a + rstr_b")
+            "a proved in-range operation may use the target's signed instruction"))
+      (try
+        (opencl/emit-scalar-kernel
+         "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+         {:target-dialect target})
+        (is false "trapping arithmetic must not silently become signed target overflow")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :kernel-body-c-intrinsic-overflow (:reason (ex-data exception)))))))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]
