@@ -1129,8 +1129,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    scheduling boundary instead of their handwritten OpenCL generators. Indirect tensor indices
    lower as explicit scalar SSA loads feeding later loads/stores, so the scheduled map remains
    portable across OpenCL, CUDA and HIP; hardware-free vendor gates compile public gather and
-   scatter workloads. The direct strided compatibility call retains its explicit generator until
-   the singleton boundary carries hoisted scalar equations as a complete mini-program.
+   scatter workloads. Direct strided gather and scatter now consume the complete typed
+   mini-program: normalization's hoisted product extent remains an ordered host-scalar equation,
+   and the backend consumes the following scheduled SegMap without reconstructing either fact.
    Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
    memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
    C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC

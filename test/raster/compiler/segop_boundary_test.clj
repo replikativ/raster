@@ -100,8 +100,10 @@
     (is (some? (:algorithm scheduled)))
     (is (= :typed-soac (get-in operation [:algorithm-dialect])))
     (is (= :unique (:write-conflict operation)))
-    (let [kernel-source (:source (first (:kernels emitted)))]
-      (is (re-find #"\[\(base \+ idx\)\]" kernel-source))
+    (let [kernel (first (:kernels emitted))
+          kernel-source (:source kernel)]
+      (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+      (is (re-find #"out_\[.*base.*rstr_i" kernel-source))
       (is (not (re-find #"inout_result\[idx\] =" kernel-source))
           "a unique scatter must not acquire a second implicit dense store"))))
 
@@ -119,6 +121,26 @@
     (is (not-any? #(and (symbol? %) (.startsWith (name %) "rstr_extent_"))
                   (flatten operation))
         "a hoisted SSA extent must never escape without its defining equation")))
+
+(deftest direct-mini-program-preserves-hoisted-scalar-equations
+  (let [source '(raster.par/gather out x indices n stride)
+        {:keys [program operations]}
+        (slp/schedule-single-program
+         'result source
+         {:target-device :ze:0
+          :dtype :float
+          :array-types {'out :float 'x :float 'indices :int}
+          :scalar-types {'n :long 'stride :long}})
+        [extent-equation parallel-equation] (:equations program)
+        operation (first operations)]
+    (is (= 2 (count (:equations program))))
+    (is (true? (get-in extent-equation [:attributes :host-only])))
+    (is (= (:results extent-equation)
+           (filterv (set (:results extent-equation)) (:operands parallel-equation))))
+    (is (= (first (:results extent-equation))
+           (-> operation :space :dims first :bound)))
+    (is (some? (:source program))
+        "the direct backend receives executable host control, not a source-free algorithm")))
 
 (deftest a-fatal-reason-still-escapes
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion

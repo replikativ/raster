@@ -511,6 +511,24 @@
         (is (= 'raster.gpu.ze-runtime/invoke-registered-kernel
                (first (:form result))))))))
 
+(deftest opencl-pass-strided-indexed-operations-consume-complete-typed-programs
+  (doseq [[label form expected-effect]
+          [[:gather '(raster.par/gather out src index 1000 4) :elementwise-map]
+           [:scatter '(raster.par/scatter! out src index 1000 4) :reducing-scatter]]]
+    (testing (name label)
+      (when-let [pass (resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)]
+        (let [result (pass form :device-id :ze:0 :dtype :float :min-elements 0
+                           :array-types {'out :float 'src :float 'index :int}
+                           :scalar-types {})
+              kernel (first (:kernels result))]
+          (is (= 1 (count (:kernels result))))
+          (is (= 1 (get-in result [:stats :segop-reused])))
+          (is (nil? (get-in result [:stats :segop-relowered])))
+          (is (= expected-effect (get-in kernel [:effects :kind])))
+          (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+          (is (not (clojure.string/includes? (:source kernel) "rstr_extent_"))
+              "the host scalar equation binds the launch extent outside the kernel"))))))
+
 (deftest opencl-pass-reduce-by-key-dispatch
   (testing "opencl-pass dispatches reduce-by-key to GPU kernel"
     (try (require '[raster.compiler.backend.gpu.par-opencl :as pocl]) (catch Exception _))

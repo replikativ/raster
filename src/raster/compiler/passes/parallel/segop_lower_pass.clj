@@ -517,3 +517,26 @@
      :algorithm (:algorithm equation)
      :diagnostics (:diagnostics scheduled)
      :stats stats}))
+
+(defn schedule-single-program
+  "Run one direct-backend source form through the complete typed program boundary.
+
+   Unlike `schedule-single-operation`, this entry preserves host scalar equations introduced by
+   normalization and reconstructs their host bindings around the scheduled parallel equation.
+   Backends use it when a direct source spelling expands to a genuine mini-program rather than
+   pretending that the parallel operation is closed in isolation."
+  [result-id source opts]
+  (let [host-source (list 'let* [result-id source] result-id)
+        typed-result
+        (typed-route/attempt
+         host-source (or (:dtype opts) :double) (:array-types opts)
+         {:scalar-types (:scalar-types opts)})
+        {scheduled :form stats :stats}
+        (segop-lower-pass (or (:program typed-result) host-source) opts)
+        equation (some #(when (seq (:operations %)) %) (:equations scheduled))]
+    {:program scheduled
+     :equation equation
+     :operations (:operations equation)
+     :algorithm (:algorithm equation)
+     :diagnostics (:diagnostics scheduled)
+     :stats (merge (:stats typed-result) stats)}))

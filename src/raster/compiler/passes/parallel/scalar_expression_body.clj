@@ -155,8 +155,10 @@
                                 {:expression expression :array array :array-types array-types}))
                     (let [coordinate-value
                           (when (contains-indexed-load? coordinate)
-                            (lower coordinate
-                                   (or (source-type coordinate :int env) :int) env))
+                            ;; Storage coordinates are address arithmetic. Keep their composed
+                            ;; SSA in the KernelBody index width; narrowing a long launch index to
+                            ;; an element dtype would either overflow or invent a cast policy.
+                            (lower coordinate :long env))
                           coordinate-expression
                           (if coordinate-value
                             (:result coordinate-value)

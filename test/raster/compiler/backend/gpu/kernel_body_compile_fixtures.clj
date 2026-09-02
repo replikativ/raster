@@ -77,6 +77,18 @@
   (let [output (float-array n)]
     (raster.par/scatter! output input indices n)))
 
+(deftm public-c-family-strided-gather
+  "Block gather exercises a hoisted extent and composed indirect address in the portable body."
+  [input :- (Array float) indices :- (Array int) blocks :- Long stride :- Long] :- (Array float)
+  (let [output (float-array (* blocks stride))]
+    (raster.par/gather output input indices blocks stride)))
+
+(deftm public-c-family-strided-scatter
+  "Block scatter carries the same composed address into a verified target atomic update."
+  [input :- (Array float) indices :- (Array int) blocks :- Long stride :- Long] :- (Array float)
+  (let [output (float-array (* blocks stride))]
+    (raster.par/scatter! output input indices blocks stride)))
+
 (defn- reduction-artifact
   [dialect]
   (let [product (with-meta
@@ -233,6 +245,10 @@
                  #'public-c-family-gather {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-scatter {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-strided-gather {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-strided-scatter {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'contract/contract-mm {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

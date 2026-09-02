@@ -293,8 +293,22 @@
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [parallel-program (when (parallel-program/parallel-program? form)
+  (let [supplied-program (when (parallel-program/parallel-program? form)
                            (parallel-program/validate! form segop/segop-node?))
+        direct-strided-indexed?
+        (and (nil? supplied-program)
+             (or (and (par/par-gather-form? form)
+                      (:stride (par/extract-par-gather-info form)))
+                 (and (par/par-scatter-form? form)
+                      (:stride (par/extract-par-scatter-info form)))))
+        direct-program
+        (when direct-strided-indexed?
+          (:program
+           (segop-lower-pass/schedule-single-program
+            (gensym "direct_indexed_result_") form
+            {:target-device device-id :dtype dtype
+             :scalar-types scalar-types :array-types array-types})))
+        parallel-program (or supplied-program direct-program)
         source-form (if parallel-program (parallel-program/source-form parallel-program) form)
         ;; Typed values supply dtypes; scheduled SegOps supply ABI roles. Logical rank cannot choose
         ;; pass-by-value versus buffer because a rank-zero result may be resident in either form.
