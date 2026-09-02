@@ -1121,9 +1121,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Kernel-local C names are fresh with respect to the typed ABI, so an index buffer cannot shadow
    the launch coordinate. Flat
    additive reducing scatters also carry a checked conflict algebra through this boundary and select
-   exact JVM or atomic OpenCL schedules. Strided gather/scatter, additional atomic monoids,
-   privatized histogram schedules, the remaining parallel forms, calibrated whole-graph placement
-   costs, and deletion of the remaining graph/backend fallbacks remain.
+   exact JVM or atomic OpenCL schedules. Strided gather and additive scatter flatten into the same
+   algebra with one hoisted product extent; gather remains a map, while generic effect analysis
+   proves the scatter update before target lowering selects sequential JVM updates or GPU atomics.
+   Additional atomic monoids, privatized histogram schedules, the remaining parallel forms,
+   calibrated whole-graph placement costs, preservation of scheduled equations through monolithic
+   C/SIMD emission, and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
