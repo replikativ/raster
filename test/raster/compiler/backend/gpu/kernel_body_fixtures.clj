@@ -34,6 +34,44 @@
     :provenance {:dialect :compile-gate}
     :attributes {:kind :workgroup-memory}}))
 
+(defn trapping-arithmetic-body
+  "Every checked signed arithmetic helper in one hardware-free target-compiler fixture."
+  []
+  (let [types [[:byte "i8"] [:int "i32"] [:long "i64"]]
+        operations [[:+ "add"] [:- "sub"] [:* "mul"]]
+        symbol-of (fn [& parts] (symbol (apply str parts)))]
+    (body/make
+     {:id :c-family-trapping-arithmetic-gate
+      :parameters
+      (vec
+       (mapcat
+        (fn [[type suffix]]
+          [(body/->KernelParameter (symbol-of "a_" suffix) :scalar type [] nil nil :left)
+           (body/->KernelParameter (symbol-of "b_" suffix) :scalar type [] nil nil :right)
+           (body/->KernelParameter
+            (symbol-of "out_" suffix) :output type [(count operations)] :global
+            (layout/row-major [(count operations)] type) :result)])
+        types))
+      :operations
+      (vec
+       (mapcat
+        (fn [[type suffix]]
+          (mapcat
+           (fn [index [operation operation-name]]
+             (let [result (symbol-of operation-name "_" suffix)]
+               [(body/->ScalarCompute
+                 (body/value result type)
+                 (body/scalar-expression
+                  operation type [(symbol-of "a_" suffix) (symbol-of "b_" suffix)]
+                  {:overflow :trap}))
+                (body/->ScalarStore (symbol-of "out_" suffix) [index] result nil)]))
+           (range) operations))
+        types))
+      :schedule {}
+      :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+      :provenance {:dialect :compile-gate}
+      :attributes {:kind :trapping-arithmetic}})))
+
 (defn swizzled-workgroup-memory-body
   "A 2-D XOR-layout fixture. Each lane accesses one logical column element; source compilation
    proves that OpenCL/CUDA/HIP share the verified address transform without choosing a schedule."

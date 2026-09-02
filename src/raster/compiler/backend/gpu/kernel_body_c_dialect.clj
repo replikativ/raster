@@ -162,6 +162,65 @@
     source
     (str/replace source #"(?m)^inline " "__device__ __forceinline__ ")))
 
+(defn trapping-arithmetic-name
+  "Name a checked signed-integer operation only when the target can terminate the invocation.
+
+  OpenCL C has no standard trap operation.  A portable OpenCL dialect must therefore decline this
+  contract instead of quietly depending on one vendor compiler's builtin or turning the operation
+  into undefined signed arithmetic."
+  [dialect operation type]
+  (when (opencl? dialect)
+    (throw (ex-info "OpenCL C has no portable trapping-arithmetic primitive"
+                    {:reason :kernel-body-c-trap-unsupported
+                     :dialect (:id dialect) :operation operation :type (dtype/canon type)})))
+  (str "rstr_trap_"
+       ({:+ "add" :- "sub" :* "mul"} operation)
+       "_"
+       ({:byte "i8" :int "i32" :long "i64"} (dtype/canon type))))
+
+(defn trapping-arithmetic-helper-source
+  "Emit one checked signed operation without first evaluating an overflowing signed expression.
+
+  The predicates use same-width unsigned arithmetic.  Only after the predicate proves the result
+  representable does the helper evaluate the ordinary signed operation.  CUDA terminates with the
+  PTX trap instruction; HIP's Clang frontend lowers `__builtin_trap` to LLVM's target trap."
+  [dialect operation type]
+  (let [type (dtype/canon type)
+        signed-type (type-name dialect type)
+        unsigned-type (unsigned-type-name dialect type)
+        helper-name (trapping-arithmetic-name dialect operation type)
+        sign-bit (str "((" unsigned-type ")1 << " (dec (* 8 (dtype/bytes-of type))) ")")
+        trap-source (case (:id dialect)
+                      :cuda "asm volatile(\"trap;\");"
+                      :hip "__builtin_trap();")
+        arithmetic ({:+ "+" :- "-" :* "*"} operation)]
+    (when-not arithmetic
+      (throw (ex-info "trapping arithmetic helper has no operation"
+                      {:reason :kernel-body-c-trap-operation
+                       :dialect (:id dialect) :operation operation :type type})))
+    (str
+     "inline " signed-type " " helper-name "(" signed-type " a, " signed-type " b) {\n"
+     "  " unsigned-type " ua = (" unsigned-type ")a;\n"
+     "  " unsigned-type " ub = (" unsigned-type ")b;\n"
+     "  " unsigned-type " sign = " sign-bit ";\n"
+     (case operation
+       :+ (str "  " unsigned-type " ur = ua + ub;\n"
+               "  if (((~(ua ^ ub) & (ua ^ ur)) & sign) != 0) {\n")
+       :- (str "  " unsigned-type " ur = ua - ub;\n"
+               "  if ((((ua ^ ub) & (ua ^ ur)) & sign) != 0) {\n")
+       :* (str "  " unsigned-type " ma = (a < 0) ? ((" unsigned-type ")0 - ua) : ua;\n"
+               "  " unsigned-type " mb = (b < 0) ? ((" unsigned-type ")0 - ub) : ub;\n"
+               "  " unsigned-type " limit = ((a < 0) != (b < 0)) ? sign : (sign - 1);\n"
+               "  if ((mb != 0) && (ma > (limit / mb))) {\n"))
+     "    " trap-source "\n"
+     ;; Keep the overflowing signed expression unreachable in the source language too.  CUDA's
+     ;; inline PTX is not declared noreturn to the C++ frontend, so falling through here would
+     ;; reintroduce the very signed UB this helper exists to prevent.
+     "    return (" signed-type ")0;\n"
+     "  }\n"
+     "  return a " arithmetic " b;\n"
+     "}\n")))
+
 (defn workgroup-arena-declaration
   "Spell one statically sized, explicitly aligned workgroup-memory arena."
   [dialect name bytes alignment]
