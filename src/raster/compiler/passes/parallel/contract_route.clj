@@ -310,8 +310,8 @@
                (reduce * 1 free-bounds)
                (reduce (fn [a b] (list 'clojure.core/* a b)) free-bounds))
         ;; memoized so the cond's test arm doesn't regenerate the kernel
-        ;; a fused contraction carries its epilogue in the form's trailing opts (par-fusion's
-        ;; fuse-contract-map puts it there); an explicit :epilogue kwarg overrides.
+        ;; A TypedSOAC result transform projects to an epilogue in the form's trailing opts;
+        ;; an explicit :epilogue kwarg overrides it at this temporary leaf boundary.
         form-opts (:opts contract-facts)
         epilogue (or epilogue (:epilogue contract-facts))
         stages (or stages (:stages contract-facts))
@@ -594,7 +594,7 @@
                (catch clojure.lang.ExceptionInfo exception
                  (let [{:keys [reason declines] :as data} (ex-data exception)]
                    (if (= :no-legal-contraction-family reason)
-                      {:family family
+                     {:family family
                       :strategy nil
                       :candidate-schedule pinned
                       :declines (candidate-declines family declines)
@@ -679,7 +679,7 @@
                      :strategy (:strategy candidate)
                      :invoke (:invoke candidate)})))
   (doseq [[slot compiler-value] (map vector (get-in candidate [:artifact :abi])
-                                      (get-in candidate [:artifact :arguments]))
+                                     (get-in candidate [:artifact :arguments]))
           :when (and (= :scalar (:kind slot))
                      (not (public-interface-slot? slot)))]
     (when-not (and (contains? #{:int :long} (:kernel-dtype slot))

@@ -5,6 +5,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -13,7 +14,6 @@
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.contract-route :as route]
-            [raster.compiler.passes.parallel.par-fusion :as fusion]
             [raster.core :refer [deftm]]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
@@ -22,9 +22,9 @@
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
     (raster.par/contract C [[i 8] [j 8]] [[l 8]]
-      (clojure.core/*
-       (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
-       (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+                         (clojure.core/*
+                          (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
+                          (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
     C))
 
 (defn- mm [m n k]
@@ -32,12 +32,16 @@
         (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
               (list 'aget 'B (list '+ (list '* 'l n) 'j)))))
 
-(defn- fuse-epilogue [body]
-  (second (:bindings
-           (fusion/fuse-contract-map
-            ['C (mm 128 256 64)
-             'out (list 'raster.par/map! 'out 't (* 128 256) nil body)]
-            []))))
+(defn- bias-epilogue-contract []
+  (let [contract (assoc (vec (mm 128 256 64)) 1 'out)]
+    (apply list
+           (concat contract
+                   [:epilogue
+                    {:acc 'acc
+                     :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
+                     :operands [{:sym 'bias :dtype :float
+                                 :map (axis-map/of-axes '[[j 256]])}]
+                     :dtype :float}]))))
 
 (defn- compile-form
   ([contract] (compile-form contract :half))
@@ -63,10 +67,8 @@
               :effects {:kind :tensor-contraction}
               :attributes {:out-elems 1 :dtype :float :out-dtype :float}}))
 
-(deftest fused-epilogue-operands-are-carried-in-the-ordered-marker
-  (let [contract (fuse-epilogue
-                  (list 'raster.numeric/+ (list 'aget 'C 't)
-                        (list 'aget 'bias (list 'mod 't 256))))
+(deftest epilogue-operands-are-carried-in-the-ordered-marker
+  (let [contract (bias-epilogue-contract)
         compiled (compile-form contract)
         kernel (first (:kernels compiled))
         marker (-> compiled :form second second)]
@@ -218,7 +220,7 @@
 
 (deftest compile-gpu-program-extracts-a-real-contraction-as-an-ordered-resident-executable
   (let [descriptor (pipeline/compile-gpu-program #'resident-contract-descriptor-probe
-                                                  :ze:0 :dtype :float)
+                                                 :ze:0 :dtype :float)
         step (first (:steps descriptor))
         executable (:artifact step)
         args [(float-array 64) (float-array 64)]
