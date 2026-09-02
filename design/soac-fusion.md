@@ -24,7 +24,9 @@ deleted.
 TypedSOAC currently has functional equations for pointwise maps and tuple maps, unique-index
 scatter, stencils, reductions, product/segmented reductions, segmented fold-map, scans,
 contractions represented as segmented reductions, and scalar equations needed to retain host
-shape/value dependencies.
+shape/value dependencies. It also defines a conservative ordered effect-map boundary for kernels
+that mix unique writes and certified atomic reductions. Each destination and conflict proof is
+explicit; effect maps remain non-fusible until an effect-aware rule proves a transformation.
 
 Fusion iterates three general transformations to a fixpoint:
 
