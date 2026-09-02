@@ -63,9 +63,11 @@
       (is (zero? (get-in gpu [:stats :fallback])))
       (is (= :reducing-scatter (get-in kernel [:effects :kind])))
       (is (= :reduce (get-in kernel [:effects :write-conflict])))
-      (is (= :inout (:kind (second (:abi kernel)))))
+      (is (= :inout (:kind (first (filter #(= 'out (:name %)) (:abi kernel))))))
+      (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
       (is (str/includes? (:source kernel) "float atomic_add_float"))
-      (is (str/includes? (:source kernel) "atomic_add_float(out_ + keys[idx], vals[idx])")))))
+      (is (str/includes? (:source kernel) "atomic_add_float(out_ +"))
+      (is (str/includes? (:source kernel) "rstr_map_load_")))))
 
 (deftest strided-scatter-is-the-same-proof-carrying-reduction
   (let [source '(let* [step (raster.par/scatter! out vals keys n stride)] step)
@@ -148,5 +150,6 @@
     (is (= :typed-soac (:source-dialect stats)))
     (is (= :reduce (:write-conflict operation)))
     (is (= :int (get-in operation [:conflict-contract :dtype])))
-    (is (str/includes? source "atomic_add(out_ + keys[idx], vals[idx])"))
+    (is (str/includes? source "atomic_add(out_ +"))
+    (is (str/includes? source "rstr_map_load_"))
     (is (not (str/includes? source "atomic_add_float")))))

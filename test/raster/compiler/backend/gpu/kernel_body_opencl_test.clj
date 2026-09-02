@@ -121,6 +121,19 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn- atomic-add-kernel-body []
+  (body/make
+   {:id :atomic-add-test
+    :parameters [(body/->KernelParameter
+                  'out :inout :float [16] :global
+                  (layout/row-major [16] :float) :result)
+                 (body/->KernelParameter 'contribution :scalar :float [] nil nil :value)]
+    :indices [(body/->IndexBinding 'lane :local 0)]
+    :operations [(body/->AtomicRMW 'out ['lane] 'contribution :+ nil)]
+    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -233,6 +246,25 @@
             (is true (str compiler " unavailable; source structure remains covered"))
             (let [{:keys [exit err]} (compile-c-family-source target source)]
               (is (zero? exit) err))))))))
+
+(deftest one-atomic-update-contract-has-thin-target-spellings
+  (doseq [[target spelling]
+          [[:opencl-portable "atomic_add_float(rstr_out +"]
+           [:cuda "atomicAdd(rstr_out +"]
+           [:hip "atomicAdd(rstr_out +"]]]
+    (let [source (opencl/emit-scalar-kernel
+                  "atomic_add_test" (atomic-add-kernel-body)
+                  {:target-dialect target})]
+      (is (str/includes? source spelling) (name target))
+      (is (not (str/includes? source "const float* out")) (name target))))
+  (testing "the OpenCL helper and pointer spelling type-check together"
+    (when (command-available? "clang")
+      (let [source (opencl/emit-scalar-kernel
+                    "atomic_add_test" (atomic-add-kernel-body)
+                    {:target-dialect :opencl-portable})
+            {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+        (is (zero? exit) err)))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]

@@ -378,6 +378,27 @@
          (scalar-body
           [(load-x) (body/->ScalarStore 'x ['lane] 'x-value nil)])))))
 
+(deftest atomic-updates-require-an-explicit-read-write-contract
+  (let [atomic (body/->AtomicRMW 'y [0] (body/literal 1.0 :float) :+ nil)
+        inout-body (fn [operation]
+                     (-> (scalar-body [])
+                         (assoc-in [:parameters 1 :kind] :inout)
+                         (assoc :operations [operation])
+                         body/validate!))]
+    (is (body/kernel-body? (inout-body atomic)))
+    (testing "write-only output storage cannot hide a read-modify-write"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"read-write kernel storage"
+           (body/validate! (assoc (scalar-body []) :operations [atomic])))))
+    (testing "the target-neutral body only accepts a proved update algebra"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"unsupported operator"
+           (inout-body (assoc atomic :operator :max)))))
+    (testing "the contribution must agree with the resident element dtype"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"contribution type"
+           (inout-body (assoc atomic :value (body/literal 1 :int))))))))
+
 (deftest structured-regions-prove-yields-and-collective-convergence
   (testing "both if branches terminate with typed yields"
     (is (thrown-with-msg?

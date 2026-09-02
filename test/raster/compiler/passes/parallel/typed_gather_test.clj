@@ -70,7 +70,10 @@
       (is (= 1 (get-in gpu [:stats :segop-reused])))
       (is (zero? (get-in gpu [:stats :fallback])))
       (is (= [:int :float :float :int] (mapv :dtype (:abi kernel))))
-      (is (str/includes? kernel-source "src[idx[idx_0]]"))
+      (is (= :kernel-body (get-in kernel [:provenance :dialect])))
+      (is (re-find #"int rstr_map_load_[0-9]+ = .*idx\[" kernel-source))
+      (is (re-find #"src\[.*rstr_map_load_[0-9]+" kernel-source)
+          "the index tensor load is explicit SSA feeding the stable source load")
       (is (not (str/includes? kernel-source "src[idx[idx]]"))))))
 
 (deftest strided-gather-is-a-flattened-typed-map

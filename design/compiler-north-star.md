@@ -1125,6 +1125,13 @@ The immediate continuation after the verified double-buffered weighted-reduction
    exact JVM or atomic OpenCL schedules. Strided gather and additive scatter flatten into the same
    algebra with one hoisted product extent; gather remains a map, while generic effect analysis
    proves the scatter update before target lowering selects sequential JVM updates or GPU atomics.
+   Direct flat gather, scatter-add and reduce-by-key calls now use that same singleton typed
+   scheduling boundary instead of their handwritten OpenCL generators. Indirect tensor indices
+   lower as explicit scalar SSA loads feeding later loads/stores, so the scheduled map remains
+   portable across OpenCL, CUDA and HIP; hardware-free vendor gates compile public gather and
+   scatter workloads. Direct strided gather and scatter now consume the complete typed
+   mini-program: normalization's hoisted product extent remains an ordered host-scalar equation,
+   and the backend consumes the following scheduled SegMap without reconstructing either fact.
    Monolithic C/SIMD now preserves the `ParallelProgram` envelope through host-only length and
    memory-reuse passes. Direct map/reduction sites consume their already scheduled SegMap/SegRed;
    C ABI length legalization is a target expression transform, and the former C-only legacy-SOAC

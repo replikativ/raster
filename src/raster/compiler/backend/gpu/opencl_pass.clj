@@ -124,19 +124,18 @@
     (swap! stats update :segop-reused (fnil inc 0))
     so))
 
-(defn- par->segmap
-  "The SegMap for a par/map! form: the one `segop-lower` already computed for this binding when
+(defn- source->segmap
+  "The SegMap for a direct parallel source form: the one `segop-lower` already computed when
    available; otherwise re-lowered here with the REAL `device-id` (it was `:ze:0` hardcoded) and
    counted as `:segop-relowered`. SegMap is a full conversion: a missing rule is an illegal
    operation, never permission to select a second emitter."
-  [stats form dtype device-id scalar-types array-types]
+  [stats result-id form dtype device-id scalar-types array-types]
   (or (take-bound-segop stats :segmap #(instance? raster.compiler.ir.segop.SegMap %))
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segmap form dtype :none
-                             #(let [par-info (par/extract-par-map-info form)
-                                    scheduled
+                             #(let [scheduled
                                     (segop-lower-pass/schedule-single-operation
-                                     (:out par-info) form
+                                     result-id form
                                      {:target-device (or device-id :ze:0)
                                       :dtype (or dtype :double)
                                       :scalar-types scalar-types
@@ -294,8 +293,22 @@
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [parallel-program (when (parallel-program/parallel-program? form)
+  (let [supplied-program (when (parallel-program/parallel-program? form)
                            (parallel-program/validate! form segop/segop-node?))
+        direct-strided-indexed?
+        (and (nil? supplied-program)
+             (or (and (par/par-gather-form? form)
+                      (:stride (par/extract-par-gather-info form)))
+                 (and (par/par-scatter-form? form)
+                      (:stride (par/extract-par-scatter-info form)))))
+        direct-program
+        (when direct-strided-indexed?
+          (:program
+           (segop-lower-pass/schedule-single-program
+            (gensym "direct_indexed_result_") form
+            {:target-device device-id :dtype dtype
+             :scalar-types scalar-types :array-types array-types})))
+        parallel-program (or supplied-program direct-program)
         source-form (if parallel-program (parallel-program/source-form parallel-program) form)
         ;; Typed values supply dtypes; scheduled SegOps supply ABI roles. Logical rank cannot choose
         ;; pass-by-value versus buffer because a rank-zero result may be resident in either form.
@@ -435,8 +448,9 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
-                (let [segmap (par->segmap stats form dtype device-id
-                                          top-scalar-types top-array-types)
+                (let [segmap (source->segmap stats
+                                             (:out (par/extract-par-map-info form)) form
+                                             dtype device-id top-scalar-types top-array-types)
                       ;; Physical storage and effects come exclusively from the scheduled SegMap.
                       ;; A dense map has one logical result; an offset map is an explicit-store
                       ;; unique scatter and therefore uses the effect-only ABI/marker.
@@ -687,45 +701,68 @@
 
             ;; par/scatter!
             (par/par-scatter-form? form)
-            (let [{:keys [n]} (par/extract-par-scatter-info form)]
+            (let [{:keys [out index n stride]} (par/extract-par-scatter-info form)]
               (if (and (number? n) (< n min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-scatter! form))
-                (let [k (register-kernel!
-                         (legacy/generate-par-scatter-kernel form
-                                                             :dtype dtype :device-id device-id)
-                         :ze-maps)
-                      {:keys [out src index stride]} (par/extract-par-scatter-info form)]
-                  (list 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel
-                        (:kernel-name k) out src index n (when stride stride)))))
+                (if stride
+                  ;; The typed route hoists n*stride into a scalar equation. Direct source callers
+                  ;; cannot yet carry that equation beside one returned operation, so retain the
+                  ;; explicit compatibility generator rather than emitting an unbound extent.
+                  (let [k (register-kernel!
+                           (legacy/generate-par-scatter-kernel
+                            form :dtype dtype :device-id device-id)
+                           :ze-maps)]
+                    (list 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel
+                          (:kernel-name k) out (:src (par/extract-par-scatter-info form))
+                          index n stride))
+                  (let [array-types (assoc top-array-types index :int)
+                        segmap (source->segmap stats (gensym "scatter_result_") form
+                                              dtype device-id top-scalar-types array-types)
+                        kernel (segop-cl/generate-scheduled-segmap-kernel
+                                segmap :dtype dtype :scalar-types top-scalar-types
+                                :array-types array-types)
+                        k (register-kernel! kernel :ze-maps)]
+                    (list 'do (emit-map-void-invocation k device-id) out)))))
 
             ;; par/gather — out[e*stride+d] = src[index[e]*stride+d]. Writes every
             ;; output element once (no atomics/accumulation), so it lowers to a map-void
             ;; kernel and binds through the existing resident map path.
             (par/par-gather-form? form)
-            (let [{:keys [n]} (par/extract-par-gather-info form)]
+            (let [{:keys [out index n stride]} (par/extract-par-gather-info form)]
               (if (and (number? n) (< n min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-gather! form))
-                (let [k (register-kernel!
-                         (legacy/generate-par-gather-kernel form
-                                                            :dtype dtype :device-id device-id)
-                         :ze-maps)]
-                  (emit-map-void-invocation k device-id))))
+                (if stride
+                  (let [k (register-kernel!
+                           (legacy/generate-par-gather-kernel
+                            form :dtype dtype :device-id device-id)
+                           :ze-maps)]
+                    (emit-map-void-invocation k device-id))
+                  (let [array-types (assoc top-array-types index :int)
+                        segmap (source->segmap stats (gensym "gather_result_") form
+                                              dtype device-id top-scalar-types array-types)
+                        kernel (segop-cl/generate-scheduled-segmap-kernel
+                                segmap :dtype dtype :scalar-types top-scalar-types
+                                :array-types array-types)
+                        k (register-kernel! kernel :ze-maps)]
+                    ;; A flat gather is an ordinary dense map with one stable indirect read.
+                    (emit-map-invocation k device-id)))))
 
             ;; par/reduce-by-key
             (par/par-reduce-by-key-form? form)
-            (let [{:keys [n]} (par/extract-par-reduce-by-key-info form)]
+            (let [{:keys [out keys n]} (par/extract-par-reduce-by-key-info form)]
               (if (and (number? n) (< n min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce-by-key form))
-                (let [k (register-kernel!
-                         (legacy/generate-par-reduce-by-key-kernel form
-                                                                   :dtype dtype :device-id device-id)
-                         :ze-reduces)
-                      {:keys [out keys vals]} (par/extract-par-reduce-by-key-info form)]
-                  (list 'raster.gpu.ze-runtime/invoke-registered-reduce-by-key-kernel
-                        (:kernel-name k) out keys vals n))))
+                (let [array-types (assoc top-array-types keys :int)
+                      segmap (source->segmap stats (gensym "reduce_by_key_result_") form
+                                            dtype device-id top-scalar-types array-types)
+                      kernel (segop-cl/generate-scheduled-segmap-kernel
+                              segmap :dtype dtype :scalar-types top-scalar-types
+                              :array-types array-types)
+                      k (register-kernel! kernel :ze-reduces)]
+                  (list 'do (emit-map-void-invocation k device-id) out))))
 
             ;; par/butterfly!
             (par/par-butterfly-form? form)

@@ -36,6 +36,7 @@
 (defrecord ScalarCompute [result expression])
 (defrecord ScalarLoad [result buffer coordinates predicate other cache])
 (defrecord ScalarStore [buffer coordinates value predicate])
+(defrecord AtomicRMW [buffer coordinates value operator predicate])
 (defrecord Yield [values])
 (defrecord IfRegion [condition then-operations else-operations results])
 (defrecord LoopArg [binding initial])
@@ -67,7 +68,7 @@
            [id parameters views stable-reads allocations indices masks fragments operations
             schedule launch provenance attributes])
 
-(def ^:private parameter-kinds #{:input :output :scalar})
+(def ^:private parameter-kinds #{:input :output :inout :scalar})
 (def ^:private index-sources #{:group :group-count :local :subgroup :lane})
 (def ^:private index-ops #{:add :sub :mul :floor-div :ceil-div :mod :min :max})
 (def ^:private predicate-ops #{:lt :lte :eq :and :or :not})
@@ -369,6 +370,7 @@
                "raster.compiler.ir.kernel_body.ScalarCompute"
                "raster.compiler.ir.kernel_body.ScalarLoad"
                "raster.compiler.ir.kernel_body.ScalarStore"
+               "raster.compiler.ir.kernel_body.AtomicRMW"
                "raster.compiler.ir.kernel_body.Yield"
                "raster.compiler.ir.kernel_body.IfRegion"
                "raster.compiler.ir.kernel_body.ForLoop"
@@ -664,6 +666,25 @@
                           {:coordinates (:coordinates operation)})))
         (when-not (= (count (:shape p)) (count (:coordinates operation)))
           (throw (ex-info "scalar-store coordinates must match the buffer rank"
+                          {:buffer (:buffer operation) :shape (:shape p)
+                           :coordinates (:coordinates operation)})))
+        (mask (:predicate operation)))
+
+      (record-kind? "raster.compiler.ir.kernel_body.AtomicRMW" operation)
+      (let [p (parameter (:buffer operation))]
+        (when-not (= :inout (:kind p))
+          (throw (ex-info "atomic updates require read-write kernel storage"
+                          {:reason :kernel-body-atomic-storage :buffer p})))
+        (when-not (= :+ (:operator operation))
+          (throw (ex-info "KernelBody atomic update has an unsupported operator"
+                          {:reason :kernel-body-atomic-operator
+                           :operator (:operator operation)})))
+        (when-not (and (vector? (:coordinates operation))
+                       (every? expression? (:coordinates operation)))
+          (throw (ex-info "atomic coordinates must use explicit index expressions"
+                          {:coordinates (:coordinates operation)})))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "atomic coordinates must match the buffer rank"
                           {:buffer (:buffer operation) :shape (:shape p)
                            :coordinates (:coordinates operation)})))
         (mask (:predicate operation)))
@@ -1253,6 +1274,19 @@
                          :buffer buffer :value-type (:type stored)})))
       values)
 
+    (record-kind? "raster.compiler.ir.kernel_body.AtomicRMW" operation)
+    (let [buffer (get storage (:buffer operation))
+          contribution (scalar-value-info! (:value operation) values)
+          buffer-type (canonical-type (:dtype buffer))]
+      (doseq [coordinate (:coordinates operation)]
+        (expression-uniformity coordinate values))
+      (mask-uniformity (:predicate operation) masks values)
+      (when-not (= buffer-type (:type contribution))
+        (throw (ex-info "atomic contribution type must equal the buffer element type"
+                        {:reason :kernel-body-atomic-dtype
+                         :buffer buffer :value-type (:type contribution)})))
+      values)
+
     (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
     (let [condition (typed-info! values (:condition operation) "kernel if condition")]
       (when-not (= :predicate (:type condition))
@@ -1693,7 +1727,8 @@
                        (assoc :awaiting-barrier #{} :consumed-stages #{}))
 
                    (or (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
-                       (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation))
+                       (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation)
+                       (record-kind? "raster.compiler.ir.kernel_body.AtomicRMW" operation))
                    (let [buffer (:buffer operation)
                          stage (memory-stage operation)
                          incomplete (into (set (map copy-stage issued))

@@ -405,7 +405,11 @@
       :arguments arguments
       :launch (:launch kernel-body)
       :temporaries []
-      :effects {:kind :elementwise-map :write-conflict :unique}
+      :effects {:kind (case (:write-conflict segmap)
+                        :reduce :reducing-scatter
+                        (if (:out-sym segmap) :elementwise-map :side-effect-map))
+                :write-conflict (or (:write-conflict segmap) :unique)
+                :conflict-contract (:conflict-contract segmap)}
       :target (kernel-body-c-dialect/target
                (kernel-body-c-dialect/resolve! target-dialect))
       :provenance {:dialect :kernel-body :source-dialect :segmap
@@ -734,25 +738,27 @@
                      target-dialect :opencl-intel}}]
   (let [dtype (or (:dtype operation) dtype :double)
         target (kernel-body-c-dialect/resolve! target-dialect)]
-    (try
-      (generate-segmap-kernel-body
-       operation :dtype dtype :scalar-types scalar-types :array-types array-types
-       :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
-      (catch clojure.lang.ExceptionInfo exception
-        (if (and (kernel-body-c-dialect/opencl? target)
-                 (segmap-body/declined? exception))
-          (-> (if (:out-sym operation)
-                (generate-segmap-kernel
-                 operation (:out-sym operation)
-                 :dtype dtype :scalar-types scalar-types :array-types array-types
-                 :kernel-name-prefix kernel-name-prefix)
-                (generate-explicit-segmap-kernel
-                 operation :dtype dtype :scalar-types scalar-types :array-types array-types
-                 :kernel-name-prefix (str kernel-name-prefix "_effect")))
-              (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
-              (assoc-in [:attributes :kernel-body-decline]
-                        (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
-          (throw exception))))))
+    (kart/certify-scheduled-operation
+     (try
+       (generate-segmap-kernel-body
+        operation :dtype dtype :scalar-types scalar-types :array-types array-types
+        :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
+       (catch clojure.lang.ExceptionInfo exception
+         (if (and (kernel-body-c-dialect/opencl? target)
+                  (segmap-body/declined? exception))
+           (-> (if (:out-sym operation)
+                 (generate-segmap-kernel
+                  operation (:out-sym operation)
+                  :dtype dtype :scalar-types scalar-types :array-types array-types
+                  :kernel-name-prefix kernel-name-prefix)
+                 (generate-explicit-segmap-kernel
+                  operation :dtype dtype :scalar-types scalar-types :array-types array-types
+                  :kernel-name-prefix (str kernel-name-prefix "_effect")))
+               (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+               (assoc-in [:attributes :kernel-body-decline]
+                         (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+           (throw exception))))
+     operation)))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
