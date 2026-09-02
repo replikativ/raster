@@ -3,11 +3,13 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.abm.firms.phases :as firms-phases]
             [raster.par]))
 
 (def ^:private extent (av/tensor {:dtype :long :shape []}))
@@ -22,7 +24,8 @@
         equation
         (list '= 0 [out-result total-result]
               (list 'effect-map
-                    {:index 'i :extent 'n :dtypes [:float :float]}
+                    {:index 'i :extent 'n :dtypes [:float :float]
+                     :iteration-order :independent}
                     '[x] [] '[out total]
                     (dialect/effect-lambda-form
                      '[element out-destination total-destination]
@@ -49,7 +52,8 @@
   [operations]
   (mapcat (fn [operation]
             (cons operation
-                  (concat (nested-operations (or (:then-operations operation) []))
+                  (concat (nested-operations (or (:operations operation) []))
+                          (nested-operations (or (:then-operations operation) []))
                           (nested-operations (or (:else-operations operation) [])))))
           operations))
 
@@ -86,12 +90,14 @@
     (is (= #{'out 'total} (:outputs operation)))
     (is (= {:locals [{:id 'shifted :dtype :float :init '(+ (clojure.core/aget x i) 1.0)}]
             :effects
-            [{:destination 'out :conflict :unique :destination-index 'i
+            [{:destination 'out :dtype :float :conflict :unique :destination-index 'i
               :predicate '(> (clojure.core/aget x i) 0.0) :value 'shifted}
              {:destination 'total
+              :dtype :float
               :conflict (dialect/reducing-scatter-conflict '+ :float)
               :destination-index 0 :predicate true
-              :value '(clojure.core/aget x i)}]}
+              :value '(clojure.core/aget x i)}]
+            :iteration-order :independent}
            (:scalar-region operation)))
     (doseq [[target atomic]
             [[:opencl-portable "atomic_add_float"]
@@ -144,3 +150,78 @@
     (is (= [4.0] (mapv double total)))
     (is (= 1 (get-in jvm [:stats :segop-reused])))
     (is (zero? (get-in jvm [:stats :fallback])))))
+
+(deftest potentially-conflicting-effects-use-one-ordered-device-loop
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (do
+                   (clojure.core/aset out (clojure.core/aget slots i)
+                                      (float (clojure.core/aget x i)))
+                   (raster.par/atomic-add! total 0 (float 1.0))))]
+               effect)
+        result (route/attempt source :float
+                              {'x :float 'slots :int 'out :float 'total :float})
+        program (:program result)
+        equation (-> program :equations first :algorithm dialect/equations first)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        artifacts
+        (into {}
+              (map (fn [target]
+                     [target
+                      (segop-opencl/generate-scheduled-segmap-kernel
+                       operation :dtype :float :target-dialect target
+                       :array-types {'x :float 'slots :int 'out :float 'total :float}
+                       :scalar-types {'n :long})]))
+              [:opencl-portable :cuda :hip])
+        artifact (get artifacts :opencl-portable)
+        kernel-body (get-in artifact [:attributes :kernel-body])
+        operations (nested-operations (:operations kernel-body))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x slots out total n] (:form jvm)))
+        out (float-array [10.0 20.0])
+        total (float-array 1)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= :sequential (get-in (dialect/operation-parts equation)
+                                [:attributes :iteration-order])))
+    (is (= [:ordered :reduce]
+           (mapv (fn [effect]
+                   (let [conflict (:conflict (dialect/effect-parts effect))]
+                     (if (keyword? conflict) conflict (:kind conflict))))
+                 (:body-results
+                  (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))))))
+    (is (= :sequential (:effect-iteration-order operation)))
+    (is (= [1] (get-in kernel-body [:launch :workgroup-size])))
+    (is (= [1] (get-in kernel-body [:launch :group-count])))
+    (is (= :one-work-item-ordered-loop (get-in kernel-body [:schedule :strategy])))
+    (is (some #(= "ForLoop" (some-> % class .getSimpleName)) operations))
+    (doseq [[target emitted] artifacts]
+      (testing (name target)
+        (is (= :kernel-body (get-in emitted [:attributes :emission-route])))
+        (is (= :one-work-item-ordered-loop
+               (get-in emitted [:attributes :kernel-body :schedule :strategy])))
+        (is (str/includes? (:source emitted) "for ("))))
+    (is (nil? (execute (float-array [1.0 2.0 3.0]) (int-array [1 1 1]) out total 3)))
+    (is (= [10.0 3.0] (mapv double out)) "the last source-order overwrite wins")
+    (is (= [3.0] (mapv double total)))
+    (is (= 1 (get-in jvm [:stats :segop-reused])))
+    (is (zero? (get-in jvm [:stats :fallback])))))
+
+(deftest firms-decision-queue-uses-the-certified-ordered-kernel
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'firms-phases/execute-stay-switch-par!
+                    :ze:0 :dtype :float :on-non-resident :nil)
+        step (first (:steps descriptor))
+        kernel-body (get-in step [:artifact :attributes :kernel-body])]
+    (is (some? descriptor))
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+    (is (= :one-work-item-ordered-loop (get-in kernel-body [:schedule :strategy])))
+    (is (= :ordered (get-in kernel-body [:schedule :association])))
+    (is (= [1] (get-in kernel-body [:launch :workgroup-size])))
+    (is (= [1] (get-in kernel-body [:launch :group-count])))
+    (is (some #(= "ForLoop" (some-> % class .getSimpleName))
+              (:operations kernel-body)))
+    (is (= :sequential (get-in kernel-body [:attributes :effect-iteration-order])))))

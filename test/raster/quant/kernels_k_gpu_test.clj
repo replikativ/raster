@@ -92,10 +92,11 @@
   (let [kernels (:kernels (pipeline/show-pipeline #'attn/rope-pos-rows-buf!
                                                   :target-device :ze:0 :dtype :float))]
     (is (= 1 (count kernels)))
-    (is (= '[[out :float] [positions :int] [x :float]
-             [head-dim :int] [heads :int] [theta :float] [_n_bound :int]]
-           (mapv (juxt :name :dtype) (:abi (first kernels))))
-        "row count shapes the launch but is specialized out of the physical ABI"))
+    (is (= '[[positions :input :int] [x :input :float] [out :output :float]
+             [head-dim :scalar :int] [heads :scalar :int] [theta :scalar :float]
+             [_n_bound :scalar :int]]
+           (mapv (juxt :name :kind :dtype) (:abi (first kernels))))
+        "KernelBody orders inputs, outputs, then scalars; row count is specialized out"))
   (when (gpu-available?)
     (testing "buffered RoPE lowers one independent position per row"
       (let [nrows 3 heads 8 hd 64 theta 10000.0 positions (int-array [0 5 29])

@@ -59,7 +59,7 @@
    source-shaped lambda remains only for compatibility-created SegMaps; its binder metadata is
    projected once here and is never used to infer an arithmetic function or result type."
   [segmap]
-  (if-let [{:keys [locals result effects] :as region} (:scalar-region segmap)]
+  (if-let [{:keys [locals result effects iteration-order] :as region} (:scalar-region segmap)]
     (do
       (when-not (and (vector? locals)
                      (every? #(and (symbol? (:id %)) (:dtype %) (contains? % :init)) locals)
@@ -71,7 +71,8 @@
                   {:operation (:id segmap) :scalar-region region}))
       (cond-> {:locals locals}
         (contains? region :result) (assoc :result result)
-        (contains? region :effects) (assoc :effects effects)))
+        (contains? region :effects) (assoc :effects effects)
+        (contains? region :iteration-order) (assoc :iteration-order iteration-order)))
     (let [expression (:lambda segmap)]
       (if (and (seq? expression)
                (contains? #{'let 'let* 'clojure.core/let} (first expression)))
@@ -136,8 +137,9 @@
                          reduction-destinations)
         read-only-inputs (vec (remove inout inputs))
         scalars (vec (sort-by name (:scalars segmap)))
-        {:keys [locals result effects]} (scalar-region segmap)
+        {:keys [locals result effects iteration-order]} (scalar-region segmap)
         ordered-effects? (seq effects)
+        sequential-effects? (and ordered-effects? (= :sequential iteration-order))
         explicit-certified-write?
         (and (nil? primary-output)
              (contains? #{:unique :reduce} (:write-conflict segmap)))
@@ -165,10 +167,12 @@
         lower-index (fn lower-index
                       ([expression] (lower-index expression #{}))
                       ([expression extra-scope]
+                       (lower-index expression extra-scope {}))
+                      ([expression extra-scope extra-types]
                        (widen-index-expression
                         (index-expression/lower
                          expression (set/union index-scope extra-scope) decline!)
-                        index-types)))
+                        (merge index-types extra-types))))
         lowerer (scalar-expression/make-lowerer
                  {:array-types array-types :scalar-types scalar-types
                   :arrays (set inputs) :index-scope index-scope
@@ -220,7 +224,8 @@
                                      ((:lower lowerer) coordinate :long environment))
                   coordinate-expression (if coordinate-value
                                           (:result coordinate-value)
-                                          (lower-index coordinate))
+                                          (lower-index coordinate (set (keys environment))
+                                                       environment))
                   lowered ((:lower lowerer) expression (get array-types array) environment)]
               (concat (:operations coordinate-value)
                       (:operations lowered)
@@ -240,7 +245,8 @@
                                    ((:lower lowerer) destination-index :long environment))
                 coordinate-expression (if coordinate-value
                                         (:result coordinate-value)
-                                        (lower-index destination-index))
+                                        (lower-index destination-index
+                                                     (set (keys environment)) environment))
                 lowered-value ((:lower lowerer) value (get array-types destination) environment)
                 operator (when (= :reduce (:kind conflict))
                            (intrinsics/canonical (:operator conflict)))
@@ -283,6 +289,19 @@
                                             (:result primary-lowered) :map-active)])))
         group-index 'map-group
         local-index 'map-lane
+        launch-index (if sequential-effects? 'effect-launch index)
+        scheduled-operations
+        (if sequential-effects?
+          [(body/->ForLoop
+            (body/value index :long)
+            (body/index-cast 0 :long :exact)
+            (body/index-cast '_n_bound :long :exact)
+            1
+            []
+            (conj scalar-operations (body/->Yield []))
+            []
+            {:association :ordered :source-order true})]
+          scalar-operations)
         parameters
         (vec (concat
               (map #(body/->KernelParameter
@@ -305,7 +324,7 @@
        :indices [(body/->IndexBinding group-index :group 0)
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
-                  index
+                  launch-index
                   (body/index-cast
                    (body/expression :add
                                     (body/expression :mul group-index workgroup-size)
@@ -313,13 +332,21 @@
                    :long :exact))]
        :masks [(body/->Mask
                 :map-active
-                [(body/predicate :lt index (body/index-cast '_n_bound :long :exact))])]
-       :operations scalar-operations
-       :schedule {:strategy :one-work-item-per-element :association :independent
+                [(if sequential-effects?
+                   (body/predicate :eq launch-index 0)
+                   (body/predicate :lt index (body/index-cast '_n_bound :long :exact)))])]
+       :operations scheduled-operations
+       :schedule {:strategy (if sequential-effects?
+                              :one-work-item-ordered-loop
+                              :one-work-item-per-element)
+                  :association (if sequential-effects? :ordered :independent)
                   :workgroup-size workgroup-size}
-       :launch (launch/spec {:workgroup-size [workgroup-size]
-                             :group-count [(launch/ceil-div bound workgroup-size)]})
+       :launch (if sequential-effects?
+                 (launch/spec {:workgroup-size [1] :group-count [1]})
+                 (launch/spec {:workgroup-size [workgroup-size]
+                               :group-count [(launch/ceil-div bound workgroup-size)]}))
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
-       :attributes {:kind :portable-segmap :extent bound :no-write-alias true}})
+       :attributes {:kind :portable-segmap :extent bound :no-write-alias true
+                    :effect-iteration-order iteration-order}})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))

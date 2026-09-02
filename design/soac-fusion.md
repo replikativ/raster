@@ -31,11 +31,12 @@ The GPU schedule projects their ordered local SSA and guarded effects directly i
 unique effects become `ScalarStore`, checked reduction effects become `AtomicRMW`, and predicates
 become structured `IfRegion` nodes. OpenCL, CUDA, and HIP therefore consume the same verified
 `KernelBody`; the operation is not reconstructed as source-level mutation in an emitter.
-Closed typed `map-void!` bodies select this operation only when every indirect write carries an
-explicit uniqueness marker or a checked reduction algebra. Conflict and dtype are retained per
-physical destination, so mixed FP32/int32 effects do not inherit a global kernel dtype. Typed
+Closed typed `map-void!` bodies retain every supported indirect write in this operation. Explicit
+uniqueness and checked reduction certificates permit independent iteration; an unproved ordinary
+write is marked `:ordered` and forces one source-order device loop. Conflict and dtype are retained
+per physical destination, so mixed FP32/int32 effects do not inherit a global kernel dtype. Typed
 locals form a pre-effect snapshot spine and guarded branches retain ordered predicates. The JVM
-consumes the same scheduled region as an exact sequential loop; unproved cross-lane writes decline.
+consumes the same region as an exact sequential loop.
 
 Fusion iterates three general transformations to a fixpoint:
 
@@ -91,12 +92,10 @@ models can refine a choice, while the typed program and numerical oracle constra
 
 ## Remaining work
 
-1. Add a resident ordered-iteration schedule for effect programs whose indices are not independent.
-   In particular, the firms ABM samples active IDs with replacement, so its decision phase cannot
-   claim unique agent writes; it must process the queue in order or group by agent before parallel
-   scheduling. Replace active-ID narrowing and specialized block-movement compatibility coverage
-   with direct typed equations and schedules. RNG fill is now an ordinary typed map with wrapping
-   SplitMix64 scalar SSA.
+1. Route the firms ABM sampled decision queue through the new resident ordered-iteration schedule,
+   then evaluate grouping by agent as a legal parallel optimization. Replace active-ID narrowing
+   and specialized block-movement compatibility coverage with direct typed equations and schedules.
+   RNG fill is now an ordinary typed map with wrapping SplitMix64 scalar SSA.
 2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
    beta-reduce away type contracts.
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain

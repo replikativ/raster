@@ -119,7 +119,7 @@
     (is (= :float (:dtype conflict))
         "the float-array declaration, not the default arithmetic dtype, owns storage type")))
 
-(deftest additive-effect-recognition-refuses-an-extra-destination-read
+(deftest additive-effect-with-an-extra-destination-read-preserves-source-order
   (let [unsafe
         '(let* [effect
                 (raster.par/map-void!
@@ -132,12 +132,20 @@
                effect)
         routed (pipeline/schedule-parallel-form
                 unsafe {:target-device :cpu:0 :dtype :float
-                        :array-types float-types :scalar-types scalar-types})]
-    (is (not= :typed-soac (get-in routed [:stats :source-dialect])))
-    (is (= :typed-soac-source-coverage
-           (get-in routed [:stats :typed-soac-declined :reason])))
-    (is (= :unsupported-parallel-operation
-           (get-in routed [:stats :typed-soac-declined :bindings 0 :reason])))))
+                        :array-types float-types :scalar-types scalar-types})
+        scheduled (:form routed)
+        equation (first (:equations scheduled))
+        attributes (-> equation :algorithm dialect/equations first
+                       dialect/operation-parts :attributes)
+        operation (first (:operations equation))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out keys n] (:form jvm)))
+        out (float-array [10.0 20.0 30.0])]
+    (is (= :typed-soac (get-in routed [:stats :source-dialect])))
+    (is (= :sequential (:iteration-order attributes)))
+    (is (= :sequential (:effect-iteration-order operation)))
+    (is (nil? (execute out (int-array [1 1]) 2)))
+    (is (= [10.0 60.0 30.0] (mapv double out)))))
 
 (deftest verified-array-dtype-selects-the-target-atomic-spelling
   (let [operation '(raster.par/atomic-add! out i contribution)

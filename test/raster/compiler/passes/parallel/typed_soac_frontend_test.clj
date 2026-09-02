@@ -678,15 +678,9 @@
     (is (= [:read-write :read-write :read-write]
            (mapv :access (dialect/result-storage program 0))))))
 
-(deftest ordered-void-bodies-decline-the-functional-tuple-map
+(deftest untyped-ordered-void-bodies-decline-the-typed-effect-map
   (doseq [[label body]
-          [["one destination written twice"
-            '(do (clojure.core/aset a i (float 1.0))
-                 (clojure.core/aset a i (float 2.0)))]
-           ["a later store observes an earlier sibling write"
-            '(do (clojure.core/aset a i (float (clojure.core/aget x i)))
-                 (clojure.core/aset b i (float (clojure.core/aget a i))))]
-           ["an untyped shared local cannot enter a typed region"
+          [["an untyped shared local cannot enter a typed region"
             '(let* [v (+ (clojure.core/aget x i) 1.0)]
                    (clojure.core/aset a i (float v))
                    (clojure.core/aset b i (float (* v v))))]
@@ -694,10 +688,7 @@
             '(let* [u (+ (clojure.core/aget x i) 1.0)
                     v (* u 2.0)]
                    (clojure.core/aset a i (float v))
-                   (clojure.core/aset b i (float u)))]
-           ["an indexed write without an explicit conflict contract"
-            '(clojure.core/aset a (clojure.core/aget indices i)
-                                (float (clojure.core/aget x i)))]]]
+                   (clojure.core/aset b i (float u)))]]]
     (testing label
       (is (nil? (frontend/form->program
                  (list 'let* ['effect (list 'raster.par/map-void! 'i 'n body)] 'effect)
@@ -740,7 +731,7 @@
     (is (= [] (dialect/outputs program)))
     (is (= program (dialect/validate! program)))))
 
-(deftest mixed-effects-still-require-an-explicit-indirect-write-proof
+(deftest unproved-indirect-write-is-explicitly-sequential
   (let [source
         '(let* [effect
                 (raster.par/map-void!
@@ -749,7 +740,18 @@
                    (clojure.core/aset out (clojure.core/aget slots i)
                                       (float (clojure.core/aget x i)))
                    (raster.par/atomic-add! total 0 (float 1.0))))]
-               effect)]
-    (is (nil? (frontend/form->program
-               source {:dtype :float
-                       :array-types {'x :float 'slots :int 'out :float 'total :float}})))))
+               effect)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'x :float 'slots :int 'out :float 'total :float}})
+        equation (first (dialect/equations program))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        effects (:body-results (dialect/lambda-parts lambda))]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= :sequential (:iteration-order attributes)))
+    (is (= [:ordered :reduce]
+           (mapv (fn [effect]
+                   (let [conflict (:conflict (dialect/effect-parts effect))]
+                     (if (keyword? conflict) conflict (:kind conflict))))
+                 effects)))
+    (is (= program (dialect/validate! program)))))
