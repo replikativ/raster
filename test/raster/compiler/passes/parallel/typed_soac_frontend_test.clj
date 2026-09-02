@@ -161,6 +161,26 @@
                                   {:scalar-types {'n :long}})
                    [:stats :front-end])))))
 
+(deftest offset-map-is-an-injective-typed-scatter
+  (let [source '(let* [result
+                       (raster.par/map! out i n :offset base float
+                                        (clojure.core/aget src i))]
+                      result)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'src :float 'out :float}
+                         :scalar-types {'n :long 'base :long}})
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        write (dialect/write-parts
+               (first (:body-results (dialect/lambda-parts (:lambda operation)))))]
+    (is (= 'scatter (:kind operation)))
+    (is (= :unique (get-in operation [:attributes :conflict])))
+    (is (= '(clojure.core/+ %capture0 i) (:destination-index write)))
+    (is (= '[src base out] (dialect/operation-inputs equation)))
+    (is (= [{:destination 'out :access :read-write :host-return :buffer}]
+           (dialect/result-storage program (second equation))))))
+
 (deftest typed-map-reduce-and-scatter-lower-without-compatibility-records
   (let [map-program
         (frontend/form->program

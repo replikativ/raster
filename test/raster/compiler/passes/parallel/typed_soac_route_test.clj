@@ -167,6 +167,37 @@
                    (tree-seq coll? seq (:form emitted))))
         "an OpenCL program must not leak a Level Zero staging call")))
 
+(deftest offset-map-routes-as-typed-unique-scatter
+  (let [source '(let* [result
+                       (raster.par/map! out i n :offset base float
+                                        (clojure.core/aget x i))]
+                      result)
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'x :float 'out :float}
+                 :scalar-types {'n :long 'base :long}})
+        equation (first (:equations form))
+        operation (first (:operations equation))
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                         :dtype :float :min-elements 0)
+        artifact (first (:kernels emitted))
+        jvm (par-simd/simd-pass form :min-elements 1)
+        execute (eval (list 'fn '[out x n base] (:form jvm)))
+        out (float-array [99.0 99.0 99.0 99.0 99.0 99.0])
+        result (execute out (float-array [10.0 11.0 12.0]) 3 2)]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (instance? raster.compiler.ir.segop.SegMap operation))
+    (is (= :unique (:write-conflict operation)))
+    (is (= :read-write (get-in equation [:attributes :result-storage 0 :access])))
+    (is (re-find #"out_\[\(base \+ idx\)\]" (:source artifact))
+        "the scheduled GPU store retains destination[base+i]")
+    (is (some #{'base} (:arguments artifact)))
+    (is (= 1 (get-in emitted [:stats :segop-reused])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))
+    (is (identical? out result))
+    (is (= [99.0 99.0 10.0 11.0 12.0 99.0] (mapv double result)))))
+
 (deftest tuple-map-deduplicates-a-read-write-physical-result
   (let [source '(raster.par/map-void!
                  i n
