@@ -992,12 +992,30 @@
 
 (defn- source-descriptions
   [pairs default-dtype array-types]
-  (mapv (fn [id [symbol expression]]
-          (or (operation-description id symbol expression default-dtype array-types)
-              (if (par/par-form? expression)
-                {:kind :unsupported :id id :sym symbol :expr expression}
-                {:kind :scalar :id id :sym symbol :expr expression})))
-        (range) pairs))
+  ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
+  ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
+  ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
+  (:descriptions
+   (reduce
+    (fn [{:keys [array-types] :as state} [id [symbol expression]]]
+      (let [description
+            (or (operation-description id symbol expression default-dtype array-types)
+                (if (par/par-form? expression)
+                  {:kind :unsupported :id id :sym symbol :expr expression}
+                  {:kind :scalar :id id :sym symbol :expr expression}))
+            allocation-dtype
+            (when (and (= :scalar (:kind description))
+                       (seq? expression)
+                       (descriptor/alloc-op? (descriptor/semantic-op expression)))
+              (let [operation (descriptor/semantic-op expression)
+                    array-tag (or (get descriptor/alloc-sym->array-tag operation)
+                                  (get descriptor/alloc-sym->array-tag
+                                       (some-> operation name symbol)))]
+                (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))]
+        (cond-> (update state :descriptions conj description)
+          allocation-dtype (assoc-in [:array-types symbol] allocation-dtype))))
+    {:descriptions [] :array-types array-types}
+    (map-indexed vector pairs))))
 
 (defn- canonical-extent
   [equalities values extent]
