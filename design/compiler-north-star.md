@@ -211,7 +211,10 @@ sources. Uniform memory facts require an explicit body-level stable-read contrac
 KernelBody-to-ABI seam projects it to a no-write-alias precondition, artifacts reject equal compiler
 bindings, direct calls check resident ranges, and graph/link binding retains its stronger
 overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from integral
-wrap/saturate/trap policies. Whole-kernel workgroup allocations now have static typed shapes, named
+wrap/saturate/trap policies. Unchecked integral add/subtract/multiply retain an explicit wrapping
+policy in scalar SSA, and the shared C-family lowering performs those operations in the
+same-width unsigned representation rather than relying on undefined signed overflow. Whole-kernel
+workgroup allocations now have static typed shapes, named
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
 accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are
 rejected outside workgroup-uniform control flow and lower from the same operation to OpenCL,

@@ -6,7 +6,8 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn- scalar-kernel-body []
   (let [group 'query-row
@@ -131,6 +132,21 @@
     :indices [(body/->IndexBinding 'lane :local 0)]
     :operations [(body/->AtomicRMW 'out ['lane] 'contribution :+ nil)]
     :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(defn- wrapping-arithmetic-kernel-body []
+  (body/make
+   {:id :wrapping-arithmetic-test
+    :parameters [(body/->KernelParameter 'a :scalar :long [] nil nil :left)
+                 (body/->KernelParameter 'b :scalar :long [] nil nil :right)
+                 (body/->KernelParameter 'out :output :long [1] :global
+                                         (layout/row-major [1] :long) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'sum :long)
+                  (body/scalar-expression :+ :long ['a 'b] {:overflow :wrap}))
+                 (body/->ScalarStore 'out [0] 'sum nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
@@ -265,6 +281,31 @@
             {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
+
+(deftest unchecked-source-arithmetic-retains-wrapping-semantics
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {} :scalar-types {'a :long 'b :long} :arrays #{}
+                  :index-scope #{} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        lowered ((:lower lowerer) '(unchecked-add a b) :long
+                 {'a :long 'b :long})]
+    (is (= {:overflow :wrap}
+           (get-in lowered [:operations 0 :expression :options])))
+    (is (= :+ (get-in lowered [:operations 0 :expression :op]))))
+  (doseq [[target unsigned-type]
+          [[:opencl-portable "ulong"]
+           [:cuda "unsigned long long"]
+           [:hip "unsigned long long"]]]
+    (testing (name target)
+      (let [source (opencl/emit-scalar-kernel
+                    "wrapping_arithmetic" (wrapping-arithmetic-kernel-body)
+                    {:target-dialect target})]
+        (is (str/includes? source
+                           (str "(" unsigned-type ")(rstr_a) + (" unsigned-type ")(rstr_b)")))
+        (is (not (str/includes? source "rstr_a + rstr_b"))
+            "signed target arithmetic must not weaken modulo-2^N semantics")))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]

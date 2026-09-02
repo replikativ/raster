@@ -78,7 +78,9 @@ models can refine a choice, while the typed program and numerical oracle constra
    movement) with direct typed equations and schedules.
 2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
    beta-reduce away type contracts.
-3. Add explicit integer arithmetic semantics (`wrap`, `trap`, or proved no-overflow) before using
+3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain
+   `:wrap` in scalar `KernelBody` SSA and C-family targets execute them through the corresponding
+   unsigned representation; add `trap` and proved-no-overflow contracts before admitting ordinary
    integral scalar algebra for indexing, RNG, and quantization.
 4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
    block movement without turning layouts into semantic tensor operators.

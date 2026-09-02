@@ -1062,13 +1062,21 @@
       intrinsic
       (let [arity (:arity intrinsic)
             kind (:kind intrinsic)
-            operand-type (same-types! "scalar intrinsic" infos)]
+            operand-type (same-types! "scalar intrinsic" infos)
+            wrapping? (= {:overflow :wrap} options)]
         (when-not (= arity (count infos))
           (throw (ex-info "scalar intrinsic arity mismatch"
                           {:operation canonical-op :expected arity :actual (count infos)})))
-        (when (seq options)
+        (when (and (seq options) (not wrapping?))
           (throw (ex-info "scalar intrinsic does not accept unspecified lowering options"
                           {:operation canonical-op :options options})))
+        (when (and wrapping?
+                   (not (and (contains? #{:+ :- :*} canonical-op)
+                             (contains? #{:byte :int :long} operand-type))))
+          (throw (ex-info "wrapping overflow is only defined for integral add, subtract, and multiply"
+                          {:reason :kernel-body-intrinsic-overflow
+                           :operation canonical-op :operand-type operand-type
+                           :options options})))
         (when (= :predicate operand-type)
           (throw (ex-info "numeric intrinsics cannot consume predicate values"
                           {:operation canonical-op})))

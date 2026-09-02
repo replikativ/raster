@@ -172,7 +172,10 @@
 ;; local-name → canonical key (covers raster.numeric/Math/clojure.core syms and
 ;; bare names; arithmetic + comparison spellings both routed here).
 (def ^:private name->key
-  {"+" :+ "-" :- "*" :* "/" :div
+  {"+" :+ "unchecked-add" :+ "unchecked-add-int" :+
+   "-" :- "unchecked-subtract" :- "unchecked-subtract-int" :-
+   "*" :* "unchecked-multiply" :* "unchecked-multiply-int" :*
+   "/" :div
    "<" :lt ">" :gt "<=" :le ">=" :ge "==" :eq "=" :eq "not=" :ne "!=" :ne
    "rem" :rem "unchecked-remainder-int" :rem "mod" :mod "quot" :quot
    "bit-and" :bit-and "bit-or" :bit-or "bit-xor" :bit-xor
@@ -205,6 +208,24 @@
     :else nil))
 
 (defn descriptor [op] (get table (canonical op)))
+
+;; These source operations carry a semantic promise that is not part of canonical operator
+;; identity: JVM-width integral arithmetic wraps modulo 2^N.  Keep the distinction here, beside
+;; canonicalization, so scalar frontends retain it in typed IR and target emitters never recover
+;; it from a function name.
+(def ^:private wrapping-arithmetic-names
+  #{"unchecked-add" "unchecked-add-int"
+    "unchecked-subtract" "unchecked-subtract-int"
+    "unchecked-multiply" "unchecked-multiply-int"})
+
+(defn source-overflow-policy
+  "Return the explicit overflow contract carried by source operation `op`, if any.
+
+  This describes source semantics only. Callers still provide and verify the authoritative
+  operand/result dtype before attaching the policy to typed IR."
+  [op]
+  (when (and (symbol? op) (contains? wrapping-arithmetic-names (name op)))
+    :wrap))
 
 ;; Semantic scalar domains are centralized beside canonical operator identity.  Backend facets say
 ;; how an operation is spelled; they do not by themselves prove that (for example) sqrt accepts an
