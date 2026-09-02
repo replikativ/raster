@@ -16,6 +16,8 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.program-tuning :as program-tuning]))
@@ -388,6 +390,35 @@
     (is (= :unsupported-scalar-binding
            (get-in (route/attempt source :float {'x :float}) [:declined :reason]))
         "the compatibility adapter must not reconstruct a missing TypedClojure result type")))
+
+(deftest route-distinguishes-source-coverage-from-compiler-contradictions
+  (testing "an uncertified recurrence is an explicit source coverage decline"
+    (let [source '(let* [result (raster.par/scan target h 0.0 i n float
+                                                  (Math/tanh
+                                                   (+ h (clojure.core/aget x i))))]
+                         result)]
+      (is (= :scan-not-associative
+             (get-in (route/attempt source :float {'x :float 'target :float})
+                     [:declined :reason])))))
+  (testing "a pre-certificate shape contradiction is an honest admission decline"
+    (with-redefs [frontend/form->program
+                  (fn [& _]
+                    (throw (ex-info "simulated value contradiction"
+                                    {:reason :source-value-conflict})))]
+      (is (= :source-value-conflict
+             (get-in (route/attempt '(let* [x 1] x) :float) [:declined :reason])))))
+  (testing "a contradiction after TypedSOAC construction is never compatibility fallback"
+    (let [source '(let* [result (raster.par/pmap i n float
+                                                  (clojure.core/aget x i))]
+                         result)
+          typed (frontend/form->program source {:dtype :float :array-types {'x :float}})]
+      (with-redefs [frontend/form->program (fn [& _] typed)
+                    fusion/fusion-fixpoint
+                    (fn [& _]
+                      (throw (ex-info "simulated fusion contradiction"
+                                      {:reason :typed-soac-fusion-contradiction})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"simulated fusion contradiction"
+                              (route/attempt source :float {'x :float})))))))
 
 (deftest semantic-alength-bounds-normalize-to-the-producing-extent
   (let [source '(let* [^long n (clojure.core/alength x)

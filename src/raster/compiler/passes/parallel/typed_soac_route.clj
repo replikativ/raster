@@ -21,6 +21,35 @@
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
 
+(def ^:private source-decline-reasons
+  "Structured exceptions that mean analyzed source is outside the closed TypedSOAC subset.
+
+   Keep this list exact. Before a validated TypedSOAC program exists, incomplete shapes, scalar
+   capture facts, or dialect coverage are honest admission declines. After construction, only the
+   explicit production-subset reason may decline; fusion bugs and unexpected materialization
+   failures must escape."
+  #{:unsupported-scalar-binding
+    :source-value-conflict
+    :scan-dtype-unsupported
+    :scan-not-associative
+    :scan-not-elementwise
+    :scan-element-impure-or-unknown
+    :scan-nonidentity-init
+    :reduction-dtype-unsupported
+    :reduction-not-associative
+    :reduction-not-elementwise
+    :reduction-element-impure-or-unknown
+    :reduction-nonidentity-init
+    :typed-soac-production-subset
+    :typed-soac-stable-read-alias
+    :typed-soac-syntax
+    :typed-soac-unbound-scalar
+    :typed-soac-unknown-value})
+
+(defn- source-decline?
+  [exception]
+  (contains? source-decline-reasons (:reason (ex-data exception))))
+
 (defn- equation-subprogram
   [program equation]
   (let [equation-id (second equation)
@@ -499,8 +528,8 @@
                                   {:route :typed-soac :typed-validated true
                                    :front-end :analyzed-source})})))))
          (catch clojure.lang.ExceptionInfo exception
-           (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
-             (throw exception))
-           {:declined {:reason (or (:reason (ex-data exception)) :typed-soac-route-declined)
-                       :message (.getMessage exception)
-                       :details (ex-data exception)}}))))))
+           (if (source-decline? exception)
+             {:declined {:reason (:reason (ex-data exception))
+                         :message (.getMessage exception)
+                         :details (ex-data exception)}}
+             (throw exception))))))))
