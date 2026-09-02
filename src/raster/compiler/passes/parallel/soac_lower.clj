@@ -297,6 +297,78 @@
                     :conflict-contract conflict)
             (lower-map-description description device-id :dtype result-dtype)))))
 
+(defn lower-typed-effect-map
+  "Lower one validated ordered effect-map to the common portable SegMap schedule boundary.
+
+   Effects remain structured data in `:scalar-region`; no source `map-void!` form is rebuilt.
+   Physical destinations come from the checked result-storage contract and every destination keeps
+   its unique/reduction conflict proof for KernelBody lowering."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)
+        equation (first (soac-dialect/equations program))]
+    (when-not (and (= 1 (count (soac-dialect/equations program)))
+                   (= 'effect-map (soac-dialect/operation-kind equation)))
+      (throw (ex-info "typed effect-map lowering requires one effect-map equation"
+                      {:reason :typed-soac-effect-map-subset :program program})))
+    (let [[_ equation-id results _operation] equation
+          {:keys [attributes arrays captures destinations lambda]}
+          (soac-dialect/operation-parts equation)
+          {:keys [locals body-results]} (soac-dialect/lambda-parts lambda)
+          {:keys [elements capture-parameters destination-parameters]}
+          (soac-dialect/parameter-layout equation)
+          facts (soac-dialect/facts program)
+          values (:values facts)
+          physical-results (soac-dialect/physical-results facts equation)
+          _ (when-not (= destinations physical-results)
+              (throw (ex-info "typed effect-map destination storage changed after validation"
+                              {:reason :raster/bug :equation equation-id
+                               :destinations destinations :physical physical-results})))
+          substitutions
+          (into (zipmap capture-parameters captures)
+                (concat
+                 (map (fn [parameter array]
+                        [parameter (list 'clojure.core/aget array (:index attributes))])
+                      elements arrays)
+                 (map vector destination-parameters physical-results)))
+          locals (mapv #(update % :init
+                                (fn [init] (util/subst-syms substitutions init)))
+                       locals)
+          effects
+          (mapv (fn [effect]
+                  (let [{:keys [destination conflict destination-index predicate value]}
+                        (soac-dialect/effect-parts effect)]
+                    {:destination (util/subst-syms substitutions destination)
+                     :conflict conflict
+                     :destination-index (util/subst-syms substitutions destination-index)
+                     :predicate (util/subst-syms substitutions predicate)
+                     :value (util/subst-syms substitutions value)}))
+                body-results)
+          stable (set (get-in attributes [:attributes :stable-array-captures]))
+          scalar-captures (set (remove stable captures))
+          write-conflicts
+          (into {} (map (fn [destination]
+                          [destination (:conflict
+                                        (first (filter #(= destination (:destination %))
+                                                       effects)))])
+                        physical-results))
+          result-dtype (or (:dtype (get values (first results))) dtype :double)
+          description {:id equation-id
+                       :bound (:extent attributes)
+                       :idx (:index attributes)
+                       :lambda nil
+                       :scalar-region {:locals locals :effects effects}
+                       :inputs (into (set arrays) stable)
+                       :outputs (set physical-results)
+                       :scalars scalar-captures
+                       :elem-type result-dtype
+                       :out-sym nil
+                       :cast-fn nil}]
+      (mapv #(assoc % :algorithm-dialect :typed-soac
+                    :algorithm-equation equation-id
+                    :write-conflict :ordered-effects
+                    :write-conflicts write-conflicts)
+            (lower-map-description description device-id :dtype result-dtype)))))
+
 (defn typed-reduce-program?
   "Whether a validated one-equation TypedSOAC program is the scalar reduction vertical currently
    accepted by SegRed lowering."

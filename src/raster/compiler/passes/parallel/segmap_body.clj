@@ -5,6 +5,7 @@
    KernelBody ForLoop; scalar loads, computation, branches, and horizontally fused stores use the
    shared typed scalar-expression lowering boundary."
   (:require [clojure.set :as set]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -58,15 +59,19 @@
    source-shaped lambda remains only for compatibility-created SegMaps; its binder metadata is
    projected once here and is never used to infer an arithmetic function or result type."
   [segmap]
-  (if-let [{:keys [locals result] :as region} (:scalar-region segmap)]
+  (if-let [{:keys [locals result effects] :as region} (:scalar-region segmap)]
     (do
       (when-not (and (vector? locals)
                      (every? #(and (symbol? (:id %)) (:dtype %) (contains? % :init)) locals)
-                     (contains? region :result))
+                     (not= (contains? region :result) (contains? region :effects))
+                     (or (not (contains? region :effects))
+                         (and (vector? effects) (seq effects))))
         (decline! :typed-local-region
                   "scheduled typed map carries a malformed scalar region"
                   {:operation (:id segmap) :scalar-region region}))
-      {:locals locals :result result})
+      (cond-> {:locals locals}
+        (contains? region :result) (assoc :result result)
+        (contains? region :effects) (assoc :effects effects)))
     (let [expression (:lambda segmap)]
       (if (and (seq? expression)
                (contains? #{'let 'let* 'clojure.core/let} (first expression)))
@@ -122,17 +127,25 @@
                                [primary-output]))
                   (vec (sort-by name (:outputs segmap))))
         output-set (set outputs)
-        inout (set/intersection (set inputs) output-set)
+        write-conflicts (or (:write-conflicts segmap) {})
+        reduction-destinations
+        (into #{} (keep (fn [[destination conflict]]
+                          (when (= :reduce (:kind conflict)) destination)))
+              write-conflicts)
+        inout (set/union (set/intersection (set inputs) output-set)
+                         reduction-destinations)
         read-only-inputs (vec (remove inout inputs))
         scalars (vec (sort-by name (:scalars segmap)))
+        {:keys [locals result effects]} (scalar-region segmap)
+        ordered-effects? (seq effects)
         explicit-certified-write?
         (and (nil? primary-output)
              (contains? #{:unique :reduce} (:write-conflict segmap)))
-        {:keys [locals result]} (scalar-region segmap)
         same-element-inout?
         (same-element-inout? inout index (conj (mapv :init locals) result))
         _ (when (and (seq inout)
-                     (not (or explicit-certified-write? same-element-inout?)))
+                     (not (or explicit-certified-write? ordered-effects?
+                              same-element-inout?)))
             (decline! :inout-storage
                       "portable dense map writable results may only read their lane-owned element"
                       {:operation (:id segmap) :inputs inputs :outputs outputs}))
@@ -179,7 +192,9 @@
               :environment (assoc environment (:result lowered) (:type lowered))}))
          {:substitutions {} :operations [] :environment base-environment}
          locals)
-        forms (scalar-forms (util/subst-syms (:substitutions local-state) result))
+        forms (if ordered-effects?
+                []
+                (scalar-forms (util/subst-syms (:substitutions local-state) result)))
         explicit-forms (if primary-output (pop forms) forms)
         primary-form (when primary-output (peek forms))
         _ (when (and primary-output (empty? forms))
@@ -215,12 +230,53 @@
                          (body/->ScalarStore array [coordinate-expression]
                                              (:result lowered) :map-active))]))))
         explicit-operations (vec (mapcat lower-store explicit-forms))
+        lower-effect
+        (fn [{:keys [destination conflict destination-index predicate value] :as effect}]
+          (when-not (contains? output-set destination)
+            (decline! :effect-destination
+                      "ordered effect targets an undeclared result"
+                      {:operation (:id segmap) :effect effect}))
+          (let [coordinate-value (when (contains-indexed-load? destination-index)
+                                   ((:lower lowerer) destination-index :long environment))
+                coordinate-expression (if coordinate-value
+                                        (:result coordinate-value)
+                                        (lower-index destination-index))
+                lowered-value ((:lower lowerer) value (get array-types destination) environment)
+                operator (when (= :reduce (:kind conflict))
+                           (intrinsics/canonical (:operator conflict)))
+                _ (when (and (= :reduce (:kind conflict)) (nil? operator))
+                    (decline! :effect-reduction-operator
+                              "ordered reduction effect has no canonical scalar operator"
+                              {:operation (:id segmap) :effect effect}))
+                store (if (= :reduce (:kind conflict))
+                        (body/->AtomicRMW destination [coordinate-expression]
+                                          (:result lowered-value) operator :map-active)
+                        (body/->ScalarStore destination [coordinate-expression]
+                                            (:result lowered-value) :map-active))
+                effect-operations (vec (concat (:operations coordinate-value)
+                                               (:operations lowered-value) [store]))]
+            (if (contains? #{true 1} predicate)
+              effect-operations
+              (let [lowered-predicate ((:lower lowerer) predicate :predicate environment)]
+                (vec (concat (:operations lowered-predicate)
+                             [(body/->IfRegion (:result lowered-predicate)
+                                               (conj effect-operations (body/->Yield []))
+                                               [(body/->Yield [])] [])]))))))
+        effect-operations
+        (vec (mapcat lower-effect
+                     (map #(reduce (fn [effect field]
+                                     (update effect field
+                                             (fn [expression]
+                                               (util/subst-syms
+                                                (:substitutions local-state) expression))))
+                                   % [:destination :destination-index :predicate :value])
+                          effects)))
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))
         scalar-operations
         (vec (concat (:operations local-state)
-                     explicit-operations
+                     (if ordered-effects? effect-operations explicit-operations)
                      (:operations primary-lowered)
                      (when primary-output
                        [(body/->ScalarStore primary-output [index]
