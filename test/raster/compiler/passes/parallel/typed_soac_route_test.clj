@@ -211,8 +211,9 @@
     (is (= [:inout] (mapv :kind pointer-slots)))
     (is (= [:result] (mapv :role pointer-slots)))
     (is (= '[target n] (:arguments artifact)))
-    (is (re-find #"inout_result\[idx\]" (:source artifact))
-        "the scalar-region read is projected through the sole result parameter")
+    (is (re-find #"rstr_map_load_\d+ = .*target\[" (:source artifact))
+        "the scalar-region read is projected through the sole typed result parameter")
+    (is (re-find #"target\[.*\] = rstr_map_value_\d+" (:source artifact)))
     (is (some #{'raster.gpu.ocl-runtime/invoke-registered-kernel}
               (tree-seq coll? seq (:form emitted))))
     (is (not (some #{'raster.gpu.ze-runtime/invoke-registered-kernel}
@@ -269,13 +270,13 @@
     (is (= :typed-soac (:source-dialect stats)))
     (is (= [:write :read-write]
            (mapv :access (get-in equation [:attributes :result-storage]))))
-    (is (= ['b 'x 'a] (mapv :name pointer-slots)))
-    (is (= [:inout :input :output] (mapv :kind pointer-slots)))
+    (is (= ['x 'b 'a] (mapv :name pointer-slots)))
+    (is (= [:input :inout :output] (mapv :kind pointer-slots)))
     (is (= 1 (count (filter #(= 'b (:name %)) pointer-slots)))
         "a read/write destination is one physical ABI value, not aliased input and output slots")
     (is (= #{'a 'b} (:outputs (first (:operations equation)))))
-    (is (re-find #"b\[idx\] = \(float\)" (:source artifact)))
-    (is (re-find #"out\[idx\]" (:source artifact)))))
+    (is (re-find #"b\[.*\] = rstr_map_value_\d+" (:source artifact)))
+    (is (re-find #"a\[.*\] = rstr_map_load_\d+" (:source artifact)))))
 
 (deftest typed-tuple-map-preserves-effect-semantics-on-the-jvm
   (let [source '(let* [effect

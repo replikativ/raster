@@ -597,6 +597,59 @@
                   (keys (:values (dialect/facts program))))
         "region-local SSA values are lexical, not fake program inputs")))
 
+(deftest nested-typed-scopes-share-one-alpha-stable-region
+  (let [expression
+        '(raster.par/map-void!
+          i n
+          (let* [^float shifted (+ (clojure.core/aget x i) 1.0)]
+                (let* [^float squared (* shifted shifted)]
+                      (clojure.core/aset out i (float squared)))))
+        program (frontend/form->program
+                 (list 'let* ['effect expression] 'effect)
+                 {:dtype :float :array-types {'x :float 'out :float}})
+        equation (first (dialect/equations program))
+        {:keys [locals body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= [{:id 'rstr_local_0 :dtype :float
+             :init '(+ %element0 1.0)}
+            {:id 'rstr_local_1 :dtype :float
+             :init '(* rstr_local_0 rstr_local_0)}]
+           locals))
+    (is (= '[(float rstr_local_1)] body-results))))
+
+(deftest closed-core-integer-case-becomes-a-typed-conditional-map
+  (let [expression
+        '(raster.par/map-void!
+          i n
+          (let* [^int choice (clojure.core/aget choices i)]
+                (case* choice 0 0 nil
+                       {0 [0 (clojure.core/aset out i (float 10.0))]
+                        1 [1 (clojure.core/aset out i (float 20.0))]}
+                       :compact :int)))
+        program (frontend/form->program
+                 (list 'let* ['effect expression] 'effect)
+                 {:dtype :float :array-types {'choices :int 'out :float}})
+        equation (first (dialect/equations program))
+        {:keys [body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))
+        result (first body-results)]
+    (is (= 'map (dialect/operation-kind equation)))
+    (is (= 'out (first (dialect/physical-results program equation))))
+    (is (not-any? #{'case* :compact :int} (flatten result)))
+    (is (some #{'clojure.core/==} (flatten result)))
+    (is (some #{10.0 20.0} (flatten result)))))
+
+(deftest noninteger-case-representation-declines-the-typed-route
+  (let [expression
+        '(raster.par/map-void!
+          i n
+          (case* choice 0 0 nil
+                 {0 [:stay (clojure.core/aset out i (float 10.0))]}
+                 :compact :hash-equiv))]
+    (is (nil? (frontend/form->program
+               (list 'let* ['effect expression] 'effect)
+               {:dtype :float :array-types {'out :float}})))))
+
 (deftest typed-local-snapshots-may-feed-several-updated-destinations
   (let [source
         '(let* [effect

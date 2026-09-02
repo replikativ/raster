@@ -136,13 +136,64 @@
                  (every? :dtype locals))
         locals))))
 
+(defn- integer-case-chain
+  "Project one closed-core integer `case*` into the conditional scalar vocabulary.
+
+   Clojure has already bound the tested expression before producing `case*`, so accepting only a
+   symbolic test preserves its evaluate-once semantics.  The clause map's dispatch hashes are an
+   implementation detail; exact integer test values are retained in its `[test-value result]`
+   entries.  Other case representations decline instead of leaking hash/keyword interpretation
+   into a target emitter."
+  [expression]
+  (when (and (seq? expression) (= 'case* (first expression)))
+    (let [[_ test _shift _mask default clauses _switch-type test-type] expression
+          ordered-clauses (when (and (map? clauses) (every? integer? (keys clauses)))
+                            (->> clauses
+                                 (sort-by key)
+                                 (mapv val)))]
+      (when (and (symbol? test)
+                 (= :int test-type)
+                 (map? clauses)
+                 (every? integer? (keys clauses))
+                 (every? #(and (vector? %) (= 2 (count %))
+                                (integer? (first %)))
+                         ordered-clauses))
+        (reduce (fn [otherwise [test-value result]]
+                  (list 'if (list 'clojure.core/== test test-value)
+                        result otherwise))
+                default (reverse ordered-clauses))))))
+
+(defn- substitute-store
+  [substitutions store]
+  (reduce (fn [store field]
+            (update store field #(util/subst-syms substitutions %)))
+          store [:index :predicate :value]))
+
+(defn- rebase-region-locals
+  "Move a recursively recognized region behind `offset` lexical SSA values.
+
+   Every nested scope initially numbers its locals from zero.  Rebasing before composing scopes
+   gives the combined region one deterministic, collision-free SSA namespace."
+  [{:keys [locals stores]} offset]
+  (let [renames (into {}
+                      (map-indexed
+                       (fn [ordinal {:keys [id]}]
+                         [id (symbol (str "rstr_local_" (+ offset ordinal)))])
+                       locals))]
+    {:locals (mapv (fn [{:keys [id] :as local}]
+                     (-> local
+                         (assoc :id (get renames id))
+                         (update :init #(util/subst-syms renames %))))
+                   locals)
+     :stores (mapv #(substitute-store renames %) stores)}))
+
 (defn- pointwise-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in indexed stores.
 
-   Local types come only from retained walker/TypedClojure facts. Nested local scopes and missing
-   local types decline; guessing them in this source recognizer or a C emitter would make the
-   region only nominally typed. Store legality is checked separately after local dependencies are
-   expanded for analysis."
+   Local types come only from retained walker/TypedClojure facts. Nested lexical scopes are
+   alpha-renamed into one ordered SSA spine; missing local types decline because guessing them in
+   this source recognizer or a C emitter would make the region only nominally typed. Store
+   legality is checked separately after local dependencies are expanded for analysis."
   [body index]
   (cond
     (and (seq? body) (form/let-head? (first body)))
@@ -150,38 +201,37 @@
       (when (and (even? (count bindings))
                  (seq nested-body)
                  (not-any? util/effectful? (take-nth 2 (rest bindings))))
-        (when-let [{nested-locals :locals stores :stores}
-                   (pointwise-region (list* 'do nested-body) index)]
-          ;; Flattening nested lexical scopes needs alpha-renaming across each scope. Keep this
-          ;; first production slice to the ANF shape the walker emits: one local spine around the
-          ;; store sequence.
-          (when (empty? nested-locals)
-            (let [pairs (vec (partition 2 bindings))
-                  typed (mapv (fn [[binding init]]
-                                [binding init (retained-local-dtype binding init)])
-                              pairs)]
-              (when (every? (comp some? #(nth % 2)) typed)
-                (let [{:keys [locals substitutions]}
-                      (reduce (fn [{:keys [locals substitutions]} [binding init local-dtype]]
-                                (let [id (symbol (str "rstr_local_" (count locals)))]
-                                  {:locals (conj locals
-                                                 {:id id :dtype local-dtype
-                                                  :init (util/subst-syms substitutions init)})
-                                   :substitutions (assoc substitutions binding id)}))
-                              {:locals [] :substitutions {}} typed)]
-                  {:locals locals
-                   :stores (mapv (fn [store]
-                                   (reduce (fn [store field]
-                                             (update store field
-                                                     #(util/subst-syms substitutions %)))
-                                           store [:index :predicate :value]))
-                                 stores)})))))))
+        (when-let [nested-region (pointwise-region (list* 'do nested-body) index)]
+          (let [pairs (vec (partition 2 bindings))
+                typed (mapv (fn [[binding init]]
+                              [binding init (retained-local-dtype binding init)])
+                            pairs)]
+            (when (every? (comp some? #(nth % 2)) typed)
+              (let [{:keys [locals substitutions]}
+                    (reduce (fn [{:keys [locals substitutions]} [binding init local-dtype]]
+                              (let [id (symbol (str "rstr_local_" (count locals)))]
+                                {:locals (conj locals
+                                               {:id id :dtype local-dtype
+                                                :init (util/subst-syms substitutions init)})
+                                 :substitutions (assoc substitutions binding id)}))
+                            {:locals [] :substitutions {}} typed)
+                    nested (rebase-region-locals nested-region (count locals))]
+                {:locals (into locals
+                               (map #(update % :init
+                                             (fn [init]
+                                               (util/subst-syms substitutions init))))
+                               (:locals nested))
+                 :stores (mapv #(substitute-store substitutions %)
+                               (:stores nested))}))))))
 
     (and (seq? body) (= 'do (first body)))
-    (let [groups (mapv #(pointwise-region % index) (rest body))]
-      (when (and (seq groups) (every? some? groups)
-                 (every? (comp empty? :locals) groups))
-        {:locals [] :stores (vec (mapcat :stores groups))}))
+    (let [expressions (vec (rest body))]
+      (if (= 1 (count expressions))
+        (pointwise-region (first expressions) index)
+        (let [groups (mapv #(pointwise-region % index) expressions)]
+          (when (and (seq groups) (every? some? groups)
+                     (every? (comp empty? :locals) groups))
+            {:locals [] :stores (vec (mapcat :stores groups))}))))
 
     (and (seq? body)
          (contains? #{'if 'clojure.core/if} (first body))
@@ -211,6 +261,10 @@
                                 predicate
                                 (list 'if predicate % 0))))))
                (range) (:stores then-region))}))
+
+    (and (seq? body) (= 'case* (first body)))
+    (when-let [conditional (integer-case-chain body)]
+      (pointwise-region conditional index))
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]

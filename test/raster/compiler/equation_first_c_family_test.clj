@@ -72,6 +72,24 @@
                                                     (raster.arrays/aget input index))))
        (raster.arrays/aset right index (long index)))))
 
+(deftm c-family-case-map!
+  [choices :- (Array int) output :- (Array float) n :- Long] :- Void
+  (raster.par/map-void!
+   index n
+   (case (raster.arrays/aget choices index)
+     0 (raster.arrays/aset output index (float 10.0))
+     1 (raster.arrays/aset output index (float 20.0))
+     nil)))
+
+(deftm c-family-shifted-inout!
+  [output :- (Array float) n :- Long] :- Void
+  (raster.par/map-void!
+   index n
+   (raster.arrays/aset
+    output index
+    (raster.arrays/aget output
+                        (if (< (inc index) n) (inc index) (long 0))))))
+
 (deftm c-family-stencil
   [input :- (Array float) n :- Long] :- (Array float)
   (let [output (float-array n)]
@@ -178,6 +196,30 @@
                    (get-in kernel [:attributes :kernel-body :parameters]))))
       (is (empty? (:outputs linked)) "Void host semantics remain effect-only")
       (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-integer-case-map-lowers-through-portable-kernel-control
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'c-family-case-map! {:target target :dtype :float})
+          kernel (first (:kernels compilation))
+          operations (nested-operations
+                      (get-in kernel [:attributes :kernel-body :operations]))]
+      (is (= module-target (:target kernel)))
+      (is (= :portable-segmap
+             (get-in kernel [:attributes :kernel-body :attributes :kind])))
+      (is (some #(= "IfRegion" (some-> % class .getSimpleName)) operations))
+      (is (not (str/includes? (:source kernel) "case*")))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest portable-inout-map-refuses-a-cross-lane-read
+  (let [reason (reason-of #(equation-first/compile
+                            #'c-family-shifted-inout!
+                            {:target cuda-target :dtype :float}))]
+    (is (= :kernel-graph-target-lowering-missing (:reason reason)))
+    (is (= :inout-storage
+           (get-in reason [:kernel-body-decline :missing-rule])))))
 
 (deftest public-gqa-composition-emits-only-portable-c-family-kernels
   (doseq [[target program-dialect module-target]

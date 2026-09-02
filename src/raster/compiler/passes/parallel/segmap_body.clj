@@ -85,6 +85,18 @@
            :result (first body)})
         {:locals [] :result expression}))))
 
+(defn- same-element-inout?
+  "Prove that every read of a writable result is owned by the same logical work item.
+
+   A same-index read followed by a same-index write is ordinary private lane state, not a
+   cross-lane alias hazard.  Shifted/indirect reads remain outside the portable SegMap schedule;
+   they require a stencil, scatter, or an explicitly ordered schedule."
+  [inout index expressions]
+  (every? (fn [{:keys [sym idx]}]
+            (or (not (contains? inout sym))
+                (= index (descriptor/unwrap-int-cast idx))))
+          (mapcat descriptor/aget-reads expressions)))
+
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
   [segmap {:keys [workgroup-size array-types scalar-types]
@@ -116,9 +128,13 @@
         explicit-certified-write?
         (and (nil? primary-output)
              (contains? #{:unique :reduce} (:write-conflict segmap)))
-        _ (when (and (seq inout) (not explicit-certified-write?))
+        {:keys [locals result]} (scalar-region segmap)
+        same-element-inout?
+        (same-element-inout? inout index (conj (mapv :init locals) result))
+        _ (when (and (seq inout)
+                     (not (or explicit-certified-write? same-element-inout?)))
             (decline! :inout-storage
-                      "portable dense map stable reads must not alias writable results"
+                      "portable dense map writable results may only read their lane-owned element"
                       {:operation (:id segmap) :inputs inputs :outputs outputs}))
         default-dtype (dtype/canon (or (:dtype segmap) :float))
         array-dtype (fn [id]
@@ -145,7 +161,6 @@
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate :map-active
                   :id-prefix "map" :decline! decline!})
-        {:keys [locals result]} (scalar-region segmap)
         base-environment (assoc scalar-types index :long)
         local-state
         (reduce

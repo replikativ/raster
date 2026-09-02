@@ -37,6 +37,12 @@ ordered multi-results, physical result-storage contracts, effects, aliases, and 
 provenance. Contraction result transforms are represented as typed store regions rather than as a
 hard-coded attention or linear-algebra fusion pass.
 
+Nested source scopes are alpha-renamed into the same ordered local-SSA region. Finite closed-core
+integer `case*` forms become exact conditional scalar expressions at the TypedSOAC boundary, so
+Clojure dispatch tables and keyword metadata are never part of scheduled or emitted kernel IR.
+Guarded dense updates remain ordinary maps only when all reads of an inout result use the lane's
+same logical index; nonlocal reads require a different certified schedule.
+
 ## Legality boundary
 
 A transformation is legal only when the TypedSOAC value/effect facts prove it. In particular:
