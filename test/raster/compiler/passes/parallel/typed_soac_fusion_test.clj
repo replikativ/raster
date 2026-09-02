@@ -5,57 +5,45 @@
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
-            [raster.compiler.passes.parallel.soac-graph :as graph]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]))
 
-(def ^:private map-map-pairs
-  [['y '(raster.par/map! y i n nil (* (aget x i) (aget x i)))]
-   ['z '(raster.par/map! z j n nil (+ (aget y j) 1.0))]])
+(def ^:private map-map-source
+  '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
+          z (raster.par/pmap j n float (+ (aget y j) 1.0))]
+     z))
 
-(def ^:private map-reduce-pairs
-  [['y '(raster.par/map! y i n nil (* (aget x i) (aget x i)))]
-   ['sum '(raster.par/reduce acc 0.0 j n (+ acc (aget y j)))]])
+(def ^:private horizontal-map-source
+  '(let* [u (raster.par/pmap i n float (* (aget a i) 2.0))
+          v (raster.par/pmap j n float (+ (aget b j) 1.0))]
+     [u v]))
 
-(def ^:private horizontal-map-pairs
-  [['u '(raster.par/map! u i n nil (* (aget a i) 2.0))]
-   ['v '(raster.par/map! v j n nil (+ (aget b j) 1.0))]])
+(defn- source-program
+  ([source array-types]
+   (source-program source array-types {'n :long}))
+  ([source array-types scalar-types]
+   (frontend/form->program source {:dtype :float
+                                   :array-types array-types
+                                   :scalar-types scalar-types})))
 
-(def ^:private captured-map-map-pairs
-  [['y '(raster.par/map! y i n nil (* (aget x i) scale))]
-   ['z '(raster.par/map! z j n nil (+ (aget y j) bias))]])
-
-(def ^:private expensive-fanout-pairs
-  [['a '(raster.par/map! a i n nil (Math/exp (Math/exp (Math/exp (aget x i)))))]
-   ['b '(raster.par/map! b j n nil (* (aget a j) 2.0))]
-   ['c '(raster.par/reduce acc 0.0 k n (+ acc (aget a k)))]])
-
-(defn- differential-fusion
-  [pairs outputs]
-  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes pairs))
-        typed-input (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                                   {:outputs outputs :dtype :float})
-        [legacy-fused legacy-stats] (graph/fusion-fixpoint legacy-graph)
-        legacy-result (adapter/legacy-nodes->program (:nodes legacy-fused)
-                                                     {:outputs outputs :dtype :float})
-        [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)]
-    {:legacy-result legacy-result
-     :typed-result typed-result
-     :legacy-stats legacy-stats
-     :typed-stats typed-stats}))
-
-(deftest map-map-fusion-matches-current-graph
-  (let [{:keys [legacy-result typed-result typed-stats]}
-        (differential-fusion map-map-pairs '[z])]
-    (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
+(deftest map-map-fusion-has-the-certified-functional-result
+  (let [typed-input (source-program map-map-source {'x :float})
+        [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)
+        operation (dialect/operation-parts (first (dialect/equations typed-result)))]
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
+    (is (= 1 (count (dialect/equations typed-result))))
+    (is (= 'map (:kind operation)))
+    (is (= '[(float (+ (float (* %element0 %element0)) 1.0))]
+           (:body-results (dialect/lambda-parts (:lambda operation)))))
     (is (= '[n x] (:inputs (dialect/facts typed-result))))
     (is (not (contains? (:values (dialect/facts typed-result)) 'y)))))
 
-(deftest map-reduce-fusion-matches-current-graph
-  (let [{:keys [legacy-result typed-result typed-stats]}
-        (differential-fusion map-reduce-pairs '[sum])]
-    (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
+(deftest map-reduce-fusion-has-the-certified-functional-result
+  (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
+                       sum (raster.par/reduce acc 0.0 j n (+ acc (aget y j)))]
+                  sum)
+        typed-input (source-program source {'x :float})
+        [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)]
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
     (is (= 'reduce (first (nth (first (dialect/equations typed-result)) 3))))
     (is (not-any? #{'y} (flatten (dialect/equations typed-result))))))
@@ -109,37 +97,42 @@
     (is (= 2 (count (dialect/equations result)))
         "materializing the map preserves its complete read before the scan mutates x")))
 
-(deftest horizontal-map-fusion-matches-current-graph
-  (let [{:keys [legacy-result typed-result typed-stats]}
-        (differential-fusion horizontal-map-pairs '[u v])
+(deftest horizontal-map-fusion-has-the-certified-functional-result
+  (let [typed-input (source-program horizontal-map-source {'a :float 'b :float})
+        [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)
         equation (first (dialect/equations typed-result))
         lambda (nth (nth equation 3) 4)
         region (dialect/lambda-parts lambda)]
-    (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
     (is (= {:vertical 0 :horizontal 1 :iterations 2} typed-stats))
     (is (= '[u v] (nth equation 2)))
     (is (= '[%element0 %element1] (second lambda)))
-    (is (= '[(* %element0 2.0) (+ %element1 1.0)] (:body-results region)))))
+    (is (= '[(float (* %element0 2.0)) (float (+ %element1 1.0))]
+           (:body-results region)))))
 
-(deftest captured-map-fusion-matches-current-graph
-  (let [{:keys [legacy-result typed-result typed-stats]}
-        (differential-fusion captured-map-map-pairs '[z])
+(deftest captured-map-fusion-has-the-certified-functional-result
+  (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) scale))
+                       z (raster.par/pmap j n float (+ (aget y j) bias))]
+                  z)
+        typed-input (source-program source {'x :float}
+                                    {'n :long 'scale :float 'bias :float})
+        [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)
         equation (first (dialect/equations typed-result))
         operation (nth equation 3)
         lambda (nth operation 4)
         region (dialect/lambda-parts lambda)]
-    (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
     (is (= '[bias scale] (nth operation 3)))
     (is (= '[%element0 %capture0 %capture1] (second lambda)))
-    (is (= '[(+ (* %element0 %capture1) %capture0)] (:body-results region)))))
+    (is (= '[(float (+ (float (* %element0 %capture1)) %capture0))]
+           (:body-results region)))))
 
 (deftest typed-multi-consumer-placement-is-hardware-costed
-  (let [program (-> expensive-fanout-pairs
-                    legacy/let-bindings->nodes
-                    graph/build-fusion-graph
-                    :nodes
-                    (adapter/legacy-nodes->program {:outputs '[b c] :dtype :float}))
+  (let [source '(let* [a (raster.par/pmap i n float
+                                           (Math/exp (Math/exp (Math/exp (aget x i)))))
+                       b (raster.par/pmap j n float (* (aget a j) 2.0))
+                       c (raster.par/reduce acc 0.0 k n (+ acc (aget a k)))]
+                  [b c])
+        program (source-program source {'x :float})
         poor-am {:ridge {:float 2.0}}
         rich-am {:ridge {:float 100.0}}
         [materialized materialized-stats] (typed-fusion/fusion-fixpoint program poor-am)
@@ -160,22 +153,40 @@
     (is (not-any? #{'a} (mapcat #(nth % 2) (dialect/equations recomputed))))
     (is (= recomputed (dialect/validate! recomputed)))))
 
-(deftest current-graph-rewrites-the-canonical-reduction-region
-  (let [pairs [['tmp '(raster.par/map! tmp i n float (* (aget x i) 2.0))]
-               ['sum '(raster.par/reduce acc 0.0 j n (+ acc (aget tmp j)))]]
-        source-graph (graph/build-fusion-graph (legacy/let-bindings->nodes pairs))
-        [fused _] (graph/fusion-fixpoint source-graph)
-        reduce-node (first (filter legacy/soac-reduce? (vals (:nodes fused))))
-        reconstructed (legacy/soac->par-form reduce-node)]
+(deftest typed-fusion-rewrites-the-canonical-reduction-region
+  (let [source '(let* [tmp (raster.par/pmap i n float (* (aget x i) 2.0))
+                       sum (raster.par/reduce acc 0.0 j n (+ acc (aget tmp j)))]
+                  sum)
+        program (source-program source {'x :float})
+        [fused _] (typed-fusion/fusion-fixpoint program)
+        reconstructed (dialect/equations fused)]
     (is (not-any? #{'tmp} (flatten reconstructed))
         "the eliminated map result cannot survive in ProductReduction")
     (is (some #{'float} (flatten reconstructed))
         "the materialized map cast is part of the inlined value semantics")))
 
+(deftest scalar-bound-dense-result-fuses-with-its-elementwise-consumer
+  (let [source '(let* [rows (clojure.core/alength b)
+                       h (raster.par/pmap i rows double (+ (aget b i) 1.0))
+                       a (raster.par/pmap k (clojure.core/alength h) double
+                                            (max 0.0 (aget h k)))]
+                  a)
+        program (frontend/form->program source {:dtype :double
+                                                :array-types {'b :double}
+                                                :scalar-types {'rows :long}})
+        [fused stats] (typed-fusion/fusion-fixpoint program)
+        equations (dialect/equations fused)]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= 2 (count equations)) "the scalar extent and one fused map remain")
+    (is (= '[a] (nth (second equations) 2)))
+    (is (= 'rows (get-in (dialect/operation-parts (second equations))
+                         [:attributes :extent])))
+    (is (not-any? #{'h} (flatten equations))
+        "alength of the producer is normalized to its certified result shape")
+    (is (= fused (dialect/validate! fused)))))
+
 (deftest effectful-equations-do-not-fuse
-  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
-        program (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                               {:outputs '[z] :dtype :float})
+  (let [program (source-program map-map-source {'x :float})
         facts (-> (dialect/facts program)
                   (update-in [:equations 0 :effects] conj :memory/write)
                   (assoc :effects #{:memory/write}))
@@ -216,9 +227,7 @@
         "the effect result remains observable and ordered between the two reads")))
 
 (deftest aliased-equations-decline-unproved-fusion
-  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
-        program (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                               {:outputs '[z] :dtype :float})
+  (let [program (source-program map-map-source {'x :float})
         facts (assoc-in (dialect/facts program) [:equations 0 :aliases] {'y 'x})
         program (dialect/make facts (dialect/equations program) (dialect/outputs program))
         [result stats] (typed-fusion/fusion-fixpoint program)]
@@ -226,9 +235,7 @@
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
 
 (deftest vertical-fusion-composes-local-ssa-regions
-  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
-        program (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                               {:outputs '[z] :dtype :float})
+  (let [program (source-program map-map-source {'x :float})
         equations (dialect/equations program)
         equations (mapv (fn [equation]
                           (let [operation (dialect/operation-parts equation)
@@ -254,19 +261,16 @@
     (is (= 1 (count (dialect/equations result))))
     (is (= [{:id 'rstr_producer_local_0
              :dtype :float
-             :init '(* %element0 %element0)}
+             :init '(float (* %element0 %element0))}
             {:id 'rstr_consumer_local_0
              :dtype :float
-             :init '(+ rstr_producer_local_0 1.0)}]
+             :init '(float (+ rstr_producer_local_0 1.0))}]
            locals))
     (is (= '[rstr_consumer_local_0] body-results))
     (is (= result (dialect/validate! result)))))
 
 (deftest horizontal-fusion-alpha-renames-and-composes-local-ssa-regions
-  (let [legacy-graph (graph/build-fusion-graph
-                      (legacy/let-bindings->nodes horizontal-map-pairs))
-        program (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                               {:outputs '[u v] :dtype :float})
+  (let [program (source-program horizontal-map-source {'a :float 'b :float})
         equations
         (mapv (fn [equation]
                 (let [operation (dialect/operation-parts equation)
@@ -287,14 +291,13 @@
         (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
     (is (= {:vertical 0 :horizontal 1 :iterations 2} stats))
     (is (= ['rstr_left_local_0 'rstr_right_local_0] (mapv :id locals)))
-    (is (= '[(* %element0 2.0) (+ %element1 1.0)] (mapv :init locals)))
+    (is (= '[(float (* %element0 2.0)) (float (+ %element1 1.0))]
+           (mapv :init locals)))
     (is (= '[rstr_left_local_0 rstr_right_local_0] body-results))
     (is (= result (dialect/validate! result)))))
 
 (deftest fusion-preserves-constituent-equation-facts
-  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
-        program (adapter/legacy-nodes->program (:nodes legacy-graph)
-                                               {:outputs '[z] :dtype :float})
+  (let [program (source-program map-map-source {'x :float})
         facts (-> (dialect/facts program)
                   (assoc-in [:equations 0 :attributes] {:source :producer})
                   (assoc-in [:equations 1 :attributes] {:source :consumer}))
@@ -352,16 +355,6 @@
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
-
-(deftest legacy-vertical-fusion-declines-ambiguous-multi-result-map
-  (let [producer (-> (legacy/par-form->soac
-                      'u '(raster.par/map! u i n nil (* (aget x i) 2.0)) 0)
-                     (assoc :outputs #{'u 'v}))
-        consumer (legacy/par-form->soac
-                  'z '(raster.par/map! z j n nil (+ (aget u j) 1.0)) 1)
-        graph (graph/build-fusion-graph [producer consumer])]
-    (is (false? (boolean (graph/can-fuse-vertically? graph 0 1)))
-        "legacy dependency edges do not identify which tuple component was consumed")))
 
 (defn- contract-result-map-program
   [map-expression]

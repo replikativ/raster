@@ -1,6 +1,6 @@
 # Raster compiler north star
 
-Status: architectural direction, reconciled with the implementation on 2026-08-30.
+Status: architectural direction, reconciled with the implementation on 2026-09-01.
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -69,7 +69,8 @@ rewrite. Direct calls to a backend may still use the explicit, counted compatibi
 path.
 
 The typed map/reduction vertical is now production-routed for supported programs whether or not a
-fusion fires. A
+fusion fires. Unsupported source remains deliberately unfused for compatibility lowering; it can
+no longer re-enter an untyped fusion authority. A
 `ProgramEquation` owns the alpha-renamed TypedSOAC program and the SegRed mechanically derived from
 its explicit lambda parameters, operands, extent, result, dtype and algebra facts. JVM SIMD consumes
 that SegRed. The GPU schedules eligible scalar regions as one verified workgroup-tree `KernelBody`
@@ -96,8 +97,8 @@ been deleted.
 The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
 effects, aliases and placement provenance before fusion; no `ir.soac` record or record-to-dialect
-adapter participates in this production route. The old dependency-graph path remains only as an
-explicit fallback for unsupported parallel forms and as a differential oracle. Scan has a distinct
+adapter participates in this production route. The old dependency-graph fusion path has been
+removed. Scan has a distinct
 equation with an explicit `:inclusive` or `:exclusive` result mode and a checked `AssociativeScan`
 certificate; its caller-owned destination and output layout are facts, not part of the functional
 algebra. Both modes lower directly to the same one- or three-node SegScan `KernelGraph` without
@@ -120,8 +121,9 @@ TypedSOAC and scheduled SegOp boundary instead of asking the OpenCL emitter to r
 maps and reductions from walked source. Destination-writing maps retain explicit destination,
 alias, effect and return facts. General recurrences remain outside this typed operation and must
 not borrow its reassociation proof. The obsolete raw exclusive-scan GPU generator is no longer a
-backend fallback: unscheduled source fails loudly. The remaining parallel forms must
-join the direct front end before the old dependency-graph fallback can be deleted.
+backend fallback: unscheduled source fails loudly. Remaining compatibility operations must join the
+direct typed front end before their source-reparsing lowerers can be deleted; coverage debt may
+retain a materialization boundary, but it cannot weaken fusion legality.
 
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
 typed equation records read/write destination access, and GPU lowering emits that storage exactly

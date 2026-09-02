@@ -1,174 +1,111 @@
-# SOAC Loop Fusion Design
+# TypedSOAC fusion
 
-Status: **Partially implemented** — vertical and horizontal fusion work via `soac_graph.clj`.
-Goal: Fuse AD backward par/map loops to match XLA lax.scan performance.
+Status: production architecture, reconciled with the implementation on 2026-09-01.
 
-## Current State
+Raster performs functional fusion over `soac-dialect/Program`, not over the historical record
+graph or walked Clojure forms. The production route is:
 
-SOAC fusion is implemented in `compiler/passes/parallel/soac_graph.clj` with:
-- Vertical fusion (producer→consumer inlining)
-- Horizontal fusion (independent same-bound maps merged)
-- Fixpoint iteration alternating vertical and horizontal passes
-- Pure par/map through the optimizer (materialize pass allocates buffers late)
-
-Current performance (2026-04-10, Valhalla JDK 27):
-- MLP f64: 136 µs, MLP f32: 77 µs
-- LeNet f64: 222 µs, LeNet f32: 148 µs
-- JAX: MLP f64 86 µs, MLP f32 50 µs, LeNet f64 370 µs, LeNet f32 356 µs
-
-## Remaining Gap
-
-The main remaining gap vs XLA is in MLP (1.6-1.5x slower). LeNet is 1.7x faster.
-
-## What XLA Fuses (MLP backward)
-
-```
-1. dot_add_fusion:     matmul(W1,x) + bias → single kernel
-2. broadcast_max:      relu (max(h, 0)) → fused with matmul output
-3. dot_add_fusion:     matmul(W2,a) + bias → single kernel
-4. softmax_fusion:     sub_max + exp + sum → single kernel
-5. backward_fusion:    cross-entropy grad + softmax backward + SGD → single kernel
-6. backward_fusion:    relu backward + weight grad + SGD → single kernel
+```text
+closed typed Clojure
+  -> TypedSOAC equations + AbstractValue/effect/alias facts
+  -> certified fusion fixpoint
+  -> scheduled SegOps / KernelGraph
+  -> verified KernelBody
+  -> target module
 ```
 
-Key: XLA fuses **across operation boundaries** (forward→backward, gradient→SGD).
-Our pipeline keeps each par/map! as a separate loop.
+Source outside the direct frontend remains byte-for-byte unfused and enters explicit compatibility
+lowering. A coverage gap may therefore retain a materialization, but it cannot select a weaker
+fusion legality implementation. The former dependency-graph fusion implementation has been
+deleted.
 
-## Why Our SOAC Fusion Doesn't Fire
+## Current algebra
 
-Three blockers identified:
+TypedSOAC currently has functional equations for pointwise maps and tuple maps, unique-index
+scatter, stencils, reductions, product/segmented reductions, segmented fold-map, scans,
+contractions represented as segmented reductions, and scalar equations needed to retain host
+shape/value dependencies.
 
-### 1. Bound expression mismatch (FIXED)
-`(alength dp)` ≠ `(alength p)` because dp was allocated from p.
-**Fix**: resolve-alength runs before soac-fuse (pipeline reorder, done).
+Fusion iterates three general transformations to a fixpoint:
 
-### 2. Alias chains hide producer→consumer edges (INVESTIGATED)
-AD generates `[dp__3 dp]` `[d_p__4 dp__3]`. The fusion graph's `producer-of`
-map only sees the ScalarBinding node for the alias, not the underlying SOAC.
+- Vertical producer/consumer composition for maps into maps, reductions, and scans.
+- Reduction-result scalar and segmented-reduction result-map composition.
+- Horizontal composition of independent maps with equivalent extents.
 
-**Options**:
-- A: Resolve aliases in the graph builder (tried, works but fused code has
-  unresolved symbols — needs alias substitution in fusion output)
-- B: Add an alias elimination pass before fusion (CSE copy propagation —
-  tried, breaks GSDM test, bytecoder expects bindings to exist)
-- C: Use a proper SSA/DAG IR where aliases don't exist
+The rules rewrite typed lambda regions. They preserve explicit local scalar SSA, result dtypes,
+ordered multi-results, physical result-storage contracts, effects, aliases, and constituent
+provenance. Contraction result transforms are represented as typed store regions rather than as a
+hard-coded attention or linear-algebra fusion pass.
 
-### 3. Multi-consumer producer blocks vertical fusion
-`dp` is read by both softmax-backward reduce AND softmax-backward map.
-`can-fuse-vertically?` condition #7 requires single consumer.
+## Legality boundary
 
-**XLA approach**: Keeps intermediate buffer for non-fused consumer, or
-duplicates cheap computations. We'd need to relax condition #7 with
-buffer retention for other consumers.
+A transformation is legal only when the TypedSOAC value/effect facts prove it. In particular:
 
-## IR Design Question
+- Equation motion cannot cross a conflicting physical read/write/atomic footprint or a host-work
+  barrier.
+- Caller-owned destinations remain distinct from functional result identities.
+- Destination aliasing, sibling store/read ordering, and unproved scatter conflicts decline.
+- Reduction or scan reassociation requires an algebra certificate; ordinary recurrences do not
+  borrow that proof.
+- Multi-consumer recomputation requires a target-neutral cost witness. Otherwise the intermediate
+  remains materialized.
+- Every rewrite reconstructs and validates a complete typed program. A contradiction is a compiler
+  error, not a reason to fall through to compatibility code.
 
-Our let* IR has fundamental limitations for fusion:
-- Alias chains (not present in SSA IRs)
-- Implicit data flow (dependencies via symbol names, not explicit edges)
-- Mixed SOAC/scalar/BLAS bindings in flat sequence
-- Mutation-based par/map! (vs functional tensor production in XLA)
+These checks are the semantic certificate. Scheduling and autotuning may choose among legal
+implementations but may not weaken them.
 
-**Futhark** uses a similar let-bound IR but runs simplification to
-convergence before fusion. Their `InternalRep` has explicit `SubExp`
-references and `VName` identifiers with guaranteed uniqueness. Aliases
-are tracked via a separate `AliasTable` (transitive closure).
+## Shape and extent identity
 
-**Our path**: Keep let* IR (maps well to JVM bytecode) but:
-1. Add alias elimination before fusion (either in CSE or as a dedicated pass)
-2. Build alias-aware producer-of map in fusion graph
-3. Support multi-consumer vertical fusion with buffer retention
+Launch extents are semantic scalar values, not emitter strings. Scalar bindings and known tensor
+shapes normalize equivalent expressions such as `rows` and `(alength producer)` to one value before
+fusion. Compound pure extents receive stable scalar SSA identities. This lets dense-result to
+elementwise chains fuse without relying on mangled implementation names or syntactic coincidence.
 
-## Design: Alias-Aware SOAC Fusion
+## Profitability
 
-### Phase 1: Alias Elimination (before fusion)
-Run a pass that replaces alias bindings `[a b]` with substitution of `a→b`
-throughout the body. This is copy propagation but must preserve:
-- Hoistable buffer metadata (`:raster.buffer/hoistable`)
-- Mutation targets (par/map! output arrays must keep their binding)
-- Bindings that the closure builder expects to exist for hoisting
+Fusion legality is target independent; profitability may use an `AbstractMachine`. The current
+fan-out rule compares recomputation against the dtype-specific machine ridge point and records its
+decision and inputs in `:fusion/placements`. With no target facts Raster conservatively preserves
+the materialization boundary.
 
-**Approach**: Don't eliminate the binding — instead, build an alias map
-and pass it to the fusion graph builder as context. The fusion graph
-resolves through aliases when building edges, but the IR stays unchanged.
+This is the initial form of the adaptive/JIT contract: observed device facts and calibrated cost
+models can refine a choice, while the typed program and numerical oracle constrain the search.
 
-### Phase 2: Fusion Graph with Alias Resolution
-`build-fusion-graph` gets an `alias-map` parameter:
-```clojure
-(defn build-fusion-graph [soac-nodes alias-map]
-  ;; When looking up producer-of for a free sym,
-  ;; resolve through alias-map first
-  (let [resolve (fn [sym] (get alias-map sym sym))]
-    ...))
-```
+## Remaining work
 
-The edges are classified using the resolved symbol (to find the right
-SOAC output). The fused code uses the **original** symbols (not resolved),
-so no substitution needed in the output.
+1. Replace remaining compatibility operation coverage (RNG, collect/atomics, and specialized block
+   movement) with direct typed equations and schedules.
+2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
+   beta-reduce away type contracts.
+3. Add explicit integer arithmetic semantics (`wrap`, `trap`, or proved no-overflow) before using
+   integral scalar algebra for indexing, RNG, and quantization.
+4. Generalize `AxisMap` and layout facts for multidimensional views, strided gather/scatter, and
+   block movement without turning layouts into semantic tensor operators.
+5. Add independent numerical/property tests across aliases, mutation, fan-out, empty extents,
+   floating-point edge cases, AD graphs, contractions, scans, and scientific stencils.
+6. Extend schedule search and measured caches across GPU families while keeping the SOAC algebra
+   and KernelBody target neutral.
 
-### Phase 3: Multi-Consumer Vertical Fusion
-Relax condition #7 to allow fusion when:
-- Producer has other consumers
-- Producer output buffer is RETAINED (not eliminated)
-- Fused consumer reads from the retained buffer
+## Relationship to reference systems
 
-This is what XLA does — the intermediate buffer stays alive for
-the non-fused consumer, but the fused consumer avoids the memory
-round-trip.
+- Futhark supplies the model of a small functional array algebra with aggressive, legality-driven
+  fusion and explicit uniqueness/alias reasoning.
+- JAX/XLA supply staging, shape specialization, graph-level AD composition, and profile-guided
+  executable selection.
+- MLIR supplies the discipline of explicit dialect conversions, verified interfaces, and target
+  lowering boundaries.
+- Triton and Halide supply programmable schedules and hardware-aware tiling/locality choices.
 
-```clojure
-(defn can-fuse-vertically? [graph producer-id consumer-id]
-  (and
-    ;; ... existing conditions 1-6 ...
-    ;; 7. Producer output can be retained if other consumers exist
-    (or (empty? (other-consumers graph producer-id consumer-id))
-        ;; Other consumers exist: check that producer output is
-        ;; written to a buffer that can stay alive
-        (some? (soac/soac-output-buffer producer)))))
-```
-
-### Phase 4: SGD Fusion
-The 4 `sgd-step!` calls at the end are independent par/map! forms on
-different arrays (W1, b1, W2, b2). They can't be horizontally fused
-(different bounds) but each could be vertically fused with its
-gradient producer:
-
-```
-backward-dW (par/map!) → sgd-step! W1 (par/map!)  → fuse into single loop
-backward-db (par/map!) → sgd-step! b1 (par/map!)  → fuse into single loop
-```
-
-This requires sgd-step! to be expanded to par/map! BEFORE fusion runs.
-Currently sgd-step! is inlined late (during segop-lower). Moving it
-earlier would expose the par form for fusion.
-
-### Phase 5: Matmul Fusion
-For small matrices (N < 512), BLAS FFI overhead (~2µs) may exceed the
-matmul itself. XLA generates inline matmul for small sizes, fused with
-bias addition. We could:
-- Skip BLAS below a threshold
-- Emit the matmul as a par/map! + par/reduce pattern
-- Fuse with bias add and relu
-
-This is lower priority — the main gains come from loop fusion.
-
-## Performance Target
-
-| Operation | Current | After Phase 1-3 | After Phase 4 | XLA |
-|-----------|---------|-----------------|---------------|-----|
-| Forward pass | 3 loops + 2 BLAS | 1 loop + 2 BLAS | 1 loop + 2 BLAS | 2 fused kernels |
-| Backward CE+softmax | 3 loops | 1 fused loop | 1 fused loop | 1 kernel |
-| Backward relu+dense | 2 loops + 2 BLAS | 1 loop + 2 BLAS | 1 fused loop + 2 BLAS | 1 kernel |
-| SGD (4x) | 4 loops | 4 loops | fused with backward | fused with backward |
-| **Total loops** | **9** | **~5** | **~3** | **~3 kernels** |
-
-With phases 1-4, we'd go from 9 separate loops to ~3 fused loops,
-matching XLA's fusion level. The remaining gap would be BLAS vs inline
-matmul, which is Phase 5.
+Raster keeps Clojure/TypedClojure as the source language, its own functional semantic IR, and
+inspectable schedule/artifact values. Attention, quantization formats, paged storage, and cluster
+placement are consumers of this stack or typed representation/layout facts; they are not alternate
+fusion authorities.
 
 ## References
 
-- XLA HLO dump: `/tmp/xla_dump/module_0035.jit_mlp_step.cpu_after_optimizations.txt`
+- `design/compiler-north-star.md`
+- `src/raster/compiler/ir/soac_dialect.clj`
+- `src/raster/compiler/passes/parallel/typed_soac_frontend.clj`
+- `src/raster/compiler/passes/parallel/typed_soac_fusion.clj`
 - Futhark fusion: `../futhark/src/Futhark/Optimise/Fusion/GraphRep.hs`
-- Our SOAC graph: `src/raster/compiler/passes/parallel/soac_graph.clj`
-- Investigation notes: `memory/f32_parametric_root_cause.md`
