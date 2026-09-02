@@ -242,6 +242,21 @@
       (par/active-ids! ids2 n-active n-agents 77777)
       (is (= (seq ids1) (seq ids2)) "Same seed must be deterministic"))))
 
+(deftest rng-fill-session-api-uses-the-generic-map-abi
+  (let [call (atom nil)
+        session (atom {:device-id :ze:0
+                       :kernels {:fill-rng-seeds [{:kernel-name "typed_rng_map"}]}
+                       :buffers {:rng-seeds :resident-seeds}})
+        resolver (fn [_device operation]
+                   (is (= "invoke-registered-kernel" operation))
+                   (fn [& arguments] (reset! call arguments)))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      #(gpu/invoke-rng-fill! session :fill-rng-seeds :rng-seeds 17 42))
+    (is (= ["typed_rng_map" [] :resident-seeds
+            [{:type :long :value 42}] 17]
+           @call))))
+
 (deftest test-active-ids-codegen
   (testing "generate-par-active-ids-kernel emits correct long types"
     (let [k (par-opencl/generate-par-active-ids-kernel)]

@@ -74,8 +74,9 @@ models can refine a choice, while the typed program and numerical oracle constra
 
 ## Remaining work
 
-1. Replace remaining compatibility operation coverage (RNG, collect/atomics, and specialized block
-   movement) with direct typed equations and schedules.
+1. Replace remaining compatibility operation coverage (active-ID narrowing, collect/atomics, and
+   specialized block movement) with direct typed equations and schedules. RNG fill is now an
+   ordinary typed map with wrapping SplitMix64 scalar SSA.
 2. Finish explicit typed scalar SSA for every region; do not recover scalar types in emitters or
    beta-reduce away type contracts.
 3. Finish explicit integer arithmetic semantics. Unchecked source add/subtract/multiply now retain

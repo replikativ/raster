@@ -823,7 +823,7 @@
         (release-kernel-graph! sess handle)))))
 
 (defn invoke-rng-fill!
-  "Invoke a compiled parallel RNG fill kernel from the session.
+  "Invoke the compiled typed-map RNG fill artifact from the session.
 
    sess: session atom
    phase-key: keyword identifying the RNG fill kernel
@@ -834,8 +834,9 @@
   (let [{:keys [kernels buffers]} @sess
         kernel-info (first (get kernels phase-key))
         device-id (:device-id @sess)
-        invoke! (rt-resolve device-id "invoke-registered-rng-fill-kernel")]
-    (invoke! (:kernel-name kernel-info) (get buffers buf-key) n base-seed)))
+        invoke! (rt-resolve device-id "invoke-registered-kernel")]
+    (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
+             [{:type :long :value (long base-seed)}] n)))
 
 (defn invoke-active-ids!
   "Invoke a compiled parallel active-id generation kernel from the session.
