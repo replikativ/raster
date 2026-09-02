@@ -9,7 +9,6 @@
    par form vocabulary but produce different target code."
   (:require [clojure.set :as set]
             [raster.compiler.ir.par :as par]
-            [raster.compiler.ir.soac]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -19,7 +18,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.passes.parallel.soac-lower]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -68,8 +67,6 @@
                                    (when-let [dt (dtype/dtype-for-array-tag t)]
                                      [p (if (#{:float :double} dt) dtype dt)]))
                                  (map vector params tags)))}))
-
-(def ^:private segop-id-counter (atom 0))
 
 (def ^:private fatal-reasons
   "A violated invariant is not \"the SegOp path does not cover this form\". Letting one fall through
@@ -137,10 +134,12 @@
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segmap form dtype :none
                              #(let [par-info (par/extract-par-map-info form)
-                                    soac (raster.compiler.ir.soac/par-form->soac
-                                          (:out par-info) form (swap! segop-id-counter inc))]
-                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     (:out par-info) form
+                                     {:target-device (or device-id :ze:0)
+                                      :dtype (or dtype :double)})]
+                                (first (:operations scheduled))))
               (let [decline (last (:segop-declined @stats))]
                 (throw (ex-info "par/map! remains illegal after full SegOp conversion"
                                 {:reason :illegal-op-remains
@@ -159,11 +158,11 @@
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segred form dtype :none
                              #(let [sym (gensym "red_")
-                                    soac (raster.compiler.ir.soac/par-form->soac
-                                          sym form (swap! segop-id-counter inc)
-                                          :dtype (or dtype :double))]
-                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+                                    scheduled
+                                    (segop-lower-pass/schedule-single-operation
+                                     sym form {:target-device (or device-id :ze:0)
+                                               :dtype (or dtype :double)})]
+                                (first (:operations scheduled))))
               (let [decline (last (:segop-declined @stats))]
                 (throw (ex-info "par/reduce remains illegal after full SegOp conversion"
                                 {:reason :illegal-op-remains

@@ -65,8 +65,9 @@ SSA-like result IDs, `AbstractValue` contracts, effects, diagnostics, and proven
 GPU and JVM backends consume the recorded operations; the source expression is retained only to
 reconstruct scalar host control around them. The `:segop-lowered` validator performs a full
 operation/type legality check, and source equality invalidates an equation after a backend-local
-rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
-path.
+rewrite. Direct calls to a backend may still request explicit, counted compatibility scheduling,
+but that request now crosses the shared SegOp middle-end boundary; JVM and OpenCL emitters no
+longer construct legacy SOAC nodes themselves.
 
 The typed map/reduction vertical is now production-routed for supported programs whether or not a
 fusion fires. Unsupported source remains deliberately unfused for compatibility lowering; it can
