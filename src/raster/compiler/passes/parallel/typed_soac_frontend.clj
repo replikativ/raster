@@ -59,6 +59,38 @@
              (= 1 (count (descriptor/call-args expression))))
     (first (descriptor/call-args expression))))
 
+(defn- same-symbol?
+  [left right]
+  (if (and (symbol? left) (symbol? right))
+    (= (name left) (name right))
+    (= left right)))
+
+(defn- additive-update-contribution
+  "Return the contribution in destination[index] + contribution.
+
+   The contribution must not read the destination again: such a read would occur outside the
+   eventual atomic update and would therefore be racy. This recognizes algebra, not a source
+   primitive, so generic effect maps and indexed operations share one conflict proof."
+  [destination destination-index value]
+  (when (and (seq? value)
+             (contains? #{'+ 'clojure.core/+} (descriptor/semantic-op value)))
+    (let [arguments (vec (descriptor/call-args value))
+          accumulator-read?
+          (fn [expression]
+            (and (descriptor/aget-call? expression)
+                 (same-symbol? destination (descriptor/aget-array-sym expression))
+                 (= (strip-index-cast destination-index)
+                    (strip-index-cast (descriptor/aget-index expression)))))]
+      (when (= 2 (count arguments))
+        (let [[left right] arguments
+              contribution (cond
+                             (accumulator-read? left) right
+                             (accumulator-read? right) left)]
+          (when (and contribution
+                     (not-any? #(same-symbol? destination %)
+                               (par/collect-aget-arrays contribution)))
+            contribution))))))
+
 (defn- retained-local-dtype
   [binding init]
   (let [init-tag (when (instance? clojure.lang.IObj init)
@@ -162,6 +194,14 @@
         (let [raw-index (nth arguments 1)
               unique-index (unique-index-expression raw-index)
               value (nth arguments 2)
+              ;; A dense destination[i] update is still an ordinary pointwise map: its old-value
+              ;; read belongs in the scalar expression and needs no cross-work-item conflict
+              ;; algebra. Extract an atomic contribution only for a genuinely indirect index.
+              contribution (when (and (not unique-index)
+                                      (not= (strip-index-cast index)
+                                            (strip-index-cast raw-index)))
+                             (additive-update-contribution
+                              (descriptor/aset-array-sym body) raw-index value))
               cast? (and (seq? value)
                          (contains? #{'float 'double 'int 'long
                                       'clojure.core/float 'clojure.core/double}
@@ -171,9 +211,12 @@
            :stores [{:out (descriptor/aset-array-sym body)
                      :index (strip-index-cast (or unique-index raw-index))
                      :conflict (when unique-index :unique)
+                     :reduction-op (when contribution '+)
                      :predicate 1
-                     :value (if cast? (second value) value)
-                     :cast (when cast? (first value))}]})))
+                     :value (if contribution
+                              contribution
+                              (if cast? (second value) value))
+                     :cast (when (and cast? (not contribution)) (first value))}]})))
 
     :else nil))
 
@@ -214,10 +257,12 @@
       :result-dtype (or (:dtype epilogue) :float)})))
 
 (defn- effect-map-description
-  [id symbol index extent {:keys [locals stores]} elem-type]
-  (when (and (seq stores) (independent-stores? locals stores))
+  [id symbol index extent {:keys [locals stores]} elem-type
+   & {:keys [host-return] :or {host-return :effect}}]
+  (when (and (seq stores) (independent-stores? locals stores)
+             (or (= :effect host-return) (= 1 (count stores))))
     (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
-          pointwise? (every? #(= index (:index %)) stores)
+          pointwise? (every? #(and (= index (:index %)) (nil? (:reduction-op %))) stores)
           stores (if pointwise?
                    (mapv (fn [{:keys [out predicate value] :as store}]
                            (assoc store :value
@@ -230,7 +275,12 @@
                                           (list 'clojure.core/aget out index)))))
                          stores)
                    stores)
-          conflict (when (every? #(= :unique (:conflict %)) stores) :unique)
+          reduction-ops (set (keep :reduction-op stores))
+          conflict (cond
+                     (every? #(= :unique (:conflict %)) stores) :unique
+                     (and (= 1 (count reduction-ops))
+                          (every? :reduction-op stores))
+                     (dialect/reducing-scatter-conflict (first reduction-ops) elem-type))
           destinations (mapv :out stores)
           values (mapv :value stores)
           write-indices (mapv :index stores)
@@ -238,21 +288,25 @@
           analysis-values (concat (map :init locals) write-indices predicates values)
           io (update (extract-io (list* 'do analysis-values) index destinations)
                      :scalars set/difference (set (map :id locals)))
-          results (mapv #(effect-result-id id %) (range (count stores)))]
-      (when (or pointwise? (= :unique conflict))
+          results (if (= :buffer host-return)
+                    [symbol]
+                    (mapv #(effect-result-id id %) (range (count stores))))]
+      (when (or pointwise? (= :unique conflict)
+                (dialect/reducing-scatter-conflict? conflict))
         (merge {:kind (if pointwise? :map :scatter)
                 :id id :sym symbol :index index :extent extent
                 :results results :locals locals :bodies values :casts (mapv :cast stores)
                 :write-indices write-indices :predicates predicates
                 :conflict (when-not pointwise? conflict)
-                :effect-only? true :host-binding symbol :elem-type elem-type
+                :effect-only? (= :effect host-return)
+                :host-binding symbol :elem-type elem-type
                 :result-storage
                 (mapv (fn [destination]
                         {:destination destination
                          :access (if (or (not pointwise?)
                                          (contains? (:inputs io) destination))
                                    :read-write :write)
-                         :host-return :effect})
+                         :host-return host-return})
                       destinations)}
                io)))))
 
@@ -576,7 +630,9 @@
     (let [{:keys [idx bound body elem-type]}
           (par/extract-par-map-void-info expression)]
       (when-let [region (pointwise-region body idx)]
-        (effect-map-description id symbol idx bound region elem-type)))
+        (effect-map-description id symbol idx bound region
+                                (dtype/canon (or elem-type default-dtype))
+                                :host-return (or (::host-return (meta expression)) :effect))))
 
     :else nil))
 
@@ -616,33 +672,41 @@
     (when position
       (with-meta (apply list (assoc (vec expression) position extent)) (meta expression)))))
 
-(defn- canonicalize-strided-gather
-  "Express a strided gather in the existing one-dimensional functional map algebra.
+(defn- canonicalize-strided-indexed-operation
+  "Express a strided gather/scatter in the existing one-dimensional functional algebra.
 
    The flattened coordinate is split into row/component indices inside the scalar region. The
    ordinary compound-extent normalization below then gives n*stride one stable scalar SSA value.
-   This keeps storage layout in index expressions instead of introducing an attention- or
-   gather-specific semantic operation."
+   Gather becomes a dense map. Scatter becomes an additive effect region that generic store
+   analysis certifies as a reducing scatter. Storage layout remains in index expressions instead
+   of introducing operation-specific semantic nodes."
   [ordinal expression]
-  (if-let [{:keys [out src index n stride]}
-           (when (par/par-gather-form? expression)
-             (par/extract-par-gather-info expression))]
+  (let [gather (when (par/par-gather-form? expression)
+                 (par/extract-par-gather-info expression))
+        scatter (when (par/par-scatter-form? expression)
+                  (par/extract-par-scatter-info expression))
+        {:keys [out src index n stride]} (or gather scatter)]
     (if stride
-      (let [flat-index (clojure.core/symbol (str "rstr_gather_flat_" ordinal))
+      (let [flat-index (clojure.core/symbol (str "rstr_indexed_flat_" ordinal))
             row-index (list 'clojure.core/quot flat-index stride)
             component (list 'clojure.core/rem flat-index stride)
-            source-index (list 'clojure.core/+
+            routed-index (list 'clojure.core/+
                                (list 'clojure.core/*
                                      (list 'clojure.core/aget index row-index)
                                      stride)
-                               component)]
+                               component)
+            extent (list 'clojure.core/* n stride)]
         (with-meta
-          (list 'raster.par/map! out flat-index
-                (list 'clojure.core/* n stride) nil
-                (list 'clojure.core/aget src source-index))
-          (meta expression)))
-      expression)
-    expression))
+          (if gather
+            (list 'raster.par/map! out flat-index extent nil
+                  (list 'clojure.core/aget src routed-index))
+            (list 'raster.par/map-void! flat-index extent
+                  (list 'clojure.core/aset out routed-index
+                        (list 'clojure.core/+
+                              (list 'clojure.core/aget out routed-index)
+                              (list 'clojure.core/aget src flat-index)))))
+          (cond-> (meta expression) scatter (assoc ::host-return :buffer))))
+      expression)))
 
 (defn normalize-source
   "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
@@ -657,7 +721,7 @@
           {:keys [normalized]}
           (reduce
            (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
-             (let [expression (canonicalize-strided-gather ordinal expression)
+             (let [expression (canonicalize-strided-indexed-operation ordinal expression)
                    extent (parallel-extent expression)
                    canonical-extent (some-> extent descriptor/unwrap-int-cast)]
                (cond

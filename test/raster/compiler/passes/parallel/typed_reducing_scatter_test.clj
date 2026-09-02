@@ -12,7 +12,7 @@
   {'out :float 'vals :float 'keys :int})
 
 (def ^:private scalar-types
-  {'n :long})
+  {'n :long 'stride :long})
 
 (defn- schedule [source dtype array-types target]
   (pipeline/schedule-parallel-form
@@ -66,6 +66,61 @@
       (is (= :inout (:kind (second (:abi kernel)))))
       (is (str/includes? (:source kernel) "float atomic_add_float"))
       (is (str/includes? (:source kernel) "atomic_add_float(out_ + keys[idx], vals[idx])")))))
+
+(deftest strided-scatter-is-the-same-proof-carrying-reduction
+  (let [source '(let* [step (raster.par/scatter! out vals keys n stride)] step)
+        {scheduled :form stats :stats} (schedule source :float float-types :ocl:0)
+        operation (-> scheduled :equations second :operations first)
+        algorithm (-> scheduled :equations second :algorithm)
+        conflict (-> algorithm dialect/equations first dialect/operation-parts
+                     :attributes :conflict)
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out vals keys n stride] (:form jvm)))
+        out (float-array [10.0 20.0 30.0 40.0])
+        gpu (opencl-pass/opencl-pass
+             scheduled :device-id :ocl:0 :dtype :float :min-elements 0
+             :array-types float-types :scalar-types scalar-types)
+        kernel (first (:kernels gpu))
+        kernel-source (:source kernel)]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= :reduce (:kind conflict)))
+    (is (= '+ (:operator conflict)))
+    (is (= :reduce (:write-conflict operation)))
+    (is (not-any? #{'raster.par/scatter!}
+                  (tree-seq coll? seq (:source scheduled))))
+    (testing "JVM performs the exact sequential reduction through the scheduled effect region"
+      (is (= 1 (get-in jvm [:stats :segop-reused])))
+      (is (nil? (get-in jvm [:stats :segop-relowered])))
+      (is (identical? out (execute out (float-array [1 2 3 4 5 6])
+                                   (int-array [1 0 1]) 3 2)))
+      (is (= [13.0 24.0 36.0 48.0] (mapv double out))))
+    (testing "GPU derives an atomic add from the same conflict certificate"
+      (is (= 1 (get-in gpu [:stats :segop-reused])))
+      (is (zero? (get-in gpu [:stats :fallback])))
+      (is (= :reducing-scatter (get-in kernel [:effects :kind])))
+      (is (str/includes? kernel-source "atomic_add_float"))
+      (is (str/includes? kernel-source " / stride"))
+      (is (str/includes? kernel-source " % stride")))))
+
+(deftest additive-effect-recognition-refuses-an-extra-destination-read
+  (let [unsafe
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (clojure.core/aset
+                  out (clojure.core/aget keys i)
+                  (clojure.core/+
+                   (clojure.core/aget out (clojure.core/aget keys i))
+                   (clojure.core/aget out i))))]
+               effect)
+        routed (pipeline/schedule-parallel-form
+                unsafe {:target-device :cpu:0 :dtype :float
+                        :array-types float-types :scalar-types scalar-types})]
+    (is (not= :typed-soac (get-in routed [:stats :source-dialect])))
+    (is (= :typed-soac-source-coverage
+           (get-in routed [:stats :typed-soac-declined :reason])))
+    (is (= :unsupported-parallel-operation
+           (get-in routed [:stats :typed-soac-declined :bindings 0 :reason])))))
 
 (deftest verified-array-dtype-selects-the-target-atomic-spelling
   (let [operation '(raster.par/atomic-add! out i contribution)
