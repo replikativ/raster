@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.typed-soac-route
-  "Production route for the closed TypedSOAC map/scalar/reduction subset.
+  "Production route for certified TypedSOAC islands inside host-controlled programs.
 
    Supported programs are represented and fused in the typed dialect whether or not a fusion
    fires. The resulting functional equations are mechanically projected into the surrounding host
@@ -383,6 +383,8 @@
   [form program]
   (let [[let-head bindings & body] form
         original-pairs (vec (partition 2 bindings))
+        host-binding-ids (set (get-in (dialect/facts program)
+                                      [:attributes :host-binding-ids]))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
         realized-host-symbols
@@ -420,7 +422,8 @@
                ;; allocation. Preserve a defining source binding when one exists; dropping it
                ;; leaves CPU-C/JVM materialization with an unbound destination and also loses a
                ;; resident scratch allocation before GPU extraction.
-               (when (and (contains? host-bindings symbol)
+               (when (and (or (contains? host-bindings symbol)
+                              (contains? host-binding-ids id))
                           (not (contains? realized-host-symbols symbol))
                           (empty? (get by-placement id)))
                  [original-pair])
@@ -493,7 +496,7 @@
 
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
-   the form is outside this closed subset."
+   no parallel binding is in this closed subset."
   ([form dtype]
    (attempt form dtype {}))
   ([form dtype array-types]
