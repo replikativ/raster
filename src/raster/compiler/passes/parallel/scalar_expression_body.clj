@@ -257,7 +257,8 @@
                               {:expression expression}))
 
                   (seq? expression)
-                  (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
+                  (let [semantic-operation (descriptor/semantic-op expression)
+                        operator (intrinsics/canonical semantic-operation)
                         intrinsic (intrinsics/descriptor operator)
                         arguments (vec (descriptor/call-args expression))]
                     (when-not intrinsic
@@ -290,6 +291,8 @@
                                               operand-type expression)
                                             arguments)
                               result-type (if comparison? :predicate operand-type)
+                              overflow (intrinsics/source-overflow-policy semantic-operation)
+                              options (cond-> {} overflow (assoc :overflow overflow))
                               _ (when-not (every? #(= operand-type (:type %)) lowered)
                                   (decline! :operand-dtype
                                             "scalar intrinsic operands require one dtype"
@@ -299,9 +302,10 @@
                           {:operations
                            (conj (vec (mapcat :operations lowered))
                                  (body/->ScalarCompute
-                                  (body/value result result-type)
+                                 (body/value result result-type)
                                   (body/scalar-expression operator result-type
-                                                          (mapv :result lowered))))
+                                                          (mapv :result lowered)
+                                                          options)))
                            :result result :type result-type}))))
 
                   :else

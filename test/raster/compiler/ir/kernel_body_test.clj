@@ -287,6 +287,34 @@
            (body/->ScalarCompute
             (body/value 'converted :int)
             (body/cast-expression 'x-value :int :toward-zero :saturate))]))))
+  (testing "integral arithmetic may carry an explicit wrapping contract"
+    (is (body/kernel-body?
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'wrapped :long)
+            (body/scalar-expression
+             :* :long [(body/literal Long/MAX_VALUE :long)
+                       (body/literal 2 :long)]
+             {:overflow :wrap}))]))))
+  (testing "wrapping overflow is not a floating-point policy"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"wrapping overflow is only defined"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :float)
+            (body/scalar-expression :+ :float
+                                    ['x-value (body/literal 1.0 :float)]
+                                    {:overflow :wrap}))]))))
+  (testing "wrapping overflow cannot annotate unrelated integral intrinsics"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"wrapping overflow is only defined"
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'bad :int)
+            (body/scalar-expression :bit-xor :int
+                                    [(body/literal 1 :int) (body/literal 2 :int)]
+                                    {:overflow :wrap}))]))))
   (testing "integral sources do not accept a fictitious rounding direction"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"policies disagree"

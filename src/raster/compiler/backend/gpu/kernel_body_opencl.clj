@@ -903,8 +903,17 @@
         lowering (intrinsics/op->c-lowering op false)
         arguments (mapv #(emit-scalar-value % context) (:arguments expression))
         operand-type (scalar-value-type (first (:arguments expression)) (:types context))
-        integral? (contains? #{:byte :int :long} operand-type)]
+        integral? (contains? #{:byte :int :long} operand-type)
+        wrapping? (= {:overflow :wrap} (:options expression))]
     (cond
+      ;; C-family signed overflow is undefined. Preserve the verified modulo-2^N contract by
+      ;; doing the arithmetic in the same-width unsigned representation and converting the bits
+      ;; back to the expression's declared signed storage type.
+      wrapping?
+      (let [unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* operand-type)]
+        (str "(" (target-type operand-type) ")((" unsigned-type ")(" (first arguments)
+             ") " (:op lowering) " (" unsigned-type ")(" (second arguments) "))"))
+
       ;; The shared C descriptor uses the floating spelling. OpenCL integer min/max are distinct
       ;; overloads, so target spelling must retain the verified operand dtype.
       (and integral? (contains? #{:min :max} op))
