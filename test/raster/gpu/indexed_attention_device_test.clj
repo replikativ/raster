@@ -114,8 +114,8 @@
     (run-case :ze:0)))
 
 (deftest opencl-indexed-attention-matches-independent-plan-oracle
-  (if-not @device-probe/opencl-available?
-    (device-probe/opencl-skip! "indexed attention plan oracle")
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "indexed attention plan oracle" :subgroups)
     (run-case :ocl:0)))
 
 (defn- production-case

@@ -76,6 +76,11 @@
     ;; Tuned dispatch alternatives (subgroup score reuse, matrix leaves) are emitted for GPU
     ;; descriptors only; a CPU OpenCL device such as PoCL executes the portable kernels.
     :gpu-device (= :gpu (:type device))
+    ;; Indexed attention and the scheduled reductions use sub-group lanes; an OpenCL 1.2 CPU
+    ;; implementation without cl_khr_subgroups (PoCL 1.8 on CI images) cannot build them.
+    :subgroups (let [extensions (extension-set device)]
+                 (or (contains? extensions "cl_khr_subgroups")
+                     (contains? extensions "cl_intel_subgroups")))
     (throw (ex-info "Unknown OpenCL test capability" {:capability capability}))))
 
 (defn opencl-status-for
@@ -95,6 +100,9 @@
 
 (def opencl-gpu-available?
   (delay (= :available (:status (opencl-status-for :gpu-device)))))
+
+(def opencl-subgroups-available?
+  (delay (= :available (:status (opencl-status-for :subgroups)))))
 
 (defonce ^:private opencl-skip-log (atom {}))
 
@@ -120,7 +128,7 @@
 (defn opencl-skip!
   "Record one visible OpenCL skip marker, or fail when the runtime is broken/required.
 
-   `capability` is nil, :fp16 or :gpu-device.  Missing optional capabilities remain honest skips;
+   `capability` is nil, :fp16, :gpu-device or :subgroups.  Missing optional capabilities remain honest skips;
    RASTER_EXPECT_OPENCL requires a usable device but does not imply every optional extension."
   ([test-label] (opencl-skip! test-label nil))
   ([test-label capability]

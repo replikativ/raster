@@ -208,11 +208,14 @@
    it enters the combine. The owner of the reduction declares that conversion here as an explicit
    cast the KernelBody lowering accepts; no schedule or emitter may invent a narrowing on its own."
   [step-result element dtype]
-  (let [element-dtype (retained-scalar-dtype element)]
-    (if (and element-dtype (dtype/fp-dtype? element-dtype) (dtype/fp-dtype? dtype)
-             (not= element-dtype (dtype/canon dtype)))
-      (let [cast-tag (dtype/scalar-tag-for-dtype (dtype/canon dtype))
-            converted (with-meta (list (symbol "clojure.core" (name cast-tag)) element)
+  (let [element-dtype (retained-scalar-dtype element)
+        carrier (dtype/canon dtype)
+        ;; Only carriers with a JVM primitive scalar can spell the cast; :half accumulators are
+        ;; owned by the matrix leaves, which convert on their own scheduled store path.
+        cast-tag (:scalar-tag (get dtype/dtype-info carrier))]
+    (if (and element-dtype cast-tag (dtype/fp-dtype? element-dtype) (dtype/fp-dtype? carrier)
+             (not= element-dtype carrier))
+      (let [converted (with-meta (list (symbol "clojure.core" (name cast-tag)) element)
                         {:raster.type/tag cast-tag})]
         (walk/postwalk-replace {element converted} step-result))
       step-result)))
