@@ -46,7 +46,10 @@
         buf->doubles (ns-resolve ze 'buffer->double-array)
         _ (register! kernel-name {:source source :dtype dtype})
         {:keys [kernel-handle]} (ensure-loaded! kernel-name)
-        [gx gy] grid
+        ;; A routed descriptor's launch rank follows its schedule: the portable segmented
+        ;; reduction is a 1-D launch, the tiled leaves are 2-D. Pad the missing axis with 1.
+        [gx gy] (into (vec grid) (repeat (- 2 (count grid)) 1))
+        wg (into (vec wg) (repeat (- 2 (count wg)) 1))
         args (into (mapv #(:segment (get bufs %)) array-params)
                    (into [(:segment out)] scalar-args))]
     (launch-2d! kernel-handle wg [gx gy] args)

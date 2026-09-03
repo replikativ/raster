@@ -179,9 +179,12 @@
       (testing "the fused KernelBody gains the operand ABI and a typed scalar region"
         (is (str/includes? (:source fused-k) "restrict bias"))
         (is (not (str/includes? (:source fused-k) "silu_f")))
-        (is (re-find #"float x = \(\(acc00\.s0\) \+ .*bias\[[^]]*col"
-                     (:source fused-k))
-            "the axis-map's j must bind to the store slot's col"))
+        ;; The typed scalar region lowers the `let` to SSA; the emitted text binds the bias
+        ;; operand's j axis to the store slot's col and evaluates the activation in place.
+        (is (re-find #"\(acc00\.s0\) \+ bias\[[^]]*col" (:source fused-k))
+            "the axis-map's j must bind to the store slot's col")
+        (is (re-find #"exp\(" (:source fused-k))
+            "the activation reaches the store slot as a scalar intrinsic"))
       (testing "fused result == unfused GEMM followed by a separate bias+silu pass"
         ;; the two-pass reference: read C back, then apply the epilogue on the host
         (let [ref (vec (map-indexed (fn [idx v] (silu (+ (double v) (aget biasd (mod idx N)))))
