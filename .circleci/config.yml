@@ -141,10 +141,12 @@ jobs:
             done
 
   opencl-cpu-gate:
-    # Executes the OpenCL-gated namespaces on Intel's CPU OpenCL runtime (OpenCL 3.0 with
-    # sub-groups and fp16, free from Intel's apt repository): emitted kernels are compiled by a
-    # real OpenCL implementation and run without a GPU. Measured locally: ~80 s wall for the
-    # whole gated set including JVM start. Only tuned-dispatch tests that need a GPU device skip.
+    # Executes the OpenCL-gated namespaces on a CPU OpenCL implementation so emitted kernels are
+    # compiled by a real OpenCL compiler and run without a GPU. Default: the distribution's PoCL
+    # (OpenCL 1.2 on this image, so sub-group and fp16 kernels skip on their capability gates and
+    # the log names the device that ran). Intel's CPU runtime (OpenCL 3.0 with sub-groups) is
+    # opt-in via RASTER_CI_OPENCL_RUNTIME=intel: its JIT segfaults inside this container image
+    # as of 2026-09, while it runs the full gated set locally in ~80 s.
     executor: clojure-java24
     steps:
       - attach_workspace:
@@ -156,26 +158,19 @@ jobs:
             - v2-dependencies-
       - run:
           name: Install OpenBLAS, clang and a CPU OpenCL runtime
-          # Preferred: Intel's CPU runtime (OpenCL 3.0, sub-groups, fp16). If its apt
-          # repository cannot be reached or verified from this image, fall back to the
-          # distribution's PoCL; sub-group and fp16 kernels then skip on their capability gates
-          # and the job log names the device that actually ran.
           command: |
             sudo apt-get update
             sudo apt-get install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
               clang ocl-icd-libopencl1 clinfo
-            sudo update-ca-certificates
-            if curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-                 | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null \
-               && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
-                 | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null \
-               && sudo apt-get update \
-               && sudo apt-get install -y intel-oneapi-runtime-opencl; then
-              echo "using Intel's CPU OpenCL runtime"
-            else
-              echo "Intel apt repository unavailable from this image; falling back to PoCL"
-              sudo rm -f /etc/apt/sources.list.d/oneAPI.list
+            if [ "${RASTER_CI_OPENCL_RUNTIME:-pocl}" = "intel" ]; then
+              sudo update-ca-certificates
+              curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+                | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
               sudo apt-get update
+              sudo apt-get install -y intel-oneapi-runtime-opencl
+            else
               sudo apt-get install -y pocl-opencl-icd
             fi
             clinfo -l
