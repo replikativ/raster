@@ -103,6 +103,49 @@
           (is (str/includes? (:source emitted) "bias["))
           (is (str/includes? (:source emitted) "scale")))))))
 
+(defn- let-epilogue-plan [expr]
+  (let [epilogue {:acc 'acc
+                  :expr expr
+                  :operands [{:sym 'bias :dtype :float
+                              :map (axis-map/of-axes [['j 8]])}]
+                  :dtype :float}
+        form '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
+                                    (raster.numeric/*
+                                     (clojure.core/aget A (clojure.core/+ (clojure.core/* i 16) l))
+                                     (clojure.core/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+        form (concat form [:epilogue epilogue])
+        verified (facts/contraction-facts form :dtype :half)
+        segred (lower/contract-form->segred form :dtype :half :facts verified)]
+    (schedule/plan-portable-body verified segred nil)))
+
+(deftest a-let-bound-result-transform-lowers-to-shared-typed-ssa
+  (testing "a let binding is one SSA value reused by every later reference"
+    (let [plan (let-epilogue-plan
+                '(let [x (raster.numeric/+ acc (clojure.core/aget bias j))]
+                   (raster.numeric// x (raster.numeric/+ 1.0
+                                                         (raster.math/exp
+                                                          (raster.numeric/* -1.0 x))))))
+          kernel (:body plan)
+          operations (:operations kernel)
+          epilogue-operations (subvec operations 1 (dec (count operations)))
+          operators (keep #(get-in % [:expression :op]) epilogue-operations)]
+      (is (:ok plan))
+      ;; widen acc, load bias, x = acc + bias, -1*x, exp, 1+exp, x/(1+exp), narrow to half
+      (is (= 8 (count epilogue-operations)))
+      (is (= [:cast :+ :* :exp :+ :div :cast] (vec operators))
+          "the addition bound to x is emitted once and reused, not once per use")
+      (doseq [dialect [:opencl-portable :cuda :hip]]
+        (let [emitted (emit/generate-contraction-kernel-body kernel :target-dialect dialect)]
+          (is (str/includes? (:source emitted) "exp("))
+          (is (= '[bias] (:epilogue-operands emitted)))))))
+  (testing "a let binder shadows the accumulator lexically"
+    (let [plan (let-epilogue-plan '(let [acc (raster.numeric/* acc 2.0)] acc))
+          operations (:operations (:body plan))
+          epilogue-operations (subvec operations 1 (dec (count operations)))]
+      (is (:ok plan))
+      ;; widen acc, multiply, narrow to half
+      (is (= 3 (count epilogue-operations))))))
+
 (deftest a-result-transform-can-reuse-one-contraction-operand-without-a-second-abi-slot
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/+ acc (clojure.core/aget A

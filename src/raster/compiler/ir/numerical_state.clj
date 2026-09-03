@@ -12,9 +12,9 @@
    reconstruction.  Sparse and AMR states are represented as multiple explicitly coordinated
    fields; future schemas may add partial/delta field coverage without weakening this contract."
   (:refer-clojure :exclude [chunk])
-  (:require [clojure.string :as string]
-            [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.ir.abstract-value :as abstract-value]))
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.validate :refer [fail! exact-keys! non-blank-string? unique-by!]]))
 
 (def schema-version 1)
 
@@ -42,22 +42,6 @@
 (defn manifest? [value] (instance? NumericalStateManifest value))
 (defn certificate? [value] (instance? NumericalStateCertificate value))
 (defn certified-state? [value] (instance? CertifiedNumericalState value))
-
-(defn- fail!
-  [message reason data]
-  (throw (ex-info message (assoc data :reason reason))))
-
-(defn- exact-keys!
-  [label reason candidate allowed]
-  (let [unexpected (vec (remove allowed (keys candidate)))]
-    (when (seq unexpected)
-      (fail! (str label " contains fields outside its versioned schema")
-             reason {:unexpected unexpected :allowed allowed})))
-  candidate)
-
-(defn- non-blank-string?
-  [value]
-  (and (string? value) (not (string/blank? value))))
 
 (defn content-address
   "Construct a storage-independent identity for immutable bytes.
@@ -154,13 +138,6 @@
          parents [] logical-coordinate {} fields [] attributes {}}}]
   (->NumericalStateManifest id schema-version parents logical-coordinate fields numerical-contract
                             provenance attributes))
-
-(defn- unique-by!
-  [label reason key-fn values]
-  (let [ids (mapv key-fn values)]
-    (when-not (= (count ids) (count (distinct ids)))
-      (fail! (str label " must have unique identities") reason {:ids ids})))
-  values)
 
 (defn- concrete-shape!
   [field-id value]

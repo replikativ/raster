@@ -187,6 +187,9 @@
          (remake-from expr (map #(subst-syms smap % leaf-fn) expr)))
 
        (vector? expr) (mapv #(subst-syms smap % leaf-fn) expr)
+       ;; IR records (KernelBody IndexExpr, SegOps, ...) are maps whose type must survive:
+       ;; substitute inside their fields, never `empty` them.
+       (record? expr) (reduce-kv (fn [r k v] (assoc r k (subst-syms smap v leaf-fn))) expr expr)
        (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn) (subst-syms smap v leaf-fn)]) expr))
        (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn) expr))
        :else expr))))
@@ -245,6 +248,7 @@
                 (mapv #(alpha-convert env %) outer))
        (remake-from form (map #(alpha-convert env %) form)))
      (vector? form) (mapv #(alpha-convert env %) form)
+     (record? form) (reduce-kv (fn [r k v] (assoc r k (alpha-convert env v))) form form)
      (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
      (set? form) (into (empty form) (map #(alpha-convert env %) form))
      :else form)))
@@ -289,6 +293,7 @@
                (mapv #(uniquify* env bound %) outer))
       (remake-from form (map #(uniquify* env bound %) form)))
     (vector? form) (mapv #(uniquify* env bound %) form)
+    (record? form) (reduce-kv (fn [r k v] (assoc r k (uniquify* env bound v))) form form)
     (map? form) (into (empty form) (map (fn [[k v]] [(uniquify* env bound k) (uniquify* env bound v)]) form))
     (set? form) (into (empty form) (map #(uniquify* env bound %) form))
     :else form))
@@ -378,6 +383,7 @@
                (and (seq? form) (= 'quote (first form))) form
                (seq? form) (remake-from form (map go form))
                (vector? form) (with-meta (mapv go form) (meta form))
+               (record? form) (reduce-kv (fn [r k v] (assoc r k (go v))) form form)
                (map? form) (with-meta
                              (into (empty form) (map (fn [[k v]] [(go k) (go v)])) form)
                              (meta form))

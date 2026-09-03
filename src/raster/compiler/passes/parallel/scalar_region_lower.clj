@@ -9,6 +9,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
@@ -129,13 +130,36 @@
                           result operand-dtype)
                    result-dtype))))
 
-            (lower-expression [expression]
+            (lower-let [expression env]
+              ;; A let region is an ordered sequence of typed SSA bindings: each init lowers in
+              ;; the environment of the binders before it, and the single body lowers in the
+              ;; environment of all of them. Binders shadow region parameters lexically.
+              (let [[_ bindings & body] expression]
+                (when-not (and (vector? bindings) (even? (count bindings))
+                               (every? simple-symbol? (take-nth 2 bindings))
+                               (= 1 (count body)))
+                  (decline! :result-transform-let
+                            "result-transform let requires simple symbol binders and one body"
+                            {:expression expression}))
+                (let [env (reduce (fn [env [binder init]]
+                                    (assoc env binder (lower-expression init env)))
+                                  env
+                                  (partition 2 bindings))]
+                  (lower-expression (first body) env))))
+
+            (lower-expression [expression env]
               (cond
                 (number? expression)
                 {:value (body/literal expression result-dtype) :dtype result-dtype}
 
+                (contains? env expression)
+                (cast (get env expression) result-dtype)
+
                 (= accumulator-id expression)
                 (cast {:value accumulator :dtype accumulator-dtype} result-dtype)
+
+                (and (seq? expression) (form/let-head? (first expression)))
+                (lower-let expression env)
 
                 (contains? (set scalar-ids) expression)
                 (let [parameter (get parameters expression)]
@@ -163,7 +187,7 @@
                               "portable result transform requires casts to its declared result dtype"
                               {:expression expression :target target
                                :result-dtype result-dtype}))
-                  (cast (lower-expression (second expression)) target))
+                  (cast (lower-expression (second expression) env) target))
 
                 (seq? expression)
                 (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
@@ -177,7 +201,7 @@
                               "result-transform expression has no typed portable scalar lowering"
                               {:expression expression :operator operator
                                :result-dtype result-dtype}))
-                  (let [inputs (mapv (comp :value lower-expression) arguments)
+                  (let [inputs (mapv #(:value (lower-expression % env)) arguments)
                         result (fresh "result-transform-value")]
                     (emit! (body/->ScalarCompute
                             (body/value result result-dtype)
@@ -188,7 +212,7 @@
                 (decline! :result-transform-expression
                           "result-transform expression references an unbound or unsupported value"
                           {:expression expression})))]
-      (let [typed-result (lower-expression (:expression region))
+      (let [typed-result (lower-expression (:expression region) {})
             stored-result (cast typed-result store-dtype)]
         {:operations @operations
          :result (:value stored-result)

@@ -4,7 +4,8 @@
    registers + launches the chosen kernel on device → result matches CPU. End-to-end proof
    that the SOAC contraction path compiles automatically (not just as a standalone emitter).
    Gated on a real GPU."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string]
+            [clojure.test :refer [deftest is testing]]
             [raster.arrays :as ra]
             [raster.compiler.backend.gpu.opencl-pass :as ocl]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -51,7 +52,12 @@
       (try
         (let [program (fixture/instantiate! session descriptor [A B])
               result (get (fixture/run! program [A B]) 'C)]
-          (is (= [:contract] (mapv :convention (:steps descriptor))))
+          ;; The typed contraction route emits one scheduled-executable step whose dispatch is
+          ;; the typed contraction dispatch; no convention-specific contraction marker remains.
+          (is (= [:executable] (mapv :convention (:steps descriptor))))
+          (is (every? #(clojure.string/starts-with? (str (:dispatch-id %))
+                                                    "raster_typed_contraction_dispatch")
+                      (:steps descriptor)))
           (is (= (vec (mapcat #(repeat 8 (float %))
                               (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
                                    (range 8))))

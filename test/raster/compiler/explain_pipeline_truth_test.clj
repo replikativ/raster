@@ -46,11 +46,22 @@
 (deftest a-declined-conversion-is-visible-even-though-the-form-did-not-change
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "explain-pipeline: declines")
-    (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)]
+    (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)
+          stage-section (fn [label]
+                          (second (re-find (re-pattern (str "--- Stage \\d+: " label
+                                                            " ---([\\s\\S]*?)(?=--- Stage|--- Kernels|\\z)"))
+                                           s)))
+          segop-lower (stage-section "segop-lower")
+          backend (stage-section "backend")]
       (testing "segop-lower records the contraction as a first-class SegContract equation; this
                 stage used to print a decline, and its stats must remain visible"
-        (is (re-find #":segops-lowered 1" s))
-        (is (not (re-find #"DECLINED a conversion" s)) "nothing declines any more"))
+        (is (re-find #":segops-lowered 1" (str segop-lower)))
+        (is (not (re-find #"DECLINED a conversion" (str segop-lower)))
+            "segop-lower no longer declines"))
+      (testing "the backend stage that declines the typed contraction dispatch (symbolic dims) says
+                so in its own stats, so the decline is visible where it happens"
+        (is (re-find #":typed-contraction-dispatch-declines" (str backend)))
+        (is (re-find #"DECLINED a conversion" (str backend))))
       (testing "the kernel section names the leaf, the headline reason, and every leaf that refused"
         (is (re-find #"--- Kernels ---" s))
         (is (re-find #"strategy=:portable-segred" s))
