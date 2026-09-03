@@ -158,3 +158,29 @@
     (is (contains? (set (:binders (first scopes))) 'left-value))
     (is (some #{'nrows} outer))
     (is (some #{'width} outer))))
+
+(deftest scalar-reduction-declares-the-element-conversion-into-its-carrier
+  (testing "a double-typed element entering a float accumulator gets an explicit float cast"
+    (let [element (with-meta '(clojure.core/* scale (clojure.core/aget a i))
+                    {:raster.type/tag 'double})
+          step (list 'clojure.core/+ 'acc element)
+          reduction (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :float
+                                       :result 's :index 'i :step-result step})
+          lambda (first (:results (reduction/fold-region reduction)))
+          converted (nth lambda 2)]
+      (is (= 'clojure.core/float (first converted)))
+      (is (= element (second converted)))
+      (is (= 'float (:raster.type/tag (meta converted))))
+      (is (= converted (:element (:algebra reduction)))
+          "the certificate is re-derived over the converted element")))
+  (testing "a matching precision leaves the step untouched"
+    (let [element (with-meta '(clojure.core/aget a i) {:raster.type/tag 'float})
+          step (list 'clojure.core/+ 'acc element)
+          reduction (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :float
+                                       :result 's :index 'i :step-result step})]
+      (is (= step (first (:results (reduction/fold-region reduction)))))))
+  (testing "an element without a retained precision is left to the owner"
+    (let [step '(clojure.core/+ acc (clojure.core/aget a i))
+          reduction (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :float
+                                       :result 's :index 'i :step-result step})]
+      (is (= step (first (:results (reduction/fold-region reduction))))))))

@@ -246,14 +246,19 @@
                       {:workgroup-size workgroup-size :launch launch-spec})))
     (mapv long workgroup-size)))
 
-(defn- index-expr?
+(defn index-expr?
   "A KernelBody IndexExpr, recognized by class name so the launch algebra stays a leaf."
   [x]
   (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" x))
 
-(defn- index-cast?
+(defn index-cast?
   [x]
   (record-kind? "raster.compiler.ir.kernel_body.IndexCast" x))
+
+(defn index-algebra?
+  "True for the KernelBody index records `resolve-expression` evaluates."
+  [x]
+  (or (index-expr? x) (index-cast? x)))
 
 (defn- resolve-integer!
   [resolve-value expression value]

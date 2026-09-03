@@ -97,8 +97,8 @@
                                                c (m/cos ang) s (m/sin ang)
                                                x0 (aget x (clojure.core/+ base i))
                                                x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                           (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                                           (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))
+                                           (aset out (raster.par/unique-index (clojure.core/+ base i)) (- (* x0 c) (* x1 s)))
+                                           (aset out (raster.par/unique-index (clojure.core/+ (clojure.core/+ base i) hdim2)) (+ (* x1 c) (* x0 s)))))
                    out)))
 
 ;; RoPE backward: RoPE applies the orthogonal rotation R(ang) to each (x0,x1)
@@ -132,8 +132,8 @@
                                                            c (m/cos ang) s (m/sin ang)
                                                            d0 (aget dy (clojure.core/+ base i))
                                                            d1 (aget dy (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                       (aset dx (clojure.core/+ base i) (+ (* d0 c) (* d1 s)))
-                                                       (aset dx (clojure.core/+ (clojure.core/+ base i) hdim2) (- (* d1 c) (* d0 s)))))
+                                                       (aset dx (raster.par/unique-index (clojure.core/+ base i)) (+ (* d0 c) (* d1 s)))
+                                                       (aset dx (raster.par/unique-index (clojure.core/+ (clojure.core/+ base i) hdim2)) (- (* d1 c) (* d0 s)))))
                                dx)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
@@ -210,7 +210,7 @@
                                      c (m/cos ang) s (m/sin ang)
                                      x0 (aget x (+ base i))
                                      x1 (aget x (+ (+ base i) half))]
-                                 (aset out (+ base i) (- (* x0 c) (* x1 s)))
+                                 (aset out (raster.par/unique-index (+ base i)) (- (* x0 c) (* x1 s)))
                                  (aset out (+ (+ base i) half) (+ (* x1 c) (* x0 s))))))))
                        out)))
 
@@ -474,8 +474,8 @@
                                    c (m/cos ang) s (m/sin ang)
                                    x0 (aget x (clojure.core/+ base i))
                                    x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                               (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                               (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+                               (aset out (raster.par/unique-index (clojure.core/+ base i)) (- (* x0 c) (* x1 s)))
+                               (aset out (raster.par/unique-index (clojure.core/+ (clojure.core/+ base i) hdim2)) (+ (* x1 c) (* x0 s)))))))
 
 (deftm kv-append-buf! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long posbuf :- (Array long)] :- Void
                            (raster.par/map-void! i kvrow
@@ -2180,8 +2180,8 @@
                                                       c (m/cos ang) s (m/sin ang)
                                                       x0 (aget x (clojure.core/+ base i))
                                                       x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                  (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                                                  (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+                                                  (aset out (raster.par/unique-index (clojure.core/+ base i)) (- (* x0 c) (* x1 s)))
+                                                  (aset out (raster.par/unique-index (clojure.core/+ (clojure.core/+ base i) hdim2)) (+ (* x1 c) (* x0 s)))))))
 
 ;; Causal batched attention, 3 phases. q:[T,nq*hd] k,v:[T,nkv*hd] row-major;
 ;; sc:[T*nq, T] scores/probs scratch; out:[T, nq*hd].

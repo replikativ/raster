@@ -140,6 +140,44 @@ jobs:
               hipcc --offload-arch=gfx1100 --genco -o "${source}.hsaco" "${source}"
             done
 
+  opencl-cpu-gate:
+    # Executes the OpenCL-gated namespaces on a CPU OpenCL implementation so emitted kernels are
+    # compiled by a real OpenCL compiler and run without a GPU. Default: the distribution's PoCL
+    # (OpenCL 1.2 on this image, so sub-group and fp16 kernels skip on their capability gates and
+    # the log names the device that ran). Intel's CPU runtime (OpenCL 3.0 with sub-groups) is
+    # opt-in via RASTER_CI_OPENCL_RUNTIME=intel: its JIT segfaults inside this container image
+    # as of 2026-09, while it runs the full gated set locally in ~80 s.
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - restore_cache:
+          keys:
+            - v2-dependencies-{{ checksum "deps.edn" }}
+            - v2-dependencies-
+      - run:
+          name: Install OpenBLAS, clang and a CPU OpenCL runtime
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
+              clang ocl-icd-libopencl1 clinfo
+            if [ "${RASTER_CI_OPENCL_RUNTIME:-pocl}" = "intel" ]; then
+              sudo update-ca-certificates
+              curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+                | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y intel-oneapi-runtime-opencl
+            else
+              sudo apt-get install -y pocl-opencl-icd
+            fi
+            clinfo -l
+      - run:
+          name: Run OpenCL-gated tests on the CPU OpenCL device
+          command: scripts/ci-opencl-cpu.sh
+
   deploy:
     executor: clojure-java24
     steps:
@@ -196,6 +234,9 @@ workflows:
           requires:
             - build
       - emit-gpu-compile-fixtures:
+          requires:
+            - build
+      - opencl-cpu-gate:
           requires:
             - build
       - cuda-compile-gate:

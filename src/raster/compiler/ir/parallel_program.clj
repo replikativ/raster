@@ -203,6 +203,20 @@
                    [id (:dtype value)])))
           ids)))
 
+(defn known-value-types
+  "Project declared dtypes for the value IDs whose program value carries a keyword dtype.
+
+   Unlike `declared-value-types`, ids without a declared dtype are omitted rather than refused, so
+   a compatibility program can still contribute every dtype it does know to a backend ABI."
+  [program ids]
+  (let [values (:values (validate! program))]
+    (into {}
+          (keep (fn [id]
+                  (let [value (get values id)]
+                    (when (and (symbol? id) value (keyword? (:dtype value)))
+                      [id (:dtype value)]))))
+          ids)))
+
 (defn equation-for-binding
   "Find the equation for a binding only when the current source still matches its certified source.
    This equality guard invalidates scheduled operations if a later backend-local fusion rewrites the

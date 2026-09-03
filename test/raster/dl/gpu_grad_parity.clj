@@ -173,7 +173,9 @@
      `(raster.core/deftm ~wname ~param-vec :- ~ret-type
         (let [vg# ((rev/value+grad (var ~loss-fqsym)) ~@names)
               g#  (clojure.core/nth vg# ~k)
-              _#  (copy-into! g# ~'__gout__ ~'__gn__)]
+              ;; bound the copy by the grad's own extent: a separate __gn__ parameter is a second,
+              ;; unprovable shape for the same logical value and declines the typed route
+              _#  (copy-into! g# ~'__gout__ (raster.arrays/alength g#))]
           ~'__gout__)))))
 
 (defn grad-parity

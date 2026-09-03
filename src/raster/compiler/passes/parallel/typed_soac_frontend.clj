@@ -251,11 +251,41 @@
           else-region (when else-expression (store-region else-expression index))
           aligned? (and else-region
                         (= (mapv (juxt :out :index) (:stores then-region))
-                           (mapv (juxt :out :index) (:stores else-region))))]
-      (when (and then-region
-                 (empty? (:locals then-region))
-                 (or (nil? else-expression)
-                     (and else-region (empty? (:locals else-region)))))
+                           (mapv (juxt :out :index) (:stores else-region))))
+          merged-predicate (fn [then-predicate else-predicate]
+                             ;; both branches store unconditionally: the merged store is a
+                             ;; full write, not a partial one that would force an in/out read
+                             (if (and (contains? #{true 1} then-predicate)
+                                      (contains? #{true 1} else-predicate))
+                               true
+                               (list 'if predicate then-predicate else-predicate)))
+          branch-value (fn [{:keys [locals stores]}]
+                         ;; A branch that computes its own locals before one store is the
+                         ;; store of a scoped value: keep the locals lexically inside the
+                         ;; branch instead of executing them unconditionally.
+                         (let [bindings (vec (mapcat (fn [{:keys [id init]}] [id init]) locals))
+                               value (:value (first stores))]
+                           (if (seq bindings) (list 'let* bindings value) value)))]
+      (cond
+        ;; Both branches store once to the same destination and at least one branch owns
+        ;; locals: one predicated store of a value-if over the two scoped branch values.
+        (and then-region else-region aligned?
+             (= 1 (count (:stores then-region)) (count (:stores else-region)))
+             (or (seq (:locals then-region)) (seq (:locals else-region))))
+        (let [then-store (first (:stores then-region))
+              else-store (first (:stores else-region))]
+          {:locals []
+           :stores [(assoc then-store
+                           :value (list 'if predicate
+                                        (branch-value then-region)
+                                        (branch-value else-region))
+                           :predicate (merged-predicate (:predicate then-store)
+                                                        (:predicate else-store)))]})
+
+        (and then-region
+             (empty? (:locals then-region))
+             (or (nil? else-expression)
+                 (and else-region (empty? (:locals else-region)))))
         {:locals []
          :stores
          (if aligned?
@@ -263,9 +293,8 @@
                    (let [else-store (nth (:stores else-region) ordinal)]
                      (assoc then-store
                             :value (list 'if predicate (:value then-store) (:value else-store))
-                            :predicate (list 'if predicate
-                                             (:predicate then-store)
-                                             (:predicate else-store)))))
+                            :predicate (merged-predicate (:predicate then-store)
+                                                         (:predicate else-store)))))
                  (range) (:stores then-region))
            (vec
             (concat

@@ -89,6 +89,7 @@
 (def ^:private CL_SUCCESS 0)
 (def ^:private CL_DEVICE_NOT_FOUND -1)
 (def ^:private CL_PLATFORM_NOT_FOUND_KHR -1001)
+(def ^:private CL_DEVICE_TYPE (long 0x1000))
 (def ^:private CL_DEVICE_TYPE_GPU (long 4))
 (def ^:private CL_DEVICE_TYPE_CPU (long 2))
 (def ^:private CL_DEVICE_TYPE_ALL (long 0xFFFFFFFF))
@@ -334,9 +335,21 @@
                       {:alignment-bits bits})))
     (quot bits 8)))
 
+(defn- device-type-keyword
+  "Classify CL_DEVICE_TYPE so capability gates can tell a CPU OpenCL implementation (PoCL, the
+   Intel CPU runtime) from a GPU without reading vendor strings."
+  [device]
+  (let [bits (query-device-info-ulong device CL_DEVICE_TYPE)]
+    (cond
+      (pos? (bit-and bits CL_DEVICE_TYPE_GPU)) :gpu
+      (pos? (bit-and bits CL_DEVICE_TYPE_CPU)) :cpu
+      (pos? (bit-and bits 8)) :accelerator
+      :else :other)))
+
 (defn- device-info
   [device]
   {:name (query-device-info-string device CL_DEVICE_NAME)
+   :type (device-type-keyword device)
    :vendor (query-device-info-string device CL_DEVICE_VENDOR)
    :version (query-device-info-string device CL_DEVICE_VERSION)
    :max-compute-units (query-device-info-uint device CL_DEVICE_MAX_COMPUTE_UNITS)
