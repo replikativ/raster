@@ -17,6 +17,7 @@
                  (list? form)   (outer (apply list (map inner form)))
                  (seq? form)    (outer (doall (map inner form)))
                  (vector? form) (outer (mapv inner form))
+                 (record? form) (outer (reduce-kv (fn [r k v] (assoc r k (inner v))) form form))
                  (map? form)    (outer (into (empty form)
                                              (map (fn [[k v]] [(inner k) (inner v)]) form)))
                  (set? form)    (outer (into (empty form) (map inner form)))
@@ -111,6 +112,7 @@
 
     (seq? form)   (with-meta (apply list (map resugar-interop form)) (meta form))
     (vector? form) (with-meta (mapv resugar-interop form) (meta form))
+    (record? form) (reduce-kv (fn [r k v] (assoc r k (resugar-interop v))) form form)
     (map? form)   (with-meta (into (empty form)
                                    (map (fn [[k v]] [(resugar-interop k) (resugar-interop v)]) form))
                     (meta form))

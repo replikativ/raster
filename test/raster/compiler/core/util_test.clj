@@ -1,6 +1,7 @@
 (ns raster.compiler.core.util-test
   "Tests for free variable analysis — correctness of scoping across all binding forms."
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.core.util :as util]))
 
 ;; ================================================================
@@ -292,3 +293,15 @@
     ;; documents WHY the mechanism was replaced, and would fail if postwalk-replace ever became safe
     (let [smap (into {} (map (fn [s] [s (gensym (str (name s) "__"))])) '[a b a c])]
       (is (= 3 (count smap)) "the duplicate `a` yields ONE entry — the collapse, in one line"))))
+
+(deftest subst-syms-rebuilds-ir-records-instead-of-emptying-them
+  (testing "a KernelBody index record keeps its type and gets its fields substituted"
+    (let [expression (body/expression :mul 'batch (body/index-cast 'seq-len :long :exact))
+          substituted (util/subst-syms '{batch arg_batch seq-len arg_seq} expression)]
+      (is (instance? raster.compiler.ir.kernel_body.IndexExpr substituted))
+      (is (= 'arg_batch (first (:arguments substituted))))
+      (is (= 'arg_seq (:argument (second (:arguments substituted)))))))
+  (testing "records nested inside forms are reached"
+    (let [form (list 'let* ['n (body/expression :add 'a 1)] 'n)
+          substituted (util/subst-syms '{a b} form)]
+      (is (= 'b (first (:arguments (second (second substituted)))))))))

@@ -246,6 +246,15 @@
                       {:workgroup-size workgroup-size :launch launch-spec})))
     (mapv long workgroup-size)))
 
+(defn- index-expr?
+  "A KernelBody IndexExpr, recognized by class name so the launch algebra stays a leaf."
+  [x]
+  (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" x))
+
+(defn- index-cast?
+  [x]
+  (record-kind? "raster.compiler.ir.kernel_body.IndexCast" x))
+
 (defn- resolve-integer!
   [resolve-value expression value]
   (let [resolved (resolve-value value)]
@@ -300,6 +309,37 @@
                   (long alignment)))
                (minimum? expression)
                (reduce min (map resolve* (:values expression)))
+               ;; KernelBody index algebra may reach a launch dimension when a scheduled body
+               ;; projects its own extent expressions into the launch spec. Evaluate it here with
+               ;; the same exact-overflow discipline rather than asking the runtime binder to
+               ;; interpret a compiler record it does not own.
+               (index-expr? expression)
+               (let [arguments (mapv resolve* (:arguments expression))]
+                 (case (:op expression)
+                   :add (reduce #(Math/addExact (long %1) (long %2)) arguments)
+                   :sub (reduce #(Math/subtractExact (long %1) (long %2)) arguments)
+                   :mul (reduce #(Math/multiplyExact (long %1) (long %2)) arguments)
+                   :floor-div (let [[value divisor] arguments]
+                                (when-not (pos? divisor)
+                                  (throw (ex-info "index floor-div resolved divisor must be positive"
+                                                  {:expression expression :divisor divisor})))
+                                (quot value divisor))
+                   :ceil-div (let [[value divisor] arguments]
+                               (when-not (pos? divisor)
+                                 (throw (ex-info "index ceil-div resolved divisor must be positive"
+                                                 {:expression expression :divisor divisor})))
+                               (+ (quot value divisor) (if (zero? (rem value divisor)) 0 1)))
+                   :mod (let [[value divisor] arguments]
+                          (when-not (pos? divisor)
+                            (throw (ex-info "index mod resolved divisor must be positive"
+                                            {:expression expression :divisor divisor})))
+                          (mod value divisor))
+                   :min (reduce min arguments)
+                   :max (reduce max arguments)
+                   (throw (ex-info "launch dimension uses an unsupported index operation"
+                                   {:expression expression :op (:op expression)}))))
+               (index-cast? expression)
+               (resolve* (:argument expression))
                :else (resolve-integer! resolve-value expression expression))))]
     (resolve* dimension)))
 

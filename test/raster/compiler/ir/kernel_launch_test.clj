@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.kernel-launch-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]))
 
 (deftest launch-contracts-are-uniformly-one-to-three-dimensional
@@ -74,3 +75,17 @@
                         (launch/geometry {:workgroup-size [8]
                                           :group-count [1]
                                           :shared-memory-bytes -1}))))
+
+(deftest kernel-body-index-algebra-resolves-as-a-launch-dimension
+  (testing "a scheduled body's extent expression evaluates with the binder's symbol values"
+    (let [expression (body/expression :mul 'batch (body/index-cast 'seq-len :long :exact))
+          resolve (fn [value] (get {'batch 4 'seq-len 6} value))]
+      (is (= 24 (launch/resolve-expression resolve expression)))
+      (is (= 3 (launch/resolve-expression
+                resolve (body/expression :ceil-div 'seq-len 2))))
+      (is (= 2 (launch/resolve-expression
+                resolve (body/expression :floor-div 'seq-len 3))))))
+  (testing "an unsupported divisor is refused rather than guessed"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (launch/resolve-expression (constantly 0)
+                                            (body/expression :ceil-div 'n 'zero))))))

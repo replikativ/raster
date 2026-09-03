@@ -145,8 +145,9 @@
       (try
         (is (= [:map-void] (mapv :convention (:steps descriptor)))
             "host control retains the nil-returning effect convention")
-        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect]))
-            "kernel generation consumes the scheduled TypedSOAC SegMap")
+        (is (= :kernel-body (get-in descriptor [:steps 0 :artifact :provenance :dialect]))
+            "kernel generation consumes the scheduled TypedSOAC SegMap through KernelBody")
+        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :source-dialect])))
         (is (= [:input :input :output :output :scalar]
                (mapv :kind (get-in descriptor [:steps 0 :abi]))))
         (let [program (fixture/instantiate! session descriptor [x y a b n]
@@ -173,6 +174,7 @@
           labels (int-array n)
           session (gpu/make-session :ocl:0)]
       (try
+        ;; mixed byte/int/float storage still emits through the SegMap generator
         (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
         (is (= [:byte :float :int :float :int]
                (mapv :dtype (get-in descriptor [:steps 0 :abi]))))
@@ -198,9 +200,9 @@
           b (float-array n)
           session (gpu/make-session :ocl:0)]
       (try
-        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
-        (is (= 1 (count (re-seq #"x\[idx\]" source)))
-            "the live kernel computes its shared tuple producer once")
+        (is (= :kernel-body (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
+        (is (= 1 (count (re-seq #"x\[" source)))
+            "the live kernel loads the shared tuple producer's input once")
         (let [program (fixture/instantiate! session descriptor [x a b n]
                                             {'x :input 'a :output 'b :output})
               result (fixture/run! program [x a b n])
@@ -390,7 +392,7 @@
       (try
         (let [program (fixture/instantiate! s descriptor [A B])
               result (get (fixture/run! program [A B]) 'C)]
-          (is (= [:contract] (mapv :convention (:steps descriptor))))
+          (is (= [:executable] (mapv :convention (:steps descriptor))))
           (is (= (vec (mapcat #(repeat 8 (float %))
                               (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
                                    (range 8))))
