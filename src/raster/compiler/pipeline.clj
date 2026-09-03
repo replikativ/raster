@@ -21,6 +21,7 @@
   (:require [clojure.string]
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.scalar.cse :as cse]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -1694,7 +1695,16 @@
   [param-syms scalar-lets expr]
   (let [clean-params (mapv strip-meta param-syms)
         clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
-    (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr])))))
+    (if (klaunch/index-algebra? expr)
+      ;; A scheduled body may project its extent as KernelBody index algebra. Evaluate it with
+      ;; the launch resolver over the same parameter/scalar-let environment instead of handing
+      ;; a compiler record to the runtime binder as if it were a number.
+      (let [symbol-fn (memoize (fn [sym] (expr->arg-fn param-syms scalar-lets sym)))]
+        (fn [args]
+          (klaunch/resolve-expression
+           (fn [value] (if (symbol? value) ((symbol-fn value) args) value))
+           expr)))
+      (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr]))))))
 
 (defn- find-untransformed-vg
   "Deep-scan form for a value+grad/grad APPLICATION that survived AD inlining:

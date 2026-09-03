@@ -161,8 +161,11 @@
           Q (rnd n 71) K (rnd n 72) V (rnd n 73)
           cpu (attn/batched-causal-sdpa Q K V batch seq-len hd)
           {:keys [descriptor out]} (run-resident #'attn/batched-causal-sdpa [Q K V batch seq-len hd])]
-      (is (= [:map-void :map-void :map-void] (mapv :convention (:steps descriptor)))
-          "causal SDPA lowers to the three resident :map-void kernels (no GEMM, no host scalar-let)")
+      ;; three resident kernels, no GEMM and no host scalar-let; a dense single-result copy is a
+      ;; value-producing :map on the typed route
+      (is (= 3 (count (:steps descriptor))))
+      (is (every? #(contains? #{:map :map-void} %) (mapv :convention (:steps descriptor)))
+          "causal SDPA lowers to three resident kernels (no GEMM, no host scalar-let)")
       (is (< (rel-err out cpu) 1e-5) (str "fused-sdpa GPU relerr " (rel-err out cpu))))))
 
 (deftest gqa-causal-mha-forward-fully-resident
@@ -178,8 +181,8 @@
           p (pl/compile-gpu-program #'attn/gqa-causal-mha :ze:0 :dtype :float :on-non-resident :nil)]
       (is (some? p) "gqa-causal-mha forward compiles to a resident descriptor (no non-resident binding)")
       (when p
-        (is (every? #(= :map-void %) (mapv :convention (:steps p)))
-            "every gqa-causal-mha forward step is a resident :map-void kernel")
+        (is (every? #(contains? #{:map :map-void} %) (mapv :convention (:steps p)))
+            "every gqa-causal-mha forward step is a resident map kernel")
         (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V 1 seq-len nq nkv hd])]
           (is (< (rel-err out cpu) 1e-5) (str "gqa-causal-mha GPU relerr " (rel-err out cpu))))))))
 
