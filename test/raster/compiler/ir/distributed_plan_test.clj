@@ -243,7 +243,7 @@
     (is (= 1151 (:makespan-ns simulation)))
     (is (= 32 (:transferred-bytes simulation)))
     (is (= {:id :batch-halo :value :batch :axis 0 :width 1
-            :boundary :nonperiodic
+            :boundary :nonperiodic :combine nil :rounds 1
             :steps [[:batch-halo :edge 0 :forward]
                     [:batch-halo :edge 0 :backward]]
             :completions [[:batch-halo :edge 0 :forward]
@@ -257,3 +257,173 @@
                 (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-halo-route (:reason (ex-data error))))
     (is (= :gpu-1 (:source (ex-data error))))))
+
+(deftest halo-steps-retain-destination-regions-in-both-frames
+  (let [halo (two-device-halo
+              {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]
+               [:gpu-1 :gpu-0] [:gpu-1->gpu-0]})
+        [forward backward] (:steps halo)]
+    ;; gpu-1 receives gpu-0's upper face into its lower ghost strip, one row before its origin.
+    (is (= {:frame :target-local :offsets [-1 0] :shape [1 4]}
+           (get-in forward [:attributes :destination-region])))
+    (is (= :copy (get-in forward [:attributes :destination-mode])))
+    (is (= {:frame :target-local :offsets [4 0] :shape [1 4]}
+           (get-in backward [:attributes :destination-region])))
+    (is (= [0 0] (mapv #(get-in % [:attributes :round]) (:steps halo))))
+    (is (false? (get-in forward [:attributes :wrap])))))
+
+(defn- three-device-topology
+  []
+  (distributed/topology
+   [(distributed/device {:id :gpu-0 :memory-capacity-bytes 16000000000})
+    (distributed/device {:id :gpu-1 :memory-capacity-bytes 16000000000})
+    (distributed/device {:id :gpu-2 :memory-capacity-bytes 16000000000})]
+   (for [[source target] [[:gpu-0 :gpu-1] [:gpu-1 :gpu-0] [:gpu-1 :gpu-2] [:gpu-2 :gpu-1]
+                          [:gpu-2 :gpu-0] [:gpu-0 :gpu-2]]]
+     (distributed/link {:id (keyword (str (name source) "->" (name target)))
+                        :source source :target target
+                        :kind :pcie :bandwidth-bytes-s 25.0e9 :latency-ns 1000}))))
+
+(defn- ring-routes
+  []
+  (into {} (for [[source target] [[:gpu-0 :gpu-1] [:gpu-1 :gpu-0] [:gpu-1 :gpu-2] [:gpu-2 :gpu-1]
+                                  [:gpu-2 :gpu-0] [:gpu-0 :gpu-2]]]
+             [[source target] [(keyword (str (name source) "->" (name target)))]])))
+
+(defn- three-shard-field
+  []
+  {:value (abstract-value/tensor
+           {:dtype :float :shape [12 4]
+            :sharding {:kind :partitioned :axis 0 :devices [:gpu-0 :gpu-1 :gpu-2]}
+            :ownership :owned})
+   :shards [(distributed/shard {:id :field-0 :value :field :device :gpu-0
+                                :offsets [0 0] :shape [4 4]})
+            (distributed/shard {:id :field-1 :value :field :device :gpu-1
+                                :offsets [4 0] :shape [4 4]})
+            (distributed/shard {:id :field-2 :value :field :device :gpu-2
+                                :offsets [8 0] :shape [4 4]})]})
+
+(deftest periodic-halo-adds-the-wrap-edge-in-one-round-on-a-ring
+  (let [{:keys [value shards]} (three-shard-field)
+        halo (distributed/schedule-halo
+              (distributed/halo-exchange
+               {:id :field-halo :value :field :axis 0 :width 1 :boundary :periodic})
+              value shards (ring-routes) [])
+        steps (:steps halo)
+        wrap-forward (first (filter #(= [:field-halo :edge 2 :forward] (:id %)) steps))
+        wrap-backward (first (filter #(= [:field-halo :edge 2 :backward] (:id %)) steps))]
+    (is (= 6 (count steps)))
+    (is (every? zero? (map #(get-in % [:attributes :round]) steps)))
+    (is (= (mapv :id steps) (:completions halo)))
+    ;; The wrap edge sends the last shard's upper face to the first shard's lower ghost.
+    (is (= :gpu-2 (:source wrap-forward)))
+    (is (= :gpu-0 (:target wrap-forward)))
+    (is (true? (get-in wrap-forward [:attributes :wrap])))
+    (is (= {:offsets [11 0] :shape [1 4]}
+           (get-in wrap-forward [:attributes :source-region])))
+    (is (= {:frame :target-local :offsets [-1 0] :shape [1 4]}
+           (get-in wrap-forward [:attributes :destination-region])))
+    (is (= {:offsets [0 0] :shape [1 4]}
+           (get-in wrap-backward [:attributes :source-region])))
+    (let [plan (distributed/plan
+                {:id :periodic-ring
+                 :mesh (distributed/mesh [{:name :space :size 3}] [:gpu-0 :gpu-1 :gpu-2])
+                 :topology (three-device-topology)
+                 :values {:field value} :shards {:field shards}
+                 :halos [halo] :steps steps :outputs (:completions halo)})
+          certificate (:certificate (distributed/certify plan))
+          simulation (distributed/simulate plan)]
+      (is (distributed/certified-plan? (distributed/verify! (distributed/certify plan))))
+      (is (= :periodic (get-in certificate [:halos 0 :boundary])))
+      (is (= 1 (get-in certificate [:halos 0 :rounds])))
+      (is (nil? (get-in certificate [:halos 0 :combine])))
+      (is (= 96 (:transferred-bytes simulation)))
+      ;; Six distinct directed links, all legs overlap: one latency + 16 B serialization.
+      (is (= 1001 (:makespan-ns simulation))))))
+
+(deftest periodic-halo-on-two-shards-packs-the-wrap-edge-into-a-second-round
+  (let [halo (distributed/schedule-halo
+              (distributed/halo-exchange
+               {:id :batch-halo :value :batch :axis 0 :width 1 :boundary :periodic})
+              (:batch (training-values)) (:batch (training-shards))
+              {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]
+               [:gpu-1 :gpu-0] [:gpu-1->gpu-0]}
+              [:stencil-0 :stencil-1])
+        steps (:steps halo)
+        rounds (mapv #(get-in % [:attributes :round]) steps)
+        second-round (filter #(= 1 (get-in % [:attributes :round])) steps)]
+    (is (= [0 0 1 1] rounds))
+    (is (= [[:batch-halo :edge 0 :forward] [:batch-halo :edge 0 :backward]]
+           (:dependencies (first second-round))))
+    (is (= [[:batch-halo :edge 1 :forward] [:batch-halo :edge 1 :backward]]
+           (:completions halo)))
+    (let [compute [(distributed/compute-step
+                    {:id :stencil-0 :device :gpu-0 :duration-ns 100})
+                   (distributed/compute-step
+                    {:id :stencil-1 :device :gpu-1 :duration-ns 150})]
+          plan (distributed/plan
+                {:id :periodic-pair
+                 :mesh (distributed/mesh [{:name :space :size 2}] [:gpu-0 :gpu-1])
+                 :topology (two-device-topology)
+                 :values (training-values) :shards (training-shards)
+                 :halos [halo]
+                 :steps (into compute steps)
+                 :outputs (:completions halo)})
+          simulation (distributed/simulate plan)]
+      (is (= 2 (get-in (:certificate (distributed/certify plan)) [:halos 0 :rounds])))
+      ;; Round 0 finishes at 150 + 1001; round 1 serializes behind it on the same links.
+      (is (= 2152 (:makespan-ns simulation)))
+      (is (= 64 (:transferred-bytes simulation))))))
+
+(deftest accumulating-halo-lands-on-the-owned-face-and-records-its-monoid
+  (let [combine (scan/certify {:acc 'acc :init 0.0 :lambda '(+ acc element)} :float)
+        halo (distributed/schedule-halo
+              (distributed/halo-exchange
+               {:id :dss :value :batch :axis 0 :width 1 :combine combine})
+              (:batch (training-values)) (:batch (training-shards))
+              {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]
+               [:gpu-1 :gpu-0] [:gpu-1->gpu-0]}
+              [])
+        [forward backward] (:steps halo)
+        plan (distributed/plan
+              {:id :dss-probe
+               :mesh (distributed/mesh [{:name :space :size 2}] [:gpu-0 :gpu-1])
+               :topology (two-device-topology)
+               :values (training-values) :shards (training-shards)
+               :halos [halo] :steps (:steps halo) :outputs (:completions halo)})
+        certificate (:certificate (distributed/certify plan))]
+    (is (= :combine (get-in forward [:attributes :destination-mode])))
+    ;; gpu-0's upper face accumulates into gpu-1's lower owned row, in global coordinates.
+    (is (= {:frame :global :offsets [4 0] :shape [1 4]}
+           (get-in forward [:attributes :destination-region])))
+    (is (= {:frame :global :offsets [3 0] :shape [1 4]}
+           (get-in backward [:attributes :destination-region])))
+    (is (= {:combine (:combine combine) :identity (:identity combine) :dtype :float}
+           (get-in certificate [:halos 0 :combine])))
+    (is (distributed/certified-plan? (distributed/verify! (distributed/certify plan))))))
+
+(deftest accumulating-halos-require-a-certified-monoid-of-the-value-dtype
+  (let [uncertified (try
+                      (distributed/halo-exchange
+                       {:id :dss :value :batch :axis 0 :width 1 :combine '(+ acc element)})
+                      (catch clojure.lang.ExceptionInfo exception exception))
+        wrong-dtype (try
+                      (distributed/schedule-halo
+                       (distributed/halo-exchange
+                        {:id :dss :value :batch :axis 0 :width 1
+                         :combine (scan/certify {:acc 'acc :init 0.0 :lambda '(+ acc element)}
+                                                :double)})
+                       (:batch (training-values)) (:batch (training-shards))
+                       {[:gpu-0 :gpu-1] [:gpu-0->gpu-1]
+                        [:gpu-1 :gpu-0] [:gpu-1->gpu-0]}
+                       [])
+                      (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :distributed-halo-combine (:reason (ex-data uncertified))))
+    (is (= :distributed-halo-combine-dtype (:reason (ex-data wrong-dtype))))))
+
+(deftest halo-boundary-policy-is-validated
+  (let [error (try
+                (distributed/halo-exchange
+                 {:id :bad :value :batch :axis 0 :width 1 :boundary :reflective})
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :distributed-halo-exchange (:reason (ex-data error))))))

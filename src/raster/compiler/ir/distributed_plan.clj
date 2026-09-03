@@ -20,7 +20,8 @@
 (def shard-ownerships #{:owned :replica})
 (def step-kinds #{:compute :transfer})
 (def collective-kinds #{:all-reduce :all-gather :reduce-scatter :broadcast})
-(def halo-boundaries #{:nonperiodic})
+(def halo-boundaries #{:nonperiodic :periodic})
+(def halo-destination-modes #{:copy :combine})
 
 (defrecord DeviceMesh [axes devices])
 (defrecord DeviceResource [id memory-capacity-bytes descriptor attributes])
@@ -32,7 +33,7 @@
 (defrecord CollectiveOperation [id kind group value reduction root attributes])
 (defrecord CollectiveSchedule [algorithm rounds numerical-mode attributes])
 (defrecord ScheduledCollective [operation schedule dependencies steps completions])
-(defrecord HaloExchange [id value axis width boundary attributes])
+(defrecord HaloExchange [id value axis width boundary combine attributes])
 (defrecord ScheduledHalo [exchange routes dependencies steps completions])
 (defrecord DistributedStep
            [id kind device source target route value bytes duration-ns dependencies
@@ -298,7 +299,13 @@
     (->ScheduledCollective operation schedule dependencies steps completions)))
 
 (defn halo-exchange
-  [{:keys [id value axis width boundary attributes]
+  "Declare a semantic neighbor exchange along one partitioned axis.
+
+   `boundary` is `:nonperiodic` (only adjacent shards exchange) or `:periodic` (the last and first
+   shards also exchange across the wrap edge). `combine` is nil for a copy into the target's ghost
+   region, or a certified associative reduction when the source face accumulates into the target's
+   owned face, as direct stiffness summation, deposition and force return require."
+  [{:keys [id value axis width boundary combine attributes]
     :or {boundary :nonperiodic attributes {}}}]
   (when-not (and id value (integer? axis) (not (neg? axis))
                  (pos-int? width) (contains? halo-boundaries boundary) (map? attributes))
@@ -306,9 +313,13 @@
            :distributed-halo-exchange
            {:id id :value value :axis axis :width width
             :boundary boundary :attributes attributes}))
-  (->HaloExchange id value axis width boundary attributes))
+  (when (and combine (not (scan/associative-scan? combine)))
+    (fail! "accumulating halo exchange requires a certified associative reduction"
+           :distributed-halo-combine {:id id :combine combine}))
+  (->HaloExchange id value axis width boundary combine attributes))
 
-(defn- halo-region
+(defn- halo-face
+  "Global rectangle of a shard's owned face of `width` cells on `side` of `axis`."
   [candidate axis width side]
   (let [offsets (:offsets candidate)
         shape (:shape candidate)
@@ -318,15 +329,56 @@
     {:offsets (assoc offsets axis start)
      :shape (assoc shape axis width)}))
 
-(defn schedule-halo
-  "Derive a nonperiodic neighbor exchange from certified axis-partitioned shards.
+(defn- halo-destination
+  "Where a received face lands on the target.
 
-   `routes` maps `[source-device target-device]` to an ordered directed-link path. All neighbor
-   transfers share one round after `dependencies`; exact source rectangles and byte counts are
-   retained on each transfer step."
+   Copy mode writes the ghost strip beyond the target's owned extent, expressed in the target's
+   local frame so a lower ghost has a negative offset. Combine mode accumulates into the target's
+   owned face, expressed in the global frame."
+  [target axis width side mode]
+  (case mode
+    :copy (let [rank (count (:shape target))
+                offsets (vec (repeat rank 0))
+                start (case side :lower (- width) :upper (nth (:shape target) axis))]
+            {:frame :target-local
+             :offsets (assoc offsets axis start)
+             :shape (assoc (:shape target) axis width)})
+    :combine (assoc (halo-face target axis width side) :frame :global)))
+
+(defn- pack-halo-rounds
+  "Greedily assign legs to the earliest round in which none of their directed links is claimed.
+
+   Legs of one round overlap; a later round waits for the previous round's completions. The
+   packing is deterministic in leg order, so a re-derived schedule reproduces the same rounds."
+  [legs]
+  (reduce
+   (fn [rounds leg]
+     (let [links (set (get-in leg [:leg :route]))
+           index (or (some (fn [[i round]]
+                             (when (empty? (set/intersection links (:links round))) i))
+                           (map-indexed vector rounds))
+                     (count rounds))
+           round (get rounds index {:links #{} :legs []})]
+       (assoc rounds index
+              (-> round
+                  (update :links set/union links)
+                  (update :legs conj leg)))))
+   []
+   legs))
+
+(defn schedule-halo
+  "Derive a neighbor exchange from certified axis-partitioned shards.
+
+   `routes` maps `[source-device target-device]` to an ordered directed-link path. Adjacent shard
+   pairs exchange their faces in both directions; a periodic boundary adds the wrap edge between
+   the last and first shards. Legs are packed into rounds so that no round claims one directed
+   link twice; a later round depends on the completions of the previous one. Exact source
+   rectangles, destination regions, byte counts and the round index are retained on each transfer
+   step."
   [exchange abstract shards routes dependencies]
   (let [exchange (if (halo-exchange? exchange) exchange (halo-exchange exchange))
-        {:keys [id value axis width]} exchange
+        {:keys [id value axis width boundary combine]} exchange
+        mode (if combine :combine :copy)
         sharding (:sharding abstract)
         global-shape (:shape abstract)
         candidates (if (and (vector? global-shape) (< axis (count global-shape)))
@@ -338,6 +390,10 @@
       (fail! "halo exchange requires a matching axis-partitioned AbstractValue"
              :distributed-halo-sharding
              {:halo id :axis axis :sharding sharding :shards candidates}))
+    (when (and combine (not= (:dtype combine) (:dtype abstract)))
+      (fail! "halo combine dtype differs from its AbstractValue"
+             :distributed-halo-combine-dtype
+             {:halo id :combine (:dtype combine) :value (:dtype abstract)}))
     (when-not (map? routes)
       (fail! "halo schedule routes must be keyed by device pairs"
              :distributed-halo-routes {:halo id :routes routes}))
@@ -351,10 +407,14 @@
                                               (fn [i extent] (when (not= i axis) extent))
                                               global-shape)))
           bytes (* face-elements (dtype/bytes-of (:dtype abstract)))
+          adjacent (map-indexed (fn [i pair] [i false pair]) (partition 2 1 candidates))
+          edges (cond-> (vec adjacent)
+                  (= :periodic boundary)
+                  (conj [(dec (count candidates)) true [(peek candidates) (first candidates)]]))
           legs
           (vec
            (mapcat
-            (fn [edge-index [left right]]
+            (fn [[edge-index wrap? [left right]]]
               (mapv
                (fn [[direction source target side destination-side]]
                  (let [route (get routes [(:device source) (:device target)])]
@@ -362,32 +422,43 @@
                      (fail! "halo schedule lacks a route for an adjacent shard pair"
                             :distributed-halo-route
                             {:halo id :source (:device source) :target (:device target)}))
-                   {:edge edge-index :direction direction :source source :target target
+                   {:edge edge-index :direction direction :wrap wrap?
                     :leg (communication-leg
                           {:source (:device source) :target (:device target)
                            :route (vec route) :bytes bytes
                            :attributes {:source-shard (:id source)
                                         :target-shard (:id target)
-                                        :source-region (halo-region source axis width side)
-                                        :destination-side destination-side}})}))
+                                        :source-region (halo-face source axis width side)
+                                        :destination-side destination-side
+                                        :destination-mode mode
+                                        :destination-region
+                                        (halo-destination target axis width
+                                                          destination-side mode)}})}))
                [[:forward left right :upper :lower]
                 [:backward right left :lower :upper]]))
-            (range) (partition 2 1 candidates)))
-          link-ids (mapcat (comp :route :leg) legs)]
-      (when-not (= (count link-ids) (count (distinct link-ids)))
-        (fail! "parallel halo legs cannot claim the same directed link"
-               :distributed-halo-link-conflict {:halo id :links (vec link-ids)}))
-      (let [steps
-            (mapv (fn [{:keys [edge direction leg]}]
-                    (transfer-step
-                     {:id [id :edge edge direction]
-                      :source (:source leg) :target (:target leg) :route (:route leg)
-                      :value value :bytes (:bytes leg) :dependencies (vec dependencies)
-                      :attributes (merge (:attributes leg)
-                                         {:halo id :axis axis :width width
-                                          :edge edge :direction direction})}))
-                  legs)]
-        (->ScheduledHalo exchange routes (vec dependencies) steps (mapv :id steps))))))
+            edges))
+          rounds (pack-halo-rounds legs)
+          {:keys [steps completions]}
+          (reduce
+           (fn [{:keys [steps completions]} [round-index round]]
+             (let [waits (if (zero? round-index) (vec dependencies) completions)
+                   round-steps
+                   (mapv (fn [{:keys [edge direction wrap leg]}]
+                           (transfer-step
+                            {:id [id :edge edge direction]
+                             :source (:source leg) :target (:target leg) :route (:route leg)
+                             :value value :bytes (:bytes leg) :dependencies waits
+                             :attributes (merge (:attributes leg)
+                                                {:halo id :axis axis :width width
+                                                 :boundary boundary
+                                                 :edge edge :direction direction
+                                                 :wrap wrap :round round-index})}))
+                         (:legs round))]
+               {:steps (into steps round-steps)
+                :completions (mapv :id round-steps)}))
+           {:steps [] :completions []}
+           (map-indexed vector rounds))]
+      (->ScheduledHalo exchange routes (vec dependencies) steps completions))))
 
 (defn- concrete-shape!
   [value-id value]
@@ -922,6 +993,9 @@
      (mapv (fn [{:keys [exchange steps completions]}]
              {:id (:id exchange) :value (:value exchange) :axis (:axis exchange)
               :width (:width exchange) :boundary (:boundary exchange)
+              :combine (some-> (:combine exchange)
+                               (select-keys [:combine :identity :dtype]))
+              :rounds (inc (reduce max 0 (map #(get-in % [:attributes :round]) steps)))
               :steps (mapv :id steps) :completions completions
               :bytes (reduce + 0 (map :bytes steps))})
            (:halos plan))
