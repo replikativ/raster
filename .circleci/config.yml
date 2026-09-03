@@ -155,15 +155,30 @@ jobs:
             - v2-dependencies-{{ checksum "deps.edn" }}
             - v2-dependencies-
       - run:
-          name: Install OpenBLAS, clang and Intel's CPU OpenCL runtime
+          name: Install OpenBLAS, clang and a CPU OpenCL runtime
+          # Preferred: Intel's CPU runtime (OpenCL 3.0, sub-groups, fp16). If its apt
+          # repository cannot be reached or verified from this image, fall back to the
+          # distribution's PoCL; sub-group and fp16 kernels then skip on their capability gates
+          # and the job log names the device that actually ran.
           command: |
-            curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-              | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
-            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
-              | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
             sudo apt-get update
-            sudo apt-get install -y libopenblas-dev liblapacke-dev clang ocl-icd-libopencl1 clinfo \
-              intel-oneapi-runtime-opencl
+            sudo apt-get install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
+              clang ocl-icd-libopencl1 clinfo
+            sudo update-ca-certificates
+            if curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+                 | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null \
+               && echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+                 | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null \
+               && sudo apt-get update \
+               && sudo apt-get install -y intel-oneapi-runtime-opencl; then
+              echo "using Intel's CPU OpenCL runtime"
+            else
+              echo "Intel apt repository unavailable from this image; falling back to PoCL"
+              sudo rm -f /etc/apt/sources.list.d/oneAPI.list
+              sudo apt-get update
+              sudo apt-get install -y pocl-opencl-icd
+            fi
+            clinfo -l
       - run:
           name: Run OpenCL-gated tests on the CPU OpenCL device
           command: scripts/ci-opencl-cpu.sh
