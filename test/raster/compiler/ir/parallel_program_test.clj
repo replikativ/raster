@@ -153,3 +153,16 @@
   (let [equations [(dataflow-equation 'first '[z a] '[x])
                    (dataflow-equation 'second '[x b a] '[y])]]
     (is (= '[z a b] (program/infer-inputs equations)))))
+
+(deftest known-value-types-projects-only-declared-dtypes
+  (testing "a compatibility program contributes the dtypes it declares and omits the rest"
+    (let [p (lowered-program)
+          p (-> p
+                (assoc-in [:values 'scale] (av/tensor {:dtype :double :shape []}))
+                ;; a descriptor-map dtype (e.g. a quant format) is not a keyword scalar dtype
+                (assoc-in [:values 'unknown] (av/tensor {:dtype {:format :q8} :shape []})))]
+      (is (= {'values :double 'scale :double}
+             (program/known-value-types p '[values scale unknown missing])))
+      (is (= :parallel-program-parameter-dtype
+             (reason-of #(program/declared-value-types p '[values unknown])))
+          "the strict projection still refuses an undeclared dtype"))))

@@ -140,6 +140,29 @@ jobs:
               hipcc --offload-arch=gfx1100 --genco -o "${source}.hsaco" "${source}"
             done
 
+  opencl-pocl-gate:
+    # Executes the OpenCL-gated namespaces on PoCL's CPU device: emitted kernels are compiled by
+    # a real OpenCL implementation and run, without a GPU. Intel-only leaves skip on their own
+    # extension gates. Not yet required by deploy: two known device-independent defects
+    # (reduction element dtype, dispatch-benchmark selector) are tracked in the debt ledger.
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - restore_cache:
+          keys:
+            - v2-dependencies-{{ checksum "deps.edn" }}
+            - v2-dependencies-
+      - run:
+          name: Install OpenBLAS, clang and the PoCL OpenCL ICD
+          command: >-
+            sudo apt-get update && sudo apt-get install -y
+            libopenblas-dev liblapacke-dev clang pocl-opencl-icd ocl-icd-libopencl1 clinfo
+      - run:
+          name: Run OpenCL-gated tests on the PoCL CPU device
+          command: scripts/ci-opencl-pocl.sh
+
   deploy:
     executor: clojure-java24
     steps:
@@ -196,6 +219,9 @@ workflows:
           requires:
             - build
       - emit-gpu-compile-fixtures:
+          requires:
+            - build
+      - opencl-pocl-gate:
           requires:
             - build
       - cuda-compile-gate:

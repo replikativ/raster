@@ -327,20 +327,28 @@
         ;; Typed values supply dtypes; scheduled SegOps supply ABI roles. Logical rank cannot choose
         ;; pass-by-value versus buffer because a rank-zero result may be resident in either form.
         program-types
-        (when (and parallel-program
-                   (= :typed-soac (get-in parallel-program [:provenance :source-dialect])))
+        (when parallel-program
           (let [operations (mapcat :operations (:equations parallel-program))
                 arrays (set (mapcat #(concat (segop/operation-inputs %)
                                              (segop/operation-outputs %))
                                     operations))
                 scalars (set (mapcat segop/operation-scalars operations))
-                overlap (set/intersection arrays scalars)]
-            (when (seq overlap)
+                overlap (set/intersection arrays scalars)
+                typed? (= :typed-soac (get-in parallel-program [:provenance :source-dialect]))]
+            (when (and typed? (seq overlap))
               (throw (ex-info "scheduled values have contradictory buffer and scalar ABI roles"
                               {:reason :parallel-program-parameter-role-conflict
                                :values overlap})))
-            {:scalar-types (parallel-program/declared-value-types parallel-program scalars)
-             :array-types (parallel-program/declared-value-types parallel-program arrays)}))
+            ;; Every scheduled program carries declared value dtypes, whichever pass produced
+            ;; it. A typed program must declare every ABI value; a compatibility program
+            ;; contributes the dtypes it does declare, so a captured host scalar such as an
+            ;; AD-generated loss scale keeps its walker-stamped dtype instead of falling to the
+            ;; SegMap emitter's integer default (which silently zeroed such scalars).
+            (if typed?
+              {:scalar-types (parallel-program/declared-value-types parallel-program scalars)
+               :array-types (parallel-program/declared-value-types parallel-program arrays)}
+              {:scalar-types (parallel-program/known-value-types parallel-program scalars)
+               :array-types (parallel-program/known-value-types parallel-program arrays)})))
         top-scalar-types (merge (or (:scalar-types program-types) {})
                                 (or (:scalar-types (meta source-form)) {})
                                 (or (:scalar-types (meta form)) {}) scalar-types)
