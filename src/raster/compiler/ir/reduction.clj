@@ -5,7 +5,10 @@
    neutral values and step results in one ordered record so lowering cannot silently lose a value
    or guess its dtype.  The operator is semantic: segmentation and target schedules live in SOAC
    and SegOp layers, while physical scratch is introduced only during scheduling/materialization."
-  (:require [raster.compiler.ir.scan :as scan]))
+  (:require [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.ir.scan :as scan]))
 
 (defrecord ReductionComponent
            [id accumulator neutral dtype result attributes])
@@ -191,15 +194,47 @@
                        (vec combine-results) {}))
     step algebra attributes)))
 
+(defn- retained-scalar-dtype
+  "The walker-stamped scalar dtype of an expression, or nil when none is retained."
+  [expression]
+  (when (instance? clojure.lang.IObj expression)
+    (some-> (types/sym-type-tag expression) dtype/dtype-for-scalar-tag)))
+
+(defn- declare-element-conversion
+  "Make the element's conversion into the accumulator's carrier explicit.
+
+   The monoid is certified at the accumulator dtype, so an element computed at another
+   floating-point precision (a double-typed scalar scaling a float load) must be converted before
+   it enters the combine. The owner of the reduction declares that conversion here as an explicit
+   cast the KernelBody lowering accepts; no schedule or emitter may invent a narrowing on its own."
+  [step-result element dtype]
+  (let [element-dtype (retained-scalar-dtype element)]
+    (if (and element-dtype (dtype/fp-dtype? element-dtype) (dtype/fp-dtype? dtype)
+             (not= element-dtype (dtype/canon dtype)))
+      (let [cast-tag (dtype/scalar-tag-for-dtype (dtype/canon dtype))
+            converted (with-meta (list (symbol "clojure.core" (name cast-tag)) element)
+                        {:raster.type/tag cast-tag})]
+        (walk/postwalk-replace {element converted} step-result))
+      step-result)))
+
 (defn scalar
   "Construct the canonical, proof-carrying representation of `raster.par/reduce`.
 
    Every scalar ProductReduction has parallel semantics, so its recurrence is certified here—the
-   single constructor boundary—rather than rediscovered by individual schedules or emitters."
+   single constructor boundary—rather than rediscovered by individual schedules or emitters. An
+   element whose retained precision differs from the accumulator's is wrapped in an explicit cast
+   at this boundary."
   [{:keys [accumulator neutral dtype result index step-result algebra attributes]
     :or {algebra {} attributes {}}}]
-  (let [derived (scan/certify-reassociation
-                 {:acc accumulator :init neutral :lambda step-result} dtype)
+  (let [certified (scan/certify-reassociation
+                   {:acc accumulator :init neutral :lambda step-result} dtype)
+        declared (declare-element-conversion step-result (:element certified) dtype)
+        converted? (not (identical? declared step-result))
+        step-result declared
+        derived (if converted?
+                  (scan/certify-reassociation
+                   {:acc accumulator :init neutral :lambda step-result} dtype)
+                  certified)
         algebra (if (empty? algebra) derived algebra)]
     (when-not (scan/compatible-certificate? algebra derived)
       (throw (ex-info "scalar reduction algebra disagrees with its recurrence"
