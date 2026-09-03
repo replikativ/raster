@@ -11,7 +11,8 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.distributed-plan :as distributed]
-            [raster.compiler.ir.numerical-state :as state]))
+            [raster.compiler.ir.numerical-state :as state]
+            [raster.compiler.ir.validate :refer [fail! exact-keys! unique-by!]]))
 
 (def schema-version 1)
 (def operation-kinds #{:prolongation :restriction})
@@ -51,25 +52,6 @@
 (defn certified-plan?
   [value]
   (record-type? "raster.compiler.ir.amr_plan.CertifiedAMRWorkload" value))
-
-(defn- fail!
-  [message reason data]
-  (throw (ex-info message (assoc data :reason reason))))
-
-(defn- exact-keys!
-  [label reason candidate allowed]
-  (let [unexpected (vec (remove allowed (keys candidate)))]
-    (when (seq unexpected)
-      (fail! (str label " contains fields outside its versioned schema")
-             reason {:unexpected unexpected :allowed allowed})))
-  candidate)
-
-(defn- unique-by!
-  [label reason key-fn values]
-  (let [ids (mapv key-fn values)]
-    (when-not (= (count ids) (count (distinct ids)))
-      (fail! (str label " must have unique identities") reason {:ids ids})))
-  values)
 
 (defn- rectangle!
   [label reason {:keys [offsets shape] :as region} rank]

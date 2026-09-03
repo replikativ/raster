@@ -14,7 +14,9 @@
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
-            [raster.compiler.ir.scan :as scan]))
+            [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.validate :refer [fail! finite-number? non-negative-number?
+                                                  positive-number? unique-by!]]))
 
 (def shard-kinds #{:replicated :partitioned})
 (def shard-ownerships #{:owned :replica})
@@ -62,29 +64,6 @@
 (defn distributed-plan? [value] (instance? DistributedPlan value))
 (defn certificate? [value] (instance? DistributedPlanCertificate value))
 (defn certified-plan? [value] (instance? CertifiedDistributedPlan value))
-
-(defn- fail!
-  [message reason data]
-  (throw (ex-info message (assoc data :reason reason))))
-
-(defn- finite-number?
-  [value]
-  (and (number? value) (Double/isFinite (double value))))
-
-(defn- non-negative-number?
-  [value]
-  (and (finite-number? value) (not (neg? value))))
-
-(defn- positive-number?
-  [value]
-  (and (finite-number? value) (pos? value)))
-
-(defn- unique-by!
-  [label reason key-fn values]
-  (let [ids (mapv key-fn values)]
-    (when-not (= (count ids) (count (distinct ids)))
-      (fail! (str label " must have unique identities") reason {:ids ids})))
-  values)
 
 (defn mesh
   "Construct a rectangular row-major device mesh.
