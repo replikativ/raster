@@ -170,8 +170,8 @@
             (make-array java.nio.file.attribute.FileAttribute 0))))
 
 (deftest compiled-resident-dispatch-tunes-and-returns-a-baked-schedule
-  (if-not @device-probe/opencl-available?
-    (device-probe/opencl-skip! "compiled resident dispatch tuning")
+  (if-not @device-probe/opencl-gpu-available?
+    (device-probe/opencl-skip! "compiled resident dispatch tuning" :gpu-device)
     (let [{:keys [buffers]} (test-case)
           args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
                 (get buffers 'dst) (get buffers 'src) 3 4 5 2]
@@ -220,8 +220,8 @@
                 (link/close! executable)))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width
-  (if-not @device-probe/opencl-available?
-    (device-probe/opencl-skip! "runtime component-width dispatch")
+  (if-not @device-probe/opencl-gpu-available?
+    (device-probe/opencl-skip! "runtime component-width dispatch" :gpu-device)
     (let [descriptor (pipeline/compile-gpu-program
                       #'resident-indexed-attention-probe :ocl:0 :dtype :float)
           small (production-case descriptor 4)
