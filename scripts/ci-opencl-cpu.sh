@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Execute the OpenCL-gated test namespaces on a CPU OpenCL device (PoCL) so emitted kernels
-# compile and run in CI without a GPU. Namespaces are discovered by their device gate, so a new
-# gated namespace joins the job without editing this script. Intel-only kernels (DPAS, 2-D block
-# IO) keep their own extension gates and skip on PoCL.
+# Execute the OpenCL-gated test namespaces on a CPU OpenCL device (Intel's CPU runtime in CI,
+# PoCL or the Intel runtime locally) so emitted kernels compile and run without a GPU. Namespaces
+# are discovered by their device gate, so a new gated namespace joins the job without editing this
+# script. GPU-only leaves (tuned dispatch, DPAS, 2-D block IO) keep their own capability gates.
 
 set -euo pipefail
 

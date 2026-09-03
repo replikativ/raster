@@ -140,11 +140,11 @@ jobs:
               hipcc --offload-arch=gfx1100 --genco -o "${source}.hsaco" "${source}"
             done
 
-  opencl-pocl-gate:
-    # Executes the OpenCL-gated namespaces on PoCL's CPU device: emitted kernels are compiled by
-    # a real OpenCL implementation and run, without a GPU. Intel-only leaves skip on their own
-    # extension gates. Not yet required by deploy: two known device-independent defects
-    # (reduction element dtype, dispatch-benchmark selector) are tracked in the debt ledger.
+  opencl-cpu-gate:
+    # Executes the OpenCL-gated namespaces on Intel's CPU OpenCL runtime (OpenCL 3.0 with
+    # sub-groups and fp16, free from Intel's apt repository): emitted kernels are compiled by a
+    # real OpenCL implementation and run without a GPU. Measured locally: ~80 s wall for the
+    # whole gated set including JVM start. Only tuned-dispatch tests that need a GPU device skip.
     executor: clojure-java24
     steps:
       - attach_workspace:
@@ -155,13 +155,18 @@ jobs:
             - v2-dependencies-{{ checksum "deps.edn" }}
             - v2-dependencies-
       - run:
-          name: Install OpenBLAS, clang and the PoCL OpenCL ICD
-          command: >-
-            sudo apt-get update && sudo apt-get install -y
-            libopenblas-dev liblapacke-dev clang pocl-opencl-icd ocl-icd-libopencl1 clinfo
+          name: Install OpenBLAS, clang and Intel's CPU OpenCL runtime
+          command: |
+            wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+              | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+              | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y libopenblas-dev liblapacke-dev clang ocl-icd-libopencl1 clinfo \
+              intel-oneapi-runtime-opencl
       - run:
-          name: Run OpenCL-gated tests on the PoCL CPU device
-          command: scripts/ci-opencl-pocl.sh
+          name: Run OpenCL-gated tests on the CPU OpenCL device
+          command: scripts/ci-opencl-cpu.sh
 
   deploy:
     executor: clojure-java24
@@ -221,7 +226,7 @@ workflows:
       - emit-gpu-compile-fixtures:
           requires:
             - build
-      - opencl-pocl-gate:
+      - opencl-cpu-gate:
           requires:
             - build
       - cuda-compile-gate:
