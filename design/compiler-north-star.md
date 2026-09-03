@@ -1,6 +1,9 @@
 # Raster compiler north star
 
-Status: architectural direction, reconciled with the implementation on 2026-09-01.
+Status: architectural direction, reconciled with the implementation on 2026-09-01. Objective,
+fidelity/time schedule axes, irregular primitives, composition, and the inference track were added
+on 2026-09-03 after the simulator survey (twenty rubric surveys of production simulators,
+training and inference systems; internal working note).
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -25,6 +28,50 @@ Futhark, Triton, JAX, or MLIR. Raster keeps its typed multiple-dispatch frontend
 functional Clojure programming model, explicit AD rules, portable hardware
 model, and vendor-JIT backends. The reference systems supply specific missing
 ideas at specific layers.
+
+## 0. Objective: what the compiler is for
+
+Raster is the foundation for compiler-driven algebraic simulation and for inference through
+simulators. The quantity to optimize is not kernel time. It is **grounding quality per unit of
+compute**: posterior or decision quality obtained from a simulation-backed model for a given
+budget of time, memory, energy and communication. Simulation-based inference that treats the
+simulator as a black box is the worst case the system must always support. The intended case is
+that inference uses the simulator's internals, through the same certified transformations the
+compiler already owns: automatic differentiation, local linearization, coarse-grained or
+marginalized variants, multi-level estimators, and emulators trained on internal state.
+
+This changes what a unit of value is. An AI agent can write a bespoke SPH or shallow-water code
+in days. What it cannot cheaply reproduce is a verified program transformation with a certificate,
+a shared cost and measurement history across workloads, and composition of plans with a database
+and provenance. Production simulators confirm the alternative: hand-instantiated kernel families,
+several hand-written transports of one halo, two hand schedules of one physics, whole-loop taping
+without checkpoint schedules. The unit of value in Raster is therefore **a verified transformation
+of a program that keeps its semantic identity**, not a kernel. The acceptance test for the whole
+project is the agent baseline in §9: if a bespoke reimplementation plus its certification is
+cheaper than expressing the workload in Raster, the direction is wrong.
+
+Three consequences are structural:
+
+1. **The cost vector gains approximation error and information value.** Beyond latency,
+   throughput, peak memory, bytes, tuning budget, energy and floating-point error, a plan carries
+   the approximation error introduced by every fidelity, coarse-graining, marginalization or
+   surrogate decision, under an explicit error model, and where a decision or inference task is
+   known, the expected information gain or decision utility that the compute buys.
+2. **Fidelity is a schedule axis.** Level of refinement, coarse-graining map, marginalized
+   sub-model, multi-level estimator, surrogate substitution and precision are schedule decisions
+   with legality rules (conservation, symmetry, positivity, coupling contracts) and an error
+   model, exactly as tile size is a schedule decision with a resource rule. Coarse-grained models
+   are proposals with an error bound, never silent substitutes.
+3. **Every transformation carries an error model.** The minimal contract is not that every solver
+   is a probabilistic-numerics solver; it is that every solver and every transformation exposes
+   an error model the certificate can check and the cost vector can consume: an a-posteriori
+   estimate, a multi-level difference, a perturbation ensemble, or a posterior variance.
+
+Probabilistic numerics is the lens that unifies these. Discretization error is epistemic
+uncertainty; a multi-fidelity hierarchy is a model over fidelities; coarse-graining is
+marginalization with an error bound; a solver is an inference procedure whose posterior variance is
+the numerical-error entry of the cost vector; optimal grounding per compute is experimental design
+under a budget. The lens is a framing for the contracts above, not a requirement on users.
 
 ## 1. What is already strong
 
@@ -717,7 +764,16 @@ IR. It is more than a bag of kernel kwargs. It can express:
 - staging space, copies, pipeline depth, and barriers;
 - reduction decomposition and split-K;
 - buffer donation, residency, and graph capture;
-- device/mesh placement and resharding policy.
+- device/mesh placement and resharding policy;
+- time integration scheme, operator splitting, subcycling ratios, task ordering and
+  iteration budgets of data-dependent loops;
+- fidelity level, coarse-graining map, marginalized sub-models, multi-level estimator
+  selection, surrogate substitution, and checkpoint/recompute schedule across time steps.
+
+Time and fidelity are scheduled axes (§3.8). Their legality rules are conservation, symmetry,
+coupling and error-model contracts rather than resource limits, but they enter the same
+legality → feasibility → analytic rank → measured rank sequence, and a failed legality check never
+changes the semantic program.
 
 Halide supplies the algorithm/schedule separation and structural search model.
 MLIR's Transform dialect supplies a useful safety model: typed handles,
@@ -886,10 +942,85 @@ Device-to-device binding is the normal path. Host transfer is an explicit graph
 edge with a reason and byte count. The compiler's memory plan owns temporary
 liveness, reuse, alignment, and peak-memory accounting.
 
+A running cluster is driven from a REPL. Changing a fidelity level, a decomposition, a coupling
+period or a tile must be a plan hot-swap on live artifacts, not a whole-program rebuild, so
+compilation must be incremental at the granularity of plan nodes, with unchanged kernels and
+artifacts reused by identity. A forkable execution context, as in Spindel, is the mechanism for
+trying a plan change on a branch and committing or discarding it with its measurements.
+
 JAX pytrees are the model for separating user structure from flat leaves, but
 Raster trees should retain stable keyed paths and type/shape information. JAX
 donation and sharding contracts are also useful references; Raster's existing
 ownership checks should remain fail-loud.
+
+### 3.8 Time, composition and rate scheduling
+
+Algorithm/schedule separation applies to the time axis. The semantic layer states a dynamical
+system: right-hand sides, conservation laws, symmetries, constraints, coupling ports, and the
+observables that ground it. The schedule layer states how it is integrated: explicit, IMEX or
+implicit tableau; operator splitting; leapfrog or multistep history; subcycled nesting with
+per-level time ratios; task ordering and retry; iteration budgets and reduced exit conditions of
+data-dependent loops; checkpoint and recompute placement for adjoints. Production codes show
+these as three schedules of one semantics: a per-block task list with dependency masks, a
+recursive nesting scheduler with per-level Δt, and a tableau-driven stepper with an implicit
+column sub-solve. Raster does not fix an integrator. It fixes that the integrator is schedule data
+with legality rules and an error model.
+
+Composition of models with different rates and different grids is a scheduling problem, not a
+scene graph. The pattern is shared by coupled Earth-system components, whole-cell models that
+partition one state among ODE, stochastic and linear-programming sub-models each step, and
+molecular dynamics with a mesh solver on its own decomposition. The plan therefore needs:
+
+- a rate scheduler over systems with declared read/write sets and periods, in the sense of an
+  entity-component schedule, expressed as SOACs over entity-set shards with explicit effects;
+- a coupler node: several meshes with owner maps, remapping weights as a content-addressed sparse
+  contraction with a pinned reduction order, conservative fractions, accumulation between coupling
+  intervals, and coupling periods;
+- a partitioned-shared-state primitive: request, allocate, run, merge, with an exact-sum
+  conservation contract for contended quantities;
+- data-dependent loops with a reduced exit condition and deterministic ordered reductions, so
+  iterative solvers lower and their iteration counts are priced.
+
+Open dynamical systems composed along ports are the specification of what composition must
+preserve. Raster uses that algebra to state legality and certificates; it does not require users
+to write categorical syntax, and it does not adopt a scene hierarchy or an entity DSL.
+
+### 3.9 Irregular values and communication
+
+The simulator survey found that dense stencils and contractions are two of ten computational
+patterns in production simulation; the others are unstructured-neighbour stencils, particles and
+populations, event-driven sparse updates, spectral transposes, multi-rate composition, coupled
+grids, adaptive refinement and differentiable rollouts. Five primitives cover them without
+prescribing any simulator:
+
+1. **A star-forest communication node.** Root and leaf index sets, a combiner monoid with a
+   deterministic-order attribute, split issue and wait phases, and periodicity as a per-pair
+   coordinate shift. It subsumes N-D halos with per-axis periodicity and widths, corner policy
+   and staggered centering; accumulating reverse halos (direct stiffness summation, deposition,
+   force return); redistribution and pencil transposes; all-to-all-v; population migration; and
+   delayed delivery, which is a halo along the time axis.
+2. **Irregular values.** Ragged arrays and CSR with offsets as first-class values; connectivity
+   tables with source dimension, local dimension, maximum arity and skip value; shards as
+   entity-id sets with an ownership function or table. The SOACs over them are gather-contract
+   (a gather fused into a weighted reduction), scatter-reduce with a declared conflict algebra,
+   segmented irregular reduce over runtime segment sets, and compaction. A pass that tiles a
+   sparse neighbour structure into small dense contractions with masks, as cluster-pair
+   molecular-dynamics kernels do, is the highest-value single lowering.
+3. **Access facts on edges.** Each dependency carries subset, volume and write-conflict facts
+   that propagate through scopes, so halo widths are derived from operator access, fusion
+   legality is subset intersection, transfer bytes are exact, and in-place reuse is proved rather
+   than inferred from spelling.
+4. **A schedule for time** (§3.8), whose simulator prices live memory under a recompute policy,
+   pipeline bubbles, subcycle ratios and iteration counts, and ingests measured per-task costs.
+5. **Contracts as certificates.** Adjoint prolongation/restriction pairs or flux registers for
+   refinement, ordered-reduction attributes that survive lowering, invariance of results under
+   re-layout, index rotation and restart, tolerance-envelope oracles from perturbation ensembles,
+   non-field state in the durable manifest, and stateless counter-based random number generation
+   so checkpoints carry no generator state.
+
+Population and particle values are irregular values with a pure `position → region → owner`
+function, so migration is derived, plus a spatial index as a plan node with static-shape overflow.
+Region trees are IR values.
 
 ## 4. Quantized computation
 
@@ -973,7 +1104,10 @@ the source of truth.
 ## 6. Distributed and resource-aware programming model
 
 Distribution belongs in the abstract value and scheduled graph, not in a
-separate orchestration wrapper. The program model needs:
+separate orchestration wrapper. Shards are entity-id sets with an ownership function or table,
+of which rectangular one-axis partitions are the simplest case; shard boundaries are plan state
+that a re-plan may move on measured cost, as dynamic load balancing and regridding require.
+Halos carry a combiner and are instances of the star-forest node of §3.9. The program model needs:
 
 - a device mesh and topology descriptor;
 - sharding annotations on logical dimensions;
@@ -982,14 +1116,23 @@ separate orchestration wrapper. The program model needs:
   point-to-point operations;
 - compute/communication dependency events;
 - memory capacity and bandwidth constraints per device/link;
-- heterogeneous placement and legal dtype/layout capabilities.
+- heterogeneous placement and legal dtype/layout capabilities;
+- mesh-axis to tensor-axis bindings so several shardings coexist on one value;
+- pipeline stage and microbatch coordinates on steps;
+- a recompute and offload policy with live-range memory accounting;
+- redistribution and all-to-all-v as first-class steps.
 
 Compilation minimizes a cost vector rather than a single kernel time:
 
 ```text
 latency, throughput, peak memory, transferred bytes,
-compile/tune budget, energy when measurable, and numerical error
+compile/tune budget, energy when measurable, floating-point error,
+approximation error under an explicit error model, and information value
 ```
+
+The analytic simulator is a seed. It must price live memory under the recompute policy, pipeline
+bubbles, subcycle ratios and iteration counts, and it must ingest measured per-task costs keyed
+by plan node and device signature so that re-planning on measurement is an ordinary transform.
 
 The compiler hierarchy extends upward without making the single-device `LinkPlan` a cluster object:
 
@@ -1075,7 +1218,17 @@ institutional archive. Datahike publishes the semantic state only after required
 receipts; direct fabrics still move hot halos, gradients and activations. See
 [`durable-numerical-state.md`](durable-numerical-state.md).
 
-## 7. Reflection, structural self-modification, and learning
+## 7. Reflection, inference through simulator internals, and learning
+
+This section is a track, not an appendix. Inference is the driver of §0, and inference that uses
+simulator internals is exactly reflection: the program is data, so automatic differentiation,
+linearization, coarse-graining, marginalization, multi-level estimators and emulators of internal
+state are certified transformations that an inference procedure may request. The track's
+demonstrator is fixed: one simulation-backed inference task solved by black-box sequential Monte
+Carlo or approximate Bayesian computation on the simulator, and again by procedures that use its
+internals through Raster transformations, with calibration checked by simulation-based
+calibration and the cost vector reported for both. Learned proposals, including amortized
+proposals from pretrained models, compete in shadow mode under the same calibration gate.
 
 Raster can make reflection unusually powerful because Clojure data is a natural
 representation for programs and schedules. The safe version has four rules:
@@ -1203,6 +1356,7 @@ The integrated roadmap has six cooperating tracks rather than one backend-only s
 | Measurement and selection | One tuner over coupled graph/kernel axes with numerical and resource gates | Hardware-aware schedule selection and selective autotuning |
 | Precise target lowering | Format-neutral target modules, differential PTX, later AMD-specific lowering | Exact async/matrix/cache control where portable source is insufficient |
 | Distributed/workload planning | Typed mesh/topology/sharding values, then certified `DistributedPlan` | End-to-end node, cluster and data-center optimization |
+| Simulation and inference vertical | One end-to-end workload with a fidelity transform, restart/branch and a parameter inference, early and on toy kernels | The objective of §0 becomes measurable before the backend is complete |
 
 The table below is the durable architectural dependency ledger, not a claim that every increment is
 unstarted. ABI, artifact composition and much of the kernel-IR foundation have landed; their stated
@@ -1218,6 +1372,26 @@ completion gates remain useful for finding legacy paths that have not joined the
 | 6. Closed tuning loop | Connect real device timing to schedule candidates and graph choices; make cache/provenance complete; wire or explicitly classify every schedule axis. | A cold compile tunes once, a warm compile reproduces the winner, numerical validation precedes timing, and the artifact explains why it won. |
 | 7. Workload-driven coverage | Add stream/hist/gather/scatter, masking/block views, atomics, layouts/staging, and quant formats as demanded by model/scientific kernels. | Coverage is measured through production lowering on a published workload corpus, with differential and device compile/run gates. |
 | 8. Distributed IR | Add mesh/sharding abstract values, collective nodes, communication cost, and placement scheduling. | A transformer training step runs data-parallel on multiple devices without hidden host copies and reports compute, communication, and memory costs. |
+
+The tracks interleave. The simulation and inference vertical does not wait for increments 7 and 8;
+it lands on toy kernels as soon as increment 1 is closed, so that fidelity axes, error models and
+calibration gates are exercised while the backend matures. Its ladder, each rung one
+production-lowered kernel, one certified plan and one oracle, with the reference kernel named in the
+survey:
+
+| Rung | Demonstrator | Primitives | Oracle |
+|---|---|---|---|
+| D1 | 2-D shallow water, 2-D decomposition, periodic and wall halos, coarse-graining transform, restart and branch, one parameter inference | star forest, access facts, contracts | mass, lake-at-rest, convergence, bitwise invariance under re-layout/rotate/restart, calibration |
+| D2 | Icosahedral divergence or spectral-element gradient with direct stiffness summation | irregular values, combiner halo | reference values, rank-invariant ordered sums |
+| D3 | Smoothed-particle pair density or Lennard-Jones over cell lists with ghost exchange | populations, star forest | brute-force oracle with per-field tolerance table |
+| D4 | Spiking-network spike delivery with delays: ragged send table, ring-buffer scatter, all-to-all-v | irregular values, time halo | exact-integration neuron reference |
+| D5 | Pencil transpose and FFT inside a distributed pressure solve with a reduced exit | redistribution, data-dependent loop | reference solver |
+| D6 | One transformer layer under tensor and data parallelism with sharded optimizer state, certified collective sequence, simulated with recompute memory and a pipeline bubble | time schedule, access facts | collective trace and measured two-device run |
+| D7 | Whole-cell-style partition/merge of ODE, stochastic and linear-programming sub-models under a versioned outer loop | rate scheduler, coupler, contracts | exact-sum conservation, queryable plan lineage |
+| D8 | Key/value continuation state: prefix index over the content chain and a cross-node transfer plan | star forest | hit rate and transfer bytes against serving systems |
+
+D2 to D4 are the test of the claim that one substrate covers simulation, because they are the
+three patterns that are not dense. D6 is the honest ceiling for training on measurable hardware.
 
 The first two increments are correctness infrastructure and should precede
 additional backend breadth. Increment 5 is the first major model-execution
@@ -1239,7 +1413,16 @@ Every tier compares semantics first and performance second:
 5. one transformer layer forward, VJP, optimizer update, and mixed precision;
 6. `pretrained-rstr` prefill and decode with KV residency and logits parity;
 7. `finetune-rstr` batched SFT/LoRA/QLoRA with a wholly resident train step;
-8. full model execution and training, then multi-device versions.
+8. full model execution and training, then multi-device versions;
+9. transformation legality: a fidelity switch, coarse-graining or marginalization preserves the
+   declared conservation and coupling contracts and stays inside its error model;
+10. calibration: simulation-based calibration of inference across fidelities, with the cost
+    vector reported per fidelity;
+11. invariance: identical results under re-layout, index rotation, restart and reproducible mode,
+    as a test matrix rather than a single case;
+12. the agent baseline: time an agent writing and certifying a bespoke version of the same
+    workload; if that is cheaper than the Raster expression including its certificate, record it
+    as a failure of direction, not of the agent.
 
 For each tier record numerical error, kernel count, allocations, peak memory,
 host/device and device/device bytes, compile time, tuning time, steady-state
@@ -1262,6 +1445,14 @@ transfer boundaries, and numerical modes.
 - Do not add distributed side protocols that are invisible to the value and
   effect model.
 - Do not let self-modifying or learned components bypass the trusted verifier.
+- Do not adopt a scene graph, entity hierarchy or integrator DSL; integrators, rates and couplings
+  are schedule data over the semantic dynamical system.
+- Do not require users to write categorical syntax; the algebra of open systems is the
+  specification the certificate checks.
+- Do not add a fidelity, coarse-graining, marginalization or surrogate transform without its
+  error model, legality rule, calibration oracle and cost-vector entry.
+- Do not require every solver to be a probabilistic-numerics solver; require every solver to
+  expose an error model.
 
 ## 11. Reference mapping and study snapshot
 
@@ -1276,6 +1467,15 @@ transfer boundaries, and numerical modes.
 | Mojo/MAX | one language spanning host and device, parametric low-level GPU libraries, explicit layouts/pipelines, heterogeneous cross-compilation | coupling Raster's semantics to a closed compiler stack or requiring imperative kernels as the main abstraction |
 | TVM Relax/Disco | graph-level tensor distribution, SPMD worker sessions, explicit collective runtime boundary | making a controller/runtime protocol the distributed semantic IR |
 | Legion/DaCe | correctness-independent mapping, topology-aware task/data placement, explicit data movement and transformations | adopting a second user programming model before Raster's value and schedule IRs are complete |
+| PETSc star forest, DaCe memlets | one communication primitive under halos, gather-scatter and collectives; subset/volume facts on edges with propagation | a solver-library object model |
+| Oceananigans, Devito, GROMACS | halo width and pairlist lifetime derived from operator access and an error tolerance; decomposition priced by an analytic communication model | hand-packed tags, per-layout kernel families |
+| AMReX, Trixi.jl | flux registers or adjoint prolong/restrict as the conservation contract of refinement | a fixed refinement data structure |
+| ICON, MOM6, E3SM | order-insensitive sums, invariance test matrices, perturbation-ensemble tolerance oracles, two schedules of one physics | Fortran-era global state |
+| Athena++, SWIFT | per-block task lists with dependencies and retry, measured task costs driving re-decomposition, stateless random numbers | bulk-synchronous stepping |
+| NEST, FLAME GPU 2, whole-cell models | ragged delivery with delays, populations with birth/death and spatial messaging, partition/merge of contended state across sub-models | a fixed neuron, agent or cell model |
+| Alpa, DeepSpeed | plans and pipeline schedules as replayable data with a cost model and memory constraint | mutable process-group globals |
+| vLLM, Mooncake | prefix-hash identity for continuation state, topology-aware transfer | scheduler state that cannot be replayed |
+| Probabilistic numerics, AlgebraicDynamics | error as uncertainty, solvers as inference, open systems composed along ports as the composition specification | a mandatory probabilistic solver or a categorical user syntax |
 
 Local source revisions studied for this direction:
 
@@ -1295,3 +1495,31 @@ The durable decision is not any one revision's class hierarchy. It is the
 separation of semantic program, transform/schedule, verified kernel, target
 lowering, and composable artifact—with stable identities and measurements
 connecting them.
+
+## 12. Iteration procedure
+
+The document is the specification; the survey corpus and its reference kernels are the
+regression reference; the demonstrator ladder in §8 is the schedule. Each rung goes through one
+cycle:
+
+1. **Design note** (internal working note, not this document): the rung, the reference kernel by
+   file and line in the surveyed system, the primitives of §3.8–§3.9 it touches, the oracle,
+   the error model, and the agent baseline to be timed.
+2. **REPL spike** on toy sizes, single device, using the existing typed route; no new pass until
+   the spike shows which primitive is actually missing.
+3. **Land the primitive** with its certificate, a production-path test through the ordinary
+   compile entry, `explain-pipeline` visibility, and no metadata-only transport.
+4. **Run the gates**: the rung's oracle, the invariance matrix of §9, the calibration check where
+   inference is involved, and the agent baseline.
+5. **Record** measurements and the certified plan with provenance, so re-planning on measurement
+   and comparison across rungs are queries rather than notebooks.
+6. **Write back** to this document: every architectural claim carries one of the labels
+   *designed*, *landed* or *measured*, and a claim may not be promoted without the gate that
+   promotes it.
+7. **Drift audit** before the next rung: an independent rubric-style reading of the landed code
+   against §10, in the manner of the alignment notes, so that landed-but-unwired pieces are
+   caught while they are small.
+
+One rung is one pull request per coherent phase, with checkpoint commits on the branch. A rung
+that fails its agent baseline twice is a direction finding, not an implementation finding, and
+returns to §0.
