@@ -15,6 +15,8 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
 (def ^:private default-min-split-chunk 1024)
@@ -258,18 +260,46 @@
      phase (cond-> {:tile tile :split-k? split-k? :accumulator-dtype :float}
              scheduled (assoc :kernel-body (:kernel-body scheduled))))))
 
+(defn emit-split-k-combine-kernel
+  "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
+  ([kernel-name] (emit-split-k-combine-kernel kernel-name :opencl-intel))
+  ([kernel-name target-dialect]
+   (let [form '(raster.par/contract C [[i mn]] [[s splits]]
+                                     (clojure.core/aget
+                                      partials (clojure.core/+ (clojure.core/* s mn) i)))
+        facts (contraction-facts/contraction-facts form :dtype :float)
+        operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
+        planned (contraction-schedule/plan-portable-body
+                 facts operation {}
+                 {:array-types {'partials :float 'C :float}
+                  :scalar-types {'mn :int 'splits :int}})
+        _ (when-not (:ok planned)
+            (throw (ex-info "split-K combination did not admit the portable contraction schedule"
+                            {:reason :raster/bug :plan planned})))
+        kernel-body (:body planned)
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect
+                 :parameter-names {'partials "partials" 'C "C"
+                                   'mn "mn" 'splits "splits" '_nseg "_nseg"}})]
+     {:source source :kernel-body kernel-body :workgroup-size 256})))
+
 (defn- combine-artifact
   [kernel-name partials c mn splits]
-  (artifact
-   kernel-name (codegen/emit-gemm-splitk-reduce-kernel kernel-name)
-   [(kabi/slot partials :input :float :c-name "partials")
-    (kabi/slot c :output :float :c-name "C")
-    (kabi/slot :mn :scalar :int :c-name "mn")
-    (kabi/slot :splits :scalar :int :c-name "splits")]
-   [partials c mn splits]
-   (klaunch/spec {:workgroup-size [256]
-                  :group-count [(klaunch/ceil-div (klaunch/runtime-value mn) 256)]})
-   :split-k-combine {:accumulator-dtype :float}))
+  (let [{:keys [source kernel-body]} (emit-split-k-combine-kernel kernel-name)]
+    (artifact
+     kernel-name source
+     [(kabi/slot 'partials :input :float :c-name "partials" :role :operand
+                 :aliasing :no-write-alias)
+      (kabi/slot 'C :output :float :c-name "C" :role :result)
+      (kabi/slot 'mn :scalar :int :c-name "mn" :role :extent)
+      (kabi/slot 'splits :scalar :int :c-name "splits" :role :extent)
+      (kabi/slot '_nseg :scalar :int :c-name "_nseg" :role :bound)]
+     [partials c mn splits mn]
+     (klaunch/spec {:workgroup-size [256]
+                    :group-count [(klaunch/ceil-div (klaunch/runtime-value mn) 256)]})
+     :split-k-combine {:accumulator-dtype :float :kernel-body kernel-body
+                       :semantic-op :contraction})))
 
 (defn- xmx-graph
   [{:keys [id a b c m n k variant tile vector-width requested-splits split-k?] :as spec}]
