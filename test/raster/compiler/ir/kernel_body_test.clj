@@ -54,9 +54,9 @@
 (deftest kernel-buffer-shapes-retain-symbolic-launch-arithmetic
   (let [extent (launch/ceil-div 'n 256)
         kernel (-> (minimal-body)
-                   (assoc-in [:parameters 0 :shape] [extent])
+                   (assoc-in [:parameters 0 :shape] [extent 16])
                    (assoc-in [:parameters 0 :layout]
-                             (layout/row-major [extent] :half)))]
+                             (layout/row-major [extent 16] :half)))]
     (is (= kernel (body/validate! kernel)))
     (is (= extent (get-in kernel [:parameters 0 :shape 0])))))
 
@@ -78,16 +78,39 @@
     (let [kernel (minimal-body)
           bad (assoc-in kernel [:operations 0 :operations 2 :mask] :missing)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared mask"
-                            (body/validate! bad))))))
+                            (body/validate! bad)))))
+  (testing "matrix fragment shapes are fixed by the instruction"
+    (let [bad (assoc-in (minimal-body) [:fragments 0 :shape] [8 8])]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"fragment shapes"
+                            (body/validate! bad)))))
+  (testing "tile coordinates match storage rank"
+    (let [bad (update-in (minimal-body)
+                         [:operations 0 :operations 1 :operations 0 :coordinates]
+                         pop)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"buffer rank"
+                            (body/validate! bad)))))
+  (testing "tile-load dtypes follow storage rather than target inference"
+    (let [bad (assoc-in (minimal-body) [:fragments 0 :dtype] :float)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dtype"
+                            (body/validate! bad)))))
+  (testing "storage shape and dtype agree with their named layout"
+    (let [bad-shape (assoc-in (minimal-body) [:parameters 0 :shape] [8 16])
+          bad-dtype (assoc-in (minimal-body) [:parameters 0 :dtype] :float)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"shape disagrees"
+                            (body/validate! bad-shape)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dtype disagrees"
+                            (body/validate! bad-dtype))))))
 
 (deftest buffer-views-retain-parent-ownership-and-explicit-offsets
   (let [kernel (minimal-body)
         kernel (-> kernel
                    (assoc-in [:parameters 0 :shape] [16 16 16])
+                   (assoc-in [:parameters 0 :layout]
+                             (layout/row-major [16 16 16] :half))
                    (assoc-in [:launch :group-count] [16]))
         view (body/->BufferView 'A-slab 'A
                                 (body/expression :mul 'group-x 16 16)
-                                [16 16] (:layout (first (:parameters kernel))))
+                                [16 16] (layout/row-major [16 16] :half))
         viewed (-> kernel
                    (assoc :views [view])
                    (assoc-in [:operations 0 :operations 1 :operations 0 :buffer] 'A-slab))]

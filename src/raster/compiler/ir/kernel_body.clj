@@ -355,6 +355,30 @@
   (when (layout/shared-memory-layout? layout)
     (layout/validate-shared-memory! layout)))
 
+(defn- storage-layout!
+  "Validate the shape/dtype facts repeated by dense storage layouts.
+
+  Fragment layouts deliberately do not all carry a tensor shape, but every layout that does state
+  one must agree with its owner.  This prevents a target emitter from indexing according to a
+  stale layout descriptor after the storage contract changed."
+  [owner shape dtype storage-layout]
+  (layout! owner storage-layout)
+  (when (and (contains? storage-layout :shape)
+             (not= (vec shape) (vec (:shape storage-layout))))
+    (throw (ex-info (str owner " shape disagrees with its layout")
+                    {:reason :kernel-body-layout-shape
+                     :shape shape :layout storage-layout})))
+  (when (and (contains? storage-layout :rank)
+             (not= (count shape) (:rank storage-layout)))
+    (throw (ex-info (str owner " rank disagrees with its layout")
+                    {:reason :kernel-body-layout-rank
+                     :shape shape :layout storage-layout})))
+  (when (and (contains? storage-layout :dtype)
+             (not= (dtype/canon dtype) (dtype/canon (:dtype storage-layout))))
+    (throw (ex-info (str owner " dtype disagrees with its layout")
+                    {:reason :kernel-body-layout-dtype
+                     :dtype dtype :layout storage-layout}))))
+
 (defn- unique-ids! [owner values]
   (let [ids (mapv :id values)]
     (when (or (some nil? ids) (not= (count ids) (count (set ids))))
@@ -547,6 +571,14 @@
           (throw (ex-info "tile loads must produce a named dot-operand fragment"
                           {:fragment f})))
         (coordinates! "tile-load" (:coordinates operation))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "tile-load coordinates must match the buffer rank"
+                          {:reason :kernel-body-tile-load-rank
+                           :buffer p :coordinates (:coordinates operation)})))
+        (when-not (= (dtype/canon (:dtype p)) (dtype/canon (:dtype f)))
+          (throw (ex-info "tile-load fragment dtype must equal the buffer element dtype"
+                          {:reason :kernel-body-tile-load-dtype
+                           :buffer p :fragment f})))
         (mask (:mask operation))
         (when-not (contains? cache-policies (:cache operation))
           (throw (ex-info "tile load has an unsupported cache policy"
@@ -559,6 +591,15 @@
         (shape! "tile prefetch" (:shape operation))
         (layout! "tile prefetch" (:layout operation))
         (coordinates! "tile-prefetch" (:coordinates operation))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "tile-prefetch coordinates must match the buffer rank"
+                          {:reason :kernel-body-tile-prefetch-rank
+                           :buffer p :coordinates (:coordinates operation)})))
+        (when-not (= (dtype/canon (:dtype p))
+                     (dtype/canon (get-in operation [:layout :dtype])))
+          (throw (ex-info "tile-prefetch layout dtype must equal the buffer element dtype"
+                          {:reason :kernel-body-tile-prefetch-dtype
+                           :buffer p :layout (:layout operation)})))
         (when-not (and (integer? (:distance operation)) (not (neg? (:distance operation))))
           (throw (ex-info "tile-prefetch distance must be a non-negative integer"
                           {:distance (:distance operation)})))
@@ -581,7 +622,22 @@
                        (= (:parent rhs-layout) acc-layout)
                        (= (:matrix acc-layout) matrix))
           (throw (ex-info "matrix MAD fragment layouts do not agree with its instruction"
-                          {:accumulator acc :lhs lhs :rhs rhs :instruction matrix}))))
+                          {:accumulator acc :lhs lhs :rhs rhs :instruction matrix})))
+        (let [{matrix-m :m matrix-n :n matrix-k :k} matrix]
+          (when-not (= [[matrix-m matrix-n] [matrix-m matrix-k] [matrix-k matrix-n]]
+                       [(:shape acc) (:shape lhs) (:shape rhs)])
+            (throw (ex-info "matrix MAD fragment shapes do not agree with its instruction"
+                            {:reason :kernel-body-matrix-fragment-shape
+                             :accumulator acc :lhs lhs :rhs rhs :instruction matrix}))))
+        (when-not (and (= (dtype/canon (:dtype acc))
+                          (dtype/canon (:dtype acc-layout)))
+                       (= (dtype/canon (:dtype lhs))
+                          (dtype/canon (:dtype lhs-layout)))
+                       (= (dtype/canon (:dtype rhs))
+                          (dtype/canon (:dtype rhs-layout))))
+          (throw (ex-info "matrix MAD fragment dtypes do not agree with their layouts"
+                          {:reason :kernel-body-matrix-fragment-dtype
+                           :accumulator acc :lhs lhs :rhs rhs :instruction matrix}))))
 
       (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
       (do
@@ -619,6 +675,10 @@
         (when-not (= :mma-frag (get-in f [:layout :kind]))
           (throw (ex-info "tile stores require an accumulator fragment" {:fragment f})))
         (coordinates! "tile-store" (:coordinates operation))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "tile-store coordinates must match the buffer rank"
+                          {:reason :kernel-body-tile-store-rank
+                           :buffer p :coordinates (:coordinates operation)})))
         (mask (:mask operation))
         (when-let [region (:value-region operation)]
           (if (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion" region)
@@ -1889,7 +1949,7 @@
           (throw (ex-info "scalar kernel parameters cannot carry storage layout"
                           {:parameter p})))
         (do (shape! "kernel buffer parameter" (:shape p))
-            (layout! "kernel buffer parameter" (:layout p))
+            (storage-layout! "kernel buffer parameter" (:shape p) (:dtype p) (:layout p))
             (when (layout/shared-memory-layout? (:layout p))
               (throw (ex-info "shared-memory layouts are restricted to workgroup allocations"
                               {:reason :kernel-body-shared-layout-memory-space
@@ -1960,7 +2020,8 @@
                    (throw (ex-info "kernel buffer view offset references values outside its scope"
                                    {:view view :references (vec outside) :scope index-scope}))))
                (shape! "kernel buffer view" (:shape view))
-               (layout! "kernel buffer view" (:layout view))
+               (storage-layout! "kernel buffer view" (:shape view) (:dtype parent)
+                                (:layout view))
                (when (layout/shared-memory-layout? (:layout view))
                  (throw (ex-info "shared-memory layouts cannot decorate global buffer views"
                                  {:reason :kernel-body-shared-layout-memory-space
@@ -2036,7 +2097,13 @@
                        (dtype/known? (:dtype f)))
           (throw (ex-info "kernel fragment requires a known dtype" {:fragment f})))
         (shape! "kernel fragment" (:shape f))
-        (layout! "kernel fragment" (:layout f)))
+        (layout! "kernel fragment" (:layout f))
+        (when (and (contains? (:layout f) :dtype)
+                   (not= (dtype/canon (:dtype f))
+                         (dtype/canon (get-in f [:layout :dtype]))))
+          (throw (ex-info "kernel fragment dtype disagrees with its layout"
+                          {:reason :kernel-body-fragment-layout-dtype
+                           :fragment f}))))
       (doseq [[field value] [[:schedule schedule] [:launch launch] [:provenance provenance]
                              [:attributes attributes]]]
         (when-not (map? value)
