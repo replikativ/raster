@@ -52,7 +52,7 @@
   {:var raster.dl.array-ops/dot-rows-dbias,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_273054 = (loop*"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_273037 = (loop*"}
   {:var raster.dl.array-ops/dot-rows-dh,
    :route :scalar,
    :typed-validated false,
@@ -112,7 +112,7 @@
   {:var raster.dl.array-ops/masked-mse-loss-backward,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_277645 = (if (cloj"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_277628 = (if (cloj"}
   {:var raster.dl.array-ops/pack-heads,
    :route :typed-soac,
    :typed-validated true,
@@ -192,18 +192,15 @@
   {:var raster.dl.attention/attn-prefill-scores!,
    :route :typed-soac,
    :typed-validated true,
-   :declines [],
-   :effect-orders {:sequential 1}}
+   :declines []}
   {:var raster.dl.attention/attn-prefill-scores-bidir!,
    :route :typed-soac,
    :typed-validated true,
-   :declines [],
-   :effect-orders {:sequential 1}}
+   :declines []}
   {:var raster.dl.attention/attn-prefill-scores-windowed!,
    :route :typed-soac,
    :typed-validated true,
-   :declines [],
-   :effect-orders {:sequential 1}}
+   :declines []}
   {:var raster.dl.attention/attn-prefill-softmax!,
    :route :compatibility,
    :typed-validated false,
@@ -333,8 +330,7 @@
   {:var raster.dl.attention/kv-append-buf!,
    :route :typed-soac,
    :typed-validated true,
-   :declines [],
-   :effect-orders {:sequential 1}}
+   :declines []}
   {:var raster.dl.attention/multi-head-attention,
    :route :compatibility,
    :typed-validated false,
@@ -407,7 +403,7 @@
   {:var raster.dl.diffusion/compute-alphas-cumprod,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_290436 = (loop*"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_290419 = (loop*"}
   {:var raster.dl.diffusion/cosine-beta-schedule,
    :route :error,
    :error
@@ -467,7 +463,7 @@
   {:var raster.dl.nn/batch-norm,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_129622 = (if (cloj"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_129649 = (if (cloj"}
   {:var raster.dl.nn/batch-norm-backward-dbeta,
    :route :scalar,
    :typed-validated false,
@@ -882,7 +878,7 @@
   {:var raster.dl.optim/clip-grad-norm!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_287828 = (if (.inv"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_287811 = (if (.inv"}
   {:var raster.dl.optim/cosine-lr,
    :route :error,
    :error
@@ -951,7 +947,7 @@
   {:var raster.nn/kaiming-init!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_301234 = \\\"Kaim"}
+   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_301217 = \\\"Kaim"}
   {:var raster.nn/loss-fn,
    :route :compatibility,
    :typed-validated false,
@@ -989,7 +985,7 @@
   {:var raster.nn/xavier-init!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_308099 = \\\"Xavi"}
+   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_308082 = \\\"Xavi"}
   {:var raster.ode.pde/heat-loss-rk4,
    :route :error,
    :error :emitted-parallel-program-call-required}

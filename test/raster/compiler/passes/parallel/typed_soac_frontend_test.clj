@@ -1047,3 +1047,60 @@
     (is (= [:float] (:dtypes attributes)))
     (is (= :float (:result-dtype transform)))
     (is (= [:float] (mapv :dtype (:operands transform))))))
+
+(defn- effect-map-order
+  "`:independent`/`:sequential` for an effect map; a proven unique offset write becomes a
+   certified scatter, reported as `:unique`."
+  [source types]
+  (let [program (frontend/form->program (frontend/normalize-source source types) types)
+        equation (last (dialect/equations program))
+        {:keys [attributes]} (dialect/operation-parts equation)]
+    (if (= 'scatter (dialect/operation-kind equation))
+      (:conflict attributes)
+      (:iteration-order attributes))))
+
+(deftest a-uniform-array-read-is-an-invariant-offset
+  ;; kv-append: cache[posbuf[0]·kvrow + i] over i < kvrow; posbuf[0] is read, never written,
+  ;; at an index free of the map, so it is an invariant factor and the map is independent
+  (let [types {:dtype :float :array-types {'src :float 'cache :float 'posbuf :long}
+               :scalar-types {'kvrow :long}}
+        map-over (fn [index]
+                   (list 'let* ['effect (list 'raster.par/map-void! 'i 'kvrow
+                                              (list 'clojure.core/aset 'cache index
+                                                    '(clojure.core/aget src i)))]
+                         'effect))]
+    (is (= :unique
+           (effect-map-order
+            (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget posbuf 0) kvrow) i))
+            types))
+        "proven unique: a certified scatter, no ordering claim")
+    (testing "a read that varies with the map index is data the algebra cannot see"
+      (is (= :sequential
+             (effect-map-order
+              (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget posbuf i) kvrow) i))
+              types))))
+    (testing "a read of the destination itself is not invariant"
+      (is (= :sequential
+             (effect-map-order
+              (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget cache 0) kvrow) i))
+              types))))))
+
+(deftest stores-at-one-address-in-exclusive-arms-are-one-write
+  ;; attention prefill: both arms write sc[(i·n-q + hq)·nrows + j]; one work item, one element
+  (let [source '(let* [effect (raster.par/map-void!
+                               idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+                               (let* [^long per-i (clojure.core/* n-q nrows)
+                                      ^long i (clojure.core/quot idx per-i)
+                                      ^long rest0 (clojure.core/rem idx per-i)
+                                      ^long hq (clojure.core/quot rest0 nrows)
+                                      ^long j (clojure.core/rem rest0 nrows)
+                                      ^long row (clojure.core/+ (clojure.core/* i n-q) hq)]
+                                 (if (clojure.core/< i j)
+                                   (clojure.core/aset sc (clojure.core/+ (clojure.core/* row nrows) j)
+                                                      (float -1.0e30))
+                                   (clojure.core/aset sc (clojure.core/+ (clojure.core/* row nrows) j)
+                                                      (clojure.core/aget q j)))))]
+                  effect)]
+    (is (= :unique
+           (effect-map-order source {:dtype :float :array-types {'sc :float 'q :float}
+                                     :scalar-types {'nrows :long 'n-q :long}})))))

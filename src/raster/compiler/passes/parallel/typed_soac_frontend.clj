@@ -644,13 +644,40 @@
         expanded
         (recur expanded (dec remaining))))))
 
+(defn- invariant-read-atoms
+  "Replace every array read in `form` that is uniform across the map with an atom symbol: a
+   read of an array the region does not write, at an index free of the map index, the loop
+   indices and the region locals (`(aget posbuf 0)`, a position established before the map).
+   Such a read is a scalar the algebra can treat as an invariant factor. `atoms` memoizes one
+   symbol per distinct read so equal reads stay equal."
+  [form destinations varying atoms]
+  (descriptor/rewrite-aget-reads
+   form
+   (fn [read]
+     (let [array (descriptor/aget-array-sym read)
+           index (descriptor/aget-index read)]
+       (when (and (symbol? array)
+                  (not (contains? destinations array))
+                  (empty? (set/intersection varying (util/free-syms index))))
+         (let [key (list 'clojure.core/aget array index)]
+           (or (get @atoms key)
+               (let [atom-symbol (clojure.core/symbol (str "rstr_read_" (count @atoms)))]
+                 (swap! atoms assoc key atom-symbol)
+                 atom-symbol))))))))
+
 (defn- store-index-form
   "The mixed-radix index form of a store's destination index over the map index (extent
    `extent`), the region locals and, for a loop store, its loop's locals and index. Host
-   scalar definitions are expanded first so extents and strides show their factors."
-  [store index extent locals loops]
+   scalar definitions are expanded first so extents and strides show their factors, and
+   uniform array reads become invariant atoms (`destinations` are the region's written arrays)."
+  [store index extent locals loops destinations]
   (let [loop (when (:loop store) (nth loops (:loop store)))
-        expand expand-scalar-definitions]
+        varying (into #{index}
+                      (concat (map :id locals) (map :id (:locals loop))
+                              (map :index loops)))
+        atoms (atom {})
+        expand (fn [form]
+                 (invariant-read-atoms (expand-scalar-definitions form) destinations varying atoms))]
     (index-algebra/index-form (expand (:index store)) index (expand extent)
                               (mapv #(update % :init expand) (concat locals (:locals loop)))
                               (if loop {(:index loop) (expand (:extent loop))} {}))))
@@ -660,7 +687,8 @@
    index form is injective, and stores sharing a destination share one form and write at
    provably disjoint offsets. Returns the set of store ordinals."
   [stores index extent locals loops]
-  (let [forms (mapv #(store-index-form % index extent locals loops) stores)
+  (let [destinations (set (map :out stores))
+        forms (mapv #(store-index-form % index extent locals loops destinations) stores)
         by-destination (group-by (fn [ordinal] (:out (nth stores ordinal)))
                                  (range (count stores)))]
     (into #{}
@@ -669,8 +697,11 @@
                       (when (and (every? some? group-forms)
                                  (every? index-algebra/injective? group-forms)
                                  (apply = (map :terms group-forms))
+                                 ;; stores at one address (the arms of a conditional) are the
+                                 ;; same element of one work item; distinct offsets must be
+                                 ;; disjoint across work items
                                  (index-algebra/disjoint-offsets?
-                                  (first group-forms) (map :offset group-forms)))
+                                  (first group-forms) (distinct (map :offset group-forms))))
                         ordinals))))
           by-destination)))
 

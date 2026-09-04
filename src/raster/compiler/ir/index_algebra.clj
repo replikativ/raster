@@ -250,9 +250,14 @@
 ;; ---------------------------------------------------------------------------------------------
 ;; Affine forms over digits
 
+(defn- monomial-form
+  [{:keys [const factors]}]
+  (apply list 'clojure.core/* const factors))
+
 (defn- affine
   "Affine normal form `{:terms {sym monomial-coefficient} :const n}` of an index expression over
-   the given digit symbols, or nil when it is not affine in them."
+   the given digit symbols, or nil when it is not affine in them. A product of one affine
+   factor by invariant monomials distributes: `(i·a + h)·b = i·(a·b) + h·b`."
   [expression digit-set]
   (let [expression (strip-cast expression)]
     (cond
@@ -283,7 +288,27 @@
           ;; a product without any digit is a symbolic offset
           (and (empty? digit-operands) (monomial expression))
           {:terms {} :const 0 :symbolic [expression]}
-          :else nil))
+          ;; one non-monomial factor (a sum, or a nested product carrying digits) times
+          ;; invariant monomials: distribute the scale over its terms and offsets
+          :else
+          (let [invariant? (fn [operand]
+                             (and (monomial operand)
+                                  (not (contains? digit-set (strip-cast operand)))))
+                [inner :as affine-operands] (remove invariant? operands)
+                scale (map monomial (filter invariant? operands))]
+            (when (and (= 1 (count affine-operands)) (seq scale))
+              (when-let [inner (affine inner digit-set)]
+                (let [m (apply product scale)]
+                  {:terms (into {} (map (fn [[digit coefficient]]
+                                          [digit (product coefficient m)]))
+                                (:terms inner))
+                   :const 0
+                   :symbolic (vec (concat (map (fn [symbolic]
+                                                 (list 'clojure.core/* symbolic (monomial-form m)))
+                                               (:symbolic inner))
+                                          (when-not (zero? (:const inner))
+                                            [(list 'clojure.core/* (:const inner)
+                                                   (monomial-form m))])))}))))))
       :else nil)))
 
 (defn index-form
