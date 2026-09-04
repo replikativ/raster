@@ -205,8 +205,10 @@
   ;; still `:half`, and no host materialization through a JVM scalar cast (the `main` failure
   ;; was `:typed-soac-materialization-dtype` for `[:half]`). The roundtrip then runs on the
   ;; device, so the test needs one.
-  (if-not @device-probe/opencl-available?
-    (device-probe/opencl-skip! "fp16 block transfer typed route")
+  ;; The kernels hold `half` values, so the device needs cl_khr_fp16 (the CI CPU gate's PoCL
+  ;; does not have it); the skip names that capability.
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "fp16 block transfer typed route" :fp16)
     (doseq [target [:ocl:0 :ze:0]]
     (let [descriptor (pipeline/compile-gpu-program #'block-transfer-half-roundtrip! target
                                                    :dtype :float)
