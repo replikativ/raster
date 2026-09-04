@@ -333,12 +333,14 @@
                    (throw (ex-info "kernel scalar has an unknown declared dtype"
                                    {:reason :kernel-scalar-dtype :symbol sym
                                     :declared explicit})))
-      ;; Stamped tag is authoritative — it OUTRANKS the name regex so a float named
-      ;; `len`/`count` isn't truncated to int and an int renamed away from an int-ish
-      ;; name still declares int.
       metadata-dtype metadata-dtype
-      (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname) :int
-      :else (dtype/canon default-dtype))))
+      ;; No declared fact and no stamped tag: refuse rather than guess from the name or the
+      ;; kernel dtype. The pipeline forwards every deftm param and every tagged binder, so
+      ;; reaching this branch means a scalar lost its type upstream.
+      :else (throw (ex-info "kernel scalar parameter has no declared or retained dtype"
+                            {:reason :kernel-scalar-dtype-unknown :symbol sym
+                             :kernel-dtype (some-> default-dtype dtype/canon)
+                             :declared (vec (keys scalar-types))})))))
 
 (defn fn-style-reduction-op?
   "True if a reduction op emits as a C function call `f(a,b)` (fmax/fmin) rather

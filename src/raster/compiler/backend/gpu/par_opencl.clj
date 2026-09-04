@@ -280,7 +280,9 @@
                      long :long
                      float :float
                      double :double
-                     (or dtype :int))
+                     (or dtype
+                         (throw (ex-info "exclusive scan generator requires a scan dtype"
+                                         {:reason :scan-dtype-unknown :form form}))))
         ctype (get {:int "int" :long "long" :float "float" :double "double"}
                    scan-dtype "int")
         ;; Extract combining op and element expression (same pattern as reduce)

@@ -34,11 +34,15 @@
   [expression types]
   (cond
     (integer? expression) :int
-    (value-id? expression) (get types expression :int)
+    (value-id? expression)
+    (or (get types expression)
+        (throw (ex-info "index expression references a value with no declared dtype"
+                        {:reason :index-value-dtype-unknown :value expression})))
     (record-kind? "IndexCast" expression) (dtype/canon (:dtype expression))
     (record-kind? "IndexExpr" expression)
-    (or (some-> (:arguments expression) first (index-expression-dtype types)) :int)
-    :else :int))
+    (index-expression-dtype (first (:arguments expression)) types)
+    :else (throw (ex-info "index expression has an unsupported operand"
+                          {:reason :index-expression-operand :expression expression}))))
 
 (defn- emit-infix [operator arguments env]
   (str "(" (str/join (str " " operator " ")

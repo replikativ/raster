@@ -11,6 +11,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -47,6 +48,50 @@
 ;; Single source of declared GPU param types (shared by BOTH compile entries:
 ;; raster.gpu.core/compile-deftm-internal! and the pipeline's pass-backend).
 ;; ================================================================
+
+(defn- counted-loop-index-dtype
+  "The integral dtype of a `loop*` binder initialised by an integer literal or an explicit
+   integral cast: the expanded `dotimes` counter. The fact is the init's own type, not a guess
+   from the binder's name; a floating or untyped init yields nil."
+  [form init]
+  (cond
+    ;; an unexpanded dotimes counter is a long by the macro's own contract
+    (contains? '#{dotimes clojure.core/dotimes} (first form)) :long
+    (form/loop-head? (first form))
+    (cond
+      (integer? init) :long
+      (and (seq? init) (= 2 (count init)))
+      (case (first init)
+        (long clojure.core/long) :long
+        (int clojure.core/int) :int
+        nil)
+      :else nil)
+    :else nil))
+
+(defn binder-scalar-types
+  "Walker-stamped scalar dtypes of every `let`/`loop` binder in `form`, projected the way
+   `derive-param-types` projects declared params: integral tags keep their width, floating
+   tags take the kernel dtype. A hoisted host scalar that a kernel captures therefore has the
+   same declared dtype on the host and in the kernel ABI; no emitter guesses it from its name."
+  [form kernel-dtype]
+  (let [kernel-dtype (dtype/canon (or kernel-dtype :float))
+        found (atom {})]
+    (clojure.walk/prewalk
+     (fn [x]
+       (when (and (seq? x)
+                  (symbol? (first x))
+                  (or (form/let-head? (first x)) (form/loop-head? (first x))
+                      (contains? '#{dotimes clojure.core/dotimes} (first x)))
+                  (vector? (second x)))
+         (doseq [[binder init] (partition 2 (second x))]
+           (when (symbol? binder)
+             (when-let [declared (or (some-> (types/sym-type-tag binder) dtype/dtype-for-scalar-tag)
+                                     (counted-loop-index-dtype x init))]
+               (swap! found assoc binder
+                      (if (dtype/fp-dtype? declared) kernel-dtype declared))))))
+       x)
+     form)
+    @found))
 
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
@@ -349,7 +394,8 @@
                :array-types (parallel-program/declared-value-types parallel-program arrays)}
               {:scalar-types (parallel-program/known-value-types parallel-program scalars)
                :array-types (parallel-program/known-value-types parallel-program arrays)})))
-        top-scalar-types (merge (or (:scalar-types program-types) {})
+        top-scalar-types (merge (binder-scalar-types source-form dtype)
+                                (or (:scalar-types program-types) {})
                                 (or (:scalar-types (meta source-form)) {})
                                 (or (:scalar-types (meta form)) {}) scalar-types)
         top-array-types (merge (or (:array-types program-types) {})
