@@ -53,7 +53,12 @@
         partial-spec (some (fn [[id spec]] (when (= :partials (last id)) spec))
                            temporary-specs)
         contract (matrix-contract graph)
+        combine (some #(when (= :split-k-combine
+                                (get-in % [:operation :attributes :strategy]))
+                         (:operation %))
+                      (:nodes graph))
         kernel-body (artifact/attribute contract :kernel-body)
+        combine-body (artifact/attribute combine :kernel-body)
         outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.Loop %)
                                   (get-in kernel-body [:operations 0 :operations])))]
     (is (= :xmx-split-k (executable/strategy graph)))
@@ -65,6 +70,9 @@
                             #(graph-call/resolve-integer scalar-values %)))))
     (is (= 4 (count (:nodes graph))))
     (is (body/kernel-body? kernel-body))
+    (is (body/kernel-body? combine-body)
+        "split-K combination is the portable typed contraction schedule")
+    (is (= :contraction (artifact/attribute combine :semantic-op)))
     (is (= 1 (count (:views kernel-body))))
     (is (= [:splits :m :n] (:shape (first (filter #(= :result (:role %))
                                                   (:parameters kernel-body))))))

@@ -3,6 +3,7 @@
   (:require [clojure.java.io :as io]
             [raster.arrays]
             [raster.compiler.backend.gpu.attention :as attention-emit]
+            [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
@@ -324,6 +325,10 @@
                            (layout-transform/emit-transpose-kernel
                             {:kernel-name "layout_transpose" :input 'in :output 'out
                              :element-dtype :half :target-dialect dialect})))
+           (write-source! directory suffix "split-k-combine"
+                          (:source
+                           (gemm-emit/emit-split-k-combine-kernel
+                            "split_k_combine" dialect)))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

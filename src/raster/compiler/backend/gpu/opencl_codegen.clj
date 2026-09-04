@@ -698,23 +698,6 @@
                      "      }\n    }\n")))
        "}\n"))))
 
-(defn emit-gemm-splitk-reduce-kernel
-  "Second stage of a split-k GEMM: C[i] = Σ_s partials[s·MN + i], i < MN = M·N.
-  One work-item per OUTPUT element (grid-stride), each summing `splits` f32
-  partials — MN work items, so the combine itself has full occupancy whenever the
-  GEMM's output is non-tiny. f32 throughout (the partials are f32 accumulators)."
-  [kernel-name]
-  (str "__kernel void " kernel-name "(\n"
-       "    __global const float* restrict partials,\n"
-       "    __global float* restrict C,\n"
-       "    int mn, int splits) {\n"
-       "    for (int i = get_global_id(0); i < mn; i += get_global_size(0)) {\n"
-       "        float acc = 0.0f;\n"
-       "        for (int s = 0; s < splits; ++s) acc += partials[(long)s * (long)mn + i];\n"
-       "        C[i] = acc;\n"
-       "    }\n"
-       "}\n"))
-
 (defn gemm-launch-config
   "Compute 2D launch config for GEMM kernel.
   Returns {:workgroup-size [256 1] :group-count [gc-n gc-m]}

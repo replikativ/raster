@@ -2404,16 +2404,18 @@
   (ensure-init!)
   (when (nil? @splitk-reduce-cache)
     (let [kname "gemm_splitk_reduce"
-          src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                  ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-splitk-reduce-kernel)
-                   kname))
+          emitted ((requiring-resolve
+                    'raster.compiler.backend.gpu.gemm/emit-split-k-combine-kernel)
+                   kname)
+          src (:source emitted)
           spv (do (require 'raster.compiler.support.spirv-cache)
                   ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                    src :device (:device-id-hex @state)))
           module (load-module! spv)
           kernel (create-kernel module kname)]
       (clojure.core/reset! splitk-reduce-cache
-                           {:module module :kernel kernel :kernel-name kname})))
+                           {:module module :kernel kernel :kernel-name kname
+                            :kernel-body (:kernel-body emitted)})))
   @splitk-reduce-cache)
 
 (defn bind-registered-gemm-splitk!
@@ -2446,7 +2448,8 @@
         kh (create-kernel-fresh module kernel-name)
         mn (long mn) splits (long splits)
         args [(:segment partials) (:segment c)
-              {:type :int :value (int mn)} {:type :int :value (int splits)}]
+              {:type :int :value (int mn)} {:type :int :value (int splits)}
+              {:type :int :value (int mn)}]
         bnd (bind-kernel! kh 256 args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double mn) 256.0))))
     bnd))
