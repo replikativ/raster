@@ -235,9 +235,15 @@
   [program sym source]
   (:operations (equation-for-binding program sym source)))
 
+(defn- scheduled-algorithm
+  "The algorithm a target should schedule against: the physically remapped one when scheduling
+   recorded it (logical results replaced by the destinations they alias), else the semantic one."
+  [equation]
+  (or (:physical-algorithm equation) (:algorithm equation)))
+
 (defn algorithm-for-binding
   [program sym source]
-  (:algorithm (equation-for-binding program sym source)))
+  (scheduled-algorithm (equation-for-binding program sym source)))
 
 (defn result-id-for-binding
   "The explicit value ID produced by a binding equation, when it has one result."
@@ -250,7 +256,7 @@
 
 (defn algorithm-for-source
   [program source]
-  (:algorithm (equation-for-source program source)))
+  (scheduled-algorithm (equation-for-source program source)))
 
 (defn kernel-graph-for-binding
   [program sym source]

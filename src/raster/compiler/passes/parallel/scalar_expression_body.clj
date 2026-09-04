@@ -279,6 +279,17 @@
                               "scalar loop is outside the canonical ordered carry form"
                               {:expression expression}))
 
+                  ;; `inc`/`dec` are the closed-core index steppers: `(+ x 1)` / `(- x 1)` with the
+                  ;; same operand dtype and overflow policy. Normalize before intrinsic lookup so
+                  ;; the KernelBody vocabulary stays binary.
+                  (and (seq? expression) (= 2 (count expression))
+                       (contains? '#{inc clojure.core/inc} (first expression)))
+                  (lower (list 'clojure.core/+ (second expression) 1) expected env)
+
+                  (and (seq? expression) (= 2 (count expression))
+                       (contains? '#{dec clojure.core/dec} (first expression)))
+                  (lower (list 'clojure.core/- (second expression) 1) expected env)
+
                   (seq? expression)
                   (let [semantic-operation (descriptor/semantic-op expression)
                         operator (intrinsics/canonical semantic-operation)

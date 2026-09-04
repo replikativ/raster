@@ -755,3 +755,59 @@
                      (if (keyword? conflict) conflict (:kind conflict))))
                  effects)))
     (is (= program (dialect/validate! program)))))
+
+(deftest a-renamed-allocation-written-through-its-alias-is-scaffolding
+  ;; `(let [y (float-array n) out y] (map-void! … (aset out i …)))`: the write goes through the
+  ;; alias, so the allocation shares its physical identity and stays host scaffolding instead of
+  ;; declining as a scalar binding without a dtype.
+  (let [source '(let* [y (clojure.core/float-array n)
+                       out y
+                       step (raster.par/map-void! i n
+                                                  (clojure.core/aset
+                                                   out i (float (clojure.core/aget x i))))]
+                      step)
+        program (frontend/form->program source {:dtype :float :array-types {'x :float}
+                                                :scalar-types {'n :long}})
+        routed (route/attempt source :float {'x :float} {:scalar-types {'n :long}})]
+    (is (= ['map] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= '[y (clojure.core/float-array n) out y]
+           (vec (take 4 (second (get-in routed [:program :source]))))))))
+
+(deftest a-blas-gemm-call-is-the-contraction-it-computes
+  ;; `(dgemm-nt! A B C m k n 1 0)` is `C[m,n] = A[m,k]·B[n,k]ᵀ`: the devirtualized BLAS effect
+  ;; normalizes to the explicit `par/contract` whose typed equation is a segmented reduction
+  ;; over `k` with free axes `[m n]`, so a block containing it no longer falls back to the host.
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 0.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n)) 'r call] 'r)
+        program (frontend/form->program
+                 (frontend/normalize-source source)
+                 {:dtype :float :array-types {'A :float 'B :float}
+                  :scalar-types {'m :long 'k :long 'n :long}})
+        equation (first (dialect/equations program))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        {:keys [body-results]} (dialect/lambda-parts lambda)]
+    (is (= ['segmented-reduce] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= '[[rstr_gemm_i_1 m] [rstr_gemm_j_1 n]] (:segment-axes attributes)))
+    (is (= 'k (:extent attributes)))
+    (is (= [:float] (:dtypes attributes)))
+    (is (= '(clojure.core/+ (clojure.core/* rstr_gemm_j_1 %capture2) rstr_gemm_l_1)
+           (-> body-results first (nth 2) (nth 2) (nth 2)))
+        "the nt variant reads B as [n,k]: B[j*k + l]")
+    (is (= [{:destination 'C :access :write :host-return :buffer}]
+           (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
+
+(deftest a-blas-gemm-with-a-non-zero-beta-stays-a-host-call
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 1.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['r call] 'r)]
+    (is (= source (frontend/normalize-source source)))))

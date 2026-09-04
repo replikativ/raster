@@ -265,8 +265,17 @@
            :locals locals
            :body-results (mapv #(util/subst-syms substitutions %) (:body-results info)))))
 
+(def ^:private single-lambda-kinds
+  "Operation kinds whose form is exactly `(kind attributes arrays captures lambda)`. Fold-maps,
+   product reductions and effect maps carry further parts (folds, a combine lambda,
+   destinations) that this emitter would silently drop."
+  #{:scalar :map :scatter :stencil :reduce :segmented-reduce :scan})
+
 (defn- emit-equation
   [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
+  (when-not (contains? single-lambda-kinds kind)
+    (throw (ex-info "fusion cannot re-emit an operation kind with parts beyond one lambda"
+                    {:reason :raster/bug :kind kind :equation id})))
   (list '= id (vec results)
         (list (symbol (name kind)) attributes (vec arrays) (vec captures)
               (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
@@ -799,11 +808,10 @@
       (rebuild-boundary program facts equations))))
 
 (defn- producer-placement-witness
-  [program infos uses producer produced abstract-machine]
-  (let [consumer-ids (->> infos
-                          (filter #(some #{produced} (equation-references
-                                                      (emit-equation %))))
-                          (mapv :id))
+  [program _infos uses producer produced abstract-machine]
+  (let [consumer-ids (->> (dialect/equations program)
+                          (filter #(some #{produced} (equation-references %)))
+                          (mapv second))
         witness (placement/placement-decision
                  {:abstract-machine abstract-machine
                   :dtype (value-scalar-dtype program produced)

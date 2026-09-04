@@ -1035,6 +1035,13 @@
                  ;; conversions are not scalar fold syntax. Keep them on the certified
                  ;; contraction route until TypedSOAC represents those facts explicitly.
                  (empty? (apply dissoc opts [:init :combine :algebra :epilogue]))
+                 ;; The contraction's element dtype is the dtype of its operands. A double
+                 ;; product over arrays declared float (a hard-typed double function compiled
+                 ;; under a float policy) has no single typed kernel; it stays a host call.
+                 (every? (fn [{:keys [sym]}]
+                           (let [declared (some-> (get array-types sym) dtype/canon)]
+                             (or (nil? declared) (= declared (dtype/canon (:dtype facts))))))
+                         (:operands facts))
                  (or (nil? epilogue) (dialect/result-transform? result-transform))
                  (reduction/scalar? (:reduction facts)))
         (let [product (:reduction facts)
@@ -1179,12 +1186,79 @@
           (cond-> (meta expression) scatter (assoc ::host-return :buffer))))
       expression)))
 
-(defn normalize-source
-  "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
+(defn- canonicalize-blas-gemm
+  "Express a devirtualized BLAS GEMM call as the explicit contraction it computes.
 
-   TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
-   This normalization inserts an ordinary typed scalar binding immediately before its operation,
-   so the same expression remains visible to JVM materialization and runtime specialization."
+   `(dgemm! A B C m k n alpha beta)` is `C[m,n] = alpha·A·B + beta·C` over row-major operands;
+   the `-tn!`/`-nt!` variants store `A` as `[k,m]` / `B` as `[n,k]`. With `beta = 0` the call
+   is the pure contraction `(raster.par/contract C [[i m] [j n]] [[l k]] (* A[i,l] B[l,j]))`
+   scaled by `alpha`, and the typed route can schedule it like any contraction instead of
+   leaving the whole block on the host because one binding is an opaque BLAS effect. A non-zero
+   `beta` reads the destination inside its own epilogue and stays a host call for now."
+  [ordinal expression]
+  (let [variant (when (and (seq? expression) (= '.invk (first expression)))
+                  (get descriptor/blas-gemm-ops (:raster.op/original (meta expression))))
+        arguments (when variant (vec (drop 2 expression)))
+        [A B C m k n alpha beta] arguments
+        beta-literal (when variant (descriptor/gemm-scalar-literal beta))
+        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))]
+    (if (and variant (= 8 (count arguments))
+             (symbol? A) (symbol? B) (symbol? C)
+             (= 0.0 beta-literal))
+      (let [i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
+            j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
+            l (clojure.core/symbol (str "rstr_gemm_l_" ordinal))
+            [m k n] (map descriptor/unwrap-int-cast [m k n])
+            a-index (case variant
+                      (:nn :nt) (list 'clojure.core/+ (list 'clojure.core/* i k) l)
+                      :tn (list 'clojure.core/+ (list 'clojure.core/* l m) i))
+            b-index (case variant
+                      (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
+                      :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l))
+            elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                              dtype/dtype-for-array-tag dtype/canon)
+            ;; The walker stamps every arithmetic form with its result dtype; the emitted loads
+            ;; and product carry the same stamp so scalar lowering reads the type instead of
+            ;; guessing it.
+            scalar-tag (some-> elem-type dtype/scalar-tag-for-dtype)
+            typed (fn [form]
+                    (if scalar-tag
+                      (with-meta form {:raster.type/tag scalar-tag :tag scalar-tag})
+                      form))
+            product (typed (list 'clojure.core/*
+                                 (typed (list 'clojure.core/aget A a-index))
+                                 (typed (list 'clojure.core/aget B b-index))))
+            ;; `alpha` arrives as `(oftype witness value)` from the source spelling; the scalar
+            ;; factor is its value, not the type witness array.
+            alpha-value (cond
+                          ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
+                          ;; it denotes, not an integer literal that would mistype the product.
+                          (some? alpha-literal) alpha-literal
+                          (and (seq? alpha)
+                               (= 'raster.numeric/oftype (descriptor/semantic-op alpha))
+                               (= 2 (count (descriptor/call-args alpha))))
+                          (second (descriptor/call-args alpha))
+                          :else alpha)
+            body (if (= 1.0 alpha-literal)
+                   product
+                   (typed (list 'clojure.core/* alpha-value product)))]
+        (with-meta (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+          (cond-> {:raster.op/original (:raster.op/original (meta expression))}
+            elem-type (assoc :raster.type/elem-type elem-type))))
+      expression)))
+
+(defn- source-shadowing-locals
+  "The symbols that are locals of the analyzed source even when they collide with a
+   `clojure.core` name: the let's own binders and the declared parameters. `util/free-syms`
+   would otherwise read a parameter named `seq` or `count` as the core function and drop it
+   from every capture set, leaving a kernel that references an unbound scalar."
+  [source & type-maps]
+  (let [[_ bindings] (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                       source)]
+    (into (set (filter symbol? (take-nth 2 bindings)))
+          (mapcat keys type-maps))))
+
+(defn- normalize-source*
   [source]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
@@ -1198,7 +1272,9 @@
             {:keys [normalized]}
             (reduce
              (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
-               (let [expression (canonicalize-strided-indexed-operation ordinal expression)
+               (let [expression (->> expression
+                                     (canonicalize-strided-indexed-operation ordinal)
+                                     (canonicalize-blas-gemm ordinal))
                      extent (parallel-extent expression)
                      canonical-extent (some-> extent descriptor/unwrap-int-cast)]
                  (cond
@@ -1342,12 +1418,24 @@
                   (descriptor/alloc-op? (descriptor/semantic-op expression)))))))
 
 (defn- physical-output-symbols
+  "Every buffer some operation writes, closed under host renamings: a binding that merely
+   renames a buffer (`out y`) shares its physical identity, so a write through the alias is a
+   write to the allocation it names and that allocation is generated scaffolding as well."
   [descriptions]
-  (reduce set/union #{}
-          (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
-                                 :product-reduce :segmented-fold-map :scan} (:kind %))
-                  (:outputs %) #{})
-               descriptions)))
+  (let [written (reduce set/union #{}
+                        (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce
+                                               :segmented-reduce :product-reduce
+                                               :segmented-fold-map :scan} (:kind %))
+                                (:outputs %) #{})
+                             descriptions))
+        renamings (keep #(when (and (= :scalar (:kind %)) (symbol? (:expr %)))
+                           [(:sym %) (:expr %)])
+                        descriptions)]
+    (loop [outputs written]
+      (let [closed (into outputs (keep (fn [[alias source]]
+                                         (when (contains? outputs alias) source))
+                                       renamings))]
+        (if (= closed outputs) outputs (recur closed))))))
 
 (defn- contains-parallel-form?
   [expression]
@@ -1401,11 +1489,29 @@
                  (supported-description? physical-outputs %))
             descriptions)))
 
+(defn normalize-source
+  "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
+
+   TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
+   This normalization inserts an ordinary typed scalar binding immediately before its operation,
+   so the same expression remains visible to JVM materialization and runtime specialization."
+  [source]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source)]
+    (normalize-source* source)))
+
+(declare coverage-decline*)
+
 (defn coverage-decline
   "Describe the exact source bindings that prevent admission to the closed TypedSOAC subset.
 
    This is diagnostic evidence only: it uses the same descriptions and admission predicate as
    form->program, so reporting cannot become a second legality implementation."
+  [source {:keys [array-types scalar-types values] :as options}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
+                                                             values)]
+    (coverage-decline* source options)))
+
+(defn- coverage-decline*
   [source {:keys [dtype array-types values shape-equalities]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
@@ -2002,6 +2108,8 @@
                 {:id id :first prior :second contract})))
      (assoc values id contract))))
 
+(declare form->program*)
+
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
 
@@ -2009,6 +2117,12 @@
    Returns nil when a parallel binding is outside the certified source subset. Type/effect/value
    contradictions throw ExceptionInfo because falling through after accepting them would hide a
    compiler correctness defect."
+  [source {:keys [array-types scalar-types values] :as options}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
+                                                             values)]
+    (form->program* source options)))
+
+(defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
