@@ -79,6 +79,10 @@
         session (atom {:device-id :ze:0 :session-id :mock-session
                        :buffers {} :allocations {} :prepared {} :graphs {}
                        :kernel-graphs {} :events {} :closed? false})
+        ;; Runtime allocations are distinct even when their dtype and extent agree.  The
+        ;; graph binder now enforces no-write-alias contracts, so the mock must retain that
+        ;; physical identity rather than representing two allocations by equal Clojure maps.
+        buffer-counter (atom 0)
         registered (atom [])
         recorded (atom [])
         replayed (atom [])
@@ -87,7 +91,8 @@
           (case name
             "make-buffer"
             (fn [elements dtype]
-              {:dtype dtype :n-elements elements
+              {:mock-allocation-id (swap! buffer-counter inc)
+               :dtype dtype :n-elements elements
                :byte-size (* (long elements) (element-bytes dtype))
                :alignment 64})
 
