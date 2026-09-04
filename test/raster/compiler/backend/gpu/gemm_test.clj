@@ -9,7 +9,9 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.matrix-stage :as matrix-stage]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
 
 (defn- matrix-contract
   [graph]
@@ -94,6 +96,8 @@
                          (:operation %))
                       (:nodes graph))
         kernel-body (artifact/attribute contract :kernel-body)
+        scheduled-contract (artifact/attribute contract :scheduled-kernel-body)
+        stage (:source scheduled-contract)
         combine-body (artifact/attribute combine :kernel-body)
         outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.Loop %)
                                   (get-in kernel-body [:operations 0 :operations])))]
@@ -106,6 +110,14 @@
                             #(graph-call/resolve-integer scalar-values %)))))
     (is (= 4 (count (:nodes graph))))
     (is (body/kernel-body? kernel-body))
+    (is (scheduled-body/scheduled-kernel-body? scheduled-contract))
+    (is (matrix-stage/matrix-stage? stage))
+    (is (= :split-k (get-in stage [:reduction :kind])))
+    (is (= [(get-in stage [:reduction :partitions]) :m :n]
+           (:result-shape stage)))
+    (is (= (:arguments scheduled-contract) (:arguments contract)))
+    (is (= (:effects scheduled-contract) (:effects contract)))
+    (is (= (scheduled-body/realized-launch scheduled-contract) (:launch contract)))
     (is (body/kernel-body? combine-body)
         "split-K combination is the portable typed contraction schedule")
     (is (= :contraction (artifact/attribute combine :semantic-op)))
@@ -120,6 +132,8 @@
         graph (dispatch/alternative (emitted :nn) :xmx-direct)
         contract (matrix-contract graph)
         kernel-body (artifact/attribute contract :kernel-body)
+        scheduled (artifact/attribute contract :scheduled-kernel-body)
+        stage (:source scheduled)
         dimensions (filter #(= :dimension (:role %)) (:parameters kernel-body))
         result (first (filter #(= :result (:role %)) (:parameters kernel-body)))
         oracle (apply opencl-codegen/emit-gemm-tiled (:kernel-name contract)
@@ -128,11 +142,52 @@
                               (select-keys tile
                                            [:block-m :block-n :sg-m :sg-n :block-k :matrix])))]
     (is (body/kernel-body? kernel-body))
+    (is (scheduled-body/scheduled-kernel-body? scheduled))
+    (is (matrix-stage/matrix-stage? stage))
+    (is (= {:kind :full :range [0 :k]} (:reduction stage)))
+    (is (= [:m :n] (:result-shape stage)))
+    (is (= (:arguments scheduled) (:arguments contract)))
+    (is (= (:effects scheduled) (:effects contract)))
     (is (= [:m :n :k] (mapv :id dimensions))
         "the body retains graph ABI identities instead of a parallel M/N/K convention")
     (is (= :float (:dtype result)))
     (is (= (:source contract) oracle)
         "direct KernelBody lowering preserves the proven f32 GEMM source exactly")))
+
+(deftest production-xmx-epilogue-is-part-of-the-certified-stage
+  (let [tile (hardware/derive-gemm-tile {})
+        epilogue {:acc 'acc
+                  :expr '(raster.numeric/*
+                          (raster.numeric/+ acc (aget bias j)) scale)
+                  :operands [{:sym 'bias :map (axis-map/of-axes [['j 'n]]) :dtype :half}]
+                  :scalars [{:sym 'scale :dtype :float}]}
+        {:keys [alternatives]}
+        (gemm/emit-matrix-alternatives
+         {:id "gemm-epilogue" :a 'a :b 'b :c 'c :m :m :n :n :k :k
+          :variant :nn :precision :mixed-f16-f32 :tile tile :fill-workgroups 32
+          :vector-width 4 :epilogue epilogue})
+        graph (first alternatives)
+        contract (matrix-contract graph)
+        scheduled (artifact/attribute contract :scheduled-kernel-body)
+        stage (:source scheduled)
+        runtime-arguments [:a-buffer :b-buffer :c-buffer
+                           {:type :int :value 16} {:type :int :value 16}
+                           {:type :int :value 16} :bias-buffer
+                           {:type :float :value 0.5}]
+        {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)
+        temporary-specs (graph-call/temporary-specs graph scalar-values)
+        temporaries (into {} (map (fn [id] [id [:temporary-buffer id]]))
+                          (keys temporary-specs))
+        call (graph-call/make graph (merge buffers temporaries) scalar-values)]
+    (is (= 1 (count alternatives)) "a result transform intentionally disables split-K")
+    (is (= epilogue (:epilogue stage)))
+    (is (= '[bias scale]
+           (mapv :name (filter #(= :epilogue (:role %)) (:abi contract)))))
+    (is (= '[bias scale] (take-last 2 (:arguments contract))))
+    (is (= (:effects scheduled) (:effects contract)))
+    (is (= #{:no-write-alias}
+           (set (keep :aliasing (filter #(= :input (:kind %)) (:abi contract))))))
+    (is (graph-call/kernel-graph-call? call))))
 
 (deftest shared-direct-emission-does-not-call-the-legacy-template
   (with-redefs [opencl-codegen/emit-gemm-tiled
@@ -223,7 +278,8 @@
       (let [graph (dispatch/alternative (emitted variant) strategy)
             {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)
             temporary-specs (graph-call/temporary-specs graph scalar-values)
-            temporary-buffers (zipmap (keys temporary-specs) (repeat :temporary-buffer))
+            temporary-buffers (into {} (map (fn [id] [id [:temporary-buffer id]]))
+                                    (keys temporary-specs))
             call (graph-call/make graph (merge buffers temporary-buffers) scalar-values)]
         (is (graph-call/kernel-graph-call? call) (str (name variant) "/" (name strategy)))
         (is (= (count (:nodes graph)) (count (:nodes call))))))))

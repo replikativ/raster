@@ -9,6 +9,7 @@
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -1172,6 +1173,8 @@
         matrix-graph (kdispatch/alternative scheduled :xmx-batched)
         matrix-node (last (:nodes matrix-graph))
         matrix-body (get-in matrix-node [:operation :attributes :kernel-body])
+        scheduled-matrix (get-in matrix-node [:operation :attributes :scheduled-kernel-body])
+        matrix-stage (:source scheduled-matrix)
         buffer-views (into {} (map (juxt :id identity)) (:views matrix-body))
         select (fn [batch m n k]
                  (-> (kdispatch/select-alternative
@@ -1185,6 +1188,15 @@
     (is (= :portable-segred (select 4 64 128 62)))
     (is (= {:row true :col false}
            (get-in matrix-graph [:attributes :batching])))
+    (is (scheduled-body/scheduled-kernel-body? scheduled-matrix))
+    (is (matrix-stage/matrix-stage? matrix-stage))
+    (is (= {:extent 'batch :lhs true :rhs false} (:batching matrix-stage)))
+    (is (= '[batch m n] (:result-shape matrix-stage)))
+    (is (= (:effects scheduled-matrix) (get-in matrix-node [:operation :effects])))
+    (is (= (scheduled-body/realized-launch scheduled-matrix)
+           (get-in matrix-node [:operation :launch])))
+    (is (= (:arguments scheduled-matrix)
+           (get-in matrix-node [:operation :arguments])))
     (is (nil? (get buffer-views 'batch-rhs-view))
         "shared weights remain the original stable buffer, not a fabricated batched view")
     (is (= '[k n]
