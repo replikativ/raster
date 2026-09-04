@@ -445,11 +445,15 @@
       candidate)))
 
 (defn- value-use-counts
+  "Uses of every program value: typed equation references, program outputs, and the reads of
+   host-controlled bindings (a producer the host reads is live however its typed consumers
+   fuse)."
   [program]
   (frequencies
    (concat
     (mapcat equation-references (dialect/equations program))
-    (dialect/outputs program))))
+    (dialect/outputs program)
+    (get-in (dialect/facts program) [:attributes :host-read-values]))))
 
 (defn- merge-provenance
   [left right fused-kind]

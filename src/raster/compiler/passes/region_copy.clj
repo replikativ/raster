@@ -9,14 +9,22 @@
      (dotimes [t len] (aset dst (+ dst-off t) (aget src (+ src-off t))))
 
    whenever the source and the destination are distinct storage. That is what this pass emits,
-   in statement positions only: a `do` statement, a `dotimes` body, or an effect binding whose
-   value nothing reads. A copy whose value is used keeps its call (it returns the destination),
-   and a copy within one array keeps its call too (`System/arraycopy` is a memmove, an
-   elementwise forward loop is not).
+   in statement positions only: a `do` statement, a `dotimes` body, a discarded `if`/`when`
+   arm, or an effect binding whose value nothing reads. A copy whose value is used keeps its
+   call (it returns the destination), and a copy within one array keeps its call too
+   (`System/arraycopy` is a memmove, an elementwise forward loop is not).
+
+   Distinct array symbols denote distinct storage here, as they do for every typed kernel
+   (each array parameter is emitted `restrict`); a locally allocated array is distinct by
+   construction. Region validity is kernel semantics: an out-of-range region is undefined in
+   a kernel, and on the JVM the loop throws at the first out-of-range element rather than
+   before the first store.
 
    The emitted read carries the copied element type as its scalar tag when a fact states one:
-   the call's own result tag, the tag of the binder that introduced either array, or the
-   deftm parameter tag. Downstream typing then reads a fact rather than inferring one."
+   the call's own result tag, the tag of the binder or deftm parameter that introduced the
+   source, else that of the destination. Two known tags that disagree are not one copy (the
+   JVM rejects such a call), so the call is retained. Downstream typing then reads a fact
+   rather than inferring one."
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -38,13 +46,14 @@
    two distinct array symbols, else nil. `environment` maps array symbols to their tags."
   [expression environment]
   (when (and (seq? expression) (contains? copy-ops (descriptor/semantic-op expression)))
-    (let [[src src-off dst dst-off len :as arguments] (vec (descriptor/call-args expression))]
-      (when (and (= 5 (count arguments)) (symbol? src) (symbol? dst) (not= src dst))
+    (let [[src src-off dst dst-off len :as arguments] (vec (descriptor/call-args expression))
+          src-tag (array-tag environment src)
+          dst-tag (array-tag environment dst)]
+      (when (and (= 5 (count arguments)) (symbol? src) (symbol? dst) (not= src dst)
+                 (or (nil? src-tag) (nil? dst-tag) (= src-tag dst-tag)))
         {:src src :src-off src-off :dst dst :dst-off dst-off :len len
          :returns-destination? (= 'raster.arrays/acopy! (descriptor/semantic-op expression))
-         :tag (or (:raster.type/tag (meta expression))
-                  (array-tag environment dst)
-                  (array-tag environment src))}))))
+         :tag (or (:raster.type/tag (meta expression)) src-tag dst-tag)}))))
 
 (defn- offset-index
   "`offset + index`; a zero offset (the walker spells a literal `0` as `(int 0)`) is the bare
@@ -80,9 +89,22 @@
                   (swap! expanded inc)
                   (store-loop call (fresh)))]
     (letfn [(statement [expression environment]
-              ;; a value nobody reads: a copy here is exactly its loop
-              (if-let [call (copy-call expression environment)]
-                (expand! call)
+              ;; a value nobody reads: a copy here is exactly its loop, and the discarded
+              ;; positions inside a conditional or a block are statements too
+              (cond
+                (copy-call expression environment)
+                (expand! (copy-call expression environment))
+
+                (and (seq? expression) (contains? '#{if when} (first expression)))
+                (with-meta (apply list (first expression) (walk (second expression) environment)
+                                  (map #(statement % environment) (nnext expression)))
+                  (meta expression))
+
+                (and (seq? expression) (= 'do (first expression)))
+                (with-meta (apply list 'do (map #(statement % environment) (rest expression)))
+                  (meta expression))
+
+                :else
                 (walk expression environment)))
             (walk [expression environment]
               (cond
@@ -109,11 +131,13 @@
                       [environment pairs]
                       (reduce (fn [[environment pairs] [k [symbol init]]]
                                 (let [call (copy-call init environment)
-                                      init (if (and call
-                                                    (or (not (:returns-destination? call))
-                                                        (not (contains? (util/free-syms (later k))
-                                                                        symbol))))
-                                             (expand! call)
+                                      ;; a binder nothing reads (an effect binding) discards its
+                                      ;; value: its init is a statement, conditionals included;
+                                      ;; a copy that returns nothing is a statement anywhere
+                                      unused? (not (contains? (util/free-syms (later k)) symbol))
+                                      init (if (or unused?
+                                                   (and call (not (:returns-destination? call))))
+                                             (statement init environment)
                                              (walk init environment))
                                       environment (cond-> environment
                                                     (binder-tag symbol)

@@ -1027,3 +1027,23 @@
                                      effect)
                               :float {'out :float} {:scalar-types {'n :long 'stride :long}})]
     (is (= :unique-index-not-provable (get-in routed [:declined :reason])))))
+
+(deftest a-destination-reading-transform-follows-the-contraction-dtype
+  ;; A double-spelled GEMM (`doubles` call tag) compiled under the float policy writes a float
+  ;; buffer; the destination it reads back is that same float buffer, so the transform's
+  ;; operand and result dtypes are the contraction's, not the call tag's.
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm!_m_doubles_doubles_doubles_long_long_long_double_double-impl
+                     'A 'B 'C 'm 'k 'n 1.0 1.0)
+               {:raster.op/original 'raster.linalg.blas/dgemm!
+                :raster.type/tag 'doubles :tag 'doubles})
+        types {:dtype :float :array-types {'A :float 'B :float 'C :float}
+               :scalar-types {'m :long 'k :long 'n :long}}
+        program (frontend/form->program
+                 (frontend/normalize-source (list 'let* ['r call] 'r) types) types)
+        {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))
+        transform (:result-transform attributes)]
+    (is (= [:float] (:dtypes attributes)))
+    (is (= :float (:result-dtype transform)))
+    (is (= [:float] (mapv :dtype (:operands transform))))))

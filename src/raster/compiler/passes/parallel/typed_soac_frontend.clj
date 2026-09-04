@@ -1175,7 +1175,21 @@
                             (:raster.type/elem-type (meta expression))
                             default-dtype :double))
           {:keys [free-axes contract-axes out opts]} facts
-          epilogue (:epilogue facts)
+          contraction-dtype (dtype/canon (:dtype facts))
+          ;; A result transform that reads the destination reads the storage the contraction
+          ;; writes: that operand and the transform result have the contraction's dtype (a
+          ;; double-spelled GEMM compiled under the float policy accumulates into a float
+          ;; buffer), whatever tag the source call carried.
+          epilogue (let [epilogue (:epilogue facts)]
+                     (if (some #(= out (:sym %)) (:operands epilogue))
+                       (-> epilogue
+                           (assoc :dtype contraction-dtype)
+                           (update :operands
+                                   (fn [operands]
+                                     (mapv #(cond-> % (= out (:sym %))
+                                              (assoc :dtype contraction-dtype))
+                                           operands))))
+                       epilogue))
           result-transform (typed-result-transform epilogue)
           epilogue-arrays (set (map :value (:operands result-transform)))
           epilogue-scalar-ids (set (map :value (:scalars result-transform)))]
@@ -2592,17 +2606,25 @@
                                                     (:host-binding description)}))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
-              host-binding-ids
-              (->> descriptions
-                   (keep #(when (and (= :scalar (:kind %))
-                                     (not (supported-description?
-                                           physical-outputs %)))
-                            (:id %)))
+              host-descriptions
+              (filterv #(and (= :scalar (:kind %))
+                             (not (supported-description? physical-outputs %)))
+                       descriptions)
+              host-binding-ids (mapv :id host-descriptions)
+              ;; Program values a host-controlled binding reads are uses of those values: a
+              ;; producer read by the host must stay materialized, whatever fusion does with
+              ;; its typed consumers.
+              host-read-values
+              (->> host-descriptions
+                   (mapcat #(util/free-syms (:expr %)))
+                   (filter #(contains? values %))
+                   distinct
                    vec)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
                       :attributes {:source-dialect :closed-clojure
-                                   :host-binding-ids host-binding-ids}})]
+                                   :host-binding-ids host-binding-ids
+                                   :host-read-values host-read-values}})]
           (dialect/make facts equations outputs))))))

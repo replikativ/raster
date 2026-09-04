@@ -297,6 +297,8 @@
          (dtype/known? (:result-dtype value))
          (= (:result-dtype value) (dtype/canon (:result-dtype value))))))
 
+(declare lambda-parts)
+
 (defn result-transform-boundary-expression
   "The result-transform body with every declared operand read collapsed to its operand
    parameter.
@@ -1816,10 +1818,13 @@
                                                    (update storage :destination rename))
                                                  %))))]))
               (:equations source-facts))
-        facts' (assoc source-facts
-                      :values values
-                      :inputs (mapv rename (:inputs source-facts))
-                      :equations equation-facts)]
+        facts' (cond-> (assoc source-facts
+                              :values values
+                              :inputs (mapv rename (:inputs source-facts))
+                              :equations equation-facts)
+                 (seq (get-in source-facts [:attributes :host-read-values]))
+                 (update-in [:attributes :host-read-values]
+                            #(vec (distinct (map rename %)))))]
     (make facts' equation-forms (mapv rename (outputs program)))))
 
 (defn default-equation-facts

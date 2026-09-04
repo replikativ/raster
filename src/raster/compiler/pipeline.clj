@@ -1553,16 +1553,18 @@
   '#{dotimes loop* loop doseq while})
 
 (defn- host-control-flow?
-  "Does `expr` run a loop or write an array on the host? Such a binding is an effect the
-   resident program cannot carry as a size-let closure: evaluating it at bind time would run
-   the loop once over host arrays, and dropping it would lose the effect. Only a pure scalar
-   expression is a host size-let."
+  "Does `expr` run a loop, write an array, or call a mutating operation on the host? Such a
+   binding is an effect the resident program cannot carry as a size-let closure: evaluating it
+   at bind time would run it once over host arrays, and dropping it would lose the effect.
+   Only a pure scalar expression is a host size-let."
   [expr]
   (boolean
    (some (fn [form]
            (and (seq? form)
-                (or (contains? host-loop-heads (first form))
-                    (op/aset-op? (op/semantic-op form)))))
+                (let [operation (op/semantic-op form)]
+                  (or (contains? host-loop-heads (first form))
+                      (op/aset-op? operation)
+                      (and (symbol? operation) (op/mutating-op? operation))))))
          (tree-seq seq? seq expr))))
 
 (defn- contains-gpu-invoke?

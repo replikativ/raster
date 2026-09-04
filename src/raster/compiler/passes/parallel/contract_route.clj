@@ -288,7 +288,10 @@
   (when (and (seq epilogue) (not (contains? splice-capable-strategies (:strategy d))))
     (throw (ex-info (str "contraction: strategy " (:strategy d) " has no store splice, so its "
                          ":epilogue would be silently dropped")
-                    {:reason :epilogue-unsupported-by-this-leaf :strategy (:strategy d)})))
+                    ;; The leaves that declined before this fallback was chosen are the reason
+                    ;; a splice-capable leaf was unavailable; keep them with the refusal.
+                    {:reason :epilogue-unsupported-by-this-leaf :strategy (:strategy d)
+                     :declines (vec (:declines d))})))
   d)
 
 (defn route-contraction

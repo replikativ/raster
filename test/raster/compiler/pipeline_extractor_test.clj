@@ -127,3 +127,10 @@
                                (clojure.core/aset out i (clojure.core/+ (clojure.core/aget out i)
                                                                          (clojure.core/aget x j)))))]
                      out)))))
+
+(deftest a-mutating-host-call-is-not-a-size-let
+  ;; a copy the region-copy pass retains (same array: memmove) is still an effect
+  (is (= :host-control-flow
+         (why '(let* [fill (raster.gpu.ze-runtime/invoke-registered-kernel "k" [b] out [] n)
+                      _eff (java.lang.System/arraycopy out (int 0) out (int 1) n)]
+                     out)))))

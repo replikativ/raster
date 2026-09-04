@@ -77,3 +77,28 @@
         {:keys [form stats]} (region-copy/expand-region-copies form)]
     (is (= {:region-copies-expanded 0} stats))
     (is (= '(java.lang.System/arraycopy buf 0 buf 1 n) (second (second form))))))
+
+(deftest a-copy-in-a-discarded-conditional-arm-is-a-statement
+  (let [form '(let* [effect_1 (if flag
+                                (java.lang.System/arraycopy src (int 0) out (int 0) n)
+                                nil)]
+                out)
+        {:keys [form stats]} (region-copy/expand-region-copies form)
+        [_ [_ conditional] _] form]
+    (is (= {:region-copies-expanded 1} stats))
+    (is (= 'dotimes (first (nth conditional 2))))))
+
+(deftest disagreeing-element-tags-keep-the-call
+  ;; float[] → double[] is not one copy (the JVM rejects the call); nothing to spell
+  (let [call '(java.lang.System/arraycopy src (int 0) out (int 0) n)
+        form (list 'let* ['effect_1 call] 'out)
+        {:keys [form stats]} (region-copy/expand-region-copies
+                              form :param-env '{src floats out doubles})]
+    (is (= {:region-copies-expanded 0} stats))
+    (is (= call (second (second form))))))
+
+(deftest the-read-is-typed-from-the-source-first
+  (let [form '(let* [effect_1 (java.lang.System/arraycopy src (int 0) out (int 0) n)] out)
+        {:keys [form]} (region-copy/expand-region-copies form :param-env '{src floats})
+        [_ [_ loop] _] form]
+    (is (= 'float (:raster.type/tag (meta (nth (nth loop 2) 3)))))))
