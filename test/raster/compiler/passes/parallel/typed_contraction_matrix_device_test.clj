@@ -17,6 +17,13 @@
                                          (clojure.core/aget B (+ (* l n) j))))]
      step))
 
+(def ^:private batched-source
+  '(let* [step (raster.par/contract
+                C [[b batch] [i m] [j n]] [[l k]]
+                (* (clojure.core/aget A (+ (* (+ (* b m) i) k) l))
+                   (clojure.core/aget B (+ (* l n) j))))]
+     step))
+
 (defn- typed-dispatch
   [device-id]
   (let [{:keys [form]}
@@ -25,6 +32,21 @@
                  :dtype :float
                  :array-types {'A :float 'B :float 'C :float}
                  :scalar-types {'m :int 'n :int 'k :int}})
+        equation (first (:equations form))]
+    (contract-route/route-typed-contraction-dispatch
+     (:algorithm equation) (first (:operations equation))
+     :dtype :float
+     :desc (hardware/descriptor-for device-id)
+     :precision :mixed-f16-f32)))
+
+(defn- typed-batched-dispatch
+  [device-id]
+  (let [{:keys [form]}
+        (pipeline/schedule-parallel-form
+         batched-source {:target-device device-id
+                         :dtype :float
+                         :array-types {'A :float 'B :float 'C :float}
+                         :scalar-types {'batch :int 'm :int 'n :int 'k :int}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
@@ -58,6 +80,24 @@
                           (+ sum (* (f16 (aget a (+ (* i k) l)))
                                     (f16 (aget b (+ (* l n) j))))))
                    sum))))))
+    result))
+
+(defn- batched-reference
+  [^floats a ^floats b batch m n k]
+  (let [result (float-array (* batch m n))]
+    (dotimes [batch-index batch]
+      (dotimes [i m]
+        (dotimes [j n]
+          (aset result (+ (* (+ (* batch-index m) i) n) j)
+                (float
+                 (loop [l 0
+                        sum 0.0]
+                   (if (< l k)
+                     (recur (inc l)
+                            (+ sum
+                               (* (f16 (aget a (+ (* (+ (* batch-index m) i) k) l)))
+                                  (f16 (aget b (+ (* l n) j))))))
+                     sum)))))))
     result))
 
 (defn- relative-l1
@@ -111,3 +151,36 @@
               (run-contraction :ze:0 scheduled 13 16 8192)]
           (is (= :xmx-split-k strategy))
           (is (< (relative-l1 actual expected) 1.0e-3)))))))
+
+(deftest batched-typed-contraction-executes-with-shared-weights
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "batched typed contraction matrix KernelExecutable")
+    (let [device-id :ze:0
+          batch 2
+          m 8
+          n 16
+          k 16
+          a (input-array (* batch m k) 41)
+          b (input-array (* k n) 43)
+          scheduled (typed-batched-dispatch device-id)
+          runtime-arguments
+          [:a :b :c
+           {:type :int :value batch}
+           {:type :int :value m}
+           {:type :int :value n}
+           {:type :int :value k}]
+          selected (dispatch/select-alternative scheduled runtime-arguments)]
+      (is (= :xmx-batched (executable/strategy selected)))
+      (gpu/with-gpu-session [session device-id]
+        (gpu/alloc! session {:a [:float (* batch m k) a]
+                             :b [:float (* k n) b]
+                             :c [:float (* batch m n) nil]})
+        (let [handle (gpu/bind-kernel-executable!
+                      session :typed-batched-contraction selected runtime-arguments)]
+          (try
+            (gpu/run-kernel-graph! session handle)
+            (is (< (relative-l1 (gpu/download session :c)
+                                (batched-reference a b batch m n k))
+                   1.0e-3))
+            (finally
+              (gpu/release-kernel-graph! session handle))))))))

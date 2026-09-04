@@ -145,6 +145,35 @@
                      :dtype :float))]
       (is (= :body-has-unmodeled-terms (:reason rejected))))))
 
+(deftest batched-dense-matrix-views-are-proved-with-explicit-broadcasting
+  (let [form
+        (fn [col-index]
+          (list 'raster.par/contract 'C [['b 3] ['i 4] ['j 6]] [['l 8]]
+                (list 'raster.numeric/*
+                      (list 'aget 'A
+                            '(clojure.core/+ (clojure.core/*
+                                              (clojure.core/+ (clojure.core/* b 4) i) 8) l))
+                      (list 'aget 'B col-index))))
+        batched-col
+        '(clojure.core/+ (clojure.core/*
+                          (clojure.core/+ (clojure.core/* b 8) l) 6) j)
+        shared-col '(clojure.core/+ (clojure.core/* l 6) j)]
+    (testing "both operands may carry the leading batch axis"
+      (let [view (cf/dense-matrix-view
+                  (cf/contraction-facts (form batched-col) :dtype :float))]
+        (is (:ok view))
+        (is (:batched? view))
+        (is (= 3 (:batch view)))
+        (is (= [4 6 8] (:dimensions view)))
+        (is (= {:row true :col true} (:batching view)))
+        (is (= '{:row A :col B} (:bindings view)))))
+    (testing "a batch-local activation may contract with stable shared weights"
+      (let [view (cf/dense-matrix-view
+                  (cf/contraction-facts (form shared-col) :dtype :float))]
+        (is (:ok view))
+        (is (= {:row true :col false} (:batching view)))
+        (is (= '{:row A :col B} (:bindings view)))))))
+
 (deftest orientation-is-a-data-row
   (let [nn (cf/contraction-facts (mm-form nn-idx))
         nt (cf/contraction-facts (mm-form nt-idx))]

@@ -49,6 +49,17 @@
          (kabi/slot k :scalar :int :c-name "K" :role :extent)]
    :arguments [a b c m n k]})
 
+(defn- batched-outer-interface
+  [{:keys [a b c batch m n k]}]
+  {:abi [(kabi/slot a :input :float :c-name "A" :role :lhs)
+         (kabi/slot b :input :float :c-name "B" :role :rhs)
+         (kabi/slot c :output :float :c-name "C" :role :result)
+         (kabi/slot batch :scalar :int :c-name "batch" :role :extent)
+         (kabi/slot m :scalar :int :c-name "M" :role :extent)
+         (kabi/slot n :scalar :int :c-name "N" :role :extent)
+         (kabi/slot k :scalar :int :c-name "K" :role :extent)]
+   :arguments [a b c batch m n k]})
+
 (defn- extents
   [{:keys [m n k variant]}]
   {:a-elements (if (contains? #{:tn :tt} variant)
@@ -251,29 +262,47 @@
       :parameter-names {kc "KC" splits "splits"}})))
 
 (defn emit-scheduled-batched-matrix-kernel
-  "Lower independent dense matrix slabs as grid-Z-selected contiguous buffer views."
-  [{:keys [kernel-name id a b c m n k batch tile provenance]}]
+  "Lower independent dense matrix slabs as grid-Z-selected contiguous buffer views.
+
+   `batching` states whether each operand carries the leading batch axis.  A false entry denotes a
+   stable broadcast operand (most commonly shared model weights), so its view has zero batch
+   offset instead of materializing a repeated tensor."
+  [{:keys [kernel-name id a b c m n k batch tile provenance batching]
+    :or {batching {:row true :col true}}}]
   (let [z 'slab
         a-view 'batch-lhs-view
         b-view 'batch-rhs-view
-        c-view 'batch-result-view]
+        c-view 'batch-result-view
+        row-batched? (get batching :row true)
+        col-batched? (get batching :col true)
+        a-shape (if row-batched? [batch m k] [m k])
+        b-shape (if col-batched? [batch k n] [k n])
+        buffer-views
+        (cond-> [{:id c-view :buffer c
+                  :element-offset (kbody/expression :mul z m n) :shape [m n]}]
+          row-batched?
+          (conj {:id a-view :buffer a
+                 :element-offset (kbody/expression :mul z m k) :shape [m k]})
+          col-batched?
+          (conj {:id b-view :buffer b
+                 :element-offset (kbody/expression :mul z k n) :shape [k n]}))
+        operation-buffers
+        (cond-> {c c-view}
+          row-batched? (assoc a a-view)
+          col-batched? (assoc b b-view))]
     (emit-scheduled-matrix-kernel
      {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
       :tile tile :result-dtype :float :provenance provenance
       :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
       :additional-indices [(kbody/->IndexBinding z :group 2)]
-      :buffer-shapes {a [batch m k] b [batch k n] c [batch m n]}
-      :buffer-views [{:id a-view :buffer a
-                      :element-offset (kbody/expression :mul z m k) :shape [m k]}
-                     {:id b-view :buffer b
-                      :element-offset (kbody/expression :mul z k n) :shape [k n]}
-                     {:id c-view :buffer c
-                      :element-offset (kbody/expression :mul z m n) :shape [m n]}]
-      :operation-buffers {a a-view b b-view c c-view}
+      :buffer-shapes {a a-shape b b-shape c [batch m n]}
+      :buffer-views buffer-views
+      :operation-buffers operation-buffers
       :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
                            (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
                            (klaunch/runtime-value batch)]
-      :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}}
+      :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}
+                   :batching batching}
       :parameter-names {batch "batch"}})))
 
 (defn- gemm-artifact
@@ -420,6 +449,115 @@
       :provenance {:semantic-op :contraction :variant variant :lowering :xmx-gemm}
       :attributes {:strategy strategy :variant variant :precision :mixed-f16-f32
                    :tile tile :requested-splits requested-splits}})))
+
+(defn- batched-gemm-artifact
+  [{:keys [id a b c batch m n k tile batching]}]
+  (let [{:keys [block-m block-n]} tile
+        kernel-name (str (identifier (str id "_xmx_batched")) "_contract")
+        scheduled (emit-scheduled-batched-matrix-kernel
+                   {:kernel-name kernel-name
+                    :id [:gemm id :xmx-batched]
+                    :a a :b b :c c :m m :n n :k k :batch batch :batching batching
+                    :tile tile
+                    :provenance {:operation-id id :phase :matrix-contract}})]
+    (artifact
+     kernel-name (:source scheduled)
+     [(kabi/slot a :input :half :c-name "A")
+      (kabi/slot b :input :half :c-name "B")
+      (kabi/slot c :output :float :c-name "C")
+      (kabi/slot m :scalar :int :c-name "M")
+      (kabi/slot n :scalar :int :c-name "N")
+      (kabi/slot k :scalar :int :c-name "K")
+      (kabi/slot batch :scalar :int :c-name "batch")]
+     [a b c m n k batch]
+     (klaunch/spec
+      {:workgroup-size (:workgroup-size scheduled)
+       :group-count [(klaunch/ceil-div n block-n)
+                     (klaunch/ceil-div m block-m)
+                     (klaunch/runtime-value batch)]})
+     :matrix-contract
+     {:tile tile
+      :batched? true
+      :batching batching
+      :accumulator-dtype :float
+      :kernel-body (:kernel-body scheduled)})))
+
+(defn emit-batched-matrix-alternative
+  "Emit one compiler-owned matrix schedule for a leading batch of dense NN contractions.
+
+   The input and result tensors remain ordinary contiguous f32 values.  Flat layout adapters
+   convert both operands once, then a grid-Z-selected matrix KernelBody interprets them as
+   [batch,M,K], [batch,K,N], and [batch,M,N] views.  The return value deliberately is not a
+   standalone dispatch: the originating typed contraction supplies its general fallback and this
+   schedule contributes the alignment selector that chooses between them."
+  [{:keys [id a b c batch m n k variant tile vector-width batching]
+    :or {vector-width 4 batching {:row true :col true}}
+    :as spec}]
+  (when-not (= :nn variant)
+    (throw (ex-info "batched matrix schedule currently requires canonical NN storage"
+                    {:reason :batched-matrix-layout-not-lowered
+                     :id id :variant variant})))
+  (doseq [[field value] [[:id id] [:a a] [:b b] [:c c] [:batch batch]
+                         [:m m] [:n n] [:k k] [:tile tile]]]
+    (when (nil? value)
+      (throw (ex-info "batched matrix schedule is missing a required field"
+                      {:reason :raster/bug :field field :spec spec}))))
+  (let [{:keys [abi arguments]} (batched-outer-interface spec)
+        a-elements (if (get batching :row true)
+                     (klaunch/product batch m k)
+                     (klaunch/product m k))
+        b-elements (if (get batching :col true)
+                     (klaunch/product batch k n)
+                     (klaunch/product k n))
+        c-elements (klaunch/product batch m n)
+        prefix (identifier (str id "_xmx_batched"))
+        a16 [:gemm id :xmx-batched :a16]
+        b16 [:gemm id :xmx-batched :b16]
+        convert-a-id [:gemm id :xmx-batched :convert-a]
+        convert-b-id [:gemm id :xmx-batched :convert-b]
+        contract-id [:gemm id :xmx-batched :contract]
+        convert-a (convert-artifact (str prefix "_convert_a") a a16 a-elements vector-width
+                                    :convert-a)
+        convert-b (convert-artifact (str prefix "_convert_b") b b16 b-elements vector-width
+                                    :convert-b)
+        contract (batched-gemm-artifact
+                  (assoc spec :a a16 :b b16 :c c :batching batching))
+        graph
+        (kgraph/make
+         {:inputs [(graph-buffer a :float a-elements :input)
+                   (graph-buffer b :float b-elements :input)]
+          :outputs [(graph-buffer c :float c-elements :output)]
+          :temporaries [(graph-buffer a16 :half a-elements :temporary)
+                        (graph-buffer b16 :half b-elements :temporary)]
+          :nodes [(node convert-a-id convert-a
+                        [(value-use a :read) (value-use a16 :write)] [])
+                  (node convert-b-id convert-b
+                        [(value-use b :read) (value-use b16 :write)] [])
+                  (node contract-id contract
+                        [(value-use a16 :read) (value-use b16 :read)
+                         (value-use c :write)]
+                        [convert-a-id convert-b-id])]
+          :abi abi :arguments arguments
+          :effects (effects spec)
+          :provenance {:semantic-op :contraction
+                       :variant :nn
+                       :lowering :batched-xmx-gemm}
+          :attributes {:strategy :xmx-batched
+                       :variant :nn
+                       :batched? true
+                       :batching batching
+                       :precision :mixed-f16-f32
+                       :tile tile}})]
+    {:graph graph
+     :selector
+     {:kind :runtime-expression-cases
+      :cases [{:expression n :op :< :value 8 :strategy :f32-scalar}
+              {:expression k :op :< :value 8 :strategy :f32-scalar}
+              {:expression (kbody/expression :mod n 8)
+               :op :> :value 0 :strategy :f32-scalar}
+              {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
+               :op :> :value 0 :strategy :f32-scalar}]
+      :default :xmx-batched}}))
 
 (defn requested-splits
   "Build the generic occupancy expression used by both selection and split-K storage/launches."
