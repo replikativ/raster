@@ -310,26 +310,34 @@
 ;; subnormal territory — only degrades rel-err to ~2.5e-3, and loss scaling recovers it
 ;; because the VJP is linear in the seed).
 ;;
-;; Dims are bind-time scalars, so the SAME compiled descriptor serves both policies (and
-;; both dim sets). CFG-MP is sized so that every :gemm step clears the XMX pitch gate
-;; (n>=8 and k>=8) — at CFG's r=4/nkh=4 the gate would silently fall back to scalar and
-;; the test would not exercise f16 at all. That is asserted, not assumed.
+;; Dims are bind-time scalars, while numerical precision is part of the compiled schedule and its
+;; tuning identity. CFG-MP is sized so that every typed matrix candidate clears the XMX pitch and
+;; fragment gates — at CFG's r=4/nkh=4 the route would correctly stay portable and the test would
+;; not exercise f16 at all. That is asserted, not assumed.
 ;; ═════════════════════════════════════════════════════════════════════════════════
 
 (def CFG-MP
   "Same block, dims above the XMX pitch gate (r=8, nkh=8, nqh=16)."
   {:seq 8 :d 16 :nq 2 :nkv 1 :hd 8 :dff 32 :r 8 :eps 1.0e-6 :theta 10000.0})
 
-(defn- gemm-dims
-  "[{:variant :m :n :k} …] for every :gemm step of a descriptor at `args`."
+(defn- matrix-schedule-dims
+  "Runtime dimensions for every typed contraction carrying a mixed matrix graph candidate."
   [prog args]
-  (mapv (fn [s]
-          (let [[m-spec n-spec k-spec] (take-last 3 (:argument-specs s))]
-            {:variant (:variant s)
-             :m (long ((:value-fn m-spec) args))
-             :n (long ((:value-fn n-spec) args))
-             :k (long ((:value-fn k-spec) args))}))
-        (filter #(= :gemm (:convention %)) (:steps prog))))
+  (into []
+        (keep
+         (fn [step]
+           (when-let [{:keys [variant dimensions]}
+                      (get-in step [:dispatch :attributes :candidate-schedules :xmx-direct])]
+             (let [scalar-specs (into {} (keep (fn [{:keys [expression] :as spec}]
+                                                  (when expression [expression spec])))
+                                      (:argument-specs step))
+                   [m n k] (mapv (fn [dimension]
+                                   (if (number? dimension)
+                                     (long dimension)
+                                     (long ((:value-fn (get scalar-specs dimension)) args))))
+                                 dimensions)]
+               {:variant variant :m m :n n :k k}))))
+        (:steps prog)))
 
 (defn- run-trajectory!
   "n-steps of the resident train step under `prog`'s GEMM policy in a fresh session.
@@ -367,21 +375,26 @@
           args (train-args cfg st0 lr)
           p32 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
                                       :on-non-resident :nil :gemm-precision :f32-scalar)
-          ;; the descriptor is plain data: the precision is a bind-time re-tag on the SAME program.
-          ;; The S6 schedule is the source of truth the linked step binder reads, so this override goes
-          ;; through [:schedule :precision] (NOT the deprecated top-level :gemm-precision, which the
-          ;; schedule now shadows — assoc'ing it would be a silent no-op and both trajectories would
-          ;; run f32).
-          p16 (assoc-in p32 [:schedule :precision] :mixed-f16-f32)]
+          p16 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
+                                      :on-non-resident :nil
+                                      :gemm-precision :mixed-f16-f32)]
       (is (some? p32) "train-step must extract fully resident")
-      (when p32
-        (let [dims (gemm-dims p32 args)]
+      (is (some? p16) "mixed train-step must extract fully resident")
+      (when (and p32 p16)
+        (let [dims (matrix-schedule-dims p16 args)]
           (testing "every backward GEMM clears the XMX pitch gate (so mixed precision really fires)"
             (println "  [mixed-precision bwd]" (count dims) "gemm steps, variants:"
                      (frequencies (map :variant dims)))
-            (is (every? (fn [{:keys [n k]}] (and (>= n 8) (>= k 8))) dims)
-                (str "gemm steps below the n>=8/k>=8 pitch gate would silently stay scalar: "
-                     (pr-str (filter (fn [{:keys [n k]}] (or (< n 8) (< k 8))) dims)))))
+            (is (seq dims) "the assertion must observe real typed matrix candidates")
+            (is (every? (fn [{:keys [n k]}]
+                          (and (>= n 8) (zero? (mod n 8))
+                               (>= k 16) (zero? (mod k 16))))
+                        dims)
+                (str "unaligned matrix candidates would select the portable schedule: "
+                     (pr-str (remove (fn [{:keys [n k]}]
+                                       (and (>= n 8) (zero? (mod n 8))
+                                            (>= k 16) (zero? (mod k 16))))
+                                     dims)))))
           (let [l32 (run-trajectory! p32 cfg st0 lr n-steps)
                 l16 (run-trajectory! p16 cfg st0 lr n-steps)]
             (println "  [mixed-precision bwd] f32-scalar loss:"

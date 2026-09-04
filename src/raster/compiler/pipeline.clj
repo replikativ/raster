@@ -47,7 +47,6 @@
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-opencl :as parallel-program-opencl]
-            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
@@ -1400,23 +1399,6 @@
   ((requiring-resolve 'raster.gpu.core/invoke-staged-executable!)
    device-id dispatch-id arguments))
 
-(def ^:private blas-gemm-ops
-  "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
-   .invk form). dgemm! = C=A·B (:nn); -nt! = A·Bᵀ; -tn! = AᵀB. A backward matmul (linear-dx =
-   dgemm! :nn, linear-dW = dgemm-tn! :tn) is just another GEMM — recognizing it here is what
-   lets an AD-expanded train step lower to a resident graph.
-
-   The op→variant map itself lives in the op-descriptor registry (shared with the STAGED
-   gpu-plan pass), so a new GEMM spelling is one registry entry, not two."
-  op/blas-gemm-ops)
-
-(defn- gemm-invk?
-  "True if form is a devirtualized BLAS GEMM .invk (carries :raster.op/original in
-   blas-gemm-ops). Metadata-based — the walker stamps the op, opencl-pass preserves it."
-  [form]
-  (and (seq? form) (= '.invk (first form))
-       (contains? blas-gemm-ops (:raster.op/original (meta form)))))
-
 (def ^:private gpu-alloc-ops
   "Array-allocating ops that appear as devirtualized .invk (not a bare `float-array` head): a
    deftm's `(alloc-like x n)` / `(zeros-like x n)` output buffer. On the resident path these are
@@ -1532,21 +1514,6 @@
             {:kernel-name kname :arguments arguments
              :convention :reduce :returns sym})))
 
-      ;; devirtualized BLAS GEMM: (.invk dgemm*-impl A B C m k n alpha beta). BLAS arg order is
-      ;; (A B C m k n) — note m,k,n (NOT m,n,k). C (out) is written in place. This is how a
-      ;; forward matmul (linear-nb → dgemm-nt!) AND its backward (linear-dx → dgemm!, linear-dW →
-      ;; dgemm-tn!) lower to resident GEMM steps.
-      (gemm-invk? expr)
-      ;; BLAS arg order is (A B C m k n alpha beta). alpha/beta are CARRIED, not dropped:
-      ;; the resident kernels implement only C = A·B, so extract-gpu-program rejects any
-      ;; call whose alpha/beta are not the default (1.0, 0.0) — see gemm-alpha-beta-default?.
-      (let [args (vec (drop 2 expr))]
-        {:convention :gemm
-         :variant (get blas-gemm-ops (:raster.op/original (meta expr)))
-         :A (nth args 0) :B (nth args 1) :C (nth args 2)
-         :m-expr (nth args 3) :k-expr (nth args 4) :n-expr (nth args 5)
-         :alpha-expr (nth args 6 nil) :beta-expr (nth args 7 nil)
-         :out-buf (nth args 2) :returns sym})
       :else nil)))
 
 (def ^:private host-loop-heads
@@ -1662,22 +1629,11 @@
                   ;; that reads the binding sym (e.g. the primary of a horizontally-fused
                   ;; multi-output map, whose out is a fusion-materialized buffer) must
                   ;; resolve to the REAL resident buffer at bind time.
-                       (when (and (#{:map :contract :reduce} (:convention s)) ordered-result)
+                       (when (and (#{:map :contract :reduce :executable} (:convention s)) ordered-result)
                          (let [out (:value ordered-result)]
                            (when (and (symbol? out) (not= sym out))
                              (vswap! aliases assoc sym out)))))))
                (reject! :unparseable-kernel-invoke sym expr))
-          ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step. A non-default
-          ;; alpha/beta is NOT representable by the resident GEMM kernels (they compute
-          ;; C = A·B and overwrite C) — reject it by NAME instead of silently dropping the
-          ;; scalars, which turned an ACCUMULATE (C += A·B, beta=1) into an OVERWRITE on
-          ;; GPU while CPU accumulated. See gemm-alpha-beta-default?.
-             (gemm-invk? expr)
-             (if-let [s (parse-gpu-step sym expr)]
-               (if (op/gemm-default-alpha-beta? (:alpha-expr s) (:beta-expr s))
-                 (do (vswap! steps conj s) (vswap! device-buffers conj sym))
-                 (reject! :unsupported-gemm-alpha-beta sym expr))
-               (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
           ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
@@ -1796,16 +1752,15 @@
    certifies zero internal host allocations/round-trips; descriptor :allocs are counted separately as
    device scratch.
 
-   :gemm-precision sets the resident :gemm binding policy. It is now deprecated SUGAR for the S6
-   schedule's [:schedule :precision] (the source of truth the linked step binder reads). A caller
-   overrides the policy on the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …)
-   — NOT (assoc descriptor :gemm-precision …), which the resolved schedule now shadows:
+   :gemm-precision is deprecated SUGAR for the general schedule's `:precision`. Precision is a
+   compile-time numerical contract and part of the executable/tuning identity; changing the
+   descriptor after compilation cannot add alternatives that the policy excluded:
      :mixed-f16-f32 (default) — permit f16 operands with f32 accumulation/output. The
                           mixed-precision (AMP) policy: f16 INPUTS, f32 math. Costs ~1e-3
                           relative gradient noise (f16 mantissa, cosine similarity to the
                           f32 grads still 1.000) and buys ~3x on the GEMM kernels.
-     :f32-scalar        — plain scalar f32 GEMM for ALL :gemm steps (reads f32 residents
-                          directly, no convert/transpose expansion). Exact f32 grads
+     :f32-scalar        — keep float contractions on exact f32 schedules (read f32 residents
+                          directly, with no narrowing/layout graph). Exact f32 grads
                           (~1e-6-level parity) — the exactness escape hatch (grad tests,
                           FD gates, anything that must bit-track the CPU reference).
    Both policies are validated for BACKWARD/value+grad programs, not just forward:
@@ -1816,8 +1771,9 @@
    — the remedy is standard AMP loss scaling, and it lives in the CALLER (scale the seed
    cotangent by S, use lr/S), not in this policy: the VJP is linear in the seed.
    The XMX pitch gate and direct-vs-split occupancy decision are emitted as checked
-   KernelDispatch expression cases. LinkPlan instantiation selects and binds that compiler value; it does
-   not recognize GEMM shapes or reconstruct conversion/split kernels."
+   KernelDispatch expression cases from ordinary typed contraction facts. LinkPlan instantiation
+   selects and binds that compiler value; it does not recognize GEMM shapes or reconstruct
+   conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
   (when-not (contains? #{:mixed-f16-f32 :f32-scalar} gemm-precision)
@@ -1828,8 +1784,7 @@
   ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
   ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
   ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
-  (let [hardware-descriptor (core-hw/descriptor-for device-id)
-        resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
+  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
                            nil device-id schedule {:precision gemm-precision})
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
@@ -1966,46 +1921,41 @@
         ;; property (escape analysis can't see it), so it's declared, not derived.
         written-params (when prog
                          (reduce (fn [acc s]
-                                   (if (= :gemm (:convention s))
-                                     ;; a GEMM writes its C (out-buf) in place
-                                     (conj acc (symbol (name (:out-buf s))))
-                                     (let [ki (if-let [dispatch-id (:dispatch-id s)]
-                                                (some-> (dispatch-entry dispatch-id)
-                                                        kdispatch/default-alternative)
-                                                (reg-entry (:kernel-name s)))]
-                                       (into acc
-                                             (map (comp symbol name)
-                                                  (if-let [abi (when ki
-                                                                 (if (kexec/kernel-executable? ki)
-                                                                   (kexec/abi ki)
-                                                                   (:abi ki)))]
-                                                    (map #(or (:binding %) (:name %))
-                                                         (filter kabi/writable?
-                                                                 (kabi/pointer-slots abi)))
-                                                    (:written-arrays ki)))))))
+                                   (let [ki (if-let [dispatch-id (:dispatch-id s)]
+                                              (some-> (dispatch-entry dispatch-id)
+                                                      kdispatch/default-alternative)
+                                              (reg-entry (:kernel-name s)))]
+                                     (into acc
+                                           (map (comp symbol name)
+                                                (if-let [abi (when ki
+                                                               (if (kexec/kernel-executable? ki)
+                                                                 (kexec/abi ki)
+                                                                 (:abi ki)))]
+                                                  (map #(or (:binding %) (:name %))
+                                                       (filter kabi/writable?
+                                                               (kabi/pointer-slots abi)))
+                                                  (:written-arrays ki))))))
                                  #{} (:steps prog)))
         ;; Scratch allocations are not necessarily the program-wide FP dtype. Ordered ABIs can
         ;; produce half, byte or int buffers (tensorized/quant contractions and mixed pipelines),
         ;; so carry the producing output slot's STORAGE dtype into the residency allocator.
         buffer-dtypes (when prog
                         (reduce (fn [m s]
-                                  (if (= :gemm (:convention s))
-                                    (assoc m (:C s) effective-dtype)
-                                    (if-let [abi (if-let [dispatch-id (:dispatch-id s)]
-                                                   (some-> (dispatch-entry dispatch-id)
-                                                           kdispatch/default-alternative
-                                                           kexec/abi)
-                                                   (let [ki (reg-entry (:kernel-name s))]
-                                                     (when ki
-                                                       (if (kexec/kernel-executable? ki)
-                                                         (kexec/abi ki)
-                                                         (:abi ki)))))]
-                                      (reduce (fn [m slot]
-                                                (if (kabi/writable? slot)
-                                                  (assoc m (:name slot) (:dtype slot))
-                                                  m))
-                                              m (kabi/pointer-slots abi))
-                                      m)))
+                                  (if-let [abi (if-let [dispatch-id (:dispatch-id s)]
+                                                 (some-> (dispatch-entry dispatch-id)
+                                                         kdispatch/default-alternative
+                                                         kexec/abi)
+                                                 (let [ki (reg-entry (:kernel-name s))]
+                                                   (when ki
+                                                     (if (kexec/kernel-executable? ki)
+                                                       (kexec/abi ki)
+                                                       (:abi ki)))))]
+                                    (reduce (fn [m slot]
+                                              (if (kabi/writable? slot)
+                                                (assoc m (:name slot) (:dtype slot))
+                                                m))
+                                            m (kabi/pointer-slots abi))
+                                    m))
                                 {} (:steps prog)))
         array-roles (when prog
                       (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
@@ -2024,60 +1974,6 @@
                      (:allocs prog))
        :steps (mapv (fn [i step]
                       (cond
-                        (= :gemm (:convention step))
-                        ;; GEMM: the compiler closes this step over scalar/direct/split executable
-                        ;; graphs. The ordered argument contract is the sole binding authority;
-                        ;; the resident binder only supplies its concrete values and flattens the
-                        ;; selected graph.
-                        (let [phase (keyword (str "gpu-step-" i))
-                              m-argument (keyword (str (name phase) "-m"))
-                              n-argument (keyword (str (name phase) "-n"))
-                              k-argument (keyword (str (name phase) "-k"))
-                              tile (:tile resolved-schedule)
-                              {:keys [block-m block-n sg-m sg-n matrix]} tile
-                              workgroup-size
-                              (* (quot block-m sg-m) (quot block-n sg-n)
-                                 (:subgroup matrix 16))]
-                          {:convention :gemm
-                           :variant (:variant step)
-                           :A (:A step) :B (:B step) :C (:C step)
-                           :dispatch
-                           (gpu-gemm/emit-executable
-                            {:id (str f-var "-" device-id "-resident-gemm-" i "-"
-                                      (name (:variant step)) "-"
-                                      (Integer/toUnsignedString (hash tile) 16))
-                             :a (:A step) :b (:B step) :c (:C step)
-                             :m m-argument :n n-argument :k k-argument
-                             :variant (:variant step)
-                             ;; Emit the complete legal schedule family. The resolved precision
-                             ;; selects :f32-scalar at bind; mixed precision uses the checked cases.
-                             :precision :mixed-f16-f32
-                             :tile tile
-                             :fill-workgroups
-                             (core-hw/fill-workgroups hardware-descriptor workgroup-size)
-                             :target-fill-multiple
-                             (get-in resolved-schedule [:gemm-dispatch :target-fill-multiple])
-                             :min-split-chunk
-                             (get-in resolved-schedule [:gemm-dispatch :min-split-chunk])
-                             :max-splits
-                             (get-in resolved-schedule [:gemm-dispatch :max-splits])})
-                           :argument-specs
-                           [{:kind :input :sym (:A step)}
-                            {:kind :input :sym (:B step)}
-                            {:kind :output :sym (:C step)}
-                            {:kind :scalar :type :int
-                             :value-fn (expr->arg-fn all-params scalar-lets (:m-expr step))}
-                            {:kind :scalar :type :int
-                             :value-fn (expr->arg-fn all-params scalar-lets (:n-expr step))}
-                            {:kind :scalar :type :int
-                             :value-fn (expr->arg-fn all-params scalar-lets (:k-expr step))}]
-                           ;; Generic schedule-path-to-strategy mapping. The binder does not know
-                           ;; which semantic operation owns :precision.
-                           :strategy-selection {:path [:precision]
-                                                :mapping {:f32-scalar :f32-scalar}
-                                                :default :auto}
-                           :phase phase})
-
                         (= :contract (:convention step))
                         (let [{:keys [kernel-name dispatch-id arguments]} step
                               dispatch (when dispatch-id

@@ -7,13 +7,21 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
+            [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]))
 
 (defn- split-gemm-descriptor
   []
-  (let [tile (hardware/derive-gemm-tile {})]
+  (let [tile (hardware/derive-gemm-tile {})
+        dispatch
+        (gemm/emit-executable
+         {:id "mock-linked-gemm" :a 'a :b 'b :c 'c
+          :m :gemm-m :n :gemm-n :k :gemm-k :variant :nt
+          :precision :mixed-f16-f32 :tile tile :fill-workgroups 32})
+        executable (kernel-dispatch/default-alternative dispatch)]
     {:dtype :float
      :gemm-precision :mixed-f16-f32
      :schedule {:precision :mixed-f16-f32}
@@ -23,12 +31,8 @@
      :scalar-params '[m n k]
      :allocs []
      :steps
-     [{:convention :gemm :variant :nt :A 'a :B 'b :C 'c
-       :dispatch
-       (gemm/emit-executable
-        {:id "mock-linked-gemm" :a 'a :b 'b :c 'c
-         :m :gemm-m :n :gemm-n :k :gemm-k :variant :nt
-         :precision :mixed-f16-f32 :tile tile :fill-workgroups 32})
+     [{:convention :executable
+       :dispatch dispatch :artifact executable :abi (kernel-executable/abi executable)
        :argument-specs [{:kind :input :sym 'a}
                         {:kind :input :sym 'b}
                         {:kind :output :sym 'c}
@@ -38,6 +42,7 @@
        :strategy-selection {:path [:precision]
                             :mapping {:f32-scalar :f32-scalar}
                             :default :auto}
+       :output :c
        :phase :gemm}]
      :result-sym 'c}))
 

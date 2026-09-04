@@ -142,7 +142,7 @@
                     :array-roles '{a :input b :output}
                     :result-sym 'b
                     :dtype :float
-                    :steps [{:convention :map} {:convention :gemm} {:convention :map}]}
+                    :steps [{:convention :map} {:convention :executable} {:convention :map}]}
         c (r/map->Compiled
            {:lowering nil :executable nil
             :in-tree  [{:key :a :sym 'a :role :input :donate? false :shape [4] :dtype :float}]
@@ -153,11 +153,11 @@
       (is (identical? c (r/explain c))))
     (testing "ir dumps the resident steps"
       (is (= 3 (count (r/ir c))))
-      (is (= [:map :gemm :map] (mapv :convention (r/ir c)))))
+      (is (= [:map :executable :map] (mapv :convention (r/ir c)))))
     (testing "cache-key captures the serializable identity (closures excluded)"
       (let [k (r/cache-key c)]
         (is (= :ze:0 (:target k)))
-        (is (= {:map 2 :gemm 1} (:steps k)))
+        (is (= {:map 2 :executable 1} (:steps k)))
         (is (= {:a :a'} (:donated k)))
         (is (= [4] (-> k :in-tree first :shape)))))))
 
