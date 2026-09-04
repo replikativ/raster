@@ -239,7 +239,7 @@
         "the scheduled SegMap is preserved through OpenCL emission")
     (is (= '[[aq :byte] [bq :byte] [bsums :int] [da :float] [db :float]
              [wp :int] [xp :int] [xs :float] [y :float]
-             [in :int] [out :int] [_n_bound :int]]
+             [in :int] [out :int] [_n_bound :long]]
            (mapv (juxt :name :dtype) (:abi (first projection-kernels)))))
     (is (re-find #"rstr_dp4a" (:source (first projection-kernels)))
         "Q4_K row projection reaches the target-neutral integer-dot intrinsic")
@@ -269,7 +269,7 @@
               [xs :float] [y :float] [in :int] [_n_bound :int]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels q6-pipeline))))
     (is (= '[[[wp :int] [ws :float] [xp :int] [xs :float] [y :float]
-              [in :int] [out :int] [_n_bound :int]]]
+              [in :int] [out :int] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels i8-pipeline))))
     (is (every? #(re-find #"rstr_dp4a" (:source %))
                 (concat (:kernels q6-pipeline) (:kernels i8-pipeline)))

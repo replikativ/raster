@@ -1,12 +1,14 @@
 (ns raster.compiler.backend.gpu.matrix-target-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (def ^:private mma
@@ -60,10 +62,23 @@
     (is (not (re-find #"__kernel" (:source emitted))))))
 
 (deftest verified-body-owns-the-complete-target-artifact
-  (let [body (assoc (mma-body) :provenance {:scheduled-operation :body-certificate
-                                            :dialect :matrix-schedule})
-        artifact (matrix-target/emit-matrix-artifact
-                  "matrix_artifact_cuda" body :cuda
+  (let [body (-> (mma-body)
+                 (assoc :provenance {:scheduled-operation :body-certificate
+                                     :dialect :matrix-schedule})
+                 (assoc-in [:attributes :instruction-family] :mfma))
+        scheduled (scheduled-body/make
+                   {:source :body-certificate
+                    :body body
+                    :arguments ['a 'b 'c 128 128 64]
+                    :effects {:kind :tensor-contraction-stage
+                              :uses [{:value 'a :access :read}
+                                     {:value 'b :access :read}
+                                     {:value 'c :access :write}]}
+                    :legality {:kind :matrix-instruction-tiling}
+                    :numerics {:mode :reassociated :policy :tiled-contraction
+                               :rounding :nearest-even :accumulator-dtype :float}})
+        artifact (body-target/emit-artifact
+                  "matrix_artifact_cuda" scheduled :cuda
                   {:provenance {:lowering :caller-lie :target-dialect :hip}
                    :attributes {:kernel-body :caller-lie :instruction-family :mfma}})
         aligned-buffer (fn [id] {:id id :alignment 32})
@@ -92,10 +107,19 @@
            (mapv :alignment (take 3 (:abi artifact))))
         "WMMA load/store alignment is a checked call precondition")
     (is (identical? body (get-in artifact [:attributes :kernel-body])))
-    (is (= :mma (get-in artifact [:attributes :instruction-family])))
-    (is (= :matrix-kernel-body (get-in artifact [:provenance :lowering])))
+    (is (= :matrix (get-in artifact [:attributes :body-family])))
+    (is (= :scheduled-kernel-body (get-in artifact [:provenance :lowering])))
     (is (= :cuda (get-in artifact [:provenance :target-dialect])))
-    (is (= :body-certificate (get-in artifact [:provenance :scheduled-operation])))
+    (is (identical? scheduled (get-in artifact [:provenance :scheduled-operation])))
+    (is (= :mma (get-in artifact [:attributes :target-facts :instruction-family]))
+        "physical identity comes from MatrixMad, not descriptive body attributes")
+    (let [downgraded (-> artifact
+                         (update :abi #(mapv (fn [slot] (dissoc slot :alignment)) %))
+                         (assoc-in [:attributes :target-facts :pointer-alignment] nil)
+                         (assoc-in [:provenance :target-facts :pointer-alignment] nil))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"requires its verified pointer alignment"
+           (scheduled-body/validate-artifact-projection! scheduled downgraded))))
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"alignment contract"
          (kernel-call/make

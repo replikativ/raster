@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
@@ -50,9 +51,16 @@
               :emitted (graph/dataflow-contract emitted)}))
     (when-not (every? true?
                       (map (fn [scheduled-node emitted-node]
-                             (= (:operation scheduled-node)
-                                (get-in emitted-node
-                                        [:operation :provenance :scheduled-operation])))
+                             (let [certificate (get-in emitted-node
+                                                       [:operation :provenance
+                                                        :scheduled-operation])]
+                               (if (scheduled-body/scheduled-kernel-body? certificate)
+                                 (do (scheduled-body/validate-against-node!
+                                      certificate scheduled-node scheduled)
+                                     (scheduled-body/validate-artifact-projection!
+                                      certificate (:operation emitted-node))
+                                     true)
+                                 (= (:operation scheduled-node) certificate))))
                            (:nodes scheduled) (:nodes emitted)))
       (fail! :emitted-parallel-equation-operation
              "target emission changed a scheduled equation operation certificate" {}))

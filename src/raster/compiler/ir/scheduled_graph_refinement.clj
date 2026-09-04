@@ -6,47 +6,12 @@
    producing schedule pass remains responsible for proving its algorithm-specific numerical or
    effect law before constructing the witness.  Target emission subsequently remains a strict
    one-node-to-one-artifact projection of the refined graph."
-  (:require [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.ir.kernel-graph :as graph]))
+  (:require [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.numerical-contract :as numerical-contract]))
 
 (defrecord ScheduledGraphRefinement [source graph schedule numerics provenance attributes])
 
-(def ^:private numerical-modes #{:exact :reassociated :bounded-error})
-(def ^:private rounding-policies
-  #{:nearest-even :toward-zero :up :down :implementation-defined})
-
 (declare fail!)
-
-(defn- validate-numerics!
-  "Validate the refinement producer's numerical attestation.
-
-   This is intentionally not presented as an automatic floating-point proof. The producer derives
-   the attestation while establishing schedule legality; this boundary makes its policy explicit
-   and rejects unstructured claims so later proof/checking machinery has one stable seam."
-  [numerics]
-  (when-not (and (map? numerics)
-                 (contains? numerical-modes (:mode numerics))
-                 (keyword? (:policy numerics)))
-    (fail! :scheduled-graph-refinement-numerics
-           "scheduled graph refinement requires a supported numerical mode and named policy"
-           {:field :numerics :value numerics :supported numerical-modes}))
-  (case (:mode numerics)
-    :exact nil
-    :reassociated
-    (when-not (and (contains? rounding-policies (:rounding numerics))
-                   (dtype/known? (:accumulator-dtype numerics)))
-      (fail! :scheduled-graph-refinement-numerics
-             "reassociated refinement requires rounding and accumulator dtype evidence"
-             {:field :numerics :value numerics}))
-    :bounded-error
-    (when-not (and (contains? rounding-policies (:rounding numerics))
-                   (dtype/known? (:accumulator-dtype numerics))
-                   (map? (:error-model numerics))
-                   (keyword? (get-in numerics [:error-model :kind])))
-      (fail! :scheduled-graph-refinement-numerics
-             "bounded-error refinement requires rounding, accumulator dtype, and an error model"
-             {:field :numerics :value numerics})))
-  numerics)
 
 (defn scheduled-graph-refinement?
   "Recognize refinement witnesses across Typed Clojure child classloaders."
@@ -93,7 +58,9 @@
       (fail! :scheduled-graph-refinement-description
              "scheduled graph refinement requires an identified schedule"
              {:field :schedule :value schedule}))
-    (validate-numerics! numerics)
+    (numerical-contract/validate!
+     numerics {:reason :scheduled-graph-refinement-numerics
+               :ir :scheduled-graph-refinement})
     (doseq [[field value] [[:schedule schedule]
                            [:numerics numerics]
                            [:provenance provenance]

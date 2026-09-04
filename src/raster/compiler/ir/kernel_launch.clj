@@ -176,8 +176,8 @@
     (or (index-expr? x) (index-cast? x)) (expression? x)
     :else (some? x)))
 
-(defn validate-typed-expression!
-  "Validate an integer expression against the logical dtype of each opaque leaf.
+(defn typed-expression-dtype
+  "Validate an integer expression and return its inferred exact integer width.
 
    `leaf-dtype` returns the public scalar dtype for a compiler value. Generic launch arithmetic
    promotes an int operand to long when needed. KernelBody IndexExpr is stricter: its operands must
@@ -227,8 +227,13 @@
                                   {:reason :kernel-launch-expression-leaf
                                    :expression expression :leaf value :dtype leaf})))
                 leaf)))]
-    (infer expression)
-    expression))
+    (infer expression)))
+
+(defn validate-typed-expression!
+  "Validate an integer expression against the logical dtype of each opaque leaf and return it."
+  [expression leaf-dtype]
+  (typed-expression-dtype expression leaf-dtype)
+  expression)
 
 (defn expression-references
   "Return the opaque compiler-value leaves read by an integer expression."

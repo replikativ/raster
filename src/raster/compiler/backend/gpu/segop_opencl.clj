@@ -8,6 +8,7 @@
    This is the GPU counterpart to segop_simd.clj — both consume the
    same SegOp IR but produce different target code."
   (:require [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
+            [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as kernel-body-c-dialect]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
@@ -25,6 +26,7 @@
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
@@ -385,50 +387,13 @@
              :or {kernel-name-prefix "segmap"
                   target-dialect :opencl-intel workgroup-size 256
                   scalar-types {} array-types {}}}]
-  (let [{:keys [kernel-body bound inputs outputs scalars]}
-        (segmap-body/lower segmap
-                           {:workgroup-size workgroup-size
-                            :scalar-types scalar-types :array-types array-types})
-        parameters (:parameters kernel-body)
+  (let [scheduled
+        (segmap-body/schedule segmap
+                              {:workgroup-size workgroup-size
+                               :scalar-types scalar-types :array-types array-types})
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        parameter-names (into {}
-                              (map (fn [parameter]
-                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
-                              parameters)
-        source (kernel-body-opencl/emit-scalar-kernel
-                kernel-name kernel-body
-                {:target-dialect target-dialect :parameter-names parameter-names})
-        abi (body-abi/project-contracts
-             (mapv (fn [{:keys [id kind dtype role]}]
-                     (kabi/slot id kind dtype :c-name (get parameter-names id)
-                                :role (if (= id '_n_bound) :bound role)))
-                   parameters)
-             kernel-body)
-        arguments (mapv (fn [parameter]
-                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
-                        parameters)]
-    (kart/make
-     {:kernel-name kernel-name
-      :source source
-      :abi abi
-      :arguments arguments
-      :launch (:launch kernel-body)
-      :temporaries []
-      :effects {:kind (case (:write-conflict segmap)
-                        :reduce :reducing-scatter
-                        (if (:out-sym segmap) :elementwise-map :side-effect-map))
-                :write-conflict (or (:write-conflict segmap) :unique)
-                :conflict-contract (:conflict-contract segmap)}
-      :target (kernel-body-c-dialect/target
-               (kernel-body-c-dialect/resolve! target-dialect))
-      :provenance {:dialect :kernel-body :source-dialect :segmap
-                   :segop-id (:id segmap)}
-      :attributes {:kernel-body kernel-body
-                   :emission-route :kernel-body
-                   :array-params (vec (concat inputs outputs))
-                   :scalar-params scalars
-                   :dtype (:dtype segmap)
-                   :aliasing :no-write-alias}})))
+        ]
+    (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)))
 
 (defn generate-segstencil-kernel-body
   "Schedule and emit one certified SegStencil through portable KernelBody."
@@ -749,8 +714,7 @@
                      target-dialect :opencl-intel}}]
   (let [dtype (or (:dtype operation) dtype :double)
         target (kernel-body-c-dialect/resolve! target-dialect)]
-    (kart/certify-scheduled-operation
-     (try
+    (try
        (generate-segmap-kernel-body
         operation :dtype dtype :scalar-types scalar-types :array-types array-types
         :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
@@ -758,17 +722,19 @@
          (if (and (kernel-body-c-dialect/opencl? target)
                   (segmap-body/declined? exception))
            (try
-             (-> (if (:out-sym operation)
-                   (generate-segmap-kernel
-                    operation (:out-sym operation)
-                    :dtype dtype :scalar-types scalar-types :array-types array-types
-                    :kernel-name-prefix kernel-name-prefix)
-                   (generate-explicit-segmap-kernel
-                    operation :dtype dtype :scalar-types scalar-types :array-types array-types
-                    :kernel-name-prefix (str kernel-name-prefix "_effect")))
-                 (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
-                 (assoc-in [:attributes :kernel-body-decline]
-                           (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+             (kart/certify-scheduled-operation
+              (-> (if (:out-sym operation)
+                    (generate-segmap-kernel
+                     operation (:out-sym operation)
+                     :dtype dtype :scalar-types scalar-types :array-types array-types
+                     :kernel-name-prefix kernel-name-prefix)
+                    (generate-explicit-segmap-kernel
+                     operation :dtype dtype :scalar-types scalar-types :array-types array-types
+                     :kernel-name-prefix (str kernel-name-prefix "_effect")))
+                  (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+                  (assoc-in [:attributes :kernel-body-decline]
+                            (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+              operation)
              (catch clojure.lang.ExceptionInfo retry
                ;; The verified OpenCL generator refused as well: report both refusals as one
                ;; structured error instead of letting the second one hide the first.
@@ -778,8 +744,7 @@
                                 :kernel-body-decline (ex-data exception)
                                 :generator-refusal (ex-data retry)}
                                retry))))
-           (throw exception))))
-     operation)))
+           (throw exception))))))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
@@ -849,16 +814,34 @@
                   (kgraph/map-operations
                    emitted
                    (fn [node]
-                     (kart/validate!
-                      (update (:operation node) :abi
-                              (fn [slots]
-                                (mapv (fn [slot argument]
-                                        (if-let [logical-dtype
-                                                 (and (= :scalar (:kind slot))
-                                                      (get logical-dtype-by-id argument))]
-                                          (assoc slot :dtype logical-dtype)
-                                          slot))
-                                      slots (get-in node [:operation :arguments])))))))
+                     (let [artifact (:operation node)
+                           certificate (get-in artifact
+                                               [:provenance :scheduled-operation])]
+                       (if (scheduled-body/scheduled-kernel-body? certificate)
+                         (do
+                           (doseq [[slot argument] (map vector (:abi artifact)
+                                                        (:arguments artifact))
+                                   :let [logical-dtype
+                                         (and (= :scalar (:kind slot))
+                                              (get logical-dtype-by-id argument))]
+                                   :when logical-dtype]
+                             (when-not (= logical-dtype (:dtype slot))
+                               (throw (ex-info
+                                       "scheduled-body ABI disagrees with its GraphScalar"
+                                       {:reason :kernel-graph-scalar-interface
+                                        :node (:id node) :argument argument
+                                        :expected logical-dtype :actual (:dtype slot)}))))
+                           artifact)
+                         (kart/validate!
+                          (update artifact :abi
+                                  (fn [slots]
+                                    (mapv (fn [slot argument]
+                                            (if-let [logical-dtype
+                                                     (and (= :scalar (:kind slot))
+                                                          (get logical-dtype-by-id argument))]
+                                              (assoc slot :dtype logical-dtype)
+                                              slot))
+                                          slots (:arguments artifact)))))))))
                   emitted)
         scalar-pairs (->> (:nodes emitted)
                           (mapcat (fn [node]
@@ -1040,31 +1023,33 @@
   [graph {:keys [scalar-types array-types target-dialect]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
+        scalar-types (merge scalar-types
+                            (into {} (map (juxt :id :dtype)) (:scalars graph)))
         array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
          graph
          (fn [{:keys [id operation]}]
-           (kart/certify-scheduled-operation
-            (cond
-              (instance? raster.compiler.ir.segop.SegMap operation)
-              (generate-scheduled-segmap-kernel
-               operation :dtype (:dtype operation)
-               :scalar-types scalar-types :array-types array-types
-               :target-dialect target-dialect
-               :kernel-name-prefix "graph_segmap")
+           (cond
+             (instance? raster.compiler.ir.segop.SegMap operation)
+             (generate-scheduled-segmap-kernel
+              operation :dtype (:dtype operation)
+              :scalar-types scalar-types :array-types array-types
+              :target-dialect target-dialect
+              :kernel-name-prefix "graph_segmap")
 
-              (instance? raster.compiler.ir.segop.SegStencil operation)
+             (instance? raster.compiler.ir.segop.SegStencil operation)
+             (kart/certify-scheduled-operation
               (generate-segstencil-kernel-body
                operation :scalar-types scalar-types :array-types array-types
                :target-dialect target-dialect
                :kernel-name-prefix "graph_segstencil")
+              operation)
 
-              :else
-              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
-                              {:reason :kernel-graph-node-target-lowering-missing
-                               :target :opencl-c :node id :operation operation})))
-            operation)))]
+             :else
+             (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
+                             {:reason :kernel-graph-node-target-lowering-missing
+                              :target :opencl-c :node id :operation operation})))))]
     (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
 (declare generate-contraction-kernel-artifact)

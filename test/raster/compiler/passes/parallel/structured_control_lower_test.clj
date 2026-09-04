@@ -5,6 +5,7 @@
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-loop-call :as loop-call]
@@ -94,12 +95,32 @@
       (is (= '[u-in u-next iteration n-in alpha-in] (:arguments emitted)))
       (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
       (is (= (mapv :operation (:nodes graph))
-             (mapv #(get-in % [:operation :provenance :scheduled-operation])
+             (mapv #(get-in % [:operation :provenance :scheduled-operation :source])
                    (:nodes emitted))))
       (is (every? #(re-find #"__kernel void graph_segmap" (:source %))
                   (map :operation (:nodes emitted))))
       (is (some #(re-find #"long iteration" (:source %))
                 (map :operation (:nodes emitted))))
+      (let [certificate (get-in emitted
+                                [:nodes 0 :operation :provenance :scheduled-operation])
+            replaced (-> certificate
+                         (update :arguments
+                                 #(mapv (fn [parameter argument]
+                                          (if (= 'alpha-in (:id parameter)) 1.0 argument))
+                                        (get-in certificate [:body :parameters]) %))
+                         (update :scalar-bindings
+                                 #(mapv (fn [binding]
+                                          (if (= 'alpha-in (:value binding))
+                                            (assoc binding :value 1.0)
+                                            binding))
+                                        %)))]
+        (is (= :scheduled-kernel-body-node-scalars
+               (try
+                 (scheduled-body/validate-against-node! replaced first-node graph)
+                 nil
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception)))))
+            "a schedule cannot silently replace one required public scalar by a constant"))
       (let [call (loop-call/make
                   scheduled emitted
                   {'u0 :initial-buffer 'u-final :output-buffer}
@@ -120,10 +141,10 @@
         (testing "a copied SegOp ID cannot hide a changed operation certificate"
           (let [tampered (assoc-in emitted
                                    [:nodes 0 :operation :provenance
-                                    :scheduled-operation :grid :block-size]
+                                    :scheduled-operation :source :grid :block-size]
                                    128)]
             (is (thrown-with-msg?
-                 clojure.lang.ExceptionInfo #"operation certificate"
+                 clojure.lang.ExceptionInfo #"exact operation|operation certificate"
                  (loop-call/validate! (assoc call :graph tampered))))))
         (testing "target emission cannot change buffers or graph effects"
           (is (thrown-with-msg?

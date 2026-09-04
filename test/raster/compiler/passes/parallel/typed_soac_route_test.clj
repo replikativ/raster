@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -329,6 +330,13 @@
         "the shared producer is emitted once, not projected into both results")
     (is (= :kernel-body (get-in (first (:kernels emitted))
                                 [:attributes :emission-route])))
+    (is (identical? operation
+                    (get-in portable
+                            [:attributes :scheduled-kernel-body :source]))
+        "the real SegMap route reaches the target only through its checked body refinement")
+    (is (scheduled-body/scheduled-kernel-body?
+         (get-in portable [:provenance :scheduled-operation]))
+        "the target artifact certifies the exact schedule/body refinement, not only its source")
     (is (= [:float :float] (mapv :dtype (get-in operation [:scalar-region :locals])))
         "SegMap scheduling retains TypedSOAC local dtypes as data, not symbol metadata")
     (is (= 1 (count (re-seq #"x\[" portable-source)))

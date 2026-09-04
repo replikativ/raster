@@ -135,7 +135,7 @@
         (let [compiled (pipeline/compile-gpu-program
                         #'block-transfer-half-roundtrip! target :dtype :float)]
           (is (= [:map-void :map-void] (mapv :convention (:steps compiled))))
-          (is (= #{:int :half}
+          (is (= #{:int :long :half}
                  (set (mapcat #(map :dtype (:abi %)) (:steps compiled))))))))))
 
 (deftest gather-rows-resident-lowering-test
@@ -156,7 +156,7 @@
       (is (= :kernel-body (get-in step [:artifact :provenance :dialect])))
       (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
       (is (= '[indices src out width _n_bound] (mapv :name (:abi step))))
-      (is (= [:int :float :float :int :int] (mapv :dtype (:abi step))))
+      (is (= [:int :float :float :int :long] (mapv :dtype (:abi step))))
       (is (= 'rstr_extent_0 (last (get-in step [:artifact :arguments])))
           "the schedule names the typed scalar extent instead of embedding host code")
       (is (= 15 ((:value-fn (last (:argument-specs step)))
