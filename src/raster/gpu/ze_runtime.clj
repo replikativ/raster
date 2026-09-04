@@ -1406,25 +1406,6 @@
                (catch Throwable _ nil))]
     (f d)))
 
-(defn gemm!
-  "GPU matrix multiply: C = A × B using XMX DPAS instructions.
-  A: FP16 DeviceBuffer [M×K], B: FP16 DeviceBuffer [K×N],
-  C: FP16 DeviceBuffer [M×N] (output, will be overwritten).
-  All matrices are row-major.
-
-  Returns C."
-  [a b c m n k]
-  (let [{:keys [kernel tile workgroup]} (ensure-gemm-kernel! :half)
-        {:keys [block-m block-n]} tile
-        gc-m (int (Math/ceil (/ (double m) (double block-m))))
-        gc-n (int (Math/ceil (/ (double n) (double block-n))))
-        args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int m)}
-              {:type :int :value (int n)}
-              {:type :int :value (int k)}]]
-    (launch-2d! kernel workgroup [gc-n gc-m] args)
-    c))
-
 ;; ================================================================
 ;; GPU weight buffer manager (persistent FP16 across training)
 ;; ================================================================
@@ -2184,9 +2165,8 @@
   (get @kernel-registry kernel-name))
 
 (defn bind-registered-gemm!
-  "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
-  command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
-  call). A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
+  "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for legacy benchmark
+  recording. A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
   {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
   handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
   ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
@@ -2507,55 +2487,6 @@
     (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n))))) ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m))))) ;; Y = gc-m
     (.set gc I32 8 (int batch))                              ;; Z = slabs
-    bnd))
-
-(def ^:private gemm-scalar-cache
-  "Cache for compiled scalar (non-XMX) GEMM kernels, keyed by variant (:nn|:nt|:tn).
-   Each entry is {:module :kernel :kernel-name}. f32 in/out — the small-N fallback."
-  (atom {}))
-
-(defn- ensure-gemm-scalar-kernel!
-  "Lazily compile + cache the plain scalar f32 GEMM kernel for a layout variant
-   (:nn | :nt | :tn). Returns {:module :kernel :kernel-name}. Used when the output
-   column dim N is too small for the XMX 2D-block path (2D-block IO needs a
-   >=16-byte pitch → N>=8 at fp16; N<8 reads garbage)."
-  [variant]
-  (ensure-init!)
-  (or (get @gemm-scalar-cache variant)
-      (let [kname (str "gemm_scalar_" (name variant))
-            emitted ((requiring-resolve
-                      'raster.compiler.backend.gpu.gemm/emit-portable-scalar-matrix-kernel)
-                     kname variant)
-            cl-src (:source emitted)
-            device-hex (:device-id-hex @state)
-            spv (do (require 'raster.compiler.support.spirv-cache)
-                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                     cl-src :device device-hex))
-            module (load-module! spv)
-            kernel (create-kernel module kname)
-            entry {:module module :kernel kernel :kernel-name kname
-                   :kernel-body (:kernel-body emitted)}]
-        (swap! gemm-scalar-cache assoc variant entry)
-        entry)))
-
-(defn bind-registered-gemm-scalar!
-  "Bind the plain scalar (non-XMX) f32 GEMM kernel over RESIDENT f32 DeviceBuffers for
-  recording into a command graph—the small-N fallback for linked :gemm steps
-  (XMX's 2D-block B read violates the 16-byte minimum pitch when N<8 and produces
-  garbage). Reads/writes the f32 buffers directly: no f16 convert or transpose expansion.
-  variant :nn (C=A·B), :nt (C=A·Bᵀ, B stored [n,k]), :tn (C=Aᵀ·B, A stored [k,m]).
-  Returns a bound {:kernel :gc-seg …} map (1D grid over m·n). A fresh kernel handle per
-  binding (LZ kernel args are mutable handle state → shared handles clobber)."
-  [a b c m n k variant]
-  (let [{:keys [module kernel-name]} (ensure-gemm-scalar-kernel! variant)
-        kh (create-kernel-fresh module kernel-name)
-        m (long m) n (long n) k (long k)
-        total (* m n)
-        args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int k)} {:type :int :value (int m)}
-              {:type :int :value (int n)} {:type :int :value (int total)}]
-        bnd (bind-kernel! kh 256 args)]
-    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
     bnd))
 
 (def ^:private convert-cache (atom {}))
@@ -3510,66 +3441,6 @@
     ;; Copy back
     (MemorySegment/copy out-seg 0 (MemorySegment/ofArray out-arr) 0 n-bytes)
     out-arr))
-
-(defn invoke-registered-gemm!
-  "Pipeline-friendly GEMM: C = A*B.
-  Accepts float[] or double[] arrays for A, B, C.
-  Internally converts to FP16 shared memory for XMX DPAS.
-  C[M*N] output is FP32 shared memory, copied back to the output array.
-  Uses 2D launch for XMX tiled GEMM."
-  [^String kernel-name A B C m n k]
-  (let [{:keys [kernel-handle workgroup-size]
-         :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
-        m (long m) n (long n) k (long k)
-        a-float? (instance? (Class/forName "[F") A)
-        b-float? (instance? (Class/forName "[F") B)
-        c-float? (instance? (Class/forName "[F") C)
-        ;; Convert A (M*K) to FP16 shared memory
-        a-elems (* m k)
-        a-shorts (ensure-arr kernel-name :gemm-a-shorts a-elems)
-        _ (if a-float?
-            (let [^floats af A]
-              (dotimes [i a-elems]
-                (aset a-shorts i (short (Float/floatToFloat16 (aget af i))))))
-            (let [^doubles ad A]
-              (dotimes [i a-elems]
-                (aset a-shorts i (short (Float/floatToFloat16 (float (aget ad i))))))))
-        a-seg (ensure-seg kernel-name :gemm-a-seg (* a-elems 2))
-        _ (MemorySegment/copy (MemorySegment/ofArray a-shorts) 0 a-seg 0 (* a-elems 2))
-        ;; Convert B (K*N) to FP16 shared memory
-        b-elems (* k n)
-        b-shorts (ensure-arr kernel-name :gemm-b-shorts b-elems)
-        _ (if b-float?
-            (let [^floats bf B]
-              (dotimes [i b-elems]
-                (aset b-shorts i (short (Float/floatToFloat16 (aget bf i))))))
-            (let [^doubles bd B]
-              (dotimes [i b-elems]
-                (aset b-shorts i (short (Float/floatToFloat16 (float (aget bd i))))))))
-        b-seg (ensure-seg kernel-name :gemm-b-seg (* b-elems 2))
-        _ (MemorySegment/copy (MemorySegment/ofArray b-shorts) 0 b-seg 0 (* b-elems 2))
-        ;; Cached C (M*N) FP32 shared memory
-        c-elems (* m n)
-        c-seg (ensure-seg kernel-name :gemm-c-seg (* c-elems 4))
-        ;; 2D launch config
-        gc-m (int (Math/ceil (/ (double m) 128.0)))
-        gc-n (int (Math/ceil (/ (double n) 128.0)))
-        args [a-seg b-seg c-seg
-              {:type :int :value (int m)}
-              {:type :int :value (int n)}
-              {:type :int :value (int k)}]]
-    (launch-2d! kernel-handle [256 1] [gc-n gc-m] args)
-    ;; Copy FP32 output back to C array
-    (if c-float?
-      (do (MemorySegment/copy c-seg 0 (MemorySegment/ofArray ^floats C) 0 (* c-elems 4))
-          C)
-      ;; For double[] output: read FP32 from GPU, convert to double
-      (let [tmp-floats (float-array c-elems)
-            ^doubles cd C]
-        (MemorySegment/copy c-seg 0 (MemorySegment/ofArray tmp-floats) 0 (* c-elems 4))
-        (dotimes [i c-elems]
-          (aset cd i (double (aget tmp-floats i))))
-        C))))
 
 (defn- stage-operand!
   "Copy host array `arr` (double[]/float[]) of `nel` elements into cached shared memory for

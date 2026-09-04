@@ -1158,33 +1158,13 @@
     :else nil))
 
 (defn gemm-default-alpha-beta?
-  "True iff a GEMM call's (alpha, beta) operands are literally (1.0, 0.0) — the plain
-   C = A·B that the GPU GEMM kernels actually implement.
+  "True iff a BLAS call's alpha/beta literals denote the plain overwrite `C = A·B`.
 
-   EVERY GPU GEMM kernel — resident XMX, resident scalar, split-k, and the staged
-   invoke-registered-gemm! — takes only (A B C m n k). None has an alpha/beta operand,
-   and all OVERWRITE C. So a call with alpha≠1 or beta≠0 is NOT representable, and the
-   lowering paths must REJECT it rather than drop the scalars on the floor:
-   `(dgemm! A B C m k n 1.0 1.0)` is an ACCUMULATE (C += A·B) — exactly how nn/linear
-   folds in its bias and how the SDPA backward sums its two dScores contributions — and
-   dropping beta silently computes C = A·B on GPU while CPU computes C += A·B. Wrong
-   results, no error, GPU only.
-
-   Honoring alpha/beta instead of rejecting is NOT the cheap kernel-arg change it looks
-   like. emit-gemm-tiled already accepts :alpha/:beta (baking the shape and
-   passing the values as runtime args), but:
-     - the XMX kernel CACHE keys on c-dtype alone, and the scalar + split-k combine
-       kernels have no alpha/beta at all (the split-k emitter explicitly THROWS on
-       beta≠0 — its partials are summed by a separate reduce kernel); and
-     - beta≠0 READS C, which collides with the residency model: buffer contents are
-       uploaded once at instantiation, and linked invocation re-uploads only :input buffers. A beta=1
-       GEMM writing an :output param would be correct on the FIRST replay and then
-       silently ACCUMULATE ACROSS REPLAYS — trading one silent miscompile for another.
-       A sound implementation must additionally prove that C's pre-step contents are
-       produced WITHIN the program (a prior beta=0 GEMM or fill kernel), which is a
-       residency analysis, not a kernel signature.
-   That work belongs with the first real consumer (sdpa-bwd on GPU), under a
-   MULTI-REPLAY test. Until then: fail loud."
+   This is a frontend semantic classification, not a statement about a backend kernel signature.
+   The typed contraction route represents non-default alpha/beta as a checked result transform and
+   records beta-dependent destination reads through the ordinary inout/effect contract.  Keeping
+   the literal test here lets source projection distinguish those semantics without teaching an
+   emitter or runtime binder about BLAS call conventions."
   [alpha-expr beta-expr]
   (and (= 1.0 (gemm-scalar-literal alpha-expr))
        (= 0.0 (gemm-scalar-literal beta-expr))))
