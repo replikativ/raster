@@ -9,11 +9,8 @@
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
-            [raster.compiler.ir.kernel-abi :as kernel-abi]
-            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
-            [raster.compiler.ir.kernel-body :as kernel-body]
-            [raster.compiler.ir.kernel-body-abi :as body-abi]
-            [raster.compiler.ir.kernel-launch :as kernel-launch]))
+            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.ir.kernel-body :as kernel-body]))
 
 (defn- target-parameter-names
   [body overrides]
@@ -69,31 +66,23 @@
                        :parameters (:parameters body) :c-names ordered-names})))
     names))
 
-(defn- projected-abi
-  [body names target-dialect]
-  (let [target-alignment (when (= :cuda target-dialect) 32)]
-    (body-abi/project-contracts
-     (mapv (fn [{:keys [id kind dtype role]}]
-             (kernel-abi/slot id kind dtype
-                              :c-name (get names id)
-                              :role role
-                              :alignment (when (and target-alignment (not= :scalar kind))
-                                           target-alignment)))
+(defn physical-requirements
+  "Return target-derived ABI requirements and identity-bearing physical lowering facts."
+  [body target-dialect plan]
+  (let [body (kernel-body/validate! body)
+        dialect (c-dialect/resolve! target-dialect)
+        pointer-alignment (when (= :cuda (:id dialect)) 32)]
+    {:parameter-alignments
+     (into {}
+           (keep (fn [{:keys [id kind]}]
+                   (when (and pointer-alignment (not= :scalar kind))
+                     [id pointer-alignment])))
            (:parameters body))
-     body)))
-
-(defn- body-arguments
-  [body]
-  (let [dimension-values (get-in body [:attributes :dimension-values])]
-    (mapv (fn [{:keys [id role]}]
-            (if (= :dimension role) (get dimension-values id id) id))
-          (:parameters body))))
-
-(defn- body-effects
-  [body]
-  {:kind :tensor-contraction-stage
-   :reads (mapv :id (filter #(contains? #{:input :inout} (:kind %)) (:parameters body)))
-   :writes (mapv :id (filter #(contains? #{:output :inout} (:kind %)) (:parameters body)))})
+     :target-facts
+     {:target-dialect (:id dialect)
+      :instruction (:instruction plan)
+      :instruction-family (get-in plan [:instruction :family])
+      :pointer-alignment pointer-alignment}}))
 
 (defn emit-matrix-kernel
   "Emit `body` for one C-family target dialect.
@@ -106,6 +95,7 @@
    (emit-matrix-kernel kernel-name body target-dialect {}))
   ([kernel-name body target-dialect {:keys [parameter-names]}]
    (let [body (kernel-body/validate! body)
+         plan (matrix-plan/analyze body)
          dialect (c-dialect/resolve! target-dialect)
          parameter-names (validate-target-names!
                           kernel-name body
@@ -131,40 +121,9 @@
                             :target (c-dialect/target dialect)
                             :instruction-family
                             (get-in body [:attributes :instruction-family])})))]
-     {:source source
+     (merge {:source source
       :target (c-dialect/target dialect)
       :target-dialect (:id dialect)
       :parameter-names parameter-names
-      :kernel-body body})))
-
-(defn emit-matrix-artifact
-  "Project one verified matrix body into a complete target artifact.
-
-   ABI order, memory contracts, compiler arguments and launch geometry are consequences of the
-   body. Static dimension specializations become literal artifact arguments; dynamic dimensions
-   retain their compiler identities. Target parameter names are spelling policy only."
-  ([kernel-name body target-dialect]
-   (emit-matrix-artifact kernel-name body target-dialect {}))
-  ([kernel-name body target-dialect {:keys [parameter-names provenance attributes]}]
-   (let [body (kernel-body/validate! body)
-         dimension-values (get-in body [:attributes :dimension-values])
-         emitted (emit-matrix-kernel kernel-name body target-dialect
-                                     {:parameter-names parameter-names})
-         names (:parameter-names emitted)]
-     (kernel-artifact/make
-      {:kernel-name kernel-name
-       :target (:target emitted)
-       :source (:source emitted)
-       :abi (projected-abi body names (:target-dialect emitted))
-       :arguments (body-arguments body)
-       :launch (kernel-launch/rebind-spec (:launch body) dimension-values)
-       :effects (body-effects body)
-       :provenance (merge provenance
-                          (:provenance body)
-                          {:lowering :matrix-kernel-body
-                           :target-dialect (:target-dialect emitted)})
-       :attributes (merge attributes
-                          {:kernel-body body
-                           :emission-route :kernel-body
-                           :instruction-family
-                           (get-in body [:attributes :instruction-family])})}))))
+      :kernel-body body}
+            (physical-requirements body (:id dialect) plan)))))

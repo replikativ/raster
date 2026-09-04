@@ -12,6 +12,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
@@ -152,6 +153,17 @@
                       "portable dense map writable results may only read their lane-owned element"
                       {:operation (:id segmap) :inputs inputs :outputs outputs}))
         default-dtype (dtype/canon (or (:dtype segmap) :float))
+        bound-dtype (cond
+                      (integer? bound)
+                      (if (<= Integer/MIN_VALUE bound Integer/MAX_VALUE) :int :long)
+
+                      (or (get scalar-types bound)
+                          (get scalar-types (when (or (symbol? bound) (keyword? bound))
+                                              (symbol (name bound)))))
+                      (dtype/canon (or (get scalar-types bound)
+                                       (get scalar-types (symbol (name bound)))))
+
+                      :else :int)
         array-dtype (fn [id]
                       (dtype/canon (or (get array-types id)
                                        (get array-types (symbol (name id)))
@@ -361,7 +373,7 @@
                    outputs)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
-              [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
+              [(body/->KernelParameter '_n_bound :scalar bound-dtype [] nil nil :bound)]))]
     {:kernel-body
      (body/make
       {:id [:segmap (:id segmap) :portable-one-item]
@@ -390,9 +402,75 @@
        :launch (if sequential-effects?
                  (launch/spec {:workgroup-size [1] :group-count [1]})
                  (launch/spec {:workgroup-size [workgroup-size]
-                               :group-count [(launch/ceil-div bound workgroup-size)]}))
+                               :group-count [(launch/ceil-div '_n_bound workgroup-size)]}))
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
        :attributes {:kind :portable-segmap :extent bound :no-write-alias true
                     :effect-iteration-order iteration-order}})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))
+
+(defn schedule
+  "Refine one SegMap into a complete, target-neutral ScheduledKernelBody.
+
+   This is the algorithm/schedule boundary. Effects, conflict legality and numerical association
+   are fixed here; a target projector may only spell the resulting body and physical ABI."
+  [segmap options]
+  (let [{:keys [kernel-body bound inputs outputs scalars]} (lower segmap options)
+        arguments (mapv (fn [parameter]
+                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
+                        (:parameters kernel-body))
+        uses (scheduled-body/derive-uses kernel-body arguments)
+        reduction-destinations
+        (into #{}
+              (keep (fn [[destination conflict]]
+                      (when (= :reduce (:kind conflict)) destination)))
+              (:write-conflicts segmap))
+        reducing? (or (= :reduce (:write-conflict segmap))
+                      (seq reduction-destinations))
+        reduction-destinations (if (and reducing? (empty? reduction-destinations))
+                                 (set outputs)
+                                 reduction-destinations)
+        reduction-parameters
+        (filterv #(contains? reduction-destinations (:id %)) (:parameters kernel-body))
+        _ (when (and reducing? (not= (count reduction-destinations)
+                                     (count reduction-parameters)))
+            (decline! :reduction-accumulator-contract
+                      "every reducing destination requires one typed KernelBody parameter"
+                      {:operation (:id segmap) :destinations reduction-destinations
+                       :parameters (mapv :id reduction-parameters)}))
+        conflict-kind (or (:write-conflict segmap)
+                          (when reducing? :mixed)
+                          :unique)]
+    (scheduled-body/make
+     {:source segmap
+      :body kernel-body
+      :arguments arguments
+      :effects {:kind (cond
+                        (= :ordered-effects (:write-conflict segmap)) :side-effect-map
+                        reducing? :reducing-scatter
+                        (:out-sym segmap) :elementwise-map
+                        :else :side-effect-map)
+                :uses uses
+                :write-conflict conflict-kind
+                :write-conflicts (:write-conflicts segmap)
+                :conflict-contract (:conflict-contract segmap)}
+      :legality {:kind :segmap-body-lowering
+                 :write-conflict conflict-kind
+                 :write-conflicts (:write-conflicts segmap)
+                 :conflict-contract (:conflict-contract segmap)}
+      :numerics (if reducing?
+                  {:mode :reassociated :policy :certified-reducing-scatter
+                   :accumulators
+                   (mapv (fn [parameter]
+                           {:value (:id parameter)
+                            :dtype (dtype/canon (:dtype parameter))
+                            :rounding :implementation-defined
+                            :policy :proof-carrying-destination})
+                         reduction-parameters)}
+                  {:mode :exact :policy :same-scalar-evaluation-order})
+      :provenance {:dialect :kernel-body :source-dialect :segmap
+                   :segop-id (:id segmap)}
+      :attributes {:array-params (vec (concat inputs outputs))
+                   :scalar-params scalars
+                   :dtype (:dtype segmap)
+                   :aliasing :no-write-alias}})))

@@ -117,6 +117,12 @@
           (is (some #(= "IfRegion" (some-> % class .getSimpleName)) operations))
           (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))
           (is (some #(= "AtomicRMW" (some-> % class .getSimpleName)) operations))
+          (is (= {:mode :reassociated :policy :certified-reducing-scatter
+                  :accumulators [{:value 'total :dtype :float
+                                  :rounding :implementation-defined
+                                  :policy :proof-carrying-destination}]}
+                 (get-in artifact [:attributes :numerics]))
+              "a proof-carrying per-destination reduction is never certified as exact")
           (is (str/includes? (:source artifact) atomic)))))))
 
 (deftest analyzed-source-selects-the-same-ordered-effect-schedule
