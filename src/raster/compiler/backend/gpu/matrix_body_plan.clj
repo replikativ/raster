@@ -165,6 +165,7 @@
         m-parameter (:m dimension-parameters)
         n-parameter (:n dimension-parameters)
         k-parameter (:k dimension-parameters)
+        dimension-values (:dimension-values attributes)
         schedule-parameters (filterv #(= :schedule (:role %)) parameters)
         _ (require! (every? #(and (= :scalar (:kind %)) (= :int (:dtype %)))
                             schedule-parameters)
@@ -175,6 +176,12 @@
                     "matrix body dimension roles and parameter identities disagree"
                     {:dimension-parameters dimension-parameters
                      :parameters (:dimension parameters-by-role)})
+        _ (require! (= {m-parameter m-extent n-parameter n-extent k-parameter k-extent}
+                       dimension-values)
+                    "matrix dimension specializations must agree with its storage shapes"
+                    {:dimension-parameters dimension-parameters
+                     :dimension-values dimension-values
+                     :storage-dimensions [m-extent n-extent k-extent]})
         _ (require! (and (= :half (:dtype lhs-param)) (= :half (:dtype rhs-param))
                          (contains? #{:half :float} (:dtype out-param)))
                     "matrix plan requires f16 inputs and an f16 or f32 result"
@@ -381,11 +388,14 @@
            "tile-store masks do not match their fragment coordinates"
            {:stores stores :masks masks})]
     {:instruction instruction
+     :dimensions [m-extent n-extent k-extent]
      :mi mi :ni ni :ki ki :subgroup subgroup
      :block-m block-m :block-n block-n :block-k block-k :sg-m sg-m :sg-n sg-n
      :ncols ncols :lhs-ids lhs-ids :rhs-ids rhs-ids :mad-by-operands mad-by-operands
      :stores stores :prefetch prefetch-distance :result-dtype (:dtype out-param)
      :dimension-parameters dimension-parameters
+     :dimension-values dimension-values
+     :parameters parameters
      :schedule-parameters schedule-parameters
      :launch launch
      :group-z (some #(when (and (record-kind? "IndexBinding" %)
