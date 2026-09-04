@@ -8,7 +8,8 @@
    This decouples hardware-aware execution planning from backend codegen:
    - Lowering decides phase decomposition, launch params, accumulator count
    - Backend translates SegOp to target code (SIMD, OpenCL, scalar)"
-  (:require [raster.compiler.ir.par :as par]
+  (:require [raster.compiler.core.util :as util]
+            [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.abstract-value :as av]
@@ -282,6 +283,10 @@
      :dtype — element type (:double or :float)"
   [form opts]
   (if (and (program/parallel-program? form) (= :typed-soac (:dialect form)))
+    ;; Every declared value of a TypedSOAC program is a local of the compiled form, even one
+    ;; spelled like a `clojure.core` name (a parameter called `seq`): free-symbol analysis in
+    ;; the lowerings must read it as a scalar operand, never as the core function.
+    (binding [util/*shadowing-locals* (set (keys (:values form)))]
     (let [device-id (or (:target-device opts) :cpu:0)
           dtype (or (:dtype opts) :double)
           ;; The TypedSOAC program remains purely functional, while `:result-storage` gives every
@@ -323,7 +328,11 @@
                     operations (:operations lowered)
                     scheduled-equation
                     (-> equation
-                        (assoc :operations operations)
+                        (assoc :operations operations
+                               ;; The algorithm in physical value names: a logical result that
+                               ;; aliases an earlier destination is spelled as that destination
+                               ;; here, exactly as the scheduled SegOps name it.
+                               :physical-algorithm scheduling-algorithm)
                         (update :provenance assoc :target-dialect :segop)
                         (update :attributes assoc :device device-id)
                         (cond-> (:kernel-graph lowered)
@@ -432,7 +441,7 @@
        :stats {:segops-lowered parallel-equation-count
                :kernel-graphs-lowered kernel-graph-count
                :typed-soac-reused parallel-equation-count
-               :typed-scalar-equations scalar-equation-count}})
+               :typed-scalar-equations scalar-equation-count}}))
     (if-not (form/binding-form? form)
       {:form (build-program form [] [] (:target-device opts) (:dtype opts))
        :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}

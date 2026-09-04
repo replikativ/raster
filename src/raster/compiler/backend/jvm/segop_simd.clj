@@ -972,15 +972,64 @@
           n-sym (gensym "effect_n__")
           j-sym (gensym "effect_i__")
           {:keys [locals effects]} (:scalar-region segmap)
+          ;; Typed locals are materialized as explicit casts; source binder tags inside their
+          ;; initializers (a walker `^double v` over a primitive init) would make the JVM compiler
+          ;; refuse the form, so the tags are dropped here and the casts carry the types.
+          strip-binder-tags
+          (fn [form]
+            (clojure.walk/postwalk
+             (fn [x]
+               (if (and (seq? x) (contains? #{'let* 'loop*} (first x)) (vector? (second x)))
+                 (with-meta
+                   (list* (first x)
+                          (vec (map-indexed (fn [ordinal item]
+                                              (if (and (even? ordinal) (symbol? item)
+                                                       (:tag (meta item)))
+                                                (vary-meta item dissoc :tag)
+                                                item))
+                                            (second x)))
+                          (nnext x))
+                   (meta x))
+                 x))
+             form))
+          materialize-locals
+          (fn [locals body]
+            (if (seq locals)
+              (list 'let*
+                    (vec (mapcat (fn [{:keys [id dtype init]}]
+                                   (let [tag (dtype/scalar-tag-for-dtype dtype)]
+                                     [(with-meta id {:raster.type/tag tag})
+                                      (list tag (strip-binder-tags init))]))
+                                 locals))
+                    body)
+              body))
           effect-statement
-          (fn [{:keys [destination dtype conflict destination-index predicate value]}]
+          (fn effect-statement
+            [{:keys [destination dtype conflict destination-index predicate value] :as effect}]
+            (if-let [{loop-index :index loop-locals :locals loop-effects :effects
+                      :keys [lower extent]} (:loop effect)]
+              (let [loop-n (gensym "effect_loop_n__")]
+                (list 'let* [loop-n (list 'int extent)]
+                      (list 'loop* [loop-index (list 'int lower)]
+                            (list 'if (ix< loop-index loop-n)
+                                  (list 'do
+                                        (materialize-locals
+                                         loop-locals
+                                         (list* 'do (mapv effect-statement loop-effects)))
+                                        (list 'recur
+                                              (list 'clojure.core/unchecked-inc-int loop-index)))
+                                  nil))))
             (let [reduction? (soac-dialect/reducing-scatter-conflict? conflict)
                   destination-dtype (or dtype (when reduction? (:dtype conflict)))
                   scalar-tag (when destination-dtype
                                (dtype/scalar-tag-for-dtype destination-dtype))
+                  ;; The destination is an array: its tag is the primitive-array tag, so the
+                  ;; bytecode compiler emits a typed array store instead of a boxed aastore.
+                  array-tag (when destination-dtype
+                              (dtype/array-tag-for-dtype destination-dtype))
                   destination (if destination-dtype
                                 (with-meta destination
-                                  {:tag scalar-tag :raster.type/tag scalar-tag})
+                                  {:tag array-tag :raster.type/tag array-tag})
                                 destination)
                   value (if scalar-tag (list scalar-tag value) value)
                   store (if reduction?
@@ -988,20 +1037,10 @@
                           (list 'clojure.core/aset destination destination-index value))]
               (if (contains? #{true 1} predicate)
                 store
-                (list 'if predicate store))))
+                (list 'if predicate store)))))
           typed-region-body
           (when (seq effects)
-            (let [statements (mapv effect-statement effects)
-                  body (list* 'do statements)]
-              (if (seq locals)
-                (list 'let*
-                      (vec (mapcat (fn [{:keys [id dtype init]}]
-                                     (let [tag (dtype/scalar-tag-for-dtype dtype)]
-                                       [(with-meta id {:raster.type/tag tag})
-                                        (list tag init)]))
-                                   locals))
-                      body)
-                body)))
+            (materialize-locals locals (list* 'do (mapv effect-statement effects))))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
                 (bc/desugar-invk (or typed-region-body (:lambda segmap))))]

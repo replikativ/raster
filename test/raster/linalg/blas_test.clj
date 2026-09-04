@@ -166,3 +166,13 @@
       (is (== 8.0 (aget C 3)))
       (is (== 20.0 (aget C 12)))
       (is (== 32.0 (aget C 15))))))
+
+(deftest gemm-with-a-zero-contraction-extent-scales-its-output-by-beta
+  ;; BLAS semantics: with k = 0 the product is the zero matrix, so `C := beta·C`; the wrapper
+  ;; skips the library call (MKL rejects a zero leading dimension) but keeps the contract.
+  (let [c (double-array [5.0 6.0])
+        cf (float-array [5.0 6.0])]
+    (blas/dgemm! (double-array 0) (double-array 0) c 1 0 2 1.0 0.0)
+    (blas/dgemm-nt! (float-array 0) (float-array 0) cf 1 0 2 (float 1.0) (float 0.5))
+    (is (= [0.0 0.0] (vec c)))
+    (is (= [2.5 3.0] (mapv double cf)))))

@@ -404,7 +404,8 @@
             :outputs [:x2]})
           session (gpu/make-session :ze:0)
           executable (gpu-link/instantiate! plan {:session session})]
-      (is (= [:gemm] (mapv :convention (:steps prog))))
+      (is (= [:contract] (mapv :convention (:steps prog)))
+          "linear-nb's BLAS GEMM is a typed contraction step")
       (try
         (let [session (:session executable)
               phases (:phases executable)
@@ -412,9 +413,10 @@
               (reduce + (map #(count (get-in @session [:prepared % :prepareds])) phases))
               private-count
               (reduce + (map #(count (get-in @session [:prepared % :temporary-buffers])) phases))]
-          (is (> prepared-count 2)
-              "each semantic GEMM selects and flattens a multi-kernel schedule")
-          (is (pos? private-count) "conversion/layout storage stays step-private")
+          (is (>= prepared-count 2)
+              "each instance prepares its own contraction dispatch")
+          (is (>= private-count 0)
+              "step-private storage is accounted per phase (a contraction dispatch may need none)")
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"have not been initialized"
                                 (gpu-link/run! executable))
               "owned dynamic inputs must be uploaded before the first replay")

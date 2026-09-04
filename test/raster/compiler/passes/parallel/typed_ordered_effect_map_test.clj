@@ -225,3 +225,93 @@
     (is (some #(= "ForLoop" (some-> % class .getSimpleName))
               (:operations kernel-body)))
     (is (= :sequential (get-in kernel-body [:attributes :effect-iteration-order])))))
+
+(def ^:private row-loop-source
+  ;; rms-norm-shaped: per row `r`, an ordered fold over the row whose exit divides the carry, then
+  ;; a counted loop storing every element of the row at `r*feat + i`.
+  '(let* [effect
+          (raster.par/map-void!
+           r rows
+           (let* [^long offset (clojure.core/* r feat)
+                  ^double ms (loop* [i 0 s 0.0]
+                                (if (clojure.core/< i feat)
+                                  (let* [^double v (double (clojure.core/aget
+                                                            x (clojure.core/+ offset i)))]
+                                    (recur (clojure.core/inc i)
+                                           (clojure.core/+ s (clojure.core/* v v))))
+                                  (clojure.core// s (double feat))))]
+             (loop* [i 0]
+               (if (clojure.core/< i feat)
+                 (let* [^float v (float (clojure.core/aget x (clojure.core/+ offset i)))]
+                   (clojure.core/aset out (clojure.core/+ offset i)
+                                      (float (clojure.core/* v ms)))
+                   (recur (clojure.core/inc i)))))))]
+         effect))
+
+(deftest row-store-loops-are-independent-effect-loops
+  (let [result (route/attempt row-loop-source :float {'x :float 'out :float}
+                              {:scalar-types {'rows :long 'feat :long}})
+        program (:program result)
+        algorithm (-> program :equations first :algorithm)
+        equation (first (dialect/equations algorithm))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        {:keys [body-results]} (dialect/lambda-parts lambda)
+        parts (mapv dialect/effect-parts body-results)
+        leaves (dialect/effect-part-leaves parts)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :dtype :float :target-dialect :opencl-portable
+                  :array-types {'x :float 'out :float}
+                  :scalar-types {'rows :long 'feat :long})
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x out rows feat] (:form jvm)))
+        x (float-array [1.0 2.0 3.0 4.0])
+        out (float-array 4)]
+    (testing "the store loop is one effect-loop item whose store is injective across rows"
+      (is (= :typed-soac (get-in result [:stats :route])))
+      (is (= 'effect-map (dialect/operation-kind equation)))
+      (is (= :independent (:iteration-order attributes)))
+      (is (= [true] (mapv :loop parts)))
+      (is (= [:unique] (mapv :conflict leaves)))
+      (is (= (dialect/validate! algorithm) algorithm)))
+    (testing "the scheduled SegMap carries the loop as structured data, not source"
+      (is (nil? (:lambda operation)))
+      (is (some :loop (get-in operation [:scalar-region :effects]))))
+    (testing "the device kernel is a verified KernelBody with a nested loop"
+      (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+      (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
+      (is (str/includes? (:source artifact) "for (")))
+    (testing "the JVM schedule executes the loop"
+      (is (nil? (execute x out 2 2)))
+      (is (= [2.5 5.0 37.5 50.0] (mapv double out)))
+      (is (zero? (get-in jvm [:stats :fallback]))))))
+
+(deftest effect-loops-must-be-closed-over-the-loop-index
+  (let [program (:program (route/attempt row-loop-source :float {'x :float 'out :float}
+                                         {:scalar-types {'rows :long 'feat :long}}))
+        algorithm (-> program :equations first :algorithm)
+        rebound (clojure.walk/postwalk
+                 (fn [form]
+                   (if (and (seq? form) (= 'effect-loop (first form)))
+                     (let [[_ attributes extent [_ _ region]] form]
+                       (list 'effect-loop attributes extent (list 'lambda '[other] region)))
+                     form))
+                 algorithm)]
+    (is (= :typed-soac-effect-loop
+           (try (dialect/validate! rebound) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest explicit-store-emission-refuses-typed-regions
+  (let [program (:program (route/attempt row-loop-source :float {'x :float 'out :float}
+                                         {:scalar-types {'rows :long 'feat :long}}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))]
+    (is (= :explicit-segmap-requires-source-lambda
+           (try (segop-opencl/generate-explicit-segmap-kernel
+                 operation :dtype :float :array-types {'x :float 'out :float}
+                 :scalar-types {'rows :long 'feat :long})
+                nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))

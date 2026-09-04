@@ -178,12 +178,47 @@
             (update store field #(util/subst-syms substitutions %)))
           store [:index :predicate :value]))
 
+(defn- substitute-loop
+  "Apply `substitutions` inside a counted store loop: its extent, its body locals' inits and its
+   stores. The loop index itself is bound by the loop and is never substituted."
+  [substitutions {:keys [index] :as loop}]
+  (let [substitutions (dissoc substitutions index)]
+    (-> loop
+        (update :extent #(util/subst-syms substitutions %))
+        (update :locals (fn [locals]
+                          (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
+                                locals)))
+        (update :stores (fn [stores] (mapv #(substitute-store substitutions %) stores))))))
+
+(defn- region-order
+  "The source order of a region's effects as `[:store i]` / `[:loop j]` entries into its
+   `:stores` and `:loops` vectors. Regions without loops are their stores in order."
+  [{:keys [stores loops order]}]
+  (when (and (nil? order) (seq loops))
+    (throw (ex-info "a region with store loops must carry its source order"
+                    {:reason :raster/bug :loops (count loops) :stores (count stores)})))
+  (or order (mapv (fn [ordinal] [:store ordinal]) (range (count stores)))))
+
+(defn- rename-loop-index
+  "Give a counted store loop the index name `fresh`, renaming its body locals' inits and its
+   stores. Sibling loops that reuse one source index name (`i`) would otherwise share a
+   KernelBody SSA value."
+  [{:keys [index] :as loop} fresh]
+  (let [renames {index fresh}]
+    (-> loop
+        (assoc :index fresh)
+        (update :locals (fn [locals]
+                          (mapv #(update % :init (fn [init] (util/subst-syms renames init)))
+                                locals)))
+        (update :stores (fn [stores] (mapv #(substitute-store renames %) stores))))))
+
 (defn- rebase-region-locals
   "Move a recursively recognized region behind `offset` lexical SSA values.
 
    Every nested scope initially numbers its locals from zero.  Rebasing before composing scopes
-   gives the combined region one deterministic, collision-free SSA namespace."
-  [{:keys [locals stores]} offset]
+   gives the combined region one deterministic, collision-free SSA namespace. Counted store
+   loops keep their own body locals; only their references to the enclosing locals are renamed."
+  [{:keys [locals stores loops] :as region} offset]
   (let [renames (into {}
                       (map-indexed
                        (fn [ordinal {:keys [id]}]
@@ -194,7 +229,99 @@
                          (assoc :id (get renames id))
                          (update :init #(util/subst-syms renames %))))
                    locals)
-     :stores (mapv #(substitute-store renames %) stores)}))
+     :stores (mapv #(substitute-store renames %) stores)
+     :loops (mapv #(substitute-loop renames %) (or loops []))
+     :order (region-order region)}))
+
+(defn- strip-trailing-recur
+  "Remove a counted loop's `(recur (inc i))` from the tail of its body, returning the remaining
+   statements form, or nil when the tail is not that exact step."
+  [form index]
+  (let [step? (fn [x]
+                (and (seq? x) (= 'recur (first x)) (= 2 (count x))
+                     (let [update (strip-index-cast (second x))]
+                       (or (and (seq? update) (= 2 (count update))
+                                (contains? '#{inc clojure.core/inc} (first update))
+                                (= index (strip-index-cast (second update))))
+                           (and (seq? update) (= 3 (count update))
+                                (contains? '#{+ clojure.core/+} (first update))
+                                (= index (strip-index-cast (second update)))
+                                (= 1 (strip-index-cast (nth update 2))))))))]
+    (cond
+      (step? form) '(do)
+      (and (seq? form) (= 'do (first form)) (step? (last form)))
+      (list* 'do (butlast (rest form)))
+      ;; (let* [...] stmt… (recur …)) — the closed-core spelling puts the statements directly
+      ;; in the let body; normalize them into one `do` before the recursive recognition.
+      (and (seq? form) (symbol? (first form)) (form/let-head? (first form)) (<= 3 (count form)))
+      (let [[head bindings & statements] form
+            inner (if (= 1 (count statements))
+                    (first statements)
+                    (list* 'do statements))]
+        (when-let [stripped (strip-trailing-recur inner index)]
+          (list head bindings stripped)))
+      :else nil)))
+
+(declare store-region)
+
+(defn- counted-store-loop
+  "Recognize a counted loop of stores inside an effect-map body.
+
+   Accepted shapes are the unexpanded `(dotimes [i n] …)` and its closed-core form
+   `(loop* [i 0] (if (< i n) (do … (recur (inc i)))))`. The body is recognized by `store-region`
+   with the map index as its context; nested store loops decline. The loop's body locals live in
+   their own SSA namespace so they cannot collide with the enclosing region's locals."
+  [form index]
+  (let [[head bindings & body] (when (seq? form) form)
+        counted (cond
+                  (and (contains? '#{dotimes clojure.core/dotimes} head)
+                       (vector? bindings) (= 2 (count bindings)) (symbol? (first bindings)))
+                  {:index (first bindings) :lower 0 :extent (strip-index-cast (second bindings))
+                   :body (list* 'do body)}
+
+                  (and (symbol? head) (form/loop-head? head)
+                       (vector? bindings) (= 2 (count bindings))
+                       (symbol? (first bindings))
+                       (integer? (second bindings)) (<= 0 (second bindings))
+                       (= 1 (count body)))
+                  (let [[loop-index lower] bindings
+                        conditional (first body)]
+                    (when (and (seq? conditional)
+                               (contains? '#{if clojure.core/if} (first conditional))
+                               (<= 3 (count conditional) 4)
+                               (nil? (nth conditional 3 nil)))
+                      (let [[_ test then] conditional]
+                        (when (and (seq? test) (= 3 (count test))
+                                   (contains? '#{< clojure.core/<} (first test))
+                                   (= loop-index (strip-index-cast (second test))))
+                          (when-let [statements (strip-trailing-recur then loop-index)]
+                            {:index loop-index :lower lower
+                             :extent (strip-index-cast (nth test 2))
+                             :body statements}))))))]
+    (when (and counted
+               (not= (:index counted) index)
+               (not (contains? (util/free-syms (:extent counted)) (:index counted))))
+      (when-let [region (store-region (:body counted) index)]
+        (when (and (seq (:stores region)) (empty? (:loops region)))
+          ;; The loop index and the body locals get their own names: a source loop index may
+          ;; shadow a captured scalar of the enclosing region, and the region's SSA namespace
+          ;; must not confuse the two.
+          (let [loop-index (symbol (str "rstr_loop_index_" (name (:index counted))))
+                renames (into {(:index counted) loop-index}
+                              (map (fn [{:keys [id]}]
+                                     [id (symbol (str "rstr_loop_" (name id)))])
+                                   (:locals region)))]
+            {:locals []
+             :stores []
+             :loops [{:index loop-index
+                      :lower (:lower counted)
+                      :extent (:extent counted)
+                      :locals (mapv (fn [{:keys [id] :as local}]
+                                      (-> local (assoc :id (get renames id))
+                                          (update :init #(util/subst-syms renames %))))
+                                    (:locals region))
+                      :stores (mapv #(substitute-store renames %) (:stores region))}]
+             :order [[:loop 0]]}))))))
 
 (defn- store-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
@@ -232,7 +359,9 @@
                                                (util/subst-syms substitutions init))))
                                (:locals nested))
                  :stores (mapv #(substitute-store substitutions %)
-                               (:stores nested))}))))))
+                               (:stores nested))
+                 :loops (mapv #(substitute-loop substitutions %) (:loops nested))
+                 :order (region-order nested)}))))))
 
     (and (seq? body) (= 'do (first body)))
     (let [expressions (vec (rest body))]
@@ -241,7 +370,20 @@
         (let [groups (mapv #(store-region % index) expressions)]
           (when (and (seq groups) (every? some? groups)
                      (every? (comp empty? :locals) groups))
-            {:locals [] :stores (vec (mapcat :stores groups))}))))
+            (reduce (fn [{:keys [stores loops order]} group]
+                      (let [store-offset (count stores)
+                            loop-offset (count loops)]
+                        {:locals []
+                         :stores (into stores (:stores group))
+                         :loops (into loops (:loops group))
+                         :order (into order
+                                      (map (fn [[kind ordinal]]
+                                             [kind (+ ordinal (if (= :store kind)
+                                                                store-offset
+                                                                loop-offset))]))
+                                      (region-order group))}))
+                    {:locals [] :stores [] :loops [] :order []}
+                    groups)))))
 
     (and (seq? body)
          (contains? #{'if 'clojure.core/if} (first body))
@@ -267,6 +409,10 @@
                                value (:value (first stores))]
                            (if (seq bindings) (list 'let* bindings value) value)))]
       (cond
+        ;; Store loops under a branch would need predicated loop regions; decline for now.
+        (or (seq (:loops then-region)) (seq (:loops else-region)))
+        nil
+
         ;; Both branches store once to the same destination and at least one branch owns
         ;; locals: one predicated store of a value-if over the two scoped branch values.
         (and then-region else-region aligned?
@@ -315,6 +461,11 @@
     (and (seq? body) (= 'case* (first body)))
     (when-let [conditional (integer-case-chain body)]
       (store-region conditional index))
+
+    (and (seq? body) (symbol? (first body))
+         (or (form/loop-head? (first body))
+             (contains? '#{dotimes clojure.core/dotimes} (first body))))
+    (counted-store-loop body index)
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
@@ -389,7 +540,7 @@
    Typed locals are evaluated before the effect sequence and may deliberately snapshot destination
    state. Direct reads in coordinates, predicates, or values would instead make cross-work-item
    ordering observable and require a stronger schedule than an effect map."
-  [locals stores]
+  [locals stores & [loop-expressions]]
   (let [destinations (set (map :out stores))]
     (and (seq stores)
          (every? (fn [{:keys [index predicate value]}]
@@ -397,9 +548,55 @@
                             destinations
                             (par/collect-aget-arrays (list 'do index predicate value)))))
                  stores)
+         ;; A region local is a snapshot only within its own work item: another item's store
+         ;; may already be visible when it is taken, so a local that reads a destination makes
+         ;; the cross-item order observable. Loop-body locals and extents are re-evaluated
+         ;; inside the loop and are checked for the same reason.
+         (empty? (set/intersection destinations
+                                   (par/collect-aget-arrays
+                                    (list* 'do (concat (map :init locals) loop-expressions)))))
          ;; Locals are an ordered pre-effect SSA spine, so their reads are snapshots rather than
          ;; sibling effect dependencies. Keep the argument explicit for this legality boundary.
          (vector? locals))))
+
+(defn- binder-array-types
+  "Element dtypes of the arrays a source `let` binds, read from the walker's array tags on the
+   binders (`floats`, `doubles`, …). A use-site symbol carries no metadata, so an internal
+   allocation such as an attention output would otherwise have no declared dtype and every map
+   writing it would decline. Declared `array-types` take precedence.
+
+   Float-family tags follow the kernel dtype exactly as `derive-param-types` maps the
+   parameters: a kernel compiled at `:float` reads and writes float buffers throughout, so a
+   double-declared allocation inside it is a float buffer of that kernel, not a second precision."
+  [pairs array-types dtype]
+  (let [kernel-dtype (some-> dtype dtype/canon)
+        policy (fn [element]
+                 (if (and kernel-dtype (dtype/fp-dtype? kernel-dtype)
+                          (contains? #{:float :double} element))
+                   kernel-dtype
+                   element))]
+    (merge
+     (into {}
+           (keep (fn [[binder init]]
+                   (when (symbol? binder)
+                     (when-let [element (some-> (types/sym-type-tag binder)
+                                                dtype/dtype-for-array-tag dtype/canon)]
+                       ;; Only an allocation that does not name its element type (`alloc-like`,
+                       ;; `zeros-like`, `similar`) follows the policy. `float-array` states its
+                       ;; element type, and a parallel form's result binder carries the form's
+                       ;; own explicit dtype (`pmap … double`); retyping either would contradict
+                       ;; a declared fact.
+                       [binder (let [operation (when (seq? init) (descriptor/semantic-op init))
+                                     named-element?
+                                     (or (contains? descriptor/alloc-sym->array-tag operation)
+                                         (contains? descriptor/alloc-sym->array-tag
+                                                    (some-> operation name clojure.core/symbol)))]
+                                 (if (and operation (descriptor/alloc-op? operation)
+                                          (not named-element?))
+                                   (policy element)
+                                   element))]))))
+           pairs)
+     (or array-types {}))))
 
 (defn- destination-dtype
   [array-types destination]
@@ -426,113 +623,208 @@
       :scalars (mapv #(-> % (assoc :value (:sym %)) (dissoc :sym)) (:scalars epilogue))
       :result-dtype (or (:dtype epilogue) :float)})))
 
+(defn- strip-index-casts
+  [expression]
+  (util/postwalk-preserving-meta strip-index-cast expression))
+
+(defn- inline-region-locals
+  "Substitute region-local SSA ids by their initializers until the expression is closed."
+  [expression locals]
+  (let [substitutions (into {} (map (juxt :id :init)) locals)]
+    (loop [expression expression remaining (inc (count locals))]
+      (let [inlined (util/subst-syms substitutions expression)]
+        (if (or (= inlined expression) (zero? remaining))
+          inlined
+          (recur inlined (dec remaining)))))))
+
+(defn- row-major-loop-index?
+  "Whether a store index inside a counted loop is `r*K + i` (either operand order) with `K` the
+   loop extent, `r` the map index and `i` the loop index: the row-major layout in which the
+   map items own disjoint rows, so the writes are injective across work items."
+  [expression loop-index map-index extent]
+  (let [expression (strip-index-casts expression)
+        extent (strip-index-casts extent)
+        ;; Rows are disjoint only when every item's row has the same width: an extent that
+        ;; varies with the map index (`(- n r)`) makes consecutive rows overlap.
+        invariant-extent? (not (contains? (util/free-syms extent) map-index))
+        row-offset? (fn [form]
+                      (and (seq? form) (= 3 (count form))
+                           (contains? '#{* clojure.core/*} (first form))
+                           (= #{map-index extent} (set (rest form)))
+                           (not= map-index extent)))]
+    (and invariant-extent?
+         (seq? expression) (= 3 (count expression))
+         (contains? '#{+ clojure.core/+} (first expression))
+         (let [[_ left right] expression]
+           (or (and (= left loop-index) (row-offset? right))
+               (and (= right loop-index) (row-offset? left)))))))
+
+(defn- effect-leaves
+  "The store effects of a description, descending into store loops."
+  [effects]
+  (vec (mapcat (fn [effect]
+                 (if-let [loop (:loop effect)]
+                   (effect-leaves (:effects loop))
+                   [effect]))
+               effects)))
+
 (defn- write-region-description
-  [id symbol index extent {:keys [locals stores]} elem-type
+  [id symbol index extent {:keys [locals stores loops] :as region} elem-type
    & {:keys [host-return array-types] :or {host-return :effect array-types {}}}]
-  (when (and (seq stores) (or (= :effect host-return) (= 1 (count stores))))
-    (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
-          dense-pointwise? (every? #(and (= index (:index %)) (nil? (:reduction-op %))) stores)
-          pointwise? (and dense-pointwise? (independent-stores? locals stores))
-          stores (if pointwise?
-                   (mapv (fn [{:keys [out predicate value] :as store}]
-                           (assoc store :value
-                                  (if (contains? #{true 1} predicate)
-                                    value
-                                    ;; A guarded dense write preserves its caller-owned
-                                    ;; destination. Making that read explicit yields an ordinary
-                                    ;; inout map instead of a hidden conditional effect.
-                                    (list 'if predicate value
-                                          (list 'clojure.core/aget out index)))))
-                         stores)
-                   stores)
-          stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
-                         (let [destination-type (some-> (destination-dtype array-types out)
-                                                       dtype/canon)
-                               contract (cond
-                                          (= :unique conflict) :unique
-                                          reduction-op
-                                          (when destination-type
-                                            (dialect/reducing-scatter-conflict
-                                             reduction-op destination-type))
-                                          (= index (:index store)) :unique
-                                          :else :ordered)]
-                           (assoc store :effect-conflict contract
-                                        :destination-dtype destination-type)))
-                       stores)
-          ;; One physical destination has one cross-item contract. If any ordinary store may
-          ;; collide, its otherwise-unique siblings must join the same sequential contract. A
-          ;; reduction mixed with an ordered overwrite remains unsupported: those are distinct
-          ;; operations and must not be blurred into one conflict certificate.
-          stores (reduce (fn [current [_ grouped]]
-                           (let [contracts (set (map :effect-conflict grouped))]
-                             (if (and (contains? contracts :ordered)
-                                      (set/subset? contracts #{:unique :ordered}))
-                               (mapv (fn [store]
-                                       (if (= (:out (first grouped)) (:out store))
-                                         (assoc store :effect-conflict :ordered)
-                                         store))
-                                     current)
-                               current)))
-                         stores (group-by :out stores))
-          effect-contracts (mapv :effect-conflict stores)
-          uniform-conflict (when (= 1 (count (set effect-contracts)))
-                             (first effect-contracts))
-          scatter? (and (not pointwise?)
-                        (independent-stores? locals stores)
-                        (or (= :unique uniform-conflict)
-                            (dialect/reducing-scatter-conflict? uniform-conflict)))
-          ordered? (and (not dense-pointwise?) (not scatter?) (= :effect host-return)
-                        (every? some? effect-contracts)
-                        (every? (fn [[_ grouped]]
-                                  (= 1 (count (set (map :effect-conflict grouped)))))
-                                (group-by :out stores)))
-          iteration-order (when ordered?
-                            (if (or (some #(= :ordered (:effect-conflict %)) stores)
-                                    (not (ordered-effects-safe? locals stores)))
-                              :sequential
-                              :independent))
-          destinations (if ordered?
-                         (vec (distinct (map :out stores)))
-                         (mapv :out stores))
-          values (mapv :value stores)
-          write-indices (mapv :index stores)
-          predicates (mapv :predicate stores)
-          analysis-values (concat (map :init locals) write-indices predicates values)
-          io (update (extract-io (list* 'do analysis-values) index destinations)
-                     :scalars set/difference (set (map :id locals)))
-          results (if (= :buffer host-return)
-                    [symbol]
-                    (mapv #(effect-result-id id %) (range (count destinations))))
-          result-dtypes (mapv #(some-> (destination-dtype array-types %) dtype/canon)
-                              destinations)]
-      (when (or pointwise? scatter? (and ordered? (every? some? result-dtypes)))
-        (merge {:kind (cond pointwise? :map scatter? :scatter :else :effect-map)
-                :id id :sym symbol :index index :extent extent
-                :results results :locals locals :bodies values :casts (mapv :cast stores)
-                :write-indices write-indices :predicates predicates
-                :conflict (when scatter? uniform-conflict)
-                :effects (when ordered?
-                           (mapv #(select-keys % [:out :index :predicate :value :cast
-                                                  :effect-conflict])
-                                 stores))
-                :iteration-order iteration-order
-                :result-dtypes (when ordered? result-dtypes)
-                :effect-only? (= :effect host-return)
-                :host-binding symbol :elem-type elem-type
-                :result-storage
-                (mapv (fn [destination]
-                        {:destination destination
-                         :access (if (or scatter?
-                                         (and ordered?
-                                              (some #(and (= destination (:out %))
-                                                          (dialect/reducing-scatter-conflict?
-                                                           (:effect-conflict %)))
-                                                    stores))
-                                         (contains? (:inputs io) destination))
-                                   :read-write :write)
-                         :host-return host-return})
-                      destinations)}
-               io)))))
+  (let [order (region-order region)
+        loops (vec (map-indexed (fn [ordinal loop]
+                                  (rename-loop-index
+                                   loop (clojure.core/symbol (str "rstr_loop_index_" ordinal))))
+                                (or loops [])))]
+    (when (and (or (seq stores) (seq loops))
+               (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
+               ;; A destination written both directly and inside a store loop would lose the work
+               ;; item's source order between the two kinds of write; such regions stay unsupported.
+               (empty? (set/intersection (set (map :out stores))
+                                         (set (mapcat #(map :out (:stores %)) loops)))))
+      (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
+            loop-stores
+            (vec (mapcat (fn [ordinal {loop-index :index loop-extent :extent
+                                       loop-locals :locals loop-store-list :stores}]
+                           (map (fn [store]
+                                  (let [store (merge {:index index :predicate 1} store)]
+                                    (assoc store
+                                           :loop ordinal
+                                           :loop-injective?
+                                           (row-major-loop-index?
+                                            (inline-region-locals (:index store)
+                                                                  (concat locals loop-locals))
+                                            loop-index index loop-extent))))
+                                loop-store-list))
+                         (range) loops))
+            dense-pointwise? (and (empty? loops)
+                                  (every? #(and (= index (:index %)) (nil? (:reduction-op %)))
+                                          stores))
+            pointwise? (and dense-pointwise? (independent-stores? locals stores))
+            stores (if pointwise?
+                     (mapv (fn [{:keys [out predicate value] :as store}]
+                             (assoc store :value
+                                    (if (contains? #{true 1} predicate)
+                                      value
+                                      ;; A guarded dense write preserves its caller-owned
+                                      ;; destination. Making that read explicit yields an ordinary
+                                      ;; inout map instead of a hidden conditional effect.
+                                      (list 'if predicate value
+                                            (list 'clojure.core/aget out index)))))
+                           stores)
+                     stores)
+            all-stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
+                               (let [destination-type (some-> (destination-dtype array-types out)
+                                                             dtype/canon)
+                                     contract (cond
+                                                (= :unique conflict) :unique
+                                                reduction-op
+                                                (when destination-type
+                                                  (dialect/reducing-scatter-conflict
+                                                   reduction-op destination-type))
+                                                (:loop-injective? store) :unique
+                                                (and (nil? (:loop store)) (= index (:index store)))
+                                                :unique
+                                                :else :ordered)]
+                                 (assoc store :effect-conflict contract
+                                              :destination-dtype destination-type)))
+                             (into stores loop-stores))
+            ;; One physical destination has one cross-item contract. If any ordinary store may
+            ;; collide, its otherwise-unique siblings must join the same sequential contract. A
+            ;; reduction mixed with an ordered overwrite remains unsupported: those are distinct
+            ;; operations and must not be blurred into one conflict certificate.
+            all-stores (reduce (fn [current [_ grouped]]
+                                 (let [contracts (set (map :effect-conflict grouped))]
+                                   (if (and (contains? contracts :ordered)
+                                            (set/subset? contracts #{:unique :ordered}))
+                                     (mapv (fn [store]
+                                             (if (= (:out (first grouped)) (:out store))
+                                               (assoc store :effect-conflict :ordered)
+                                               store))
+                                           current)
+                                     current)))
+                               all-stores (group-by :out all-stores))
+            stores (vec (remove :loop all-stores))
+            effect-contracts (mapv :effect-conflict all-stores)
+            uniform-conflict (when (= 1 (count (set effect-contracts)))
+                               (first effect-contracts))
+            scatter? (and (not pointwise?)
+                          (empty? loops)
+                          (independent-stores? locals stores)
+                          (or (= :unique uniform-conflict)
+                              (dialect/reducing-scatter-conflict? uniform-conflict)))
+            ordered? (and (not dense-pointwise?) (not scatter?) (= :effect host-return)
+                          (every? some? effect-contracts)
+                          (every? (fn [[_ grouped]]
+                                    (= 1 (count (set (map :effect-conflict grouped)))))
+                                  (group-by :out all-stores)))
+            all-locals (vec (concat locals (mapcat :locals loops)))
+            iteration-order (when ordered?
+                              (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
+                                      (not (ordered-effects-safe?
+                                            locals all-stores
+                                            (concat (map :extent loops)
+                                                    (map :init (mapcat :locals loops))))))
+                                :sequential
+                                :independent))
+            destinations (if ordered?
+                           (vec (distinct (map :out all-stores)))
+                           (mapv :out stores))
+            values (mapv :value all-stores)
+            write-indices (mapv :index all-stores)
+            predicates (mapv :predicate all-stores)
+            analysis-values (concat (map :init all-locals) (map :extent loops)
+                                    write-indices predicates values)
+            io (update (extract-io (list* 'do analysis-values) index destinations)
+                       :scalars set/difference (set (map :id all-locals))
+                       (set (map :index loops)))
+            results (if (= :buffer host-return)
+                      [symbol]
+                      (mapv #(effect-result-id id %) (range (count destinations))))
+            result-dtypes (mapv #(some-> (destination-dtype array-types %) dtype/canon)
+                                destinations)
+            store-effect (fn [store]
+                           (select-keys store [:out :index :predicate :value :cast
+                                               :effect-conflict]))
+            loop-effects (mapv (fn [ordinal {loop-index :index loop-locals :locals
+                                             :keys [lower extent]}]
+                                 {:loop {:index loop-index :lower lower :extent extent
+                                         :locals loop-locals
+                                         :effects (mapv store-effect
+                                                        (filter #(= ordinal (:loop %))
+                                                                all-stores))}})
+                               (range) loops)
+            ;; Effects keep the region's source order across direct stores and loops.
+            ordered-effects (mapv (fn [[kind ordinal]]
+                                    (if (= :store kind)
+                                      (store-effect (nth stores ordinal))
+                                      (nth loop-effects ordinal)))
+                                  order)]
+        (when (or pointwise? scatter? (and ordered? (every? some? result-dtypes)))
+          (merge {:kind (cond pointwise? :map scatter? :scatter :else :effect-map)
+                  :id id :sym symbol :index index :extent extent
+                  :results results :locals locals :bodies values :casts (mapv :cast all-stores)
+                  :write-indices write-indices :predicates predicates
+                  :conflict (when scatter? uniform-conflict)
+                  :effects (when ordered? ordered-effects)
+                  :iteration-order iteration-order
+                  :result-dtypes (when ordered? result-dtypes)
+                  :effect-only? (= :effect host-return)
+                  :host-binding symbol :elem-type elem-type
+                  :result-storage
+                  (mapv (fn [destination]
+                          {:destination destination
+                           :access (if (or scatter?
+                                           (and ordered?
+                                                (some #(and (= destination (:out %))
+                                                            (dialect/reducing-scatter-conflict?
+                                                             (:effect-conflict %)))
+                                                      all-stores))
+                                           (contains? (:inputs io) destination))
+                                     :read-write :write)
+                           :host-return host-return})
+                        destinations)}
+                 io))))))
 
 (defn- reducing-scatter-description
   [id symbol out values indices extent operator default-dtype]
@@ -818,8 +1110,14 @@
 
     (and (seq? expression) (= 'raster.par/contract (first expression)))
     (let [facts (contraction-facts/contraction-facts
-                 expression :dtype (or (:raster.type/elem-type (meta expression))
-                                       default-dtype :double))
+                 expression
+                 ;; A contraction's element dtype is the declared dtype of the array it writes.
+                 ;; The form's elem-type stamp is the compile's dtype policy, which a hard-typed
+                 ;; double kernel compiled under a float policy does not follow; the program-wide
+                 ;; dtype is only the last resort when nothing declares it.
+                 :dtype (or (some-> (get array-types (second expression)) dtype/canon)
+                            (:raster.type/elem-type (meta expression))
+                            default-dtype :double))
           {:keys [free-axes contract-axes out opts]} facts
           epilogue (:epilogue facts)
           result-transform (typed-result-transform epilogue)
@@ -833,6 +1131,13 @@
                  ;; conversions are not scalar fold syntax. Keep them on the certified
                  ;; contraction route until TypedSOAC represents those facts explicitly.
                  (empty? (apply dissoc opts [:init :combine :algebra :epilogue]))
+                 ;; The contraction's element dtype is the dtype of its operands. A double
+                 ;; product over arrays declared float (a hard-typed double function compiled
+                 ;; under a float policy) has no single typed kernel; it stays a host call.
+                 (every? (fn [{:keys [sym]}]
+                           (let [declared (some-> (get array-types sym) dtype/canon)]
+                             (or (nil? declared) (= declared (dtype/canon (:dtype facts))))))
+                         (:operands facts))
                  (or (nil? epilogue) (dialect/result-transform? result-transform))
                  (reduction/scalar? (:reduction facts)))
         (let [product (:reduction facts)
@@ -977,12 +1282,131 @@
           (cond-> (meta expression) scatter (assoc ::host-return :buffer))))
       expression)))
 
-(defn normalize-source
-  "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
+(defn- canonicalize-blas-gemm
+  "Express a devirtualized BLAS GEMM call as the explicit contraction it computes.
 
-   TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
-   This normalization inserts an ordinary typed scalar binding immediately before its operation,
-   so the same expression remains visible to JVM materialization and runtime specialization."
+   `(dgemm! A B C m k n alpha beta)` is `C[m,n] = alpha·A·B + beta·C` over row-major operands;
+   the `-tn!`/`-nt!` variants store `A` as `[k,m]` / `B` as `[n,k]`. With `beta = 0` the call
+   is the pure contraction `(raster.par/contract C [[i m] [j n]] [[l k]] (* A[i,l] B[l,j]))`
+   scaled by `alpha`, and the typed route can schedule it like any contraction instead of
+   leaving the whole block on the host because one binding is an opaque BLAS effect. A non-zero
+   `beta` reads the destination inside its own epilogue and stays a host call for now."
+  [ordinal expression]
+  (let [variant (when (and (seq? expression) (= '.invk (first expression)))
+                  (get descriptor/blas-gemm-ops (:raster.op/original (meta expression))))
+        arguments (when variant (vec (drop 2 expression)))
+        [A B C m k n alpha beta] arguments
+        beta-literal (when variant (descriptor/gemm-scalar-literal beta))
+        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))]
+    (if (and variant (= 8 (count arguments))
+             (symbol? A) (symbol? B) (symbol? C)
+             (= 0.0 beta-literal))
+      (let [i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
+            j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
+            l (clojure.core/symbol (str "rstr_gemm_l_" ordinal))
+            [m k n] (map descriptor/unwrap-int-cast [m k n])
+            a-index (case variant
+                      (:nn :nt) (list 'clojure.core/+ (list 'clojure.core/* i k) l)
+                      :tn (list 'clojure.core/+ (list 'clojure.core/* l m) i))
+            b-index (case variant
+                      (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
+                      :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l))
+            elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                              dtype/dtype-for-array-tag dtype/canon)
+            ;; The walker stamps every arithmetic form with its result dtype; the emitted loads
+            ;; and product carry the same stamp so scalar lowering reads the type instead of
+            ;; guessing it.
+            scalar-tag (some-> elem-type dtype/scalar-tag-for-dtype)
+            typed (fn [form]
+                    (if scalar-tag
+                      (with-meta form {:raster.type/tag scalar-tag :tag scalar-tag})
+                      form))
+            product (typed (list 'clojure.core/*
+                                 (typed (list 'clojure.core/aget A a-index))
+                                 (typed (list 'clojure.core/aget B b-index))))
+            ;; `alpha` arrives as `(oftype witness value)` from the source spelling; the scalar
+            ;; factor is its value, not the type witness array.
+            alpha-value (cond
+                          ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
+                          ;; it denotes, not an integer literal that would mistype the product.
+                          (some? alpha-literal) alpha-literal
+                          (and (seq? alpha)
+                               (= 'raster.numeric/oftype (descriptor/semantic-op alpha))
+                               (= 2 (count (descriptor/call-args alpha))))
+                          (second (descriptor/call-args alpha))
+                          :else alpha)
+            body (if (= 1.0 alpha-literal)
+                   product
+                   (typed (list 'clojure.core/* alpha-value product)))]
+        (with-meta (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+          (cond-> {:raster.op/original (:raster.op/original (meta expression))}
+            elem-type (assoc :raster.type/elem-type elem-type))))
+      expression)))
+
+(defn- source-shadowing-locals
+  "The symbols that are locals of the analyzed source even when they collide with a
+   `clojure.core` name: the let's own binders and the declared parameters. `util/free-syms`
+   would otherwise read a parameter named `seq` or `count` as the core function and drop it
+   from every capture set, leaving a kernel that references an unbound scalar."
+  [source & type-maps]
+  (let [[_ bindings] (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                       source)]
+    (into (set (filter symbol? (take-nth 2 bindings)))
+          (mapcat keys type-maps))))
+
+(declare alength-array)
+
+(def ^:dynamic ^:private *declared-kinds*
+  "Declared value kinds visible to `normalize-source`: `{:arrays #{sym} :scalars #{sym}}`."
+  {:arrays #{} :scalars #{}})
+
+(defn- length-expression?
+  "A syntactic array-length operand: a scalar value id, an integer, or integer arithmetic over
+   them. A bare symbol counts only when it is positively a scalar (declared, or carrying an
+   integral scalar tag): `(float-array x)` with an array `x` is a copy constructor, and a symbol
+   of unknown kind is not a length either."
+  [expression]
+  (or (and (symbol? expression)
+           (not (contains? (:arrays *declared-kinds*) expression))
+           (or (contains? (:scalars *declared-kinds*) expression)
+               (contains? #{:long :int}
+                          (some-> (types/sym-type-tag expression) dtype/dtype-for-scalar-tag
+                                  dtype/canon))))
+      (integer? expression)
+      (and (seq? expression)
+           (contains? '#{* + - quot clojure.core/* clojure.core/+ clojure.core/- clojure.core/quot
+                         long int clojure.core/long clojure.core/int}
+                      (first expression))
+           (every? length-expression? (rest expression)))))
+
+(defn- allocation-length
+  "The length expression an allocation binding declares, or nil.
+
+   `(float-array n)` and `(zeros-like a n)` allocate `n` elements; `(zeros-like a)` allocates
+   `(alength a)`. Recording this lets `(alength y)` over a local allocation resolve to the same
+   extent id as every other use of `n`, instead of each `alength` minting a fresh compound
+   extent that then contradicts the buffer's shape elsewhere in the program."
+  [expression]
+  (when (and (seq? expression) (descriptor/alloc-op? (descriptor/semantic-op expression)))
+    (let [operation (descriptor/semantic-op expression)
+          arguments (vec (descriptor/call-args expression))
+          constructor? (or (contains? descriptor/alloc-sym->array-tag operation)
+                           (contains? descriptor/alloc-sym->array-tag
+                                      (some-> operation name clojure.core/symbol)))]
+      (cond
+        (and constructor? (= 1 (count arguments)) (length-expression? (first arguments)))
+        (first arguments)
+
+        (and (not constructor?) (= 2 (count arguments)) (symbol? (first arguments))
+             (length-expression? (second arguments)))
+        (second arguments)
+
+        (and (not constructor?) (= 1 (count arguments)) (symbol? (first arguments)))
+        (list 'clojure.core/alength (first arguments))
+
+        :else nil))))
+
+(defn- normalize-source*
   [source]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
@@ -995,10 +1419,80 @@
             pairs (vec (partition 2 bindings))
             {:keys [normalized]}
             (reduce
-             (fn [{:keys [compound-extents] :as state} [ordinal [symbol expression]]]
-               (let [expression (canonicalize-strided-indexed-operation ordinal expression)
+             (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids]
+                   :as state}
+                  [ordinal [symbol expression]]]
+               (let [expression (->> expression
+                                     (canonicalize-strided-indexed-operation ordinal)
+                                     (canonicalize-blas-gemm ordinal))
+                     ;; Host scalar identities: a binding that renames a scalar, or recomputes
+                     ;; a pure scalar expression an earlier binding already computed, denotes
+                     ;; that earlier value. Extents are compared in these canonical names so
+                     ;; `(* seq dff)` and `(* n1 n2)` with `n1 = seq`, `n2 = dff` are one size.
+                     canonical-scalar (fn [form]
+                                        (util/subst-syms scalar-aliases (strip-index-casts form)))
+                     ;; `(long x)` of a floating scalar is a conversion, not a renaming.
+                     floating-cast? (and (seq? expression) (= 2 (count expression))
+                                         (contains? '#{long int clojure.core/long clojure.core/int}
+                                                    (first expression))
+                                         (symbol? (second expression))
+                                         (some-> (types/sym-type-tag (second expression))
+                                                 dtype/dtype-for-scalar-tag dtype/fp-dtype?))
+                     scalar-form (when-not (or (parallel-extent expression)
+                                               (allocation-length expression)
+                                               (par/par-form? expression)
+                                               floating-cast?)
+                                   (canonical-scalar expression))
+                     ;; A recomputed scalar denotes an earlier one only when nothing between
+                     ;; them can have changed its value: it reads no array (a kernel in between
+                     ;; may write one), or it is an array length, which no kernel changes.
+                     stable-scalar? (and (seq? scalar-form)
+                                         (provably-pure-scalar? scalar-form)
+                                         (or (empty? (par/collect-aget-arrays scalar-form))
+                                             (some? (alength-array scalar-form))))
+                     state (cond
+                             (and (symbol? scalar-form) (not= scalar-form symbol))
+                             (do
+                               ;; the alias inherits its target's declared kind
+                               (when (contains? (:scalars *declared-kinds*) scalar-form)
+                                 (set! *declared-kinds*
+                                       (update *declared-kinds* :scalars conj symbol)))
+                               (when (contains? (:arrays *declared-kinds*) scalar-form)
+                                 (set! *declared-kinds*
+                                       (update *declared-kinds* :arrays conj symbol)))
+                               (assoc-in state [:scalar-aliases symbol] scalar-form))
+
+                             stable-scalar?
+                             (if-let [earlier (get pure-scalar-ids scalar-form)]
+                               (assoc-in state [:scalar-aliases symbol] earlier)
+                               (assoc-in state [:pure-scalar-ids scalar-form] symbol))
+
+                             :else state)
+                     scalar-aliases (:scalar-aliases state)
                      extent (parallel-extent expression)
-                     canonical-extent (some-> extent descriptor/unwrap-int-cast)]
+                     ;; `(alength y)` over a local allocation is the allocation's declared
+                     ;; length; follow renamed allocations to their length as well.
+                     resolve-length (fn resolve-length [extent seen]
+                                      (let [array (alength-array extent)]
+                                        (if (and array (contains? allocation-lengths array)
+                                                 (not (contains? seen array)))
+                                          (resolve-length (get allocation-lengths array)
+                                                          (conj seen array))
+                                          extent)))
+                     canonical-extent (some-> extent
+                                              (resolve-length #{})
+                                              (->> (util/subst-syms scalar-aliases))
+                                              descriptor/unwrap-int-cast)
+                     state (if-let [length (allocation-length expression)]
+                             (assoc-in state [:allocation-lengths symbol]
+                                       (->> (resolve-length length #{})
+                                            (util/subst-syms scalar-aliases)
+                                            descriptor/unwrap-int-cast))
+                             (if (and (symbol? expression)
+                                      (contains? allocation-lengths expression))
+                               (assoc-in state [:allocation-lengths symbol]
+                                         (get allocation-lengths expression))
+                               state))]
                  (cond
                    (nil? extent)
                    (update state :normalized conj [symbol expression])
@@ -1028,7 +1522,8 @@
 
                    :else
                    (update state :normalized conj [symbol expression]))))
-             {:normalized [] :compound-extents {}}
+             {:normalized [] :compound-extents {} :allocation-lengths {}
+              :scalar-aliases {} :pure-scalar-ids {}}
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
       source)))
@@ -1140,12 +1635,24 @@
                   (descriptor/alloc-op? (descriptor/semantic-op expression)))))))
 
 (defn- physical-output-symbols
+  "Every buffer some operation writes, closed under host renamings: a binding that merely
+   renames a buffer (`out y`) shares its physical identity, so a write through the alias is a
+   write to the allocation it names and that allocation is generated scaffolding as well."
   [descriptions]
-  (reduce set/union #{}
-          (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
-                                 :product-reduce :segmented-fold-map :scan} (:kind %))
-                  (:outputs %) #{})
-               descriptions)))
+  (let [written (reduce set/union #{}
+                        (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce
+                                               :segmented-reduce :product-reduce
+                                               :segmented-fold-map :scan} (:kind %))
+                                (:outputs %) #{})
+                             descriptions))
+        renamings (keep #(when (and (= :scalar (:kind %)) (symbol? (:expr %)))
+                           [(:sym %) (:expr %)])
+                        descriptions)]
+    (loop [outputs written]
+      (let [closed (into outputs (keep (fn [[alias source]]
+                                         (when (contains? outputs alias) source))
+                                       renamings))]
+        (if (= closed outputs) outputs (recur closed))))))
 
 (defn- contains-parallel-form?
   [expression]
@@ -1172,7 +1679,7 @@
                      (every? (fn [{:keys [effect-conflict]}]
                                (or (contains? #{:unique :ordered} effect-conflict)
                                    (dialect/reducing-scatter-conflict? effect-conflict)))
-                             (:effects description)))
+                             (effect-leaves (:effects description))))
     :stencil (and (= 1 (count (:result-storage description)))
                   (symbol? (get-in description [:result-storage 0 :destination])))
     :reduce true
@@ -1199,16 +1706,49 @@
                  (supported-description? physical-outputs %))
             descriptions)))
 
+(defn normalize-source
+  "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
+
+   TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
+   This normalization inserts an ordinary typed scalar binding immediately before its operation,
+   so the same expression remains visible to JVM materialization and runtime specialization."
+  ([source] (normalize-source source {}))
+  ([source {:keys [array-types scalar-types]}]
+   ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
+   ;; binder an array, exactly as the walker stamps them.
+   (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                   (filter symbol? (take-nth 2 (second source))))
+         tagged (fn [kind?]
+                  (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+     (binding [util/*shadowing-locals* (source-shadowing-locals source)
+               *declared-kinds*
+               {:arrays (into (set (keys array-types))
+                              (tagged #(some? (dtype/dtype-for-array-tag %))))
+                :scalars (into (set (keys scalar-types))
+                               (tagged #(contains? #{:long :int}
+                                                   (some-> % dtype/dtype-for-scalar-tag
+                                                           dtype/canon))))}]
+       (normalize-source* source)))))
+
+(declare coverage-decline*)
+
 (defn coverage-decline
   "Describe the exact source bindings that prevent admission to the closed TypedSOAC subset.
 
    This is diagnostic evidence only: it uses the same descriptions and admission predicate as
    form->program, so reporting cannot become a second legality implementation."
+  [source {:keys [array-types scalar-types values] :as options}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
+                                                             values)]
+    (coverage-decline* source options)))
+
+(defn- coverage-decline*
   [source {:keys [dtype array-types values shape-equalities]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
+          array-types (binder-array-types pairs array-types dtype)
           descriptions (normalize-extents (source-descriptions pairs dtype array-types)
                                           shape-equalities values)
           physical-outputs (physical-output-symbols descriptions)
@@ -1280,11 +1820,32 @@
        form))
    expression))
 
+(defn- declare-result-conversion
+  "Wrap a map body in the explicit cast to its result element dtype when the body's retained
+   dtype differs.
+
+   Both dtypes are facts: the result buffer's element dtype and the walker's stamp on the body.
+   A double body written to a float buffer (a double-typed schedule compiled under the float
+   policy) is a stated narrowing, not a silent one; KernelBody would otherwise refuse the store."
+  [expression elem-type]
+  (let [tag (when (instance? clojure.lang.IObj expression)
+              (or (:raster.type/tag (meta expression)) (:tag (meta expression))))
+        source (some-> tag dtype/dtype-for-scalar-tag dtype/canon)
+        target (some-> elem-type dtype/canon)]
+    (if (and source target (not= source target)
+             (dtype/fp-dtype? source) (dtype/fp-dtype? target))
+      (list (dtype/scalar-tag-for-dtype target) expression)
+      expression)))
+
 (defn- map-equation
   [description]
   (let [{:keys [id index extent locals casts bodies inputs results elem-type]} description
         fold-dtype (or elem-type (:result-dtype description) :double)
-        expressions (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
+        expressions (mapv (fn [cast body]
+                            (if cast
+                              (list cast body)
+                              (declare-result-conversion body fold-dtype)))
+                          casts bodies)
         all-expressions (into (mapv :init locals) expressions)
         [pointwise stable] ((juxt filter remove) #(pointwise-input? all-expressions % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
@@ -1347,13 +1908,20 @@
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms writes)))))
 
+(defn- effect-expressions
+  "Every expression an effect evaluates, descending into store loops."
+  [effect]
+  (if-let [{:keys [extent locals effects]} (:loop effect)]
+    (concat [extent] (map :init locals) (mapcat effect-expressions effects))
+    [(:index effect) (:predicate effect) (:value effect)]))
+
 (defn- effect-map-equation
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
         destination-set (set destinations)
         all-expressions (vec (concat (map :init locals)
-                                     (mapcat (juxt :index :predicate :value) effects)))
+                                     (mapcat effect-expressions effects)))
         semantic-inputs (set/difference (set inputs) destination-set)
         [pointwise stable]
         ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
@@ -1373,12 +1941,21 @@
         local-forms (mapv (fn [{:keys [id dtype init]}]
                             (dialect/local-value id dtype (transform init)))
                           locals)
-        effect-forms
-        (mapv (fn [{:keys [out index predicate value cast effect-conflict]}]
-                (list 'effect (get destination-substitutions out)
-                      effect-conflict (transform index) (transform predicate)
-                      (transform (if cast (list cast value) value))))
-              effects)]
+        effect-form
+        (fn effect-form [{:keys [out index predicate value cast effect-conflict] :as effect}]
+          (if-let [{loop-index :index loop-locals :locals loop-effects :effects
+                    :keys [lower extent]} (:loop effect)]
+            (list 'effect-loop {:index loop-index :lower lower} (transform extent)
+                  (list 'lambda [loop-index]
+                        (dialect/effect-lambda-region
+                         (mapv (fn [{:keys [id dtype init]}]
+                                 (dialect/local-value id dtype (transform init)))
+                               loop-locals)
+                         (mapv effect-form loop-effects))))
+            (list 'effect (get destination-substitutions out)
+                  effect-conflict (transform index) (transform predicate)
+                  (transform (if cast (list cast value) value)))))
+        effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map
                 {:index index :extent extent :dtypes result-dtypes
@@ -1783,6 +2360,8 @@
                 {:id id :first prior :second contract})))
      (assoc values id contract))))
 
+(declare form->program*)
+
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
 
@@ -1790,11 +2369,18 @@
    Returns nil when a parallel binding is outside the certified source subset. Type/effect/value
    contradictions throw ExceptionInfo because falling through after accepting them would hide a
    compiler correctness defect."
+  [source {:keys [array-types scalar-types values] :as options}]
+  (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
+                                                             values)]
+    (form->program* source options)))
+
+(defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
+          array-types (binder-array-types pairs array-types dtype)
           descriptions (normalize-extents (source-descriptions pairs dtype array-types)
                                           shape-equalities values)]
       (when (and (even? (count bindings))

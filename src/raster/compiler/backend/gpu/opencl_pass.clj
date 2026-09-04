@@ -7,7 +7,8 @@
 
    This is the GPU counterpart of simd-pass — both consume the same
    par form vocabulary but produce different target code."
-  (:require [clojure.set :as set]
+  (:require [raster.compiler.core.util :as util]
+            [clojure.set :as set]
             [clojure.walk :as walk]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -612,9 +613,12 @@
                   typed-dispatch
                   (when bound-sr
                     (try
+                      ;; The scheduled SegRed carries its equation's dtype; a double contraction
+                      ;; inside a float program routes at its own precision, not the program's.
                       (croute/route-static-typed-contraction-dispatch
                        typed-algorithm bound-sr
-                       :dtype dtype :tile (:tile schedule) :desc target-desc)
+                       :dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
+                       :precision (:precision schedule))
                       (catch clojure.lang.ExceptionInfo exception
                         (let [reason (:reason (ex-data exception))]
                           (if (contains? #{:typed-contraction-dispatch-dynamic-scalar
@@ -659,7 +663,8 @@
                          (if bound-sr
                            (croute/route-typed-contraction
                             typed-algorithm bound-sr
-                            :dtype dtype :tile (:tile schedule) :desc target-desc)
+                            :dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
+                            :precision (:precision schedule))
                            (croute/route-contraction
                             ;; A compatibility equation routes from its verified facts. Without a
                             ;; scheduled operation, the direct backend door still consumes the form.
@@ -935,7 +940,13 @@
                 rebuilt))
 
             :else form))]
-    {:form (transform source-form)
+    ;; Every declared value id is a local of the compiled form, even one spelled like a
+    ;; `clojure.core` name (a parameter called `seq`): free-symbol analysis inside the emitters
+    ;; must read it as a kernel scalar, never as the core function.
+    {:form (binding [util/*shadowing-locals*
+                     (set (concat (keys top-scalar-types) (keys top-array-types)
+                                  (keys (:values parallel-program))))]
+             (transform source-form))
      :stats @stats
      :kernels @kernels
      :dispatches @dispatches}))

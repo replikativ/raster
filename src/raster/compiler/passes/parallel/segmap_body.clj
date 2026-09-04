@@ -185,7 +185,8 @@
                   :lower-index lower-index :predicate :map-active
                   :id-prefix "map" :decline! decline!})
         base-environment (assoc scalar-types index :long)
-        local-state
+        lower-locals
+        (fn [locals base-environment]
         (reduce
          (fn [{:keys [substitutions operations environment]}
               {:keys [id init] local-dtype :dtype}]
@@ -201,7 +202,8 @@
               :operations (into operations (:operations lowered))
               :environment (assoc environment (:result lowered) (:type lowered))}))
          {:substitutions {} :operations [] :environment base-environment}
-         locals)
+         locals))
+        local-state (lower-locals locals base-environment)
         forms (if ordered-effects?
                 []
                 (scalar-forms (util/subst-syms (:substitutions local-state) result)))
@@ -212,7 +214,17 @@
                       {:operation (:id segmap) :output primary-output}))
         environment (:environment local-state)
         lower-store
-        (fn [form]
+        (fn lower-store [form]
+          (if (and (seq? form) (= 'if (first form)) (= 3 (count form)))
+            ;; A guarded explicit store `(if predicate (aset …))` is the store under an
+            ;; IfRegion; the bounds guard of a block scatter is exactly this shape.
+            (let [[_ predicate store] form
+                  lowered-predicate ((:lower lowerer) predicate :predicate environment)
+                  store-operations (vec (lower-store store))]
+              (vec (concat (:operations lowered-predicate)
+                           [(body/->IfRegion (:result lowered-predicate)
+                                             (conj store-operations (body/->Yield []))
+                                             [(body/->Yield [])] [])])))
           (let [atomic-add? (and (seq? form)
                                  (= 'raster.par/atomic-add!
                                     (descriptor/semantic-op form)))]
@@ -239,10 +251,43 @@
                          (body/->AtomicRMW array [coordinate-expression]
                                            (:result lowered) :+ :map-active)
                          (body/->ScalarStore array [coordinate-expression]
-                                             (:result lowered) :map-active))]))))
+                                             (:result lowered) :map-active))])))))
         explicit-operations (vec (mapcat lower-store explicit-forms))
+        substitute-effect
+        (fn substitute-effect [substitutions effect]
+          (let [substitute #(util/subst-syms substitutions %)]
+            (if-let [loop (:loop effect)]
+              (assoc effect :loop
+                     (-> loop
+                         (update :extent substitute)
+                         (update :locals (fn [locals] (mapv #(update % :init substitute) locals)))
+                         (update :effects (fn [effects]
+                                            (mapv #(substitute-effect substitutions %) effects)))))
+              (reduce (fn [effect field] (update effect field substitute))
+                      effect [:destination :destination-index :predicate :value]))))
         lower-effect
-        (fn [{:keys [destination conflict destination-index predicate value] :as effect}]
+        (fn lower-effect
+          [environment {:keys [destination conflict destination-index predicate value] :as effect}]
+          (if-let [{loop-index :index loop-locals :locals loop-effects :effects
+                    :keys [lower extent]} (:loop effect)]
+            ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
+            ;; locals are SSA values scoped to one iteration and its stores keep their own
+            ;; per-destination contracts.
+            (let [loop-state (lower-locals loop-locals (assoc environment loop-index :long))
+                  inner (vec (mapcat #(lower-effect (:environment loop-state)
+                                                    (substitute-effect
+                                                     (:substitutions loop-state) %))
+                                     loop-effects))]
+              [(body/->ForLoop
+                (body/value loop-index :long)
+                (lower-index lower (set (keys environment)) environment)
+                (lower-index extent (set (keys environment)) environment)
+                1
+                []
+                (vec (concat (:operations loop-state) inner [(body/->Yield [])]))
+                []
+                {:association :ordered :source-order true})])
+          (do
           (when-not (contains? output-set destination)
             (decline! :effect-destination
                       "ordered effect targets an undeclared result"
@@ -273,16 +318,11 @@
                 (vec (concat (:operations lowered-predicate)
                              [(body/->IfRegion (:result lowered-predicate)
                                                (conj effect-operations (body/->Yield []))
-                                               [(body/->Yield [])] [])]))))))
+                                               [(body/->Yield [])] [])]))))))))
         effect-operations
-        (vec (mapcat lower-effect
-                     (map #(reduce (fn [effect field]
-                                     (update effect field
-                                             (fn [expression]
-                                               (util/subst-syms
-                                                (:substitutions local-state) expression))))
-                                   % [:destination :destination-index :predicate :value])
-                          effects)))
+        (vec (mapcat #(lower-effect environment
+                                    (substitute-effect (:substitutions local-state) %))
+                     effects))
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))

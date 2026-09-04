@@ -442,3 +442,26 @@
     (is (not (contains? remapped-attributes :segment-axes))
         "remapping a full reduction must not invent segmented axes")
     (is (= result (dialect/validate! result)))))
+
+(deftest a-map-feeding-a-fold-map-keeps-the-fold-map-intact
+  ;; The fold-map reads the map's result as a stable capture, so it is not a vertical fusion
+  ;; consumer; reading its references must not re-emit it through the single-lambda builder,
+  ;; which used to drop its folds and leave a malformed operation for the next iteration.
+  (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) 2.0))
+                       eff (raster.par/segmented-fold-map!
+                            [out] [[b m]] j n
+                            [[mx -1.0E38 :element n
+                              (max mx (aget y (+ (* b n) j)))]]
+                            [(- (aget y (+ (* b n) j)) mx)])]
+                      eff)
+        program (source-program source {'x :float 'out :float 'y :float}
+                                {'n :long 'm :long})
+        [fused stats] (typed-fusion/fusion-fixpoint program)
+        fold-map (first (filter #(= 'segmented-fold-map (dialect/operation-kind %))
+                                (dialect/equations fused)))]
+    (is (= ['map 'segmented-fold-map]
+           (mapv dialect/operation-kind (dialect/equations program))))
+    (is (zero? (:vertical stats)))
+    (is (some? fold-map))
+    (is (= 1 (count (:folds (dialect/operation-parts fold-map)))))
+    (is (= fused (dialect/validate! fused)))))

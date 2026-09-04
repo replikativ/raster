@@ -323,12 +323,12 @@
           "full attention-block grad(x) must extract FULLY RESIDENT"))))
 
 ;; ── :gemm-precision :f32-scalar — exact-grad GEMM policy (training) ──────────────
-;; Same composed attention block as above, but the resident :gemm steps bind the plain
-;; scalar f32 GEMM (no f32→f16 convert/transpose expansion). The ~1.7e-2 composed
-;; divergence of the default :f16-xmx path is pure f16 INPUT-CONVERSION noise, not an
-;; AD/compile defect — under :f32-scalar the same compiled program matches the CPU f32
-;; reference at ~1e-6-level. This pins the policy end-to-end: compile-gpu-program
-;; carries :gemm-precision on the descriptor, and the linked binder selects scalar GEMMs for it.
+;; Same composed attention block as above. The block's BLAS GEMMs are typed contractions
+;; (`:contract` steps); under :f32-scalar the contraction route excludes the f16 matrix family,
+;; so the compiled program matches the CPU f32 reference at ~1e-6-level (the f16 XMX path's
+;; ~1.7e-2 composed divergence is pure input-conversion noise). This pins the policy end-to-end:
+;; compile-gpu-program resolves :gemm-precision into the schedule's :precision, and the typed
+;; contraction candidates honour it.
 (deftest attn-block-f32-scalar-gemm-precision-parity
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "attn-block :f32-scalar gemm-precision parity")
@@ -363,8 +363,8 @@
                "rel-err" (:rel-err (get grads 'x)))
       (is (:resident? (get grads 'x))
           "attn-block grad(x) under :gemm-precision :f32-scalar must extract FULLY RESIDENT")
-      (is (some #{:gemm} (:step-kinds (get grads 'x)))
-          "the policy case must actually exercise resident :gemm steps"))))
+      (is (some #{:contract} (:step-kinds (get grads 'x)))
+          "the policy case must actually exercise typed contraction steps"))))
 
 ;; ── B2 MILESTONE: RESIDUAL-connection fan-out value+grad, FULLY RESIDENT ──────────
 ;; A real decoder layer has RESIDUAL connections (the attention block above has none):

@@ -755,3 +755,195 @@
                      (if (keyword? conflict) conflict (:kind conflict))))
                  effects)))
     (is (= program (dialect/validate! program)))))
+
+(deftest a-renamed-allocation-written-through-its-alias-is-scaffolding
+  ;; `(let [y (float-array n) out y] (map-void! … (aset out i …)))`: the write goes through the
+  ;; alias, so the allocation shares its physical identity and stays host scaffolding instead of
+  ;; declining as a scalar binding without a dtype.
+  (let [source '(let* [y (clojure.core/float-array n)
+                       out y
+                       step (raster.par/map-void! i n
+                                                  (clojure.core/aset
+                                                   out i (float (clojure.core/aget x i))))]
+                      step)
+        program (frontend/form->program source {:dtype :float :array-types {'x :float}
+                                                :scalar-types {'n :long}})
+        routed (route/attempt source :float {'x :float} {:scalar-types {'n :long}})]
+    (is (= ['map] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= '[y (clojure.core/float-array n) out y]
+           (vec (take 4 (second (get-in routed [:program :source]))))))))
+
+(deftest a-blas-gemm-call-is-the-contraction-it-computes
+  ;; `(dgemm-nt! A B C m k n 1 0)` is `C[m,n] = A[m,k]·B[n,k]ᵀ`: the devirtualized BLAS effect
+  ;; normalizes to the explicit `par/contract` whose typed equation is a segmented reduction
+  ;; over `k` with free axes `[m n]`, so a block containing it no longer falls back to the host.
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 0.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n)) 'r call] 'r)
+        program (frontend/form->program
+                 (frontend/normalize-source source)
+                 {:dtype :float :array-types {'A :float 'B :float}
+                  :scalar-types {'m :long 'k :long 'n :long}})
+        equation (first (dialect/equations program))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        {:keys [body-results]} (dialect/lambda-parts lambda)]
+    (is (= ['segmented-reduce] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= '[[rstr_gemm_i_1 m] [rstr_gemm_j_1 n]] (:segment-axes attributes)))
+    (is (= 'k (:extent attributes)))
+    (is (= [:float] (:dtypes attributes)))
+    (is (= '(clojure.core/+ (clojure.core/* rstr_gemm_j_1 %capture2) rstr_gemm_l_1)
+           (-> body-results first (nth 2) (nth 2) (nth 2)))
+        "the nt variant reads B as [n,k]: B[j*k + l]")
+    (is (= [{:destination 'C :access :write :host-return :buffer}]
+           (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
+
+(deftest a-blas-gemm-with-a-non-zero-beta-stays-a-host-call
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 1.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['r call] 'r)]
+    (is (= source (frontend/normalize-source source)))))
+
+(deftest equal-sizes-spelled-through-host-bindings-are-one-extent
+  ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`
+  ;; over `y = (float-array n)` is `n`. Without those identities the buffer `y` would receive
+  ;; two shapes and the whole form would decline with :source-value-conflict.
+  (let [source '(let* [^long n1 seq
+                       ^long n2 dff
+                       ^long total (clojure.core/* seq dff)
+                       ^long again (clojure.core/* n1 n2)
+                       y (clojure.core/float-array total)
+                       fill (raster.par/map! y i again float (clojure.core/aget x i))
+                       z (raster.par/pmap j (clojure.core/alength y) float
+                                          (clojure.core/* 2.0 (clojure.core/aget y j)))]
+                      z)
+        normalized (frontend/normalize-source source {:array-types {'x :float}
+                                                      :scalar-types {'seq :long 'dff :long}})
+        program (frontend/form->program normalized
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'seq :long 'dff :long}})
+        equations (dialect/equations program)
+        maps (filter #(= 'map (dialect/operation-kind %)) equations)]
+    (is (= '[scalar map map] (mapv dialect/operation-kind equations))
+        "the canonical size keeps one scalar equation; its restatement is an alias")
+    (is (= '[total total] (mapv dialect/operation-extent maps))
+        "both maps iterate the one canonical extent")
+    (is (= (get-in (dialect/facts program) [:values 'y :shape])
+           (get-in (dialect/facts program) [:values 'z :shape]))
+        "the allocation and its consumer agree on one shape")))
+
+(deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
+  ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
+  ;; array-free scalars and array lengths alias across kernels.
+  (let [source '(let* [^long n0 (clojure.core/aget counts 0)
+                       e0 (raster.par/map-void! i m (clojure.core/aset counts 0 (float 7.0)))
+                       ^long n1 (clojure.core/aget counts 0)
+                       e1 (raster.par/map-void! j n1 (clojure.core/aset out j (float 1.0)))]
+                      e1)
+        normalized (frontend/normalize-source source)
+        pairs (partition 2 (second normalized))
+        second-kernel (some (fn [[binder init]] (when (= 'e1 binder) init)) pairs)]
+    (is (= 'n1 (nth second-kernel 2))
+        "the second launch keeps its own post-kernel length")))
+
+(deftest an-explicit-float-array-keeps-its-element-type-under-a-double-policy
+  ;; `float-array` names its element type; only allocators without one (`alloc-like`,
+  ;; `zeros-like`) follow the kernel dtype. A double kernel must not widen a float buffer.
+  (let [source '(let* [^floats z (clojure.core/float-array n)
+                       step (raster.par/map! z i n float (clojure.core/aget x i))]
+                      step)
+        program (frontend/form->program source {:dtype :double :array-types {'x :double}
+                                                :scalar-types {'n :long}})]
+    (is (= :float (get-in (dialect/facts program) [:values 'z :dtype])))))
+
+(deftest sibling-loops-sharing-a-source-index-name-get-distinct-ssa-indices
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        r rows
+                        (do
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float 1.0))
+                                  (recur (clojure.core/inc i)))))
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out2 (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float 2.0))
+                                  (recur (clojure.core/inc i)))))))]
+                      effect)
+        program (frontend/form->program source {:dtype :float
+                                                :array-types {'out :float 'out2 :float}
+                                                :scalar-types {'rows :long 'feat :long}})
+        equation (first (dialect/equations program))
+        {:keys [lambda]} (dialect/operation-parts equation)
+        loops (filter :loop (map dialect/effect-parts
+                                 (:body-results (dialect/lambda-parts lambda))))]
+    (is (= 2 (count loops)))
+    (is (= 2 (count (distinct (map :index loops))))
+        "each effect-loop binds its own index symbol")
+    (is (= program (dialect/validate! program)))))
+
+(deftest a-copy-constructor-over-an-array-is-not-a-length
+  ;; `(float-array x)` with an array `x` copies it; only a positively scalar operand is a length.
+  (let [source '(let* [y (clojure.core/float-array x)
+                       z (raster.par/pmap i (clojure.core/alength y) float
+                                          (clojure.core/aget y i))]
+                      z)
+        normalized (frontend/normalize-source source {:array-types {'x :float}})
+        z-init (some (fn [[binder init]] (when (= 'z binder) init))
+                     (partition 2 (second normalized)))]
+    (is (not= 'x (nth z-init 2))
+        "the extent stays the copy's length, not the copied array")))
+
+(deftest a-region-local-reading-a-destination-serializes-the-loop-map
+  ;; `previous = out[0]` observes earlier work items' writes, so the loop map cannot run its
+  ;; items independently even though every row store is injective.
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        r rows
+                        (let* [^float previous (clojure.core/aget out 0)]
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float (clojure.core/+ previous 1.0)))
+                                  (recur (clojure.core/inc i)))))))]
+                      effect)
+        program (frontend/form->program source {:dtype :float :array-types {'out :float}
+                                                :scalar-types {'rows :long 'feat :long}})
+        {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))]
+    (is (= :sequential (:iteration-order attributes)))))
+
+(deftest effect-loop-locals-cannot-reference-later-locals
+  (let [program (frontend/form->program
+                 '(let* [effect
+                         (raster.par/map-void!
+                          r rows
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (let* [^float a (float (clojure.core/aget x (clojure.core/+ (clojure.core/* r feat) i)))
+                                     ^float b (float (clojure.core/* a 2.0))]
+                                (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i) b)
+                                (recur (clojure.core/inc i))))))]
+                        effect)
+                 {:dtype :float :array-types {'x :float 'out :float}
+                  :scalar-types {'rows :long 'feat :long}})
+        swapped (clojure.walk/postwalk
+                 (fn [form]
+                   (if (and (seq? form) (= 'effect-region (first form)) (= 2 (count (second form))))
+                     (list 'effect-region (vec (reverse (second form))) (nth form 2))
+                     form))
+                 program)]
+    (is (= program (dialect/validate! program)))
+    (is (= :typed-soac-effect-loop
+           (try (dialect/validate! swapped) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "a loop local may only reference the locals before it")))
