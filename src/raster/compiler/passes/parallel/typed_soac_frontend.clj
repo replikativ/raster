@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
@@ -643,13 +644,40 @@
         expanded
         (recur expanded (dec remaining))))))
 
+(defn- invariant-read-atoms
+  "Replace every array read in `form` that is uniform across the map with an atom symbol: a
+   read of an array the region does not write, at an index free of the map index, the loop
+   indices and the region locals (`(aget posbuf 0)`, a position established before the map).
+   Such a read is a scalar the algebra can treat as an invariant factor. `atoms` memoizes one
+   symbol per distinct read so equal reads stay equal."
+  [form destinations varying atoms]
+  (descriptor/rewrite-aget-reads
+   form
+   (fn [read]
+     (let [array (descriptor/aget-array-sym read)
+           index (descriptor/aget-index read)]
+       (when (and (symbol? array)
+                  (not (contains? destinations array))
+                  (empty? (set/intersection varying (util/free-syms index))))
+         (let [key (list 'clojure.core/aget array index)]
+           (or (get @atoms key)
+               (let [atom-symbol (clojure.core/symbol (str "rstr_read_" (count @atoms)))]
+                 (swap! atoms assoc key atom-symbol)
+                 atom-symbol))))))))
+
 (defn- store-index-form
   "The mixed-radix index form of a store's destination index over the map index (extent
    `extent`), the region locals and, for a loop store, its loop's locals and index. Host
-   scalar definitions are expanded first so extents and strides show their factors."
-  [store index extent locals loops]
+   scalar definitions are expanded first so extents and strides show their factors, and
+   uniform array reads become invariant atoms (`destinations` are the region's written arrays)."
+  [store index extent locals loops destinations]
   (let [loop (when (:loop store) (nth loops (:loop store)))
-        expand expand-scalar-definitions]
+        varying (into #{index}
+                      (concat (map :id locals) (map :id (:locals loop))
+                              (map :index loops)))
+        atoms (atom {})
+        expand (fn [form]
+                 (invariant-read-atoms (expand-scalar-definitions form) destinations varying atoms))]
     (index-algebra/index-form (expand (:index store)) index (expand extent)
                               (mapv #(update % :init expand) (concat locals (:locals loop)))
                               (if loop {(:index loop) (expand (:extent loop))} {}))))
@@ -659,7 +687,8 @@
    index form is injective, and stores sharing a destination share one form and write at
    provably disjoint offsets. Returns the set of store ordinals."
   [stores index extent locals loops]
-  (let [forms (mapv #(store-index-form % index extent locals loops) stores)
+  (let [destinations (set (map :out stores))
+        forms (mapv #(store-index-form % index extent locals loops destinations) stores)
         by-destination (group-by (fn [ordinal] (:out (nth stores ordinal)))
                                  (range (count stores)))]
     (into #{}
@@ -668,8 +697,11 @@
                       (when (and (every? some? group-forms)
                                  (every? index-algebra/injective? group-forms)
                                  (apply = (map :terms group-forms))
+                                 ;; stores at one address (the arms of a conditional) are the
+                                 ;; same element of one work item; distinct offsets must be
+                                 ;; disjoint across work items
                                  (index-algebra/disjoint-offsets?
-                                  (first group-forms) (map :offset group-forms)))
+                                  (first group-forms) (distinct (map :offset group-forms))))
                         ordinals))))
           by-destination)))
 
@@ -983,8 +1015,13 @@
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
           (par/extract-par-map-info expression)
+          ;; The map's element dtype is a fact before it is a policy: the form's own element
+          ;; type, its store cast, then the destination's declared dtype (a lifted copy into a
+          ;; `double-array` under a float policy stores doubles). The program dtype is the last
+          ;; resort when nothing declares it.
           elem-type (dtype/canon (or elem-type
                                      (dtype/dtype-for-scalar-tag cast)
+                                     (when (symbol? out) (get array-types out))
                                      default-dtype))
           write-index (when offset (list 'clojure.core/+ offset idx))
           io (extract-io (if offset (list 'do write-index body) body) idx [out])]
@@ -1169,7 +1206,21 @@
                             (:raster.type/elem-type (meta expression))
                             default-dtype :double))
           {:keys [free-axes contract-axes out opts]} facts
-          epilogue (:epilogue facts)
+          contraction-dtype (dtype/canon (:dtype facts))
+          ;; A result transform that reads the destination reads the storage the contraction
+          ;; writes: that operand and the transform result have the contraction's dtype (a
+          ;; double-spelled GEMM compiled under the float policy accumulates into a float
+          ;; buffer), whatever tag the source call carried.
+          epilogue (let [epilogue (:epilogue facts)]
+                     (if (some #(= out (:sym %)) (:operands epilogue))
+                       (-> epilogue
+                           (assoc :dtype contraction-dtype)
+                           (update :operands
+                                   (fn [operands]
+                                     (mapv #(cond-> % (= out (:sym %))
+                                              (assoc :dtype contraction-dtype))
+                                           operands))))
+                       epilogue))
           result-transform (typed-result-transform epilogue)
           epilogue-arrays (set (map :value (:operands result-transform)))
           epilogue-scalar-ids (set (map :value (:scalars result-transform)))]
@@ -1214,8 +1265,11 @@
            ;; Contract is effectful at the source spelling because it writes `out`, but its
            ;; TypedSOAC equation denotes the mathematical output tensor. A terminal reference to
            ;; that physical destination therefore returns the logical value; generic map-void
-           ;; destinations remain `:effect` storage and retain host nil semantics.
-           :result-storage [{:destination out :access :write :host-return :buffer}]})))
+           ;; destinations remain `:effect` storage and retain host nil semantics. A result
+           ;; transform that reads the destination (an accumulating GEMM) makes it read-write.
+           :result-storage [{:destination out
+                             :access (if (contains? epilogue-arrays out) :read-write :write)
+                             :host-return :buffer}]})))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
@@ -1340,17 +1394,38 @@
    is the pure contraction `(raster.par/contract C [[i m] [j n]] [[l k]] (* A[i,l] B[l,j]))`
    scaled by `alpha`, and the typed route can schedule it like any contraction instead of
    leaving the whole block on the host because one binding is an opaque BLAS effect. A non-zero
-   `beta` reads the destination inside its own epilogue and stays a host call for now."
+   `beta` (a literal or a scalar value) is the same contraction with a result transform that
+   reads the destination element it overwrites: `C[i,j] := acc + beta·C[i,j]`. The destination
+   is then read-write storage of one kernel, which the KernelBody builders express as a single
+   `:inout` parameter. A `beta` that is neither a literal nor a scalar value id, or a call whose
+   element type is unknown, stays a host call."
   [ordinal expression]
   (let [variant (when (and (seq? expression) (= '.invk (first expression)))
                   (get descriptor/blas-gemm-ops (:raster.op/original (meta expression))))
         arguments (when variant (vec (drop 2 expression)))
         [A B C m k n alpha beta] arguments
         beta-literal (when variant (descriptor/gemm-scalar-literal beta))
-        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))]
+        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))
+        ;; `alpha`/`beta` arrive as `(oftype witness value)` from the source spelling; the scalar
+        ;; factor is its value, not the type witness array.
+        scalar-value (fn [argument literal]
+                       (cond
+                         ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
+                         ;; it denotes, not an integer literal that would mistype the product.
+                         (some? literal) literal
+                         (and (seq? argument)
+                              (= 'raster.numeric/oftype (descriptor/semantic-op argument))
+                              (= 2 (count (descriptor/call-args argument))))
+                         (second (descriptor/call-args argument))
+                         :else argument))
+        beta-value (when variant (scalar-value beta beta-literal))
+        accumulate? (not= 0.0 beta-literal)
+        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                          dtype/dtype-for-array-tag dtype/canon)]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
-             (= 0.0 beta-literal))
+             (or (not accumulate?)
+                 (and elem-type (or (number? beta-value) (symbol? beta-value)))))
       (let [i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
             j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
             l (clojure.core/symbol (str "rstr_gemm_l_" ordinal))
@@ -1361,8 +1436,6 @@
             b-index (case variant
                       (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
                       :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l))
-            elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                              dtype/dtype-for-array-tag dtype/canon)
             ;; The walker stamps every arithmetic form with its result dtype; the emitted loads
             ;; and product carry the same stamp so scalar lowering reads the type instead of
             ;; guessing it.
@@ -1374,21 +1447,29 @@
             product (typed (list 'clojure.core/*
                                  (typed (list 'clojure.core/aget A a-index))
                                  (typed (list 'clojure.core/aget B b-index))))
-            ;; `alpha` arrives as `(oftype witness value)` from the source spelling; the scalar
-            ;; factor is its value, not the type witness array.
-            alpha-value (cond
-                          ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
-                          ;; it denotes, not an integer literal that would mistype the product.
-                          (some? alpha-literal) alpha-literal
-                          (and (seq? alpha)
-                               (= 'raster.numeric/oftype (descriptor/semantic-op alpha))
-                               (= 2 (count (descriptor/call-args alpha))))
-                          (second (descriptor/call-args alpha))
-                          :else alpha)
+            alpha-value (scalar-value alpha alpha-literal)
             body (if (= 1.0 alpha-literal)
                    product
-                   (typed (list 'clojure.core/* alpha-value product)))]
-        (with-meta (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+                   (typed (list 'clojure.core/* alpha-value product)))
+            ;; `beta·C[i,j]` is read at the store coordinates of the element being produced;
+            ;; the operand map declares that coordinate, the index inside the read is its
+            ;; row-major spelling for the host expansion.
+            epilogue
+            (when accumulate?
+              (let [acc (clojure.core/symbol (str "rstr_gemm_acc_" ordinal))
+                    destination (typed (list 'clojure.core/aget C
+                                             (list 'clojure.core/+ (list 'clojure.core/* i n) j)))
+                    scaled (if (= 1.0 beta-literal)
+                             destination
+                             (typed (list 'clojure.core/* beta-value destination)))]
+                {:acc acc
+                 :expr (typed (list 'clojure.core/+ acc scaled))
+                 :operands [{:sym C :map (axis-map/of-axes [[i m] [j n]]) :dtype elem-type}]
+                 :scalars (if (symbol? beta-value) [{:sym beta-value :dtype elem-type}] [])
+                 :dtype elem-type}))]
+        (with-meta (cond-> (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+                     epilogue (concat [:epilogue epilogue])
+                     true (->> (apply list)))
           (cond-> {:raster.op/original (:raster.op/original (meta expression))}
             elem-type (assoc :raster.type/elem-type elem-type))))
       expression)))
@@ -2556,17 +2637,25 @@
                                                     (:host-binding description)}))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
-              host-binding-ids
-              (->> descriptions
-                   (keep #(when (and (= :scalar (:kind %))
-                                     (not (supported-description?
-                                           physical-outputs %)))
-                            (:id %)))
+              host-descriptions
+              (filterv #(and (= :scalar (:kind %))
+                             (not (supported-description? physical-outputs %)))
+                       descriptions)
+              host-binding-ids (mapv :id host-descriptions)
+              ;; Program values a host-controlled binding reads are uses of those values: a
+              ;; producer read by the host must stay materialized, whatever fusion does with
+              ;; its typed consumers.
+              host-read-values
+              (->> host-descriptions
+                   (mapcat #(util/free-syms (:expr %)))
+                   (filter #(contains? values %))
+                   distinct
                    vec)
               facts (dialect/default-program-facts
                      {:values values :inputs inputs :equations equation-facts
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
                       :attributes {:source-dialect :closed-clojure
-                                   :host-binding-ids host-binding-ids}})]
+                                   :host-binding-ids host-binding-ids
+                                   :host-read-values host-read-values}})]
           (dialect/make facts equations outputs))))))

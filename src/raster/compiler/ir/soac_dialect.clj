@@ -297,13 +297,34 @@
          (dtype/known? (:result-dtype value))
          (= (:result-dtype value) (dtype/canon (:result-dtype value))))))
 
+(declare lambda-parts)
+
+(defn result-transform-boundary-expression
+  "The result-transform body with every declared operand read collapsed to its operand
+   parameter.
+
+   An operand read `(aget operand index)` denotes the element the operand's axis map names at
+   the current segment coordinates; the spelled `index` is that map's row-major spelling for
+   host expansion and may mention the segment extents. Every kernel lowering loads through the
+   map, so the boundary an expression must respect is judged on this collapsed form."
+  [transform]
+  (let [operand-parameters (set (map :parameter (:operands transform)))
+        {:keys [body-results]} (lambda-parts (:lambda transform))]
+    (descriptor/rewrite-aget-reads
+     (first body-results)
+     (fn [read]
+       (let [operand (descriptor/aget-array-sym read)]
+         (when (contains? operand-parameters operand) operand))))))
+
 (defn make-result-transform
   "Close a post-reduction scalar expression over an alpha-stable typed boundary.
 
    Operand and scalar `:value` fields are program SSA IDs.  The returned lambda refers only to
-   fresh lexical parameters, its accumulator, and the segmented-reduction axes.  Frontends and
-   fusion rules use this one constructor so target projections never have to rediscover captures
-   from an expression."
+   fresh lexical parameters, its accumulator, and the segmented-reduction axes; an operand read
+   `(aget operand index)` is addressed by the operand's axis map, its spelled index being the
+   map's row-major spelling (see `result-transform-boundary-expression`).  Frontends and fusion
+   rules use this one constructor so target projections never have to rediscover captures from
+   an expression."
   [{:keys [accumulator expression operands scalars result-dtype]}]
   (let [operands (mapv (fn [ordinal {:keys [value dtype map]}]
                          {:value value
@@ -1154,8 +1175,9 @@
           (let [operand-ids (set (map :value (:operands transform)))
                 scalar-ids (set (map :value (:scalars transform)))
                 transform-ids (set/union operand-ids scalar-ids)
-                {:keys [parameters body-results]} (lambda-parts (:lambda transform))
-                unbound (util/free-syms (first body-results) (set parameters))]
+                {:keys [parameters]} (lambda-parts (:lambda transform))
+                unbound (util/free-syms (result-transform-boundary-expression transform)
+                                        (set parameters))]
             (when-not (set/subset? transform-ids (set captures))
               (fail! :typed-soac-result-transform-captures
                      "reduce result transforms require explicit capture values"
@@ -1199,9 +1221,9 @@
                 transform-ids (set/union operand-ids scalar-ids)
                 stable (set (get-in attributes [:attributes :stable-array-captures]))
                 segment-indices (set (map first (:segment-axes attributes)))
-                {:keys [parameters body-results]} (lambda-parts (:lambda transform))
+                {:keys [parameters]} (lambda-parts (:lambda transform))
                 bound (set/union (set parameters) segment-indices)
-                unbound (util/free-syms (first body-results) bound)
+                unbound (util/free-syms (result-transform-boundary-expression transform) bound)
                 map-axes (set (mapcat (comp axis-map/axes :map) (:operands transform)))]
             (when-not (set/subset? transform-ids (set captures))
               (fail! :typed-soac-result-transform-captures
@@ -1796,10 +1818,13 @@
                                                    (update storage :destination rename))
                                                  %))))]))
               (:equations source-facts))
-        facts' (assoc source-facts
-                      :values values
-                      :inputs (mapv rename (:inputs source-facts))
-                      :equations equation-facts)]
+        facts' (cond-> (assoc source-facts
+                              :values values
+                              :inputs (mapv rename (:inputs source-facts))
+                              :equations equation-facts)
+                 (seq (get-in source-facts [:attributes :host-read-values]))
+                 (update-in [:attributes :host-read-values]
+                            #(vec (distinct (map rename %)))))]
     (make facts' equation-forms (mapv rename (outputs program)))))
 
 (defn default-equation-facts

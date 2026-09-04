@@ -1356,3 +1356,42 @@
     (is (= :typed-soac (get-in scheduled [:equations 0 :attributes :algorithm-dialect])))
     (is (= 1 (get-in simd [:stats :segop-reused])))
     (is (nil? (get-in simd [:stats :segop-relowered])))))
+
+(deftest host-controlled-bindings-keep-the-scalars-they-read
+  ;; `cols` is read only by the host reduction loop the typed program leaves under host
+  ;; control. The realized source must still bind it: the host closure is a root of the
+  ;; dependency closure, not only the body and the physical destinations.
+  (let [routed (route/attempt
+                '(let* [^long rows (clojure.core/alength b)
+                        ^long cols (clojure.core/alength x)
+                        fill (raster.par/map! out i rows nil (clojure.core/aget b i))
+                        _eff (dotimes [i rows]
+                               (dotimes [j cols]
+                                 (clojure.core/aset out i (clojure.core/+ (clojure.core/aget out i)
+                                                                           (clojure.core/aget x j)))))]
+                       out)
+                :float {'b :float 'x :float 'out :float} {})
+        source (:source (:program routed))
+        binders (take-nth 2 (second source))]
+    (is (nil? (:declined routed)))
+    (is (some #{'cols} binders) (pr-str source))
+    (is (some #{'_eff} binders) "the host loop itself is retained as written")))
+
+(deftest a-producer-the-host-reads-is-not-fused-away
+  ;; `y` has one typed consumer (`z`) and one host reader (the loop). Counting only typed uses
+  ;; would inline `y` into `z` and then resurrect its source binding for the host: the producer
+  ;; would run twice. Host reads are uses, so `y` stays its own equation.
+  (let [routed (route/attempt
+                '(let* [y (raster.par/pmap i n float (clojure.core/* 2.0 (clojure.core/aget x i)))
+                        z (raster.par/pmap j n float (clojure.core/+ 1.0 (clojure.core/aget y j)))
+                        _eff (dotimes [k n]
+                               (clojure.core/aset acc 0 (clojure.core/+ (clojure.core/aget acc 0)
+                                                                         (clojure.core/aget y k))))]
+                       z)
+                :float {'x :float 'acc :float} {:scalar-types {'n :long}})
+        program (:program routed)
+        source (:source program)
+        binders (vec (take-nth 2 (second source)))]
+    (is (nil? (:declined routed)))
+    (is (= 2 (count (:equations program))) "y and z remain separate equations")
+    (is (= 1 (count (filter #{'y} binders))) "y is materialized exactly once")))

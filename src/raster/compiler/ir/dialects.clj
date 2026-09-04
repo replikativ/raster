@@ -579,6 +579,7 @@
   Used by run-passes to validate IR at pass boundaries."
   {:walked           [valid-walked?       validate-walked]
    :lowered          [valid-walked?      validate-walked]
+   :region-copied    [valid-walked?      validate-walked]
    :structured-reductions [valid-walked? validate-walked]
    :ad-transformed   [valid-ad-transformed? validate-ad-transformed]
    :flattened        [valid-flattened?    validate-flattened]

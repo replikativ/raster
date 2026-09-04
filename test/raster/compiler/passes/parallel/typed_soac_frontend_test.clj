@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy-soac]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
@@ -802,15 +803,46 @@
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
 
-(deftest a-blas-gemm-with-a-non-zero-beta-stays-a-host-call
-  (let [call (with-meta
-               (list '.invk
-                     'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
-                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 1.0))
-               {:raster.op/original 'raster.linalg.blas/dgemm!
-                :raster.type/tag 'floats :tag 'floats})
-        source (list 'let* ['r call] 'r)]
-    (is (= source (frontend/normalize-source source)))))
+(defn- accumulating-gemm-call
+  [beta]
+  (with-meta
+    (list '.invk
+          'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
+          'A 'B 'C 'm 'k 'n '(float 1.0) beta)
+    {:raster.op/original 'raster.linalg.blas/dgemm!
+     :raster.type/tag 'floats :tag 'floats}))
+
+(deftest a-blas-gemm-with-a-non-zero-beta-reads-its-destination-in-the-result-transform
+  ;; `(dgemm! A B C m k n 1 beta)` is `C[i,j] := Σ_l A[i,l]·B[l,j] + beta·C[i,j]`: the same
+  ;; contraction, with a result transform that reads the destination element it overwrites.
+  ;; The destination is then read-write storage of one kernel rather than a host BLAS effect.
+  (let [types {:dtype :float :array-types {'A :float 'B :float 'C :float}
+               :scalar-types {'m :long 'k :long 'n :long 'beta :float}}
+        program-for (fn [beta]
+                      (let [source (list 'let* ['r (accumulating-gemm-call beta)] 'r)]
+                        (frontend/form->program (frontend/normalize-source source types) types)))
+        program (program-for '(float 1.0))
+        equation (first (dialect/equations program))
+        {:keys [attributes]} (dialect/operation-parts equation)
+        transform (:result-transform attributes)]
+    (is (= ['segmented-reduce] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= '[[rstr_gemm_i_0 m] [rstr_gemm_j_0 n]] (:segment-axes attributes)))
+    (is (= [{:value 'C :parameter '%result-operand0 :dtype :float
+             :map (axis-map/of-axes '[[rstr_gemm_i_0 m] [rstr_gemm_j_0 n]])}]
+           (:operands transform))
+        "the destination is the one transform operand, read at the store coordinates")
+    (is (= [] (:scalars transform)) "beta = 1 is folded")
+    (is (= [{:destination 'C :access :read-write :host-return :buffer}]
+           (get-in (dialect/facts program)
+                   [:equations (second equation) :attributes :result-storage])))
+    (testing "a scalar beta is a transform scalar"
+      (let [program (program-for 'beta)
+            {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))]
+        (is (= [{:value 'beta :parameter '%result-scalar0 :dtype :float}]
+               (:scalars (:result-transform attributes))))))
+    (testing "a beta that is neither a literal nor a scalar value stays a host call"
+      (let [source (list 'let* ['r (accumulating-gemm-call '(clojure.core/aget S 0))] 'r)]
+        (is (= source (frontend/normalize-source source types)))))))
 
 (deftest equal-sizes-spelled-through-host-bindings-are-one-extent
   ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`
@@ -995,3 +1027,80 @@
                                      effect)
                               :float {'out :float} {:scalar-types {'n :long 'stride :long}})]
     (is (= :unique-index-not-provable (get-in routed [:declined :reason])))))
+
+(deftest a-destination-reading-transform-follows-the-contraction-dtype
+  ;; A double-spelled GEMM (`doubles` call tag) compiled under the float policy writes a float
+  ;; buffer; the destination it reads back is that same float buffer, so the transform's
+  ;; operand and result dtypes are the contraction's, not the call tag's.
+  (let [call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm!_m_doubles_doubles_doubles_long_long_long_double_double-impl
+                     'A 'B 'C 'm 'k 'n 1.0 1.0)
+               {:raster.op/original 'raster.linalg.blas/dgemm!
+                :raster.type/tag 'doubles :tag 'doubles})
+        types {:dtype :float :array-types {'A :float 'B :float 'C :float}
+               :scalar-types {'m :long 'k :long 'n :long}}
+        program (frontend/form->program
+                 (frontend/normalize-source (list 'let* ['r call] 'r) types) types)
+        {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))
+        transform (:result-transform attributes)]
+    (is (= [:float] (:dtypes attributes)))
+    (is (= :float (:result-dtype transform)))
+    (is (= [:float] (mapv :dtype (:operands transform))))))
+
+(defn- effect-map-order
+  "`:independent`/`:sequential` for an effect map; a proven unique offset write becomes a
+   certified scatter, reported as `:unique`."
+  [source types]
+  (let [program (frontend/form->program (frontend/normalize-source source types) types)
+        equation (last (dialect/equations program))
+        {:keys [attributes]} (dialect/operation-parts equation)]
+    (if (= 'scatter (dialect/operation-kind equation))
+      (:conflict attributes)
+      (:iteration-order attributes))))
+
+(deftest a-uniform-array-read-is-an-invariant-offset
+  ;; kv-append: cache[posbuf[0]·kvrow + i] over i < kvrow; posbuf[0] is read, never written,
+  ;; at an index free of the map, so it is an invariant factor and the map is independent
+  (let [types {:dtype :float :array-types {'src :float 'cache :float 'posbuf :long}
+               :scalar-types {'kvrow :long}}
+        map-over (fn [index]
+                   (list 'let* ['effect (list 'raster.par/map-void! 'i 'kvrow
+                                              (list 'clojure.core/aset 'cache index
+                                                    '(clojure.core/aget src i)))]
+                         'effect))]
+    (is (= :unique
+           (effect-map-order
+            (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget posbuf 0) kvrow) i))
+            types))
+        "proven unique: a certified scatter, no ordering claim")
+    (testing "a read that varies with the map index is data the algebra cannot see"
+      (is (= :sequential
+             (effect-map-order
+              (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget posbuf i) kvrow) i))
+              types))))
+    (testing "a read of the destination itself is not invariant"
+      (is (= :sequential
+             (effect-map-order
+              (map-over '(clojure.core/+ (clojure.core/* (clojure.core/aget cache 0) kvrow) i))
+              types))))))
+
+(deftest stores-at-one-address-in-exclusive-arms-are-one-write
+  ;; attention prefill: both arms write sc[(i·n-q + hq)·nrows + j]; one work item, one element
+  (let [source '(let* [effect (raster.par/map-void!
+                               idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+                               (let* [^long per-i (clojure.core/* n-q nrows)
+                                      ^long i (clojure.core/quot idx per-i)
+                                      ^long rest0 (clojure.core/rem idx per-i)
+                                      ^long hq (clojure.core/quot rest0 nrows)
+                                      ^long j (clojure.core/rem rest0 nrows)
+                                      ^long row (clojure.core/+ (clojure.core/* i n-q) hq)]
+                                 (if (clojure.core/< i j)
+                                   (clojure.core/aset sc (clojure.core/+ (clojure.core/* row nrows) j)
+                                                      (float -1.0e30))
+                                   (clojure.core/aset sc (clojure.core/+ (clojure.core/* row nrows) j)
+                                                      (clojure.core/aget q j)))))]
+                  effect)]
+    (is (= :unique
+           (effect-map-order source {:dtype :float :array-types {'sc :float 'q :float}
+                                     :scalar-types {'nrows :long 'n-q :long}})))))

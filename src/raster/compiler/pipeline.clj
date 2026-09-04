@@ -6,7 +6,7 @@
   runner validates arrow compatibility at composition time.
 
   Single unified pipeline (GPU/SIMD):
-    [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :resolve-alength :soac-fuse :compound-detect :backend :mem-merge]
+    [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :resolve-alength :soac-fuse :compound-detect :backend :mem-merge]
 
   AD is handled by inlining value+grad calls during the fixpoint pass.
   Training, gradients, and higher-order derivatives all go through the
@@ -51,6 +51,7 @@
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
+            [raster.compiler.passes.region-copy :as region-copy]
             [raster.compiler.passes.parallel.write-read-fuse :as write-read-fuse]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -328,6 +329,13 @@
    Entry point that initializes the env from param-env."
   [form param-env]
   (tag-expr-types form (or param-env {})))
+
+(defn- pass-region-copy
+  "Spell array region copies (`acopy!`, `System/arraycopy`) in statement position as the
+  counted store loops they are, so the loop lifter, the typed frontend and the resident
+  extractor see stores instead of an opaque effect. (=> :lowered :region-copied)"
+  [form opts]
+  (region-copy/expand-region-copies form :param-env (:param-env opts)))
 
 (defn- pass-lower
   "Lower compound deftm ops into primitive ops for AD.
@@ -1043,8 +1051,10 @@
   flat let* form). The :from tag is set to the most common input."
   {;; Core pipeline passes (used in forward-passes)
    :lower            {:from :walked            :to :lowered           :fn pass-lower}
+   :region-copy      {:from :lowered           :to :region-copied     :fn pass-region-copy
+                      :label "Region copies as store loops"}
    :structured-reduction-fuse
-   {:from :lowered :to :structured-reductions :fn pass-structured-reduction-fuse}
+   {:from :region-copied :to :structured-reductions :fn pass-structured-reduction-fuse}
    :fixpoint         {:from :structured-reductions :to :fixpointed    :fn pass-fixpoint}
    :dce              {:from :*                 :to :dce-cleaned       :fn pass-dce}
    :buffer-fuse      {:from :dce-cleaned       :to :buffer-fused      :fn pass-buffer-fuse}
@@ -1152,19 +1162,20 @@
 ;; ================================================================
 
 (def forward-passes
-  "Forward: lower → fixpoint → DCE → buffer-fuse → late-cleanup → loop-lift → write-read-fuse → soac-fuse → compound-detect → segop-lower → backend → resolve-alength → mem-merge.
+  "Forward: lower → region-copy → fixpoint → DCE → buffer-fuse → late-cleanup → loop-lift → write-read-fuse → soac-fuse → compound-detect → segop-lower → backend → resolve-alength → mem-merge.
+   region-copy spells acopy!/System.arraycopy statements as counted store loops.
    fixpoint loops expand+normalize+rewalk until stable, handling composable AD inlining.
    loop-lift recovers par structure from dotimes/loop forms (e.g. SGD inlined to dotimes).
    write-read-fuse eliminates intermediate buffers by fusing 2D producers into 1D consumers (dW+SGD).
    segop-lower converts par forms to a typed SegOp ParallelProgram for unified backend consumption."
-  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :compound-detect :segop-lower :backend :resolve-alength :mem-merge])
+  [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :compound-detect :segop-lower :backend :resolve-alength :mem-merge])
 
 (def gpu-resident-pre-soa-passes
   "forward-passes up to (and including) :materialize. The resident GPU path splits here so
    soa-lower can explode value-type (Params container) params into per-field arrays at the
    :materialized boundary — BEFORE the :backend pass emits kernels (the JVM bytecode backend
    keeps Valhalla value-classes native, so soa-lower is per-backend, not a shared pass)."
-  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
+  [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
 
 (def gpu-resident-post-soa-passes
   "forward-passes from :compound-detect onward — resumed (from :materialized) after soa-lower."
@@ -1538,6 +1549,24 @@
          :out-buf (nth args 2) :returns sym})
       :else nil)))
 
+(def ^:private host-loop-heads
+  '#{dotimes loop* loop doseq while})
+
+(defn- host-control-flow?
+  "Does `expr` run a loop, write an array, or call a mutating operation on the host? Such a
+   binding is an effect the resident program cannot carry as a size-let closure: evaluating it
+   at bind time would run it once over host arrays, and dropping it would lose the effect.
+   Only a pure scalar expression is a host size-let."
+  [expr]
+  (boolean
+   (some (fn [form]
+           (and (seq? form)
+                (let [operation (op/semantic-op form)]
+                  (or (contains? host-loop-heads (first form))
+                      (op/aset-op? operation)
+                      (and (symbol? operation) (op/mutating-op? operation))))))
+         (tree-seq seq? seq expr))))
+
 (defn- contains-gpu-invoke?
   "Deep check: does form contain a gpu-invoke head anywhere? (A scalar binding whose value is
    itself computed from a kernel result is NOT a straight-line scalar let.)"
@@ -1670,6 +1699,10 @@
           ;; alength) is fine — only intermediate buffers are tracked.
              (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
              (reject! :scalar-let-reads-device-buffer sym expr)
+          ;; A host loop or array write is an effect, not a size-let: it can neither be
+          ;; evaluated at bind time nor dropped. The program is not straight-line.
+             (host-control-flow? expr)
+             (reject! :host-control-flow sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
              (not (contains-gpu-invoke? expr))
              (vswap! scalar-lets into [sym expr])

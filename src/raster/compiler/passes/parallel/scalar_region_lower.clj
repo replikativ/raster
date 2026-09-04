@@ -112,8 +112,14 @@
               (let [{:keys [map] :as operand} (get operand-by-id id)
                     operand-dtype (dtype/canon (get operand :dtype :float))
                     parameter (get parameters id)]
-                (when-not (and operand parameter (= :input (:kind parameter))
-                               (contains? #{:operand :lhs :rhs :epilogue} (:role parameter))
+                ;; An operand is a read-only input, or the kernel's own read-write result when
+                ;; the transform reads the element it overwrites.
+                (when-not (and operand parameter
+                               (or (and (= :input (:kind parameter))
+                                        (contains? #{:operand :lhs :rhs :epilogue}
+                                                   (:role parameter)))
+                                   (and (= :inout (:kind parameter))
+                                        (= :result (:role parameter))))
                                (= operand-dtype (dtype/canon (:dtype parameter))))
                   (decline! :result-transform-operand
                             "result-transform operand lacks its typed KernelBody parameter"

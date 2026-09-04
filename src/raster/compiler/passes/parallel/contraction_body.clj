@@ -75,8 +75,14 @@
         ;; rebuilding a narrower SegRed from a generated host form.
         arrays (vec (sort-by name (set/intersection (:inputs segred) core-operand-ids)))
         scalars (vec (sort-by name (set/intersection (:scalars segred) core-scalar-ids)))
+        output (:out contract-facts)
+        ;; A result transform that reads the destination (`C := acc + beta·C`) reads the element
+        ;; this work item stores: the destination is one read-write parameter, never a second
+        ;; read-only view of the same storage.
+        destination-read? (boolean (some #(= output (:sym %)) transform-operands))
         transform-only-operands
-        (filterv #(not (contains? (set arrays) (:sym %))) transform-operands)
+        (filterv #(not (or (contains? (set arrays) (:sym %)) (= output (:sym %))))
+                 transform-operands)
         transform-only-scalars
         (filterv #(not (contains? (set scalars) (:sym %))) transform-scalars)
         scalar-dtype (fn [id] (or (get scalar-types id)
@@ -152,7 +158,6 @@
         accumulator 'segment-accumulator
         next-accumulator 'next-segment-accumulator
         reduction-result 'segment-result
-        output (:out contract-facts)
         physical-extent
         (fn [array]
           (lower-index (axis-map/n-elements (get operand-maps array)) index-scope))
@@ -176,7 +181,8 @@
                         array :input dtype [extent] :global
                         (layout/row-major [extent] dtype) :operand)))
                    arrays)
-              [(body/->KernelParameter output :output dtype [segment-count] :global
+              [(body/->KernelParameter output (if destination-read? :inout :output) dtype
+                                       [segment-count] :global
                                        (layout/row-major [segment-count] dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
@@ -200,7 +206,8 @@
         {:id [:contraction (:id segred) :portable-sequential]
          :parameters parameters
          :stable-reads (mapv body/stable-read
-                             (distinct (concat arrays (map :sym transform-operands))))
+                             (distinct (remove #{output}
+                                               (concat arrays (map :sym transform-operands)))))
          :indices (vec (concat
                         [(body/->IndexBinding group-index :group 0)
                          (body/->IndexBinding local-index :local 0)

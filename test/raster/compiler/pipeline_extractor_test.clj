@@ -113,3 +113,24 @@
                info)]
         (is (nil? (nr-key r)))
         (is (= 'obuf (:result r)))))))
+
+(deftest a-host-loop-after-a-kernel-step-is-not-straight-line
+  ;; A `dotimes` binding is untagged and reads no intermediate buffer, so it used to pass as a
+  ;; size-let closure: the loop's effect (here a reduction into `out`) silently vanished from
+  ;; the resident program. It is host control flow and is rejected by name.
+  (is (= :host-control-flow
+         (why '(let* [rows (clojure.core/alength b)
+                      cols (clojure.core/alength x)
+                      fill (raster.gpu.ze-runtime/invoke-registered-kernel "k" [b] out [] rows)
+                      _eff (dotimes [i rows]
+                             (dotimes [j cols]
+                               (clojure.core/aset out i (clojure.core/+ (clojure.core/aget out i)
+                                                                         (clojure.core/aget x j)))))]
+                     out)))))
+
+(deftest a-mutating-host-call-is-not-a-size-let
+  ;; a copy the region-copy pass retains (same array: memmove) is still an effect
+  (is (= :host-control-flow
+         (why '(let* [fill (raster.gpu.ze-runtime/invoke-registered-kernel "k" [b] out [] n)
+                      _eff (java.lang.System/arraycopy out (int 0) out (int 1) n)]
+                     out)))))

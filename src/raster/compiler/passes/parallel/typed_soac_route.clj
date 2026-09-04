@@ -470,6 +470,15 @@
                          (map :destination
                               (get-in equation-facts [:attributes :result-storage])))))
               (:equations (dialect/facts program)))
+        ;; Bindings the typed program leaves under host control (an opaque effect loop, a
+        ;; host call) are retained as written, so everything they read is a root of the host
+        ;; dependency closure too: a size scalar only that loop reads must stay bound.
+        host-controlled-reads
+        (into #{}
+              (comp (keep-indexed (fn [id [_ expression]]
+                                    (when (contains? host-binding-ids id) expression)))
+                    (mapcat util/free-syms))
+              original-pairs)
         host-bindings
         (required-host-bindings
          (keep-indexed (fn [_ [symbol :as pair]]
@@ -480,6 +489,7 @@
                          (when-not (contains? realized-host-symbols symbol) pair))
                        original-pairs)
          (set/union physical-destinations
+                    host-controlled-reads
                     (into #{} (mapcat util/free-syms) body)))
         pairs
         (vec

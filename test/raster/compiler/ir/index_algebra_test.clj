@@ -91,3 +91,26 @@
     (is (nil? (ia/index-form '(+ (+ (* t (* 2 (* h H))) (* h (* 2 h))) j) 'idx '(* T H)
                              '[{:id t :init (quot idx H)} {:id h :init (rem idx H)}]
                              '{j (* 2 h)})))))
+
+(deftest a-product-of-a-sum-by-an-invariant-distributes
+  ;; attention prefill: sc[(i·n-q + hq)·nrows + j] over idx with digits i, hq, j
+  (let [extent '(clojure.core/* nrows (clojure.core/* n-q nrows))
+        locals '[{:id per-i :init (clojure.core/* n-q nrows)}
+                 {:id i :init (clojure.core/quot idx per-i)}
+                 {:id rest0 :init (clojure.core/rem idx per-i)}
+                 {:id hq :init (clojure.core/quot rest0 nrows)}
+                 {:id j :init (clojure.core/rem rest0 nrows)}
+                 {:id row :init (clojure.core/+ (clojure.core/* i n-q) hq)}]
+        form (ia/index-form '(clojure.core/+ (clojure.core/* row nrows) j) 'idx extent locals {})]
+    (is (some? form))
+    (is (ia/injective? form))
+    (is (= '{i {:const 1 :factors [n-q nrows]} hq {:const 1 :factors [nrows]} j {:const 1 :factors []}}
+           (into {} (map (fn [[digit {:keys [coefficient]}]] [digit coefficient])) (:terms form)))))
+  (testing "a scaled constant becomes a symbolic offset"
+    (let [form (ia/index-form '(clojure.core/* (clojure.core/+ i 1) n) 'i 'm [] {})]
+      (is (= {:const 1 :factors '[n]} (:offset form)))))
+  (testing "a product of two digit-carrying factors is not affine"
+    (is (nil? (ia/index-form '(clojure.core/* (clojure.core/+ i 1) (clojure.core/+ j 1)) 'idx
+                             '(clojure.core/* m n)
+                             '[{:id i :init (clojure.core/quot idx n)} {:id j :init (clojure.core/rem idx n)}]
+                             {})))))

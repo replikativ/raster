@@ -284,7 +284,11 @@
     contract-axes— [[idx-sym bound] ...] the reduced axes: 0 (outer product / pure map),
                    1, or n (n≥2 are flattened into one innermost reduced dim)
     body         — the summand expression; may reference every free and contract idx
-    opts         — :init (accumulator init, default 0.0), :combine (default +)
+    opts         — :init (accumulator init, default 0.0), :combine (default +),
+                   :epilogue (a result transform applied to every completed segment result:
+                   {:acc sym :expr form :operands [{:sym array :map axis-map :dtype dt}]
+                    :scalars [{:sym s :dtype dt}]}; `expr` reads each operand at the element
+                   its axis map names, so it may read the destination itself)
 
   Semantics: for each free index tuple f, out[flat(f)] = combine-fold over the
   contracted axis of body. The COMPILER recognizes the `raster.par/contract` form
@@ -296,7 +300,8 @@
   Example (C[m,n] = A[m,k]·B[k,n], row-major):
     (raster.par/contract C [[i m] [j n]] [[l k]]
       (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))"
-  [out free-axes contract-axes body & {:keys [init combine stages] :or {init 0.0 combine '+}}]
+  [out free-axes contract-axes body & {:keys [init combine stages epilogue]
+                                       :or {init 0.0 combine '+}}]
   (assert (vector? free-axes) "par/contract: free-axes must be a vector of [idx bound]")
   (assert (vector? contract-axes)
           "par/contract: contract-axes must be a vector (0 → outer product/map; n≥1 → contraction, n≥2 flattened)")
@@ -313,6 +318,21 @@
         body (if (seq stages)
                ((requiring-resolve 'raster.compiler.ir.contract-stages/flat-equivalent) stages body)
                body)
+        ;; The result transform is the same region the typed kernels store through; an operand
+        ;; read is the element at the coordinates its axis map names, in the free indices that
+        ;; are in scope at the store.
+        apply-epilogue
+        (fn [value]
+          (if epilogue
+            (let [{:keys [acc expr operands]} epilogue
+                  index-expr (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)
+                  rewrite (requiring-resolve
+                           'raster.compiler.core.op-descriptor/rewrite-aget-indices)
+                  indices (into {} (clojure.core/map (fn [operand]
+                                                       [(:sym operand) (index-expr (:map operand))]))
+                                operands)]
+              `(let [~acc ~value] ~(rewrite expr indices)))
+            value))
         free-syms   (mapv first free-axes)
         int-bounds  (mapv (fn [[_ b]] `(int ~b)) free-axes)
         f-sym   (gensym "f__")
@@ -341,7 +361,7 @@
       `(let [~out-sym ~out ~F-sym ~F-expr]
          (dotimes [~f-sym ~F-sym]
            (let [~@decomp]
-             (clojure.core/aset ~out-sym ~f-sym ~body)))
+             (clojure.core/aset ~out-sym ~f-sym ~(apply-epilogue body))))
          ~out-sym)
       ;; n≥1 contract axes → contraction: reduce `body` over the (flattened) contracted axis.
       ;; flatten-contract-axes collapses n≥2 axes into one flat index k-sym and substitutes
@@ -353,10 +373,11 @@
            (dotimes [~f-sym ~F-sym]
              (let [~@decomp]
                (clojure.core/aset ~out-sym ~f-sym
-                                  (loop [~k-sym 0 ~acc-sym ~init]
-                                    (if (clojure.core/< ~k-sym (int ~k-bound))
-                                      (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~sbody))
-                                      ~acc-sym)))))
+                                  ~(apply-epilogue
+                                    `(loop [~k-sym 0 ~acc-sym ~init]
+                                       (if (clojure.core/< ~k-sym (int ~k-bound))
+                                         (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~sbody))
+                                         ~acc-sym))))))
            ~out-sym)))))
 
 (defmacro scan

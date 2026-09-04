@@ -125,35 +125,30 @@
   [sym]
   (or (descriptor/multiplication-op? sym) (contains? unchecked-multiply-ops sym)))
 
+(defn- linear-index-parts
+  "`[outer-sym extent inner-sym]` of an index spelled `(+ (* outer extent) inner)`, in the
+   semantic view of the call (a walked `.invk` multiply is a multiply), else nil."
+  [idx-expr]
+  (when (and (seq? idx-expr) (index-add-op? (descriptor/semantic-op idx-expr)))
+    (let [[mul-expr inner :as arguments] (vec (descriptor/call-args idx-expr))]
+      (when (and (= 2 (count arguments))
+                 (seq? mul-expr)
+                 (index-multiply-op? (descriptor/semantic-op mul-expr)))
+        (let [[outer extent :as factors] (vec (descriptor/call-args mul-expr))]
+          (when (= 2 (count factors))
+            [outer extent inner]))))))
+
 (defn row-major-linear-index?
   "Check whether idx-expr is the row-major linearization (+ (* i cols) j).
-	Accepts qualified and unchecked arithmetic variants."
+	Accepts qualified, unchecked and walker-devirtualized arithmetic variants."
   [idx-expr i-sym j-sym cols-expr]
-  (and (seq? idx-expr)
-       (index-add-op? (first idx-expr))
-       (= 3 (count idx-expr))
-       (let [mul-expr (second idx-expr)]
-         (and (seq? mul-expr)
-              (index-multiply-op? (first mul-expr))
-              (= 3 (count mul-expr))
-              (= i-sym (second mul-expr))
-              (= cols-expr (nth mul-expr 2))))
-       (= j-sym (nth idx-expr 2))))
+  (= [i-sym cols-expr j-sym] (linear-index-parts idx-expr)))
 
 (defn column-major-linear-index?
   "Check whether idx-expr is the column-major linearization (+ (* j rows) i).
-				Accepts qualified and unchecked arithmetic variants."
+	Accepts qualified, unchecked and walker-devirtualized arithmetic variants."
   [idx-expr i-sym j-sym rows-expr]
-  (and (seq? idx-expr)
-       (index-add-op? (first idx-expr))
-       (= 3 (count idx-expr))
-       (let [mul-expr (second idx-expr)]
-         (and (seq? mul-expr)
-              (index-multiply-op? (first mul-expr))
-              (= 3 (count mul-expr))
-              (= j-sym (second mul-expr))
-              (= rows-expr (nth mul-expr 2))))
-       (= i-sym (nth idx-expr 2))))
+  (= [j-sym rows-expr i-sym] (linear-index-parts idx-expr)))
 
 (defn match-dotimes-map-loop
   "Match a dotimes loop that writes one element with aset.
