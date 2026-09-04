@@ -64,7 +64,7 @@
         right (bview/view allocation {:id :right :byte-offset 32 :dtype :float :shape [8]})
         overlap (bview/view allocation {:id :overlap :byte-offset 16 :dtype :float :shape [8]})
         use (fn [id access] (kgraph/->ValueUse id access))
-        node (fn [id uses deps] (kgraph/->ScheduledKernel id :mock uses deps))
+        node (fn [id uses deps] (kgraph/->ScheduledKernel id :mock uses nil deps))
         validate! (ns-resolve 'raster.gpu.core 'validate-physical-aliases!)]
     (testing "disjoint views of one allocation are legal"
       (is (map? (validate! {:nodes [(node :one [(use :a :read) (use :b :write)] [])]}

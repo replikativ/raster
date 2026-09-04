@@ -850,6 +850,7 @@
                           (filter (fn [[slot argument]]
                                     (and (= :scalar (:kind slot))
                                          (or (symbol? argument)
+                                             (keyword? argument)
                                              (contains? declared-scalar-ids argument)))))
                           vec)
         scalar-groups (group-by second scalar-pairs)
@@ -898,10 +899,31 @@
                                         :target supplied-dtype})))
                              (kabi/slot argument :scalar logical-dtype
                                         :kernel-dtype kernel-dtype :role role)))
-                         scalar-arguments)]
+                         scalar-arguments)
+        explicit-scalars
+        (if (some? declared-scalars)
+          declared-scalars
+          (mapv (fn [slot argument]
+                  (kgraph/scalar argument (:dtype slot)))
+                scalar-abi scalar-arguments))
+        explicit-nodes
+        (mapv (fn [node]
+                (let [artifact (:operation node)
+                      actual (kgraph/scalar-argument-uses
+                              (:abi artifact) (:arguments artifact))
+                      scheduled (:scalar-uses node)]
+                  (when (and (some? scheduled) (not= scheduled actual))
+                    (throw (ex-info "emitted kernel scalar dependencies differ from its schedule"
+                                    {:reason :kernel-graph-artifact-scalar-uses
+                                     :node (:id node)
+                                     :expected scheduled :actual actual})))
+                  (assoc node :scalar-uses actual)))
+              (:nodes emitted))]
     (-> emitted
         (assoc :abi (vec (concat pointer-abi scalar-abi))
-               :arguments (vec (concat (map :id external-buffers) scalar-arguments)))
+               :arguments (vec (concat (map :id external-buffers) scalar-arguments))
+               :scalars explicit-scalars
+               :nodes explicit-nodes)
         (assoc-in [:provenance :target-dialect] target-dialect)
         (assoc-in [:attributes :emitted?] true)
         kgraph/validate!)))

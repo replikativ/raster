@@ -4,6 +4,7 @@
             [clojure.java.shell :as shell]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.indexed-attention-route :as route]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]))
@@ -77,21 +78,42 @@
                                     (map (fn [value] {:type :long :value value})
                                          [3 4 5 2 2 15])))
         call (kcall/make artifact runtime-values)
-        output-elements (get-in (plan) [:output :elements])
+        graph-scalars (zipmap (map :id (:scalars graph))
+                              (map (fn [value] {:type :long :value value})
+                                   [3 4 5 2 2]))
+        graph-buffers (into {}
+                            (map (fn [{:keys [id]}] [id (Object.)]))
+                            (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        graph-call (kgcall/make graph graph-buffers graph-scalars)
+        output-elements (launch/product 'n-nodes 'emb-dim)
         graph-output (first (:outputs graph))]
     (is (= '[Q K V dst src normalized
              n_entities n_edges total_dim n_heads n_components output_elements]
            (mapv :name (:abi artifact))))
-    (is (= '[Q K V dst src normalized
-             n-nodes n-edges emb-dim n-heads dk
-             (clojure.core/* n-nodes emb-dim)]
-           (:arguments artifact)))
+    (is (= '[Q K V dst src normalized n-nodes n-edges emb-dim n-heads dk]
+           (vec (butlast (:arguments artifact))))
+        "the final target-private extent has explicit arithmetic IR")
+    (is (= (launch/product 'n-nodes 'emb-dim)
+           (last (:arguments artifact))))
+    (is (= '[Q K V dst src normalized n-nodes n-edges emb-dim n-heads dk]
+           (:arguments graph))
+        "the graph boundary exposes logical shape scalars, not a derived duplicate")
+    (is (= #{'n-nodes 'n-edges 'emb-dim 'n-heads 'dk}
+           (get-in graph [:nodes 0 :scalar-uses])))
     (is (= [16 1] (get-in call [:geometry :workgroup-size])))
     (is (= [1 3] (get-in call [:geometry :group-count])))
-    (is (= output-elements (get-in artifact [:attributes :out-elems])))
-    (is (= 15 (kgcall/resolve-integer
-               {output-elements {:type :long :value 15}}
-               (:elements graph-output))))
+    (is (= (launch/product 'n-nodes 'emb-dim)
+           (get-in artifact [:attributes :out-elems])))
+    (is (= {:type :long :value 15}
+           (last (get-in graph-call [:nodes 0 :call :arguments])))
+        "the graph derives the target-private output extent from public shape scalars")
+    (is (every? #(= output-elements (:elements %))
+                (remove (comp #{'dst 'src} :id)
+                        (concat (:inputs graph) (:outputs graph)))))
+    (is (every? #(= #{'n-edges}
+                     (launch/expression-references (:elements %)))
+                (filter (comp #{'dst 'src} :id) (:inputs graph))))
+    (is (= 15 (kgcall/resolve-integer graph-scalars (:elements graph-output))))
     (is (str/includes? (:source artifact) "long n_entities"))
     (is (str/includes? (:source artifact) "sqrt((float)n_components)"))))
 

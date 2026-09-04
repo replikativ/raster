@@ -24,22 +24,23 @@
                    :semantic-contract :contract
                    [(graph/->ValueUse 'a :read)
                     (graph/->ValueUse 'b :read)
-                    (graph/->ValueUse 'c :write)] [])]
+                    (graph/->ValueUse 'c :write)] #{} [])]
           :scalars scalars :abi interface :arguments arguments :effects effects})
         refined
         (graph/make
          {:inputs [a b] :outputs [c] :temporaries [ah bh]
           :nodes [(graph/->ScheduledKernel
                    :cast-a :cast-a
-                   [(graph/->ValueUse 'a :read) (graph/->ValueUse 'a-half :write)] [])
+                   [(graph/->ValueUse 'a :read) (graph/->ValueUse 'a-half :write)] #{} [])
                   (graph/->ScheduledKernel
                    :cast-b :cast-b
-                   [(graph/->ValueUse 'b :read) (graph/->ValueUse 'b-half :write)] [])
+                   [(graph/->ValueUse 'b :read) (graph/->ValueUse 'b-half :write)] #{} [])
                   (graph/->ScheduledKernel
                    :matrix :matrix
                    [(graph/->ValueUse 'a-half :read)
                     (graph/->ValueUse 'b-half :read)
                     (graph/->ValueUse 'c :write)]
+                   #{}
                    [:cast-a :cast-b])]
           :scalars scalars :abi interface :arguments arguments :effects effects})]
     {:a a :b b :c c :source source :refined refined}))

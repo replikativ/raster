@@ -56,7 +56,7 @@
               (keep (fn [[slot argument]]
                       (when (= :scalar (:kind slot)) [argument slot])))
               (map vector (:abi graph) (:arguments graph)))]
-    (doseq [{:keys [id operation uses]} (:nodes graph)]
+    (doseq [{:keys [id operation uses scalar-uses]} (:nodes graph)]
       (let [artifact (kart/validate! operation)
             pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot)))
                                    (mapv vector (:abi artifact) (:arguments artifact)))
@@ -109,7 +109,13 @@
                                    :references references
                                    :public-scalars (set (keys public-scalars))
                                    :expression-error (ex-data exception)}
-                                  exception)))))))))
+                                  exception)))))))
+        (let [actual-scalar-uses
+              (kgraph/scalar-argument-uses (:abi artifact) (:arguments artifact))]
+          (when (not= scalar-uses actual-scalar-uses)
+            (throw (ex-info "kernel artifact scalar arguments differ from scheduled graph uses"
+                            {:reason :kernel-graph-artifact-scalar-uses
+                             :node id :expected scalar-uses :actual actual-scalar-uses}))))))
     graph))
 
 (defn validate!
@@ -125,6 +131,12 @@
       (when-not (seq (:nodes graph))
         (throw (ex-info "emitted kernel graph requires at least one kernel node"
                         {:reason :kernel-graph-executable-empty :graph graph})))
+      (when (or (nil? (:scalars graph))
+                (some (comp nil? :scalar-uses) (:nodes graph)))
+        (throw (ex-info "emitted kernel graph requires explicit scalar dependencies"
+                        {:reason :kernel-graph-executable-scalars
+                         :scalars (:scalars graph)
+                         :node-scalar-uses (mapv (juxt :id :scalar-uses) (:nodes graph))})))
       (validate-node-artifact-bindings! graph)
       (let [targets (set (map :target (artifacts graph)))]
         (when-not (= 1 (count targets))

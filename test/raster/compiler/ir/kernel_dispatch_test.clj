@@ -84,14 +84,15 @@
       :temporaries [(kgraph/buffer temporary :float 'width :device :temporary)]
       :abi abi
       :arguments '[x out width]
+      :scalars [(kgraph/scalar 'width :long)]
       :nodes [(kgraph/->ScheduledKernel
                :stage-one first-stage
                [(kgraph/->ValueUse 'x :read)
-                (kgraph/->ValueUse temporary :write)] [])
+                (kgraph/->ValueUse temporary :write)] #{'width} [])
               (kgraph/->ScheduledKernel
                :stage-two second-stage
                [(kgraph/->ValueUse temporary :read)
-                (kgraph/->ValueUse 'out :write)] [:stage-one])]
+                (kgraph/->ValueUse 'out :write)] #{'width} [:stage-one])]
       :effects (:effects reference)
       :attributes {:strategy :two-stage}})))
 

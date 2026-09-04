@@ -28,6 +28,35 @@
   [graph]
   (set (map :id (graph-buffers graph))))
 
+(defn- scalar-interface
+  [graph]
+  (filterv (fn [[slot _]] (= :scalar (:kind slot)))
+           (mapv vector (:abi graph) (:arguments graph))))
+
+(defn- validate-scalar-values!
+  [graph scalar-values]
+  (when-not (map? scalar-values)
+    (throw (ex-info "kernel graph call scalar values must be a map"
+                    {:scalar-values scalar-values})))
+  (let [interface (scalar-interface graph)
+        expected (set (map second interface))
+        actual (set (keys scalar-values))]
+    (when-not (= expected actual)
+      (throw (ex-info "kernel graph call requires exactly every public scalar"
+                      {:reason :kernel-graph-call-scalars
+                       :expected expected :bound actual})))
+    (doseq [[slot argument] interface
+            :let [value (get scalar-values argument)]]
+      (when-not (and (map? value) (contains? value :type) (contains? value :value))
+        (throw (ex-info "graph symbolic scalar requires an explicitly typed runtime value"
+                        {:reason :kernel-graph-call-scalar-type
+                         :argument argument :slot slot :value value})))
+      (when-not (= (:kernel-dtype slot) (:type value))
+        (throw (ex-info "kernel graph scalar argument has the wrong ABI dtype"
+                        {:reason :kernel-graph-call-scalar-type
+                         :argument argument :slot slot :value value}))))
+    scalar-values))
+
 (defn- scalar-number
   [scalar-values value]
   (let [resolved (if (contains? scalar-values value)
@@ -95,9 +124,7 @@
                       {:declared declared :bound (set (keys buffers))})))
     (when (some nil? (vals buffers))
       (throw (ex-info "kernel graph call buffer cannot be nil" {})))
-    (when-not (map? scalar-values)
-      (throw (ex-info "kernel graph call scalar values must be a map"
-                      {:scalar-values scalar-values})))
+    (validate-scalar-values! graph scalar-values)
     (when-not (vector? nodes)
       (throw (ex-info "kernel graph call nodes must be an ordered vector" {:nodes nodes})))
     (when-not (= (count (:nodes graph)) (count nodes))
@@ -129,7 +156,7 @@
   [graph buffers scalar-values]
   (let [graph (kgraph/validate! graph)
         declared (declared-buffer-ids graph)
-        scalar-values (or scalar-values {})]
+        scalar-values (validate-scalar-values! graph (or scalar-values {}))]
     (when-not (= declared (set (keys buffers)))
       (throw (ex-info "kernel graph call requires exactly every declared graph buffer"
                       {:declared declared :bound (set (keys buffers))})))

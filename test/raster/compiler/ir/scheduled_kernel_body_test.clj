@@ -107,11 +107,12 @@
   (let [value (fixture)
         node (graph/->ScheduledKernel
               :node :semantic-map
-              [(graph/->ValueUse 'input :read) (graph/->ValueUse 'output :write)] [])
+              [(graph/->ValueUse 'input :read) (graph/->ValueUse 'output :write)] #{} [])
         kernel-graph
         (graph/make
          {:inputs [(graph/buffer 'input :float 1 :global :input)]
           :outputs [(graph/buffer 'output :float 1 :global :output)]
+          :scalars []
           :nodes [node]})]
     (is (identical? value (scheduled/validate-against-node! value node kernel-graph)))
     (testing "source identity and memory effects are independent obligations"

@@ -874,7 +874,9 @@
   [candidate operation-id common-abi common-arguments]
   (let [{:keys [family strategy artifact candidate-schedule]} candidate
         artifact (kart/validate! artifact)
-        interface (mapv vector common-abi common-arguments)
+        {public-abi :abi public-arguments :arguments}
+        (kgraph/public-interface common-abi common-arguments)
+        interface (mapv vector public-abi public-arguments)
         pointer-interface (filterv #(not= :scalar (:kind (first %))) interface)
         buffers (mapv (fn [[slot argument]]
                         [argument
@@ -896,10 +898,12 @@
     (kgraph/make
      {:inputs inputs
       :outputs outputs
-      :abi common-abi
-      :arguments common-arguments
+      :scalars (kgraph/interface-scalars public-abi public-arguments)
+      :abi public-abi
+      :arguments public-arguments
       :nodes [(kgraph/->ScheduledKernel
-               [:typed-contraction operation-id family strategy] artifact uses [])]
+               [:typed-contraction operation-id family strategy] artifact uses
+               (kgraph/scalar-argument-uses (:abi artifact) (:arguments artifact)) [])]
       :effects (:effects artifact)
       :provenance {:operation-id operation-id
                    :semantic-op :contraction
@@ -950,13 +954,16 @@
 
 (defn- reinterface-graph
   [graph abi arguments effects operation-id]
-  (kgraph/validate!
-   (-> graph
-       (assoc :abi abi :arguments arguments :effects effects)
-       (update :provenance merge {:operation-id operation-id
-                                  :source-dialect :typed-soac})
-       (update :attributes merge {:candidate-family :matrix
-                                  :semantic-op :contraction}))))
+  (let [{public-abi :abi public-arguments :arguments}
+        (kgraph/public-interface abi arguments)]
+    (kgraph/validate!
+     (-> graph
+         (assoc :abi public-abi :arguments public-arguments :effects effects
+                :scalars (kgraph/interface-scalars public-abi public-arguments))
+         (update :provenance merge {:operation-id operation-id
+                                    :source-dialect :typed-soac})
+         (update :attributes merge {:candidate-family :matrix
+                                    :semantic-op :contraction})))))
 
 (defn- mixed-dpas-alternatives
   "Derive graph-valued mixed-precision DPAS schedules from ordinary typed contraction facts.

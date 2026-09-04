@@ -240,7 +240,7 @@
   [expression]
   (cond
     (integer? expression) #{}
-    (runtime-value? expression) #{(:value expression)}
+    (runtime-value? expression) (expression-references (:value expression))
     (ceil-div? expression) (into (expression-references (:value expression))
                                  (expression-references (:divisor expression)))
     (floor-div? expression) (into (expression-references (:value expression))
