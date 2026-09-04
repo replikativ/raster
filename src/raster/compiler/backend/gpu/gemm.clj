@@ -141,10 +141,11 @@
                                   (aget B (+ (* j k) l))))))
 
 (defn- portable-scalar-matrix-plan
-  [variant]
+  [variant stage-id]
   (let [form (scalar-contraction-form variant)
         facts (contraction-facts/contraction-facts form :dtype :float)
-        operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
+        operation (contract-lower/contract-form->segred
+                   form :id stage-id :dtype :float :facts facts)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'A :float 'B :float 'C :float}
@@ -159,7 +160,8 @@
   ([kernel-name variant]
    (emit-portable-scalar-matrix-kernel kernel-name variant :opencl-intel))
   ([kernel-name variant target-dialect]
-   (let [kernel-body (:body (portable-scalar-matrix-plan variant))]
+   (let [kernel-body (:body (portable-scalar-matrix-plan
+                             variant [:direct-gemm kernel-name]))]
      {:source
       (kernel-body-opencl/emit-scalar-kernel
        kernel-name kernel-body
@@ -175,7 +177,8 @@
         {:keys [a-elements b-elements c-elements]} (extents spec)
         prefix (identifier (str id "_scalar"))
         kernel-name (str prefix "_gemm")
-        {:keys [operation body]} (portable-scalar-matrix-plan variant)
+        stage-id [:gemm id :f32-scalar :contract]
+        {:keys [operation body]} (portable-scalar-matrix-plan variant stage-id)
         gemm (emit-scheduled-body-artifact
               {:kernel-name kernel-name :source operation :body body
                :arguments [a b c k m n c-elements]
@@ -191,7 +194,7 @@
      {:inputs [(graph-buffer a :float a-elements :input)
                (graph-buffer b :float b-elements :input)]
       :outputs [(graph-buffer c :float c-elements :output)]
-      :nodes [(node [:gemm id :scalar] gemm
+      :nodes [(node stage-id gemm
                     [(value-use a :read) (value-use b :read) (value-use c :write)] [])]
       :abi abi :arguments arguments
       :effects (effects spec)
@@ -199,7 +202,7 @@
       :attributes {:strategy :f32-scalar :variant variant :precision :f32}})))
 
 (defn- convert-artifact
-  [kernel-name in out elements vector-width phase]
+  [kernel-name stage-id in out elements vector-width phase]
   (let [kernel-name (c-emit/c-symbol kernel-name)
         kernel-body
         (layout-emitter/cast-body
@@ -209,7 +212,7 @@
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name
       :source (layout-stage/make
-               {:id [:gemm phase] :operation :cast :input in :output out
+               {:id stage-id :operation :cast :input in :output out
                 :input-shape [elements] :output-shape [elements]
                 :input-dtype :float :output-dtype :half
                 :policy {:rounding :nearest-even :overflow :ieee}})
@@ -226,7 +229,7 @@
       :parameter-names {in "input" out "output" :layout-elements "n"}})))
 
 (defn- transpose-artifact
-  [kernel-name in out rows cols phase]
+  [kernel-name stage-id in out rows cols phase]
   (let [kernel-name (c-emit/c-symbol kernel-name)
         kernel-body
         (layout-emitter/transpose-body
@@ -234,7 +237,7 @@
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name
       :source (layout-stage/make
-               {:id [:gemm phase] :operation :transpose :input in :output out
+               {:id stage-id :operation :transpose :input in :output out
                 :input-shape [rows cols] :output-shape [cols rows]
                 :input-dtype :half :output-dtype :half
                 :policy {:permutation [1 0]}})
@@ -402,8 +405,14 @@
           :effects {:kind :tensor-contraction-stage :uses uses}
           :legality {:kind :matrix-instruction-tiling
                      :scheduled-body (:id kernel-body)}
-          :numerics {:mode :reassociated :policy :tiled-contraction
-                     :rounding :nearest-even :accumulator-dtype :float}
+          :numerics (cond-> {:mode :reassociated :policy :tiled-contraction
+                             :rounding :nearest-even :accumulator-dtype :float}
+                      (seq (:epilogue source-operation))
+                      (assoc :result-transform
+                             {:kind :typed-scalar-region
+                              :policy :same-typed-ssa-evaluation-order
+                              :input-dtype :float
+                              :result-dtype (:result-dtype source-operation)}))
           :provenance {:semantic-op :contraction :lowering :gemm-graph :phase phase}
           :attributes (cond-> {:strategy phase
                                ;; Temporary compatibility projection; the body schedule is the
@@ -417,7 +426,7 @@
      kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn- gemm-artifact
-  [{:keys [id m n k tile epilogue]} kernel-name a b c split-k? kc splits phase]
+  [{:keys [id m n k tile epilogue]} stage-id kernel-name a b c split-k? kc splits phase]
   (let [reduction (if split-k?
                     (let [slice 'k-slice
                           lower (kbody/expression :mul slice kc)]
@@ -426,13 +435,13 @@
                                       :min (kbody/expression :add lower kc) k)]})
                     {:kind :full :range [0 k]})
         stage (matrix-stage/make
-               {:id [:gemm id phase]
+               {:id stage-id
                 :lhs a :rhs b :result c :dimensions [m n k]
                 :reduction reduction
                 :result-shape (if split-k? [splits m n] [m n])
                 :epilogue (when-not split-k? epilogue)})
         emit-args {:kernel-name kernel-name
-                   :id [:gemm id phase]
+                   :id stage-id
                    :a a :b b :c c :m m :n n :k k
                    :tile tile :result-dtype :float
                    :epilogue (when-not split-k? epilogue)
@@ -448,12 +457,13 @@
        emit-args))))
 
 (defn- split-k-combine-plan
-  []
+  [stage-id]
   (let [form '(raster.par/contract C [[i mn]] [[s splits]]
                                    (clojure.core/aget
                                     partials (clojure.core/+ (clojure.core/* s mn) i)))
         facts (contraction-facts/contraction-facts form :dtype :float)
-        operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
+        operation (contract-lower/contract-form->segred
+                   form :id stage-id :dtype :float :facts facts)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'partials :float 'C :float}
@@ -468,7 +478,7 @@
   ([kernel-name] (emit-split-k-combine-kernel kernel-name :opencl-intel))
   ([kernel-name target-dialect]
    (let [kernel-name (c-emit/c-symbol kernel-name)
-         kernel-body (:body (split-k-combine-plan))
+         kernel-body (:body (split-k-combine-plan [:direct-split-k-combine kernel-name]))
          source (kernel-body-opencl/emit-scalar-kernel
                  kernel-name kernel-body
                 {:target-dialect target-dialect
@@ -477,8 +487,8 @@
      {:kernel-name kernel-name :source source :kernel-body kernel-body :workgroup-size 256})))
 
 (defn- combine-artifact
-  [kernel-name partials c mn splits]
-  (let [{:keys [operation body]} (split-k-combine-plan)]
+  [kernel-name stage-id partials c mn splits]
+  (let [{:keys [operation body]} (split-k-combine-plan stage-id)]
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name :source operation :body body
       :arguments [partials c mn splits mn]
@@ -524,21 +534,28 @@
         transpose-a-id [:gemm id strategy :transpose-a]
         transpose-b-id [:gemm id strategy :transpose-b]
         contract-id [:gemm id strategy :contract]
-        convert-a (convert-artifact (str prefix "_convert_a") a a16 a-elements vector-width
+        convert-a (convert-artifact (str prefix "_convert_a") convert-a-id
+                                    a a16 a-elements vector-width
                                     :convert-a)
-        convert-b (convert-artifact (str prefix "_convert_b") b b16 b-elements vector-width
+        convert-b (convert-artifact (str prefix "_convert_b") convert-b-id
+                                    b b16 b-elements vector-width
                                     :convert-b)
         transpose-a (when (contains? #{:tn :tt} variant)
-                      (transpose-artifact (str prefix "_transpose_a") a16 at16 k m
+                      (transpose-artifact (str prefix "_transpose_a") transpose-a-id
+                                          a16 at16 k m
                                           :transpose-a))
         transpose-b (when (contains? #{:nt :tt} variant)
-                      (transpose-artifact (str prefix "_transpose_b") b16 bt16 n k
+                      (transpose-artifact (str prefix "_transpose_b") transpose-b-id
+                                          b16 bt16 n k
                                           :transpose-b))
         contract-output (if split-k? partials c)
-        contract (gemm-artifact spec (str prefix "_contract") final-a final-b contract-output
+        contract (gemm-artifact spec contract-id (str prefix "_contract")
+                                final-a final-b contract-output
                                 split-k? kc splits :matrix-contract)
         combine (when split-k?
-                  (combine-artifact (str prefix "_combine") partials c c-elements splits))
+                  (combine-artifact (str prefix "_combine")
+                                    [:gemm id strategy :combine]
+                                    partials c c-elements splits))
         nodes (cond->
                [(node convert-a-id convert-a [(value-use a :read) (value-use a16 :write)] [])
                 (node convert-b-id convert-b [(value-use b :read) (value-use b16 :write)] [])]
@@ -582,7 +599,7 @@
   [{:keys [id a b c batch m n k tile batching]}]
   (let [kernel-name (str (identifier (str id "_xmx_batched")) "_contract")
         stage (matrix-stage/make
-               {:id [:gemm id :xmx-batched]
+               {:id [:gemm id :xmx-batched :contract]
                 :lhs a :rhs b :result c :dimensions [m n k]
                 :batching {:extent batch
                            :lhs (get batching :row true)
@@ -633,9 +650,11 @@
         convert-a-id [:gemm id :xmx-batched :convert-a]
         convert-b-id [:gemm id :xmx-batched :convert-b]
         contract-id [:gemm id :xmx-batched :contract]
-        convert-a (convert-artifact (str prefix "_convert_a") a a16 a-elements vector-width
+        convert-a (convert-artifact (str prefix "_convert_a") convert-a-id
+                                    a a16 a-elements vector-width
                                     :convert-a)
-        convert-b (convert-artifact (str prefix "_convert_b") b b16 b-elements vector-width
+        convert-b (convert-artifact (str prefix "_convert_b") convert-b-id
+                                    b b16 b-elements vector-width
                                     :convert-b)
         contract (batched-gemm-artifact
                   (assoc spec :a a16 :b b16 :c c :batching batching))

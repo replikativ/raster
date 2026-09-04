@@ -53,6 +53,13 @@
            (reason-of #(scheduled/validate! (assoc value :source nil)))))
     (is (= :scheduled-kernel-body-numerics
            (reason-of #(scheduled/validate! (assoc value :numerics {})))))
+    (is (= :scheduled-kernel-body-numerics
+           (reason-of #(scheduled/validate!
+                        (assoc-in value [:numerics :result-transform]
+                                  {:kind :typed-scalar-region
+                                   :policy :unverified
+                                   :input-dtype :float
+                                   :result-dtype :float})))))
     (is (= :scheduled-kernel-body-effects
            (reason-of #(scheduled/validate!
                         (assoc-in value [:effects :reads] ['output])))))))

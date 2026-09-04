@@ -186,6 +186,11 @@
            (mapv :name (filter #(= :epilogue (:role %)) (:abi contract)))))
     (is (= '[bias scale] (take-last 2 (:arguments contract))))
     (is (= (:effects scheduled) (:effects contract)))
+    (is (= {:kind :typed-scalar-region
+            :policy :same-typed-ssa-evaluation-order
+            :input-dtype :float
+            :result-dtype :float}
+           (get-in scheduled [:numerics :result-transform])))
     (is (= #{:no-write-alias}
            (set (keep :aliasing (filter #(= :input (:kind %)) (:abi contract))))))
     (is (graph-call/kernel-graph-call? call))))
@@ -294,6 +299,36 @@
             source)]
       (is (seq layout-sources))
       (is (every? #(contains? #{:cast :transpose} (:operation %)) layout-sources)))))
+
+(deftest scheduled-stage-identities-include-the-candidate-strategy
+  (let [graphs (mapv #(dispatch/alternative (emitted :tt {:split-factors [2 8]}) %)
+                     [:f32-scalar :xmx-direct :xmx-split-k
+                      :xmx-split-k-2 :xmx-split-k-8])
+        stages (for [graph graphs
+                     node (:nodes graph)
+                     :let [source (get-in node [:operation :attributes
+                                                :scheduled-kernel-body :source])]]
+                 [(:id node) (:id source)])
+        stage-ids (mapv second stages)]
+    (is (every? (fn [[node-id stage-id]] (= node-id stage-id)) stages)
+        "the certificate names the exact scheduled graph node")
+    (is (= (count stage-ids) (count (distinct stage-ids)))
+        "a stage identity denotes one exact alternative, not merely a phase name")))
+
+(deftest batched-production-graph-stages-use-the-common-scheduled-body-projection
+  (let [{graph :graph}
+        (gemm/emit-batched-matrix-alternative
+         {:id :batched-certificate
+          :a 'a :b 'b :c 'c :batch 'batch :m 'm :n 'n :k 'k
+          :variant :nn :tile (hardware/derive-gemm-tile {})
+          :batching {:row true :col false}})]
+    (doseq [node (:nodes graph)]
+      (let [artifact (:operation node)
+            certificate (artifact/attribute artifact :scheduled-kernel-body)]
+        (is (scheduled-body/scheduled-kernel-body? certificate))
+        (is (= (:arguments certificate) (:arguments artifact)))
+        (is (= (:effects certificate) (:effects artifact)))
+        (is (= (scheduled-body/realized-launch certificate) (:launch artifact)))))))
 
 (deftest every-layout-schedule-realizes-to-kernel-calls
   (let [runtime-arguments (arguments 13 640 262144)]
