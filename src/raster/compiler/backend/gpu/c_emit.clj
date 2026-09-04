@@ -381,11 +381,28 @@
 (def ^:private c-reserved-words
   #{"int" "float" "double" "long" "void" "char" "short" "unsigned" "signed"
     "for" "while" "do" "if" "else" "return" "break" "continue" "switch" "case"
+    "default"
     "struct" "union" "enum" "typedef" "const" "static" "extern" "auto" "register"
     "sizeof" "goto" "volatile"
+    ;; C++ is part of the target-language intersection: CUDA and HIP kernels are compiled as C++.
+    "alignas" "alignof" "and" "and_eq" "asm" "bitand" "bitor" "catch" "class"
+    "compl" "concept" "consteval" "constexpr" "constinit" "const_cast" "co_await"
+    "co_return" "co_yield" "decltype" "delete" "dynamic_cast" "explicit" "export"
+    "char8_t" "char16_t" "char32_t" "final" "override"
+    "friend" "inline" "mutable" "namespace" "new" "noexcept" "not" "not_eq"
+    "nullptr" "operator" "or" "or_eq" "protected" "public" "reflexpr"
+    "reinterpret_cast" "requires" "static_assert" "static_cast" "template" "this"
+    "thread_local" "throw" "try" "typeid" "typename" "using" "virtual" "wchar_t"
+    "xor" "xor_eq"
+    ;; C11/C17 underscored spellings and C23 additions. Some have non-underscored C23 aliases
+    ;; already listed above; both remain unavailable in our shared target-language namespace.
+    "_Alignas" "_Alignof" "_Atomic" "_BitInt" "_Bool" "_Complex" "_Generic"
+    "_Imaginary" "_Noreturn" "_Static_assert" "_Thread_local"
+    "_Decimal32" "_Decimal64" "_Decimal128" "typeof" "typeof_unqual"
     ;; OpenCL specific (incl. scalar type keywords that are common variable names —
     ;; `half` is the OpenCL fp16 type, so a deftm binding named `half` collides)
-    "kernel" "global" "local" "constant" "private" "restrict"
+    "kernel" "global" "local" "constant" "private" "generic" "restrict"
+    "read_only" "write_only" "read_write" "pipe"
     "half" "bool" "uchar" "ushort" "uint" "ulong" "size_t" "ptrdiff_t"
     ;; GLSL specific
     "attribute" "uniform" "varying" "layout" "buffer" "shared"
@@ -398,6 +415,14 @@
     ;; Other reserved
     "sample" "patch" "coherent" "readonly" "writeonly"
     "centroid" "invariant" "main" "true" "false"})
+
+(defn- reserved-c-family-identifier?
+  [identifier]
+  (or (contains? c-reserved-words identifier)
+      ;; C and C++ reserve double-underscore names everywhere and underscore-uppercase names in
+      ;; the global namespace. CUDA/HIP implementation builtins use the same space.
+      (str/starts-with? identifier "__")
+      (boolean (re-matches #"_[A-Z].*" identifier))))
 
 (defn c-symbol
   "Convert a Clojure symbol name to a valid C identifier.
@@ -420,9 +445,17 @@
                      (<= (int \0) (int ch) (int \9))))
         s (apply str (map #(if (ascii? %) (str %) (format "_u%04x_" (int %))) source))
         s (if (and (seq s) (Character/isDigit ^char (first s))) (str "_" s) s)]
-    (if (contains? c-reserved-words s)
-      (str s "_")
-      s)))
+    (cond
+      (or (str/starts-with? s "__") (boolean (re-matches #"_[A-Z].*" s))) (str "rstr" s)
+      (contains? c-reserved-words s) (str s "_")
+      :else s)))
+
+(defn c-identifier?
+  "Whether `value` is already a portable, non-reserved C-family identifier."
+  [value]
+  (and (string? value)
+       (boolean (re-matches #"[A-Za-z_][A-Za-z0-9_]*" value))
+       (not (reserved-c-family-identifier? value))))
 
 ;; ================================================================
 ;; Identity value normalization

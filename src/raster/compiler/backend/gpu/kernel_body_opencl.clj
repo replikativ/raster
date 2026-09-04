@@ -25,9 +25,7 @@
   (or (symbol? value) (keyword? value)))
 
 (defn- target-name [value]
-  (-> (name value)
-      (str/replace #"[^A-Za-z0-9_]" "_")
-      (str/replace #"^[^A-Za-z_]" "_$0")))
+  (ce/c-symbol value))
 
 (declare emit-index-expression target-type)
 
@@ -115,7 +113,7 @@
   (symbol (str (name dtype) "s")))
 
 (defn- lower-scalar-region
-  [kernel-body region]
+  [kernel-body region parameter-names]
   (let [parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
         operand-ids (set (map :sym (:operands region)))
         scalar-ids (remove operand-ids (rest (:parameters region)))
@@ -133,7 +131,7 @@
         (into {}
               (for [id (rest (:parameters region))
                     :let [parameter (get parameters id)]]
-                [id (with-meta (symbol (name id))
+                [id (with-meta (symbol (get parameter-names id))
                       {:raster.type/tag (if (= :scalar (:kind parameter))
                                           (scalar-tag (:dtype parameter))
                                           (array-tag (:dtype parameter)))})]))
@@ -152,11 +150,11 @@
                       (concat
                        (for [{:keys [sym dtype] :or {dtype :float}} (:operands region)]
                          (str ", __global const " (dtype/ctype :opencl dtype)
-                              "* restrict " (ce/c-symbol sym)))
+                              "* restrict " (get parameter-names sym)))
                        (for [id scalar-ids
                              :let [parameter (get parameters id)]]
                          (str ", " (dtype/ctype :opencl (:dtype parameter))
-                              " " (ce/c-symbol id)))))]
+                              " " (get parameter-names id)))))]
     {:epilogue (fn [accumulator-expression row col]
                  (-> emitted
                      (str/replace accumulator-token (str "(" accumulator-expression ")"))
@@ -172,7 +170,12 @@
 
   Returns nil for identity stores. This is a target lowering of typed KernelBody data: callers
   never supply source callbacks, parameter declaration strings, or helper source."
-  [kernel-body]
+  ([kernel-body]
+   (lower-store-region
+    kernel-body
+    (into {} (map (fn [parameter] [(:id parameter) (ce/c-symbol (:id parameter))]))
+          (:parameters kernel-body))))
+  ([kernel-body parameter-names]
   (let [kernel-body (body/validate! kernel-body)
         stores (filter #(record-kind? "TileStore" %)
                        (nested-operations (:operations kernel-body)))
@@ -182,8 +185,8 @@
                       {:reason :raster/bug :regions (vec regions)})))
     (when-let [region (first regions)]
       (if (record-kind? "ScalarSSARegion" region)
-        (lower-scalar-ssa-region kernel-body region)
-        (lower-scalar-region kernel-body region)))))
+        (lower-scalar-ssa-region kernel-body region parameter-names)
+        (lower-scalar-region kernel-body region parameter-names))))))
 
 (defn- require!
   [condition message data]
@@ -338,6 +341,17 @@
                    "      }\n    }\n")))
      "}\n")))
 
+(defn- matrix-parameter-names
+  [kernel-body overrides]
+  (let [{:keys [m n k]} (get-in kernel-body [:attributes :dimension-parameters])]
+    (merge
+     (into {}
+           (map (fn [{:keys [id role]}]
+                  [id (case role :lhs "A" :rhs "B" :result "C" (ce/c-symbol id))]))
+           (:parameters kernel-body))
+     {m "M" n "N" k "K"}
+     overrides)))
+
 (defn emit-matrix-kernel
   "Lower a verified f16 DPAS KernelBody directly to OpenCL C.
 
@@ -346,9 +360,10 @@
   ([kernel-name kernel-body]
    (emit-matrix-kernel kernel-name kernel-body {}))
   ([kernel-name kernel-body {:keys [parameter-names]}]
-   (emit-plan kernel-name (intel-matrix-plan kernel-body)
-              (assoc (or (lower-store-region kernel-body) {})
-                     :parameter-names parameter-names))))
+   (let [parameter-names (matrix-parameter-names kernel-body parameter-names)]
+     (emit-plan kernel-name (intel-matrix-plan kernel-body)
+                (assoc (or (lower-store-region kernel-body parameter-names) {})
+                       :parameter-names parameter-names)))))
 
 ;; ---------------------------------------------------------------------------
 ;; General scalar/control KernelBody lowering
@@ -701,15 +716,13 @@
       (str "(" local-offset ")"))))
 
 (defn- lower-scalar-ssa-region
-  [kernel-body region]
+  [kernel-body region parameter-names]
   (let [storage (into {} (map (juxt :id identity)) (:parameters kernel-body))
         accumulator (first (:parameters region))
         [row-id col-id] (:indices region)
         accumulator-token (str "__acc_" (name (gensym "")))
         row-token (str "__row_" (name (gensym "")))
         col-token (str "__col_" (name (gensym "")))
-        parameter-names (into {} (map (fn [id] [id (ce/c-symbol id)]))
-                              (rest (:parameters region)))
         initial-context
         {:names (merge parameter-names
                        {accumulator accumulator-token row-id row-token col-id col-token})
@@ -756,9 +769,10 @@
                (for [id epilogue-parameters
                      :let [parameter (get storage id)]]
                  (if (= :scalar (:kind parameter))
-                   (str ", " (dtype/ctype :opencl (:dtype parameter)) " " (ce/c-symbol id))
+                   (str ", " (dtype/ctype :opencl (:dtype parameter)) " "
+                        (get parameter-names id))
                    (str ", __global const " (dtype/ctype :opencl (:dtype parameter))
-                        "* restrict " (ce/c-symbol id)))))]
+                        "* restrict " (get parameter-names id)))))]
     (when-not emitted
       (throw (ex-info "matrix scalar SSA region has no emitted result"
                       {:reason :raster/bug :region region})))

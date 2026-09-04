@@ -59,7 +59,10 @@
     (testing "runtime dimension identities are specialized to the storage contract"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dimension specializations"
                             (matrix-plan/analyze
-                             (assoc-in kernel [:attributes :dimension-values 'M] 63)))))))
+                             (assoc-in kernel [:attributes :dimension-values 'M] 63)))))
+    (testing "restrict-qualified matrix inputs require stable read contracts"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable no-write-alias"
+                            (matrix-plan/analyze (assoc kernel :stable-reads [])))))))
 
 (deftest intel-opencl-retains-its-own-instruction-legality
   (testing "neutral MMA analysis does not make an Intel DPAS emitter accept MMA"

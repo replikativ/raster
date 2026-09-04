@@ -72,6 +72,19 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be an integer"
                         (launch/resolve-expression {} (launch/ceil-div 'n 256)))))
 
+(deftest launch-specialization-rebinds-explicit-expression-leaves
+  (let [original (launch/spec
+                  {:workgroup-size [256 1]
+                   :group-count [(launch/ceil-div (launch/runtime-value 'n) 128)
+                                 (launch/ceil-div 'm 64)]})
+        specialized (launch/rebind-spec original {'n 256 'm 'rows})]
+    (is (= #{} (launch/expression-references
+                (first (:group-count specialized)))))
+    (is (= #{'rows} (launch/expression-references
+                     (second (:group-count specialized)))))
+    (is (= [2 3]
+           (:group-count (launch/realize specialized {'rows 129}))))))
+
 (deftest concrete-geometry-rejects-invalid-backend-launches
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
                         (launch/geometry {:workgroup-size [0] :group-count [1]})))

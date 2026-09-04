@@ -3,6 +3,10 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
+            [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (def ^:private mma
@@ -54,3 +58,98 @@
            (mapv :id (get-in emitted [:kernel-body :parameters]))))
     (is (re-find #"extern \"C\" __global__" (:source emitted)))
     (is (not (re-find #"__kernel" (:source emitted))))))
+
+(deftest verified-body-owns-the-complete-target-artifact
+  (let [body (assoc (mma-body) :provenance {:scheduled-operation :body-certificate
+                                            :dialect :matrix-schedule})
+        artifact (matrix-target/emit-matrix-artifact
+                  "matrix_artifact_cuda" body :cuda
+                  {:provenance {:lowering :caller-lie :target-dialect :hip}
+                   :attributes {:kernel-body :caller-lie :instruction-family :mfma}})
+        aligned-buffer (fn [id] {:id id :alignment 32})
+        call (kernel-call/make
+              artifact
+              [(aligned-buffer :a-buffer)
+               (aligned-buffer :b-buffer)
+               (aligned-buffer :c-buffer)
+               {:type :int :value 128}
+               {:type :int :value 128}
+               {:type :int :value 64}])]
+    (is (kernel-artifact/kernel-artifact? artifact))
+    (is (= :cuda-c (:target artifact)))
+    (is (= ['a 'b 'c 128 128 64] (:arguments artifact)))
+    (is (= [1 1] (get-in call [:geometry :group-count])))
+    (is (empty? (mapcat kernel-launch/expression-references
+                        (concat (get-in artifact [:launch :workgroup-size])
+                                (get-in artifact [:launch :group-count]))))
+        "static dimension specialization closes launch expressions")
+    (is (= [:no-write-alias :no-write-alias nil]
+           (mapv :aliasing (take 3 (:abi artifact))))
+        "stable body reads survive target ABI projection")
+    (is (= [:lhs :rhs :result :dimension :dimension :dimension]
+           (mapv :role (:abi artifact))))
+    (is (= [32 32 32]
+           (mapv :alignment (take 3 (:abi artifact))))
+        "WMMA load/store alignment is a checked call precondition")
+    (is (identical? body (get-in artifact [:attributes :kernel-body])))
+    (is (= :mma (get-in artifact [:attributes :instruction-family])))
+    (is (= :matrix-kernel-body (get-in artifact [:provenance :lowering])))
+    (is (= :cuda (get-in artifact [:provenance :target-dialect])))
+    (is (= :body-certificate (get-in artifact [:provenance :scheduled-operation])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"alignment contract"
+         (kernel-call/make
+          artifact
+          [{:id :a-buffer :alignment 16}
+           (aligned-buffer :b-buffer)
+           (aligned-buffer :c-buffer)
+           {:type :int :value 128}
+           {:type :int :value 128}
+           {:type :int :value 64}])))))
+
+(deftest target-symbols-are-validated-before-source-emission
+  (let [body (mma-body)]
+    (testing "the public entry point is already a portable identifier"
+      (try
+        (matrix-target/emit-matrix-kernel "bad-name" body :cuda)
+        (is false "invalid entry point unexpectedly reached CUDA emission")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :matrix-target-entry-point (:reason (ex-data exception)))))))
+    (testing "the CUDA C++ keyword set is part of the public-name contract"
+      (try
+        (matrix-target/emit-matrix-kernel "default" body :cuda)
+        (is false "C++ keyword unexpectedly reached CUDA emission")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :matrix-target-entry-point (:reason (ex-data exception)))))))
+    (testing "ABI spelling cannot shadow an emitter-owned local"
+      (try
+        (matrix-target/emit-matrix-kernel
+         "valid_name" body :opencl-intel {:parameter-names {'a "m_base"}})
+        (is false "generated-local collision unexpectedly reached OpenCL emission")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :matrix-target-name-collision (:reason (ex-data exception)))))))
+    (testing "CUDA currently has one exact verified spelling"
+      (try
+        (matrix-target/emit-matrix-kernel
+         "valid_name" body :cuda {:parameter-names {'a "lhs"}})
+        (is false "unsupported CUDA spelling override was accepted")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :cuda-mma-parameter-spelling-unsupported
+                 (:reason (ex-data exception)))))))
+    (testing "a dynamically emitted grid-Z local shares the ABI collision check"
+      (let [grid-body
+            (schedule/matrix-body
+             {:id :grid-z-name-collision :row 'a :col 'b :out 'c
+              :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
+              :tile (assoc (hardware/derive-gemm-tile {})
+                           :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16})
+              :result-dtype :float
+              :additional-parameters
+              [(kernel-body/->KernelParameter 'k_slice :scalar :int [] nil nil :schedule)]
+              :additional-indices [(kernel-body/->IndexBinding 'k-slice :group 2)]
+              :launch-group-count [1 1 (kernel-launch/runtime-value 'k_slice)]})]
+        (try
+          (matrix-target/emit-matrix-kernel "grid_z_collision" grid-body :opencl-intel)
+          (is false "grid-Z local unexpectedly shadowed an ABI parameter")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :matrix-target-name-collision (:reason (ex-data exception))))))))))

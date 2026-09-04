@@ -134,6 +134,12 @@
         lhs-param (only! "lhs parameter" (:lhs parameters-by-role))
         rhs-param (only! "rhs parameter" (:rhs parameters-by-role))
         out-param (only! "result parameter" (:result parameters-by-role))
+        stable-read-buffers (set (map :buffer (:stable-reads kernel-body)))
+        read-only-parameters (filterv #(= :input (:kind %)) parameters)
+        _ (require! (every? #(contains? stable-read-buffers (:id %)) read-only-parameters)
+                    "matrix read-only parameters require stable no-write-alias contracts"
+                    {:read-only-parameters (mapv :id read-only-parameters)
+                     :stable-reads stable-read-buffers})
         view-map (into {} (map (juxt :id identity)) views)
         operation-buffers (:operation-buffers attributes)
         lhs-storage-id (get operation-buffers :row (:id lhs-param))

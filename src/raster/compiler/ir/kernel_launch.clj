@@ -107,7 +107,7 @@
 (defn- minimum? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.Minimum" x))
 
-(declare index-expr? index-cast?)
+(declare index-expr? index-cast? validate-spec! spec)
 
 (defn expression?
   "True for explicit symbolic integer-expression nodes and literal integers. Opaque compiler
@@ -147,6 +147,42 @@
     (reduce into #{} (map expression-references (:arguments expression)))
     (index-cast? expression) (expression-references (:argument expression))
     :else #{expression}))
+
+(defn rebind-expression
+  "Replace opaque compiler-value leaves in an integer expression.
+
+   `bindings` maps compiler identities to either literals or new identities. RuntimeValue wrappers
+   disappear when their replacement is an integer, so a statically specialized artifact no longer
+   asks its call binder to resolve a value absent from the public compiler-argument order. The
+   explicit arithmetic structure is otherwise preserved; this is substitution, not evaluation."
+  [expression bindings]
+  (letfn [(rebind [value]
+            (cond
+              (integer? value) value
+              (runtime-value? value)
+              (let [replacement (get bindings (:value value) (:value value))]
+                (if (integer? replacement) replacement (->RuntimeValue replacement)))
+              (ceil-div? value) (assoc value :value (rebind (:value value))
+                                            :divisor (rebind (:divisor value)))
+              (floor-div? value) (assoc value :value (rebind (:value value))
+                                             :divisor (rebind (:divisor value)))
+              (sum? value) (assoc value :terms (mapv rebind (:terms value)))
+              (product? value) (assoc value :factors (mapv rebind (:factors value)))
+              (align-up? value) (assoc value :value (rebind (:value value)))
+              (minimum? value) (assoc value :values (mapv rebind (:values value)))
+              (index-expr? value) (assoc value :arguments (mapv rebind (:arguments value)))
+              (index-cast? value) (assoc value :argument (rebind (:argument value)))
+              :else (get bindings value value)))]
+    (rebind expression)))
+
+(defn rebind-spec
+  "Substitute compiler-value leaves throughout a checked LaunchSpec."
+  [launch-spec bindings]
+  (let [{:keys [workgroup-size group-count shared-memory-bytes]}
+        (validate-spec! launch-spec)]
+    (spec {:workgroup-size (mapv #(rebind-expression % bindings) workgroup-size)
+           :group-count (mapv #(rebind-expression % bindings) group-count)
+           :shared-memory-bytes shared-memory-bytes})))
 
 (defn- dimension-vector!
   [owner field dimensions pred expected]

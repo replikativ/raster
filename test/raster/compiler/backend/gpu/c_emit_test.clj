@@ -2,6 +2,22 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.c-emit :as c-emit]))
 
+(deftest portable-identifiers-cover-the-cuda-and-hip-cpp-language
+  (is (not (c-emit/c-identifier? "class")))
+  (is (not (c-emit/c-identifier? "default")))
+  (is (not (c-emit/c-identifier? "template")))
+  (is (not (c-emit/c-identifier? "char8_t")))
+  (is (not (c-emit/c-identifier? "_Atomic")))
+  (is (not (c-emit/c-identifier? "read_only")))
+  (is (not (c-emit/c-identifier? "__device__")))
+  (is (not (c-emit/c-identifier? "_Reserved")))
+  (is (= "class_" (c-emit/c-symbol 'class)))
+  (is (= "default_" (c-emit/c-symbol 'default)))
+  (is (= "rstr_Atomic" (c-emit/c-symbol '_Atomic)))
+  (is (= "read_only_" (c-emit/c-symbol 'read-only)))
+  (is (= "rstr__device__" (c-emit/c-symbol '__device__)))
+  (is (c-emit/c-identifier? "ordinary_kernel")))
+
 (deftest retained-scalar-dtypes-are-not-collapsed-to-the-kernel-element-type
   (is (= :long (c-emit/scalar-parameter-dtype 'iteration {'iteration :int64} :float)))
   (is (= :byte (c-emit/scalar-parameter-dtype 'quantized {'quantized :int8} :float)))

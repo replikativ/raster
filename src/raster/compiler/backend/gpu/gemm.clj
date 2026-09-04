@@ -6,6 +6,7 @@
    split-K combination. All mixed-precision scratch and derived scheduling scalars are private to
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
   (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
@@ -187,7 +188,8 @@
 
 (defn- convert-artifact
   [kernel-name in out elements vector-width phase]
-  (let [{:keys [source kernel-body]}
+  (let [kernel-name (c-emit/c-symbol kernel-name)
+        {:keys [source kernel-body]}
         (layout-emitter/emit-cast-kernel
          {:kernel-name kernel-name :input in :output out
           :source-dtype :float :destination-dtype :half :vector-width vector-width
@@ -209,7 +211,8 @@
 
 (defn- transpose-artifact
   [kernel-name in out rows cols phase]
-  (let [{:keys [source kernel-body]}
+  (let [kernel-name (c-emit/c-symbol kernel-name)
+        {:keys [source kernel-body]}
         (layout-emitter/emit-transpose-kernel
          {:kernel-name kernel-name :input in :output out :element-dtype :half})]
     (artifact
@@ -237,7 +240,8 @@
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
            k-range launch-group-count attributes parameter-names epilogue]
     :or {result-dtype :float provenance {} target-dialect :opencl-intel}}]
-  (let [kernel-body
+  (let [kernel-name (c-emit/c-symbol kernel-name)
+        kernel-body
         (contraction-schedule/matrix-body
          {:id (or id [:gemm kernel-name])
           :row a :col b :out c
@@ -259,7 +263,9 @@
           :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})
         emitted (matrix-target/emit-matrix-kernel
                  kernel-name kernel-body target-dialect {:parameter-names parameter-names})]
-    (assoc emitted :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
+    (assoc emitted
+           :kernel-name kernel-name
+           :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
 
 (defn emit-scheduled-split-k-kernel
   "Lower a grid-Z partition of the K reduction into disjoint f32 output views."
@@ -367,7 +373,7 @@
         abi (mapv first interface)
         arguments (mapv second interface)]
     (artifact
-     kernel-name (:source scheduled)
+     (:kernel-name scheduled) (:source scheduled)
      abi arguments
      (klaunch/spec {:workgroup-size (:workgroup-size scheduled)
                     :group-count group-count})
@@ -378,7 +384,8 @@
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
   ([kernel-name] (emit-split-k-combine-kernel kernel-name :opencl-intel))
   ([kernel-name target-dialect]
-   (let [form '(raster.par/contract C [[i mn]] [[s splits]]
+   (let [kernel-name (c-emit/c-symbol kernel-name)
+         form '(raster.par/contract C [[i mn]] [[s splits]]
                                      (clojure.core/aget
                                       partials (clojure.core/+ (clojure.core/* s mn) i)))
         facts (contraction-facts/contraction-facts form :dtype :float)
@@ -396,11 +403,11 @@
                 {:target-dialect target-dialect
                  :parameter-names {'partials "partials" 'C "C"
                                    'mn "mn" 'splits "splits" '_nseg "_nseg"}})]
-     {:source source :kernel-body kernel-body :workgroup-size 256})))
+     {:kernel-name kernel-name :source source :kernel-body kernel-body :workgroup-size 256})))
 
 (defn- combine-artifact
   [kernel-name partials c mn splits]
-  (let [{:keys [source kernel-body]} (emit-split-k-combine-kernel kernel-name)]
+  (let [{:keys [kernel-name source kernel-body]} (emit-split-k-combine-kernel kernel-name)]
     (artifact
      kernel-name source
      [(kabi/slot 'partials :input :float :c-name "partials" :role :operand
@@ -513,7 +520,7 @@
                     :tile tile
                     :provenance {:operation-id id :phase :matrix-contract}})]
     (artifact
-     kernel-name (:source scheduled)
+     (:kernel-name scheduled) (:source scheduled)
      [(kabi/slot a :input :half :c-name "A")
       (kabi/slot b :input :half :c-name "B")
       (kabi/slot c :output :float :c-name "C")

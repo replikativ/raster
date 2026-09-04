@@ -1658,13 +1658,17 @@
         ;; substitute each operand's aget index from its declared map (maps, not pattern-matching)
         idx-of (into {} (for [{:keys [sym map]} operands] [sym (am/index-expr map)]))
         expr' (descriptor/rewrite-aget-indices expr idx-of)
-        acc-token (str "__acc_" (name (gensym "")))
+        acc-symbol (symbol (str "__acc_" (name (gensym ""))))
+        ;; The target identifier policy may rename implementation-reserved source names (notably
+        ;; the double-underscore spelling used to keep this placeholder collision-free).  Splice
+        ;; the spelling that `emit-expr` actually writes, not the pre-projection source symbol.
+        acc-token (ce/c-symbol acc-symbol)
         ;; emit once with a distinctive token standing in for the accumulator, then splice the
         ;; real acc C-expression in at call time (the hook supplies it per store slot)
         emitted (binding [ce/*emit-config* ce/opencl-config
                           ce/*scalar-type* ctype
                           ce/*int-vars* (into ce/*int-vars* int-vars)]
-                  (ce/emit-expr (walk/postwalk-replace {acc (symbol acc-token)} expr')
+                  (ce/emit-expr (walk/postwalk-replace {acc acc-symbol} expr')
                                 (gensym "z__") arr-syms))
         params (apply str
                       (concat
