@@ -416,14 +416,16 @@
                    (emit "bad" :c-dtype :float :beta 1.0 :epilogue (fn [a _ _] a)))
           "epilogue + beta≠0 (both write the store) is rejected"))))
 
-(deftest transpose-kernel-layout-driven-byte-identical
-  (testing "the transpose kernel is now LAYOUT-DRIVEN (indices from layout/layout->offset) yet emits
-            the byte-identical row-major index line — the first place a layout drives codegen"
-    (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)]
+(deftest transpose-kernel-is-lowered-from-the-layout-transform-body
+  (testing "the transpose is a typed affine permutation before target source emission"
+    (require 'raster.compiler.backend.gpu.layout-transform)
+    (let [emit (resolve 'raster.compiler.backend.gpu.layout-transform/emit-transpose-kernel)]
       (doseq [dt [:float :double :half]]
-        (is (.contains ^String (emit "t" :dtype dt) "out[j * rows + i] = in[i * cols + j];")
-            (str "layout-driven transpose index must be byte-identical for " dt))))))
+        (let [{:keys [source kernel-body]}
+              (emit {:kernel-name "t" :input 'in :output 'out :element-dtype dt})]
+          (is (= [1 0] (get-in kernel-body [:schedule :permutation])))
+          (is (.contains ^String source "rstr_layout_column")
+              (str "layout-driven transpose must lower for " dt)))))))
 
 (deftest gemm-tiled-kernel-test
   (testing "tile-parametric GEMM kernel generates valid OpenCL"

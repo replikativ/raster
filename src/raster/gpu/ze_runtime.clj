@@ -2556,10 +2556,13 @@
 
 (defn- convert-source
   "Compatibility substrate for raw benchmark callers. Production graph schedules consume the
-   same compiler-owned conversion emitter directly."
+   same target-neutral layout-transform schedule directly."
   [w]
-  ((requiring-resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-f32-to-f16-kernel)
-   "f32_to_f16" w))
+  (:source
+   ((requiring-resolve 'raster.compiler.backend.gpu.layout-transform/emit-cast-kernel)
+    {:kernel-name "f32_to_f16" :input 'in :output 'out
+     :source-dtype :float :destination-dtype :half :vector-width w
+     :rounding :nearest-even :overflow :ieee})))
 
 (defn- ensure-convert-kernel!
   "Lazily compile + cache the f32→f16 convert kernel for vector width `w`. {:module :kernel}."
@@ -2580,8 +2583,7 @@
   out: f16 (:half) DeviceBuffer, n elements. Returns a bound {:kernel :gc-seg} map. Fresh
   kernel handle per binding.
 
-  `w` = elements per work-item (the vector width the CALLER scheduled from the hardware
-  descriptor); default 1 = the scalar kernel."
+  `w` = statically unrolled elements per work-item, selected by the schedule; default 1."
   ([in out n] (bind-registered-convert! in out n 1))
   ([in out n w]
    (let [{:keys [module]} (ensure-convert-kernel! w)
@@ -2589,9 +2591,8 @@
          n (long n) w (long w)
          args [(:segment in) (:segment out) {:type :int :value (int n)}]
          bnd (bind-kernel! kh 256 args)
-         ;; one work-item per w elements. Floor at one group so an n < w program still
-         ;; launches the work-items its tail loop needs.
-         gc (max 1 (long (Math/ceil (/ (double (quot n w)) 256.0))))]
+         ;; One work-item owns w masked elements. Floor at one group so n < w still launches.
+         gc (max 1 (long (Math/ceil (/ (double n) (* (double w) 256.0)))))]
      (.set ^MemorySegment (:gc-seg bnd) I32 0 (int gc))
      bnd)))
 
@@ -2604,9 +2605,10 @@
   (ensure-init!)
   (or (get @transpose-cache dtype)
       (let [kname (str "transpose_" (name dtype))
-            src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                    ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)
-                     kname :dtype dtype))
+            src (:source
+                 ((requiring-resolve
+                   'raster.compiler.backend.gpu.layout-transform/emit-transpose-kernel)
+                  {:kernel-name kname :input 'in :output 'out :element-dtype dtype}))
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                      src :device (:device-id-hex @state)))
