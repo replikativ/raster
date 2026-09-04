@@ -67,14 +67,16 @@
       ;; makes the change safe here and correct elsewhere
       (is (= (gc 4096 128) (gc 4096 block-n))))))
 
-(deftest resident-direct-and-autotune-sources-use-the-scheduled-body
-  (let [emit-resident (do (require 'raster.gpu.ze-runtime)
-                          (ns-resolve 'raster.gpu.ze-runtime 'emit-scheduled-gemm))
-        tile (hw/gemm-tile-for nil)]
+(deftest direct-and-autotune-sources-use-the-scheduled-body
+  (let [tile (hw/gemm-tile-for nil)]
     (with-redefs [opencl-codegen/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
-      (let [emitted (emit-resident "resident_body" :float tile nil)]
+      (let [emitted (gemm/emit-scheduled-matrix-kernel
+                     {:kernel-name "typed_matrix_body"
+                      :id :typed-matrix-body
+                      :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
+                      :tile tile :result-dtype :float})]
         (is (body/kernel-body? (:kernel-body emitted)))
         (is (= :float (:dtype (first (filter #(= :result (:role %))
                                              (get-in emitted [:kernel-body :parameters]))))))
@@ -82,42 +84,41 @@
                (:workgroup-size emitted)))
         (is (re-find #"__global float\* restrict C" (:source emitted)))))))
 
-(deftest resident-epilogues-use-typed-programs-and-body-owned-abi
-  (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-        emit-resident (ns-resolve ze 'emit-scheduled-gemm)
-        resident-program (ns-resolve ze 'resident-epilogue-program)
-        tile (hw/gemm-tile-for nil)
+(deftest result-transforms-use-typed-programs-and-body-owned-abi
+  (let [tile (hw/gemm-tile-for nil)
         program {:acc 'acc
                  :expr '(raster.numeric/+ acc (aget bias j))
                  :operands [{:sym 'bias
                              :map (axis-map/of-axes [['j 'N]])
-                             :dtype :half}]}
-        descriptor (assoc program :bindings {'bias :resident-buffer})]
+                             :dtype :half}]}]
     (with-redefs [opencl-codegen/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
-      (let [emitted (emit-resident "resident_typed_epilogue" :float tile program)]
-        (is (= program (resident-program descriptor)))
+      (let [emitted (gemm/emit-scheduled-matrix-kernel
+                     {:kernel-name "typed_matrix_epilogue"
+                      :id :typed-matrix-epilogue
+                      :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
+                      :tile tile :result-dtype :float :epilogue program})]
         (is (= [['bias :input :half :epilogue]]
                (mapv (juxt :id :kind :dtype :role)
                      (filter #(= :epilogue (:role %))
                              (get-in emitted [:kernel-body :parameters])))))
         (is (re-find #"restrict bias" (:source emitted)))
-        (is (re-find #"bias\[[^]]*col" (:source emitted)))))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported fields"
-                          (resident-program {:key :bias :fn identity :params "raw"
-                                             :bindings {}})))))
+        (is (re-find #"bias\[[^]]*col" (:source emitted)))))))
 
-(deftest resident-grid-z-sources-use-the-scheduled-body
-  (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-        emit-split (ns-resolve ze 'emit-scheduled-split-k-gemm)
-        emit-batched (ns-resolve ze 'emit-scheduled-batched-gemm)
-        tile (hw/gemm-tile-for nil)]
+(deftest grid-z-sources-use-the-scheduled-body
+  (let [tile (hw/gemm-tile-for nil)]
     (with-redefs [opencl-codegen/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
-      (let [split (emit-split "resident_split_body" tile)
-            batched (emit-batched "resident_batched_body" tile)]
+      (let [split (gemm/emit-scheduled-split-k-kernel
+                   {:kernel-name "typed_split_body" :id :typed-split-body
+                    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
+                    :kc 'KC :splits 'splits :tile tile})
+            batched (gemm/emit-scheduled-batched-matrix-kernel
+                     {:kernel-name "typed_batched_body" :id :typed-batched-body
+                      :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
+                      :batch 'batch :tile tile})]
         (is (= [256 1 1] (:workgroup-size split)))
         (is (= 1 (count (get-in split [:kernel-body :views]))))
         (is (re-find #"int KC, int splits" (:source split)))

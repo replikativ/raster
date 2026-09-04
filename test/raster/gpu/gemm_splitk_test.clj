@@ -16,9 +16,11 @@
        and splits the low-occupancy ones."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.dl.gpu-grad-parity :as gp]))
+            [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.core :as gpu]))
 
 (defn- rnd ^floats [n seed]
   (let [a (float-array n) r (java.util.Random. (long seed))]
@@ -38,15 +40,9 @@
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gemm split-k")
     (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          make-buffer   (ns-resolve ze 'make-buffer)
-          upload!       (ns-resolve ze 'array->buffer!)
-          download      (ns-resolve ze 'buffer->array)
-          free!         (ns-resolve ze 'free-buffer!)
           record-graph! (ns-resolve ze 'record-graph!)
           replay!       (ns-resolve ze 'replay-graph!)
           destroy!      (ns-resolve ze 'destroy-graph!)
-          convert!      (ns-resolve ze 'bind-registered-convert!)
-          gemm!         (ns-resolve ze 'bind-registered-gemm!)
           splitk!       (ns-resolve ze 'bind-registered-gemm-splitk!)
           reduce!       (ns-resolve ze 'bind-registered-splitk-reduce!)]
       (doseq [[m n k splits kc]
@@ -56,26 +52,47 @@
                [33 200 1000 3 352]      ;; ragged m, n and k; last chunk clipped
                [128 256 4096 8 512]]]
         (let [A (rnd (* m k) 1) B (rnd (* k n) 2)
-              af (make-buffer (* m k) :float) bf (make-buffer (* k n) :float)
-              a16 (make-buffer (* m k) :half) b16 (make-buffer (* k n) :half)
-              c-plain (make-buffer (* m n) :float)
-              c-split (make-buffer (* m n) :float)
-              parts (make-buffer (* splits m n) :float)]
-          (upload! af A)
-          (upload! bf B)
-          (let [g (record-graph! [{:bound (convert! af a16 (* m k))}
-                                  {:bound (convert! bf b16 (* k n))}
-                                  {:bound (gemm! a16 b16 c-plain m n k :float)}
-                                  {:bound (splitk! a16 b16 parts m n k kc splits)}
-                                  {:bound (reduce! parts c-split (* m n) splits)}])]
-            (replay! g)
-            (let [P (download c-plain) S (download c-split)
-                  err (rel-l1 S P)]
-              (testing (str "m=" m " n=" n " k=" k " splits=" splits)
-                (is (< err 1.0e-4)
-                    (str "split-k vs plain XMX gemm rel-L1 " err))))
-            (destroy! g))
-          (doseq [b [af bf a16 b16 c-plain c-split parts]] (free! b)))))))
+              scheduled (support/dense-dispatch :ze:0)
+              direct (support/matrix-artifact scheduled :xmx-direct)]
+          (gpu/with-gpu-session [session :ze:0]
+            (gpu/alloc! session {:a16 [:half (* m k) (support/half-array A)]
+                                 :b16 [:half (* k n) (support/half-array B)]
+                                 :c-plain [:float (* m n) nil]
+                                 :c-split [:float (* m n) nil]
+                                 :parts [:float (* splits m n) nil]})
+            (let [direct-handle
+                  (gpu/bind-kernel-executable!
+                   session [:typed-direct m n k] direct
+                   [:a16 :b16 :c-plain
+                    {:type :int :value m}
+                    {:type :int :value n}
+                    {:type :int :value k}])]
+              (try
+                (gpu/run-kernel-graph! session direct-handle)
+                ;; Explicit split factors remain a legacy benchmark surface until split count is
+                ;; represented as a finite compiler schedule candidate in the next increment.
+                (let [g (record-graph!
+                         [{:bound (splitk! (gpu/buffer session :a16)
+                                           (gpu/buffer session :b16)
+                                           (gpu/buffer session :parts)
+                                           m n k kc splits)
+                           :kernel-name "gemm_nonsquare_splitk"}
+                          {:bound (reduce! (gpu/buffer session :parts)
+                                           (gpu/buffer session :c-split)
+                                           (* m n) splits)
+                           :kernel-name "splitk_reduce"}])]
+                  (try
+                    (replay! g)
+                    (let [plain (gpu/download session :c-plain)
+                          split (gpu/download session :c-split)
+                          error (rel-l1 split plain)]
+                      (testing (str "m=" m " n=" n " k=" k " splits=" splits)
+                        (is (< error 1.0e-4)
+                            (str "split-k vs compiler-derived direct matrix rel-L1 " error))))
+                    (finally
+                      (destroy! g))))
+                (finally
+                  (gpu/release-kernel-graph! session direct-handle))))))))))
 
 (deftest unrolled-layout-convert-is-bit-exact
   ;; The f32→f16 operand cast schedules w statically unrolled, lane-owned elements per work-item.
