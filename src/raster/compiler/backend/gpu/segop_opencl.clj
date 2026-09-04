@@ -9,6 +9,7 @@
    same SegOp IR but produce different target code."
   (:require [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as kernel-body-c-dialect]
+            [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -1712,7 +1713,8 @@
                    (:parameters kernel-body))
              kernel-body)))
         source (if kernel-body
-                 (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body)
+                 (:source (matrix-target/emit-matrix-kernel
+                           kernel-name kernel-body :opencl-intel))
                  (apply codegen/emit-gemm-tiled kernel-name
                         (concat [:c-dtype :half
                                  :block-m (:block-m effective-tile)

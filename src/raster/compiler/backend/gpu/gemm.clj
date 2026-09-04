@@ -8,6 +8,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
+            [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -231,16 +232,17 @@
   is solely a target concern. Optional views, hardware indices, and K bounds are explicit schedule
   values used by the split-K and batched wrappers below. An optional epilogue becomes a typed
   ScalarRegion on every store and is lowered as part of the body."
-  [{:keys [kernel-name id a b c m n k tile result-dtype provenance
+  [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
+           target-dialect
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
            k-range launch-group-count attributes parameter-names epilogue]
-    :or {result-dtype :float provenance {}}}]
+    :or {result-dtype :float provenance {} target-dialect :opencl-intel}}]
   (let [kernel-body
         (contraction-schedule/matrix-body
          {:id (or id [:gemm kernel-name])
           :row a :col b :out c
           :dimensions [m n k]
-          :dimension-parameters [m n k]
+          :dimension-parameters (or dimension-parameters [m n k])
           :axis-symbols ['i 'j 'l]
           :tile tile
           :bindings {:row a :col b}
@@ -254,11 +256,10 @@
           :k-range k-range
           :launch-group-count launch-group-count
           :attributes attributes
-          :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})]
-    {:source (kernel-body-opencl/emit-matrix-kernel
-              kernel-name kernel-body {:parameter-names parameter-names})
-     :kernel-body kernel-body
-     :workgroup-size (get-in kernel-body [:launch :workgroup-size])}))
+          :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})
+        emitted (matrix-target/emit-matrix-kernel
+                 kernel-name kernel-body target-dialect {:parameter-names parameter-names})]
+    (assoc emitted :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
 
 (defn emit-scheduled-split-k-kernel
   "Lower a grid-Z partition of the K reduction into disjoint f32 output views."
