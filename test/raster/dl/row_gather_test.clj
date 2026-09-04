@@ -103,14 +103,15 @@
                            #'ops/gather-blocks! :ocl:0 :dtype :float)]
     (testing "both directions are ordinary allocation-free SOAC maps"
       (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
-      (is (= [:segmap :segmap]
+      (is (= [:segmap :kernel-body]
              (mapv #(get-in % [:artifact :provenance :dialect]) (:steps descriptor)))
-          "scatter and gather share the typed scheduled-map vertical")
+          "the explicit-store scatter keeps the verified SegMap generator; the bounded gather
+           lowers through KernelBody now that its index narrowing states its policy")
       (is (= [true nil]
              (mapv #(get-in % [:artifact :attributes :explicit-stores])
                    (:steps descriptor)))
           "scatter owns explicit indexed stores; gather retains the implicit dense result")
-      (is (= [:segmap]
+      (is (= [:kernel-body]
              (mapv #(get-in % [:artifact :provenance :dialect])
                    (:steps gather-descriptor)))
           "bounded block gather independently enters TypedSOAC as an inout map")
