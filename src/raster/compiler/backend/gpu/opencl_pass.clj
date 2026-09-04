@@ -615,14 +615,13 @@
                     (try
                       ;; The scheduled SegRed carries its equation's dtype; a double contraction
                       ;; inside a float program routes at its own precision, not the program's.
-                      (croute/route-static-typed-contraction-dispatch
+                      (croute/route-typed-contraction-dispatch
                        typed-algorithm bound-sr
                        :dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
                        :precision (:precision schedule))
                       (catch clojure.lang.ExceptionInfo exception
                         (let [reason (:reason (ex-data exception))]
-                          (if (contains? #{:typed-contraction-dispatch-dynamic-scalar
-                                           :typed-contraction-dispatch-invoke-protocol}
+                          (if (contains? #{:typed-contraction-dispatch-invoke-protocol}
                                          reason)
                             (do
                               (swap! stats update-in [:typed-contraction-dispatch-declines reason]
