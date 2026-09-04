@@ -327,7 +327,15 @@
         metadata-dtype (cond
                          (keyword? mtag) (when (dtype/known? mtag) (dtype/canon mtag))
                          (symbol? mtag) (dtype/dtype-for-scalar-tag
-                                         (descriptor/cast-result-tag mtag)))]
+                                         (descriptor/cast-result-tag mtag)))
+        ;; A floating hoisted local specializes to the kernel dtype exactly as a declared
+        ;; floating param does (derive-param-types), so the host encoding and the kernel
+        ;; declaration cannot disagree on width.
+        kernel-dtype (some-> default-dtype dtype/canon)
+        metadata-dtype (if (and metadata-dtype kernel-dtype
+                                (dtype/fp-dtype? metadata-dtype) (dtype/fp-dtype? kernel-dtype))
+                         kernel-dtype
+                         metadata-dtype)]
     (cond
       explicit (or declared
                    (throw (ex-info "kernel scalar has an unknown declared dtype"

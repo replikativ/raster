@@ -79,11 +79,16 @@
                       (frequencies (map :route rows)))
       :vars (vec (sort-by (comp str :var) rows))})))
 
+(def route-rank
+  "Routes ordered from best to worst; a move down this order is a regression."
+  {:typed-soac 0 :compatibility 1 :scalar 2 :error 3})
+
 (defn ratchet-violations
   "Ways in which `report` regressed against `baseline`.
 
-   A var on the typed route may not leave it; a var that compiled may not error. New and removed
-   vars are not violations, so the corpus can grow and shrink without editing the baseline."
+   A var may not move to a worse route (typed → compatibility → scalar → error) and a validated
+   typed program may not lose its validation. New and removed vars are not violations, so the
+   corpus can grow and shrink without editing the baseline."
   [baseline report]
   (let [before (into {} (map (juxt :var identity)) (:vars baseline))]
     (vec
@@ -91,15 +96,14 @@
            :let [old (get before (:var row))]
            :when old
            violation (cond-> []
-                       (and (= :typed-soac (:route old))
-                            (not= :typed-soac (:route row)))
-                       (conj {:var (:var row) :violation :left-typed-route
+                       (> (get route-rank (:route row) 3) (get route-rank (:route old) 3))
+                       (conj {:var (:var row) :violation :route-downgraded
                               :before (:route old) :after (:route row)
                               :declines (:declines row) :error (:error row)})
 
-                       (and (not= :error (:route old)) (= :error (:route row)))
-                       (conj {:var (:var row) :violation :started-failing
-                              :before (:route old) :error (:error row)}))]
+                       (and (:typed-validated old) (not (:typed-validated row)))
+                       (conj {:var (:var row) :violation :lost-typed-validation
+                              :route (:route row)}))]
        violation))))
 
 (defn read-baseline [path]

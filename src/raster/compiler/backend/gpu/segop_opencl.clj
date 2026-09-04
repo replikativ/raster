@@ -694,7 +694,9 @@
         scalar-dtype (fn [id]
                        (or (get scalar-types id)
                            (get scalar-types (symbol (name id)))
-                           dtype))
+                           (throw (ex-info "kernel scalar parameter has no declared dtype"
+                                           {:reason :kernel-scalar-dtype-unknown :symbol id
+                                            :declared (vec (keys scalar-types))}))))
         result-name (or out-sym 'output)
         abi (kabi/validate!
              (vec (concat
@@ -746,17 +748,27 @@
        (catch clojure.lang.ExceptionInfo exception
          (if (and (kernel-body-c-dialect/opencl? target)
                   (segmap-body/declined? exception))
-           (-> (if (:out-sym operation)
-                 (generate-segmap-kernel
-                  operation (:out-sym operation)
-                  :dtype dtype :scalar-types scalar-types :array-types array-types
-                  :kernel-name-prefix kernel-name-prefix)
-                 (generate-explicit-segmap-kernel
-                  operation :dtype dtype :scalar-types scalar-types :array-types array-types
-                  :kernel-name-prefix (str kernel-name-prefix "_effect")))
-               (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
-               (assoc-in [:attributes :kernel-body-decline]
-                         (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+           (try
+             (-> (if (:out-sym operation)
+                   (generate-segmap-kernel
+                    operation (:out-sym operation)
+                    :dtype dtype :scalar-types scalar-types :array-types array-types
+                    :kernel-name-prefix kernel-name-prefix)
+                   (generate-explicit-segmap-kernel
+                    operation :dtype dtype :scalar-types scalar-types :array-types array-types
+                    :kernel-name-prefix (str kernel-name-prefix "_effect")))
+                 (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
+                 (assoc-in [:attributes :kernel-body-decline]
+                           (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
+             (catch clojure.lang.ExceptionInfo retry
+               ;; The verified OpenCL generator refused as well: report both refusals as one
+               ;; structured error instead of letting the second one hide the first.
+               (throw (ex-info "scheduled map has no OpenCL emission: KernelBody declined and the verified generator refused"
+                               {:reason :segmap-emission-refused
+                                :operation (:id operation)
+                                :kernel-body-decline (ex-data exception)
+                                :generator-refusal (ex-data retry)}
+                               retry))))
            (throw exception))))
      operation)))
 
@@ -894,7 +906,9 @@
         scalar-dtype (fn [id]
                        (or (get scalar-types id)
                            (get scalar-types (symbol (name id)))
-                           (:dtype algebra)))
+                           (throw (ex-info "kernel scalar parameter has no declared dtype"
+                                           {:reason :kernel-scalar-dtype-unknown :symbol id
+                                            :declared (vec (keys scalar-types))}))))
         emitted
         (kgraph/map-operations
          graph
