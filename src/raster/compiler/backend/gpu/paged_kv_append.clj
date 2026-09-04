@@ -63,8 +63,8 @@
      [(kabi/slot key-rows :input :float :c-name "key_rows" :role :key-rows)
       (kabi/slot value-rows :input :float :c-name "value_rows" :role :value-rows)
       (kabi/slot slot-mapping :input :int :c-name "slot_mapping" :role :slot-mapping)
-      (kabi/slot key-pages :output :half :c-name "key_pages" :role :key-pages)
-      (kabi/slot value-pages :output :half :c-name "value_pages" :role :value-pages)])))
+      (kabi/slot key-pages :inout :half :c-name "key_pages" :role :key-pages)
+      (kabi/slot value-pages :inout :half :c-name "value_pages" :role :value-pages)])))
 
 (defn emit-fp32-to-fp16-reference
   "Emit the portable assignment kernel as a verified KernelArtifact."

@@ -52,6 +52,9 @@
     (is (not (str/includes? source "atomic")))
     (is (= ['key-rows 'value-rows 'slots 'key-pages 'value-pages]
            (:arguments artifact)))
+    (is (= [:input :input :input :inout :inout]
+           (mapv :kind (:abi artifact)))
+        "the append mutates existing page pools rather than producing fresh whole pools")
     (is (= :paged-kv-append (get-in graph [:provenance :semantic-op])))
     (is (= #{'key-pages 'value-pages}
            (set (map :id (:outputs graph)))))
