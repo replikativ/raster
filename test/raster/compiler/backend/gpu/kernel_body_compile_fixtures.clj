@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
+            [raster.compiler.backend.gpu.layout-transform :as layout-transform]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
@@ -311,6 +312,18 @@
                             (segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
+           (write-source! directory suffix "layout-cast"
+                          (:source
+                           (layout-transform/emit-cast-kernel
+                            {:kernel-name "layout_cast" :input 'in :output 'out
+                             :source-dtype :float :destination-dtype :half
+                             :vector-width 4 :rounding :nearest-even :overflow :ieee
+                             :target-dialect dialect})))
+           (write-source! directory suffix "layout-transpose"
+                          (:source
+                           (layout-transform/emit-transpose-kernel
+                            {:kernel-name "layout_transpose" :input 'in :output 'out
+                             :element-dtype :half :target-dialect dialect})))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

@@ -7,6 +7,7 @@
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
+            [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -100,33 +101,42 @@
 
 (defn- convert-artifact
   [kernel-name in out elements vector-width phase]
-  (artifact
-   kernel-name (codegen/emit-f32-to-f16-kernel kernel-name vector-width)
-   [(kabi/slot in :input :float :c-name "in")
-    (kabi/slot out :output :half :c-name "out")
-    (kabi/slot :elements :scalar :int :c-name "n")]
-   [in out elements]
-   (klaunch/spec
-    {:workgroup-size [256]
-     :group-count [(klaunch/ceil-div
-                    (klaunch/ceil-div (klaunch/runtime-value elements) vector-width)
-                    256)]})
-   phase {:vector-width vector-width :from :float :to :half
-          :cacheable-transform? true}))
+  (let [{:keys [source kernel-body]}
+        (layout-emitter/emit-cast-kernel
+         {:kernel-name kernel-name :input in :output out
+          :source-dtype :float :destination-dtype :half :vector-width vector-width
+          :rounding :nearest-even :overflow :ieee})]
+    (artifact
+     kernel-name source
+     [(kabi/slot in :input :float :c-name "in")
+      (kabi/slot out :output :half :c-name "out")
+      (kabi/slot :layout-elements :scalar :int :c-name "n")]
+     [in out elements]
+     (klaunch/spec
+      {:workgroup-size [256]
+       :group-count [(klaunch/ceil-div
+                      (klaunch/ceil-div (klaunch/runtime-value elements) vector-width)
+                      256)]})
+     phase {:vector-width vector-width :from :float :to :half
+            :rounding :nearest-even :overflow :ieee
+            :kernel-body kernel-body :cacheable-transform? true})))
 
 (defn- transpose-artifact
   [kernel-name in out rows cols phase]
-  (let [elements (klaunch/product rows cols)]
+  (let [{:keys [source kernel-body]}
+        (layout-emitter/emit-transpose-kernel
+         {:kernel-name kernel-name :input in :output out :element-dtype :half})]
     (artifact
-     kernel-name (codegen/emit-transpose-kernel kernel-name :dtype :half)
+     kernel-name source
      [(kabi/slot in :input :half :c-name "in")
       (kabi/slot out :output :half :c-name "out")
-      (kabi/slot :rows :scalar :int :c-name "rows")
-      (kabi/slot :cols :scalar :int :c-name "cols")]
+      (kabi/slot :layout-rows :scalar :int :c-name "rows")
+      (kabi/slot :layout-cols :scalar :int :c-name "cols")]
      [in out rows cols]
      (klaunch/spec {:workgroup-size [256]
-                    :group-count [(klaunch/ceil-div elements 256)]})
-     phase {:layout :transpose :dtype :half :cacheable-transform? true})))
+                    :group-count [(klaunch/ceil-div (klaunch/product rows cols) 256)]})
+     phase {:layout :transpose :dtype :half
+            :kernel-body kernel-body :cacheable-transform? true})))
 
 (defn emit-scheduled-matrix-kernel
   "Build and directly lower one canonical f16 matrix contraction.
