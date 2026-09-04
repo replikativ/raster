@@ -1077,6 +1077,56 @@
         (is (= :portable-segred (:leaf (ex-data exception))))
         (is (= :none (:fallback (ex-data exception))))))))
 
+(deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                                          (* (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ze:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :int 'n :int 'k :int}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        dispatch (contract-route/route-typed-contraction-dispatch
+                  algorithm operation :dtype :float :desc descriptor
+                  :precision :mixed-f16-f32)
+        strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
+        select (fn [m n k]
+                 (kdispatch/alternative-strategy
+                  (kdispatch/select-alternative dispatch
+                                                [:a :b :c m n k])))]
+    (is (= [:portable-segred :xmx-direct :xmx-split-k] strategies))
+    (is (apply = (map :abi (:alternatives dispatch))))
+    (is (apply = (map :arguments (:alternatives dispatch))))
+    (is (= '[A B C m n k] (:arguments (first (:alternatives dispatch)))))
+    (is (= :xmx-direct (select 512 512 512)))
+    (is (= :portable-segred (select 512 510 512))
+        "a misaligned half row pitch cannot enter the DPAS graph")
+    (is (= :portable-segred (select 512 512 510))
+        "a partial matrix K fragment cannot enter the DPAS graph")
+    (is (= :mixed-f16-f32
+           (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
+    (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (testing "a non-DPAS target keeps the same semantic contraction on portable schedules"
+      (let [portable (contract-route/route-typed-contraction-dispatch
+                      algorithm operation :dtype :float
+                      :desc (assoc descriptor :backend :cuda
+                                   :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
+                      :precision :mixed-f16-f32)]
+        (is (= [:portable-segred]
+               (mapv kdispatch/alternative-strategy (:alternatives portable))))
+        (is (= :mixed-dpas-target-capability
+               (get-in portable [:attributes :matrix-graph-decline :reason])))))))
+
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]

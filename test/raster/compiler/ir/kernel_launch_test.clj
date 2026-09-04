@@ -58,6 +58,10 @@
     (is (= #{'m 'n 'k} (launch/expression-references requested-splits)))
     (is (= 26 (launch/resolve-expression {'m 13 'n 640 'k 262144}
                                          requested-splits))))
+  (let [remainder (body/expression :mod 'k 16)]
+    (is (launch/expression? remainder))
+    (is (= #{'k} (launch/expression-references remainder)))
+    (is (= 14 (launch/resolve-expression {'k 510} remainder))))
   (is (= [3 2]
          (:group-count
           (launch/realize

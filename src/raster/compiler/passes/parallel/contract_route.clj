@@ -20,6 +20,7 @@
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.util :as util]
             [clojure.string :as str]
+            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
@@ -908,9 +909,10 @@
                    :candidate-schedule candidate-schedule}})))
 
 (defn- candidate-dispatch-id
-  [operation-id candidates]
+  [operation-id candidates schedule-identity]
   (let [identity
         [operation-id
+         schedule-identity
          (mapv (fn [{:keys [family strategy artifact]}]
                  (let [kernel-name (:kernel-name artifact)]
                    {:family family
@@ -946,6 +948,87 @@
                       :interface interface}
      :layout {:external-interface interface}}))
 
+(defn- reinterface-graph
+  [graph abi arguments effects operation-id]
+  (kgraph/validate!
+   (-> graph
+       (assoc :abi abi :arguments arguments :effects effects)
+       (update :provenance merge {:operation-id operation-id
+                                  :source-dialect :typed-soac})
+       (update :attributes merge {:candidate-family :matrix
+                                  :semantic-op :contraction}))))
+
+(defn- mixed-dpas-alternatives
+  "Derive graph-valued mixed-precision DPAS schedules from ordinary typed contraction facts.
+
+   The typed equation remains the algorithm.  This bridge contributes only schedule alternatives:
+   explicit f32→f16 layout adapters, a canonical matrix KernelBody, and an optional typed split-K
+   reduction.  It declines as data when the algebra, layout, precision policy, enabled families,
+   or target capability does not justify that transformation."
+  [program operation options abi arguments effects]
+  (let [{:keys [facts dtype operation-id]}
+        (scheduled-typed-contraction-context program operation)
+        precision (or (:precision options) :mixed-f16-f32)
+        matrix-enabled? (contains? (set (get-in operation [:schedule :tuning-space :families]))
+                                   :matrix)
+        matrix-view (when (and matrix-enabled? (= :float (dtype/canon dtype)))
+                      (cf/dense-matrix-view facts))
+        target-schedule (when (and (= :mixed-f16-f32 precision) (:ok matrix-view))
+                          (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))]
+    (cond
+      (not matrix-enabled?)
+      {:alternatives [] :decline {:reason :schedule-family-disabled :family :matrix}}
+
+      (not= :mixed-f16-f32 precision)
+      {:alternatives [] :decline {:reason :precision-policy :precision precision}}
+
+      (not= :float (dtype/canon dtype))
+      {:alternatives [] :decline {:reason :mixed-dpas-source-dtype :dtype dtype}}
+
+      (not (:ok matrix-view))
+      {:alternatives [] :decline (dissoc matrix-view :ok)}
+
+      (nil? target-schedule)
+      {:alternatives []
+       :decline {:reason :mixed-dpas-target-capability
+                 :backend (get-in options [:desc :backend])
+                 :matrix (get-in options [:desc :matrix])}}
+
+      :else
+      (let [[m n k] (:dimensions matrix-view)
+            {:keys [row col]} (:bindings matrix-view)
+            emitted (gpu-gemm/emit-executable
+                     {:id [:typed-contraction operation-id]
+                      :a row :b col :c (:out facts)
+                      :m m :n n :k k
+                      :variant (:variant matrix-view)
+                      :precision :mixed-f16-f32
+                      :tile (:tile target-schedule)
+                      :fill-workgroups (:fill-workgroups target-schedule)})
+            alternatives (->> (:alternatives emitted)
+                              (remove #(= :f32-scalar (get-in % [:attributes :strategy])))
+                              (mapv #(reinterface-graph % abi arguments effects operation-id)))
+            selector (:selector emitted)]
+        {:alternatives alternatives
+         :selector selector
+         :schedule {:family :matrix
+                    :precision :mixed-f16-f32
+                    :variant (:variant matrix-view)
+                    :bindings (:bindings matrix-view)
+                    :dimensions (:dimensions matrix-view)
+                    :tile (:tile target-schedule)
+                    :matrix (:matrix target-schedule)}}))))
+
+(defn- replace-selector-strategy
+  [selector old-strategy new-strategy]
+  (-> selector
+      (update :cases
+              (fn [cases]
+                (mapv #(cond-> % (= old-strategy (:strategy %))
+                               (assoc :strategy new-strategy))
+                      cases)))
+      (update :default #(if (= old-strategy %) new-strategy %))))
+
 (defn route-typed-contraction-dispatch
   "Normalize legal typed contraction leaves behind one logical ABI-compatible dispatch.
 
@@ -962,25 +1045,40 @@
         {:keys [abi arguments public-scalars]}
         (common-logical-interface candidates operation operation-id)
         candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
-        default-strategy (:strategy (first candidates))
-        dispatch-id (candidate-dispatch-id operation-id candidates)
+        fallback-strategy (:strategy (first candidates))
+        common-effects (:effects (:artifact (first candidates)))
+        mixed (mixed-dpas-alternatives program operation options abi arguments common-effects)
+        default-strategy (if (seq (:alternatives mixed)) :xmx-direct fallback-strategy)
+        schedule-identity (select-keys mixed [:schedule :decline])
+        dispatch-id (candidate-dispatch-id operation-id candidates schedule-identity)
         candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)
-        alternatives (mapv #(candidate-graph % operation-id abi arguments) candidates)]
+        alternatives (into (mapv #(candidate-graph % operation-id abi arguments) candidates)
+                           (:alternatives mixed))
+        selector (if (seq (:alternatives mixed))
+                   (replace-selector-strategy (:selector mixed)
+                                              :f32-scalar fallback-strategy)
+                   {:kind :fixed-strategy :strategy default-strategy})]
     (kdispatch/make
      {:id dispatch-id
       :alternatives alternatives
       :default-strategy default-strategy
-      :selector {:kind :fixed-strategy :strategy default-strategy}
+      :selector selector
       :provenance {:operation-id operation-id
                    :semantic-op :contraction
                    :source-dialect :typed-soac}
       :attributes {:operation-family :typed-contraction
                    :candidate-schedules
-                   (into {} (map (juxt :strategy :candidate-schedule)) candidates)
+                   (cond-> (into {} (map (juxt :strategy :candidate-schedule)) candidates)
+                     (:schedule mixed)
+                     (assoc :xmx-direct (:schedule mixed)
+                            :xmx-split-k (assoc (:schedule mixed) :split-k? true)))
                    :declines (:declines routed)
+                   :matrix-graph-decline (:decline mixed)
                    :tuning (typed-contraction-tuning-contract schedule dispatch-id abi
                                                                (:precision options))
-                   :selection :analytic-fixed}})))
+                   :selection (if (seq (:alternatives mixed))
+                                :analytic-runtime
+                                :analytic-fixed)}})))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.

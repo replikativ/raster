@@ -8,6 +8,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -50,8 +51,10 @@
 
 (defn- extents
   [{:keys [m n k variant]}]
-  {:a-elements (if (= :tn variant) (klaunch/product k m) (klaunch/product m k))
-   :b-elements (if (= :nt variant) (klaunch/product n k) (klaunch/product k n))
+  {:a-elements (if (contains? #{:tn :tt} variant)
+                 (klaunch/product k m) (klaunch/product m k))
+   :b-elements (if (contains? #{:nt :tt} variant)
+                 (klaunch/product n k) (klaunch/product k n))
    :c-elements (klaunch/product m n)})
 
 (defn- effects
@@ -81,10 +84,13 @@
                                   (aget B (+ (* j k) l))))
     :tn '(raster.par/contract C [[i m] [j n]] [[l k]]
                                (* (aget A (+ (* l m) i))
-                                  (aget B (+ (* l n) j))))))
+                                  (aget B (+ (* l n) j))))
+    :tt '(raster.par/contract C [[i m] [j n]] [[l k]]
+                               (* (aget A (+ (* l m) i))
+                                  (aget B (+ (* j k) l))))))
 
 (defn emit-portable-scalar-matrix-kernel
-  "Lower a dynamic f32 NN/NT/TN matrix product through the portable contraction schedule."
+  "Lower a dynamic f32 NN/NT/TN/TT matrix product through the portable contraction schedule."
   ([kernel-name variant]
    (emit-portable-scalar-matrix-kernel kernel-name variant :opencl-intel))
   ([kernel-name variant target-dialect]
@@ -354,8 +360,8 @@
         at16 [:gemm id strategy :at16]
         bt16 [:gemm id strategy :bt16]
         partials [:gemm id strategy :partials]
-        final-a (if (= :tn variant) at16 a16)
-        final-b (if (= :nt variant) bt16 b16)
+        final-a (if (contains? #{:tn :tt} variant) at16 a16)
+        final-b (if (contains? #{:nt :tt} variant) bt16 b16)
         kc (when split-k?
              (klaunch/align-up (klaunch/ceil-div k requested-splits) (:block-k tile)))
         splits (when split-k? (klaunch/ceil-div k kc))
@@ -369,10 +375,10 @@
                                     :convert-a)
         convert-b (convert-artifact (str prefix "_convert_b") b b16 b-elements vector-width
                                     :convert-b)
-        transpose-a (when (= :tn variant)
+        transpose-a (when (contains? #{:tn :tt} variant)
                       (transpose-artifact (str prefix "_transpose_a") a16 at16 k m
                                           :transpose-a))
-        transpose-b (when (= :nt variant)
+        transpose-b (when (contains? #{:nt :tt} variant)
                       (transpose-artifact (str prefix "_transpose_b") b16 bt16 n k
                                           :transpose-b))
         contract-output (if split-k? partials c)
@@ -436,6 +442,27 @@
                       (klaunch/floor-div k min-split-chunk)
                       max-splits))))
 
+(defn mixed-dpas-schedule
+  "Return the target-derived schedule facts for the current mixed f16×f16→f32 DPAS graph.
+
+   A nil result is an honest target decline.  CUDA MMA and HIP MFMA will be separate target
+   lowering rows over the same typed contraction; an arbitrary `:matrix` capability must never be
+   emitted with Intel DPAS source."
+  [desc requested-tile]
+  (let [{:keys [family m n k subgroup]} (:matrix desc)
+        backend (:backend desc)]
+    (when (and (contains? #{:ze :opencl} backend)
+               (= :dpas family) (= [8 16 16] [m n k])
+               (contains? #{8 16} subgroup)
+               (contains? (hardware/supported-subgroup-sizes desc) (long subgroup)))
+      (let [tile (or requested-tile (hardware/gemm-tile-for desc))
+            workgroup-size (* (quot (:block-m tile) (:sg-m tile))
+                              (quot (:block-n tile) (:sg-n tile))
+                              subgroup)]
+        {:tile tile
+         :fill-workgroups (hardware/fill-workgroups desc workgroup-size)
+         :matrix (:matrix desc)}))))
+
 (defn emit-executable
   "Emit the resident GEMM schedule as one graph or a checked runtime dispatch.
 
@@ -445,8 +472,8 @@
   [{:keys [id a b c m n k variant precision tile fill-workgroups vector-width]
     :or {vector-width 4}
     :as spec}]
-  (when-not (contains? #{:nn :nt :tn} variant)
-    (throw (ex-info "GEMM executable requires :nn, :nt, or :tn variant"
+  (when-not (contains? #{:nn :nt :tn :tt} variant)
+    (throw (ex-info "GEMM executable requires :nn, :nt, :tn, or :tt variant"
                     {:id id :variant variant})))
   (doseq [[field value] [[:id id] [:a a] [:b b] [:c c] [:m m] [:n n] [:k k]
                          [:precision precision] [:tile tile] [:fill-workgroups fill-workgroups]]]
@@ -469,6 +496,10 @@
           {:kind :runtime-expression-cases
            :cases [{:expression n :op :< :value 8 :strategy :f32-scalar}
                    {:expression k :op :< :value 8 :strategy :f32-scalar}
+                   {:expression (kbody/expression :mod n 8)
+                    :op :> :value 0 :strategy :f32-scalar}
+                   {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
+                    :op :> :value 0 :strategy :f32-scalar}
                    {:expression split-expression :op :>= :value 2 :strategy :xmx-split-k}]
            :default :xmx-direct}
           :provenance {:semantic-op :contraction :variant variant :lowering :gemm-schedule}
