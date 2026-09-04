@@ -18,12 +18,12 @@
   (:require
    [clojure.set :as set]
    [raster.compiler.backend.gpu.gemm :as gpu-gemm]
+   [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
    [raster.compiler.core.op-descriptor :as op]
    [raster.compiler.core.hardware :as hardware]
    [raster.compiler.passes.parallel.device :as device]
    [raster.compiler.passes.parallel.patterns :as patterns]
-   [raster.compiler.passes.parallel.gemm-recognize :as gemm-recognize]
-   [raster.compiler.backend.gpu.opencl-codegen :as codegen]))
+   [raster.compiler.passes.parallel.gemm-recognize :as gemm-recognize]))
 
 ;; ================================================================
 ;; Pattern matching helpers
@@ -160,10 +160,14 @@
 (defn- gen-transpose-kernel
   "Generate a transpose kernel. Returns {:kernel-name :source :dtype}."
   [dtype kernel-counter]
-  (let [kname (str "transpose_" (swap! kernel-counter inc))]
+  (let [kname (str "transpose_" (swap! kernel-counter inc))
+        dtype (or dtype :float)
+        emitted (layout-emitter/emit-transpose-kernel
+                 {:kernel-name kname :input 'in :output 'out :element-dtype dtype})]
     {:kernel-name kname
-     :source (codegen/emit-transpose-kernel kname :dtype (or dtype :float))
-     :dtype (or dtype :float)
+     :source (:source emitted)
+     :kernel-body (:kernel-body emitted)
+     :dtype dtype
      :type :transpose}))
 
 ;; ================================================================

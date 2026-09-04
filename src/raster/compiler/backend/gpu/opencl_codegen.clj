@@ -17,7 +17,6 @@
     (kernel-launch-config 100000 :device-id :ze:0)"
   (:require [clojure.string :as str]
             [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.core.layout :as layout]
             [raster.compiler.backend.gpu.c-emit :as ce]))
 
 ;; ================================================================
@@ -387,72 +386,6 @@
 ;; ================================================================
 ;; Transpose kernel
 ;; ================================================================
-
-(defn emit-f32-to-f16-kernel
-  "Generate the vectorized f32→f16 conversion used by mixed-precision GEMM schedules.
-
-   `vector-width` is the compiler-selected number of elements per work-item and must be 1, 2, or
-   4. The scalar tail preserves correctness for arbitrary extents and for extents below the vector
-   width. Keeping this emitter in compiler codegen lets conversion participate in KernelGraph
-   scheduling instead of being synthesized privately by a runtime registry."
-  [kernel-name vector-width]
-  (let [w (long vector-width)]
-    (when-not (contains? #{1 2 4} w)
-      (throw (ex-info "f32-to-f16 vector width must be 1, 2, or 4"
-                      {:vector-width vector-width})))
-    (if (= 1 w)
-      (str "__kernel void " kernel-name
-           "(__global const float* restrict in, __global half* restrict out, int n) {\n"
-           "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
-           "out[i] = (half)in[i];\n}\n")
-      (let [shift (case w 2 1 4 2)]
-        (str "__kernel void " kernel-name
-             "(__global const float* restrict in, __global half* restrict out, int n) {\n"
-             "  int nv = n >> " shift ";\n"
-             "  for (int i = get_global_id(0); i < nv; i += get_global_size(0))\n"
-             "    vstore_half" w "(vload" w "(i, in), i, out);\n"
-             "  for (int i = (nv << " shift ") + get_global_id(0); i < n; "
-             "i += get_global_size(0))\n"
-             "    out[i] = (half)in[i];\n}\n")))))
-
-(defn- render-c-index
-  "Render a layout->offset index S-expression to C infix (matches the hand-written kernel strings:
-   `(+ (* i cols) j)` → \"i * cols + j\"). Index arithmetic only (+ and *, symbols/ints)."
-  [e]
-  (cond
-    (symbol? e) (name e)
-    (number? e) (str e)
-    (seq? e)    (let [[op a b] e]
-                  (str (render-c-index a) " " (case op + "+" * "*" (str op)) " " (render-c-index b)))
-    :else       (str e)))
-
-(defn emit-transpose-kernel
-  "Generate an OpenCL 2D matrix transpose kernel. LAYOUT-DRIVEN: the read/write indices are computed
-   from the layout facet (`layout/layout->offset`), not hand-written — a transpose is exactly a
-   `convert_layout` between a row-major input [rows,cols] and its transposed output [cols,rows]. The
-   emitted string is byte-identical to the former hand-written `out[j*rows+i] = in[i*cols+j]`; this
-   is the first place a layout DRIVES codegen (the Stage-1 transpose-as-convert seam, proven here).
-
-  dtype: :double | :float | :half (default :float). Returns OpenCL C source string."
-  [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype  (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
-        in-l   (layout/row-major '[rows cols] dtype)          ;; input row-major
-        out-l  (layout/row-major '[cols rows] dtype)          ;; output row-major, transposed extents
-        in-idx  (render-c-index (layout/layout->offset in-l  '[i j]))   ;; "i * cols + j"
-        out-idx (render-c-index (layout/layout->offset out-l '[j i]))]  ;; "j * rows + i"
-    (str (extension-pragmas dtype)
-         "__kernel void " kernel-name
-         "(__global const " ctype "* restrict in,"
-         " __global " ctype "* restrict out,"
-         " int rows, int cols) {\n"
-         "    int gid = get_global_id(0);\n"
-         "    int total = rows * cols;\n"
-         "    for (int idx = gid; idx < total; idx += get_global_size(0)) {\n"
-         "        int i = idx / cols;\n"
-         "        int j = idx % cols;\n"
-         "        out[" out-idx "] = in[" in-idx "];\n"
-         "    }\n"
-         "}\n")))
 
 ;; ================================================================
 ;; Scalar (non-XMX) GEMM kernel — small-N fallback

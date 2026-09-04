@@ -77,15 +77,13 @@
             (destroy! g))
           (doseq [b [af bf a16 b16 c-plain c-split parts]] (free! b)))))))
 
-(deftest vectorized-convert-is-bit-exact
-  ;; The f32→f16 operand cast is VECTORIZED (w elements per work-item, w from the hardware
-  ;; descriptor). `vstore_halfN` rounds to nearest-even — the same rounding as the `(half)`
-  ;; cast it replaced — so the result must be BIT-IDENTICAL to the scalar reference, not
-  ;; merely close. The interesting cases are the ones a vectorized kernel gets wrong:
-  ;; an n that is not a multiple of w (the tail loop) and an n below w (no vector iteration
-  ;; at all, and a group count that must not round down to zero).
+(deftest unrolled-layout-convert-is-bit-exact
+  ;; The f32→f16 operand cast schedules w statically unrolled, lane-owned elements per work-item.
+  ;; Its explicit nearest-even IEEE conversion must be BIT-IDENTICAL to the scalar reference, not
+  ;; merely close. The interesting cases are a non-multiple tail and an extent below w, where the
+  ;; launch still needs one workgroup and every inactive unrolled element must remain masked.
   (if-not @gp/gpu-available?
-    (gp/gpu-skip! "vectorized convert")
+    (gp/gpu-skip! "unrolled layout convert")
     (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
           make-buffer (ns-resolve ze 'make-buffer)
           upload!     (ns-resolve ze 'array->buffer!)
