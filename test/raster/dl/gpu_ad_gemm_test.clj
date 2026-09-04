@@ -284,11 +284,15 @@
         compiled (try {:ok (pl/compile-gpu-program probe :ze:0 :dtype :float)}
                       (catch Throwable t {:err t}))]
     (if-let [t (:err compiled)]
-      ;; Fix (b): rejected at compile. Assert it is the PRINCIPLED, named rejection —
-      ;; not an incidental failure that might mask a real regression.
-      (is (= :unsupported-gemm-alpha-beta (:why (:non-resident (ex-data t))))
-          (str "an accumulating GEMM must be rejected by NAME "
-               "(:unsupported-gemm-alpha-beta), got: " (.getMessage t)))
+      ;; Fix (b): rejected at compile. The TypedSOAC frontend now represents BLAS accumulation as
+      ;; an ordinary result transform, so the honest narrow rejection is the missing typed result
+      ;; operand rather than the retired BLAS-specific classification. Assert that exact structured
+      ;; decline—not an incidental emitter failure that might mask a real regression.
+      (let [data (ex-data t)
+            reason (or (:missing-rule data) (:why (:non-resident data)))]
+        (is (= :result-transform-operand reason)
+            (str "an accumulating GEMM must be rejected by its typed result-transform rule "
+                 "(:result-transform-operand), got: " (.getMessage t))))
       ;; Fix (a): it compiled — then it MUST be numerically correct on device.
       (if-not @gp/gpu-available?
         (gp/gpu-skip! "gemm-accumulate device verify (compiled resident)")

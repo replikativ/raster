@@ -3,7 +3,8 @@
 
    A LaunchSpec belongs to compiler IR: its dimensions may refer to compiler values.  A
    LaunchGeometry is the concrete 1-3D value a backend submits.  Keeping the two distinct stops
-   emitters, extractors and runtimes from inventing incompatible scalar/2-D marker conventions.")
+   emitters, extractors and runtimes from inventing incompatible scalar/2-D marker conventions."
+  (:require [raster.compiler.core.dtype :as dtype]))
 
 (defrecord RuntimeValue [value])
 (defrecord CeilDiv [value divisor])
@@ -109,6 +110,16 @@
 
 (declare index-expr? index-cast? validate-spec! spec)
 
+(def ^:private index-operations
+  #{:add :sub :mul :floor-div :ceil-div :mod :min :max})
+
+(defn- valid-index-arity?
+  [op arguments]
+  (case op
+    (:floor-div :ceil-div :mod) (= 2 (count arguments))
+    (:add :sub :mul :min :max) (seq arguments)
+    false))
+
 (defn expression?
   "True for explicit symbolic integer-expression nodes and literal integers. Opaque compiler
    values such as symbols are leaves and are therefore also accepted. Sequential Clojure forms
@@ -116,18 +127,108 @@
   [x]
   (cond
     (integer? x) true
-    (runtime-value? x) (some? (:value x))
-    (ceil-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
-    (floor-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
+    (runtime-value? x) (let [value (:value x)]
+                         (or (integer? value) (symbol? value) (keyword? value)))
+    (ceil-div? x) (and (expression? (:value x))
+                       (expression? (:divisor x))
+                       (or (not (integer? (:divisor x))) (pos? (:divisor x))))
+    (floor-div? x) (and (expression? (:value x))
+                        (expression? (:divisor x))
+                        (or (not (integer? (:divisor x))) (pos? (:divisor x))))
     (sum? x) (and (seq (:terms x)) (every? expression? (:terms x)))
     (product? x) (and (seq (:factors x)) (every? expression? (:factors x)))
     (align-up? x) (and (expression? (:value x))
                        (integer? (:alignment x)) (pos? (:alignment x)))
     (minimum? x) (and (seq (:values x)) (every? expression? (:values x)))
-    (index-expr? x) (and (seq (:arguments x)) (every? expression? (:arguments x)))
-    (index-cast? x) (expression? (:argument x))
+    (index-expr? x) (and (contains? index-operations (:op x))
+                         (valid-index-arity? (:op x) (:arguments x))
+                         (every? expression? (:arguments x)))
+    ;; The launch evaluator represents exact mathematical integers. Wrapping, saturation, or
+    ;; floating conversion would change that algebra and therefore needs a distinct lowering.
+    (index-cast? x) (and (dtype/known? (:dtype x))
+                         (contains? #{:int :long} (dtype/canon (:dtype x)))
+                         (= :exact (:overflow x))
+                         (expression? (:argument x)))
     (sequential? x) false
+    :else (or (symbol? x) (keyword? x))))
+
+(defn- resolvable-expression?
+  "Structural launch/storage expression check that preserves opaque compiler value identities.
+
+   Unlike certified target-private scalar algebra, a graph extent identity may itself be a list,
+   for example `(extent output)`. Such a leaf is passed whole to the resolver and never evaluated.
+   Known arithmetic records still receive their complete structural checks here."
+  [x]
+  (cond
+    (integer? x) true
+    (runtime-value? x) (some? (:value x))
+    (ceil-div? x) (and (resolvable-expression? (:value x))
+                       (resolvable-expression? (:divisor x))
+                       (or (not (integer? (:divisor x))) (pos? (:divisor x))))
+    (floor-div? x) (and (resolvable-expression? (:value x))
+                        (resolvable-expression? (:divisor x))
+                        (or (not (integer? (:divisor x))) (pos? (:divisor x))))
+    (sum? x) (and (seq (:terms x)) (every? resolvable-expression? (:terms x)))
+    (product? x) (and (seq (:factors x)) (every? resolvable-expression? (:factors x)))
+    (align-up? x) (and (resolvable-expression? (:value x))
+                       (integer? (:alignment x)) (pos? (:alignment x)))
+    (minimum? x) (and (seq (:values x)) (every? resolvable-expression? (:values x)))
+    (or (index-expr? x) (index-cast? x)) (expression? x)
     :else (some? x)))
+
+(defn validate-typed-expression!
+  "Validate an integer expression against the logical dtype of each opaque leaf.
+
+   `leaf-dtype` returns the public scalar dtype for a compiler value. Generic launch arithmetic
+   promotes an int operand to long when needed. KernelBody IndexExpr is stricter: its operands must
+   already have one width, and IndexCast permits only exact identity or int-to-long widening. The
+   final artifact-slot conversion is separately range-checked when a graph call is bound."
+  [expression leaf-dtype]
+  (when-not (expression? expression)
+    (throw (ex-info "invalid checked integer expression"
+                    {:reason :kernel-launch-expression :expression expression})))
+  (letfn [(promote [types]
+            (if (some #{:long} types) :long :int))
+          (infer [value]
+            (cond
+              (integer? value)
+              (if (<= Integer/MIN_VALUE value Integer/MAX_VALUE) :int :long)
+
+              (runtime-value? value) (infer (:value value))
+              (ceil-div? value) (promote (map infer [(:value value) (:divisor value)]))
+              (floor-div? value) (promote (map infer [(:value value) (:divisor value)]))
+              (sum? value) (promote (map infer (:terms value)))
+              (product? value) (promote (map infer (:factors value)))
+              (align-up? value) (promote [(infer (:value value)) :int])
+              (minimum? value) (promote (map infer (:values value)))
+
+              (index-expr? value)
+              (let [types (set (map infer (:arguments value)))]
+                (when-not (= 1 (count types))
+                  (throw (ex-info "kernel index expression mixes widths without an exact cast"
+                                  {:reason :kernel-launch-index-dtype
+                                   :expression value :types types})))
+                (first types))
+
+              (index-cast? value)
+              (let [source (infer (:argument value))
+                    target (dtype/canon (:dtype value))]
+                (when-not (or (= source target)
+                              (and (= :int source) (= :long target)))
+                  (throw (ex-info "kernel launch index cast is not an exact widening"
+                                  {:reason :kernel-launch-index-cast
+                                   :expression value :source source :target target})))
+                target)
+
+              :else
+              (let [leaf (some-> (leaf-dtype value) dtype/canon)]
+                (when-not (contains? #{:int :long} leaf)
+                  (throw (ex-info "integer expression references a non-integral or absent scalar"
+                                  {:reason :kernel-launch-expression-leaf
+                                   :expression expression :leaf value :dtype leaf})))
+                leaf)))]
+    (infer expression)
+    expression))
 
 (defn expression-references
   "Return the opaque compiler-value leaves read by an integer expression."
@@ -205,14 +306,15 @@
    values with `runtime-value` so scheduled extents cannot smuggle source S-expressions into an
    emitted ABI."
   [x]
-  (or (and (integer? x) (pos? x))
-      (runtime-value? x)
-      (ceil-div? x)
-      (product? x)
-      (align-up? x)
-      (floor-div? x)
-      (sum? x)
-      (minimum? x)))
+  (and (resolvable-expression? x)
+       (or (and (integer? x) (pos? x))
+           (runtime-value? x)
+           (ceil-div? x)
+           (product? x)
+           (align-up? x)
+           (floor-div? x)
+           (sum? x)
+           (minimum? x))))
 
 (defn validate-spec!
   "Validate and return a symbolic launch specification."
@@ -328,6 +430,9 @@
                (ceil-div? expression)
                (let [value (resolve* (:value expression))
                      divisor (resolve* (:divisor expression))]
+                 (when (neg? value)
+                   (throw (ex-info "ceil-div resolved value must be non-negative"
+                                   {:expression expression :value value})))
                  (when-not (pos? divisor)
                    (throw (ex-info "ceil-div resolved divisor must be positive"
                                    {:expression expression :divisor divisor})))
@@ -336,6 +441,9 @@
                (floor-div? expression)
                (let [value (resolve* (:value expression))
                      divisor (resolve* (:divisor expression))]
+                 (when (neg? value)
+                   (throw (ex-info "floor-div resolved value must be non-negative"
+                                   {:expression expression :value value})))
                  (when-not (pos? divisor)
                    (throw (ex-info "floor-div resolved divisor must be positive"
                                    {:expression expression :divisor divisor})))
@@ -352,6 +460,9 @@
                (let [value (resolve* (:value expression))
                      alignment (:alignment expression)
                      quotient (quot value alignment)]
+                 (when (neg? value)
+                   (throw (ex-info "align-up resolved value must be non-negative"
+                                   {:expression expression :value value})))
                  (Math/multiplyExact
                   (long (+ quotient (if (zero? (rem value alignment)) 0 1)))
                   (long alignment)))
@@ -362,22 +473,35 @@
                ;; the same exact-overflow discipline rather than asking the runtime binder to
                ;; interpret a compiler record it does not own.
                (index-expr? expression)
-               (let [arguments (mapv resolve* (:arguments expression))]
+               (let [_ (when-not (expression? expression)
+                         (throw (ex-info "cannot resolve an invalid kernel index expression"
+                                         {:reason :kernel-launch-expression
+                                          :expression expression})))
+                     arguments (mapv resolve* (:arguments expression))]
                  (case (:op expression)
                    :add (reduce #(Math/addExact (long %1) (long %2)) arguments)
                    :sub (reduce #(Math/subtractExact (long %1) (long %2)) arguments)
                    :mul (reduce #(Math/multiplyExact (long %1) (long %2)) arguments)
                    :floor-div (let [[value divisor] arguments]
+                                (when (neg? value)
+                                  (throw (ex-info "index floor-div resolved value must be non-negative"
+                                                  {:expression expression :value value})))
                                 (when-not (pos? divisor)
                                   (throw (ex-info "index floor-div resolved divisor must be positive"
                                                   {:expression expression :divisor divisor})))
                                 (quot value divisor))
                    :ceil-div (let [[value divisor] arguments]
+                               (when (neg? value)
+                                 (throw (ex-info "index ceil-div resolved value must be non-negative"
+                                                 {:expression expression :value value})))
                                (when-not (pos? divisor)
                                  (throw (ex-info "index ceil-div resolved divisor must be positive"
                                                  {:expression expression :divisor divisor})))
                                (+ (quot value divisor) (if (zero? (rem value divisor)) 0 1)))
                    :mod (let [[value divisor] arguments]
+                          (when (neg? value)
+                            (throw (ex-info "index mod resolved value must be non-negative"
+                                            {:expression expression :value value})))
                           (when-not (pos? divisor)
                             (throw (ex-info "index mod resolved divisor must be positive"
                                             {:expression expression :divisor divisor})))
@@ -387,7 +511,12 @@
                    (throw (ex-info "launch dimension uses an unsupported index operation"
                                    {:expression expression :op (:op expression)}))))
                (index-cast? expression)
-               (resolve* (:argument expression))
+               (do
+                 (when-not (expression? expression)
+                   (throw (ex-info "cannot resolve an invalid kernel index cast"
+                                   {:reason :kernel-launch-expression
+                                    :expression expression})))
+                 (resolve* (:argument expression)))
                :else (resolve-integer! resolve-value expression expression))))]
     (resolve* dimension)))
 

@@ -108,7 +108,7 @@
         input-buffers (mapv buffer inputs)
         output-buffers (mapv buffer outputs)
         uses (vec (concat (map #(graph/->ValueUse % :read) inputs)
-                          (map #(graph/->ValueUse % :write) outputs)))]
+                          (map #(graph/->ValueUse % :read-write) outputs)))]
     (graph/make
      {:inputs (into input-buffers output-buffers)
       :outputs output-buffers

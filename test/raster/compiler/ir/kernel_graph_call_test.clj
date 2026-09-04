@@ -44,6 +44,14 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicitly typed"
                           (graph-call/make graph buffers {'n 1025})))))
 
+(deftest derived-int-scalars-refuse-narrowing-overflow
+  (let [graph (emitted-graph)
+        ids (set (map :id (concat (:inputs graph) (:outputs graph) (:temporaries graph))))
+        buffers (zipmap ids (repeatedly #(Object.)))]
+    (is (thrown? ArithmeticException
+                 (graph-call/make graph buffers
+                                  {'n {:type :int :value Long/MAX_VALUE}})))))
+
 (deftest emitted-graph-projects-one-ordered-public-call-to-runtime-binding-maps
   (let [graph (emitted-graph)
         n {:type :int :value 1025}

@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.paged-kv-append-route-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.paged-kv-append :as append]
             [raster.compiler.passes.parallel.paged-kv-append-route :as route]))
@@ -59,7 +60,10 @@
     (is (= #{'key-pages 'value-pages}
            (set (map :id (:outputs graph)))))
     (is (every? #(= :inout (:role %)) (:outputs graph)))
-    (is (graph/kernel-graph? graph))))
+    (is (every? #(= :read-write (:access %))
+                (filter (comp #{'key-pages 'value-pages} :buffer)
+                        (get-in graph [:nodes 0 :uses]))))
+    (is (identical? graph (executable/validate! graph)))))
 
 (deftest unsupported-storage-declines-before-emission
   (let [result (route/route (problem {:key-storage-dtype :float}))]

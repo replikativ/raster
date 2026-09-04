@@ -62,7 +62,7 @@
 (defn- cast-scalar
   [dtype value]
   (case dtype
-    :int (int value)
+    :int (Math/toIntExact (long value))
     :long (long value)
     (throw (ex-info "derived graph scalar is only defined for integer ABI slots"
                     {:dtype dtype :value value}))))

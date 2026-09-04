@@ -668,6 +668,7 @@
     (is (= 3 (count (:nodes graph))))
     (is (= :typed-soac (get-in (first (:operations equation)) [:algorithm-dialect])))
     (is (= #{'out} (set (map :id (:outputs graph)))))
+    (is (= [['n :long]] (mapv (juxt :id :dtype) (:scalars graph))))
     (is (= 1 (count (:temporaries graph))))
     (parallel-program/validate! scheduled segop/segop-node?)))
 

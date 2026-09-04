@@ -6,13 +6,16 @@
    replaces the operation with a KernelArtifact without reconstructing dataflow from marker
    conventions.  Stable GraphBuffer identities make intermediate storage part of the program."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.segop :as segop]))
 
 (defrecord GraphBuffer [id dtype elements memory-space role])
+(defrecord GraphScalar [id dtype])
 (defrecord ValueUse [buffer access])
 (defrecord ScheduledKernel [id operation uses dependencies])
-(defrecord KernelGraph [inputs outputs temporaries nodes abi arguments effects provenance attributes])
+(defrecord KernelGraph
+           [inputs outputs temporaries scalars nodes abi arguments effects provenance attributes])
 
 (def ^:private buffer-roles #{:input :output :inout :temporary})
 (def ^:private access-modes #{:read :write :read-write})
@@ -22,6 +25,9 @@
 
 (defn graph-buffer? [x]
   (record-kind? "raster.compiler.ir.kernel_graph.GraphBuffer" x))
+
+(defn graph-scalar? [x]
+  (record-kind? "raster.compiler.ir.kernel_graph.GraphScalar" x))
 
 (defn value-use? [x]
   (record-kind? "raster.compiler.ir.kernel_graph.ValueUse" x))
@@ -50,6 +56,16 @@
   [id dtype elements memory-space role]
   (validate-buffer-fields! (->GraphBuffer id dtype elements memory-space role)))
 
+(defn scalar
+  "Construct one ordered, target-neutral public scalar dependency."
+  [id scalar-dtype]
+  (when-not (or (symbol? id) (keyword? id))
+    (throw (ex-info "graph scalar identity must be a symbol or keyword" {:id id})))
+  (when-not (dtype/known? scalar-dtype)
+    (throw (ex-info "graph scalar requires a known dtype"
+                    {:id id :dtype scalar-dtype})))
+  (->GraphScalar id (dtype/canon scalar-dtype)))
+
 (defn- reads? [access] (contains? #{:read :read-write} access))
 (defn- writes? [access] (contains? #{:write :read-write} access))
 
@@ -76,7 +92,7 @@
 
 (defn- validate-interface!
   [graph]
-  (let [{:keys [abi arguments]} graph]
+  (let [{:keys [abi arguments scalars]} graph]
     (when-not (= (some? abi) (some? arguments))
       (throw (ex-info "kernel graph ABI and arguments must be declared together"
                       {:abi abi :arguments arguments})))
@@ -87,9 +103,9 @@
             pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot)))
                                    (mapv vector abi arguments))
             pointer-arguments (mapv second pointer-pairs)
-            scalar-arguments (mapv second
-                                   (filterv (fn [[slot _]] (= :scalar (:kind slot)))
-                                            (mapv vector abi arguments)))]
+            scalar-pairs (filterv (fn [[slot _]] (= :scalar (:kind slot)))
+                                  (mapv vector abi arguments))
+            scalar-arguments (mapv second scalar-pairs)]
         (when-not (= (set (keys external-by-id)) (set pointer-arguments))
           (throw (ex-info "kernel graph pointer interface differs from its external buffers"
                           {:external (set (keys external-by-id))
@@ -100,6 +116,15 @@
         (when-not (= (count scalar-arguments) (count (set scalar-arguments)))
           (throw (ex-info "kernel graph scalar interface arguments must be unique"
                           {:scalar-arguments scalar-arguments})))
+        (when (some? scalars)
+          (let [expected (mapv (juxt :id :dtype) scalars)
+                actual (mapv (fn [[slot argument]]
+                               [argument (dtype/canon (:dtype slot))])
+                             scalar-pairs)]
+            (when-not (= expected actual)
+              (throw (ex-info "kernel graph ABI scalar interface differs from its schedule"
+                              {:reason :kernel-graph-scalar-interface
+                               :expected expected :actual actual})))))
         (doseq [[slot id] pointer-pairs]
           (let [{:keys [dtype role]} (get external-by-id id)
                 expected-kind (case role
@@ -125,7 +150,7 @@
   (when-not (kernel-graph? graph)
     (throw (ex-info "kernel graph must be a KernelGraph value"
                     {:graph graph :actual (type graph)})))
-  (let [{:keys [inputs outputs temporaries nodes effects provenance attributes]} graph
+  (let [{:keys [inputs outputs temporaries scalars nodes effects provenance attributes]} graph
         sections [inputs outputs temporaries]
         buffers (vec (mapcat identity sections))
         buffer-ids (mapv :id buffers)]
@@ -134,6 +159,29 @@
       (when-not (vector? values)
         (throw (ex-info "kernel graph sections must be ordered vectors"
                         {:field field :value values}))))
+    (when-not (or (nil? scalars) (vector? scalars))
+      (throw (ex-info "kernel graph scalar interface must be an ordered vector"
+                      {:field :scalars :value scalars})))
+    (when (some? scalars)
+      (doseq [value scalars]
+        (when-not (graph-scalar? value)
+          (throw (ex-info "kernel graph contains a non-scalar interface value"
+                          {:scalar value})))
+        (when-not (or (symbol? (:id value)) (keyword? (:id value)))
+          (throw (ex-info "graph scalar identity must be a symbol or keyword"
+                          {:scalar value})))
+        (when-not (and (dtype/known? (:dtype value))
+                       (= (:dtype value) (dtype/canon (:dtype value))))
+          (throw (ex-info "kernel graph scalar must use its canonical dtype"
+                          {:scalar value}))))
+      (when-not (= (count scalars) (count (distinct (map :id scalars))))
+        (throw (ex-info "kernel graph scalar identities must be unique"
+                        {:scalars scalars})))
+      (let [collisions (set/intersection (set buffer-ids) (set (map :id scalars)))]
+        (when (seq collisions)
+          (throw (ex-info "kernel graph buffer and scalar identities must be disjoint"
+                          {:reason :kernel-graph-value-identity
+                           :collisions collisions})))))
     (doseq [b buffers]
       (when-not (graph-buffer? b)
         (throw (ex-info "kernel graph contains a non-buffer value" {:buffer b})))
@@ -236,9 +284,9 @@
 
 (defn make
   "Construct and verify a scheduled KernelGraph from explicit compiler values."
-  [{:keys [inputs outputs temporaries nodes abi arguments effects provenance attributes]
+  [{:keys [inputs outputs temporaries scalars nodes abi arguments effects provenance attributes]
     :or {inputs [] outputs [] temporaries [] nodes [] effects {} provenance {} attributes {}}}]
-  (validate! (->KernelGraph inputs outputs temporaries nodes abi arguments
+  (validate! (->KernelGraph inputs outputs temporaries scalars nodes abi arguments
                             effects provenance attributes)))
 
 (defn map-operations
@@ -260,8 +308,37 @@
     {:inputs (:inputs graph)
      :outputs (:outputs graph)
      :temporaries (:temporaries graph)
+     :scalars (:scalars graph)
      :nodes (mapv #(select-keys % [:id :uses :dependencies]) (:nodes graph))
      :effects (:effects graph)}))
+
+(defn boundary-contract
+  "Project the exact public boundary of a scheduled graph.
+
+   A schedule refinement may introduce private buffers and replace one operation with several
+   scheduled stages, but it may not change the ordered external storage contract, public ABI, or
+   logical effects.  Keeping this projection separate from `dataflow-contract` makes that
+   distinction explicit instead of weakening target-emission equivalence."
+  [graph]
+  (let [graph (validate! graph)]
+    {:inputs (:inputs graph)
+     :outputs (:outputs graph)
+     :scalars (:scalars graph)
+     :abi (:abi graph)
+     :arguments (:arguments graph)
+     :effects (:effects graph)}))
+
+(defn schedule-contract
+  "Project the complete scheduled identity of a graph before target emission.
+
+   Unlike `dataflow-contract`, this includes the exact ordered operations.  It is used to bind a
+   graph-refinement witness to the semantic schedule it claims to refine; target emission still
+   uses the stricter positional one-operation-to-one-artifact check."
+  [graph]
+  (let [graph (validate! graph)]
+    {:boundary (boundary-contract graph)
+     :dataflow (dataflow-contract graph)
+     :operations (mapv :operation (:nodes graph))}))
 
 (defn dataflow-equivalent?
   "Whether two valid graphs have exactly the same target-independent dataflow contract."
@@ -283,7 +360,7 @@
    `temporaries` is a map from stable buffer identity to at least `{:elements expr}`. External
    inputs/outputs are explicit; therefore a newly introduced intermediate can never hide as an
    undeclared symbol in a later kernel."
-  [segops {:keys [inputs outputs temporaries buffer-specs dtype memory-space effects provenance
+  [segops {:keys [inputs outputs temporaries scalars buffer-specs dtype memory-space effects provenance
                   attributes]
            :or {temporaries {} buffer-specs {} memory-space :device effects {} provenance {}
                 attributes {}}}]
@@ -346,6 +423,7 @@
       (make {:inputs inputs*
              :outputs outputs*
              :temporaries temporaries*
+             :scalars scalars
              :nodes nodes
              :effects effects
              :provenance provenance
