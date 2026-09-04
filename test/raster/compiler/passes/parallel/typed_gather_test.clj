@@ -69,7 +69,7 @@
     (testing "portable GPU emission consumes the same SegMap and keeps C names hygienic"
       (is (= 1 (get-in gpu [:stats :segop-reused])))
       (is (zero? (get-in gpu [:stats :fallback])))
-      (is (= [:int :float :float :int] (mapv :dtype (:abi kernel))))
+      (is (= [:int :float :float :long] (mapv :dtype (:abi kernel))))
       (is (= :kernel-body (get-in kernel [:provenance :dialect])))
       (is (re-find #"int rstr_map_load_[0-9]+ = .*idx\[" kernel-source))
       (is (re-find #"src\[.*rstr_map_load_[0-9]+" kernel-source)

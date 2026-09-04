@@ -153,15 +153,21 @@
                       "portable dense map writable results may only read their lane-owned element"
                       {:operation (:id segmap) :inputs inputs :outputs outputs}))
         default-dtype (dtype/canon (or (:dtype segmap) :float))
+        ;; SegSpace bounds are index-domain values.  A compatibility ParallelProgram can still
+        ;; describe a let-bound integer literal with the selected floating kernel dtype; that is
+        ;; not permission to turn the launch domain into floating-point.  Preserve an explicitly
+        ;; typed integer width, otherwise use the ordinary 32-bit index representation.
+        declared-bound-dtype
+        (some-> (or (get scalar-types bound)
+                    (get scalar-types (when (or (symbol? bound) (keyword? bound))
+                                        (symbol (name bound)))))
+                dtype/canon)
         bound-dtype (cond
                       (integer? bound)
                       (if (<= Integer/MIN_VALUE bound Integer/MAX_VALUE) :int :long)
 
-                      (or (get scalar-types bound)
-                          (get scalar-types (when (or (symbol? bound) (keyword? bound))
-                                              (symbol (name bound)))))
-                      (dtype/canon (or (get scalar-types bound)
-                                       (get scalar-types (symbol (name bound)))))
+                      (contains? #{:int :long} declared-bound-dtype)
+                      declared-bound-dtype
 
                       :else :int)
         array-dtype (fn [id]
