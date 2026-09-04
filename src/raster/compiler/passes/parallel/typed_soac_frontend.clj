@@ -13,6 +13,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
@@ -43,7 +44,8 @@
     :typed-soac-stable-read-alias
     :typed-soac-syntax
     :typed-soac-unbound-scalar
-    :typed-soac-unknown-value})
+    :typed-soac-unknown-value
+    :unique-index-not-provable})
 
 (defn source-decline?
   [exception]
@@ -627,37 +629,49 @@
   [expression]
   (util/postwalk-preserving-meta strip-index-cast expression))
 
-(defn- inline-region-locals
-  "Substitute region-local SSA ids by their initializers until the expression is closed."
-  [expression locals]
-  (let [substitutions (into {} (map (juxt :id :init)) locals)]
-    (loop [expression expression remaining (inc (count locals))]
-      (let [inlined (util/subst-syms substitutions expression)]
-        (if (or (= inlined expression) (zero? remaining))
-          inlined
-          (recur inlined (dec remaining)))))))
+(def ^:dynamic ^:private *scalar-definitions*
+  "Host scalar bindings preceding the operation being described, as `{id expression}` for the
+   pure product/sum definitions (the normalizer's `rstr_extent_n` ids among them). The index
+   algebra needs an extent's product structure, which its SSA id hides."
+  {})
 
-(defn- row-major-loop-index?
-  "Whether a store index inside a counted loop is `r*K + i` (either operand order) with `K` the
-   loop extent, `r` the map index and `i` the loop index: the row-major layout in which the
-   map items own disjoint rows, so the writes are injective across work items."
-  [expression loop-index map-index extent]
-  (let [expression (strip-index-casts expression)
-        extent (strip-index-casts extent)
-        ;; Rows are disjoint only when every item's row has the same width: an extent that
-        ;; varies with the map index (`(- n r)`) makes consecutive rows overlap.
-        invariant-extent? (not (contains? (util/free-syms extent) map-index))
-        row-offset? (fn [form]
-                      (and (seq? form) (= 3 (count form))
-                           (contains? '#{* clojure.core/*} (first form))
-                           (= #{map-index extent} (set (rest form)))
-                           (not= map-index extent)))]
-    (and invariant-extent?
-         (seq? expression) (= 3 (count expression))
-         (contains? '#{+ clojure.core/+} (first expression))
-         (let [[_ left right] expression]
-           (or (and (= left loop-index) (row-offset? right))
-               (and (= right loop-index) (row-offset? left)))))))
+(defn- expand-scalar-definitions
+  [expression]
+  (loop [expression expression remaining (inc (count *scalar-definitions*))]
+    (let [expanded (util/subst-syms *scalar-definitions* expression)]
+      (if (or (= expanded expression) (zero? remaining))
+        expanded
+        (recur expanded (dec remaining))))))
+
+(defn- store-index-form
+  "The mixed-radix index form of a store's destination index over the map index (extent
+   `extent`), the region locals and, for a loop store, its loop's locals and index. Host
+   scalar definitions are expanded first so extents and strides show their factors."
+  [store index extent locals loops]
+  (let [loop (when (:loop store) (nth loops (:loop store)))
+        expand expand-scalar-definitions]
+    (index-algebra/index-form (expand (:index store)) index (expand extent)
+                              (mapv #(update % :init expand) (concat locals (:locals loop)))
+                              (if loop {(:index loop) (expand (:extent loop))} {}))))
+
+(defn- proven-unique-stores
+  "The stores whose destination writes are provably injective across work items: each store's
+   index form is injective, and stores sharing a destination share one form and write at
+   provably disjoint offsets. Returns the set of store ordinals."
+  [stores index extent locals loops]
+  (let [forms (mapv #(store-index-form % index extent locals loops) stores)
+        by-destination (group-by (fn [ordinal] (:out (nth stores ordinal)))
+                                 (range (count stores)))]
+    (into #{}
+          (mapcat (fn [[_ ordinals]]
+                    (let [group-forms (map #(nth forms %) ordinals)]
+                      (when (and (every? some? group-forms)
+                                 (every? index-algebra/injective? group-forms)
+                                 (apply = (map :terms group-forms))
+                                 (index-algebra/disjoint-offsets?
+                                  (first group-forms) (map :offset group-forms)))
+                        ordinals))))
+          by-destination)))
 
 (defn- effect-leaves
   "The store effects of a description, descending into store loops."
@@ -684,17 +698,10 @@
                                          (set (mapcat #(map :out (:stores %)) loops)))))
       (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
             loop-stores
-            (vec (mapcat (fn [ordinal {loop-index :index loop-extent :extent
-                                       loop-locals :locals loop-store-list :stores}]
+            (vec (mapcat (fn [ordinal {loop-store-list :stores}]
                            (map (fn [store]
-                                  (let [store (merge {:index index :predicate 1} store)]
-                                    (assoc store
-                                           :loop ordinal
-                                           :loop-injective?
-                                           (row-major-loop-index?
-                                            (inline-region-locals (:index store)
-                                                                  (concat locals loop-locals))
-                                            loop-index index loop-extent))))
+                                  (assoc (merge {:index index :predicate 1} store)
+                                         :loop ordinal))
                                 loop-store-list))
                          (range) loops))
             dense-pointwise? (and (empty? loops)
@@ -713,22 +720,65 @@
                                             (list 'clojure.core/aget out index)))))
                            stores)
                      stores)
+            candidate-stores (into stores loop-stores)
+            ;; Uniqueness is a fact the index algebra proves. A source `unique-index` marker is
+            ;; an author's claim: it is redundant when the proof succeeds, it is the only
+            ;; certificate when the index depends on data the algebra cannot see (an indirect
+            ;; index through another array, established at runtime by validate-block-indices!),
+            ;; and it is an error when the index is in the algebra's reach and the proof fails.
+            proven (proven-unique-stores (vec (remove :reduction-op candidate-stores))
+                                         index extent locals loops)
+            proven? (let [indices (vec (remove :reduction-op candidate-stores))]
+                      (fn [store] (contains? proven (.indexOf ^java.util.List indices store))))
+            ;; A marker is honoured only for an index outside the algebra's reach: the index
+            ;; expression or a local it depends on (transitively) reads an array. Unrelated
+            ;; locals may not authorize a claim, so only the index's dependency slice counts.
+            data-dependent? (fn [{:keys [index] :as store}]
+                              (let [scope (concat locals
+                                                  (:locals (when (:loop store)
+                                                             (nth loops (:loop store)))))
+                                    inits (into {} (map (juxt :id :init)) scope)
+                                    slice (loop [pending (set (filter symbol?
+                                                                      (tree-seq coll? seq index)))
+                                                 seen #{}
+                                                 expressions [index]]
+                                            (let [next (set/difference pending seen)]
+                                              (if (empty? next)
+                                                expressions
+                                                (let [found (keep inits next)]
+                                                  (recur (set (filter symbol?
+                                                                      (mapcat #(tree-seq coll? seq %)
+                                                                              found)))
+                                                         (set/union seen next)
+                                                         (into expressions found))))))]
+                                (seq (par/collect-aget-arrays (list* 'do slice)))))
             all-stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
                                (let [destination-type (some-> (destination-dtype array-types out)
                                                              dtype/canon)
+                                     uniqueness (cond
+                                                  reduction-op nil
+                                                  (proven? store) :proven
+                                                  (and (= :unique conflict) (data-dependent? store))
+                                                  :claimed
+                                                  (= :unique conflict)
+                                                  (fail! :unique-index-not-provable
+                                                         "a unique-index claim on an index the algebra can decide must be provable; the proof is a sufficient condition, so the form declines to the compatibility route"
+                                                         {:binding id :destination out
+                                                          :index (:index store)})
+                                                  :else nil)
                                      contract (cond
-                                                (= :unique conflict) :unique
                                                 reduction-op
                                                 (when destination-type
                                                   (dialect/reducing-scatter-conflict
                                                    reduction-op destination-type))
-                                                (:loop-injective? store) :unique
+                                                uniqueness :unique
                                                 (and (nil? (:loop store)) (= index (:index store)))
                                                 :unique
                                                 :else :ordered)]
                                  (assoc store :effect-conflict contract
-                                              :destination-dtype destination-type)))
-                             (into stores loop-stores))
+                                              :destination-dtype destination-type
+                                              :uniqueness uniqueness)))
+                             candidate-stores)
             ;; One physical destination has one cross-item contract. If any ordinary store may
             ;; collide, its otherwise-unique siblings must join the same sequential contract. A
             ;; reduction mixed with an ordered overwrite remains unsupported: those are distinct
@@ -1542,12 +1592,23 @@
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
   (:descriptions
    (reduce
-    (fn [{:keys [array-types] :as state} [id [symbol expression]]]
+    (fn [{:keys [array-types scalar-definitions] :as state} [id [symbol expression]]]
       (let [description
-            (or (operation-description id symbol expression default-dtype array-types)
+            (or (binding [*scalar-definitions* scalar-definitions]
+                  (operation-description id symbol expression default-dtype array-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
+            ;; a pure product/sum of scalars is a definition later index algebra may expand
+            scalar-definition
+            (when (and (= :scalar (:kind description)) (symbol? symbol)
+                       (seq? expression)
+                       (contains? '#{* + clojure.core/* clojure.core/+ quot clojure.core/quot}
+                                  (descriptor/semantic-op expression))
+                       (provably-pure-scalar? expression)
+                       ;; a definition that reads an array is not an invariant extent
+                       (empty? (par/collect-aget-arrays expression)))
+              expression)
             allocation-dtype
             (when (and (= :scalar (:kind description))
                        (seq? expression)
@@ -1558,8 +1619,9 @@
                                        (some-> operation name symbol)))]
                 (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))]
         (cond-> (update state :descriptions conj description)
-          allocation-dtype (assoc-in [:array-types symbol] allocation-dtype))))
-    {:descriptions [] :array-types array-types}
+          allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
+          scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
+    {:descriptions [] :array-types array-types :scalar-definitions {}}
     (map-indexed vector pairs))))
 
 (defn- canonical-extent
