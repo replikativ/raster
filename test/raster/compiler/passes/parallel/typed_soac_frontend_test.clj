@@ -947,3 +947,26 @@
            (try (dialect/validate! swapped) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
         "a loop local may only reference the locals before it")))
+
+(deftest a-unique-index-claim-is-checked-against-its-own-dependency-slice
+  (testing "an unrelated array read does not authorize a claim on a decidable colliding index"
+    (is (= :unique-index-not-provable
+           (try (frontend/form->program
+                 '(let* [effect (raster.par/map-void!
+                                 i n
+                                 (let* [^long k (long (clojure.core/aget slots i))]
+                                   (clojure.core/aset out (raster.par/unique-index 0) (float k))))]
+                        effect)
+                 {:dtype :float :array-types {'slots :int 'out :float} :scalar-types {'n :long}})
+                nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+  (testing "a claim on an index that reads an array is honoured"
+    (let [program (frontend/form->program
+                   '(let* [effect (raster.par/map-void!
+                                   i n
+                                   (let* [^long k (long (clojure.core/aget slots i))]
+                                     (clojure.core/aset out (raster.par/unique-index k) (float 1.0))))]
+                          effect)
+                   {:dtype :float :array-types {'slots :int 'out :float} :scalar-types {'n :long}})
+          {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))]
+      (is (= :unique (:conflict attributes))))))

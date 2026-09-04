@@ -14,6 +14,7 @@
 
    See .internal/design/index_algebra.md for the derivation."
   (:require [clojure.set :as set]
+            [clojure.set]
             [clojure.walk]))
 
 ;; ---------------------------------------------------------------------------------------------
@@ -56,6 +57,12 @@
                :factors (vec (sort (concat (:factors acc) (:factors m))))}))
           {:const 1 :factors []}
           monomials))
+
+(defn add
+  "The sum of two monomials when it is again a monomial (equal factor multisets), else nil."
+  [a b]
+  (when (and a b (= (:factors a) (:factors b)))
+    {:const (+ (:const a) (:const b)) :factors (:factors a)}))
 
 (defn- dominates-directly?
   [a b]
@@ -109,19 +116,37 @@
   (and (seq? expression) (= 3 (count expression))
        (contains? '#{rem clojure.core/rem mod clojure.core/mod} (first expression))))
 
+(defn- quotient
+  "The exact monomial quotient `a / b`, or nil when `b` does not divide `a` syntactically."
+  [a b]
+  (when (and a b (pos? (:const b)) (zero? (mod (:const a) (:const b))))
+    (let [remaining (reduce (fn [factors f]
+                              (let [position (.indexOf ^java.util.List factors f)]
+                                (if (and factors (<= 0 position))
+                                  (vec (concat (subvec factors 0 position)
+                                               (subvec factors (inc position))))
+                                  (reduced nil))))
+                            (:factors a) (:factors b))]
+      (when remaining
+        {:const (quot (:const a) (:const b)) :factors remaining}))))
+
 (defn digits
   "Recover the mixed-radix digits of `index` (extent `extent`) from ordered region locals.
 
-   Returns `{:digits {sym {:radix monomial :order n}} :quot-facts [{:factor sym :times m :le e}]}`.
-   A `rem`-digit `(rem x m)` of an already known quantity `x` has radix `m`; a `quot`-digit
-   `(quot x m)` has radix `extent(x)/m`, recorded as an opaque factor with the fact
-   `m·factor ≤ extent(x)`. Locals that are neither are ignored (they may be arithmetic over
-   digits, which `index-form` handles)."
+   A quantity `x` of extent `E` is decomposed only by a matched pair `(quot x d)` / `(rem x d)`
+   with the same divisor `d` dividing `E` exactly: the remainder digit has radix `d`, the
+   quotient digit radix `E/d`, and `x` stops being a leaf only then (a lone `quot` or `rem` is a
+   lossy projection, so `x` stays a leaf and a store using only the projection is incomplete).
+   A scalar `(quot e c)` local becomes an opaque factor with the fact `c·factor ≤ e`. Locals
+   that are products or sums are substituted into later expressions; any other local stays an
+   unresolved symbol that `index-form` refuses."
   [index extent locals]
   (let [initial {:quantities {index {:extent nil :raw extent}}
                  :digits {index {:radix nil :order 0}}
                  :leaves #{index}
                  :parents {}
+                 :pending {}
+                 :locals #{}
                  :substitutions {}
                  :quot-expressions {}
                  :quot-facts []
@@ -142,37 +167,39 @@
                               (when-let [raw (get-in state [:quantities quantity :raw])]
                                 (resolve state raw))))]
     (reduce
-     (fn [{:keys [quantities substitutions] :as state} {:keys [id init]}]
+     (fn [{:keys [quantities] :as state} {:keys [id init]}]
        (let [init (strip-cast init)
-             source (when (seq? init) (strip-cast (second init)))]
+             source (when (seq? init) (strip-cast (second init)))
+             state (update state :locals conj id)
+             ;; a quot/rem digit of a known quantity: registered once its divisor divides the
+             ;; quantity's extent exactly; the source leaves the leaf set only when both digits
+             ;; of the same divisor exist
+             decompose
+             (fn [kind]
+               (let [divisor (resolve state (nth init 2))
+                     source-extent (quantity-extent state source)
+                     radix (when (and divisor source-extent)
+                             (case kind
+                               :rem divisor
+                               :quot (quotient source-extent divisor)))]
+                 (if (and radix (pos? (:const radix)))
+                   (let [state (-> state
+                                   (assoc-in [:digits id] {:radix radix :order (:order state)})
+                                   (assoc-in [:quantities id] {:extent radix})
+                                   (assoc-in [:parents id] source)
+                                   (assoc-in [:pending source divisor kind] id)
+                                   (update :order inc))
+                         pair (get-in state [:pending source divisor])]
+                     (if (and (:quot pair) (:rem pair))
+                       (update state :leaves #(-> % (disj source) (conj (:quot pair) (:rem pair))))
+                       state))
+                   state)))]
          (cond
-           ;; a digit: the remainder of a known quantity
            (and (rem-form? init) (contains? quantities source))
-           (if-let [radix (resolve state (nth init 2))]
-             (-> state
-                 (assoc-in [:digits id] {:radix radix :order (:order state)})
-                 (assoc-in [:quantities id] {:extent radix})
-                 (assoc-in [:parents id] source)
-                 (update :leaves #(-> % (disj source) (conj id)))
-                 (update :order inc))
-             state)
+           (decompose :rem)
 
-           ;; a digit: the quotient of a known quantity, with radix extent/divisor as an
-           ;; opaque factor bounded by `divisor·factor ≤ extent`
            (and (quot-form? init) (contains? quantities source))
-           (let [divisor (resolve state (nth init 2))
-                 source-extent (quantity-extent state source)]
-             (if (and divisor source-extent)
-               (let [factor (symbol (str "rstr_quot_" (name id)))
-                     radix {:const 1 :factors [factor]}]
-                 (-> state
-                     (assoc-in [:digits id] {:radix radix :order (:order state)})
-                     (assoc-in [:quantities id] {:extent radix})
-                     (assoc-in [:parents id] source)
-                     (update :leaves #(-> % (disj source) (conj id)))
-                     (update :quot-facts conj {:factor factor :times divisor :le source-extent})
-                     (update :order inc)))
-               state))
+           (decompose :quot)
 
            ;; a scalar quotient of an extent (`hdim2 = (quot head-dim 2)`): an opaque factor
            ;; with its bound, usable in later radices and coefficients
@@ -191,7 +218,7 @@
            (and (seq? init)
                 (contains? '#{* + clojure.core/* clojure.core/+} (first init)))
            (assoc-in state [:substitutions id]
-                     (clojure.walk/postwalk-replace substitutions init))
+                     (clojure.walk/postwalk-replace (:substitutions state) init))
 
            :else state)))
      initial
@@ -227,9 +254,11 @@
       (reduce (fn [sum operand]
                 (when-let [a (affine operand digit-set)]
                   (when sum
-                    {:terms (merge-with (fn [x y] (product x y)) (:terms sum) (:terms a))
-                     :const (+ (:const sum) (:const a))
-                     :symbolic (vec (concat (:symbolic sum) (:symbolic a)))})))
+                    (let [terms (merge-with add (:terms sum) (:terms a))]
+                      (when (every? some? (vals terms))
+                        {:terms terms
+                         :const (+ (:const sum) (:const a))
+                         :symbolic (vec (concat (:symbolic sum) (:symbolic a)))})))))
               {:terms {} :const 0 :symbolic []}
               (rest expression))
       (and (seq? expression) (contains? '#{* clojure.core/*} (first expression)))
@@ -252,7 +281,7 @@
    `loop-indices` is a map of loop index symbol → extent for counted loops inside the region;
    they are digits too, with their extent as radix."
   [expression index extent locals loop-indices]
-  (let [{:keys [digits leaves parents substitutions quot-facts]}
+  (let [{:keys [digits leaves parents substitutions quot-facts] unresolved :locals}
         (complete-digits (digits index extent locals) index)
         loop-digits (reduce-kv (fn [acc loop-index loop-extent]
                                  (if-let [radix (monomial loop-extent)]
@@ -263,14 +292,20 @@
         leaves (into leaves (keys loop-digits))
         digit-set (set (keys digits))
         expression (clojure.walk/postwalk-replace substitutions (strip-cast expression))
-        form (affine expression digit-set)
-        ;; the constant offset: an integer, or one symbolic extent monomial (not both)
+        ;; every local the index references must have become a digit or been substituted:
+        ;; an unresolved local (a subtraction, a load, a cast of a float) is not invariant
+        resolved (set/union digit-set (set (keys substitutions)))
+        unresolved-locals (set/intersection (set (remove resolved unresolved))
+                                            (set (filter symbol? (tree-seq coll? seq expression))))
+        form (when (empty? unresolved-locals) (affine expression digit-set))
+        ;; the constant offset: an integer, or the sum of the symbolic operands when that sum
+        ;; is one monomial (`d + d = 2d`); a mixed or non-monomial sum is undecidable
         offset (when form
-                 (let [symbolic (distinct (:symbolic form))]
+                 (let [symbolic (map monomial (:symbolic form))]
                    (cond
                      (empty? symbolic) {:const (:const form) :factors []}
-                     (and (= 1 (count symbolic)) (zero? (:const form)))
-                     (monomial (first symbolic))
+                     (and (every? some? symbolic) (zero? (:const form)))
+                     (reduce add symbolic)
                      :else nil)))
         ancestors (fn ancestors [digit]
                     (when-let [parent (get parents digit)]
@@ -313,10 +348,23 @@
                        (when-let [parent (get parents digit)] (covered? parent))))]
     (every? covered? leaves)))
 
+(defn- supported-factor?
+  "A symbolic factor of a coefficient is admissible only when some lower digit's radix vouches
+   for it: it is a factor of that radix, or a quot fact bounds such a factor by it. Then a zero
+   value of the factor empties the lower digit and no item stores at all, so `a·f ≥ a` may be
+   used; an arbitrary captured scalar (`stride`) could be zero and collapse every item."
+  [factor lower-radices quot-facts]
+  (or (some #(some #{factor} (:factors %)) lower-radices)
+      (some (fn [{:keys [factor* le]}]
+              (and (some #(some #{factor*} (:factors %)) lower-radices)
+                   (some #{factor} (:factors le))))
+            (map #(clojure.set/rename-keys % {:factor :factor*}) quot-facts))))
+
 (defn injective?
   "Sufficient condition that the index form maps distinct digit tuples to distinct addresses:
    with terms ordered by coefficient dominance, every coefficient dominates the product of the
-   radices of all lower terms (the row-major carry condition), and the form is complete."
+   radices of all lower terms (the row-major carry condition), every coefficient's symbolic
+   factors are vouched for by a lower radix, and the form is complete."
   [{:keys [terms quot-facts] :as form}]
   (boolean
    (and form
@@ -340,10 +388,14 @@
            ;; induction `c_k ≥ Σ_{j>k} c_j (r_j − 1) + 1`, so distinct digit tuples never meet.
            (every? (fn [k]
                      (let [{:keys [coefficient]} (nth ordered k)
-                           required (if-let [next-term (nth ordered (inc k) nil)]
+                           lower (subvec ordered (inc k))
+                           required (if-let [next-term (first lower)]
                                       (product (:coefficient next-term) (:radix next-term))
                                       {:const 1 :factors []})]
-                       (dominates? coefficient required quot-facts)))
+                       (and (pos? (:const coefficient))
+                            (every? #(supported-factor? % (map :radix lower) quot-facts)
+                                    (:factors coefficient))
+                            (dominates? coefficient required quot-facts))))
                    (range (count ordered))))))))
 
 (defn- offset-multiple

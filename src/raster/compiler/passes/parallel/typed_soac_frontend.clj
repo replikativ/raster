@@ -628,14 +628,30 @@
   [expression]
   (util/postwalk-preserving-meta strip-index-cast expression))
 
+(def ^:dynamic ^:private *scalar-definitions*
+  "Host scalar bindings preceding the operation being described, as `{id expression}` for the
+   pure product/sum definitions (the normalizer's `rstr_extent_n` ids among them). The index
+   algebra needs an extent's product structure, which its SSA id hides."
+  {})
+
+(defn- expand-scalar-definitions
+  [expression]
+  (loop [expression expression remaining (inc (count *scalar-definitions*))]
+    (let [expanded (util/subst-syms *scalar-definitions* expression)]
+      (if (or (= expanded expression) (zero? remaining))
+        expanded
+        (recur expanded (dec remaining))))))
+
 (defn- store-index-form
   "The mixed-radix index form of a store's destination index over the map index (extent
-   `extent`), the region locals and, for a loop store, its loop's locals and index."
+   `extent`), the region locals and, for a loop store, its loop's locals and index. Host
+   scalar definitions are expanded first so extents and strides show their factors."
   [store index extent locals loops]
-  (let [loop (when (:loop store) (nth loops (:loop store)))]
-    (index-algebra/index-form (:index store) index extent
-                              (vec (concat locals (:locals loop)))
-                              (if loop {(:index loop) (:extent loop)} {}))))
+  (let [loop (when (:loop store) (nth loops (:loop store)))
+        expand expand-scalar-definitions]
+    (index-algebra/index-form (expand (:index store)) index (expand extent)
+                              (mapv #(update % :init expand) (concat locals (:locals loop)))
+                              (if loop {(:index loop) (expand (:extent loop))} {}))))
 
 (defn- proven-unique-stores
   "The stores whose destination writes are provably injective across work items: each store's
@@ -713,12 +729,28 @@
                                          index extent locals loops)
             proven? (let [indices (vec (remove :reduction-op candidate-stores))]
                       (fn [store] (contains? proven (.indexOf ^java.util.List indices store))))
+            ;; A marker is honoured only for an index outside the algebra's reach: the index
+            ;; expression or a local it depends on (transitively) reads an array. Unrelated
+            ;; locals may not authorize a claim, so only the index's dependency slice counts.
             data-dependent? (fn [{:keys [index] :as store}]
-                              (seq (par/collect-aget-arrays
-                                    (list 'do index
-                                          (map :init (concat locals
-                                                             (:locals (when (:loop store)
-                                                                        (nth loops (:loop store))))))))))
+                              (let [scope (concat locals
+                                                  (:locals (when (:loop store)
+                                                             (nth loops (:loop store)))))
+                                    inits (into {} (map (juxt :id :init)) scope)
+                                    slice (loop [pending (set (filter symbol?
+                                                                      (tree-seq coll? seq index)))
+                                                 seen #{}
+                                                 expressions [index]]
+                                            (let [next (set/difference pending seen)]
+                                              (if (empty? next)
+                                                expressions
+                                                (let [found (keep inits next)]
+                                                  (recur (set (filter symbol?
+                                                                      (mapcat #(tree-seq coll? seq %)
+                                                                              found)))
+                                                         (set/union seen next)
+                                                         (into expressions found))))))]
+                                (seq (par/collect-aget-arrays (list* 'do slice)))))
             all-stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
                                (let [destination-type (some-> (destination-dtype array-types out)
                                                              dtype/canon)
@@ -1559,12 +1591,21 @@
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
   (:descriptions
    (reduce
-    (fn [{:keys [array-types] :as state} [id [symbol expression]]]
+    (fn [{:keys [array-types scalar-definitions] :as state} [id [symbol expression]]]
       (let [description
-            (or (operation-description id symbol expression default-dtype array-types)
+            (or (binding [*scalar-definitions* scalar-definitions]
+                  (operation-description id symbol expression default-dtype array-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
+            ;; a pure product/sum of scalars is a definition later index algebra may expand
+            scalar-definition
+            (when (and (= :scalar (:kind description)) (symbol? symbol)
+                       (seq? expression)
+                       (contains? '#{* + clojure.core/* clojure.core/+ quot clojure.core/quot}
+                                  (descriptor/semantic-op expression))
+                       (provably-pure-scalar? expression))
+              expression)
             allocation-dtype
             (when (and (= :scalar (:kind description))
                        (seq? expression)
@@ -1575,8 +1616,9 @@
                                        (some-> operation name symbol)))]
                 (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))]
         (cond-> (update state :descriptions conj description)
-          allocation-dtype (assoc-in [:array-types symbol] allocation-dtype))))
-    {:descriptions [] :array-types array-types}
+          allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
+          scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
+    {:descriptions [] :array-types array-types :scalar-definitions {}}
     (map-indexed vector pairs))))
 
 (defn- canonical-extent
