@@ -32,7 +32,7 @@
 
 (defn route
   "Compile `source` through TypedSOAC and return its target-aware contraction dispatch."
-  [device-id source array-types scalar-types & {:keys [tile precision]
+  [device-id source array-types scalar-types & {:keys [tile precision split-factors]
                                                 :or {precision :mixed-f16-f32}}]
   (let [{:keys [form]}
         (pipeline/schedule-parallel-form
@@ -46,14 +46,15 @@
            (cond-> [:dtype :float
                     :desc (hardware/descriptor-for device-id)
                     :precision precision]
-             tile (conj :tile tile)))))
+             tile (conj :tile tile)
+             split-factors (conj :split-factors split-factors)))))
 
 (defn dense-dispatch
-  [device-id & {:keys [tile]}]
+  [device-id & {:keys [tile split-factors]}]
   (route device-id dense-source
          {'A :float 'B :float 'C :float}
          {'m :int 'n :int 'k :int}
-         :tile tile))
+         :tile tile :split-factors split-factors))
 
 (defn batched-dispatch
   [device-id & {:keys [shared-column?]

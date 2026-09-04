@@ -1116,6 +1116,15 @@
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (testing "explicit split factors remain compiler schedule candidates over the same typed equation"
+      (let [tunable (contract-route/route-typed-contraction-dispatch
+                     algorithm operation :dtype :float :desc descriptor
+                     :precision :mixed-f16-f32 :split-factors [2 8])]
+        (is (= #{:portable-segred :xmx-direct :xmx-split-k
+                 :xmx-split-k-2 :xmx-split-k-8}
+               (set (map kdispatch/alternative-strategy (:alternatives tunable)))))
+        (is (= 8 (get-in tunable [:attributes :candidate-schedules
+                                  :xmx-split-k-8 :split-factor])))))
     (testing "a non-DPAS target keeps the same semantic contraction on portable schedules"
       (let [portable (contract-route/route-typed-contraction-dispatch
                       algorithm operation :dtype :float

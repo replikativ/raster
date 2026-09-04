@@ -1,90 +1,91 @@
 (ns raster.gpu.gemm-autotune-test
-  "The measurement loop end-to-end on REAL kernels: a finite emitted-candidate search driven by a
-   real device-event GEMM benchmark finds the measured-optimal split-k factor on a deep-k,
-   occupancy-bound shape — the axis with the largest proven win (~10×). This is the proof that the
-   Phase-2 machinery tunes actual kernels, not a synthetic cost.
+  "Device-event measurement of finite compiler-emitted matrix schedule spaces.
 
-   Honesty: split-k is a wired, high-headroom axis (occupancy). The dominant proj GEMM on this Arc
-   iGPU is already ~ceiling and its inner-loop levers (grf256/prefetch/dbuf) measured DEAD; the
-   small-m attention slab's gap to oneDNN is DECOMPOSITION (M=64 underfills the XMX 30×), not a
-   tuning knob. So the autotuner earns its keep on the occupancy axis (split-k), where measurement —
-   not a 'maximize splits' heuristic — finds a measured beneficial interior point.  The exact
-   factor is deliberately hardware-, driver-, and load-dependent."
+   Split factor and tile are schedule facts over an ordinary typed contraction. The tests execute
+   those alternatives through the common KernelExecutable binder; the backend runtime knows
+   neither GEMM semantics nor candidate-specific ABIs."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
-            [raster.compiler.core.hardware :as hw]
-            [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]))
 
-;; ── the real cost-fn: device-event time of the resident split-k XMX GEMM ─────────
-(defn- bench-splitk-ms
-  "Median device-event ms of the split-k GEMM (+reduce) at (m,n,k) with `splits` k-chunks."
-  [ze m n k splits]
-  (let [g!   (ns-resolve ze 'make-buffer)
-        f16  (ns-resolve ze 'buffer-of-floats-as-half)
-        rec  (ns-resolve ze 'record-graph!)   rep (ns-resolve ze 'replay-graph!)
-        rst  (ns-resolve ze 'reset-graph-events!) rts (ns-resolve ze 'read-graph-timestamps!)
-        dst  (ns-resolve ze 'destroy-graph!)
-        skg  (ns-resolve ze 'bind-registered-gemm-splitk!)
-        skr  (ns-resolve ze 'bind-registered-splitk-reduce!)
-        free (ns-resolve ze 'free-buffer!)
-        rng  (java.util.Random. 3)
-        mk   (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (.nextGaussian rng)))) a))
-        kc   (* 32 (quot (quot (long k) (long splits)) 32))
-        a16  (f16 (mk (* m k)))  b16 (f16 (mk (* k n)))
-        part (g! (* splits m n) :float)  c (g! (* m n) :float)]
+(defn- bench-split-ms
+  "Measure one complete typed contraction graph, including layout conversion and final combine."
+  [session scheduled m n k splits]
+  (let [strategy (if (= 1 splits) :xmx-direct (gemm/split-factor-strategy splits))
+        graph (dispatch/alternative scheduled strategy)
+        output [:split-output splits]
+        _ (gpu/alloc! session {output [:float (* m n) nil]})
+        handle (gpu/bind-kernel-executable!
+                session [:split-candidate splits] graph
+                [:split-a :split-b output
+                 {:type :int :value m}
+                 {:type :int :value n}
+                 {:type :int :value k}]
+                {:profile? true})]
     (try
-      (let [g (rec [{:bound (skg a16 b16 part m n k kc splits) :kernel-name "gemm_nonsquare_splitk"}
-                    {:bound (skr part c (* m n) splits) :kernel-name "splitk_reduce"}]
-                   {:profile? true})]
-        (try
-          (dotimes [_ 3] (rep g) (rst g))
-          (let [s (vec (for [_ (range 11)] (do (rep g) (reduce + (map :ms (:kernels (rts g)))))))]
-            (nth (sort s) 5))
-          (finally (dst g))))
-      (finally (free a16) (free b16) (free part) (free c)))))
+      (gpu/run-kernel-graph! session handle)
+      (/ (:median-ns
+          (gpu/measure-bound-kernel-graph!
+           session handle
+           :warmup-iterations 3 :budget-ms 1000
+           :min-samples 11 :max-samples 11))
+         1.0e6)
+      (finally
+        (gpu/release-kernel-graph! session handle)))))
 
 (deftest autotune-finds-splitk-optimum
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "GEMM autotune: split-k optimum on the resident XMX GEMM")
-    (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          m 16 n 512 k 131072                     ;; deep-k, small (m,n) grid → occupancy-bound
-          gflops (fn [ms] (/ (* 2.0 m k n) (* ms 1.0e6)))
-          measured (atom 0)
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "typed contraction autotune: split-K optimum")
+    (let [m 16 n 512 k 131072
           candidates [1 2 4 8 16 32]
-          results (mapv (fn [splits]
-                          (swap! measured inc)
-                          {:splits splits :ms (bench-splitk-ms ze m n k splits)})
-                        candidates)
-          baseline-ms (:ms (first results))
-          winner (apply min-key :ms results)
-          tuned (:splits winner)
-          tuned-ms (:ms winner)
-          speedup (/ baseline-ms tuned-ms)]
-      (println (format (str "\n=== GEMM split-k autotune (m=%d n=%d k=%d) ===\n"
-                            "  baseline splits=1 : %.2f GFLOPS\n"
-                            "  autotuned splits=%d: %.2f GFLOPS  (%.1fx, %d kernels measured)\n")
-                       m n k (gflops baseline-ms) tuned (gflops tuned-ms) speedup @measured))
-      (testing "finite candidate measurement finds a large occupancy win"
-        (is (> tuned 1) "the measured search must select a non-trivial split factor")
-        (is (> speedup 2.0) (str "tuned split-k must beat the non-split baseline by >2× (got "
-                                 (format "%.1fx" speedup) ")"))
-        (is (= (count candidates) @measured) "every emitted candidate is measured once")))))
+          measured (atom 0)
+          random (java.util.Random. 3)
+          make-input (fn [size]
+                       (let [result (float-array size)]
+                         (dotimes [index size]
+                           (aset result index (float (.nextGaussian random))))
+                         result))
+          scheduled (support/dense-dispatch :ze:0 :split-factors (vec (rest candidates)))
+          gflops (fn [ms] (/ (* 2.0 m k n) (* ms 1.0e6)))]
+      (gpu/with-gpu-session [session :ze:0]
+        (gpu/alloc! session {:split-a [:float (* m k) (make-input (* m k))]
+                             :split-b [:float (* k n) (make-input (* k n))]})
+        (let [results (mapv (fn [splits]
+                              (swap! measured inc)
+                              {:splits splits
+                               :ms (bench-split-ms session scheduled m n k splits)})
+                            candidates)
+              baseline-ms (:ms (first results))
+              winner (apply min-key :ms results)
+              tuned (:splits winner)
+              tuned-ms (:ms winner)
+              speedup (/ baseline-ms tuned-ms)]
+          (println (format (str "\n=== typed contraction split-K autotune (m=%d n=%d k=%d) ===\n"
+                                "  baseline splits=1 : %.2f GFLOPS\n"
+                                "  autotuned splits=%d: %.2f GFLOPS  (%.1fx, %d graphs measured)\n")
+                           m n k (gflops baseline-ms) tuned (gflops tuned-ms) speedup @measured))
+          (testing "finite compiler schedule measurement finds a large occupancy win"
+            (is (> tuned 1) "the measured search selects a non-trivial split factor")
+            (is (> speedup 2.0)
+                (str "split-K must beat the complete direct graph by >2× (got "
+                     (format "%.1fx" speedup) ")"))
+            (is (= (count candidates) @measured)
+                "every compiler-emitted schedule is measured once")))))))
 
-;; ── T3: the TILE axis — every finite emitted candidate is correct and device-priced ──
 (defn- run-tiled-gemm
-  "Measure one tile selected from an ordinary typed contraction.
-
-   The compiler-emitted matrix artifact is isolated so this remains a target-kernel tile ruler;
-   binding, launch geometry, profiling, and ownership still go through the generic runtime API."
+  "Measure the target matrix artifact selected from an ordinary typed contraction."
   [session m n k tile key]
   (let [scheduled (support/dense-dispatch :ze:0 :tile tile)
         artifact (support/matrix-artifact scheduled :xmx-direct)
-        c-key [:tile-output key]
-        _ (gpu/alloc! session {c-key [:float (* m n) nil]})
+        output [:tile-output key]
+        _ (gpu/alloc! session {output [:float (* m n) nil]})
         handle (gpu/bind-kernel-executable!
                 session [:tile-candidate key] artifact
-                [:tile-a :tile-b c-key
+                [:tile-a :tile-b output
                  {:type :int :value m}
                  {:type :int :value n}
                  {:type :int :value k}]
@@ -95,41 +96,41 @@
                          session handle
                          :warmup-iterations 2 :budget-ms 1000
                          :min-samples 7 :max-samples 7)]
-        [(vec (gpu/download session c-key)) (/ (:median-ns measurement) 1.0e6)])
+        [(vec (gpu/download session output)) (/ (:median-ns measurement) 1.0e6)])
       (finally
         (gpu/release-kernel-graph! session handle)))))
 
 (deftest autotune-tile-axis-all-candidates-correct
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "GEMM autotune: tile axis (all candidates correct + measured search)")
-    (let [desc (hw/descriptor-for :ze:0)
-          cands (hw/gemm-tile-candidates desc)
-          default-tile (hw/derive-gemm-tile desc)
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "typed contraction autotune: tile candidates")
+    (let [descriptor (hardware/descriptor-for :ze:0)
+          candidates (hardware/gemm-tile-candidates descriptor)
+          default-tile (hardware/derive-gemm-tile descriptor)
           m 256 n 256 k 512
-          rng (java.util.Random. 4)
-          mk  (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (* 0.05 (.nextGaussian rng))))) a))
-          a (mk (* m k))
-          b (mk (* k n))]
+          a (support/input-array (* m k) 4)
+          b (support/input-array (* k n) 5)]
       (gpu/with-gpu-session [session :ze:0]
         (gpu/alloc! session {:tile-a [:half (* m k) (support/half-array a)]
                              :tile-b [:half (* k n) (support/half-array b)]})
-        (testing "the curated candidate list is non-trivial and includes the derived default"
-          (is (> (count cands) 1) "more than one tile to search")
-          (is (some #(= % default-tile) cands) "the derived default is in the search space"))
-        (let [ref (first (run-tiled-gemm session m n k default-tile :reference))
-              results (mapv (fn [index t]
-                              (let [[c ms] (run-tiled-gemm session m n k t index)]
-                                {:tile t :bit-identical? (= ref c) :ms ms}))
-                            (range) cands)]
-          (testing "SAFETY: every candidate tile produces output bit-identical to the default"
-            (doseq [{:keys [tile bit-identical?]} results]
-              (is bit-identical? (str "tile " (select-keys tile [:block-m :block-n :block-k]) " must match default"))))
+        (testing "the finite schedule space is non-trivial and contains the analytic default"
+          (is (> (count candidates) 1))
+          (is (some #(= % default-tile) candidates)))
+        (let [reference (first (run-tiled-gemm session m n k default-tile :reference))
+              results (mapv (fn [index tile]
+                              (let [[result ms] (run-tiled-gemm session m n k tile index)]
+                                {:tile tile :bit-identical? (= reference result) :ms ms}))
+                            (range) candidates)]
+          (doseq [{:keys [tile bit-identical?]} results]
+            (is bit-identical?
+                (str "tile " (select-keys tile [:block-m :block-n :block-k])
+                     " preserves the contraction result")))
           (let [winner (:tile (apply min-key :ms results))]
-            (println (format "\n=== GEMM tile autotune (m=%d n=%d k=%d) ===" m n k))
+            (println (format "\n=== typed contraction tile autotune (m=%d n=%d k=%d) ==="
+                             m n k))
             (doseq [{:keys [tile ms]} (sort-by :ms results)]
-              (println (format "  %-22s %.3f ms%s" (str (:block-m tile) "x" (:block-n tile) " k" (:block-k tile))
+              (println (format "  %-22s %.3f ms%s"
+                               (str (:block-m tile) "x" (:block-n tile)
+                                    " k" (:block-k tile))
                                ms (if (= tile winner) "  <- winner" ""))))
-            (testing "measured search returns a feasible candidate (Arc: hand-tuned default is ~optimal)"
-              (is (some #(= % winner) cands) "winner is one of the candidates")
-              (is (= ref (first (run-tiled-gemm session m n k winner :winner)))
-                  "winner output is correct"))))))))
+            (is (some #(= % winner) candidates))
+            (is (= reference (first (run-tiled-gemm session m n k winner :winner))))))))))
