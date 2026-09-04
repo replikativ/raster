@@ -66,13 +66,30 @@
     (check :host-lease-until-await? (boolean? host-lease-until-await?) host-lease-until-await?)
     (check :host-memory (contains? host-memory-requirements host-memory) host-memory)
     (check :physically-serialized? (boolean? physically-serialized?) physically-serialized?)
-    ;; consistency: a backend without an independent physical queue is serialized; a peer
-    ;; route needs at least one mechanism; an inline host copy has no asynchrony to report
-    (when (and (not independent-physical-queue?) (not physically-serialized?))
-      (fail! "a transfer queue that is not physically independent is physically serialized"
+    ;; consistency: an inline copy, or an in-order queue shared with compute, serializes
+    ;; transfers with compute (an out-of-order shared queue may still overlap them); a peer
+    ;; route needs at least one mechanism; an inline host copy has no asynchrony, no device
+    ;; event and no queue order to report, and a device-event submission has all three
+    (when (and (or (= :inline queue-ordering)
+                   (and (not independent-physical-queue?) (= :in-order queue-ordering)))
+               (not physically-serialized?))
+      (fail! "an inline copy or an in-order queue shared with compute is physically serialized"
              :transfer-capabilities-consistency
              {:independent-physical-queue? independent-physical-queue?
+              :queue-ordering queue-ordering
               :physically-serialized? physically-serialized?}))
+    (when (and (= :inline-host-copy submission)
+               (not (and (= :inline queue-ordering) (= :already-complete semantics))))
+      (fail! "an inline host copy has inline ordering and is complete when it returns"
+             :transfer-capabilities-consistency
+             {:submission submission :queue-ordering queue-ordering
+              :event-semantics semantics}))
+    (when (and (= :device-event submission)
+               (not (and (not= :inline queue-ordering) (= :device-completion semantics))))
+      (fail! "a device-event submission is queued device work completing through its event"
+             :transfer-capabilities-consistency
+             {:submission submission :queue-ordering queue-ordering
+              :event-semantics semantics}))
     (when (not= peer-transfer? (boolean (seq mechanisms)))
       (fail! "peer transfer support and its mechanisms must agree"
              :transfer-capabilities-consistency

@@ -24,6 +24,20 @@
            [layers page-size physical-pages key-elements-per-token value-elements-per-token
             storage-dtype])
 
+(defn- exact
+  "Checked long arithmetic: every derived extent must fit a non-negative long, or the geometry
+   is refused as a whole rather than overflowing later in a range or a byte count."
+  [operation & operands]
+  (try
+    (reduce (fn [acc operand]
+              (case operation
+                :* (Math/multiplyExact (long acc) (long operand))
+                :+ (Math/addExact (long acc) (long operand))))
+            operands)
+    (catch ArithmeticException _
+      (fail! "paged geometry extent exceeds signed 64-bit capacity"
+             :kv-transfer-geometry-overflow {:operation operation :operands (vec operands)}))))
+
 (defn paged-geometry?
   [value]
   (instance? PagedGeometry value))
@@ -40,15 +54,23 @@
    page pool); byte counts follow from it, never from the arithmetic dtype."
   [{:keys [layers page-size physical-pages key-elements-per-token value-elements-per-token
            storage-dtype]}]
-  (let [storage-dtype (dtype/canon storage-dtype)]
+  (let [storage-dtype (dtype/canon storage-dtype)
+        layers (positive-integer! :layers layers)
+        page-size (positive-integer! :page-size page-size)
+        physical-pages (positive-integer! :physical-pages physical-pages)
+        key-per-token (positive-integer! :key-elements-per-token key-elements-per-token)
+        value-per-token (positive-integer! :value-elements-per-token value-elements-per-token)]
     (when-not (dtype/known? storage-dtype)
       (fail! "paged geometry requires a known storage dtype"
              :kv-transfer-storage-dtype {:storage-dtype storage-dtype}))
-    (->PagedGeometry (positive-integer! :layers layers)
-                     (positive-integer! :page-size page-size)
-                     (positive-integer! :physical-pages physical-pages)
-                     (positive-integer! :key-elements-per-token key-elements-per-token)
-                     (positive-integer! :value-elements-per-token value-elements-per-token)
+    ;; the largest quantity any derived value can reach: every layer buffer's extent, the whole
+    ;; pool's continuation, and its byte count; smaller page sets are bounded by these
+    (let [page-elements (exact :+ (exact :* page-size key-per-token)
+                               (exact :* page-size value-per-token))
+          pool-elements (exact :* physical-pages page-elements)
+          all-elements (exact :* layers pool-elements)]
+      (exact :* all-elements (dtype/bytes-of storage-dtype)))
+    (->PagedGeometry layers page-size physical-pages key-per-token value-per-token
                      storage-dtype)))
 
 (defn validate-geometry!
@@ -135,18 +157,28 @@
                                 :ownership :replica}))
           devices)))
 
+(defn- serialized-devices
+  "Endpoints whose stated transfer capabilities serialize transfers with compute. Such a leg
+   also occupies the device's compute lane in the simulation, so the plan never claims an
+   overlap the hardware contract rules out."
+  [capabilities devices]
+  (vec (filter #(true? (get-in capabilities [% :physically-serialized?])) devices)))
+
 (defn transfer
   "The transfer steps of one continuation: one `DistributedPlan` transfer leg per layer, in
    layer order, each depending on `dependencies` (page reservation on the target, the decode
-   event that produced the pages) and on nothing else; legs of one continuation serialize on
-   their route's links, so a per-layer compute loop on the target may consume layer `l` while
-   layer `l+1` is in flight. Returns `{:value :steps :ranges :bytes}`; `:value` is the
-   continuation's page-set identity the plan must declare with `value-of`."
-  [{:keys [id source target route geometry pages dependencies attributes]
-    :or {dependencies [] attributes {}}}]
+   event that produced the pages) and on nothing else. Legs serialize on their route's links;
+   whether a per-layer compute loop on the target overlaps a leg in flight is decided by the
+   endpoints' stated transfer capabilities (`capabilities`: device → validated capability map):
+   a physically serialized endpoint's compute lane is reserved for the leg as well.
+   Returns `{:value :steps :ranges :bytes}`; `:value` is the continuation's page-set identity
+   the plan must declare with `value-of`."
+  [{:keys [id source target route geometry pages dependencies attributes capabilities]
+    :or {dependencies [] attributes {} capabilities {}}}]
   (let [geometry (validate-geometry! geometry)
         pages (pages! geometry pages)
         per-layer (layer-bytes geometry pages)
+        serialized (serialized-devices capabilities [source target])
         value id]
     (when (nil? id)
       (fail! "kv transfer requires an identity" :kv-transfer-id {}))
@@ -157,12 +189,42 @@
                     (distributed/transfer-step
                      {:id (leg-id id layer) :source source :target target :route route
                       :value value :bytes per-layer :dependencies (vec dependencies)
-                      :attributes (assoc attributes :kv-transfer id :layer layer
-                                         :pages pages)}))
+                      :attributes (cond-> (assoc attributes :kv-transfer id :layer layer
+                                                 :pages pages)
+                                    (seq serialized) (assoc :serialized-on serialized))}))
                   (range (:layers geometry)))}))
 
-(defn certified-bytes
-  "Bytes a certified plan moves for continuation `id`, recomputed from its legs."
-  [certified id]
-  (reduce + 0 (map :bytes (filter #(= id (get-in % [:attributes :kv-transfer]))
-                                  (get-in certified [:plan :steps])))))
+(defn certificate
+  "The KV witness of continuation `id`: canonical geometry, pages, ranges and the per-layer
+   byte count, all derived here. `verify!` recomputes it and checks the plan's legs against it."
+  [id geometry pages]
+  (let [geometry (validate-geometry! geometry)
+        pages (pages! geometry pages)]
+    {:kv-transfer id
+     :geometry (into {} geometry)
+     :pages pages
+     :ranges (ranges geometry pages)
+     :layer-bytes (layer-bytes geometry pages)
+     :bytes (total-bytes geometry pages)}))
+
+(defn verify!
+  "Check a certified `DistributedPlan` against a KV certificate: the certificate is recomputed
+   from its own geometry and pages, and the plan holds exactly one leg per layer for the
+   continuation, in layer order, each moving that layer's derived bytes. Returns the bytes."
+  [certified {:keys [kv-transfer pages] witness-geometry :geometry :as witness}]
+  (let [expected (certificate kv-transfer (geometry witness-geometry) pages)
+        legs (filterv #(= kv-transfer (get-in % [:attributes :kv-transfer]))
+                      (get-in certified [:plan :steps]))]
+    (when-not (= expected witness)
+      (fail! "kv transfer certificate does not match its geometry and pages"
+             :kv-transfer-certificate {:expected expected :actual witness}))
+    (when-not (and (= (:layers (:geometry expected)) (count legs))
+                   (= (range (count legs)) (map #(get-in % [:attributes :layer]) legs))
+                   (every? #(= (:layer-bytes expected) (:bytes %)) legs)
+                   (every? #(= (:pages expected) (get-in % [:attributes :pages])) legs))
+      (fail! "certified plan legs disagree with the kv transfer certificate"
+             :kv-transfer-legs
+             {:expected {:layers (:layers (:geometry expected))
+                         :layer-bytes (:layer-bytes expected) :pages (:pages expected)}
+              :legs (mapv #(select-keys % [:id :bytes :attributes]) legs)}))
+    (:bytes expected)))
