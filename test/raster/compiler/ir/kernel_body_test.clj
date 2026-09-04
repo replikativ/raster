@@ -90,9 +90,14 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"buffer rank"
                             (body/validate! bad)))))
   (testing "tile-load dtypes follow storage rather than target inference"
-    (let [bad (assoc-in (minimal-body) [:fragments 0 :dtype] :float)]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dtype"
-                            (body/validate! bad)))))
+    (let [bad (-> (minimal-body)
+                  (assoc-in [:fragments 0 :dtype] :float)
+                  (assoc-in [:fragments 0 :layout :dtype] :float))]
+      (try
+        (body/validate! bad)
+        (is false "a tile load accepted a fragment dtype different from its source buffer")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :kernel-body-tile-load-dtype (:reason (ex-data exception))))))))
   (testing "storage shape and dtype agree with their named layout"
     (let [bad-shape (assoc-in (minimal-body) [:parameters 0 :shape] [8 16])
           bad-dtype (assoc-in (minimal-body) [:parameters 0 :dtype] :float)]
