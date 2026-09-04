@@ -941,7 +941,17 @@
   {:submission :inline-host-copy
    :host-staging :caller-owned
    :independent-physical-queue? false
-   :queue-ordering :inline})
+   :queue-ordering :inline
+   ;; Transfers are inline host copies into shared allocations: complete on return, no
+   ;; asynchrony, no peer route, no event to await, no physical queue of their own.
+   :async-h2d? false
+   :async-d2h? false
+   :peer-transfer? false
+   :peer-mechanisms []
+   :event-semantics :already-complete
+   :host-lease-until-await? false
+   :host-memory :shared
+   :physically-serialized? true})
 
 (defn upload-range!
   "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element

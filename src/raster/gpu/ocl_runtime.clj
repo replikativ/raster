@@ -1708,7 +1708,19 @@
   {:submission :device-event
    :host-staging :runtime-owned-native
    :independent-physical-queue? true
-   :queue-ordering :in-order})
+   :queue-ordering :in-order
+   ;; H2D/D2H are submitted as device work and complete through an event; no peer route is
+   ;; implemented (a device-to-device move stages through the host); the host source of an
+   ;; upload is copied into runtime-owned native staging before the event is visible, so the
+   ;; caller's array is free on return and any host memory works.
+   :async-h2d? true
+   :async-d2h? true
+   :peer-transfer? false
+   :peer-mechanisms []
+   :event-semantics :device-completion
+   :host-lease-until-await? false
+   :host-memory :any
+   :physically-serialized? false})
 
 (defn reset-graph-events!
   "Discard the most recent OpenCL profiling sample and release its native events."
