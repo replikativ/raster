@@ -1020,8 +1020,14 @@
 
     (and (seq? expression) (= 'raster.par/contract (first expression)))
     (let [facts (contraction-facts/contraction-facts
-                 expression :dtype (or (:raster.type/elem-type (meta expression))
-                                       default-dtype :double))
+                 expression
+                 ;; A contraction's element dtype is the declared dtype of the array it writes.
+                 ;; The form's elem-type stamp is the compile's dtype policy, which a hard-typed
+                 ;; double kernel compiled under a float policy does not follow; the program-wide
+                 ;; dtype is only the last resort when nothing declares it.
+                 :dtype (or (some-> (get array-types (second expression)) dtype/canon)
+                            (:raster.type/elem-type (meta expression))
+                            default-dtype :double))
           {:keys [free-axes contract-axes out opts]} facts
           epilogue (:epilogue facts)
           result-transform (typed-result-transform epilogue)
