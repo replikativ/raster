@@ -984,8 +984,13 @@
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
           (par/extract-par-map-info expression)
+          ;; The map's element dtype is a fact before it is a policy: the form's own element
+          ;; type, its store cast, then the destination's declared dtype (a lifted copy into a
+          ;; `double-array` under a float policy stores doubles). The program dtype is the last
+          ;; resort when nothing declares it.
           elem-type (dtype/canon (or elem-type
                                      (dtype/dtype-for-scalar-tag cast)
+                                     (when (symbol? out) (get array-types out))
                                      default-dtype))
           write-index (when offset (list 'clojure.core/+ offset idx))
           io (extract-io (if offset (list 'do write-index body) body) idx [out])]

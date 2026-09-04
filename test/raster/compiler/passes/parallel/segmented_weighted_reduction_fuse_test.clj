@@ -117,8 +117,8 @@
 
 (deftest compiler-pass-is-gpu-only
   (let [opts {:inline? false :simd? false :dtype :float}
-        cpu (pipeline/run-passes (chain) [:lower :structured-reduction-fuse] opts)
-        gpu (pipeline/run-passes (chain) [:lower :structured-reduction-fuse]
+        cpu (pipeline/run-passes (chain) [:lower :region-copy :structured-reduction-fuse] opts)
+        gpu (pipeline/run-passes (chain) [:lower :region-copy :structured-reduction-fuse]
                                  (assoc opts :target-device :ze:0))
         marker-count #(count (filter fuse/marker? (tree-seq coll? seq %)))]
     (is (zero? (marker-count cpu)))
