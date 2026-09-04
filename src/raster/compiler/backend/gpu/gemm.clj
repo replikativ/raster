@@ -374,7 +374,7 @@
         scalar (scalar-graph spec)]
     (case precision
       :f32-scalar scalar
-      :f16-xmx
+      :mixed-f16-f32
       (let [split-expression (requested-splits spec)
             xmx-spec (assoc spec :requested-splits split-expression)
             direct (xmx-graph (assoc xmx-spec :split-k? false))

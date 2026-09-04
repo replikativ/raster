@@ -22,7 +22,7 @@
   (gemm/emit-executable
    {:id (str "gemm-test-" (name variant))
     :a 'a :b 'b :c 'c :m :m :n :n :k :k
-    :variant variant :precision :f16-xmx
+    :variant variant :precision :mixed-f16-f32
     :tile (hardware/derive-gemm-tile {})
     :fill-workgroups 32}))
 

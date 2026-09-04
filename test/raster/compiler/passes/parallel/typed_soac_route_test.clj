@@ -1148,6 +1148,8 @@
            (get-in dispatch [:attributes :tuning :schedule-path])))
     (is (= (:id dispatch) (get-in dispatch [:attributes :tuning :schedule-key])))
     (is (map? (get-in dispatch [:attributes :tuning :numerical-mode])))
+    (is (= :mixed-f16-f32
+           (get-in dispatch [:attributes :tuning :numerical-mode :precision])))
     (is (map? (get-in dispatch [:attributes :tuning :layout])))
     (is (= {:path [:typed-contraction :measured-selectors]
             :key (:id dispatch)}

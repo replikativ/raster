@@ -1800,7 +1800,7 @@
    schedule's [:schedule :precision] (the source of truth the linked step binder reads). A caller
    overrides the policy on the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …)
    — NOT (assoc descriptor :gemm-precision …), which the resolved schedule now shadows:
-     :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C accumulate/output. The
+     :mixed-f16-f32 (default) — permit f16 operands with f32 accumulation/output. The
                           mixed-precision (AMP) policy: f16 INPUTS, f32 math. Costs ~1e-3
                           relative gradient noise (f16 mantissa, cosine similarity to the
                           f32 grads still 1.000) and buys ~3x on the GEMM kernels.
@@ -1819,10 +1819,10 @@
    KernelDispatch expression cases. LinkPlan instantiation selects and binds that compiler value; it does
    not recognize GEMM shapes or reconstruct conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?]
-                      :or {on-non-resident :throw gemm-precision :f16-xmx}}]
-  (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
+                      :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
+  (when-not (contains? #{:mixed-f16-f32 :f32-scalar} gemm-precision)
     (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
-                         " (expected :f16-xmx or :f32-scalar)")
+                         " (expected :mixed-f16-f32 or :f32-scalar)")
                     {:gemm-precision gemm-precision})))
   ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
   ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
@@ -2050,8 +2050,8 @@
                              :m m-argument :n n-argument :k k-argument
                              :variant (:variant step)
                              ;; Emit the complete legal schedule family. The resolved precision
-                             ;; selects :f32-scalar at bind; :f16-xmx uses the checked cases.
-                             :precision :f16-xmx
+                             ;; selects :f32-scalar at bind; mixed precision uses the checked cases.
+                             :precision :mixed-f16-f32
                              :tile tile
                              :fill-workgroups
                              (core-hw/fill-workgroups hardware-descriptor workgroup-size)
