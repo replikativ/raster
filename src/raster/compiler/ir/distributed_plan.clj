@@ -885,9 +885,13 @@
          (fn [state step]
            (let [dependency-ready (reduce max 0 (map #(get-in state [:finish-by-step %])
                                                      (:dependencies step)))
+                 ;; a transfer an endpoint physically serializes with compute (a stated
+                 ;; capability, carried as `:serialized-on`) occupies that compute lane too
                  resources (case (:kind step)
                              :compute [[:compute (:device step)]]
-                             :transfer (mapv (fn [link-id] [:link link-id]) (:route step)))
+                             :transfer (into (mapv (fn [link-id] [:link link-id]) (:route step))
+                                             (map (fn [device] [:compute device]))
+                                             (get-in step [:attributes :serialized-on])))
                  resource-ready (reduce max 0 (map #(get-in state [:resource-free %] 0)
                                                    resources))
                  start (max dependency-ready resource-ready)
@@ -910,13 +914,17 @@
                    (assoc-in [:resource-free [:compute (:device step)]] finish))
 
                :transfer
-               (reduce (fn [state link-id]
-                         (-> state
-                             (assoc-in [:resource-free [:link link-id]] finish)
-                             (update-in [:link-transfer-bytes link-id]
-                                        (fnil + 0) (:bytes step))
-                             (update-in [:link-busy-ns link-id] (fnil + 0) duration)))
-                       state (:route step)))))
+               (as-> state state
+                 (reduce (fn [state link-id]
+                           (-> state
+                               (assoc-in [:resource-free [:link link-id]] finish)
+                               (update-in [:link-transfer-bytes link-id]
+                                          (fnil + 0) (:bytes step))
+                               (update-in [:link-busy-ns link-id] (fnil + 0) duration)))
+                         state (:route step))
+                 (reduce (fn [state device]
+                           (assoc-in state [:resource-free [:compute device]] finish))
+                         state (get-in step [:attributes :serialized-on]))))))
          initial (:steps plan))
         makespan (reduce max 0 (vals (:finish-by-step state)))
         transferred-bytes (reduce + 0 (map :bytes (filter #(= :transfer (:kind %))

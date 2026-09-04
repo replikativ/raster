@@ -939,9 +939,20 @@
   "Return the Level Zero runtime's physical transfer execution contract."
   []
   {:submission :inline-host-copy
-   :host-staging :caller-owned
+   ;; Transfers are inline host copies into shared device allocations: complete on return, so
+   ;; there is no in-flight staging copy, no asynchrony, no peer route, no event to await and no
+   ;; physical queue of their own; the host argument may be any JVM array or segment.
+   :host-staging :none
    :independent-physical-queue? false
-   :queue-ordering :inline})
+   :queue-ordering :inline
+   :async-h2d? false
+   :async-d2h? false
+   :peer-transfer? false
+   :peer-mechanisms []
+   :event-semantics :already-complete
+   :host-lease-until-await? false
+   :host-memory :any
+   :physically-serialized? true})
 
 (defn upload-range!
   "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element
