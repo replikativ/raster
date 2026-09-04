@@ -18,6 +18,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]))
@@ -39,60 +40,51 @@
 (deftest split-k-matches-plain-xmx-gemm
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gemm split-k")
-    (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          record-graph! (ns-resolve ze 'record-graph!)
-          replay!       (ns-resolve ze 'replay-graph!)
-          destroy!      (ns-resolve ze 'destroy-graph!)
-          splitk!       (ns-resolve ze 'bind-registered-gemm-splitk!)
-          reduce!       (ns-resolve ze 'bind-registered-splitk-reduce!)]
-      (doseq [[m n k splits kc]
-              [[13 640 8192 8 1024]     ;; the LM-head dx shape (small k, same geometry)
-               [13 640 8192 26 320]     ;; k/splits not a multiple of kc*splits
-               [7 640 4096 4 1024]      ;; m below one 8-row DPAS tile
-               [33 200 1000 3 352]      ;; ragged m, n and k; last chunk clipped
-               [128 256 4096 8 512]]]
-        (let [A (rnd (* m k) 1) B (rnd (* k n) 2)
-              scheduled (support/dense-dispatch :ze:0)
-              direct (support/matrix-artifact scheduled :xmx-direct)]
-          (gpu/with-gpu-session [session :ze:0]
-            (gpu/alloc! session {:a16 [:half (* m k) (support/half-array A)]
-                                 :b16 [:half (* k n) (support/half-array B)]
-                                 :c-plain [:float (* m n) nil]
-                                 :c-split [:float (* m n) nil]
-                                 :parts [:float (* splits m n) nil]})
-            (let [direct-handle
-                  (gpu/bind-kernel-executable!
-                   session [:typed-direct m n k] direct
-                   [:a16 :b16 :c-plain
-                    {:type :int :value m}
-                    {:type :int :value n}
-                    {:type :int :value k}])]
+    (let [cases [[13 640 8192 8]      ;; the LM-head dx shape (small k, same geometry)
+                 [13 640 8192 26]     ;; k/splits is not integral; last chunk is clipped
+                 [7 640 4096 4]       ;; m below one 8-row DPAS tile
+                 [33 200 1000 3]      ;; ragged m, n and k
+                 [128 256 4096 8]]
+          factors (vec (distinct (map #(nth % 3) cases)))
+          scheduled (support/dense-dispatch :ze:0 :split-factors factors)
+          direct (dispatch/alternative scheduled :xmx-direct)]
+      (gpu/with-gpu-session [session :ze:0]
+        (doseq [[case-index [m n k splits]] (map-indexed vector cases)]
+          (let [a (rnd (* m k) 1)
+                b (rnd (* k n) 2)
+                a-key [:a case-index]
+                b-key [:b case-index]
+                plain-key [:plain case-index]
+                split-key [:split case-index]
+                split-graph (dispatch/alternative
+                             scheduled (gemm/split-factor-strategy splits))
+                arguments (fn [output]
+                            [a-key b-key output
+                             {:type :int :value m}
+                             {:type :int :value n}
+                             {:type :int :value k}])]
+            (gpu/alloc! session {a-key [:float (* m k) a]
+                                 b-key [:float (* k n) b]
+                                 plain-key [:float (* m n) nil]
+                                 split-key [:float (* m n) nil]})
+            (let [direct-handle (gpu/bind-kernel-executable!
+                                 session [:typed-direct case-index]
+                                 direct (arguments plain-key))
+                  split-handle (gpu/bind-kernel-executable!
+                                session [:typed-split case-index]
+                                split-graph (arguments split-key))]
               (try
                 (gpu/run-kernel-graph! session direct-handle)
-                ;; Explicit split factors remain a legacy benchmark surface until split count is
-                ;; represented as a finite compiler schedule candidate in the next increment.
-                (let [g (record-graph!
-                         [{:bound (splitk! (gpu/buffer session :a16)
-                                           (gpu/buffer session :b16)
-                                           (gpu/buffer session :parts)
-                                           m n k kc splits)
-                           :kernel-name "gemm_nonsquare_splitk"}
-                          {:bound (reduce! (gpu/buffer session :parts)
-                                           (gpu/buffer session :c-split)
-                                           (* m n) splits)
-                           :kernel-name "splitk_reduce"}])]
-                  (try
-                    (replay! g)
-                    (let [plain (gpu/download session :c-plain)
-                          split (gpu/download session :c-split)
-                          error (rel-l1 split plain)]
-                      (testing (str "m=" m " n=" n " k=" k " splits=" splits)
-                        (is (< error 1.0e-4)
-                            (str "split-k vs compiler-derived direct matrix rel-L1 " error))))
-                    (finally
-                      (destroy! g))))
+                (gpu/run-kernel-graph! session split-handle)
+                (let [plain (gpu/download session plain-key)
+                      split (gpu/download session split-key)
+                      error (rel-l1 split plain)]
+                  (testing (str "m=" m " n=" n " k=" k " splits=" splits)
+                    (is (< error 1.0e-4)
+                        (str "split-K candidate vs direct typed contraction rel-L1 " error))))
                 (finally
-                  (gpu/release-kernel-graph! session direct-handle))))))))))
+                  (gpu/release-kernel-graph! session direct-handle)
+                  (gpu/release-kernel-graph! session split-handle))))))))))
 
 (deftest unrolled-layout-convert-is-bit-exact
   ;; The f32→f16 operand cast schedules w statically unrolled, lane-owned elements per work-item.

@@ -1008,7 +1008,8 @@
                        :epilogue (:epilogue matrix-view)
                        :precision :mixed-f16-f32
                        :tile (:tile target-schedule)
-                       :fill-workgroups (:fill-workgroups target-schedule)}
+                       :fill-workgroups (:fill-workgroups target-schedule)
+                       :split-factors (or (:split-factors options) [])}
             emitted (if (:batched? matrix-view)
                       (gpu-gemm/emit-batched-matrix-alternative
                        (assoc emit-spec
@@ -1030,6 +1031,7 @@
                     :batch (:batch matrix-view)
                     :batching (:batching matrix-view)
                     :result-transform? (boolean (seq (:epilogue matrix-view)))
+                    :split-factor-schedules (:split-factor-schedules emitted)
                     :split-k-decline (:result-transform-split-decline emitted)
                     :bindings (:bindings matrix-view)
                     :dimensions (:dimensions matrix-view)
@@ -1091,12 +1093,19 @@
                      (merge
                       (if (:batched? (:schedule mixed))
                         {:xmx-batched (:schedule mixed)}
-                        {:xmx-direct (:schedule mixed)
-                         :xmx-split-k (assoc (:schedule mixed) :split-k? true)})))
+                        (merge
+                         {:xmx-direct (:schedule mixed)
+                          :xmx-split-k (assoc (:schedule mixed) :split-k? true)}
+                         (into {}
+                               (map (fn [[strategy factor]]
+                                      [strategy (assoc (:schedule mixed)
+                                                       :split-k? true
+                                                       :split-factor factor)]))
+                               (:split-factor-schedules (:schedule mixed)))))))
                    :declines (:declines routed)
                    :matrix-graph-decline (:decline mixed)
                    :tuning (typed-contraction-tuning-contract schedule dispatch-id abi
-                                                               (:precision options))
+                                                              (:precision options))
                    :selection (if (seq (:alternatives mixed))
                                 :analytic-runtime
                                 :analytic-fixed)}})))

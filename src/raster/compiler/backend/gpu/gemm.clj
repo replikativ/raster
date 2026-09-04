@@ -414,13 +414,22 @@
      :split-k-combine {:accumulator-dtype :float :kernel-body kernel-body
                        :semantic-op :contraction})))
 
+(defn split-factor-strategy
+  "Stable strategy identity for one explicit split-K candidate."
+  [factor]
+  (when-not (and (integer? factor) (> (long factor) 1))
+    (throw (ex-info "split factor must be an integer greater than one"
+                    {:split-factor factor})))
+  (keyword (str "xmx-split-k-" factor)))
+
 (defn- xmx-graph
-  [{:keys [id a b c m n k variant tile vector-width requested-splits split-k? epilogue]
+  [{:keys [id a b c m n k variant tile vector-width requested-splits split-k? epilogue
+           strategy]
     :as spec}]
   (let [{:keys [abi arguments]} (outer-interface spec)
         {:keys [a-elements b-elements c-elements]} (extents spec)
         epilogue-buffers (epilogue-buffer-specs epilogue)
-        strategy (if split-k? :xmx-split-k :xmx-direct)
+        strategy (or strategy (if split-k? :xmx-split-k :xmx-direct))
         prefix (identifier (str id "_" (name strategy)))
         a16 [:gemm id strategy :a16]
         b16 [:gemm id strategy :b16]
@@ -643,6 +652,15 @@
          :fill-workgroups (hardware/fill-workgroups desc workgroup-size)
          :matrix (:matrix desc)}))))
 
+(defn- validate-split-factors!
+  [split-factors]
+  (when-not (and (vector? split-factors)
+                 (= (count split-factors) (count (set split-factors)))
+                 (every? #(and (integer? %) (> (long %) 1)) split-factors))
+    (throw (ex-info "split-factor candidates must be unique integers greater than one"
+                    {:split-factors split-factors})))
+  split-factors)
+
 (defn emit-matrix-alternatives
   "Emit direct and, when algebraically valid, split-K matrix graph schedules.
 
@@ -650,8 +668,8 @@
    scalar fallback or a new semantic operation.  A result transform is fused into the direct
    matrix store.  Split-K is withheld until the final combine can own that transform exactly—
    applying it independently to partial sums would be a silent algebraic error."
-  [{:keys [id a b c m n k variant tile fill-workgroups vector-width epilogue]
-    :or {vector-width 4}
+  [{:keys [id a b c m n k variant tile fill-workgroups vector-width epilogue split-factors]
+    :or {vector-width 4 split-factors []}
     :as spec}]
   (when-not (contains? #{:nn :nt :tn :tt} variant)
     (throw (ex-info "matrix alternatives require :nn, :nt, :tn, or :tt variant"
@@ -661,12 +679,21 @@
     (when (nil? value)
       (throw (ex-info "matrix alternatives are missing a required field"
                       {:field field :spec spec}))))
-  (let [spec (assoc spec :vector-width vector-width)
+  (let [split-factors (validate-split-factors! split-factors)
+        spec (assoc spec :vector-width vector-width)
         split-expression (requested-splits spec)
         xmx-spec (assoc spec :requested-splits split-expression)
         direct (xmx-graph (assoc xmx-spec :split-k? false))
         split? (not (seq epilogue))
         split (when split? (xmx-graph (assoc xmx-spec :split-k? true)))
+        explicit-splits
+        (when split?
+          (mapv (fn [factor]
+                  (xmx-graph (assoc spec
+                                    :split-k? true
+                                    :strategy (split-factor-strategy factor)
+                                    :requested-splits factor)))
+                split-factors))
         alignment-cases
         [{:expression n :op :< :value 8 :strategy :f32-scalar}
          {:expression k :op :< :value 8 :strategy :f32-scalar}
@@ -679,8 +706,13 @@
                            split? (conj {:expression split-expression :op :>= :value 2
                                          :strategy :xmx-split-k}))
                   :default :xmx-direct}]
-    {:alternatives (cond-> [direct] split (conj split))
+    {:alternatives (cond-> [direct]
+                     split (conj split)
+                     (seq explicit-splits) (into explicit-splits))
      :selector selector
+     :split-factor-schedules
+     (into {} (map (fn [factor] [(split-factor-strategy factor) factor]))
+           (if split? split-factors []))
      :result-transform-split-decline
      (when-not split? {:reason :split-k-result-transform-not-lowered})}))
 
@@ -709,12 +741,14 @@
                 (throw (ex-info
                         "standalone GEMM executable cannot manufacture its scalar fallback for a result transform"
                         {:reason :result-transform-requires-typed-contraction :id id})))
-            {:keys [alternatives selector]} (emit-matrix-alternatives spec)]
+            {:keys [alternatives selector split-factor-schedules]}
+            (emit-matrix-alternatives spec)]
         (kdispatch/make
          {:id (str id)
           :alternatives (into [scalar] alternatives)
           :default-strategy :xmx-direct
           :selector selector
           :provenance {:semantic-op :contraction :variant variant :lowering :gemm-schedule}
-          :attributes {:tile tile :precision precision :hardware-aware? true}}))
+          :attributes {:tile tile :precision precision :hardware-aware? true
+                       :split-factor-schedules split-factor-schedules}}))
       (throw (ex-info "unsupported GEMM precision" {:id id :precision precision})))))

@@ -18,13 +18,16 @@
         (:nodes graph)))
 
 (defn- emitted
-  [variant]
-  (gemm/emit-executable
-   {:id (str "gemm-test-" (name variant))
-    :a 'a :b 'b :c 'c :m :m :n :n :k :k
-    :variant variant :precision :mixed-f16-f32
-    :tile (hardware/derive-gemm-tile {})
-    :fill-workgroups 32}))
+  ([variant] (emitted variant {}))
+  ([variant options]
+   (gemm/emit-executable
+    (merge
+     {:id (str "gemm-test-" (name variant))
+      :a 'a :b 'b :c 'c :m :m :n :n :k :k
+      :variant variant :precision :mixed-f16-f32
+      :tile (hardware/derive-gemm-tile {})
+      :fill-workgroups 32}
+     options))))
 
 (defn- arguments
   [m n k]
@@ -58,6 +61,24 @@
       (is (= :contraction (artifact/attribute operation :semantic-op)))
       (is (= [256] (get-in kernel-body [:launch :workgroup-size])))
       (is (graph-call/kernel-graph-call? call)))))
+
+(deftest explicit-split-factors-are-finite-schedule-alternatives
+  (let [scheduled (emitted :nn {:split-factors [2 8 32]})
+        by-strategy (into {} (map (juxt executable/strategy identity))
+                          (:alternatives scheduled))]
+    (is (= #{:f32-scalar :xmx-direct :xmx-split-k
+             :xmx-split-k-2 :xmx-split-k-8 :xmx-split-k-32}
+           (set (keys by-strategy))))
+    (doseq [factor [2 8 32]]
+      (let [strategy (gemm/split-factor-strategy factor)
+            graph (get by-strategy strategy)]
+        (is (= factor (get-in graph [:attributes :requested-splits])))
+        (is (= factor (get-in scheduled
+                              [:attributes :split-factor-schedules strategy])))))
+    (is (= :xmx-split-k
+           (executable/strategy
+            (dispatch/select-alternative scheduled (arguments 13 640 262144))))
+        "explicit tuning candidates do not replace the analytic default selector")))
 
 (deftest split-k-storage-and-launch-use-the-selector-expression
   (let [scheduled (emitted :nn)
