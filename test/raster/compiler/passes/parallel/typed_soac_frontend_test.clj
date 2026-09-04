@@ -811,3 +811,30 @@
                 :raster.type/tag 'floats :tag 'floats})
         source (list 'let* ['r call] 'r)]
     (is (= source (frontend/normalize-source source)))))
+
+(deftest equal-sizes-spelled-through-host-bindings-are-one-extent
+  ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`
+  ;; over `y = (float-array n)` is `n`. Without those identities the buffer `y` would receive
+  ;; two shapes and the whole form would decline with :source-value-conflict.
+  (let [source '(let* [^long n1 seq
+                       ^long n2 dff
+                       ^long total (clojure.core/* seq dff)
+                       ^long again (clojure.core/* n1 n2)
+                       y (clojure.core/float-array total)
+                       fill (raster.par/map! y i again float (clojure.core/aget x i))
+                       z (raster.par/pmap j (clojure.core/alength y) float
+                                          (clojure.core/* 2.0 (clojure.core/aget y j)))]
+                      z)
+        normalized (frontend/normalize-source source)
+        program (frontend/form->program normalized
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'seq :long 'dff :long}})
+        equations (dialect/equations program)
+        maps (filter #(= 'map (dialect/operation-kind %)) equations)]
+    (is (= '[scalar map map] (mapv dialect/operation-kind equations))
+        "the canonical size keeps one scalar equation; its restatement is an alias")
+    (is (= '[total total] (mapv dialect/operation-extent maps))
+        "both maps iterate the one canonical extent")
+    (is (= (get-in (dialect/facts program) [:values 'y :shape])
+           (get-in (dialect/facts program) [:values 'z :shape]))
+        "the allocation and its consumer agree on one shape")))

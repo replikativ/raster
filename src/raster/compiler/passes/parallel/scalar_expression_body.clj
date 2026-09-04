@@ -107,6 +107,10 @@
                           (and fp-source? fp-target? widening?) [:exact :exact]
                           (and fp-source? fp-target?) [:nearest-even :ieee]
                           (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
+                          ;; Integral narrowing (`(int j)` on a long counter) keeps the two's
+                          ;; complement bits, which agrees with the checked JVM cast on every
+                          ;; in-range value; the policy is stated so no target can guess it.
+                          (and (not fp-source?) (not fp-target?)) [:exact :wrap]
                           (and (not fp-source?) fp-target? (= :double target)
                                (<= (dtype/bytes-of source) 4)) [:exact :exact]
                           (and (not fp-source?) fp-target?)

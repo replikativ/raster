@@ -249,11 +249,8 @@
                  #'public-c-family-strided-gather {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-strided-scatter {:target device-id :dtype :float}))
-      ;; contract-mm is declared over double arrays and allocates its double output; compiling
-      ;; it under a float policy would retype the parameters but not the allocation, and the
-      ;; typed route refuses that mixed program. Its declared dtype exercises the fp64 leaf.
       (:kernels (equation-first/compile
-                 #'contract/contract-mm {:target device-id :dtype :double}))
+                 #'contract/contract-mm {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

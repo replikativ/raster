@@ -295,8 +295,8 @@
                           result-dtype (get dtype-by-destination destination)
                           destination (with-meta destination
                                         {:raster.type/tag
-                                         (dtype/scalar-tag-for-dtype result-dtype)
-                                         :tag (dtype/scalar-tag-for-dtype result-dtype)})
+                                         (dtype/array-tag-for-dtype result-dtype)
+                                         :tag (dtype/array-tag-for-dtype result-dtype)})
                           typed-value (list cast value)
                           store (if (dialect/reducing-scatter-conflict? conflict)
                                   (list 'raster.par/atomic-add!

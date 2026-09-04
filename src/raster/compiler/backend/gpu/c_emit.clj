@@ -372,7 +372,7 @@
 
 (def element-tag->c
   "Map primitive element-tag to C type string."
-  {'double "double" 'float "float" 'long "long" 'int "int" 'byte "int8_t"})
+  {'double "double" 'float "float" 'long "long" 'int "int" 'byte "int8_t" 'short "int16_t"})
 
 ;; ================================================================
 ;; Symbol mangling
@@ -994,7 +994,7 @@
 
      ;; Primitive cast
      (and (seq? expr)
-          (contains? #{'double 'float 'long 'int} (first expr))
+          (contains? #{'double 'float 'long 'int 'byte 'short} (first expr))
           (= 2 (count expr)))
      ;; Vectorizing: a cast the walker inserted around a now-vector expr. An element-type
      ;; cast MATCHING the element type (e.g. `(double x)` where x is a double vload) is a
@@ -1005,7 +1005,9 @@
        (if (= (name (first expr)) *scalar-type*)
          (emit-expr (second expr) idx-sym array-syms opencl-idx)
          (throw (ex-info "vector precision cast" {:raster.compiler.backend.gpu.c-emit/bail true})))
-       (emit-cast (remap-type (name (first expr)))
+       (emit-cast (let [tag (name (first expr))]
+                    ;; Narrow integer casts name JVM scalar tags; C spells them by width.
+                    (get {"byte" "int8_t" "short" "int16_t"} tag (remap-type tag)))
                   (emit-expr (second expr) idx-sym array-syms opencl-idx)))
 
      ;; TypedSOAC scalar Fold. It remains a semantic term through scheduling;
@@ -1708,7 +1710,7 @@
                                     'clojure.core/alength
                                     'if 'when 'cond 'case 'case* 'loop 'loop* 'recur
                                     'fn 'fn* 'quote 'new 'throw 'try
-                                    'double 'float 'long 'int
+                                    'double 'float 'long 'int 'byte 'short
                                     'Math/sin 'Math/cos 'Math/exp 'Math/log
                                     'Math/sqrt 'Math/abs 'Math/pow 'Math/max
                                     'Math/min 'Math/fma 'Math/atan2
@@ -1990,9 +1992,10 @@
 
 (def ^:private quot-ops #{'quot 'clojure.core/quot})
 (def ^:private rem-ops  #{'rem 'clojure.core/rem 'mod 'clojure.core/mod})
-(def ^:private prim-cast-ops #{'double 'float 'long 'int
+(def ^:private prim-cast-ops #{'double 'float 'long 'int 'byte 'short
                                'clojure.core/double 'clojure.core/float
-                               'clojure.core/long 'clojure.core/int})
+                               'clojure.core/long 'clojure.core/int
+                               'clojure.core/byte 'clojure.core/short})
 (def ^:private idx-cast-ops #{'long 'int 'clojure.core/long 'clojure.core/int})
 
 (defn- sym-occurs?

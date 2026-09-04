@@ -978,7 +978,19 @@
           strip-binder-tags
           (fn [form]
             (clojure.walk/postwalk
-             (fn [x] (if (and (symbol? x) (:tag (meta x))) (vary-meta x dissoc :tag) x))
+             (fn [x]
+               (if (and (seq? x) (contains? #{'let* 'loop*} (first x)) (vector? (second x)))
+                 (with-meta
+                   (list* (first x)
+                          (vec (map-indexed (fn [ordinal item]
+                                              (if (and (even? ordinal) (symbol? item)
+                                                       (:tag (meta item)))
+                                                (vary-meta item dissoc :tag)
+                                                item))
+                                            (second x)))
+                          (nnext x))
+                   (meta x))
+                 x))
              form))
           materialize-locals
           (fn [locals body]
@@ -1011,9 +1023,13 @@
                   destination-dtype (or dtype (when reduction? (:dtype conflict)))
                   scalar-tag (when destination-dtype
                                (dtype/scalar-tag-for-dtype destination-dtype))
+                  ;; The destination is an array: its tag is the primitive-array tag, so the
+                  ;; bytecode compiler emits a typed array store instead of a boxed aastore.
+                  array-tag (when destination-dtype
+                              (dtype/array-tag-for-dtype destination-dtype))
                   destination (if destination-dtype
                                 (with-meta destination
-                                  {:tag scalar-tag :raster.type/tag scalar-tag})
+                                  {:tag array-tag :raster.type/tag array-tag})
                                 destination)
                   value (if scalar-tag (list scalar-tag value) value)
                   store (if reduction?

@@ -174,8 +174,9 @@
           labels (int-array n)
           session (gpu/make-session :ocl:0)]
       (try
-        ;; mixed byte/int/float storage still emits through the SegMap generator
-        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
+        ;; mixed byte/int/float storage lowers through the verified KernelBody: the int8 store
+        ;; is a stated narrowing cast, not a source spelling the SegMap generator reparses
+        (is (= :kernel-body (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
         (is (= [:byte :float :int :float :int]
                (mapv :dtype (get-in descriptor [:steps 0 :abi]))))
         (let [program (fixture/instantiate! session descriptor [x q y labels n]

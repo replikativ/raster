@@ -16,7 +16,8 @@
    (int8 widening). Keys: :kernel-name :source :array-params (binding order) :dtype :out-dtype
    :out-elems :wg/:grid (uniform 1-3D geometry) :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
-  (:require [raster.compiler.core.op-descriptor :as od]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as od]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
@@ -516,10 +517,14 @@
    `:f32-scalar` promises exact f32 arithmetic, so the `:matrix` family (f16 XMX / int8
    instruction inputs) is excluded; the default `:f16-xmx` policy admits every family. An
    unknown policy or a policy that leaves no family is a loud error, never a silent default."
-  [families precision operation-id]
+  [families precision dtype operation-id]
   (case precision
     (nil :f16-xmx) families
-    :f32-scalar (let [kept (vec (remove #{:matrix} families))]
+    ;; The matrix family covers f16 XMX products and exact int8 dp4a products; only the
+    ;; floating-point contractions lose exactness there, so integer contractions keep it.
+    :f32-scalar (let [kept (if (dtype/fp-dtype? (dtype/canon dtype))
+                             (vec (remove #{:matrix} families))
+                             families)]
                   (when (empty? kept)
                     (throw (ex-info "the :f32-scalar precision policy leaves no contraction family"
                                     {:reason :typed-contraction-precision
@@ -616,7 +621,7 @@
         options (apply hash-map options)
         families (families-for-precision
                   (validated-typed-contraction-families schedule operation-id)
-                  (:precision options) operation-id)
+                  (:precision options) dtype operation-id)
         _ (when (and (contains? options :dtype)
                      (not= dtype (:dtype options)))
             (throw (ex-info "typed contraction route dtype disagrees with its equation"
@@ -681,7 +686,7 @@
         schedule (reduction/validate-schedule! (:schedule operation))
         families (families-for-precision
                   (validated-typed-contraction-families schedule operation-id)
-                  (:precision (apply hash-map options)) operation-id)
+                  (:precision (apply hash-map options)) (:dtype operation) operation-id)
         results
         (mapv
          (fn [family]
