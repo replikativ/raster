@@ -7,6 +7,7 @@
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
+            [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
@@ -18,6 +19,8 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.matrix-stage :as matrix-stage]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
@@ -227,6 +230,32 @@
      phase {:layout :transpose :dtype :half
             :kernel-body kernel-body :cacheable-transform? true})))
 
+(defn- scheduled-matrix-body
+  "Build one canonical f16 matrix KernelBody without selecting a target spelling."
+  [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
+           additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
+           k-range launch-group-count attributes epilogue]
+    :or {result-dtype :float provenance {}}}]
+  (contraction-schedule/matrix-body
+   {:id (or id [:gemm kernel-name])
+    :row a :col b :out c
+    :dimensions [m n k]
+    :dimension-parameters (or dimension-parameters [m n k])
+    :axis-symbols ['i 'j 'l]
+    :tile tile
+    :bindings {:row a :col b}
+    :epilogue epilogue
+    :result-dtype result-dtype
+    :additional-parameters additional-parameters
+    :additional-indices additional-indices
+    :buffer-shapes buffer-shapes
+    :buffer-views buffer-views
+    :operation-buffers operation-buffers
+    :k-range k-range
+    :launch-group-count launch-group-count
+    :attributes attributes
+    :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)}))
+
 (defn emit-scheduled-matrix-kernel
   "Build and directly lower one canonical f16 matrix contraction.
 
@@ -241,63 +270,50 @@
            k-range launch-group-count attributes parameter-names epilogue]
     :or {result-dtype :float provenance {} target-dialect :opencl-intel}}]
   (let [kernel-name (c-emit/c-symbol kernel-name)
-        kernel-body
-        (contraction-schedule/matrix-body
-         {:id (or id [:gemm kernel-name])
-          :row a :col b :out c
-          :dimensions [m n k]
-          :dimension-parameters (or dimension-parameters [m n k])
-          :axis-symbols ['i 'j 'l]
-          :tile tile
-          :bindings {:row a :col b}
-          :epilogue epilogue
-          :result-dtype result-dtype
-          :additional-parameters additional-parameters
-          :additional-indices additional-indices
-          :buffer-shapes buffer-shapes
-          :buffer-views buffer-views
-          :operation-buffers operation-buffers
-          :k-range k-range
-          :launch-group-count launch-group-count
-          :attributes attributes
-          :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})
+        kernel-body (scheduled-matrix-body
+                     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+                      :dimension-parameters dimension-parameters :tile tile
+                      :result-dtype result-dtype :provenance provenance
+                      :additional-parameters additional-parameters
+                      :additional-indices additional-indices :buffer-shapes buffer-shapes
+                      :buffer-views buffer-views :operation-buffers operation-buffers
+                      :k-range k-range :launch-group-count launch-group-count
+                      :attributes attributes :epilogue epilogue})
         emitted (matrix-target/emit-matrix-kernel
                  kernel-name kernel-body target-dialect {:parameter-names parameter-names})]
     (assoc emitted
            :kernel-name kernel-name
            :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
 
-(defn emit-scheduled-split-k-kernel
-  "Lower a grid-Z partition of the K reduction into disjoint f32 output views."
+(defn- split-k-matrix-spec
   [{:keys [kernel-name id a b c m n k kc splits tile provenance]}]
   (let [z 'k-slice
         c-view 'split-result-view
         k-lower (kbody/expression :mul z kc)
         k-upper (kbody/expression :min (kbody/expression :add k-lower kc) k)]
-    (emit-scheduled-matrix-kernel
-     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
-      :tile tile :result-dtype :float :provenance provenance
-      :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
-                              (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
-      :additional-indices [(kbody/->IndexBinding z :group 2)]
-      :buffer-shapes {c [splits m n]}
-      :buffer-views [{:id c-view :buffer c
-                      :element-offset (kbody/expression :mul z m n)
-                      :shape [m n]}]
-      :operation-buffers {c c-view}
-      :k-range [k-lower k-upper]
-      :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
-                           (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
-                           (klaunch/runtime-value splits)]
-      :attributes {:grid-z {:index z :extent splits :purpose :reduction-partition}}
-      :parameter-names {kc "KC" splits "splits"}})))
+    {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+     :tile tile :result-dtype :float :provenance provenance
+     :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
+                             (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
+     :additional-indices [(kbody/->IndexBinding z :group 2)]
+     :buffer-shapes {c [splits m n]}
+     :buffer-views [{:id c-view :buffer c
+                     :element-offset (kbody/expression :mul z m n)
+                     :shape [m n]}]
+     :operation-buffers {c c-view}
+     :k-range [k-lower k-upper]
+     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
+                          (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+                          (klaunch/runtime-value splits)]
+     :attributes {:grid-z {:index z :extent splits :purpose :reduction-partition}}
+     :parameter-names {kc "KC" splits "splits"}}))
 
-(defn emit-scheduled-batched-matrix-kernel
-  "Lower independent dense matrix slabs as grid-Z-selected contiguous buffer views.
+(defn emit-scheduled-split-k-kernel
+  "Lower a grid-Z partition of the K reduction into disjoint f32 output views."
+  [spec]
+  (emit-scheduled-matrix-kernel (split-k-matrix-spec spec)))
 
-   `batching` states whether each operand carries the leading batch axis.  A false entry denotes a
-   stable broadcast operand (most commonly shared model weights), so its view has zero batch
-   offset instead of materializing a repeated tensor."
+(defn- batched-matrix-spec
   [{:keys [kernel-name id a b c m n k batch tile provenance batching]
     :or {batching {:row true :col true}}}]
   (let [z 'slab
@@ -321,64 +337,98 @@
         (cond-> {c c-view}
           row-batched? (assoc a a-view)
           col-batched? (assoc b b-view))]
-    (emit-scheduled-matrix-kernel
-     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
-      :tile tile :result-dtype :float :provenance provenance
-      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
-      :additional-indices [(kbody/->IndexBinding z :group 2)]
-      :buffer-shapes {a a-shape b b-shape c [batch m n]}
-      :buffer-views buffer-views
-      :operation-buffers operation-buffers
-      :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
-                           (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
-                           (klaunch/runtime-value batch)]
-      :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}
-                   :batching batching}
-      :parameter-names {batch "batch"}})))
+    {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+     :tile tile :result-dtype :float :provenance provenance
+     :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
+     :additional-indices [(kbody/->IndexBinding z :group 2)]
+     :buffer-shapes {a a-shape b b-shape c [batch m n]}
+     :buffer-views buffer-views
+     :operation-buffers operation-buffers
+     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
+                          (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+                          (klaunch/runtime-value batch)]
+     :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}
+                  :batching batching}
+     :parameter-names {batch "batch"}}))
 
-(defn- kernel-epilogue-interface
-  [kernel-body]
-  (mapv
-   (fn [{:keys [id kind dtype]}]
-     [(kabi/slot id kind dtype :c-name (name id) :role :epilogue)
-      id])
-   (filterv #(= :epilogue (:role %)) (:parameters kernel-body))))
+(defn emit-scheduled-batched-matrix-kernel
+  "Lower independent dense matrix slabs as grid-Z-selected contiguous buffer views.
+
+   `batching` states whether each operand carries the leading batch axis.  A false entry denotes a
+   stable broadcast operand (most commonly shared model weights), so its view has zero batch
+   offset instead of materializing a repeated tensor."
+  [spec]
+  (emit-scheduled-matrix-kernel (batched-matrix-spec spec)))
+
+(defn- emit-scheduled-matrix-artifact
+  [{:keys [kernel-name target-dialect parameter-names argument-values source-operation phase]
+    :or {target-dialect :opencl-intel argument-values {}}
+    :as spec}]
+  (let [kernel-name (c-emit/c-symbol kernel-name)
+        kernel-body (scheduled-matrix-body spec)
+        dimension-values (get-in kernel-body [:attributes :dimension-values])
+        arguments (mapv (fn [{:keys [id role]}]
+                          (cond
+                            (contains? argument-values id) (get argument-values id)
+                            (= :dimension role) (get dimension-values id)
+                            :else id))
+                        (:parameters kernel-body))
+        uses (scheduled-body/derive-uses kernel-body arguments)
+        scheduled
+        (scheduled-body/make
+         {:source (or source-operation
+                      (throw (ex-info "matrix artifact requires its exact scheduled stage"
+                                      {:reason :matrix-stage-source :id (:id spec)
+                                       :phase phase})))
+          :body kernel-body
+          :arguments arguments
+          :effects {:kind :tensor-contraction-stage :uses uses}
+          :legality {:kind :matrix-instruction-tiling
+                     :scheduled-body (:id kernel-body)}
+          :numerics {:mode :reassociated :policy :tiled-contraction
+                     :rounding :nearest-even :accumulator-dtype :float}
+          :provenance {:semantic-op :contraction :lowering :gemm-graph :phase phase}
+          :attributes (cond-> {:strategy phase
+                               ;; Temporary compatibility projection; the body schedule is the
+                               ;; authority and target/device tests use this flattened view.
+                               :tile (:schedule kernel-body)
+                               :accumulator-dtype :float}
+                        (get-in kernel-body [:attributes :batching])
+                        (assoc :batched? true
+                               :batching (get-in kernel-body [:attributes :batching])))} )]
+    (kernel-body-target/emit-artifact
+     kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn- gemm-artifact
   [{:keys [id m n k tile epilogue]} kernel-name a b c split-k? kc splits phase]
-  (let [{:keys [block-m block-n]} tile
-        group-count (cond-> [(klaunch/ceil-div n block-n)
-                             (klaunch/ceil-div m block-m)]
-                      split-k? (conj (klaunch/runtime-value splits)))
+  (let [reduction (if split-k?
+                    (let [slice 'k-slice
+                          lower (kbody/expression :mul slice kc)]
+                      {:kind :split-k :slice slice :chunk kc :partitions splits
+                       :range [lower (kbody/expression
+                                      :min (kbody/expression :add lower kc) k)]})
+                    {:kind :full :range [0 k]})
+        stage (matrix-stage/make
+               {:id [:gemm id phase]
+                :lhs a :rhs b :result c :dimensions [m n k]
+                :reduction reduction
+                :result-shape (if split-k? [splits m n] [m n])
+                :epilogue (when-not split-k? epilogue)})
         emit-args {:kernel-name kernel-name
                    :id [:gemm id phase]
                    :a a :b b :c c :m m :n n :k k
                    :tile tile :result-dtype :float
                    :epilogue (when-not split-k? epilogue)
-                   :provenance {:operation-id id :phase phase}}
-        scheduled (if split-k?
-                    (emit-scheduled-split-k-kernel
-                     (assoc emit-args :kc :k-chunk :splits :splits))
-                    (emit-scheduled-matrix-kernel emit-args))
-        base-interface
-        (cond-> [[(kabi/slot a :input :half :c-name "A") a]
-                 [(kabi/slot b :input :half :c-name "B") b]
-                 [(kabi/slot c :output :float :c-name "C") c]
-                 [(kabi/slot m :scalar :int :c-name "M") m]
-                 [(kabi/slot n :scalar :int :c-name "N") n]
-                 [(kabi/slot k :scalar :int :c-name "K") k]]
-          split-k? (conj [(kabi/slot :k-chunk :scalar :int :c-name "KC") kc]
-                         [(kabi/slot :splits :scalar :int :c-name "splits") splits]))
-        interface (into base-interface (kernel-epilogue-interface (:kernel-body scheduled)))
-        abi (mapv first interface)
-        arguments (mapv second interface)]
-    (artifact
-     (:kernel-name scheduled) (:source scheduled)
-     abi arguments
-     (klaunch/spec {:workgroup-size (:workgroup-size scheduled)
-                    :group-count group-count})
-     phase (cond-> {:tile tile :split-k? split-k? :accumulator-dtype :float}
-             scheduled (assoc :kernel-body (:kernel-body scheduled))))))
+                   :phase phase
+                   :source-operation stage
+                   :provenance {:operation-id id :phase phase}}]
+    (emit-scheduled-matrix-artifact
+     (if split-k?
+       (assoc (split-k-matrix-spec
+               (assoc emit-args :kc :k-chunk :splits :splits))
+              :phase phase :source-operation stage
+              :argument-values {:k-chunk kc :splits splits})
+       emit-args))))
 
 (defn emit-split-k-combine-kernel
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
@@ -511,35 +561,24 @@
 
 (defn- batched-gemm-artifact
   [{:keys [id a b c batch m n k tile batching]}]
-  (let [{:keys [block-m block-n]} tile
-        kernel-name (str (identifier (str id "_xmx_batched")) "_contract")
-        scheduled (emit-scheduled-batched-matrix-kernel
-                   {:kernel-name kernel-name
-                    :id [:gemm id :xmx-batched]
-                    :a a :b b :c c :m m :n n :k k :batch batch :batching batching
-                    :tile tile
-                    :provenance {:operation-id id :phase :matrix-contract}})]
-    (artifact
-     (:kernel-name scheduled) (:source scheduled)
-     [(kabi/slot a :input :half :c-name "A")
-      (kabi/slot b :input :half :c-name "B")
-      (kabi/slot c :output :float :c-name "C")
-      (kabi/slot m :scalar :int :c-name "M")
-      (kabi/slot n :scalar :int :c-name "N")
-      (kabi/slot k :scalar :int :c-name "K")
-      (kabi/slot batch :scalar :int :c-name "batch")]
-     [a b c m n k batch]
-     (klaunch/spec
-      {:workgroup-size (:workgroup-size scheduled)
-       :group-count [(klaunch/ceil-div n block-n)
-                     (klaunch/ceil-div m block-m)
-                     (klaunch/runtime-value batch)]})
-     :matrix-contract
-     {:tile tile
-      :batched? true
-      :batching batching
-      :accumulator-dtype :float
-      :kernel-body (:kernel-body scheduled)})))
+  (let [kernel-name (str (identifier (str id "_xmx_batched")) "_contract")
+        stage (matrix-stage/make
+               {:id [:gemm id :xmx-batched]
+                :lhs a :rhs b :result c :dimensions [m n k]
+                :batching {:extent batch
+                           :lhs (get batching :row true)
+                           :rhs (get batching :col true)}
+                :reduction {:kind :full :range [0 k]}
+                :result-shape [batch m n]})]
+    (emit-scheduled-matrix-artifact
+     (assoc (batched-matrix-spec
+             {:kernel-name kernel-name
+              :id [:gemm id :xmx-batched]
+              :a a :b b :c c :m m :n n :k k :batch batch :batching batching
+              :tile tile
+              :provenance {:operation-id id :phase :matrix-contract}})
+            :phase :matrix-contract
+            :source-operation stage))))
 
 (defn emit-batched-matrix-alternative
   "Emit one compiler-owned matrix schedule for a leading batch of dense NN contractions.
