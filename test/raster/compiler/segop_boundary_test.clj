@@ -96,7 +96,8 @@
                     (slp/schedule-single-operation 'out source opts))
         operation (first (:operations scheduled))
         emitted ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
-                 source :dtype :float :device-id :ze:0 :min-elements 0)]
+                 source :dtype :float :device-id :ze:0 :min-elements 0
+                 :scalar-types (:scalar-types opts) :array-types (:array-types opts))]
     (is (some? (:algorithm scheduled)))
     (is (= :typed-soac (get-in operation [:algorithm-dialect])))
     (is (= :unique (:write-conflict operation)))

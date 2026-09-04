@@ -51,17 +51,22 @@
   "[label form opts] — arith, scalar broadcast, device math, float, fma, the abs/max/min double
    overrides (hip-config), and an integer body."
   [["add-double"   '(raster.par/map! out i n double (+ (aget a i) (aget b i)))          {}]
-   ["scalar-mul"   '(raster.par/map! out i n double (* alpha (aget a i)))               {}]
+   ;; captured scalars are declared: an isolated emitter test has no deftm to type them and
+   ;; the emitters refuse to guess
+   ["scalar-mul"   '(raster.par/map! out i n double (* alpha (aget a i)))
+    {:scalar-types {'alpha :double}}]
    ["device-math"  '(raster.par/map! out i n double (Math/sin (aget a i)))              {}]
    ["abs-double"   '(raster.par/map! out i n double (Math/abs (aget a i)))              {}]
-   ["clamp-double" '(raster.par/map! out i n double (Math/max (aget a i) (Math/min (aget b i) c))) {}]
+   ["clamp-double" '(raster.par/map! out i n double (Math/max (aget a i) (Math/min (aget b i) c)))
+    {:scalar-types {'c :double}}]
    ["long-scalar"  '(raster.par/map! out i n double (+ (aget a i) (* 0.0 iteration)))
     {:scalar-types {'iteration :long}}]
    ["add-float"    '(raster.par/map! out i n float  (+ (aget a i) (aget b i)))          {:dtype :float}]
    ["fma-float"    '(raster.par/map! out i n float  (+ (* (aget a i) (aget b i)) (aget c i))) {:dtype :float}]])
 
 (def ^:private void-kernels
-  [["axpy-void"   '(raster.par/map-void! i n (raster.arrays/aset y i (+ (aget y i) (* alpha (aget x i))))) {:dtype :float}]
+  [["axpy-void"   '(raster.par/map-void! i n (raster.arrays/aset y i (+ (aget y i) (* alpha (aget x i)))))
+    {:dtype :float :scalar-types {'alpha :float}}]
    ;; a let-BOUND integer index: without *int-vars* seeding `base` infers the float scalar-type and
    ;; becomes a non-integer array subscript → compile error. Guards the emit-stmt/*int-vars* path.
    ["let-index-void" '(raster.par/map-void! i n (let [base (* i 2)]

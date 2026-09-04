@@ -280,9 +280,12 @@
                      long :long
                      float :float
                      double :double
-                     (or dtype :int))
-        ctype (get {:int "int" :long "long" :float "float" :double "double"}
-                   scan-dtype "int")
+                     (or dtype
+                         (throw (ex-info "exclusive scan generator requires a scan dtype"
+                                         {:reason :scan-dtype-unknown :form form}))))
+        ctype (or (get {:int "int" :long "long" :float "float" :double "double"} scan-dtype)
+                  (throw (ex-info "exclusive scan generator has no C type for its dtype"
+                                  {:reason :scan-dtype-unknown :dtype scan-dtype :form form})))
         ;; Extract combining op and element expression (same pattern as reduce)
         [let-bindings inner-body]
         (if (and (seq? body) (contains? #{'let* 'let} (first body)))

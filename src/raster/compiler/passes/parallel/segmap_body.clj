@@ -157,9 +157,15 @@
                                        (get array-types (symbol (name id)))
                                        default-dtype)))
         scalar-dtype (fn [id]
-                       (dtype/canon (or (get scalar-types id)
-                                        (get scalar-types (symbol (name id)))
-                                        :int)))
+                       (if-let [declared (or (get scalar-types id)
+                                             (get scalar-types (symbol (name id))))]
+                         (dtype/canon declared)
+                         ;; A guessed integer here silently zeroed a captured floating scalar
+                         ;; once; the owner (params, program values or walker tags) must say.
+                         (decline! :scalar-dtype
+                                   "portable map scalar parameter has no declared dtype"
+                                   {:operation (:id segmap) :scalar id
+                                    :declared (vec (keys scalar-types))})))
         array-types (into {} (map (juxt identity array-dtype)) (concat inputs outputs))
         scalar-types (into {} (map (juxt identity scalar-dtype)) scalars)
         index-scope (conj (set scalars) index)

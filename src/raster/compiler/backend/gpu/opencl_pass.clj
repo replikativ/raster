@@ -8,9 +8,11 @@
    This is the GPU counterpart of simd-pass — both consume the same
    par form vocabulary but produce different target code."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -47,6 +49,78 @@
 ;; Single source of declared GPU param types (shared by BOTH compile entries:
 ;; raster.gpu.core/compile-deftm-internal! and the pipeline's pass-backend).
 ;; ================================================================
+
+(def ^:private integral-arithmetic-heads
+  "clojure.core integer index/dimension arithmetic: the fixpoint census exempts such bindings from
+   type tags because their result is a long whenever every operand is a long."
+  '#{clojure.core/* clojure.core/+ clojure.core/- clojure.core/quot clojure.core/rem
+     clojure.core/mod clojure.core/inc clojure.core/dec clojure.core/max clojure.core/min})
+
+(defn- strip-scalar-cast [x]
+  (if (and (seq? x) (= 2 (count x))
+           (contains? '#{long clojure.core/long int clojure.core/int} (first x)))
+    (recur (second x))
+    x))
+
+(defn- integral-expression?
+  "An expression whose value is provably an integral scalar from declared facts: an integer
+   literal, an explicit integral cast, a symbol declared integral in `env`, or integer arithmetic
+   over such operands."
+  [expression env]
+  (cond
+    (integer? expression) true
+    (symbol? expression) (contains? #{:int :long} (get env expression))
+    (and (seq? expression) (= 2 (count expression))
+         (contains? '#{long clojure.core/long int clojure.core/int} (first expression)))
+    true
+    (and (seq? expression) (contains? integral-arithmetic-heads (first expression)))
+    (every? #(integral-expression? % env) (rest expression))
+    :else false))
+
+(defn- counted-loop-index-dtype
+  "The integral dtype of a loop counter: a `dotimes` binder, or the `loop*` binder that the
+   loop's own exit test compares against a bound. The fact is the loop's structure, not the
+   binder's name; accumulators and other carries are left to their tags."
+  [form binder init]
+  (cond
+    (contains? '#{dotimes clojure.core/dotimes} (first form)) :long
+    (and (form/loop-head? (first form)) (integer? init))
+    (let [body (nth form 2 nil)
+          test (when (and (seq? body) (contains? '#{if clojure.core/if} (first body)))
+                 (second body))]
+      (when (and (seq? test)
+                 (contains? '#{< <= clojure.core/< clojure.core/<=} (first test))
+                 (= binder (strip-scalar-cast (second test))))
+        :long))
+    :else nil))
+
+(defn binder-scalar-types
+  "Walker-stamped scalar dtypes of every `let`/`loop`/`dotimes` binder in `form`, projected the
+   way `derive-param-types` projects declared params: integral tags keep their width, floating
+   tags take the kernel dtype. Untagged integer-arithmetic locals (which the fixpoint census
+   exempts from tags) are typed from their operands' declared dtypes. A hoisted host scalar that
+   a kernel captures therefore has the same declared dtype on the host and in the kernel ABI; no
+   emitter guesses it from its name."
+  [form kernel-dtype declared]
+  (let [kernel-dtype (dtype/canon (or kernel-dtype :float))
+        found (atom (or declared {}))]
+    (walk/prewalk
+     (fn [x]
+       (when (and (seq? x)
+                  (symbol? (first x))
+                  (or (form/let-head? (first x)) (form/loop-head? (first x))
+                      (contains? '#{dotimes clojure.core/dotimes} (first x)))
+                  (vector? (second x)))
+         (doseq [[binder init] (partition 2 (second x))]
+           (when (symbol? binder)
+             (when-let [inferred (or (some-> (types/sym-type-tag binder) dtype/dtype-for-scalar-tag)
+                                     (counted-loop-index-dtype x binder init)
+                                     (when (integral-expression? init @found) :long))]
+               (swap! found assoc binder
+                      (if (dtype/fp-dtype? inferred) kernel-dtype inferred))))))
+       x)
+     form)
+    (apply dissoc @found (keys (or declared {})))))
 
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
@@ -349,7 +423,12 @@
                :array-types (parallel-program/declared-value-types parallel-program arrays)}
               {:scalar-types (parallel-program/known-value-types parallel-program scalars)
                :array-types (parallel-program/known-value-types parallel-program arrays)})))
-        top-scalar-types (merge (or (:scalar-types program-types) {})
+        top-scalar-types (merge (binder-scalar-types
+                                 source-form dtype
+                                 (merge (or (:scalar-types program-types) {})
+                                        (or (:scalar-types (meta source-form)) {})
+                                        (or (:scalar-types (meta form)) {}) scalar-types))
+                                (or (:scalar-types program-types) {})
                                 (or (:scalar-types (meta source-form)) {})
                                 (or (:scalar-types (meta form)) {}) scalar-types)
         top-array-types (merge (or (:array-types program-types) {})
