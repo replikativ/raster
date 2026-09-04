@@ -19,6 +19,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -101,17 +102,27 @@
    :reads (into [a b] (map :sym) (:operands epilogue))
    :writes [c]})
 
-(defn- artifact
-  [kernel-name source abi arguments launch phase attributes]
-  (kart/make
-   {:kernel-name kernel-name
-    :source source
-    :abi abi
-    :arguments arguments
-    :launch launch
-    :effects {:kind :tensor-contraction-stage}
-    :provenance {:semantic-op :contraction :lowering :gemm-graph :phase phase}
-    :attributes (merge {:strategy phase} attributes)}))
+(defn- emit-scheduled-body-artifact
+  [{:keys [kernel-name source body arguments effects legality numerics phase target-dialect
+           parameter-names provenance attributes]
+    :or {target-dialect :opencl-intel effects {:kind :tensor-contraction-stage}
+         provenance {} attributes {}}}]
+  (let [uses (scheduled-body/derive-uses body arguments)
+        scheduled
+        (scheduled-body/make
+         {:source source
+          :body body
+          :arguments arguments
+          :effects (assoc effects :uses uses)
+          :legality legality
+          :numerics numerics
+          :provenance (merge {:semantic-op :contraction
+                              :lowering :gemm-graph :phase phase}
+                             provenance)
+          :attributes (merge {:strategy phase} attributes)})]
+    (kernel-body-target/emit-artifact
+     (c-emit/c-symbol kernel-name) scheduled target-dialect
+     {:parameter-names parameter-names})))
 
 (defn- scalar-contraction-form
   [variant]
@@ -129,22 +140,26 @@
                                (* (aget A (+ (* l m) i))
                                   (aget B (+ (* j k) l))))))
 
+(defn- portable-scalar-matrix-plan
+  [variant]
+  (let [form (scalar-contraction-form variant)
+        facts (contraction-facts/contraction-facts form :dtype :float)
+        operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
+        planned (contraction-schedule/plan-portable-body
+                 facts operation {}
+                 {:array-types {'A :float 'B :float 'C :float}
+                  :scalar-types {'m :int 'n :int 'k :int}})]
+    (when-not (:ok planned)
+      (throw (ex-info "matrix product did not admit the portable contraction schedule"
+                      {:reason :raster/bug :variant variant :plan planned})))
+    {:operation operation :body (:body planned) :plan planned}))
+
 (defn emit-portable-scalar-matrix-kernel
   "Lower a dynamic f32 NN/NT/TN/TT matrix product through the portable contraction schedule."
   ([kernel-name variant]
    (emit-portable-scalar-matrix-kernel kernel-name variant :opencl-intel))
   ([kernel-name variant target-dialect]
-   (let [form (scalar-contraction-form variant)
-         facts (contraction-facts/contraction-facts form :dtype :float)
-         operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
-         planned (contraction-schedule/plan-portable-body
-                  facts operation {}
-                  {:array-types {'A :float 'B :float 'C :float}
-                   :scalar-types {'m :int 'n :int 'k :int}})
-         _ (when-not (:ok planned)
-             (throw (ex-info "matrix product did not admit the portable contraction schedule"
-                             {:reason :raster/bug :variant variant :plan planned})))
-         kernel-body (:body planned)]
+   (let [kernel-body (:body (portable-scalar-matrix-plan variant))]
      {:source
       (kernel-body-opencl/emit-scalar-kernel
        kernel-name kernel-body
@@ -160,24 +175,18 @@
         {:keys [a-elements b-elements c-elements]} (extents spec)
         prefix (identifier (str id "_scalar"))
         kernel-name (str prefix "_gemm")
-        emitted (emit-portable-scalar-matrix-kernel kernel-name variant)
-        gemm (artifact
-              kernel-name
-              (:source emitted)
-              [(kabi/slot 'A :input :float :c-name "A" :role :operand
-                          :aliasing :no-write-alias)
-               (kabi/slot 'B :input :float :c-name "B" :role :operand
-                          :aliasing :no-write-alias)
-               (kabi/slot 'C :output :float :c-name "C" :role :result)
-               (kabi/slot 'k :scalar :int :c-name "k" :role :extent)
-               (kabi/slot 'm :scalar :int :c-name "m" :role :extent)
-               (kabi/slot 'n :scalar :int :c-name "n" :role :extent)
-               (kabi/slot '_nseg :scalar :int :c-name "_nseg" :role :bound)]
-              [a b c k m n c-elements]
-              (klaunch/spec {:workgroup-size [256]
-                             :group-count [(klaunch/ceil-div c-elements 256)]})
-              :scalar-gemm {:variant variant :kernel-body (:kernel-body emitted)
-                            :semantic-op :contraction})]
+        {:keys [operation body]} (portable-scalar-matrix-plan variant)
+        gemm (emit-scheduled-body-artifact
+              {:kernel-name kernel-name :source operation :body body
+               :arguments [a b c k m n c-elements]
+               :effects {:kind :tensor-contraction-stage}
+               :legality {:kind :portable-contraction :variant variant}
+               :numerics {:mode :reassociated :policy :sequential-segment-fold
+                          :rounding :nearest-even :accumulator-dtype :float}
+               :phase :scalar-gemm
+               :attributes {:variant variant :semantic-op :contraction}
+               :parameter-names {'A "A" 'B "B" 'C "C" 'k "k" 'm "m" 'n "n"
+                                 '_nseg "_nseg"}})]
     (kgraph/make
      {:inputs [(graph-buffer a :float a-elements :input)
                (graph-buffer b :float b-elements :input)]
@@ -192,43 +201,51 @@
 (defn- convert-artifact
   [kernel-name in out elements vector-width phase]
   (let [kernel-name (c-emit/c-symbol kernel-name)
-        {:keys [source kernel-body]}
-        (layout-emitter/emit-cast-kernel
+        kernel-body
+        (layout-emitter/cast-body
          {:kernel-name kernel-name :input in :output out
           :source-dtype :float :destination-dtype :half :vector-width vector-width
           :rounding :nearest-even :overflow :ieee})]
-    (artifact
-     kernel-name source
-     [(kabi/slot in :input :float :c-name "in")
-      (kabi/slot out :output :half :c-name "out")
-      (kabi/slot :layout-elements :scalar :int :c-name "n")]
-     [in out elements]
-     (klaunch/spec
-      {:workgroup-size [256]
-       :group-count [(klaunch/ceil-div
-                      (klaunch/ceil-div (klaunch/runtime-value elements) vector-width)
-                      256)]})
-     phase {:vector-width vector-width :from :float :to :half
-            :rounding :nearest-even :overflow :ieee
-            :kernel-body kernel-body :cacheable-transform? true})))
+    (emit-scheduled-body-artifact
+     {:kernel-name kernel-name
+      :source (layout-stage/make
+               {:id [:gemm phase] :operation :cast :input in :output out
+                :input-shape [elements] :output-shape [elements]
+                :input-dtype :float :output-dtype :half
+                :policy {:rounding :nearest-even :overflow :ieee}})
+      :body kernel-body :arguments [in out elements]
+      :effects {:kind :layout-transform-stage}
+      :legality {:kind :dense-affine-cast :vector-width vector-width}
+      :numerics {:mode :bounded-error :policy :f32-to-f16-storage
+                 :rounding :nearest-even :accumulator-dtype :half
+                 :error-model {:kind :ieee-f16-conversion :overflow :ieee}}
+      :phase phase
+      :attributes {:vector-width vector-width :from :float :to :half
+                   :rounding :nearest-even :overflow :ieee
+                   :cacheable-transform? true}
+      :parameter-names {in "input" out "output" :layout-elements "n"}})))
 
 (defn- transpose-artifact
   [kernel-name in out rows cols phase]
   (let [kernel-name (c-emit/c-symbol kernel-name)
-        {:keys [source kernel-body]}
-        (layout-emitter/emit-transpose-kernel
+        kernel-body
+        (layout-emitter/transpose-body
          {:kernel-name kernel-name :input in :output out :element-dtype :half})]
-    (artifact
-     kernel-name source
-     [(kabi/slot in :input :half :c-name "in")
-      (kabi/slot out :output :half :c-name "out")
-      (kabi/slot :layout-rows :scalar :int :c-name "rows")
-      (kabi/slot :layout-cols :scalar :int :c-name "cols")]
-     [in out rows cols]
-     (klaunch/spec {:workgroup-size [256]
-                    :group-count [(klaunch/ceil-div (klaunch/product rows cols) 256)]})
-     phase {:layout :transpose :dtype :half
-            :kernel-body kernel-body :cacheable-transform? true})))
+    (emit-scheduled-body-artifact
+     {:kernel-name kernel-name
+      :source (layout-stage/make
+               {:id [:gemm phase] :operation :transpose :input in :output out
+                :input-shape [rows cols] :output-shape [cols rows]
+                :input-dtype :half :output-dtype :half
+                :policy {:permutation [1 0]}})
+      :body kernel-body :arguments [in out rows cols]
+      :effects {:kind :layout-transform-stage}
+      :legality {:kind :bijective-affine-permutation :permutation [1 0]}
+      :numerics {:mode :exact :policy :bit-preserving-permutation}
+      :phase phase
+      :attributes {:layout :transpose :dtype :half :cacheable-transform? true}
+      :parameter-names {in "input" out "output"
+                        :layout-rows "rows" :layout-cols "cols"}})))
 
 (defn- scheduled-matrix-body
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
@@ -430,14 +447,11 @@
               :argument-values {:k-chunk kc :splits splits})
        emit-args))))
 
-(defn emit-split-k-combine-kernel
-  "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
-  ([kernel-name] (emit-split-k-combine-kernel kernel-name :opencl-intel))
-  ([kernel-name target-dialect]
-   (let [kernel-name (c-emit/c-symbol kernel-name)
-         form '(raster.par/contract C [[i mn]] [[s splits]]
-                                     (clojure.core/aget
-                                      partials (clojure.core/+ (clojure.core/* s mn) i)))
+(defn- split-k-combine-plan
+  []
+  (let [form '(raster.par/contract C [[i mn]] [[s splits]]
+                                   (clojure.core/aget
+                                    partials (clojure.core/+ (clojure.core/* s mn) i)))
         facts (contraction-facts/contraction-facts form :dtype :float)
         operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
         planned (contraction-schedule/plan-portable-body
@@ -446,10 +460,17 @@
                   :scalar-types {'mn :int 'splits :int}})
         _ (when-not (:ok planned)
             (throw (ex-info "split-K combination did not admit the portable contraction schedule"
-                            {:reason :raster/bug :plan planned})))
-        kernel-body (:body planned)
-        source (kernel-body-opencl/emit-scalar-kernel
-                kernel-name kernel-body
+                            {:reason :raster/bug :plan planned})))]
+    {:operation operation :body (:body planned) :plan planned}))
+
+(defn emit-split-k-combine-kernel
+  "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
+  ([kernel-name] (emit-split-k-combine-kernel kernel-name :opencl-intel))
+  ([kernel-name target-dialect]
+   (let [kernel-name (c-emit/c-symbol kernel-name)
+         kernel-body (:body (split-k-combine-plan))
+         source (kernel-body-opencl/emit-scalar-kernel
+                 kernel-name kernel-body
                 {:target-dialect target-dialect
                  :parameter-names {'partials "partials" 'C "C"
                                    'mn "mn" 'splits "splits" '_nseg "_nseg"}})]
@@ -457,20 +478,18 @@
 
 (defn- combine-artifact
   [kernel-name partials c mn splits]
-  (let [{:keys [kernel-name source kernel-body]} (emit-split-k-combine-kernel kernel-name)]
-    (artifact
-     kernel-name source
-     [(kabi/slot 'partials :input :float :c-name "partials" :role :operand
-                 :aliasing :no-write-alias)
-      (kabi/slot 'C :output :float :c-name "C" :role :result)
-      (kabi/slot 'mn :scalar :int :c-name "mn" :role :extent)
-      (kabi/slot 'splits :scalar :int :c-name "splits" :role :extent)
-      (kabi/slot '_nseg :scalar :int :c-name "_nseg" :role :bound)]
-     [partials c mn splits mn]
-     (klaunch/spec {:workgroup-size [256]
-                    :group-count [(klaunch/ceil-div (klaunch/runtime-value mn) 256)]})
-     :split-k-combine {:accumulator-dtype :float :kernel-body kernel-body
-                       :semantic-op :contraction})))
+  (let [{:keys [operation body]} (split-k-combine-plan)]
+    (emit-scheduled-body-artifact
+     {:kernel-name kernel-name :source operation :body body
+      :arguments [partials c mn splits mn]
+      :effects {:kind :tensor-contraction-stage}
+      :legality {:kind :portable-contraction :purpose :split-k-combine}
+      :numerics {:mode :reassociated :policy :sequential-segment-fold
+                 :rounding :nearest-even :accumulator-dtype :float}
+      :phase :split-k-combine
+      :attributes {:accumulator-dtype :float :semantic-op :contraction}
+      :parameter-names {'partials "partials" 'C "C"
+                        'mn "mn" 'splits "splits" '_nseg "_nseg"}})))
 
 (defn split-factor-strategy
   "Stable strategy identity for one explicit split-K candidate."

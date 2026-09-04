@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
 
@@ -270,6 +271,29 @@
       (is (= expected-node-count (count (:nodes graph))) (name variant))
       (when transpose-phase
         (is (some #{transpose-phase} phases) (name variant))))))
+
+(deftest every-production-gemm-graph-stage-has-one-certified-target-projection
+  (let [scheduled (emitted :tt)
+        graphs (mapv #(dispatch/alternative scheduled %)
+                     [:f32-scalar :xmx-direct :xmx-split-k])]
+    (doseq [graph graphs
+            node (:nodes graph)]
+      (let [artifact (:operation node)
+            refinement (artifact/attribute artifact :scheduled-kernel-body)]
+        (is (scheduled-body/scheduled-kernel-body? refinement)
+            (str (executable/strategy graph) " / " (:id node)))
+        (is (= (:arguments refinement) (:arguments artifact)))
+        (is (= (:effects refinement) (:effects artifact)))
+        (is (= (scheduled-body/realized-launch refinement) (:launch artifact)))))
+    (let [layout-sources
+          (for [graph (rest graphs)
+                node (:nodes graph)
+                :let [source (get-in node [:operation :attributes
+                                           :scheduled-kernel-body :source])]
+                :when (layout-stage/layout-stage? source)]
+            source)]
+      (is (seq layout-sources))
+      (is (every? #(contains? #{:cast :transpose} (:operation %)) layout-sources)))))
 
 (deftest every-layout-schedule-realizes-to-kernel-calls
   (let [runtime-arguments (arguments 13 640 262144)]
