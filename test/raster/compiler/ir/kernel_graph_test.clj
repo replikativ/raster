@@ -97,6 +97,32 @@
     (is (identical? interfaced (graph/validate! interfaced)))
     (is (= :inout (get-in interfaced [:abi 0 :kind])))))
 
+(deftest graph-scalars-are-an-ordered-target-neutral-interface
+  (let [operation (segop/->SegMap
+                   10 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(+ alpha (aget values i)) nil #{'values} #{'out} #{'alpha}
+                   (segop/->KernelGrid 1 32 0) :float 'out nil)
+        scalars [(graph/scalar 'n :long) (graph/scalar 'alpha :float)]
+        scheduled (graph/from-segops
+                   [operation]
+                   {:inputs #{'values} :outputs #{'out} :dtype :float :scalars scalars})]
+    (is (= scalars (:scalars scheduled)))
+    (is (not (graph/dataflow-equivalent?
+              scheduled (assoc scheduled :scalars (vec (reverse scalars))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar identities must be unique"
+                          (graph/validate!
+                           (assoc scheduled :scalars [(graph/scalar 'n :long)
+                                                      (graph/scalar 'n :long)]))))
+    (is (= :kernel-graph-value-identity
+           (try
+             (graph/validate!
+              (assoc scheduled :scalars [(graph/scalar 'values :long)]))
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbol or keyword"
+                          (graph/scalar 42 :int)))))
+
 (deftest ordered-output-vectors-retain-write-access
   (let [operation (segop/->SegFoldMap
                    10 (segop/make-seg-space 'segment 'nsegments)

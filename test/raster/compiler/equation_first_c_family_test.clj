@@ -282,5 +282,6 @@
                         [:equations 0 :operations 0 :graph :nodes 0 :operation :target]
                         :hip-cpp)
         failure (reason-of #(emitted-program/validate! mixed))]
-    (is (= :emitted-parallel-program-target (:reason failure)))
-    (is (= :cuda-c (:expected-target failure)))))
+    (is (= :kernel-graph-executable-targets (:reason failure))
+        "the executable graph rejects a mixed target before its enclosing program must")
+    (is (= #{:cuda-c :hip-cpp} (:targets failure)))))

@@ -76,6 +76,32 @@
        (= (:operands equation) (:inputs (soac/facts algorithm)))
        (= (:results equation) (soac/outputs algorithm))))
 
+(defn- ordered-distinct
+  [values]
+  (reduce (fn [result value]
+            (if (some #(= value %) result) result (conj result value)))
+          [] values))
+
+(defn- public-scalars
+  [scheduled operations]
+  (let [required (reduce set/union #{} (map segop/operation-scalars operations))
+        ordered (ordered-distinct
+                 (concat (filter required (:inputs scheduled))
+                         (sort-by pr-str (remove (set (:inputs scheduled)) required))))
+        values (:values scheduled)]
+    (mapv (fn [id]
+            (let [value (get values id)]
+              (when-not value
+                (fail! :scheduled-equation-scalar-value
+                       "scheduled scalar lacks an AbstractValue"
+                       {:value id}))
+              (when-not (empty? (:shape value))
+                (fail! :scheduled-equation-scalar-shape
+                       "scheduled scalar dependency must have scalar shape"
+                       {:value id :shape (:shape value)}))
+              (graph/scalar id (:dtype value))))
+          ordered)))
+
 (defn make
   "Build a verified graph from `algorithm` and its fully scheduled SegOp ParallelProgram.
 
@@ -115,6 +141,7 @@
                                        operations))
          temporary-ids (set/difference operation-values inputs outputs)
          values (:values scheduled)
+         scalars (public-scalars scheduled operations)
          buffer-specs (into {}
                             (map (fn [id] [id (storage-spec values id)]))
                             (set/union inputs outputs temporary-ids))]
@@ -123,6 +150,7 @@
       {:inputs inputs
        :outputs outputs
        :temporaries (select-keys buffer-specs temporary-ids)
+       :scalars scalars
        :buffer-specs buffer-specs
        :dtype (:dtype (first (vals buffer-specs)))
        :effects (or effects {:semantic (:effects (soac/facts algorithm))})

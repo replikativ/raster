@@ -85,11 +85,13 @@
     (is (= [(:id first-node)] (:dependencies second-node)))
     (is (= '[u-in] (mapv :id (:inputs graph))))
     (is (= '[u-next] (mapv :id (:outputs graph))))
+    (is (= '[iteration n-in alpha-in] (mapv :id (:scalars graph)))
+        "public scalars retain the typed body input order")
     (let [emitted (opencl/generate-kernel-graph
                    graph :scalar-types {'alpha-in :float 'iteration :long})]
       (is (emitted-loop/emitted-loop? (emitted-loop/make scheduled emitted)))
       (is (every? artifact/kernel-artifact? (map :operation (:nodes emitted))))
-      (is (= '[u-in u-next alpha-in iteration n-in] (:arguments emitted)))
+      (is (= '[u-in u-next iteration n-in alpha-in] (:arguments emitted)))
       (is (= :opencl-c (get-in emitted [:provenance :target-dialect])))
       (is (= (mapv :operation (:nodes graph))
              (mapv #(get-in % [:operation :provenance :scheduled-operation])

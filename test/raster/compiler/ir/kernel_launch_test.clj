@@ -43,6 +43,14 @@
                             (launch/realize spec {'groups 1.5}))))))
 
 (deftest symbolic-storage-expressions-use-the-same-checked-evaluator
+  (is (= 17 (launch/resolve-expression {'(extent output) 17} '(extent output)))
+      "stable compound extent identities are resolved as values, never evaluated as source")
+  (is (= [1]
+         (:group-count
+          (launch/realize
+           (launch/spec {:workgroup-size [32]
+                         :group-count [(launch/ceil-div '(extent output) 32)]})
+           {'(extent output) 17}))))
   (is (= 5 (launch/resolve-expression {'n 1025} (launch/ceil-div 'n 256))))
   (is (= 768
          (launch/resolve-expression
@@ -70,7 +78,12 @@
                                        (launch/ceil-div 'm 128)]})
            {'m 129 'n 257}))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be an integer"
-                        (launch/resolve-expression {} (launch/ceil-div 'n 256)))))
+                        (launch/resolve-expression {} (launch/ceil-div 'n 256))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be non-negative"
+                        (launch/resolve-expression {} (launch/ceil-div -1 256))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be non-negative"
+                        (launch/resolve-expression
+                         {} (body/expression :mod -1 4)))))
 
 (deftest launch-specialization-rebinds-explicit-expression-leaves
   (let [original (launch/spec
@@ -106,3 +119,21 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (launch/resolve-expression (constantly 0)
                                             (body/expression :ceil-div 'n 'zero))))))
+
+(deftest malformed-kernel-body-index-algebra-is-not-a-launch-expression
+  (is (false? (launch/expression? (launch/->CeilDiv 'n 0))))
+  (is (false? (launch/expression? (launch/->FloorDiv 'n -1))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"divisor must be positive"
+                        (launch/resolve-expression {'n 4} (launch/->CeilDiv 'n 0))))
+  (is (false? (launch/expression? (body/->IndexExpr :unknown ['n]))))
+  (is (false? (launch/expression? (body/->IndexExpr :ceil-div ['n]))))
+  (is (false? (launch/expression? (body/->IndexCast 'n :float :exact))))
+  (is (false? (launch/expression? (body/->IndexCast 'n :long :wrap))))
+  (is (launch/expression? (body/index-cast 'n :int64 :exact)))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"not an exact widening"
+       (launch/validate-typed-expression!
+        (body/index-cast 'n :int :exact) (constantly :long))))
+  (let [expression (body/index-cast 'n :int64 :exact)]
+    (is (= expression
+           (launch/validate-typed-expression! expression (constantly :int))))))

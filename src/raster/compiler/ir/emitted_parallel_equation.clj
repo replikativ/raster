@@ -1,13 +1,15 @@
 (ns raster.compiler.ir.emitted-parallel-equation
   "Checked target emission of one scheduled TypedSOAC equation."
   (:require [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
-(defrecord EmittedParallelEquation [algorithm body graph provenance attributes])
+(defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
 
 (defn emitted-equation?
   [value]
@@ -31,25 +33,27 @@
     (fail! :emitted-parallel-equation-type
            "expected an EmittedParallelEquation"
            {:actual (type emitted-equation)}))
-  (let [{:keys [algorithm body graph provenance attributes]} emitted-equation
+  (let [{:keys [algorithm body refinement graph provenance attributes]} emitted-equation
         algorithm (soac/validate! algorithm)
         body (program/validate! body segop/segop-node? algorithm-boundary?)
         expected (equation-graph/make algorithm body)
-        emitted (graph/validate! graph)]
+        refinement (when refinement (refinement/validate-against! refinement expected))
+        scheduled (if refinement (refinement/scheduled-graph refinement) expected)
+        emitted (-> graph graph/validate! executable/validate!)]
     (when-not (every? (comp artifact/kernel-artifact? :operation) (:nodes emitted))
       (fail! :emitted-parallel-equation-artifact
              "emitted equation graph requires only KernelArtifact nodes" {}))
-    (when-not (graph/dataflow-equivalent? expected emitted)
+    (when-not (graph/dataflow-equivalent? scheduled emitted)
       (fail! :emitted-parallel-equation-dataflow
              "target emission changed scheduled equation dataflow"
-             {:scheduled (graph/dataflow-contract expected)
+             {:scheduled (graph/dataflow-contract scheduled)
               :emitted (graph/dataflow-contract emitted)}))
     (when-not (every? true?
                       (map (fn [scheduled-node emitted-node]
                              (= (:operation scheduled-node)
                                 (get-in emitted-node
                                         [:operation :provenance :scheduled-operation])))
-                           (:nodes expected) (:nodes emitted)))
+                           (:nodes scheduled) (:nodes emitted)))
       (fail! :emitted-parallel-equation-operation
              "target emission changed a scheduled equation operation certificate" {}))
     (doseq [[field value] [[:provenance provenance] [:attributes attributes]]]
@@ -62,7 +66,7 @@
 (defn make
   ([algorithm body emitted]
    (make algorithm body emitted {}))
-  ([algorithm body emitted {:keys [provenance attributes]
+  ([algorithm body emitted {:keys [refinement provenance attributes]
                             :or {provenance {} attributes {}}}]
    (validate!
-    (->EmittedParallelEquation algorithm body emitted provenance attributes))))
+    (->EmittedParallelEquation algorithm body refinement emitted provenance attributes))))

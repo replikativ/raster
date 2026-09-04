@@ -8,7 +8,8 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
-            [raster.compiler.ir.kernel-graph :as kgraph]))
+            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 (defn kernel-executable?
   [value]
@@ -31,6 +32,86 @@
     (throw (ex-info "kernel executable must be an artifact or graph"
                     {:executable executable :actual (type executable)}))))
 
+(defn- access-flags
+  [access]
+  (case access
+    :read #{:read}
+    :write #{:write}
+    :read-write #{:read :write}))
+
+(defn- flags-access
+  [flags]
+  (case flags
+    #{:read} :read
+    #{:write} :write
+    #{:read :write} :read-write))
+
+(defn- validate-node-artifact-bindings!
+  "Bind every emitted pointer slot back to the exact scheduled ValueUse it implements."
+  [graph]
+  (let [buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        public-scalars
+        (into {}
+              (keep (fn [[slot argument]]
+                      (when (= :scalar (:kind slot)) [argument slot])))
+              (map vector (:abi graph) (:arguments graph)))]
+    (doseq [{:keys [id operation uses]} (:nodes graph)]
+      (let [artifact (kart/validate! operation)
+            pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot)))
+                                   (mapv vector (:abi artifact) (:arguments artifact)))
+            undeclared (filterv (fn [[_ argument]] (not (contains? buffers argument)))
+                                pointer-pairs)]
+        (when (seq undeclared)
+          (throw (ex-info "kernel artifact pointer argument is not a declared graph buffer"
+                          {:reason :kernel-graph-artifact-buffer
+                           :node id :arguments (mapv second undeclared)
+                           :declared (set (keys buffers))})))
+        (doseq [[slot argument] pointer-pairs
+                :let [buffer (get buffers argument)]]
+          (when-not (= (:dtype slot) (:dtype buffer))
+            (throw (ex-info "kernel artifact pointer dtype differs from its graph buffer"
+                            {:reason :kernel-graph-artifact-buffer-dtype
+                             :node id :argument argument :slot slot :buffer buffer}))))
+        (let [actual
+              (into {}
+                    (map (fn [[argument pairs]]
+                           [argument
+                            (flags-access
+                             (reduce into #{}
+                                     (map (comp access-flags kabi/slot-access first) pairs)))]))
+                    (group-by second pointer-pairs))
+              expected (into {} (map (juxt :buffer :access)) uses)]
+          (when-not (= expected actual)
+            (throw (ex-info "kernel artifact pointer ABI differs from scheduled graph uses"
+                            {:reason :kernel-graph-artifact-uses
+                             :node id :expected expected :actual actual}))))
+        (doseq [[slot argument] (filterv (fn [[slot _]] (= :scalar (:kind slot)))
+                                         (mapv vector (:abi artifact) (:arguments artifact)))]
+          (if-let [public-slot (get public-scalars argument)]
+            (when-not (= (select-keys slot [:dtype :kernel-dtype])
+                         (select-keys public-slot [:dtype :kernel-dtype]))
+              (throw (ex-info "kernel artifact scalar dtype differs from its graph interface"
+                              {:reason :kernel-graph-artifact-scalar-dtype
+                               :node id :argument argument
+                               :artifact-slot slot :graph-slot public-slot})))
+            (let [references (klaunch/expression-references argument)]
+              (try
+                (when-not (contains? #{:int :long} (:kernel-dtype slot))
+                  (throw (ex-info "target-private scalar representation must be integral"
+                                  {:kernel-dtype (:kernel-dtype slot)})))
+                (klaunch/validate-typed-expression!
+                 argument #(some-> (get public-scalars %) :dtype))
+                (catch clojure.lang.ExceptionInfo exception
+                  (throw (ex-info "kernel artifact scalar is not closed over checked graph scalars"
+                                  {:reason :kernel-graph-artifact-scalar
+                                   :node id :argument argument :slot slot
+                                   :references references
+                                   :public-scalars (set (keys public-scalars))
+                                   :expression-error (ex-data exception)}
+                                  exception)))))))))
+    graph))
+
 (defn validate!
   "Validate an emitted executable and return it unchanged."
   [executable]
@@ -40,13 +121,15 @@
     (let [graph (kgraph/validate! executable)]
       (when-not (kgraph/has-interface? graph)
         (throw (ex-info "emitted kernel graph requires an ordered external ABI"
-                        {:graph graph})))
+                        {:reason :kernel-graph-executable-interface :graph graph})))
       (when-not (seq (:nodes graph))
-        (throw (ex-info "emitted kernel graph requires at least one kernel node" {:graph graph})))
+        (throw (ex-info "emitted kernel graph requires at least one kernel node"
+                        {:reason :kernel-graph-executable-empty :graph graph})))
+      (validate-node-artifact-bindings! graph)
       (let [targets (set (map :target (artifacts graph)))]
         (when-not (= 1 (count targets))
           (throw (ex-info "kernel graph nodes must share one target dialect"
-                          {:targets targets}))))
+                          {:reason :kernel-graph-executable-targets :targets targets}))))
       graph)
     (throw (ex-info "kernel executable must be an artifact or graph"
                     {:executable executable :actual (type executable)}))))

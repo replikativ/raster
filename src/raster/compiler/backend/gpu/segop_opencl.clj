@@ -824,18 +824,62 @@
   "Give an artifact-valued graph its one ordered external ABI.
 
    Node artifacts remain free to order their own physical parameters. The graph boundary groups
-   equal symbolic scalars, proves their emitted dtypes agree, and exposes every external buffer
-   exactly once."
+   equal scalar uses, proves their emitted dtypes agree, and exposes every external buffer exactly
+   once. An explicit target-neutral GraphScalar interface is authoritative: target artifacts may
+   choose a physical kernel dtype, but cannot invent, omit, reorder, or retype public scalars."
   [emitted target-dialect scalar-types]
   (let [external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
+        declared-scalars (:scalars emitted)
+        declared-scalar-ids (set (map :id declared-scalars))
+        ;; Artifacts own physical parameter order and kernel representation; the scheduled graph
+        ;; owns the logical scalar dtype. Project that logical fact into every direct use before
+        ;; KernelExecutable checks node-to-boundary agreement. Derived expressions remain private
+        ;; and are checked for closure below.
+        declared-by-id (into {} (map (juxt :id identity)) declared-scalars)
+        ;; Typed scheduled graphs carry GraphScalar declarations. Compatibility graphs that have
+        ;; not migrated yet still receive compiler-owned scalar facts from the enclosing program.
+        ;; In both cases project only direct public arguments; target-private expressions retain
+        ;; their independently checked representation.
+        logical-dtype-by-id (merge (into {} (map (fn [[id scalar-dtype]]
+                                                   [id (dt/canon scalar-dtype)]))
+                                          scalar-types)
+                                   (into {} (map (fn [[id scalar]] [id (:dtype scalar)]))
+                                         declared-by-id))
+        emitted (if (seq logical-dtype-by-id)
+                  (kgraph/map-operations
+                   emitted
+                   (fn [node]
+                     (kart/validate!
+                      (update (:operation node) :abi
+                              (fn [slots]
+                                (mapv (fn [slot argument]
+                                        (if-let [logical-dtype
+                                                 (and (= :scalar (:kind slot))
+                                                      (get logical-dtype-by-id argument))]
+                                          (assoc slot :dtype logical-dtype)
+                                          slot))
+                                      slots (get-in node [:operation :arguments])))))))
+                  emitted)
         scalar-pairs (->> (:nodes emitted)
                           (mapcat (fn [node]
                                     (map vector (get-in node [:operation :abi])
                                          (get-in node [:operation :arguments]))))
                           (filter (fn [[slot argument]]
-                                    (and (= :scalar (:kind slot)) (symbol? argument))))
+                                    (and (= :scalar (:kind slot))
+                                         (or (symbol? argument)
+                                             (contains? declared-scalar-ids argument)))))
                           vec)
         scalar-groups (group-by second scalar-pairs)
+        scalar-arguments (if (some? declared-scalars)
+                           (mapv :id declared-scalars)
+                           (vec (sort-by name (keys scalar-groups))))
+        _ (when (and (some? declared-scalars)
+                     (not (clojure.set/subset? (set (keys scalar-groups))
+                                               declared-scalar-ids)))
+            (throw (ex-info "emitted kernel graph invented a public scalar argument"
+                            {:reason :kernel-graph-scalar-interface
+                             :expected scalar-arguments
+                             :actual (vec (sort-by pr-str (keys scalar-groups)))})))
         _ (doseq [[argument pairs] scalar-groups]
             (when-not (apply = (map (comp :kernel-dtype first) pairs))
               (throw (ex-info "kernel graph scalar has inconsistent emitted ABI dtypes"
@@ -852,13 +896,23 @@
                                                :output :result
                                                :inout :inout)))
                           external-buffers)
-        scalar-arguments (vec (sort-by name (keys scalar-groups)))
         scalar-abi (mapv (fn [argument]
                            (let [slots (mapv first (get scalar-groups argument))
-                                 kernel-dtype (:kernel-dtype (first slots))
-                                 logical-dtype (or (get scalar-types argument) kernel-dtype)
+                                 declared (some #(when (= argument (:id %)) %) declared-scalars)
+                                 kernel-dtype (or (:kernel-dtype (first slots)) (:dtype declared))
+                                 logical-dtype (or (:dtype declared)
+                                                   (get scalar-types argument)
+                                                   kernel-dtype)
+                                 supplied-dtype (get scalar-types argument)
                                  role (if (some #(= :bound (:role %)) slots)
                                         :bound :parameter)]
+                             (when (and declared supplied-dtype
+                                        (not= (:dtype declared) (dt/canon supplied-dtype)))
+                               (throw (ex-info
+                                       "target scalar facts differ from the scheduled interface"
+                                       {:reason :kernel-graph-scalar-logical-dtype
+                                        :argument argument :scheduled (:dtype declared)
+                                        :target supplied-dtype})))
                              (kabi/slot argument :scalar logical-dtype
                                         :kernel-dtype kernel-dtype :role role)))
                          scalar-arguments)]

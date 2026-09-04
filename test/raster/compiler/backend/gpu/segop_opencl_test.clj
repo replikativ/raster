@@ -54,6 +54,20 @@
         partials (first (:inputs (second (mapv :operation (:nodes graph)))))
         temporary-specs (graph-call/temporary-specs
                          emitted {'n {:type :long :value 1025}})]
+    (is (= [(kgraph/scalar 'n :long)] (:scalars graph)))
+    (is (= (:scalars graph) (:scalars emitted)))
+    (let [slot (->> (map vector (:abi emitted) (:arguments emitted))
+                    (some (fn [[slot argument]] (when (= 'n argument) slot))))]
+      (is (= :long (:dtype slot))
+          "the scheduled graph supplies the public logical dtype")
+      (is (= :int (:kernel-dtype slot))
+          "the target graph retains the physical scalar representation used by its nodes"))
+    (doseq [artifact [phase-one phase-two]
+            :let [[slot argument] (last (map vector (:abi artifact) (:arguments artifact)))]]
+      (is (= :int (:kernel-dtype slot))
+          "the target-private bound retains its physical scalar representation")
+      (is (= #{'n} (klaunch/expression-references argument))
+          "a target-private derived bound closes over the public logical scalar"))
     (is (= 2 (count (:nodes emitted))))
     (is (every? kart/kernel-artifact? [phase-one phase-two]))
     (is (str/includes? (:source phase-two) (str (name partials) "[")))

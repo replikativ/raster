@@ -677,6 +677,13 @@
                    elements arrays))
         stable (set (get-in attributes [:attributes :stable-array-captures]))
         scalar-captures (set (remove stable captures))
+        public-scalar-ids (cond-> scalar-captures
+                            (or (symbol? (:extent attributes))
+                                (keyword? (:extent attributes)))
+                            (conj (:extent attributes)))
+        ordered-public-scalars
+        (vec (concat (filter public-scalar-ids (:inputs facts))
+                     (sort-by pr-str (remove (set (:inputs facts)) public-scalar-ids))))
         scan-dtype (or (first (:dtypes attributes)) dtype :double)
         substitutions (assoc substitutions index index)
         algebra (update (first (:algebra attributes)) :element
@@ -694,6 +701,15 @@
      :inputs (into (set arrays) (disj stable destination))
      :outputs #{destination}
      :scalars scalar-captures
+     :public-scalars
+     (mapv (fn [id]
+             (let [value (get (:values facts) id)]
+               (when-not (and value (empty? (:shape value)))
+                 (throw (ex-info "typed scan public scalar lacks a scalar AbstractValue"
+                                 {:reason :typed-soac-scan-scalar :value id
+                                  :abstract-value value})))
+               (kernel-graph/scalar id (:dtype value))))
+           ordered-public-scalars)
      :elem-type scan-dtype}))
 
 (defn lower-typed-scan
@@ -1117,6 +1133,7 @@
      {:inputs (or (:inputs description) #{})
       :outputs (or (:outputs description) #{})
       :temporaries temporaries
+      :scalars (:public-scalars description)
       :buffer-specs buffer-specs
       :dtype dtype
       :effects {:memory-order :dependency-ordered}
