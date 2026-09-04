@@ -298,7 +298,7 @@
 
 ;; ═════════════════════════════════════════════════════════════════════════════════
 ;; MIXED-PRECISION BACKWARD (S2a): the SAME resident train step (value+grad + SGD) under
-;; :gemm-precision :f16-xmx — f16 GEMM inputs, f32 accumulate/output — must train the
+;; :gemm-precision :mixed-f16-f32 — f16 GEMM inputs, f32 accumulate/output — must train the
 ;; adapters along the SAME loss trajectory as the exact :f32-scalar policy.
 ;;
 ;; This is the gate for running the VJP/backward program in mixed precision (the forward
@@ -372,11 +372,11 @@
           ;; through [:schedule :precision] (NOT the deprecated top-level :gemm-precision, which the
           ;; schedule now shadows — assoc'ing it would be a silent no-op and both trajectories would
           ;; run f32).
-          p16 (assoc-in p32 [:schedule :precision] :f16-xmx)]
+          p16 (assoc-in p32 [:schedule :precision] :mixed-f16-f32)]
       (is (some? p32) "train-step must extract fully resident")
       (when p32
         (let [dims (gemm-dims p32 args)]
-          (testing "every backward GEMM clears the XMX pitch gate (so :f16-xmx really fires)"
+          (testing "every backward GEMM clears the XMX pitch gate (so mixed precision really fires)"
             (println "  [mixed-precision bwd]" (count dims) "gemm steps, variants:"
                      (frequencies (map :variant dims)))
             (is (every? (fn [{:keys [n k]}] (and (>= n 8) (>= k 8))) dims)
@@ -387,13 +387,13 @@
             (println "  [mixed-precision bwd] f32-scalar loss:"
                      (mapv #(format "%.6f" %) (take 3 l32)) "…"
                      (mapv #(format "%.6f" %) (take-last 2 l32)))
-            (println "  [mixed-precision bwd] f16-xmx    loss:"
+            (println "  [mixed-precision bwd] mixed-f16-f32 loss:"
                      (mapv #(format "%.6f" %) (take 3 l16)) "…"
                      (mapv #(format "%.6f" %) (take-last 2 l16)))
-            (testing "the f16-xmx backward still trains (loss decreases on-device)"
+            (testing "the mixed-f16-f32 backward still trains (loss decreases on-device)"
               (is (< (peek l16) (* 0.7 (first l16)))
                   (str "final " (peek l16) " vs initial " (first l16))))
-            (testing "the f16-xmx trajectory tracks the exact f32 trajectory step for step"
+            (testing "the mixed-f16-f32 trajectory tracks the exact f32 trajectory step for step"
               ;; f16 GEMM inputs perturb each gradient by ~1e-3 relative; over 25 SGD steps
               ;; that stays a ~1e-3-level trajectory divergence (it does NOT compound into a
               ;; different optimization path at this lr).

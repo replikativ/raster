@@ -50,8 +50,8 @@
       (is (= (sched/resolve derived {:gemm-precision :f32-scalar})
              (sched/resolve derived {:precision :f32-scalar}))
           "sugar and explicit override produce byte-identical schedules"))
-    (testing "the default policy is f16-xmx (training AMP)"
-      (is (= :f16-xmx (:precision derived))))
+    (testing "the default policy is target-neutral mixed f16/f32"
+      (is (= :mixed-f16-f32 (:precision derived))))
     (testing "dynamic segmented reductions default to runtime shape selection"
       (is (= {:strategy :auto :score-reuse-subgroup-multiple 16
               :measured-selectors {}}
@@ -71,13 +71,13 @@
 ;; ════════════════════════════════════════════════════════════════════════════════
 
 (deftest t2-feasibility-gate
-  (testing "the DEFAULT f16-xmx GEMM (stage :none) is feasible at grf128 — 256 ≤ 256"
+  (testing "the default mixed-f16-f32 GEMM (stage :none) is feasible at grf128 — 256 ≤ 256"
     (is (true? (sched/feasible? (sched/derive-default nil arc-desc) arc-desc))))
   (testing "f32-scalar (quarter-file accumulator) is comfortably feasible"
     (is (true? (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)
                                                {:precision :f32-scalar})
                                 arc-desc))))
-  (testing "register double-buffering BOTH operands on f16-xmx at grf128 is REJECTED before emit"
+  (testing "register double-buffering both operands under mixed-f16-f32 is rejected before emit"
     (let [infeasible (sched/resolve (sched/derive-default nil arc-desc)
                                     {:stage {:space :register :copies {:a 2 :b 2}}})
           ex (try (sched/feasible? infeasible arc-desc) nil
@@ -93,7 +93,7 @@
   (testing "grf256 DOUBLES the budget and GENUINELY unblocks register staging (acc is fixed, not budget-coupled)"
     ;; the accumulator is a fixed 256 B/lane tile property; grf256 lifts the budget to 512, so
     ;; register double-buffering both operands (256 acc + 256 staged = 512) now FITS — the knob is
-    ;; not pointless (the earlier budget-coupled model made grf256 useless for f16-xmx).
+    ;; not pointless (the earlier budget-coupled model made grf256 useless for mixed f16/f32).
     (let [g128 (sched/resolve (sched/derive-default nil arc-desc)
                               {:stage {:space :register :copies {:a 2 :b 2}}})
           g256 (sched/resolve (sched/derive-default nil arc-desc)
@@ -184,7 +184,7 @@
   (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
                           (sched/resolve (sched/derive-default nil arc-desc)
-                                         {:gemm-precision :f16-xmx :precision :f32-scalar})))))
+                                         {:gemm-precision :mixed-f16-f32 :precision :f32-scalar})))))
 
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; T3 — derive-default: no dead knobs on by default (no device)
@@ -192,8 +192,8 @@
 
 (deftest t3-derived-default
   (let [d (sched/derive-default nil arc-desc)]
-    (testing "precision default is f16-xmx"
-      (is (= :f16-xmx (:precision d))))
+    (testing "precision default is mixed-f16-f32"
+      (is (= :mixed-f16-f32 (:precision d))))
     (testing "the dead inner-loop knobs are OFF by default"
       (is (= :grf128 (get-in d [:grf :mode])))
       (is (= :none (get-in d [:stage :space]))))

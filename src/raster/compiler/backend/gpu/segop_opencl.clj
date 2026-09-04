@@ -841,7 +841,11 @@
                               {:reason :kernel-graph-scalar-dtype
                                :argument argument :slots (mapv first pairs)}))))
         pointer-abi (mapv (fn [{:keys [id dtype role]}]
-                            (kabi/slot id (if (= :input role) :input :output) dtype
+                            (kabi/slot id (case role
+                                            :input :input
+                                            :output :output
+                                            :inout :inout)
+                                       dtype
                                        :role (case role
                                                :input :operand
                                                :output :result

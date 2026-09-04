@@ -29,7 +29,7 @@
 (def ^:private default-precision
   "The one POLICY axis. Training default: mixed-precision f16 GEMM inputs, f32 accumulate —
    the measured-robust 2.33× backward speedup at grads cosine 1.000."
-  :f16-xmx)
+  :mixed-f16-f32)
 
 (defn- machine-params
   "The cost/legality numbers the schedule carries in :meta for inspection + the gate."
@@ -43,7 +43,8 @@
    descriptor values. PR-1 wires the precision axis; :grf/:stage are the dead-knob homes,
    default OFF (:grf128 / :stage :none) so the emitter never sees a dead default on.
 
-   opts: {:precision :f16-xmx|:f32-scalar}  — policy override of the training default."
+   opts: {:precision :mixed-f16-f32|:f32-scalar} — numerical policy override. Matrix-instruction
+   families such as XMX, MMA and MFMA are target schedules, not precision names."
   ([desc] (derive-default nil desc {}))
   ([steps desc] (derive-default steps desc {}))
   ([steps desc {:keys [precision]}]
@@ -89,7 +90,7 @@
     (some? b) b
     :else a))
 
-(def ^:private valid-precisions #{:f16-xmx :f32-scalar})
+(def ^:private valid-precisions #{:mixed-f16-f32 :f32-scalar})
 (def ^:private valid-stage-spaces #{:none :slm :l3 :register})
 (def ^:private valid-grf-modes #{:grf128 :grf256})
 (def ^:private valid-segmented-reduction-strategies
@@ -158,12 +159,12 @@
 
 (defn- acc-bytes-per-lane
   "Accumulator footprint per lane by precision. Prefers the ACTUAL emitted :tile (T2/T3 —
-   tile-acc-bytes-per-lane); falls back to the Arc-default constant when no tile is pinned. f16-xmx
+   tile-acc-bytes-per-lane); falls back to the Arc-default constant when no tile is pinned. Mixed
    uses the full XMX accumulator tile; :f32-scalar a quarter of it (no wide MMA accumulator)."
   [schedule]
   (let [full (or (tile-acc-bytes-per-lane schedule) xmx-f16-acc-bytes-per-lane)]
     (case (:precision schedule)
-      :f16-xmx    full
+      :mixed-f16-f32 full
       :f32-scalar (quot full 4)
       full)))
 
@@ -185,13 +186,13 @@
    Requires `acc + register-staged ≤ GRF-budget` per lane. Fail-loud (raster-native); a
    `minimize()` fallback is deferred until an autotuner generates candidates.
 
-   Anchors (grf128, 256 B/lane): the default f16-xmx GEMM with :stage :none is 256 ≤ 256 → OK;
+   Anchors (grf128, 256 B/lane): the default mixed-f16-f32 GEMM with :stage :none is 256 ≤ 256 → OK;
    register double-buffering both operands is 256 + 4×64 = 512 > 256 → REJECTED at compile time
    (precisely the measurement-time spill, turned into a loud rejection)."
   [schedule desc]
   ;; validate the resolved schedule BEFORE pricing it — an unmodeled precision / stage-space / grf
   ;; mode (e.g. a :bf16 typo, or `:regsiter`) must FAIL LOUD here, not slip past into a silent XMX
-  ;; bind (the #{:f16-xmx :f32-scalar} kwarg check upstream only sees the sugar, not a :schedule).
+  ;; bind (the #{:mixed-f16-f32 :f32-scalar} kwarg check upstream only sees the sugar, not a :schedule).
   (let [prec  (:precision schedule)
         space (get-in schedule [:stage :space] :none)
         grf   (get-in schedule [:grf :mode] :grf128)

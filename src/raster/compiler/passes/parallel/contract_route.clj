@@ -519,11 +519,11 @@
   "Restrict candidate families to the compile's precision policy.
 
    `:f32-scalar` promises exact f32 arithmetic, so the `:matrix` family (f16 XMX / int8
-   instruction inputs) is excluded; the default `:f16-xmx` policy admits every family. An
+   instruction inputs) is excluded; the default `:mixed-f16-f32` policy admits every family. An
    unknown policy or a policy that leaves no family is a loud error, never a silent default."
   [families precision dtype operation-id]
   (case precision
-    (nil :f16-xmx) families
+    (nil :mixed-f16-f32) families
     ;; The matrix family covers f16 XMX products and exact int8 dp4a products; only the
     ;; floating-point contractions lose exactness there, so integer contractions keep it.
     :f32-scalar (let [kept (if (dtype/fp-dtype? (dtype/canon dtype))
@@ -935,13 +935,14 @@
                 (update :source str/replace old-name new-name))))))
 
 (defn- typed-contraction-tuning-contract
-  [schedule dispatch-id abi]
+  [schedule dispatch-id abi precision]
   (let [interface (mapv #(select-keys % [:kind :dtype :kernel-dtype :role
                                          :aliasing :alignment])
                         abi)]
     {:schedule-path [:typed-contraction :measured-selectors]
      :schedule-key dispatch-id
-     :numerical-mode {:reduction (:numerical-mode schedule)
+     :numerical-mode {:precision (or precision :mixed-f16-f32)
+                      :reduction (:numerical-mode schedule)
                       :interface interface}
      :layout {:external-interface interface}}))
 
@@ -952,11 +953,12 @@
    remain graph-private checked expressions over those scalars. Matrix, register-tiled and portable
    kernels can therefore compete without baking a runtime shape or exposing schedule temporaries."
   [program operation & options]
-  (let [operation-id (:id operation)
+  (let [options (apply hash-map options)
+        operation-id (:id operation)
         schedule (reduction/validate-schedule! (:schedule operation))
         {:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
-               program operation options)
+               program operation (mapcat identity options))
         {:keys [abi arguments public-scalars]}
         (common-logical-interface candidates operation operation-id)
         candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
@@ -976,7 +978,8 @@
                    :candidate-schedules
                    (into {} (map (juxt :strategy :candidate-schedule)) candidates)
                    :declines (:declines routed)
-                   :tuning (typed-contraction-tuning-contract schedule dispatch-id abi)
+                   :tuning (typed-contraction-tuning-contract schedule dispatch-id abi
+                                                               (:precision options))
                    :selection :analytic-fixed}})))
 
 (def ^:private decline-reasons
