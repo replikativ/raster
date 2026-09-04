@@ -9,7 +9,18 @@
 
 (def modes #{:exact :reassociated :bounded-error})
 (def rounding-policies
-  #{:nearest-even :toward-zero :up :down :implementation-defined})
+  #{:nearest-even :toward-zero :up :down :exact :implementation-defined})
+
+(def cast-overflow-policies
+  #{:wrap :saturate :trap :exact :ieee})
+
+(defn rounding-policy?
+  [value]
+  (contains? rounding-policies value))
+
+(defn cast-overflow-policy?
+  [value]
+  (contains? cast-overflow-policies value))
 
 (defn- canonical-dtype?
   [value]
@@ -30,6 +41,14 @@
          (seq components)
          (every? accumulator-component? components)
          (= (count components) (count (set (map :value components)))))))
+
+(defn- result-transform?
+  [transform]
+  (and (map? transform)
+       (= :typed-scalar-region (:kind transform))
+       (= :same-typed-ssa-evaluation-order (:policy transform))
+       (canonical-dtype? (:input-dtype transform))
+       (canonical-dtype? (:result-dtype transform))))
 
 (defn validate!
   "Validate and return a numerical contract.
@@ -61,4 +80,8 @@
                       (keyword? (get-in contract [:error-model :kind])))
          (fail! "bounded-error numerical contract requires rounding, accumulator dtype, and an error model"
                 {:value contract})))
+     (when (and (contains? contract :result-transform)
+                (not (result-transform? (:result-transform contract))))
+       (fail! "numerical result transform requires a checked typed scalar-region policy"
+              {:value (:result-transform contract)}))
      contract)))

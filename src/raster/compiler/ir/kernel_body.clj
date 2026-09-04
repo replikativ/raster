@@ -10,7 +10,8 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]))
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
@@ -75,8 +76,6 @@
 (def ^:private cache-policies #{:default :cached :streaming})
 (def ^:private internal-types #{:predicate})
 (def ^:private special-scalar-ops #{:cast :select :isnan})
-(def ^:private cast-rounding-policies #{:toward-zero :nearest-even :up :down :exact})
-(def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact :ieee})
 (def ^:private arithmetic-overflow-policies #{:wrap :trap :no-overflow})
 (def ^:private collective-kinds #{:reduce :broadcast})
 (def ^:private workgroup-memory-spaces #{:workgroup})
@@ -222,7 +221,7 @@
     (or (integer? value) (value-id? value)) true
     (record-kind? "raster.compiler.ir.kernel_body.IndexCast" value)
     (and (contains? #{:int :long} (dtype/canon (:dtype value)))
-         (contains? cast-overflow-policies (:overflow value))
+         (numerics/cast-overflow-policy? (:overflow value))
          (expression? (:argument value)))
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (and (contains? index-ops (:op value))
@@ -1058,8 +1057,8 @@
         (when-not (= #{:rounding :overflow} (set (keys options)))
           (throw (ex-info "scalar cast must state exactly its rounding and overflow policies"
                           {:reason :kernel-body-cast-policy :options options})))
-        (when-not (and (contains? cast-rounding-policies (:rounding options))
-                       (contains? cast-overflow-policies (:overflow options)))
+        (when-not (and (numerics/rounding-policy? (:rounding options))
+                       (numerics/cast-overflow-policy? (:overflow options)))
           (throw (ex-info "scalar cast has an unsupported numerical policy"
                           {:reason :kernel-body-cast-policy :options options})))
         (when (or (= :predicate result-type) (= :predicate (:type (first infos))))
@@ -1180,7 +1179,7 @@
         (throw (ex-info "index conversion target must be integral"
                         {:reason :kernel-body-index-cast-dtype
                          :expression expression :target target})))
-      (when-not (contains? cast-overflow-policies (:overflow expression))
+      (when-not (numerics/cast-overflow-policy? (:overflow expression))
         (throw (ex-info "index conversion requires an explicit overflow policy"
                         {:reason :kernel-body-index-cast-overflow
                          :expression expression :overflow (:overflow expression)})))
