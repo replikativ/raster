@@ -51,8 +51,12 @@
      (println "  [SKIP] No Level Zero GPU")))
 
 ;; Helper: generate kernel and extract source
-(defn- map-kernel-src [form]
-  (:source (first (:kernels (opencl-pass/opencl-pass form :min-elements 0)))))
+(defn- map-kernel-src
+  "Emit one map kernel from a bare par form. An isolated emitter test has no deftm to declare
+   its captured scalars, so it states their dtypes explicitly; the emitters refuse to guess."
+  [form & {:keys [scalar-types]}]
+  (:source (first (:kernels (opencl-pass/opencl-pass form :min-elements 0
+                                                     :scalar-types scalar-types)))))
 
 (defn- map-void-kernel-src [form]
   (:source (par-opencl/generate-par-map-void-kernel form)))
@@ -207,7 +211,8 @@
     (let [src (map-kernel-src
                '(raster.par/map! out i n double
                                  (clojure.core/+ (clojure.core/* a (aget x i))
-                                                 (clojure.core/* b (Math/pow (aget x i) beta)))))]
+                                                 (clojure.core/* b (Math/pow (aget x i) beta))))
+               :scalar-types '{a :double b :double beta :double})]
       (is (str/includes? src "pow("))
       (is (str/includes? src "x["))
       (is (str/includes? src "out_["))))
