@@ -376,7 +376,7 @@
           W0 (fa (* width width) 12)
           W1 (fa (* width width) 13)
           prog (pl/compile-gpu-program #'nn/linear-nb :ze:0 :dtype :float
-                                       :gemm-precision :f16-xmx :on-non-resident :nil)
+                                       :gemm-precision :mixed-f16-f32 :on-non-resident :nil)
           _ (is (some? prog) "spike-gemm must extract as one resident contraction")
           result-sym (:result-sym prog)
           scalar-values {'batch rows 'in-f width 'out-f width}

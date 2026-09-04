@@ -143,7 +143,7 @@
             :outputs [sym …]         additional written params to project as outputs
             :taps    [sym …]         internal nodes to additionally expose (§5.1)
             :roles   {sym → role}    explicit role override (last word)
-            :gemm-precision :f16-xmx|:f32-scalar
+            :gemm-precision :mixed-f16-f32|:f32-scalar
             :on-non-resident :nil|:throw
             :schedule <map>}         reserved S6 schedule (threaded into the cache key)"
   [fn-var args {:keys [target dtype donate constants outputs taps roles

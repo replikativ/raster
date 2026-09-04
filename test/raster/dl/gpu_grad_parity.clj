@@ -138,7 +138,7 @@
 
 (defn- run-resident
   "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array.
-   gemm-precision is compile-gpu-program's :gemm-precision (:f16-xmx | :f32-scalar)."
+   gemm-precision is compile-gpu-program's :gemm-precision (:mixed-f16-f32 | :f32-scalar)."
   [f-var args dtype gemm-precision]
   (let [p (pl/compile-gpu-program f-var :ze:0 :dtype dtype :gemm-precision gemm-precision)
         s (gpu/make-session :ze:0)]
@@ -187,14 +187,14 @@
      :dtype       :float (default) | :double   — resident compile dtype
      :rtol        max relative error (default 1e-3 for f32)
      :grad-args   coll of arg :name symbols to check (default: all Array-typed args)
-     :gemm-precision  :f16-xmx (default) | :f32-scalar — compile-gpu-program's resident
+     :gemm-precision  :mixed-f16-f32 (default) | :f32-scalar — compile-gpu-program's resident
                   :gemm binding policy (:f32-scalar = exact-grad scalar f32 GEMM)
 
    Runs on ze:0. Fails loudly (via clojure.test/is) if any checked gradient's wrapper
    does not extract fully resident, or if the GPU grad diverges beyond rtol.
    Returns {:grads {argname {:resident? :step-kinds :rel-err}}}."
   [loss-var arg-specs & {:keys [dtype rtol grad-args gemm-precision]
-                         :or {dtype :float rtol 1.0e-3 gemm-precision :f16-xmx}}]
+                         :or {dtype :float rtol 1.0e-3 gemm-precision :mixed-f16-f32}}]
   (let [names (mapv :name arg-specs)
         types (mapv :type arg-specs)
         vals  (mapv :val arg-specs)

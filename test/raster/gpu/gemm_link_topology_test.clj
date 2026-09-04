@@ -15,8 +15,8 @@
   []
   (let [tile (hardware/derive-gemm-tile {})]
     {:dtype :float
-     :gemm-precision :f16-xmx
-     :schedule {:precision :f16-xmx}
+     :gemm-precision :mixed-f16-f32
+     :schedule {:precision :mixed-f16-f32}
      :all-params '[a b c m n k]
      :array-params '[a b c]
      :array-roles {'a :input 'b :input 'c :output}
@@ -28,7 +28,7 @@
        (gemm/emit-executable
         {:id "mock-linked-gemm" :a 'a :b 'b :c 'c
          :m :gemm-m :n :gemm-n :k :gemm-k :variant :nt
-         :precision :f16-xmx :tile tile :fill-workgroups 32})
+         :precision :mixed-f16-f32 :tile tile :fill-workgroups 32})
        :argument-specs [{:kind :input :sym 'a}
                         {:kind :input :sym 'b}
                         {:kind :output :sym 'c}
