@@ -329,6 +329,10 @@
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel
                             "split_k_combine" dialect)))
+           (write-source! directory suffix "portable-matrix-nt"
+                          (:source
+                           (gemm-emit/emit-portable-scalar-matrix-kernel
+                            "portable_matrix_nt" :nt dialect)))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

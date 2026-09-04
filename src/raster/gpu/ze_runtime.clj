@@ -2523,16 +2523,18 @@
   (ensure-init!)
   (or (get @gemm-scalar-cache variant)
       (let [kname (str "gemm_scalar_" (name variant))
-            cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-scalar-kernel)
-                        kname :variant variant))
+            emitted ((requiring-resolve
+                      'raster.compiler.backend.gpu.gemm/emit-portable-scalar-matrix-kernel)
+                     kname variant)
+            cl-src (:source emitted)
             device-hex (:device-id-hex @state)
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                      cl-src :device device-hex))
             module (load-module! spv)
             kernel (create-kernel module kname)
-            entry {:module module :kernel kernel :kernel-name kname}]
+            entry {:module module :kernel kernel :kernel-name kname
+                   :kernel-body (:kernel-body emitted)}]
         (swap! gemm-scalar-cache assoc variant entry)
         entry)))
 
@@ -2550,7 +2552,8 @@
         m (long m) n (long n) k (long k)
         total (* m n)
         args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+              {:type :int :value (int k)} {:type :int :value (int m)}
+              {:type :int :value (int n)} {:type :int :value (int total)}]
         bnd (bind-kernel! kh 256 args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
     bnd))
