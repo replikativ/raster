@@ -1786,11 +1786,6 @@
     (cl-call! "clReleaseCommandQueue" @h-clReleaseCommandQueue [queue]))
   nil)
 
-(defn bind-registered-gemm!
-  "Intel-XMX fp16 GEMM is not available on generic OpenCL devices."
-  [& _]
-  (throw (ex-info "bind-registered-gemm! (XMX fp16 tile GEMM) is Level-Zero/Intel-only; generic OpenCL GEMM fallback not yet implemented" {})))
-
 (defn bind-registered-convert!
   [& _]
   (throw (ex-info "bind-registered-convert! (fp16 cast for XMX) is Level-Zero/Intel-only" {})))
