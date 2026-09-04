@@ -271,9 +271,9 @@
 
 (deftest one-atomic-update-contract-has-thin-target-spellings
   (doseq [[target spelling]
-          [[:opencl-portable "atomic_add_float(rstr_out +"]
-           [:cuda "atomicAdd(rstr_out +"]
-           [:hip "atomicAdd(rstr_out +"]]]
+          [[:opencl-portable "atomic_add_float(rstr_out_ +"]
+           [:cuda "atomicAdd(rstr_out_ +"]
+           [:hip "atomicAdd(rstr_out_ +"]]]
     (let [source (opencl/emit-scalar-kernel
                   "atomic_add_test" (atomic-add-kernel-body)
                   {:target-dialect target})]
