@@ -76,3 +76,9 @@
       "a captured stride may be zero and collapse every item")
   (is (ia/injective? (ia/index-form '(+ (* r feat) j) 'r 'rows [] '{j feat}))
       "feat is the inner digit's radix: a zero feat empties the loop"))
+
+(deftest an-extent-may-not-depend-on-an-unresolved-local
+  ;; `q = (quot (- 8 i) 2)` varies with the item: it is neither a digit nor invariant, so it may
+  ;; not become an extent factor. Items (1,0) and (0,3) both address 3 in `i·q + j`.
+  (is (nil? (ia/index-form '(+ (* i q) j) 'i 8
+                           '[{:id y :init (- 8 i)} {:id q :init (quot y 2)}] '{j q}))))

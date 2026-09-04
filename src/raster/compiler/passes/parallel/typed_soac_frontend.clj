@@ -1604,7 +1604,9 @@
                        (seq? expression)
                        (contains? '#{* + clojure.core/* clojure.core/+ quot clojure.core/quot}
                                   (descriptor/semantic-op expression))
-                       (provably-pure-scalar? expression))
+                       (provably-pure-scalar? expression)
+                       ;; a definition that reads an array is not an invariant extent
+                       (empty? (par/collect-aget-arrays expression)))
               expression)
             allocation-dtype
             (when (and (= :scalar (:kind description))

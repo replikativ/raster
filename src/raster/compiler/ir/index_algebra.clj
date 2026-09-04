@@ -151,15 +151,20 @@
                  :quot-expressions {}
                  :quot-facts []
                  :order 1}
-        ;; a radix or divisor is an extent: it may not mention the index or a digit. A
+        ;; a radix or divisor is an extent: it may not mention the index, a digit, or a region
+        ;; local the algebra did not resolve (`y = (- 8 i)` varies with the item). A
         ;; `(quot e c)` inside it is the scalar local that computed it, when one exists.
-        resolve (fn [{:keys [substitutions quot-expressions digits]} form]
+        resolve (fn [{:keys [substitutions quot-expressions digits] unresolved :locals} form]
                   (let [m (monomial (->> (strip-cast form)
                                          (clojure.walk/postwalk-replace substitutions)
                                          (clojure.walk/postwalk strip-cast)
-                                         (clojure.walk/postwalk-replace quot-expressions)))]
-                    (when (and m (empty? (set/intersection (set (:factors m))
-                                                           (set (keys digits)))))
+                                         (clojure.walk/postwalk-replace quot-expressions)))
+                        factors (set (:factors m))]
+                    (when (and m
+                               (empty? (set/intersection factors (set (keys digits))))
+                               (empty? (set/intersection factors
+                                                         (set (remove (set (keys substitutions))
+                                                                      unresolved)))))
                       m)))
         ;; the map extent may mention a quot the locals define later; resolve it on demand
         quantity-extent (fn [state quantity]
