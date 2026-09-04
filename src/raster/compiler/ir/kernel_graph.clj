@@ -102,7 +102,10 @@
                           {:scalar-arguments scalar-arguments})))
         (doseq [[slot id] pointer-pairs]
           (let [{:keys [dtype role]} (get external-by-id id)
-                expected-kind (if (= :input role) :input :output)]
+                expected-kind (case role
+                                :input :input
+                                :output :output
+                                :inout :inout)]
             (when-not (= dtype (:dtype slot))
               (throw (ex-info "kernel graph ABI storage dtype differs from its buffer"
                               {:buffer id :buffer-dtype dtype :slot slot})))

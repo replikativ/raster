@@ -404,7 +404,7 @@
             :outputs [:x2]})
           session (gpu/make-session :ze:0)
           executable (gpu-link/instantiate! plan {:session session})]
-      (is (= [:contract] (mapv :convention (:steps prog)))
+      (is (= [:executable] (mapv :convention (:steps prog)))
           "linear-nb's BLAS GEMM is a typed contraction step")
       (try
         (let [session (:session executable)

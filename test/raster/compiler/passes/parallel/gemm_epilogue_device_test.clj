@@ -1,11 +1,13 @@
 (ns raster.compiler.passes.parallel.gemm-epilogue-device-test
   "An accumulating BLAS GEMM (`beta ≠ 0`) is a typed contraction whose result transform reads
    the destination element it overwrites. The deftm below keeps its BLAS spelling; the typed
-   route turns it into one resident `:contract` step whose destination is a single `:inout`
+   route turns it into one typed executable dispatch whose destination is a single `:inout`
    ABI slot, and the same source runs bit-comparably on the JVM (host expansion of the same
    result transform), on OpenCL and on Level Zero."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
@@ -28,6 +30,14 @@
 (defn- b-matrix [] (float-array (map #(float (* 0.5 %)) (range (* k n)))))
 (defn- c-initial [] (float-array (map #(float (* 100 %)) (range (* m n)))))
 
+(defn- default-executable
+  [step]
+  (kdispatch/default-alternative (:dispatch step)))
+
+(defn- default-artifact
+  [step]
+  (first (kexec/artifacts (default-executable step))))
+
 (defn- reference
   "C0 + A·B in float, the value every backend must reproduce."
   []
@@ -45,18 +55,20 @@
     (accumulate-gemm! (a-matrix) (b-matrix) C m k n)
     (is (= (reference) (vec C)))))
 
-(deftest the-resident-program-is-one-contract-step-with-a-read-write-destination
+(deftest the-resident-program-is-one-typed-executable-with-a-read-write-destination
   (doseq [target [:ocl:0 :ze:0]]
     (let [descriptor (pipeline/compile-gpu-program #'accumulate-gemm! target :dtype :float)
-          step (first (:steps descriptor))]
+          step (first (:steps descriptor))
+          executable (default-executable step)
+          artifact (default-artifact step)]
       (testing (str target)
-        (is (= [:contract] (mapv :convention (:steps descriptor))))
+        (is (= [:executable] (mapv :convention (:steps descriptor))))
         (is (= '[[A :input] [B :input] [C :inout]]
-               (vec (for [slot (get-in step [:artifact :abi])
+               (vec (for [slot (kexec/abi executable)
                           :when (not= :scalar (:kind slot))]
                       [(:name slot) (:kind slot)]))))
         (is (empty? (:allocs descriptor)))
-        (is (re-find #"__global float\* C" (get-in step [:artifact :source]))
+        (is (re-find #"__global float\* C" (:source artifact))
             "the destination pointer is writable: no const qualifier")))))
 
 (defn- run-on-device
@@ -105,13 +117,14 @@
                      (reduce + (for [l (range in-f)]
                                  (* (aget x (+ (* i in-f) l)) (aget W (+ (* j in-f) l)))))))))))
 
-(deftest the-linear-layer-is-a-resident-map-and-contract
+(deftest the-linear-layer-is-a-resident-map-and-typed-executable
   (doseq [target [:ocl:0 :ze:0]]
     (let [descriptor (pipeline/compile-gpu-program #'nn/linear! target :dtype :float)]
       (testing (str target)
-        (is (= [:map :contract] (mapv :convention (:steps descriptor))))
+        (is (= [:map :executable] (mapv :convention (:steps descriptor))))
         (is (= '[[W :input] [x :input] [y :inout]]
-               (vec (for [slot (get-in (second (:steps descriptor)) [:artifact :abi])
+               (vec (for [slot (kexec/abi
+                                (default-executable (second (:steps descriptor))))
                           :when (not= :scalar (:kind slot))]
                       [(:name slot) (:kind slot)]))))))))
 
