@@ -13,7 +13,9 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pp]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.report :as report]))
 
 (def default-namespaces
   "Corpus namespaces: the deep-learning substrate, the ODE/PDE surface and the NN primitives."
@@ -54,17 +56,35 @@
   (or (:reason (ex-data throwable))
       (some-> (.getMessage throwable) (subs 0 (min 120 (count (.getMessage throwable)))))))
 
+(defn- effect-order-facts
+  "How the typed program's effect maps iterate: `{:independent n :sequential m}`. A store the
+   index algebra proves injective keeps its map `:independent`; an unproven one serializes the
+   whole launch, so a move from `:independent` to `:sequential` is a performance regression the
+   ratchet must see even though the route is unchanged."
+  [pipeline]
+  (let [program (:soac-fused pipeline)]
+    (when (and (map? program) (= :typed-soac (:dialect program)))
+      (frequencies
+       (for [equation (:equations program)
+             typed-equation (dialect/equations (:algorithm equation))
+             :let [{:keys [kind attributes]} (dialect/operation-parts typed-equation)]
+             :when (= 'effect-map kind)]
+         (:iteration-order attributes))))))
+
 (defn report-var
   "Compile one source deftm for `target-device` at `dtype` and reduce its report to route facts."
   [v {:keys [target-device dtype] :or {dtype :float}}]
   (let [row {:var (var-symbol v)}]
     (try
-      (let [report (pipeline/compile-report v :target-device target-device :dtype dtype)]
-        (assoc row
-               :route (get-in report [:route :source-dialect])
-               :typed-validated (boolean (get-in report [:route :typed-validated]))
-               :declines (decline-facts (get-in report [:route :declines]))
-               :emission-declines (count (get-in report [:emission :declines]))))
+      (let [pipeline (pipeline/show-pipeline v :target-device target-device :dtype dtype)
+            report (report/from-pipeline pipeline)
+            orders (effect-order-facts pipeline)]
+        (cond-> (assoc row
+                       :route (get-in report [:route :source-dialect])
+                       :typed-validated (boolean (get-in report [:route :typed-validated]))
+                       :declines (decline-facts (get-in report [:route :declines]))
+                       :emission-declines (count (get-in report [:emission :declines])))
+          (seq orders) (assoc :effect-orders orders)))
       (catch Throwable t
         (assoc row :route :error :error (error-reason t))))))
 
@@ -103,7 +123,13 @@
 
                        (and (:typed-validated old) (not (:typed-validated row)))
                        (conj {:var (:var row) :violation :lost-typed-validation
-                              :route (:route row)}))]
+                              :route (:route row)})
+
+                       ;; an effect map that iterated independently may not start serializing
+                       (> (get-in row [:effect-orders :sequential] 0)
+                          (get-in old [:effect-orders :sequential] 0))
+                       (conj {:var (:var row) :violation :effect-map-serialized
+                              :before (:effect-orders old) :after (:effect-orders row)}))]
        violation))))
 
 (defn read-baseline [path]
