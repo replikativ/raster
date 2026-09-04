@@ -9,6 +9,7 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -39,15 +40,36 @@
   [id operation uses dependencies]
   (kgraph/->ScheduledKernel id operation (vec uses) (vec dependencies)))
 
+(defn- epilogue-interface
+  [epilogue]
+  (vec
+   (concat
+    (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
+      [(kabi/slot sym :input dtype :c-name (name sym) :role :epilogue)
+       sym])
+    (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+      [(kabi/slot sym :scalar dtype :c-name (name sym) :role :epilogue)
+       sym]))))
+
+(defn- epilogue-buffer-specs
+  [epilogue]
+  (mapv (fn [{:keys [sym dtype map] :or {dtype :float}}]
+          (let [shape (axis-map/shape map)
+                elements (if (seq shape) (apply klaunch/product shape) 1)]
+            {:id sym :dtype dtype :elements elements}))
+        (:operands epilogue)))
+
 (defn- outer-interface
-  [{:keys [a b c m n k]}]
-  {:abi [(kabi/slot a :input :float :c-name "A" :role :lhs)
-         (kabi/slot b :input :float :c-name "B" :role :rhs)
-         (kabi/slot c :output :float :c-name "C" :role :result)
-         (kabi/slot m :scalar :int :c-name "M" :role :extent)
-         (kabi/slot n :scalar :int :c-name "N" :role :extent)
-         (kabi/slot k :scalar :int :c-name "K" :role :extent)]
-   :arguments [a b c m n k]})
+  [{:keys [a b c m n k epilogue]}]
+  (let [base [[(kabi/slot a :input :float :c-name "A" :role :lhs) a]
+              [(kabi/slot b :input :float :c-name "B" :role :rhs) b]
+              [(kabi/slot c :output :float :c-name "C" :role :result) c]
+              [(kabi/slot m :scalar :int :c-name "M" :role :extent) m]
+              [(kabi/slot n :scalar :int :c-name "N" :role :extent) n]
+              [(kabi/slot k :scalar :int :c-name "K" :role :extent) k]]
+        interface (into base (epilogue-interface epilogue))]
+    {:abi (mapv first interface)
+     :arguments (mapv second interface)}))
 
 (defn- batched-outer-interface
   [{:keys [a b c batch m n k]}]
@@ -69,8 +91,10 @@
    :c-elements (klaunch/product m n)})
 
 (defn- effects
-  [{:keys [a b c]}]
-  {:kind :tensor-contraction :reads [a b] :writes [c]})
+  [{:keys [a b c epilogue]}]
+  {:kind :tensor-contraction
+   :reads (into [a b] (map :sym) (:operands epilogue))
+   :writes [c]})
 
 (defn- artifact
   [kernel-name source abi arguments launch phase attributes]
@@ -305,18 +329,17 @@
                    :batching batching}
       :parameter-names {batch "batch"}})))
 
+(defn- kernel-epilogue-interface
+  [kernel-body]
+  (mapv
+   (fn [{:keys [id kind dtype]}]
+     [(kabi/slot id kind dtype :c-name (name id) :role :epilogue)
+      id])
+   (filterv #(= :epilogue (:role %)) (:parameters kernel-body))))
+
 (defn- gemm-artifact
-  [{:keys [id m n k tile]} kernel-name a b c split-k? kc splits phase]
+  [{:keys [id m n k tile epilogue]} kernel-name a b c split-k? kc splits phase]
   (let [{:keys [block-m block-n]} tile
-        abi (cond-> [(kabi/slot a :input :half :c-name "A")
-                     (kabi/slot b :input :half :c-name "B")
-                     (kabi/slot c :output :float :c-name "C")
-                     (kabi/slot m :scalar :int :c-name "M")
-                     (kabi/slot n :scalar :int :c-name "N")
-                     (kabi/slot k :scalar :int :c-name "K")]
-              split-k? (conj (kabi/slot :k-chunk :scalar :int :c-name "KC")
-                             (kabi/slot :splits :scalar :int :c-name "splits")))
-        arguments (cond-> [a b c m n k] split-k? (conj kc splits))
         group-count (cond-> [(klaunch/ceil-div n block-n)
                              (klaunch/ceil-div m block-m)]
                       split-k? (conj (klaunch/runtime-value splits)))
@@ -324,11 +347,24 @@
                    :id [:gemm id phase]
                    :a a :b b :c c :m m :n n :k k
                    :tile tile :result-dtype :float
+                   :epilogue (when-not split-k? epilogue)
                    :provenance {:operation-id id :phase phase}}
         scheduled (if split-k?
                     (emit-scheduled-split-k-kernel
                      (assoc emit-args :kc :k-chunk :splits :splits))
-                    (emit-scheduled-matrix-kernel emit-args))]
+                    (emit-scheduled-matrix-kernel emit-args))
+        base-interface
+        (cond-> [[(kabi/slot a :input :half :c-name "A") a]
+                 [(kabi/slot b :input :half :c-name "B") b]
+                 [(kabi/slot c :output :float :c-name "C") c]
+                 [(kabi/slot m :scalar :int :c-name "M") m]
+                 [(kabi/slot n :scalar :int :c-name "N") n]
+                 [(kabi/slot k :scalar :int :c-name "K") k]]
+          split-k? (conj [(kabi/slot :k-chunk :scalar :int :c-name "KC") kc]
+                         [(kabi/slot :splits :scalar :int :c-name "splits") splits]))
+        interface (into base-interface (kernel-epilogue-interface (:kernel-body scheduled)))
+        abi (mapv first interface)
+        arguments (mapv second interface)]
     (artifact
      kernel-name (:source scheduled)
      abi arguments
@@ -379,9 +415,11 @@
                        :semantic-op :contraction})))
 
 (defn- xmx-graph
-  [{:keys [id a b c m n k variant tile vector-width requested-splits split-k?] :as spec}]
+  [{:keys [id a b c m n k variant tile vector-width requested-splits split-k? epilogue]
+    :as spec}]
   (let [{:keys [abi arguments]} (outer-interface spec)
         {:keys [a-elements b-elements c-elements]} (extents spec)
+        epilogue-buffers (epilogue-buffer-specs epilogue)
         strategy (if split-k? :xmx-split-k :xmx-direct)
         prefix (identifier (str id "_" (name strategy)))
         a16 [:gemm id strategy :a16]
@@ -426,8 +464,10 @@
                             [(value-use b16 :read) (value-use bt16 :write)] [convert-b-id]))
                 true
                 (conj (node contract-id contract
-                            [(value-use final-a :read) (value-use final-b :read)
-                             (value-use contract-output :write)]
+                            (into [(value-use final-a :read) (value-use final-b :read)
+                                   (value-use contract-output :write)]
+                                  (map #(value-use (:id %) :read))
+                                  epilogue-buffers)
                             [(if transpose-a transpose-a-id convert-a-id)
                              (if transpose-b transpose-b-id convert-b-id)]))
                 combine
@@ -439,8 +479,10 @@
                       transpose-b (conj (graph-buffer bt16 :half b-elements :temporary))
                       split-k? (conj (graph-buffer partials :float partial-elements :temporary)))]
     (kgraph/make
-     {:inputs [(graph-buffer a :float a-elements :input)
-               (graph-buffer b :float b-elements :input)]
+     {:inputs (into [(graph-buffer a :float a-elements :input)
+                    (graph-buffer b :float b-elements :input)]
+                   (map #(graph-buffer (:id %) (:dtype %) (:elements %) :input))
+                   epilogue-buffers)
       :outputs [(graph-buffer c :float c-elements :output)]
       :temporaries temporaries
       :nodes nodes
@@ -601,13 +643,54 @@
          :fill-workgroups (hardware/fill-workgroups desc workgroup-size)
          :matrix (:matrix desc)}))))
 
+(defn emit-matrix-alternatives
+  "Emit direct and, when algebraically valid, split-K matrix graph schedules.
+
+   This is the schedule contribution used by a typed contraction dispatch; it does not invent a
+   scalar fallback or a new semantic operation.  A result transform is fused into the direct
+   matrix store.  Split-K is withheld until the final combine can own that transform exactly—
+   applying it independently to partial sums would be a silent algebraic error."
+  [{:keys [id a b c m n k variant tile fill-workgroups vector-width epilogue]
+    :or {vector-width 4}
+    :as spec}]
+  (when-not (contains? #{:nn :nt :tn :tt} variant)
+    (throw (ex-info "matrix alternatives require :nn, :nt, :tn, or :tt variant"
+                    {:id id :variant variant})))
+  (doseq [[field value] [[:id id] [:a a] [:b b] [:c c] [:m m] [:n n] [:k k]
+                         [:tile tile] [:fill-workgroups fill-workgroups]]]
+    (when (nil? value)
+      (throw (ex-info "matrix alternatives are missing a required field"
+                      {:field field :spec spec}))))
+  (let [spec (assoc spec :vector-width vector-width)
+        split-expression (requested-splits spec)
+        xmx-spec (assoc spec :requested-splits split-expression)
+        direct (xmx-graph (assoc xmx-spec :split-k? false))
+        split? (not (seq epilogue))
+        split (when split? (xmx-graph (assoc xmx-spec :split-k? true)))
+        alignment-cases
+        [{:expression n :op :< :value 8 :strategy :f32-scalar}
+         {:expression k :op :< :value 8 :strategy :f32-scalar}
+         {:expression (kbody/expression :mod n 8)
+          :op :> :value 0 :strategy :f32-scalar}
+         {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
+          :op :> :value 0 :strategy :f32-scalar}]
+        selector {:kind :runtime-expression-cases
+                  :cases (cond-> alignment-cases
+                           split? (conj {:expression split-expression :op :>= :value 2
+                                         :strategy :xmx-split-k}))
+                  :default :xmx-direct}]
+    {:alternatives (cond-> [direct] split (conj split))
+     :selector selector
+     :result-transform-split-decline
+     (when-not split? {:reason :split-k-result-transform-not-lowered})}))
+
 (defn emit-executable
   "Emit the resident GEMM schedule as one graph or a checked runtime dispatch.
 
    Required keys: :id, :a/:b/:c, :m/:n/:k compiler values, :variant, :precision, :tile,
    :fill-workgroups. The mixed-precision dispatch handles the XMX pitch gate and low-occupancy
    split-K choice entirely through generic expression cases."
-  [{:keys [id a b c m n k variant precision tile fill-workgroups vector-width]
+  [{:keys [id a b c m n k variant precision tile fill-workgroups vector-width epilogue]
     :or {vector-width 4}
     :as spec}]
   (when-not (contains? #{:nn :nt :tn :tt} variant)
@@ -622,24 +705,16 @@
     (case precision
       :f32-scalar scalar
       :mixed-f16-f32
-      (let [split-expression (requested-splits spec)
-            xmx-spec (assoc spec :requested-splits split-expression)
-            direct (xmx-graph (assoc xmx-spec :split-k? false))
-            split (xmx-graph (assoc xmx-spec :split-k? true))]
+      (let [_ (when (seq epilogue)
+                (throw (ex-info
+                        "standalone GEMM executable cannot manufacture its scalar fallback for a result transform"
+                        {:reason :result-transform-requires-typed-contraction :id id})))
+            {:keys [alternatives selector]} (emit-matrix-alternatives spec)]
         (kdispatch/make
          {:id (str id)
-          :alternatives [scalar direct split]
+          :alternatives (into [scalar] alternatives)
           :default-strategy :xmx-direct
-          :selector
-          {:kind :runtime-expression-cases
-           :cases [{:expression n :op :< :value 8 :strategy :f32-scalar}
-                   {:expression k :op :< :value 8 :strategy :f32-scalar}
-                   {:expression (kbody/expression :mod n 8)
-                    :op :> :value 0 :strategy :f32-scalar}
-                   {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
-                    :op :> :value 0 :strategy :f32-scalar}
-                   {:expression split-expression :op :>= :value 2 :strategy :xmx-split-k}]
-           :default :xmx-direct}
+          :selector selector
           :provenance {:semantic-op :contraction :variant variant :lowering :gemm-schedule}
           :attributes {:tile tile :precision precision :hardware-aware? true}}))
       (throw (ex-info "unsupported GEMM precision" {:id id :precision precision})))))

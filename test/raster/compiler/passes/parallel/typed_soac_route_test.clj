@@ -1366,6 +1366,60 @@
            (last (-> call :nodes first :call :arguments))))
     (is (nil? (get-in emitted [:stats :segop-relowered])))))
 
+(deftest dynamic-result-transform-fuses-into-the-mixed-matrix-graph
+  (let [transform {:acc 'acc
+                   :expr '(raster.numeric/*
+                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
+                   :operands [{:sym 'bias :dtype :float
+                               :map {:groups [[['j 'n]]]}}]
+                   :scalars [{:sym 'scale :dtype :float}]
+                   :dtype :float}
+        contract (apply list
+                        (concat
+                         '(raster.par/contract C [[i m] [j n]] [[l k]]
+                                               (* (clojure.core/aget A (+ (* i k) l))
+                                                  (clojure.core/aget B (+ (* l n) j))))
+                         [:epilogue transform]))
+        source (list 'let* ['step contract] 'step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ze:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float 'bias :float}
+                 :scalar-types {'m :int 'n :int 'k :int 'scale :float}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        scheduled (contract-route/route-typed-contraction-dispatch
+                   algorithm operation :dtype :float :desc descriptor
+                   :precision :mixed-f16-f32)
+        matrix-graph (kdispatch/alternative scheduled :xmx-direct)
+        contract-artifact (-> matrix-graph :nodes last :operation)
+        body (get-in contract-artifact [:attributes :kernel-body])]
+    (is (= [:portable-segred :xmx-direct]
+           (mapv kdispatch/alternative-strategy (:alternatives scheduled)))
+        "split-K waits until its final combine can own the result transform")
+    (is (= '[A B C bias scale m n k] (:arguments matrix-graph)))
+    (is (some #(= 'bias (:id %)) (:inputs matrix-graph)))
+    (is (some #(= 'bias (:buffer %)) (:uses (last (:nodes matrix-graph))))
+        "the fused operand is an explicit graph input and matrix-node read")
+    (is (= :split-k-result-transform-not-lowered
+           (get-in scheduled [:attributes :candidate-schedules
+                              :xmx-direct :split-k-decline :reason])))
+    (is (= '[bias scale]
+           (mapv :id (filter #(= :epilogue (:role %)) (:parameters body)))))
+    (is (re-find #"bias\[.*col" (:source contract-artifact)))
+    (is (re-find #"\* scale" (:source contract-artifact)))
+    (is (= :xmx-direct
+           (-> (kdispatch/select-alternative
+                scheduled [:a :b :c :bias 0.5 13 128 8192])
+               kdispatch/alternative-strategy))
+        "low occupancy stays direct rather than transforming split partials")))
+
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source
         '(let* [total (raster.par/reduce acc 0.0 i n

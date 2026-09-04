@@ -988,6 +988,10 @@
       (not (:ok matrix-view))
       {:alternatives [] :decline (dissoc matrix-view :ok)}
 
+      (and (:batched? matrix-view) (seq (:epilogue matrix-view)))
+      {:alternatives []
+       :decline {:reason :batched-matrix-result-transform-not-lowered}}
+
       (nil? target-schedule)
       {:alternatives []
        :decline {:reason :mixed-dpas-target-capability
@@ -1001,6 +1005,7 @@
                        :a row :b col :c (:out facts)
                        :m m :n n :k k
                        :variant (:variant matrix-view)
+                       :epilogue (:epilogue matrix-view)
                        :precision :mixed-f16-f32
                        :tile (:tile target-schedule)
                        :fill-workgroups (:fill-workgroups target-schedule)}
@@ -1009,12 +1014,10 @@
                        (assoc emit-spec
                               :batch (:batch matrix-view)
                               :batching (:batching matrix-view)))
-                      (gpu-gemm/emit-executable emit-spec))
+                      (gpu-gemm/emit-matrix-alternatives emit-spec))
             raw-alternatives (if (:batched? matrix-view)
                                [(:graph emitted)]
-                               (remove #(= :f32-scalar
-                                           (get-in % [:attributes :strategy]))
-                                       (:alternatives emitted)))
+                               (:alternatives emitted))
             alternatives (mapv #(reinterface-graph % abi arguments effects operation-id)
                                raw-alternatives)
             selector (:selector emitted)]
@@ -1026,6 +1029,8 @@
                     :batched? (:batched? matrix-view)
                     :batch (:batch matrix-view)
                     :batching (:batching matrix-view)
+                    :result-transform? (boolean (seq (:epilogue matrix-view)))
+                    :split-k-decline (:result-transform-split-decline emitted)
                     :bindings (:bindings matrix-view)
                     :dimensions (:dimensions matrix-view)
                     :tile (:tile target-schedule)
