@@ -188,6 +188,15 @@
   [value]
   (or (contains? #{:unique :ordered} value) (reducing-scatter-conflict? value)))
 
+(defn effect-loop-attributes?
+  "The binder of a counted store loop inside an effect region: its index symbol and the integer
+   lower bound. The extent is a scalar operand of the form, so the grammar checks it."
+  [value]
+  (and (map? value)
+       (= #{:index :lower} (set (keys value)))
+       (symbol? (:index value))
+       (integer? (:lower value))))
+
 (defn effect-map-attributes?
   [value]
   (and (map-attributes? value)
@@ -456,6 +465,7 @@
              [xa scatter-attributes?]
              [ema effect-map-attributes?]
              [ec effect-conflict?]
+             [ela effect-loop-attributes?]
              [sta stencil-attributes?]
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
@@ -479,7 +489,8 @@
 
   (Effect [e :enforce]
           (effect ?sym:destination ?ec:conflict
-                  ?s:destination-index ?s:predicate ?s:value))
+                  ?s:destination-index ?s:predicate ?s:value)
+          (effect-loop ?ela ?s:extent ?el))
 
   (Local [d :enforce]
          (let-value ?sym:binding ?dt ?s:init))
@@ -605,17 +616,55 @@
     (let [[_ destination-index predicate written-value] value]
       {:destination-index destination-index :predicate predicate :value written-value})))
 
-(defn effect-form?
-  "Whether a typed ordered-effect region item has canonical syntax."
+(defn effect-loop-form?
+  "Whether an effect-region item is a counted store loop `(effect-loop attrs extent lambda)`."
   [value]
-  (and (seq? value) (= 'effect (first value)) (= 6 (count value))))
+  (and (seq? value) (= 'effect-loop (first value)) (= 4 (count value))))
+
+(defn effect-form?
+  "Whether a typed ordered-effect region item has canonical syntax: one store effect or one
+   counted loop of them."
+  [value]
+  (or (and (seq? value) (= 'effect (first value)) (= 6 (count value)))
+      (effect-loop-form? value)))
+
+(declare lambda-parts)
 
 (defn effect-parts
+  "Project one effect-region item. Store effects yield their destination, conflict contract,
+   index, predicate and value; loops yield `:loop true` with `:index`, `:lower`, `:extent` and
+   the `:lambda` whose single parameter is the loop index."
   [value]
-  (when (effect-form? value)
+  (cond
+    (effect-loop-form? value)
+    (let [[_ attributes extent lambda] value]
+      {:loop true :index (:index attributes) :lower (:lower attributes)
+       :extent extent :lambda lambda})
+
+    (effect-form? value)
     (let [[_ destination conflict destination-index predicate written-value] value]
       {:destination destination :conflict conflict
        :destination-index destination-index :predicate predicate :value written-value})))
+
+(defn effect-part-leaves
+  "The store effects of projected effect parts, descending into store loops."
+  [parts]
+  (vec (mapcat (fn [part]
+                 (if (:loop part)
+                   (effect-part-leaves
+                    (map effect-parts (:body-results (lambda-parts (:lambda part)))))
+                   [part]))
+               parts)))
+
+(defn effect-leaves
+  "The store effects of lowered effect maps (`{:loop {:effects […]}}` entries), descending into
+   store loops."
+  [effects]
+  (vec (mapcat (fn [effect]
+                 (if-let [loop (:loop effect)]
+                   (effect-leaves (:effects loop))
+                   [effect]))
+               effects)))
 
 (defn local-value
   "Construct one explicitly typed scalar-region SSA definition."
@@ -955,9 +1004,12 @@
               expression (cond
                            (= 'scatter kind) (vals (write-parts body))
                            (= 'effect-map kind)
-                           (let [{:keys [destination destination-index predicate value]}
+                           (let [{:keys [loop extent destination destination-index predicate
+                                         value]}
                                  (effect-parts body)]
-                             [destination destination-index predicate value])
+                             (if loop
+                               [extent]
+                               [destination destination-index predicate value]))
                            :else [body])
               :let [unbound (util/free-syms expression final-bound)]
               :when (seq unbound)]
@@ -988,8 +1040,34 @@
             destination-parameters (vec (take-last destination-count parameters))
             destination-set (set destination-parameters)
             effects (mapv effect-parts body-results)
-            by-destination (group-by :destination effects)
-            iteration-order (:iteration-order attributes)]
+            leaves (effect-part-leaves effects)
+            by-destination (group-by :destination leaves)
+            iteration-order (:iteration-order attributes)
+            region-bound (into (set parameters) (cons (:index attributes) (map :id locals)))]
+        (doseq [part effects :when (:loop part)]
+          (let [{loop-parameters :parameters loop-locals :locals :keys [body-results]}
+                (lambda-parts (:lambda part))
+                loop-bound (into region-bound (cons (:index part) (map :id loop-locals)))
+                inner (map effect-parts body-results)
+                extent-unbound (util/free-syms (:extent part) region-bound)
+                unbound (into #{}
+                              (mapcat #(util/free-syms % loop-bound))
+                              (concat (map :init loop-locals)
+                                      (mapcat (fn [{:keys [loop destination-index predicate value]}]
+                                                (when-not loop
+                                                  [destination-index predicate value]))
+                                              inner)))]
+            (when-not (and (= [(:index part)] loop-parameters)
+                           (every? some? inner)
+                           (not (some :loop inner))
+                           (seq inner)
+                           (empty? extent-unbound)
+                           (empty? unbound))
+              (fail! :typed-soac-effect-loop
+                     "effect loops are closed single-level counted regions over their loop index"
+                     {:equation equation-id :loop (:index part) :parameters loop-parameters
+                      :extent-unbound extent-unbound :unbound unbound
+                      :body body-results}))))
         (when-not (= result-count destination-count (count (:dtypes attributes)))
           (fail! :typed-soac-effect-results
                  "effect-map results, physical destinations, and dtypes must align"
@@ -1000,7 +1078,7 @@
                  "effect-map regions contain only canonical ordered effects"
                  {:equation equation-id :effects body-results}))
         (when (and (= :independent iteration-order)
-                   (some #(= :ordered (:conflict %)) effects))
+                   (some #(= :ordered (:conflict %)) leaves))
           (fail! :typed-soac-effect-iteration-order
                  "conflicting effects require sequential logical iteration"
                  {:equation equation-id :iteration-order iteration-order

@@ -66,6 +66,14 @@
   [segmap & {:keys [dtype kernel-name-prefix scalar-types array-types]
              :or {dtype :float kernel-name-prefix "segmap_effect"
                   scalar-types {} array-types {}}}]
+  ;; This generator consumes only a source-shaped lambda. A typed scalar region carries no
+  ;; source spelling, and emitting its absence as an empty body would be a silent miscompile.
+  (when (nil? (:lambda segmap))
+    (throw (ex-info "explicit-store SegMap emission requires a source-shaped lambda"
+                    {:reason :explicit-segmap-requires-source-lambda
+                     :operation (:id segmap)
+                     :scalar-region (some-> (:scalar-region segmap) keys vec)
+                     :fallback :none})))
   (let [idx (seg-idx segmap)
         bound (seg-bound segmap)
         body (ce/normalize-array-prims (:lambda segmap))

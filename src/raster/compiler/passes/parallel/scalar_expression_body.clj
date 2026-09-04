@@ -224,15 +224,23 @@
                     (do
                       (when (or (patterns/contains-sym? bound-expr index-sym)
                                 (patterns/contains-sym? bound-expr acc-sym)
-                                (not= else-expr acc-sym))
+                                (patterns/contains-sym? else-expr index-sym))
                         (decline! :ordered-loop-shape
-                                  "ordered scalar loop requires an invariant upper bound and returns its carry"
+                                  "ordered scalar loop requires an invariant upper bound and an exit over its carry"
                                   {:expression expression :bound bound-expr
                                    :index index-sym :accumulator acc-sym :exit else-expr}))
                       (let [loop-index (fresh "loop-index")
                             carry (fresh "loop-carry")
                             result (fresh "loop-result")
-                            initial (lower acc-init expected env)
+                            ;; `(loop [i 0 s init] (if (< i n) (recur (inc i) step) exit))` is the
+                            ;; ordered fold followed by `exit` over the final carry. The carry keeps
+                            ;; the step's own dtype so the exit's cast (e.g. `(double s)`) is an
+                            ;; explicit conversion rather than a silent widening of the fold.
+                            exit? (not= else-expr acc-sym)
+                            carry-type (if exit?
+                                         (canon-type (source-type update-expr expected env))
+                                         expected)
+                            initial (lower acc-init carry-type env)
                             loop-type (:type initial)
                             update (util/subst-syms {index-sym loop-index acc-sym carry}
                                                     update-expr)
@@ -257,9 +265,16 @@
                                   (conj (vec (:operations lowered))
                                         (body/->Yield [(:result lowered)]))
                                   [(body/value result loop-type)]
-                                  {:association :ordered})]
-                        {:operations (conj (vec (:operations initial)) loop)
-                         :result result :type loop-type}))
+                                  {:association :ordered})
+                            exit (when exit?
+                                   (lower (util/subst-syms {acc-sym result} else-expr)
+                                          expected (assoc env result loop-type)))]
+                        (if exit
+                          {:operations (into (conj (vec (:operations initial)) loop)
+                                             (:operations exit))
+                           :result (:result exit) :type (:type exit)}
+                          {:operations (conj (vec (:operations initial)) loop)
+                           :result result :type loop-type})))
                     (decline! :ordered-loop-shape
                               "scalar loop is outside the canonical ordered carry form"
                               {:expression expression}))
