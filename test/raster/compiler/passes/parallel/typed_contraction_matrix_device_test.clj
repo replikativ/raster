@@ -54,6 +54,35 @@
      :desc (hardware/descriptor-for device-id)
      :precision :mixed-f16-f32)))
 
+(defn- typed-epilogue-dispatch
+  [device-id]
+  (let [transform {:acc 'acc
+                   :expr '(raster.numeric/*
+                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
+                   :operands [{:sym 'bias :dtype :float
+                               :map {:groups [[['j 'n]]]}}]
+                   :scalars [{:sym 'scale :dtype :float}]
+                   :dtype :float}
+        contract (apply list
+                        (concat
+                         '(raster.par/contract C [[i m] [j n]] [[l k]]
+                                               (* (clojure.core/aget A (+ (* i k) l))
+                                                  (clojure.core/aget B (+ (* l n) j))))
+                         [:epilogue transform]))
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         (list 'let* ['step contract] 'step)
+         {:target-device device-id
+          :dtype :float
+          :array-types {'A :float 'B :float 'C :float 'bias :float}
+          :scalar-types {'m :int 'n :int 'k :int 'scale :float}})
+        equation (first (:equations form))]
+    (contract-route/route-typed-contraction-dispatch
+     (:algorithm equation) (first (:operations equation))
+     :dtype :float
+     :desc (hardware/descriptor-for device-id)
+     :precision :mixed-f16-f32)))
+
 (defn- input-array
   [n seed]
   (let [result (float-array n)
@@ -182,5 +211,45 @@
             (is (< (relative-l1 (gpu/download session :c)
                                 (batched-reference a b batch m n k))
                    1.0e-3))
+            (finally
+              (gpu/release-kernel-graph! session handle))))))))
+
+(deftest typed-result-transform-executes-inside-the-matrix-store
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "typed matrix result transform")
+    (let [device-id :ze:0
+          m 8
+          n 16
+          k 16
+          scale 0.5
+          a (input-array (* m k) 47)
+          b (input-array (* k n) 53)
+          bias (input-array n 59)
+          base (reference a b m n k)
+          expected (float-array (* m n))
+          _ (dotimes [index (* m n)]
+              (aset expected index
+                    (float (* scale
+                              (+ (double (aget base index))
+                                 (double (aget bias (mod index n))))))))
+          scheduled (typed-epilogue-dispatch device-id)
+          runtime-arguments
+          [:a :b :c :bias
+           {:type :float :value scale}
+           {:type :int :value m}
+           {:type :int :value n}
+           {:type :int :value k}]
+          selected (dispatch/select-alternative scheduled runtime-arguments)]
+      (is (= :xmx-direct (executable/strategy selected)))
+      (gpu/with-gpu-session [session device-id]
+        (gpu/alloc! session {:a [:float (* m k) a]
+                             :b [:float (* k n) b]
+                             :bias [:float n bias]
+                             :c [:float (* m n) nil]})
+        (let [handle (gpu/bind-kernel-executable!
+                      session :typed-result-transform selected runtime-arguments)]
+          (try
+            (gpu/run-kernel-graph! session handle)
+            (is (< (relative-l1 (gpu/download session :c) expected) 1.0e-3))
             (finally
               (gpu/release-kernel-graph! session handle))))))))

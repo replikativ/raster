@@ -385,9 +385,6 @@
       (nil? (body-product-of element (map :sym operands)))
       {:ok false :reason :body-has-unmodeled-terms}
 
-      (seq epilogue)
-      {:ok false :reason :matrix-graph-result-transform-not-lowered}
-
       :else
       (if-let [[layout-kind verdict]
                (some (fn [layout-kind]
@@ -398,6 +395,7 @@
          {:ok true
           :variant (if batched? :nn layout-kind)
           :batched? batched?
+          :epilogue epilogue
           :bindings (:bindings verdict)
           :dimensions (if batched?
                         [(second (second free-axes))
