@@ -3,7 +3,9 @@
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
-            [raster.dl.array-ops :as ops]))
+            [raster.dl.array-ops :as ops]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 (deftm greedy-embedding-tail!
   [logits :- (Array float), token-indices :- (Array int),
@@ -103,14 +105,13 @@
                            #'ops/gather-blocks! :ocl:0 :dtype :float)]
     (testing "both directions are ordinary allocation-free SOAC maps"
       (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
-      (is (= [:segmap :kernel-body]
+      (is (= [:kernel-body :kernel-body]
              (mapv #(get-in % [:artifact :provenance :dialect]) (:steps descriptor)))
-          "the explicit-store scatter keeps the verified SegMap generator; the bounded gather
-           lowers through KernelBody now that its index narrowing states its policy")
-      (is (= [true nil]
-             (mapv #(get-in % [:artifact :attributes :explicit-stores])
-                   (:steps descriptor)))
-          "scatter owns explicit indexed stores; gather retains the implicit dense result")
+          "the guarded explicit-store scatter and the bounded gather both lower through the
+           verified KernelBody; no source-shaped generator is involved")
+      (is (every? nil? (map #(get-in % [:artifact :attributes :kernel-body-decline])
+                            (:steps descriptor)))
+          "neither step recorded a KernelBody decline")
       (is (= [:kernel-body]
              (mapv #(get-in % [:artifact :provenance :dialect])
                    (:steps gather-descriptor)))
@@ -195,3 +196,50 @@
              (get-in descriptor [:steps 0 :artifact :attributes :schedule :strategy]))))
     (testing "the ordinary multi-output descriptor certifies before allocation"
       (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))
+
+(deftest fp16-block-transfer-stays-on-the-typed-route
+  ;; The consumer's fragmented KV-page path moves FP16 pages as `(Array short)` carriers. The
+  ;; typed route must keep that carrier dtype end to end: two effect-only steps in source order
+  ;; (scatter, then gather), both lowered through the verified KernelBody, every array ABI slot
+  ;; still `:half`,
+  ;; and no host materialization through a JVM scalar cast (the `main` failure was
+  ;; `:typed-soac-materialization-dtype` for `[:half]`).
+  (doseq [target [:ocl:0 :ze:0]]
+    (let [descriptor (pipeline/compile-gpu-program #'block-transfer-half-roundtrip! target
+                                                   :dtype :float)
+          steps (:steps descriptor)
+          array-slots (fn [step]
+                        (filter #(not= :scalar (:kind %)) (get-in step [:artifact :abi])))]
+      (testing (str target ": scatter then gather, both typed effect-only steps")
+        (is (= [:map-void :map-void] (mapv :convention steps)))
+        (is (= [:kernel-body :kernel-body]
+               (mapv #(get-in % [:artifact :provenance :dialect]) steps)))
+        (is (every? nil? (map #(get-in % [:artifact :attributes :kernel-body-decline]) steps))
+            "no step fell back to a source-shaped generator")
+        (is (empty? (:allocs descriptor))))
+      (testing (str target ": the FP16 carriers keep their storage dtype in every kernel ABI")
+        (is (= {:half 4 :int 2}
+               (frequencies (map :dtype (mapcat array-slots steps))))
+            "src/paged/restored slots are :half and the index buffers :int; nothing is widened")
+        (is (= '[paged restored]
+               (vec (for [step steps
+                          slot (array-slots step)
+                          :when (contains? #{:output :inout} (:kind slot))]
+                      (:name slot))))))
+      (testing (str target ": the pages move bit-exactly on the device")
+        (let [width 3 nblocks 3 indexed 6
+              indices (int-array [4 1 5])
+              src (short-array (map short [10 11 12 20 21 22 30 31 32]))
+              paged (short-array (* indexed width) (short -1))
+              restored (short-array (* nblocks width))
+              session (gpu/make-session target)]
+          (try
+            (let [program (fixture/instantiate! session descriptor
+                                                [src indices paged restored nblocks width indexed]
+                                                {'src :input 'block-indices :input
+                                                 'paged :output 'restored :output})
+                  result (fixture/run! program [src indices paged restored nblocks width indexed])]
+              (is (= [-1 -1 -1 20 21 22 -1 -1 -1 -1 -1 -1 10 11 12 30 31 32]
+                     (vec (get result 'paged))))
+              (is (= [10 11 12 20 21 22 30 31 32] (vec (get result 'restored)))))
+            (finally (gpu/close-session! session))))))))

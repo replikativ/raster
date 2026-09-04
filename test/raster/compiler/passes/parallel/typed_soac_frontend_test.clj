@@ -825,7 +825,8 @@
                        z (raster.par/pmap j (clojure.core/alength y) float
                                           (clojure.core/* 2.0 (clojure.core/aget y j)))]
                       z)
-        normalized (frontend/normalize-source source)
+        normalized (frontend/normalize-source source {:array-types {'x :float}
+                                                      :scalar-types {'seq :long 'dff :long}})
         program (frontend/form->program normalized
                                         {:dtype :float :array-types {'x :float}
                                          :scalar-types {'seq :long 'dff :long}})
@@ -890,3 +891,59 @@
     (is (= 2 (count (distinct (map :index loops))))
         "each effect-loop binds its own index symbol")
     (is (= program (dialect/validate! program)))))
+
+(deftest a-copy-constructor-over-an-array-is-not-a-length
+  ;; `(float-array x)` with an array `x` copies it; only a positively scalar operand is a length.
+  (let [source '(let* [y (clojure.core/float-array x)
+                       z (raster.par/pmap i (clojure.core/alength y) float
+                                          (clojure.core/aget y i))]
+                      z)
+        normalized (frontend/normalize-source source {:array-types {'x :float}})
+        z-init (some (fn [[binder init]] (when (= 'z binder) init))
+                     (partition 2 (second normalized)))]
+    (is (not= 'x (nth z-init 2))
+        "the extent stays the copy's length, not the copied array")))
+
+(deftest a-region-local-reading-a-destination-serializes-the-loop-map
+  ;; `previous = out[0]` observes earlier work items' writes, so the loop map cannot run its
+  ;; items independently even though every row store is injective.
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        r rows
+                        (let* [^float previous (clojure.core/aget out 0)]
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float (clojure.core/+ previous 1.0)))
+                                  (recur (clojure.core/inc i)))))))]
+                      effect)
+        program (frontend/form->program source {:dtype :float :array-types {'out :float}
+                                                :scalar-types {'rows :long 'feat :long}})
+        {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))]
+    (is (= :sequential (:iteration-order attributes)))))
+
+(deftest effect-loop-locals-cannot-reference-later-locals
+  (let [program (frontend/form->program
+                 '(let* [effect
+                         (raster.par/map-void!
+                          r rows
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (let* [^float a (float (clojure.core/aget x (clojure.core/+ (clojure.core/* r feat) i)))
+                                     ^float b (float (clojure.core/* a 2.0))]
+                                (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i) b)
+                                (recur (clojure.core/inc i))))))]
+                        effect)
+                 {:dtype :float :array-types {'x :float 'out :float}
+                  :scalar-types {'rows :long 'feat :long}})
+        swapped (clojure.walk/postwalk
+                 (fn [form]
+                   (if (and (seq? form) (= 'effect-region (first form)) (= 2 (count (second form))))
+                     (list 'effect-region (vec (reverse (second form))) (nth form 2))
+                     form))
+                 program)]
+    (is (= program (dialect/validate! program)))
+    (is (= :typed-soac-effect-loop
+           (try (dialect/validate! swapped) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "a loop local may only reference the locals before it")))

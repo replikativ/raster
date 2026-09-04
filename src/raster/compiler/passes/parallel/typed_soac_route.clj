@@ -85,6 +85,16 @@
                        locals)
          :bodies (mapv project-body body-results)}))))
 
+(defn- storage-only-dtype?
+  "A dtype with device storage but no JVM scalar: its values move bit-exactly between arrays
+   (`short[]` carries `:half`) and a host statement stores them without a scalar cast."
+  [dtype]
+  (= :half (some-> dtype dtype/canon)))
+
+(defn- typed-store-value
+  [cast value]
+  (if cast (list cast value) value))
+
 (defn- materialize-region
   [locals body]
   (if (seq locals)
@@ -144,7 +154,10 @@
         (let [result (first results)
               result-dtypes (mapv #(:dtype (get values %)) results)
               casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
-              _ (when (some nil? casts)
+              ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
+              ;; results are stored bit-exactly, so only dtypes with a scalar need one.
+              _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))
+                            (map vector casts result-dtypes))
                   (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
                                   {:reason :typed-soac-materialization-dtype
                                    :results results :dtypes result-dtypes})))
@@ -164,7 +177,7 @@
               secondary-stores
               (mapv (fn [secondary secondary-cast body]
                       (list 'clojure.core/aset secondary (:index attributes)
-                            (list secondary-cast body)))
+                            (typed-store-value secondary-cast body)))
                     (rest physical-results) (rest casts) (rest bodies))
               body (materialize-region
                     region-locals
@@ -182,7 +195,7 @@
                                        (map (fn [destination result-cast result-body]
                                               (list 'clojure.core/aset destination
                                                     (:index attributes)
-                                                    (list result-cast result-body)))
+                                                    (typed-store-value result-cast result-body)))
                                             physical-results casts bodies))))
 
                          (= #{:buffer} host-returns)
@@ -221,7 +234,8 @@
             host-returns (mapv :host-return storage)
             _ (when-not (and (= (count results) (count writes) (count physical-results))
                              (every? some? writes)
-                             (every? some? casts)
+                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
+                                     (map vector casts result-dtypes))
                              (every? #{:effect :buffer} host-returns))
                 (throw (ex-info "the production scatter route requires typed effect writes"
                                 {:reason :typed-soac-production-subset
@@ -232,9 +246,9 @@
                        {:keys [destination-index predicate value]}]
                     (let [destination (with-meta destination
                                         {:raster.type/tag
-                                         (dtype/scalar-tag-for-dtype result-dtype)
-                                         :tag (dtype/scalar-tag-for-dtype result-dtype)})
-                          typed-value (list cast value)
+                                         (dtype/array-tag-for-dtype result-dtype)
+                                         :tag (dtype/array-tag-for-dtype result-dtype)})
+                          typed-value (typed-store-value cast value)
                           store (if reducing?
                                   (list 'raster.par/atomic-add!
                                         destination destination-index typed-value)
@@ -270,7 +284,9 @@
             effects (mapv dialect/effect-parts bodies)
             _ (when-not (and (= (count results) (count physical-results)
                                 (count result-dtypes) (count casts))
-                             (every? some? effects) (every? some? casts)
+                             (every? some? effects)
+                             (every? (fn [[cast dtype]] (or cast (storage-only-dtype? dtype)))
+                                     (map vector casts result-dtypes))
                              (= #{:effect} (set (map :host-return storage))))
                 (throw (ex-info "the production effect-map route requires typed effect storage"
                                 {:reason :typed-soac-production-subset
@@ -297,7 +313,7 @@
                                         {:raster.type/tag
                                          (dtype/array-tag-for-dtype result-dtype)
                                          :tag (dtype/array-tag-for-dtype result-dtype)})
-                          typed-value (list cast value)
+                          typed-value (typed-store-value cast value)
                           store (if (dialect/reducing-scatter-conflict? conflict)
                                   (list 'raster.par/atomic-add!
                                         destination destination-index typed-value)
@@ -558,7 +574,8 @@
   ([form dtype array-types {:keys [resident-reductions? scalar-types values abstract-machine]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
-     (let [form (frontend/normalize-source form)]
+     (let [form (frontend/normalize-source form {:array-types array-types
+                                                 :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :scalar-types scalar-types :values values}

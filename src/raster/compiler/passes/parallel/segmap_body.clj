@@ -214,7 +214,17 @@
                       {:operation (:id segmap) :output primary-output}))
         environment (:environment local-state)
         lower-store
-        (fn [form]
+        (fn lower-store [form]
+          (if (and (seq? form) (= 'if (first form)) (= 3 (count form)))
+            ;; A guarded explicit store `(if predicate (aset …))` is the store under an
+            ;; IfRegion; the bounds guard of a block scatter is exactly this shape.
+            (let [[_ predicate store] form
+                  lowered-predicate ((:lower lowerer) predicate :predicate environment)
+                  store-operations (vec (lower-store store))]
+              (vec (concat (:operations lowered-predicate)
+                           [(body/->IfRegion (:result lowered-predicate)
+                                             (conj store-operations (body/->Yield []))
+                                             [(body/->Yield [])] [])])))
           (let [atomic-add? (and (seq? form)
                                  (= 'raster.par/atomic-add!
                                     (descriptor/semantic-op form)))]
@@ -241,7 +251,7 @@
                          (body/->AtomicRMW array [coordinate-expression]
                                            (:result lowered) :+ :map-active)
                          (body/->ScalarStore array [coordinate-expression]
-                                             (:result lowered) :map-active))]))))
+                                             (:result lowered) :map-active))])))))
         explicit-operations (vec (mapcat lower-store explicit-forms))
         substitute-effect
         (fn substitute-effect [substitutions effect]

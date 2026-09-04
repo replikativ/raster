@@ -1047,17 +1047,26 @@
         (doseq [part effects :when (:loop part)]
           (let [{loop-parameters :parameters loop-locals :locals :keys [body-results]}
                 (lambda-parts (:lambda part))
-                loop-bound (into region-bound (cons (:index part) (map :id loop-locals)))
+                loop-ids (mapv :id loop-locals)
+                ;; loop locals are ordered SSA: each initializer sees the index and the
+                ;; locals before it, never a later one
+                {:keys [bound local-unbound]}
+                (reduce (fn [{:keys [bound local-unbound]} {:keys [id init]}]
+                          {:bound (conj bound id)
+                           :local-unbound (into local-unbound (util/free-syms init bound))})
+                        {:bound (conj region-bound (:index part)) :local-unbound #{}}
+                        loop-locals)
                 inner (map effect-parts body-results)
                 extent-unbound (util/free-syms (:extent part) region-bound)
-                unbound (into #{}
-                              (mapcat #(util/free-syms % loop-bound))
-                              (concat (map :init loop-locals)
-                                      (mapcat (fn [{:keys [loop destination-index predicate value]}]
-                                                (when-not loop
-                                                  [destination-index predicate value]))
-                                              inner)))]
+                unbound (into local-unbound
+                              (mapcat #(util/free-syms % bound))
+                              (mapcat (fn [{:keys [loop destination-index predicate value]}]
+                                        (when-not loop
+                                          [destination-index predicate value]))
+                                      inner))]
             (when-not (and (= [(:index part)] loop-parameters)
+                           (= (count loop-ids) (count (distinct loop-ids)))
+                           (not (contains? region-bound (:index part)))
                            (every? some? inner)
                            (not (some :loop inner))
                            (seq inner)

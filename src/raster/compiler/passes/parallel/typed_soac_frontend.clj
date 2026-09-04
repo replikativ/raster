@@ -548,10 +548,13 @@
                             destinations
                             (par/collect-aget-arrays (list 'do index predicate value)))))
                  stores)
-         ;; Loop-body locals are re-evaluated inside the loop, interleaved with its stores;
-         ;; unlike the region's pre-effect locals they are not snapshots.
+         ;; A region local is a snapshot only within its own work item: another item's store
+         ;; may already be visible when it is taken, so a local that reads a destination makes
+         ;; the cross-item order observable. Loop-body locals and extents are re-evaluated
+         ;; inside the loop and are checked for the same reason.
          (empty? (set/intersection destinations
-                                   (par/collect-aget-arrays (list* 'do loop-expressions))))
+                                   (par/collect-aget-arrays
+                                    (list* 'do (concat (map :init locals) loop-expressions)))))
          ;; Locals are an ordered pre-effect SSA spine, so their reads are snapshots rather than
          ;; sibling effect dependencies. Keep the argument explicit for this legality boundary.
          (vector? locals))))
@@ -1353,12 +1356,22 @@
 
 (declare alength-array)
 
+(def ^:dynamic ^:private *declared-kinds*
+  "Declared value kinds visible to `normalize-source`: `{:arrays #{sym} :scalars #{sym}}`."
+  {:arrays #{} :scalars #{}})
+
 (defn- length-expression?
-  "A syntactic array-length operand: a value id, an integer, or integer arithmetic over them.
-   A collection-valued constructor argument (`(float-array [1 2 3])`) is not a length."
+  "A syntactic array-length operand: a scalar value id, an integer, or integer arithmetic over
+   them. A bare symbol counts only when it is positively a scalar (declared, or carrying an
+   integral scalar tag): `(float-array x)` with an array `x` is a copy constructor, and a symbol
+   of unknown kind is not a length either."
   [expression]
   (or (and (symbol? expression)
-           (nil? (some-> (types/sym-type-tag expression) dtype/dtype-for-array-tag)))
+           (not (contains? (:arrays *declared-kinds*) expression))
+           (or (contains? (:scalars *declared-kinds*) expression)
+               (contains? #{:long :int}
+                          (some-> (types/sym-type-tag expression) dtype/dtype-for-scalar-tag
+                                  dtype/canon))))
       (integer? expression)
       (and (seq? expression)
            (contains? '#{* + - quot clojure.core/* clojure.core/+ clojure.core/- clojure.core/quot
@@ -1439,7 +1452,15 @@
                                              (some? (alength-array scalar-form))))
                      state (cond
                              (and (symbol? scalar-form) (not= scalar-form symbol))
-                             (assoc-in state [:scalar-aliases symbol] scalar-form)
+                             (do
+                               ;; the alias inherits its target's declared kind
+                               (when (contains? (:scalars *declared-kinds*) scalar-form)
+                                 (set! *declared-kinds*
+                                       (update *declared-kinds* :scalars conj symbol)))
+                               (when (contains? (:arrays *declared-kinds*) scalar-form)
+                                 (set! *declared-kinds*
+                                       (update *declared-kinds* :arrays conj symbol)))
+                               (assoc-in state [:scalar-aliases symbol] scalar-form))
 
                              stable-scalar?
                              (if-let [earlier (get pure-scalar-ids scalar-form)]
@@ -1691,9 +1712,23 @@
    TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
    This normalization inserts an ordinary typed scalar binding immediately before its operation,
    so the same expression remains visible to JVM materialization and runtime specialization."
-  [source]
-  (binding [util/*shadowing-locals* (source-shadowing-locals source)]
-    (normalize-source* source)))
+  ([source] (normalize-source source {}))
+  ([source {:keys [array-types scalar-types]}]
+   ;; The let's own binders declare kinds too: a `^long n` binder is a scalar, a `^floats y`
+   ;; binder an array, exactly as the walker stamps them.
+   (let [binders (when (and (seq? source) (contains? #{'let 'let*} (first source)))
+                   (filter symbol? (take-nth 2 (second source))))
+         tagged (fn [kind?]
+                  (set (filter #(kind? (types/sym-type-tag %)) binders)))]
+     (binding [util/*shadowing-locals* (source-shadowing-locals source)
+               *declared-kinds*
+               {:arrays (into (set (keys array-types))
+                              (tagged #(some? (dtype/dtype-for-array-tag %))))
+                :scalars (into (set (keys scalar-types))
+                               (tagged #(contains? #{:long :int}
+                                                   (some-> % dtype/dtype-for-scalar-tag
+                                                           dtype/canon))))}]
+       (normalize-source* source)))))
 
 (declare coverage-decline*)
 
