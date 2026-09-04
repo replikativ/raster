@@ -44,6 +44,19 @@
     (testing "a low-output-occupancy, deep-K shape selects a graph-private split"
       (is (= :xmx-split-k (executable/strategy (select [13 640 262144])))))))
 
+(deftest scalar-layout-fallbacks-are-portable-typed-contractions
+  (doseq [variant [:nn :nt :tn]]
+    (let [graph (dispatch/alternative (emitted variant) :f32-scalar)
+          operation (get-in graph [:nodes 0 :operation])
+          kernel-body (artifact/attribute operation :kernel-body)
+          runtime-arguments (arguments 3 2 4)
+          {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)
+          call (graph-call/make graph buffers scalar-values)]
+      (is (body/kernel-body? kernel-body) (name variant))
+      (is (= :contraction (artifact/attribute operation :semantic-op)))
+      (is (= [256] (get-in kernel-body [:launch :workgroup-size])))
+      (is (graph-call/kernel-graph-call? call)))))
+
 (deftest split-k-storage-and-launch-use-the-selector-expression
   (let [scheduled (emitted :nn)
         runtime-arguments (arguments 13 640 262144)

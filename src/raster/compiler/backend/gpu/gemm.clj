@@ -8,7 +8,6 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
-            [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -71,25 +70,68 @@
     :provenance {:semantic-op :contraction :lowering :gemm-graph :phase phase}
     :attributes (merge {:strategy phase} attributes)}))
 
+(defn- scalar-contraction-form
+  [variant]
+  (case variant
+    :nn '(raster.par/contract C [[i m] [j n]] [[l k]]
+                               (* (aget A (+ (* i k) l))
+                                  (aget B (+ (* l n) j))))
+    :nt '(raster.par/contract C [[i m] [j n]] [[l k]]
+                               (* (aget A (+ (* i k) l))
+                                  (aget B (+ (* j k) l))))
+    :tn '(raster.par/contract C [[i m] [j n]] [[l k]]
+                               (* (aget A (+ (* l m) i))
+                                  (aget B (+ (* l n) j))))))
+
+(defn emit-portable-scalar-matrix-kernel
+  "Lower a dynamic f32 NN/NT/TN matrix product through the portable contraction schedule."
+  ([kernel-name variant]
+   (emit-portable-scalar-matrix-kernel kernel-name variant :opencl-intel))
+  ([kernel-name variant target-dialect]
+   (let [form (scalar-contraction-form variant)
+         facts (contraction-facts/contraction-facts form :dtype :float)
+         operation (contract-lower/contract-form->segred form :dtype :float :facts facts)
+         planned (contraction-schedule/plan-portable-body
+                  facts operation {}
+                  {:array-types {'A :float 'B :float 'C :float}
+                   :scalar-types {'m :int 'n :int 'k :int}})
+         _ (when-not (:ok planned)
+             (throw (ex-info "matrix product did not admit the portable contraction schedule"
+                             {:reason :raster/bug :variant variant :plan planned})))
+         kernel-body (:body planned)]
+     {:source
+      (kernel-body-opencl/emit-scalar-kernel
+       kernel-name kernel-body
+       {:target-dialect target-dialect
+        :parameter-names {'A "A" 'B "B" 'C "C" 'k "k" 'm "m" 'n "n"
+                          '_nseg "_nseg"}})
+      :kernel-body kernel-body
+      :workgroup-size 256})))
+
 (defn- scalar-graph
   [{:keys [id a b c m n k variant] :as spec}]
   (let [{:keys [abi arguments]} (outer-interface spec)
         {:keys [a-elements b-elements c-elements]} (extents spec)
         prefix (identifier (str id "_scalar"))
         kernel-name (str prefix "_gemm")
+        emitted (emit-portable-scalar-matrix-kernel kernel-name variant)
         gemm (artifact
               kernel-name
-              (codegen/emit-gemm-scalar-kernel kernel-name :variant variant)
-              [(kabi/slot a :input :float :c-name "A")
-               (kabi/slot b :input :float :c-name "B")
-               (kabi/slot c :output :float :c-name "C")
-               (kabi/slot m :scalar :int :c-name "m")
-               (kabi/slot n :scalar :int :c-name "n")
-               (kabi/slot k :scalar :int :c-name "k")]
-              [a b c m n k]
+              (:source emitted)
+              [(kabi/slot 'A :input :float :c-name "A" :role :operand
+                          :aliasing :no-write-alias)
+               (kabi/slot 'B :input :float :c-name "B" :role :operand
+                          :aliasing :no-write-alias)
+               (kabi/slot 'C :output :float :c-name "C" :role :result)
+               (kabi/slot 'k :scalar :int :c-name "k" :role :extent)
+               (kabi/slot 'm :scalar :int :c-name "m" :role :extent)
+               (kabi/slot 'n :scalar :int :c-name "n" :role :extent)
+               (kabi/slot '_nseg :scalar :int :c-name "_nseg" :role :bound)]
+              [a b c k m n c-elements]
               (klaunch/spec {:workgroup-size [256]
                              :group-count [(klaunch/ceil-div c-elements 256)]})
-              :scalar-gemm {:variant variant})]
+              :scalar-gemm {:variant variant :kernel-body (:kernel-body emitted)
+                            :semantic-op :contraction})]
     (kgraph/make
      {:inputs [(graph-buffer a :float a-elements :input)
                (graph-buffer b :float b-elements :input)]
