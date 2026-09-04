@@ -276,6 +276,7 @@
                     :instruction-family (:family matrix)
                     :dims [M N K]
                     :dimension-parameters {:m m-parameter :n n-parameter :k k-parameter}
+                    :dimension-values {m-parameter M n-parameter N k-parameter K}
                     :axis-symbols [i j k-sym]
                     :bindings bindings
                     :operation-buffers {:row row-buffer :col col-buffer :out out-buffer}

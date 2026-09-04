@@ -55,7 +55,11 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact row-major"
                               (matrix-plan/analyze
                                (assoc-in kernel [:parameters 0 :layout]
-                                         (layout/col-major shape :half)))))))))
+                                         (layout/col-major shape :half)))))))
+    (testing "runtime dimension identities are specialized to the storage contract"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dimension specializations"
+                            (matrix-plan/analyze
+                             (assoc-in kernel [:attributes :dimension-values 'M] 63)))))))
 
 (deftest intel-opencl-retains-its-own-instruction-legality
   (testing "neutral MMA analysis does not make an Intel DPAS emitter accept MMA"
