@@ -25,6 +25,19 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
+(deftest emitted-graph-interface-preserves-in-place-buffer-direction
+  (let [operation (segop/->SegMap
+                   901 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(inc (clojure.core/aget output i)) nil #{'output} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        scheduled (kgraph/from-segops [operation]
+                                      {:inputs #{'output} :outputs #{'output} :dtype :float})
+        emitted (sg/generate-kernel-graph
+                 scheduled :array-types {'output :float} :scalar-types {'n :int})]
+    (is (= ['output 'n] (:arguments emitted)))
+    (is (= [:inout :scalar] (mapv :kind (:abi emitted))))
+    (is (= :inout (get-in emitted [:inputs 0 :role])))))
+
 (deftest two-phase-reduction-graph-emits-its-explicit-scheduled-dataflow
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
