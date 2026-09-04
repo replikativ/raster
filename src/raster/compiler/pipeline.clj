@@ -54,7 +54,6 @@
             [raster.compiler.passes.parallel.write-read-fuse :as write-read-fuse]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
-            [raster.compiler.passes.parallel.gpu-plan :as gpu-plan]
             [raster.compiler.passes.scalar.mem-merge :as mem-merge]
             [raster.compiler.passes.scalar.resolve-alength :as resolve-alength]
             [raster.compiler.core.closure :as closure]
@@ -873,35 +872,6 @@
         (catch Exception e
           (println "Warning: could not register GPU kernel dispatches:" (.getMessage e)))))))
 
-(defn- pass-gpu-plan
-  "GPU execution plan: rewrite BLAS calls to GPU GEMM kernels,
-  plan DeviceBuffer allocations for persistent GPU execution.
-  Only runs when target-device is a GPU device (Level Zero, CUDA, ROCm).
-  (=> :dce-cleaned :gpu-planned)"
-  [form opts]
-  (let [target-device (:target-device opts)
-        dtype (:dtype opts)]
-    (if-not (device/gpu-target? target-device)
-      ;; No GPU target — pass through
-      form
-      (let [result (gpu-plan/gpu-plan-pass form
-                                           :dtype dtype
-                                           :weight-params (:weight-params opts)
-                                           :active-params (:active-params opts)
-                                           :target-device target-device)
-            kernels (:kernels result)]
-        (register-gpu-kernels! kernels target-device)
-        (if (pos? (+ (get-in result [:stats :gemm-rewrites] 0)
-                     (get-in result [:stats :transpose-rewrites] 0)
-                     (get-in result [:stats :map-rewrites] 0)
-                     (get-in result [:stats :reduce-rewrites] 0)))
-          {:form (:form result)
-           :stats (:stats result)
-           :kernels kernels
-           :gpu-buffers (:gpu-buffers result)}
-          ;; Nothing rewritten — pass through original form
-          form)))))
-
 (defn- pass-materialize
   "Materialize pure par/map forms into alloc + par/map! for backend consumption.
   Pure par/map forms are value-producing with no output buffer. This pass
@@ -1072,7 +1042,6 @@
    ;; Building blocks for custom/GPU pipelines
    :expand           {:from :*                 :to :expanded          :fn pass-expand}
    :mode-select      {:from :walked            :to :walked            :fn pass-mode-select}
-   :gpu-plan         {:from :dce-cleaned       :to :gpu-planned       :fn pass-gpu-plan}
    :late-cleanup     {:from :*                 :to :late-cleaned      :fn pass-late-cleanup}})
 
 ;; ================================================================
@@ -2487,7 +2456,7 @@
           ;; ONE source for the sequence: the vector that RAN. Labels come from pass-specs (a
           ;; pass without :label prints its keyword — loud, never dropped). The old parallel
           ;; `stage-labels` table lacked three live passes (late-cleanup, loop-lift,
-          ;; write-read-fuse) and carried three dead ones (expand, mode-select, gpu-plan): a
+          ;; write-read-fuse) and carried dead helper passes (expand, mode-select): a
           ;; fourth disagreeing description of the pipeline, in the tool meant to be the truth.
           stage-labels (into {} (map (fn [[k spec]] [k (or (:label spec) (name k))])) pass-specs)
           walked (:walked result)
