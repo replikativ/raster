@@ -305,6 +305,20 @@
    :tn {:row [:contract0 :free0] :col [:contract0 :free1]}
    :tt {:row [:contract0 :free0] :col [:free1 :contract0]}})
 
+(def dense-batched-matrix-layouts
+  "Canonical dense batch×matrix storage layouts.
+
+   The leading free axis selects an independent slab; the other two free axes and the contracted
+   axis retain the ordinary M/N/K meaning.  This first schedule row is deliberately NN-only.
+   Transposed batched operands require a compiler-owned batched layout transform before they can
+   enter the same matrix body; they must not be accepted by assuming a stride convention."
+  {:both       {:row [:free0 :free1 :contract0]
+                :col [:free0 :contract0 :free2]}
+   :shared-col {:row [:free0 :free1 :contract0]
+                :col [:contract0 :free2]}
+   :shared-row {:row [:free1 :contract0]
+                :col [:free0 :contract0 :free2]}})
+
 (defn- role-map
   "The axis-map a role-spec denotes, e.g. [:free0 :contract0] → of-axes [[i M] [l L]] (index i·L+l)."
   [facts axis-roles]
@@ -344,17 +358,22 @@
 
    This does not introduce a GEMM semantic node.  It proves that a two-free/one-contracted additive
    reduction is exactly a product of two dense operands in one of the four AxisMap orientations,
-   and returns the schedule-facing row/column bindings and M/N/K extents.  Anything else returns a
-   structured decline so sparse gathers, extra factors, non-additive monoids, and result transforms
-   remain on their general contraction schedules."
+   or that a three-free reduction is a leading batch of canonical NN products.  It returns only
+   schedule-facing row/column bindings and B/M/N/K extents.  Anything else returns a structured
+   decline so sparse gathers, extra factors, non-additive monoids, and result transforms remain on
+   their general contraction schedules."
   [facts]
   (when-not (facts? facts)
     (throw (ex-info "dense matrix classification requires verified contraction facts"
                     {:reason :raster/bug :facts facts})))
   (let [{:keys [free-axes contract-axes operands epilogue]} facts
-        {:keys [combine neutral element]} (scalar-reduction-view facts)]
+        {:keys [combine neutral element]} (scalar-reduction-view facts)
+        batched? (= 3 (count free-axes))
+        layouts (if batched? dense-batched-matrix-layouts dense-matrix-layouts)
+        layout-order (if batched? [:both :shared-col :shared-row] [:nn :nt :tn :tt])]
     (cond
-      (not= [2 1] [(count free-axes) (count contract-axes)])
+      (not (and (contains? #{2 3} (count free-axes))
+                (= 1 (count contract-axes))))
       {:ok false :reason :not-2-free}
 
       (not (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
@@ -370,17 +389,26 @@
       {:ok false :reason :matrix-graph-result-transform-not-lowered}
 
       :else
-      (if-let [[variant verdict]
-               (some (fn [variant]
-                       (let [verdict (check-layout facts (get dense-matrix-layouts variant))]
-                         (when (:ok verdict) [variant verdict])))
-                     [:nn :nt :tn :tt])]
-        {:ok true
-         :variant variant
-         :bindings (:bindings verdict)
-         :dimensions [(second (first free-axes))
-                      (second (second free-axes))
-                      (second (first contract-axes))]}
+      (if-let [[layout-kind verdict]
+               (some (fn [layout-kind]
+                       (let [verdict (check-layout facts (get layouts layout-kind))]
+                         (when (:ok verdict) [layout-kind verdict])))
+                     layout-order)]
+        (cond->
+         {:ok true
+          :variant (if batched? :nn layout-kind)
+          :batched? batched?
+          :bindings (:bindings verdict)
+          :dimensions (if batched?
+                        [(second (second free-axes))
+                         (second (nth free-axes 2))
+                         (second (first contract-axes))]
+                        [(second (first free-axes))
+                         (second (second free-axes))
+                         (second (first contract-axes))])}
+          batched? (assoc :batch (second (first free-axes))
+                          :batching {:row (contains? #{:both :shared-col} layout-kind)
+                                     :col (contains? #{:both :shared-row} layout-kind)}))
         {:ok false :reason :non-dense-matrix-layout
          :actual (mapv (juxt :sym :idx) operands)}))))
 

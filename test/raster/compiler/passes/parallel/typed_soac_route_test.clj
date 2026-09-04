@@ -1127,6 +1127,56 @@
         (is (= :mixed-dpas-target-capability
                (get-in portable [:attributes :matrix-graph-decline :reason])))))))
 
+(deftest batched-f32-contraction-derives-one-grid-z-matrix-schedule
+  (let [source
+        '(let* [step (raster.par/contract
+                      C [[b batch] [i m] [j n]] [[l k]]
+                      (* (clojure.core/aget
+                          A (+ (* (+ (* b m) i) k) l))
+                         (clojure.core/aget B (+ (* l n) j))))]
+           step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ze:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'batch :int 'm :int 'n :int 'k :int}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        scheduled (contract-route/route-typed-contraction-dispatch
+                   algorithm operation :dtype :float :desc descriptor
+                   :precision :mixed-f16-f32)
+        matrix-graph (kdispatch/alternative scheduled :xmx-batched)
+        matrix-node (last (:nodes matrix-graph))
+        matrix-body (get-in matrix-node [:operation :attributes :kernel-body])
+        buffer-views (into {} (map (juxt :id identity)) (:views matrix-body))
+        select (fn [batch m n k]
+                 (-> (kdispatch/select-alternative
+                      scheduled [:a :b :c batch m n k])
+                     kdispatch/alternative-strategy))]
+    (is (= [:portable-segred :xmx-batched]
+           (mapv kdispatch/alternative-strategy (:alternatives scheduled))))
+    (is (= '[A B C batch m n k] (:arguments matrix-graph)))
+    (is (= :xmx-batched (select 4 64 128 64)))
+    (is (= :portable-segred (select 4 64 126 64)))
+    (is (= :portable-segred (select 4 64 128 62)))
+    (is (= {:row true :col false}
+           (get-in matrix-graph [:attributes :batching])))
+    (is (nil? (get buffer-views 'batch-rhs-view))
+        "shared weights remain the original stable buffer, not a fabricated batched view")
+    (is (= '[k n]
+           (:shape (first (filter #(= :rhs (:role %)) (:parameters matrix-body)))))
+        "the matrix ABI records the shared weight shape without a leading batch extent")
+    (is (= 3 (count (get-in matrix-node [:operation :launch :group-count]))))
+    (is (= 'batch
+           (get-in matrix-node [:operation :launch :group-count 2 :value]))
+        "the third launch dimension is the semantic batch extent")))
+
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]

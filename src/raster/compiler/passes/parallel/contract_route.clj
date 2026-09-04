@@ -997,23 +997,35 @@
       :else
       (let [[m n k] (:dimensions matrix-view)
             {:keys [row col]} (:bindings matrix-view)
-            emitted (gpu-gemm/emit-executable
-                     {:id [:typed-contraction operation-id]
-                      :a row :b col :c (:out facts)
-                      :m m :n n :k k
-                      :variant (:variant matrix-view)
-                      :precision :mixed-f16-f32
-                      :tile (:tile target-schedule)
-                      :fill-workgroups (:fill-workgroups target-schedule)})
-            alternatives (->> (:alternatives emitted)
-                              (remove #(= :f32-scalar (get-in % [:attributes :strategy])))
-                              (mapv #(reinterface-graph % abi arguments effects operation-id)))
+            emit-spec {:id [:typed-contraction operation-id]
+                       :a row :b col :c (:out facts)
+                       :m m :n n :k k
+                       :variant (:variant matrix-view)
+                       :precision :mixed-f16-f32
+                       :tile (:tile target-schedule)
+                       :fill-workgroups (:fill-workgroups target-schedule)}
+            emitted (if (:batched? matrix-view)
+                      (gpu-gemm/emit-batched-matrix-alternative
+                       (assoc emit-spec
+                              :batch (:batch matrix-view)
+                              :batching (:batching matrix-view)))
+                      (gpu-gemm/emit-executable emit-spec))
+            raw-alternatives (if (:batched? matrix-view)
+                               [(:graph emitted)]
+                               (remove #(= :f32-scalar
+                                           (get-in % [:attributes :strategy]))
+                                       (:alternatives emitted)))
+            alternatives (mapv #(reinterface-graph % abi arguments effects operation-id)
+                               raw-alternatives)
             selector (:selector emitted)]
         {:alternatives alternatives
          :selector selector
          :schedule {:family :matrix
                     :precision :mixed-f16-f32
                     :variant (:variant matrix-view)
+                    :batched? (:batched? matrix-view)
+                    :batch (:batch matrix-view)
+                    :batching (:batching matrix-view)
                     :bindings (:bindings matrix-view)
                     :dimensions (:dimensions matrix-view)
                     :tile (:tile target-schedule)
@@ -1048,7 +1060,8 @@
         fallback-strategy (:strategy (first candidates))
         common-effects (:effects (:artifact (first candidates)))
         mixed (mixed-dpas-alternatives program operation options abi arguments common-effects)
-        default-strategy (if (seq (:alternatives mixed)) :xmx-direct fallback-strategy)
+        matrix-default (some-> mixed :alternatives first kdispatch/alternative-strategy)
+        default-strategy (or matrix-default fallback-strategy)
         schedule-identity (select-keys mixed [:schedule :decline])
         dispatch-id (candidate-dispatch-id operation-id candidates schedule-identity)
         candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)
@@ -1070,8 +1083,11 @@
                    :candidate-schedules
                    (cond-> (into {} (map (juxt :strategy :candidate-schedule)) candidates)
                      (:schedule mixed)
-                     (assoc :xmx-direct (:schedule mixed)
-                            :xmx-split-k (assoc (:schedule mixed) :split-k? true)))
+                     (merge
+                      (if (:batched? (:schedule mixed))
+                        {:xmx-batched (:schedule mixed)}
+                        {:xmx-direct (:schedule mixed)
+                         :xmx-split-k (assoc (:schedule mixed) :split-k? true)})))
                    :declines (:declines routed)
                    :matrix-graph-decline (:decline mixed)
                    :tuning (typed-contraction-tuning-contract schedule dispatch-id abi
