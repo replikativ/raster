@@ -11,16 +11,18 @@
    tiles = 128 workgroups, which FILL the ~32-workgroup iGPU where one slab (2 wg)
    starves it.
 
-   Kernel: raster.gpu.ze-runtime/bind-registered-gemm-batched!, lowered from three explicit
-   grid-Z-selected KernelBody buffer views. This is the batched NN primitive C[b]=A[b]·B[b]; the -tn layout
-   (Wᵀ) is staged host-side here (transpose each W slab → A) to isolate the GEMM lever
-   the GATE measures.
+   The target artifact is derived from an ordinary batched TypedSOAC contraction and contains
+   three explicit grid-Z-selected KernelBody buffer views. This is the batched NN schedule
+   C[b]=A[b]·B[b]; the -tn layout (Wᵀ) is staged host-side here (transpose each W slab → A)
+   to isolate the matrix-instruction lever the GATE measures.
 
    GATE (real shape 64 slabs, m=k=64, n=256): device-event GFLOPS ≥ ~900 (½ of the
    oneDNN 1829-GFLOPS ceiling, ~10× the 79-GFLOPS scalar path) → the lever is real."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
             [raster.dl.nn :as nn]
-            [raster.dl.attention :as attn]))
+            [raster.dl.attention :as attn]
+            [raster.gpu.core :as gpu]))
 
 (def ^:private gpu-available?
   (delay (try (require 'raster.gpu.ze-runtime)
@@ -33,11 +35,6 @@
 (defn- da ^doubles [n seed]
   (let [r (java.util.Random. (long seed)) a (double-array n)]
     (dotimes [i n] (aset a i (.nextGaussian r))) a))
-
-(defn- median [xs]
-  (let [v (vec (sort xs)) n (count v)]
-    (if (odd? n) (nth v (quot n 2))
-        (/ (+ (nth v (dec (quot n 2))) (nth v (quot n 2))) 2.0))))
 
 ;; ── Host transpose-A staging: A[b] = W[b]ᵀ, flattened [batch, seq, seq] ───────────
 (defn- transpose-slabs ^floats [^floats W batch seq-len]
@@ -74,19 +71,7 @@
 (deftest dv-batched-gemm-gpu-gate
   (if-not @gpu-available?
     (println "  [SKIP] dv batched-gemm gate: no Level Zero GPU")
-    (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          make-buffer (ns-resolve ze 'make-buffer)
-          buf-f16-of  (ns-resolve ze 'buffer-of-floats-as-half)
-          upload!     (ns-resolve ze 'array->buffer!)
-          download    (ns-resolve ze 'buffer->array)
-          free!       (ns-resolve ze 'free-buffer!)
-          record!     (ns-resolve ze 'record-graph!)
-          replay!     (ns-resolve ze 'replay-graph!)
-          reset-ev!   (ns-resolve ze 'reset-graph-events!)
-          read-ts!    (ns-resolve ze 'read-graph-timestamps!)
-          destroy!    (ns-resolve ze 'destroy-graph!)
-          batched!    (ns-resolve ze 'bind-registered-gemm-batched!)
-          ;; real gemma attention shape: 64 slabs (B·n-heads), seq=64, hd=256
+    (let [;; real gemma attention shape: 64 slabs (B·n-heads), seq=64, hd=256
           batch 64 sl 64 hd 256
           m sl k sl n hd
           nQ (* batch sl hd)
@@ -95,26 +80,32 @@
           W ^floats (attn/batched-causal-attn-weights Q K batch sl hd)
           A (transpose-slabs W batch sl)           ;; [batch, m=seq, k=seq]  (= Wᵀ per slab)
           B dO                                     ;; [batch, k=seq, n=hd]
-          a16 (buf-f16-of A)
-          b16 (buf-f16-of B)
-          c   (make-buffer nQ :float)]
-      (try
-        (let [g (record! [{:bound (batched! a16 b16 c m n k batch)
-                           :kernel-name "gemm_nonsquare_batched"}]
-                         {:profile? true})]
+          scheduled (support/batched-dispatch :ze:0)
+          artifact (support/matrix-artifact scheduled :xmx-batched)]
+      (gpu/with-gpu-session [session :ze:0]
+        (gpu/alloc! session {:a [:half (* batch m k) (support/half-array A)]
+                             :b [:half (* batch k n) (support/half-array B)]
+                             :c [:float nQ nil]})
+        (let [handle (gpu/bind-kernel-executable!
+                      session :typed-batched-matrix artifact
+                      [:a :b :c
+                       {:type :int :value m}
+                       {:type :int :value n}
+                       {:type :int :value k}
+                       {:type :int :value batch}]
+                      {:profile? true})]
           (try
-            ;; warmup
-            (dotimes [_ 3] (replay! g) (reset-ev! g))
-            ;; timed replays (interleaved medians)
-            (let [samples (vec (for [_ (range 13)]
-                                 (do (replay! g)
-                                     (let [ts (read-ts! g)]
-                                       (-> ts :kernels first :ms)))))
-                  med-ms (median samples)
+            (gpu/run-kernel-graph! session handle)
+            (let [measurement (gpu/measure-bound-kernel-graph!
+                               session handle
+                               :warmup-iterations 3 :budget-ms 1000
+                               :min-samples 13 :max-samples 13)
+                  samples (mapv #(/ % 1.0e6) (:samples-ns measurement))
+                  med-ms (/ (:median-ns measurement) 1.0e6)
                   flops (* 2.0 batch m k n)
                   gflops (/ flops (* med-ms 1.0e6))
                   ceil 1829.0 scalar-gflops 79.0
-                  out ^floats (download c)
+                  out ^floats (gpu/download session :c)
                   numr (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2))) out scalar))
                   denr (reduce max 1e-9 (map #(Math/abs (double %)) scalar))
                   relerr (/ numr denr)]
@@ -129,5 +120,5 @@
                                relerr (if (>= gflops 900.0) "PASS" "FAIL")))
               (is (< relerr 5.0e-3)
                   (str "batched-GEMM dV vs scalar rel-err " relerr " (f16 floor ~1e-3)")))
-            (finally (destroy! g))))
-        (finally (doseq [b [a16 b16 c]] (free! b)))))))
+            (finally
+              (gpu/release-kernel-graph! session handle))))))))

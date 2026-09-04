@@ -1336,18 +1336,11 @@
 ;; GPU GEMM (non-square XMX)
 ;; ================================================================
 
-(defn- emit-scheduled-gemm
-  "Ask the compiler for the shared scheduled matrix body and its direct OpenCL lowering."
-  [kernel-name c-dtype tile epilogue]
-  ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-matrix-kernel)
-   {:kernel-name kernel-name
-    :id [:resident-gemm kernel-name]
-    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
-    :tile tile :result-dtype c-dtype :epilogue epilogue
-    :provenance {:dialect :resident-runtime}}))
-
 (defn- emit-scheduled-split-k-gemm
-  "Ask the compiler for a grid-Z sliced K reduction over resident buffers."
+  "Legacy explicit-split-factor benchmark seam.
+
+   Ordinary direct/split selection is compiler-owned. This remains only until split count becomes
+   a finite typed-contraction schedule space rather than a runtime-specific benchmark parameter."
   [kernel-name tile]
   ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-split-k-kernel)
    {:kernel-name kernel-name
@@ -1356,44 +1349,7 @@
     :tile tile
     :provenance {:dialect :resident-runtime}}))
 
-(defn- emit-scheduled-batched-gemm
-  "Ask the compiler for grid-Z-selected independent resident matrix views."
-  [kernel-name tile]
-  ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-batched-matrix-kernel)
-   {:kernel-name kernel-name
-    :id [:resident-gemm kernel-name]
-    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K :batch 'batch
-    :tile tile
-    :provenance {:dialect :resident-runtime}}))
-
 (declare gemm-tile)
-
-(def ^:private gemm-cache
-  "Cache for compiled GEMM kernels, keyed by C-output dtype (:half | :float).
-   Each entry is {:module :kernel :kernel-name}. (A/B are always fp16 in.)"
-  (atom {}))
-
-(defn- ensure-gemm-kernel!
-  "Lazily compile + cache the XMX gemm_nonsquare kernel for a given C-output dtype
-   (:half or :float — A/B always fp16, fp32 accumulate). Returns {:module :kernel :kernel-name}."
-  [c-dtype]
-  (ensure-init!)
-  (or (get @gemm-cache c-dtype)
-      (let [kname (str "gemm_nonsquare_" (name c-dtype))
-            tile (gemm-tile)
-            emitted (emit-scheduled-gemm kname c-dtype tile nil)
-            cl-src (:source emitted)
-            device-hex (:device-id-hex @state)
-            spv (do (require 'raster.compiler.support.spirv-cache)
-                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                     cl-src :device device-hex))
-            module (load-module! spv)
-            kernel (create-kernel module kname)
-            entry {:module module :kernel kernel :kernel-name kname
-                   :tile tile :kernel-body (:kernel-body emitted)
-                   :workgroup (:workgroup-size emitted)}]
-        (swap! gemm-cache assoc c-dtype entry)
-        entry)))
 
 (defn- gemm-tile
   "The GEMM tile for this device, from the ONE source (compiler.core.hardware/gemm-tile-for).
@@ -2164,187 +2120,6 @@
   [kernel-name]
   (get @kernel-registry kernel-name))
 
-(defn bind-registered-gemm!
-  "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for legacy benchmark
-  recording. A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
-  {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
-  handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
-  ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
-  ([a b c m n k c-dtype]
-   ;; Fail loud on an output-buffer dtype mismatch: a :half kernel writing 2-byte halfs into a
-   ;; :float (4-byte) buffer reads back as silent zeros/garbage — the exact silent-miscompile the
-   ;; compiler is built to prevent. The kernel's output dtype IS c-dtype; the buffer must agree.
-   (when-let [bd (:dtype c)]
-     (when (not= bd c-dtype)
-       (throw (ex-info (str "bind-registered-gemm!: output buffer dtype " bd " ≠ kernel output dtype " c-dtype
-                            " — a mismatched write reads back as garbage. Allocate C as " c-dtype
-                            " or pass the matching c-dtype.")
-                       {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
-   (let [{:keys [module kernel-name tile workgroup]} (ensure-gemm-kernel! c-dtype)
-         kh (create-kernel-fresh module kernel-name)
-         m (long m) n (long n) k (long k)
-         args [(:segment a) (:segment b) (:segment c)
-               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-         bnd (bind-kernel! kh workgroup args)
-         gc ^MemorySegment (:gc-seg bnd)]
-     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n tile))))))   ;; X = gc-n
-     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m tile))))))   ;; Y = gc-m
-     (.set gc I32 8 (int 1))
-     bnd)))
-
-;; ── TILE-PARAMETRIC GEMM (autotune-facing) ─────────────────────────────────────
-;; The default bind-registered-gemm! above schedules the device-derived default tile. This path
-;; takes an EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune candidate) through the
-;; same KernelBody scheduler and derives launch geometry from that body. At the default tile it
-;; produces identical source and launch geometry.
-
-(def ^:private gemm-tiled-cache
-  "Compiled tile-parametric GEMM kernels, keyed by [c-dtype tile-map]. Distinct tiles are distinct
-   kernels (distinct __kernel names)."
-  (atom {}))
-
-(defn- tile-signature [tile]
-  (let [{:keys [block-m block-n sg-m sg-n block-k num-stages]} tile]
-    (str block-m "x" block-n "_" sg-m "x" sg-n "_k" block-k "_s" (or num-stages 3))))
-
-(defn- ensure-gemm-kernel-tiled!
-  "Compile + cache the GEMM kernel for [c-dtype × tile]. Returns {:module :kernel-name :tile}."
-  [c-dtype tile]
-  (ensure-init!)
-  (or (get @gemm-tiled-cache [c-dtype tile])
-      (let [kname (str "gemm_tiled_" (name c-dtype) "_" (tile-signature tile))
-            emitted (emit-scheduled-gemm kname c-dtype tile nil)
-            cl-src (:source emitted)
-            spv (do (require 'raster.compiler.support.spirv-cache)
-                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                     cl-src :device (:device-id-hex @state)))
-            module (load-module! spv)
-            entry {:module module :kernel-name kname :tile tile
-                   :kernel-body (:kernel-body emitted)
-                   :workgroup (:workgroup-size emitted)}]
-        (swap! gemm-tiled-cache assoc [c-dtype tile] entry)
-        entry)))
-
-(defn bind-registered-gemm-tiled!
-  "Bind the GEMM kernel for an EXPLICIT tile over resident fp16 buffers, DERIVING the launch
-   geometry from the tile. `tile` is a derive-gemm-tile map {:block-m :block-n :sg-m :sg-n :block-k
-   :matrix}. Fail-loud on an output-dtype mismatch, like bind-registered-gemm!."
-  [a b c m n k c-dtype tile]
-  (when-let [bd (:dtype c)]
-    (when (not= bd c-dtype)
-      (throw (ex-info (str "bind-registered-gemm-tiled!: output buffer dtype " bd " ≠ kernel dtype " c-dtype)
-                      {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
-  (let [{:keys [module kernel-name workgroup]} (ensure-gemm-kernel-tiled! c-dtype tile)
-        {:keys [block-m block-n]} tile
-        kh   (create-kernel-fresh module kernel-name)
-        args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd  (bind-kernel! kh workgroup args)
-        gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))   ;; X = gc-n
-    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))   ;; Y = gc-m
-    (.set gc I32 8 (int 1))
-    bnd))
-
-;; ── FUSED-EPILOGUE GEMM (C = ScalarRegion(A·B, row, col)) ──────────────────────
-;; One typed KernelBody for GEMM + a same-position elementwise consumer (bias/act/residual), the
-;; training-M win (~15-18% at M≥512, measured). Runtime bindings remain separate from the scalar
-;; program so cache identity and ABI order come from compiler data rather than source strings.
-(def ^:private gemm-epilogue-cache (atom {}))
-
-(defn- resident-epilogue-program
-  [epilogue]
-  (let [allowed #{:acc :expr :operands :scalars :dtype :bindings}
-        unsupported (seq (remove allowed (keys epilogue)))]
-    (when unsupported
-      (throw (ex-info "resident GEMM epilogue contains unsupported fields"
-                      {:unsupported (vec unsupported) :allowed allowed})))
-    (when-not (map? (:bindings epilogue))
-      (throw (ex-info "resident GEMM epilogue requires explicit runtime bindings"
-                      {:epilogue epilogue})))
-    (dissoc epilogue :bindings)))
-
-(defn- ensure-gemm-epilogue-kernel!
-  "Compile and cache a typed ScalarRegion GEMM by its structural program, output dtype and tile."
-  [c-dtype tile epilogue]
-  (ensure-init!)
-  (let [program (resident-epilogue-program epilogue)
-        cache-key [c-dtype tile program]]
-    (or (get @gemm-epilogue-cache cache-key)
-        (let [program-id (Integer/toUnsignedString (hash program) 16)
-              kname (str "gemm_epi_" program-id "_" (name c-dtype) "_" (tile-signature tile))
-              emitted (emit-scheduled-gemm kname c-dtype tile program)
-              cl-src (:source emitted)
-              spv (do (require 'raster.compiler.support.spirv-cache)
-                      ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                       cl-src :device (:device-id-hex @state)))
-              module (load-module! spv)
-              entry {:module module :kernel-name kname :tile tile :program program
-                     :kernel-body (:kernel-body emitted)
-                     :workgroup (:workgroup-size emitted)}]
-          (swap! gemm-epilogue-cache assoc cache-key entry)
-          entry))))
-
-(defn- resident-epilogue-argument
-  [parameter value]
-  (case (:kind parameter)
-    :input
-    (do
-      (when-not (instance? DeviceBuffer value)
-        (throw (ex-info "resident epilogue buffer binding is not a DeviceBuffer"
-                        {:parameter parameter :actual (type value)})))
-      (when-not (= (dt/canon (:dtype parameter)) (dt/canon (:dtype value)))
-        (throw (ex-info "resident epilogue buffer dtype differs from its KernelBody ABI"
-                        {:parameter parameter :actual (:dtype value)})))
-      (:segment value))
-
-    :scalar
-    {:type (case (dt/canon (:dtype parameter))
-             :int8 :byte
-             :byte :byte
-             :half :half
-             :float :float
-             :double :double
-             :int :int
-             :long :long
-             (throw (ex-info "resident epilogue scalar dtype is unsupported"
-                             {:parameter parameter})))
-     :value value}
-
-    (throw (ex-info "resident epilogue ABI slot must be input or scalar"
-                    {:parameter parameter}))))
-
-(defn bind-registered-gemm-epilogue!
-  "Bind C = ScalarRegion(A·B) using the same typed epilogue descriptor as the compiler.
-
-   `epilogue` contains :acc, :expr, ordered :operands/:scalars, and a :bindings map from each
-   operand/scalar identity to its resident buffer or scalar value. KernelBody owns the physical
-   ABI and launch geometry; target source callbacks and declaration strings are not accepted."
-  [a b c m n k c-dtype tile epilogue]
-  (when-let [bd (:dtype c)]
-    (when (not= bd c-dtype)
-      (throw (ex-info (str "bind-registered-gemm-epilogue!: output buffer dtype " bd " ≠ kernel dtype " c-dtype) {}))))
-  (let [{:keys [module kernel-name kernel-body workgroup]}
-        (ensure-gemm-epilogue-kernel! c-dtype tile epilogue)
-        {:keys [block-m block-n]} tile
-        parameters (filterv #(= :epilogue (:role %)) (:parameters kernel-body))
-        expected (mapv :id parameters)
-        bindings (:bindings epilogue)
-        provided (set (keys bindings))
-        _ (when-not (= (set expected) provided)
-            (throw (ex-info "resident epilogue bindings differ from the KernelBody ABI"
-                            {:expected expected :provided (vec (keys bindings))})))
-        kh   (create-kernel-fresh module kernel-name)
-        args (vec (concat [(:segment a) (:segment b) (:segment c)
-                           {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-                          (map #(resident-epilogue-argument % (get bindings (:id %))) parameters)))
-        bnd  (bind-kernel! kh workgroup args)
-        gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
-    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
-    (.set gc I32 8 (int 1))
-    bnd))
-
 ;; ── SPLIT-K GEMM (the low-occupancy-shape schedule) ────────────────────────────
 ;; A GEMM whose (M,N) tiling yields fewer workgroups than fill the machine —
 ;; ceil(N/128)·ceil(M/128) — cannot be rescued by a better inner loop: the machine
@@ -2432,61 +2207,6 @@
               {:type :int :value (int mn)}]
         bnd (bind-kernel! kh 256 args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double mn) 256.0))))
-    bnd))
-
-;; ── BATCHED XMX GEMM (bmm) ───────────────────────────────────────────────────
-;; A per-slab GEMM whose (M,N) tiling launches too few workgroups to fill the
-;; machine is occupancy-bound (see split-k). When the deficit is instead resolved
-;; by MANY independent slabs (attention over heads: dV[b]=W[b]ᵀ·dO[b], 64 slabs of
-;; m=k=64,n=256), a single batched kernel over a 3D grid (z = slab) launches
-;; slabs × per-slab-tiles workgroups — feeding the DPAS array across all slabs where
-;; one slab starves it. A/B/C are contiguous [batch,M,K]/[batch,K,N]/[batch,M,N]
-;; f16/f16/f32 buffers; each workgroup offsets its base by its slab. This is the
-;; batched-nn primitive; the -tn/-nt layouts are handled by staging A/B (convert +
-;; batched transpose) exactly as the single GEMM's resident path does.
-
-(def ^:private gemm-batched-cache (atom nil))
-
-(defn- ensure-gemm-batched-kernel!
-  "Lazily compile + cache the BATCHED XMX gemm (f16 A/B in, f32 C out, grid-z=slab).
-   Returns {:module :kernel :kernel-name}."
-  []
-  (ensure-init!)
-  (when (nil? @gemm-batched-cache)
-    (let [kname "gemm_nonsquare_batched"
-          tile (gemm-tile)
-          emitted (emit-scheduled-batched-gemm kname tile)
-          cl-src (:source emitted)
-          spv (do (require 'raster.compiler.support.spirv-cache)
-                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                   cl-src :device (:device-id-hex @state)))
-          module (load-module! spv)
-          kernel (create-kernel module kname)]
-      (clojure.core/reset! gemm-batched-cache
-                           {:module module :kernel kernel :kernel-name kname :tile tile
-                            :kernel-body (:kernel-body emitted)
-                            :workgroup (:workgroup-size emitted)})))
-  @gemm-batched-cache)
-
-(defn bind-registered-gemm-batched!
-  "Bind the BATCHED XMX GEMM: C[b] = A[b]·B[b] (nn) for b in 0..batch-1, over a 3D
-  grid — X = ceil(n/128), Y = ceil(m/128), Z = batch — so the launched workgroup
-  count is `batch`× the plain GEMM's. A[batch,m,k] & B[batch,k,n] f16, C[batch,m,n]
-  f32, all contiguous. Fresh kernel handle per bind (LZ kernel args are mutable
-  handle state)."
-  [a b c m n k batch]
-  (let [{:keys [module kernel-name tile workgroup]} (ensure-gemm-batched-kernel!)
-        {:keys [block-m block-n]} tile
-        kh (create-kernel-fresh module kernel-name)
-        m (long m) n (long n) k (long k) batch (long batch)
-        args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int m)} {:type :int :value (int n)}
-              {:type :int :value (int k)} {:type :int :value (int batch)}]
-        bnd (bind-kernel! kh workgroup args)
-        gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n))))) ;; X = gc-n
-    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m))))) ;; Y = gc-m
-    (.set gc I32 8 (int batch))                              ;; Z = slabs
     bnd))
 
 (def ^:private convert-cache (atom {}))

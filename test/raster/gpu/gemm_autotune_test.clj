@@ -11,8 +11,10 @@
    not a 'maximize splits' heuristic — finds a measured beneficial interior point.  The exact
    factor is deliberately hardware-, driver-, and load-dependent."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
+            [raster.compiler.core.hardware :as hw]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.compiler.core.hardware :as hw]))
+            [raster.gpu.core :as gpu]))
 
 ;; ── the real cost-fn: device-event time of the resident split-k XMX GEMM ─────────
 (defn- bench-splitk-ms
@@ -71,42 +73,54 @@
 
 ;; ── T3: the TILE axis — every finite emitted candidate is correct and device-priced ──
 (defn- run-tiled-gemm
-  "Run bind-registered-gemm-tiled! for `tile` at (m,n,k) over fixed A/B, returning [C median-ms]."
-  [ze a16 b16 m n k tile]
-  (let [g!   (ns-resolve ze 'make-buffer)   free (ns-resolve ze 'free-buffer!)
-        rec  (ns-resolve ze 'record-graph!) rep (ns-resolve ze 'replay-graph!)
-        rst  (ns-resolve ze 'reset-graph-events!) rts (ns-resolve ze 'read-graph-timestamps!)
-        dst  (ns-resolve ze 'destroy-graph!) ba (ns-resolve ze 'buffer->array)
-        btg  (ns-resolve ze 'bind-registered-gemm-tiled!)
-        c    (g! (* m n) :float)]
+  "Measure one tile selected from an ordinary typed contraction.
+
+   The compiler-emitted matrix artifact is isolated so this remains a target-kernel tile ruler;
+   binding, launch geometry, profiling, and ownership still go through the generic runtime API."
+  [session m n k tile key]
+  (let [scheduled (support/dense-dispatch :ze:0 :tile tile)
+        artifact (support/matrix-artifact scheduled :xmx-direct)
+        c-key [:tile-output key]
+        _ (gpu/alloc! session {c-key [:float (* m n) nil]})
+        handle (gpu/bind-kernel-executable!
+                session [:tile-candidate key] artifact
+                [:tile-a :tile-b c-key
+                 {:type :int :value m}
+                 {:type :int :value n}
+                 {:type :int :value k}]
+                {:profile? true})]
     (try
-      (let [g (rec [{:bound (btg a16 b16 c m n k :float tile) :kernel-name "t"}] {:profile? true})]
-        (try
-          (dotimes [_ 2] (rep g) (rst g))
-          (let [ms (vec (for [_ (range 7)] (do (rep g) (reduce + (map :ms (:kernels (rts g)))))))]
-            [(vec (ba c)) (nth (sort ms) 3)])
-          (finally (dst g))))
-      (finally (free c)))))
+      (gpu/run-kernel-graph! session handle)
+      (let [measurement (gpu/measure-bound-kernel-graph!
+                         session handle
+                         :warmup-iterations 2 :budget-ms 1000
+                         :min-samples 7 :max-samples 7)]
+        [(vec (gpu/download session c-key)) (/ (:median-ns measurement) 1.0e6)])
+      (finally
+        (gpu/release-kernel-graph! session handle)))))
 
 (deftest autotune-tile-axis-all-candidates-correct
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "GEMM autotune: tile axis (all candidates correct + measured search)")
-    (let [ze   (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          f16  (ns-resolve ze 'buffer-of-floats-as-half)  free (ns-resolve ze 'free-buffer!)
-          desc (hw/descriptor-for :ze:0)
+    (let [desc (hw/descriptor-for :ze:0)
           cands (hw/gemm-tile-candidates desc)
           default-tile (hw/derive-gemm-tile desc)
           m 256 n 256 k 512
           rng (java.util.Random. 4)
           mk  (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (* 0.05 (.nextGaussian rng))))) a))
-          a16 (f16 (mk (* m k)))  b16 (f16 (mk (* k n)))]
-      (try
+          a (mk (* m k))
+          b (mk (* k n))]
+      (gpu/with-gpu-session [session :ze:0]
+        (gpu/alloc! session {:tile-a [:half (* m k) (support/half-array a)]
+                             :tile-b [:half (* k n) (support/half-array b)]})
         (testing "the curated candidate list is non-trivial and includes the derived default"
           (is (> (count cands) 1) "more than one tile to search")
           (is (some #(= % default-tile) cands) "the derived default is in the search space"))
-        (let [ref (first (run-tiled-gemm ze a16 b16 m n k default-tile))
-              results (mapv (fn [t] (let [[c ms] (run-tiled-gemm ze a16 b16 m n k t)]
-                                      {:tile t :bit-identical? (= ref c) :ms ms})) cands)]
+        (let [ref (first (run-tiled-gemm session m n k default-tile :reference))
+              results (mapv (fn [index t]
+                              (let [[c ms] (run-tiled-gemm session m n k t index)]
+                                {:tile t :bit-identical? (= ref c) :ms ms}))
+                            (range) cands)]
           (testing "SAFETY: every candidate tile produces output bit-identical to the default"
             (doseq [{:keys [tile bit-identical?]} results]
               (is bit-identical? (str "tile " (select-keys tile [:block-m :block-n :block-k]) " must match default"))))
@@ -117,5 +131,5 @@
                                ms (if (= tile winner) "  <- winner" ""))))
             (testing "measured search returns a feasible candidate (Arc: hand-tuned default is ~optimal)"
               (is (some #(= % winner) cands) "winner is one of the candidates")
-              (is (= ref (first (run-tiled-gemm ze a16 b16 m n k winner))) "winner output is correct"))))
-        (finally (free a16) (free b16))))))
+              (is (= ref (first (run-tiled-gemm session m n k winner :winner)))
+                  "winner output is correct"))))))))
