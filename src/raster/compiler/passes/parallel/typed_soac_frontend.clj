@@ -44,7 +44,8 @@
     :typed-soac-stable-read-alias
     :typed-soac-syntax
     :typed-soac-unbound-scalar
-    :typed-soac-unknown-value})
+    :typed-soac-unknown-value
+    :unique-index-not-provable})
 
 (defn source-decline?
   [exception]
@@ -761,7 +762,7 @@
                                                   :claimed
                                                   (= :unique conflict)
                                                   (fail! :unique-index-not-provable
-                                                         "a unique-index claim on an index the algebra can decide must be provable"
+                                                         "a unique-index claim on an index the algebra can decide must be provable; the proof is a sufficient condition, so the form declines to the compatibility route"
                                                          {:binding id :destination out
                                                           :index (:index store)})
                                                   :else nil)

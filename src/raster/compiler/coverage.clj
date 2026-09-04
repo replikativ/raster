@@ -126,8 +126,11 @@
                               :route (:route row)})
 
                        ;; an effect map that iterated independently may not start serializing
-                       (> (get-in row [:effect-orders :sequential] 0)
-                          (get-in old [:effect-orders :sequential] 0))
+                       ;; or disappear from the typed program
+                       (or (> (get-in row [:effect-orders :sequential] 0)
+                              (get-in old [:effect-orders :sequential] 0))
+                           (< (get-in row [:effect-orders :independent] 0)
+                              (get-in old [:effect-orders :independent] 0)))
                        (conj {:var (:var row) :violation :effect-map-serialized
                               :before (:effect-orders old) :after (:effect-orders row)}))]
        violation))))

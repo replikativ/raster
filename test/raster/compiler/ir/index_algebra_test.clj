@@ -82,3 +82,12 @@
   ;; not become an extent factor. Items (1,0) and (0,3) both address 3 in `i·q + j`.
   (is (nil? (ia/index-form '(+ (* i q) j) 'i 8
                            '[{:id y :init (- 8 i)} {:id q :init (quot y 2)}] '{j q}))))
+
+(deftest loop-extents-must-be-invariant-radices
+  (testing "a triangular loop index is not a digit, so the form is undecidable"
+    (is (nil? (ia/index-form '(+ (* r 4) j) 'r 'rows [] '{j (+ r 1)})))
+    (is (nil? (ia/index-form '(+ (* r 4) j) 'r 'rows [] '{j (quot n 2)}))))
+  (testing "a coefficient may not mention a digit"
+    (is (nil? (ia/index-form '(+ (+ (* t (* 2 (* h H))) (* h (* 2 h))) j) 'idx '(* T H)
+                             '[{:id t :init (quot idx H)} {:id h :init (rem idx H)}]
+                             '{j (* 2 h)})))))

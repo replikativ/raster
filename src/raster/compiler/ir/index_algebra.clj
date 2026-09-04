@@ -14,7 +14,6 @@
 
    See .internal/design/index_algebra.md for the derivation."
   (:require [clojure.set :as set]
-            [clojure.set]
             [clojure.walk]))
 
 ;; ---------------------------------------------------------------------------------------------
@@ -211,7 +210,7 @@
            (quot-form? init)
            (if-let [[divisor bound] (let [d (resolve state (nth init 2))
                                           b (resolve state (second init))]
-                                      (when (and d b) [d b]))]
+                                      (when (and d b (pos? (:const d))) [d b]))]
              (-> state
                  (assoc-in [:substitutions id] id)
                  (assoc-in [:quot-expressions (clojure.walk/postwalk strip-cast init)] id)
@@ -230,15 +229,22 @@
      locals)))
 
 (defn- complete-digits
-  "Resolve the map index's own radix (its extent) once every scalar local is known."
-  [{:keys [digits] :as state} index]
+  "Resolve the map index's own radix (its extent) once every scalar local is known, under the
+   same guard as any radix: no digit and no unresolved local among its factors."
+  [{:keys [digits substitutions quot-expressions] unresolved :locals :as state} index]
   (let [extent (or (get-in digits [index :radix])
-                   (let [{:keys [substitutions quot-expressions]} state
-                         raw (get-in state [:quantities index :raw])]
-                     (monomial (->> (strip-cast raw)
-                                    (clojure.walk/postwalk-replace substitutions)
-                                    (clojure.walk/postwalk strip-cast)
-                                    (clojure.walk/postwalk-replace quot-expressions)))))]
+                   (let [raw (get-in state [:quantities index :raw])
+                         m (monomial (->> (strip-cast raw)
+                                          (clojure.walk/postwalk-replace substitutions)
+                                          (clojure.walk/postwalk strip-cast)
+                                          (clojure.walk/postwalk-replace quot-expressions)))
+                         factors (set (:factors m))]
+                     (when (and m
+                                (empty? (set/intersection factors (set (keys digits))))
+                                (empty? (set/intersection
+                                         factors (set (remove (set (keys substitutions))
+                                                              unresolved)))))
+                       m)))]
     (assoc-in state [:digits index :radix] extent)))
 
 ;; ---------------------------------------------------------------------------------------------
@@ -286,12 +292,31 @@
    `loop-indices` is a map of loop index symbol → extent for counted loops inside the region;
    they are digits too, with their extent as radix."
   [expression index extent locals loop-indices]
-  (let [{:keys [digits leaves parents substitutions quot-facts] unresolved :locals}
+  (let [{:keys [digits leaves parents substitutions quot-facts quot-expressions]
+         unresolved :locals :as state}
         (complete-digits (digits index extent locals) index)
+        ;; a loop extent is a radix: an extent monomial over resolved, digit-free factors
+        invariant-extent (fn [form]
+                           (let [m (monomial (->> (strip-cast form)
+                                                  (clojure.walk/postwalk-replace substitutions)
+                                                  (clojure.walk/postwalk strip-cast)
+                                                  (clojure.walk/postwalk-replace quot-expressions)))
+                                 factors (set (:factors m))]
+                             (when (and m (pos? (:const m))
+                                        (empty? (set/intersection factors (set (keys digits))))
+                                        (empty? (set/intersection
+                                                 factors
+                                                 (set (remove (set (keys substitutions))
+                                                              unresolved)))))
+                               m)))
         loop-digits (reduce-kv (fn [acc loop-index loop-extent]
-                                 (if-let [radix (monomial loop-extent)]
-                                   (assoc acc loop-index {:radix radix :order (count acc)})
-                                   acc))
+                                 (when acc
+                                   (if-let [radix (invariant-extent loop-extent)]
+                                     (assoc acc loop-index {:radix radix :order (count acc)})
+                                     ;; a triangular or data-dependent loop extent is not a
+                                     ;; radix; the loop index cannot be a digit, so the form is
+                                     ;; undecidable rather than the index an invariant offset
+                                     (reduced nil))))
                                {} loop-indices)
         digits (merge digits loop-digits)
         leaves (into leaves (keys loop-digits))
@@ -302,7 +327,7 @@
         resolved (set/union digit-set (set (keys substitutions)))
         unresolved-locals (set/intersection (set (remove resolved unresolved))
                                             (set (filter symbol? (tree-seq coll? seq expression))))
-        form (when (empty? unresolved-locals) (affine expression digit-set))
+        form (when (and loop-digits (empty? unresolved-locals)) (affine expression digit-set))
         ;; the constant offset: an integer, or the sum of the symbolic operands when that sum
         ;; is one monomial (`d + d = 2d`); a mixed or non-monomial sum is undecidable
         offset (when form
@@ -319,7 +344,12 @@
     (when (and form offset (seq term-set)
                ;; a quantity used whole may not appear beside a digit derived from it
                (not-any? (fn [digit] (some term-set (ancestors digit))) term-set)
-               (every? #(some? (get-in digits [% :radix])) term-set))
+               (every? #(some? (get-in digits [% :radix])) term-set)
+               ;; coefficients and the offset are constant across the digits
+               (every? (fn [[_ coefficient]]
+                         (empty? (set/intersection (set (:factors coefficient)) digit-set)))
+                       (:terms form))
+               (empty? (set/intersection (set (:factors offset)) digit-set)))
       {:terms (into {} (map (fn [[digit coefficient]]
                               [digit {:coefficient coefficient
                                       :radix (get-in digits [digit :radix])}]))
@@ -331,17 +361,6 @@
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Proofs
-
-(defn- span
-  "The monomial bound on Σ c_j (r_j − 1) + 1 over `terms`: Σ c_j·r_j is a sound over-approximation."
-  [terms]
-  (reduce (fn [acc {:keys [coefficient radix]}]
-            (let [term (product coefficient radix)]
-              (when (and acc term)
-                ;; monomials do not add; a sound bound is the dominant term times the count
-                (if (dominates? acc term) acc (if (dominates? term acc) term nil)))))
-          {:const 0 :factors []}
-          terms))
 
 (defn complete?
   "Every leaf digit of the map index is covered by a term: itself, or an ancestor used whole.
@@ -363,7 +382,7 @@
       (some (fn [{:keys [factor* le]}]
               (and (some #(some #{factor*} (:factors %)) lower-radices)
                    (some #{factor} (:factors le))))
-            (map #(clojure.set/rename-keys % {:factor :factor*}) quot-facts))))
+            (map #(set/rename-keys % {:factor :factor*}) quot-facts))))
 
 (defn injective?
   "Sufficient condition that the index form maps distinct digit tuples to distinct addresses:
