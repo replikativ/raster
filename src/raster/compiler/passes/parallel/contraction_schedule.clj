@@ -127,10 +127,12 @@
         buffer-views (mapv (fn [view]
                              (if (instance? raster.compiler.ir.kernel_body.BufferView view)
                                view
-                               (body/->BufferView (:id view) (:buffer view)
-                                                  (:element-offset view) (:shape view)
-                                                  (or (:layout view)
-                                                      (get buffer-layouts (:buffer view))))))
+                               (let [parent-layout (get buffer-layouts (:buffer view))]
+                                 (body/->BufferView
+                                  (:id view) (:buffer view) (:element-offset view) (:shape view)
+                                  (or (:layout view)
+                                      (layout/row-major (:shape view)
+                                                        (:dtype parent-layout)))))))
                            buffer-views)
         {:keys [block-m block-n block-k sg-m sg-n num-stages]} tile
         {matrix-m :m matrix-n :n matrix-k :k subgroup :subgroup} matrix
