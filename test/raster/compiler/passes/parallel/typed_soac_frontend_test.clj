@@ -838,3 +838,55 @@
     (is (= (get-in (dialect/facts program) [:values 'y :shape])
            (get-in (dialect/facts program) [:values 'z :shape]))
         "the allocation and its consumer agree on one shape")))
+
+(deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
+  ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
+  ;; array-free scalars and array lengths alias across kernels.
+  (let [source '(let* [^long n0 (clojure.core/aget counts 0)
+                       e0 (raster.par/map-void! i m (clojure.core/aset counts 0 (float 7.0)))
+                       ^long n1 (clojure.core/aget counts 0)
+                       e1 (raster.par/map-void! j n1 (clojure.core/aset out j (float 1.0)))]
+                      e1)
+        normalized (frontend/normalize-source source)
+        pairs (partition 2 (second normalized))
+        second-kernel (some (fn [[binder init]] (when (= 'e1 binder) init)) pairs)]
+    (is (= 'n1 (nth second-kernel 2))
+        "the second launch keeps its own post-kernel length")))
+
+(deftest an-explicit-float-array-keeps-its-element-type-under-a-double-policy
+  ;; `float-array` names its element type; only allocators without one (`alloc-like`,
+  ;; `zeros-like`) follow the kernel dtype. A double kernel must not widen a float buffer.
+  (let [source '(let* [^floats z (clojure.core/float-array n)
+                       step (raster.par/map! z i n float (clojure.core/aget x i))]
+                      step)
+        program (frontend/form->program source {:dtype :double :array-types {'x :double}
+                                                :scalar-types {'n :long}})]
+    (is (= :float (get-in (dialect/facts program) [:values 'z :dtype])))))
+
+(deftest sibling-loops-sharing-a-source-index-name-get-distinct-ssa-indices
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        r rows
+                        (do
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float 1.0))
+                                  (recur (clojure.core/inc i)))))
+                          (loop* [i 0]
+                            (if (clojure.core/< i feat)
+                              (do (clojure.core/aset out2 (clojure.core/+ (clojure.core/* r feat) i)
+                                                     (float 2.0))
+                                  (recur (clojure.core/inc i)))))))]
+                      effect)
+        program (frontend/form->program source {:dtype :float
+                                                :array-types {'out :float 'out2 :float}
+                                                :scalar-types {'rows :long 'feat :long}})
+        equation (first (dialect/equations program))
+        {:keys [lambda]} (dialect/operation-parts equation)
+        loops (filter :loop (map dialect/effect-parts
+                                 (:body-results (dialect/lambda-parts lambda))))]
+    (is (= 2 (count loops)))
+    (is (= 2 (count (distinct (map :index loops))))
+        "each effect-loop binds its own index symbol")
+    (is (= program (dialect/validate! program)))))

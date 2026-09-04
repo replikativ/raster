@@ -867,13 +867,20 @@
                            :source-type source-type :result-type result-type
                            :rounding rounding :overflow overflow}))))
 
-      ;; Saturating FP->integer conversion and wrapping integral conversion have direct spellings.
-      (or (and source-fp? (not result-fp?) (= :saturate overflow))
-          (and (not source-fp?) (not result-fp?) (= :wrap overflow)))
+      ;; Wrapping integral conversion: OpenCL spells it `convert_T`; on CUDA and HIP the plain C
+      ;; cast between two's-complement integer types is the same modular truncation.
+      (and (not source-fp?) (not result-fp?) (= :wrap overflow))
       (if (c-dialect/opencl? *scalar-dialect*)
         (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
              "(" argument-source ")")
-        (throw (ex-info "CUDA/HIP cannot preserve this saturating or wrapping cast policy"
+        (str "(" (target-type result-type) ")(" argument-source ")"))
+
+      ;; Saturating FP->integer conversion has a direct OpenCL spelling only.
+      (and source-fp? (not result-fp?) (= :saturate overflow))
+      (if (c-dialect/opencl? *scalar-dialect*)
+        (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
+             "(" argument-source ")")
+        (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
                         {:reason :kernel-body-c-cast-policy
                          :dialect (:id *scalar-dialect*)
                          :source-type source-type :result-type result-type

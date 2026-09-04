@@ -108,8 +108,10 @@
                           (and fp-source? fp-target?) [:nearest-even :ieee]
                           (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
                           ;; Integral narrowing (`(int j)` on a long counter) keeps the two's
-                          ;; complement bits, which agrees with the checked JVM cast on every
-                          ;; in-range value; the policy is stated so no target can guess it.
+                          ;; complement bits. The JVM source cast is range-checked and throws
+                          ;; on overflow; kernels state `:wrap` because no portable target traps
+                          ;; inside a conversion, so an out-of-range narrowing is loud on the
+                          ;; JVM and modular on the device. In-range values agree everywhere.
                           (and (not fp-source?) (not fp-target?)) [:exact :wrap]
                           (and (not fp-source?) fp-target? (= :double target)
                                (<= (dtype/bytes-of source) 4)) [:exact :exact]

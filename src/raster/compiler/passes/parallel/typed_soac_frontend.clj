@@ -193,8 +193,24 @@
 (defn- region-order
   "The source order of a region's effects as `[:store i]` / `[:loop j]` entries into its
    `:stores` and `:loops` vectors. Regions without loops are their stores in order."
-  [{:keys [stores order]}]
+  [{:keys [stores loops order]}]
+  (when (and (nil? order) (seq loops))
+    (throw (ex-info "a region with store loops must carry its source order"
+                    {:reason :raster/bug :loops (count loops) :stores (count stores)})))
   (or order (mapv (fn [ordinal] [:store ordinal]) (range (count stores)))))
+
+(defn- rename-loop-index
+  "Give a counted store loop the index name `fresh`, renaming its body locals' inits and its
+   stores. Sibling loops that reuse one source index name (`i`) would otherwise share a
+   KernelBody SSA value."
+  [{:keys [index] :as loop} fresh]
+  (let [renames {index fresh}]
+    (-> loop
+        (assoc :index fresh)
+        (update :locals (fn [locals]
+                          (mapv #(update % :init (fn [init] (util/subst-syms renames init)))
+                                locals)))
+        (update :stores (fn [stores] (mapv #(substitute-store renames %) stores))))))
 
 (defn- rebase-region-locals
   "Move a recursively recognized region behind `offset` lexical SSA values.
@@ -265,7 +281,8 @@
 
                   (and (symbol? head) (form/loop-head? head)
                        (vector? bindings) (= 2 (count bindings))
-                       (symbol? (first bindings)) (integer? (second bindings))
+                       (symbol? (first bindings))
+                       (integer? (second bindings)) (<= 0 (second bindings))
                        (= 1 (count body)))
                   (let [[loop-index lower] bindings
                         conditional (first body)]
@@ -561,13 +578,20 @@
                    (when (symbol? binder)
                      (when-let [element (some-> (types/sym-type-tag binder)
                                                 dtype/dtype-for-array-tag dtype/canon)]
-                       ;; Only a bare allocation follows the policy. A parallel form's result
-                       ;; binder carries the form's own explicit element dtype (`pmap … double`),
-                       ;; which its equation declares; retyping it here would contradict that.
-                       [binder (if (and (seq? init)
-                                        (descriptor/alloc-op? (descriptor/semantic-op init)))
-                                 (policy element)
-                                 element)]))))
+                       ;; Only an allocation that does not name its element type (`alloc-like`,
+                       ;; `zeros-like`, `similar`) follows the policy. `float-array` states its
+                       ;; element type, and a parallel form's result binder carries the form's
+                       ;; own explicit dtype (`pmap … double`); retyping either would contradict
+                       ;; a declared fact.
+                       [binder (let [operation (when (seq? init) (descriptor/semantic-op init))
+                                     named-element?
+                                     (or (contains? descriptor/alloc-sym->array-tag operation)
+                                         (contains? descriptor/alloc-sym->array-tag
+                                                    (some-> operation name clojure.core/symbol)))]
+                                 (if (and operation (descriptor/alloc-op? operation)
+                                          (not named-element?))
+                                   (policy element)
+                                   element))]))))
            pairs)
      (or array-types {}))))
 
@@ -644,8 +668,11 @@
 (defn- write-region-description
   [id symbol index extent {:keys [locals stores loops] :as region} elem-type
    & {:keys [host-return array-types] :or {host-return :effect array-types {}}}]
-  (let [loops (or loops [])
-        order (region-order region)]
+  (let [order (region-order region)
+        loops (vec (map-indexed (fn [ordinal loop]
+                                  (rename-loop-index
+                                   loop (clojure.core/symbol (str "rstr_loop_index_" ordinal))))
+                                (or loops [])))]
     (when (and (or (seq stores) (seq loops))
                (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
                ;; A destination written both directly and inside a store loop would lose the work
@@ -733,7 +760,8 @@
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
                                             locals all-stores
-                                            (map :init (mapcat :locals loops)))))
+                                            (concat (map :extent loops)
+                                                    (map :init (mapcat :locals loops))))))
                                 :sequential
                                 :independent))
             destinations (if ordered?
@@ -1329,7 +1357,8 @@
   "A syntactic array-length operand: a value id, an integer, or integer arithmetic over them.
    A collection-valued constructor argument (`(float-array [1 2 3])`) is not a length."
   [expression]
-  (or (symbol? expression)
+  (or (and (symbol? expression)
+           (nil? (some-> (types/sym-type-tag expression) dtype/dtype-for-array-tag)))
       (integer? expression)
       (and (seq? expression)
            (contains? '#{* + - quot clojure.core/* clojure.core/+ clojure.core/- clojure.core/quot
@@ -1389,15 +1418,30 @@
                      ;; `(* seq dff)` and `(* n1 n2)` with `n1 = seq`, `n2 = dff` are one size.
                      canonical-scalar (fn [form]
                                         (util/subst-syms scalar-aliases (strip-index-casts form)))
+                     ;; `(long x)` of a floating scalar is a conversion, not a renaming.
+                     floating-cast? (and (seq? expression) (= 2 (count expression))
+                                         (contains? '#{long int clojure.core/long clojure.core/int}
+                                                    (first expression))
+                                         (symbol? (second expression))
+                                         (some-> (types/sym-type-tag (second expression))
+                                                 dtype/dtype-for-scalar-tag dtype/fp-dtype?))
                      scalar-form (when-not (or (parallel-extent expression)
                                                (allocation-length expression)
-                                               (par/par-form? expression))
+                                               (par/par-form? expression)
+                                               floating-cast?)
                                    (canonical-scalar expression))
+                     ;; A recomputed scalar denotes an earlier one only when nothing between
+                     ;; them can have changed its value: it reads no array (a kernel in between
+                     ;; may write one), or it is an array length, which no kernel changes.
+                     stable-scalar? (and (seq? scalar-form)
+                                         (provably-pure-scalar? scalar-form)
+                                         (or (empty? (par/collect-aget-arrays scalar-form))
+                                             (some? (alength-array scalar-form))))
                      state (cond
                              (and (symbol? scalar-form) (not= scalar-form symbol))
                              (assoc-in state [:scalar-aliases symbol] scalar-form)
 
-                             (and (seq? scalar-form) (provably-pure-scalar? scalar-form))
+                             stable-scalar?
                              (if-let [earlier (get pure-scalar-ids scalar-form)]
                                (assoc-in state [:scalar-aliases symbol] earlier)
                                (assoc-in state [:pure-scalar-ids scalar-form] symbol))
