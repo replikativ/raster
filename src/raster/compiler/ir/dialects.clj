@@ -601,7 +601,6 @@
    :materialized     [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :segop-lowered    [valid-scheduled-program? validate-scheduled-program]
    :compound-detected [valid-source-or-typed-soac? validate-source-or-typed-soac]
-   :gpu-planned      [valid-let*-ordered? validate-let*-ordered]
    :dtype-remapped   [valid-let*-ordered? validate-let*-ordered]
    ;; The ordinary JVM backend consumes the envelope and returns a host let*. Monolithic C/SIMD
    ;; deliberately preserves scheduled equations around that same host projection through its

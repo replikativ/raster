@@ -1123,12 +1123,12 @@
               (not (.startsWith ^String ns-str "java."))
               (not= ns-str "Math")))))
 
-;; --- BLAS GEMM alpha/beta (the resident + staged GPU GEMM representability gate) ---
+;; --- BLAS GEMM projection into the typed contraction frontend ---
 
 (def blas-gemm-ops
-  "BLAS GEMM ops the GPU lowering paths recognize, → layout variant. dgemm! = C=A·B (:nn);
-   -nt! = A·Bᵀ; -tn! = AᵀB. Single source of truth for both the RESIDENT extractor
-   (pipeline/extract-gpu-program) and the STAGED plan pass (passes.parallel.gpu-plan)."
+  "BLAS GEMM source spellings projected by the TypedSOAC frontend, → dense layout variant.
+   This is a frontend translation table, not a kernel or runtime dispatch registry: after
+   projection, verified contraction facts and AxisMaps are the sole scheduling authority."
   {'raster.linalg.blas/dgemm!    :nn
    'raster.linalg.blas/dgemm-nt! :nt
    'raster.linalg.blas/dgemm-tn! :tn})

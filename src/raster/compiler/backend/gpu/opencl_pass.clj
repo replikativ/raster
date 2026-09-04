@@ -889,9 +889,9 @@
                     (par/expand-par-butterfly! form))))
 
             ;; === Structural recursion (PRESERVE metadata) ===
-            ;; A bare (apply list head ...) rebuild drops the form's metadata — in particular
-            ;; :raster.op/original on a devirtualized .invk (e.g. blas/dgemm!), which downstream
-            ;; GEMM recognition (parse-gpu-step, gpu_plan) reads. Re-attach the original meta.
+            ;; A bare (apply list head ...) rebuild drops source and type metadata on devirtualized
+            ;; calls. Re-attach it: compatibility admission and diagnostics must never infer a
+            ;; different semantic operation merely because structural recursion rebuilt a list.
 
             (and (seq? form) (contains? #{'let 'let*} (first form)))
             (let [[let-sym bindings & body-exprs] form
