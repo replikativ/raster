@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.kernel-graph-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as soac]
@@ -81,6 +82,20 @@
     (is (= :inout (get-in scheduled [:inputs 0 :role])))
     (is (identical? (first (:inputs scheduled)) (first (:outputs scheduled))))
     (is (= :read-write (get-in scheduled [:nodes 0 :uses 0 :access])))))
+
+(deftest in-place-graph-interface-retains-the-read-write-abi-direction
+  (let [operation (segop/->SegMap
+                   9 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(inc (aget state i)) nil #{'state} #{'state} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'state nil)
+        scheduled (graph/from-segops [operation]
+                                     {:inputs #{'state} :outputs #{'state} :dtype :float})
+        interfaced (assoc scheduled
+                          :abi [(kabi/slot 'state :inout :float)
+                                (kabi/slot 'n :scalar :long)]
+                          :arguments '[state n])]
+    (is (identical? interfaced (graph/validate! interfaced)))
+    (is (= :inout (get-in interfaced [:abi 0 :kind])))))
 
 (deftest ordered-output-vectors-retain-write-access
   (let [operation (segop/->SegFoldMap

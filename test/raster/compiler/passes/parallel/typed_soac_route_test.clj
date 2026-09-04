@@ -1003,14 +1003,17 @@
            (set (map :candidate-family (:declines candidate-routes)))))
     (is (not-any? #(= :schedule-family-disabled (:reason %))
                   (:declines candidate-routes)))
-    (try
-      (contract-route/route-static-typed-contraction-dispatch
-       algorithm operation
-       :dtype :float :desc {})
-      (is false "a static dispatch must not bake runtime-dependent contraction dimensions")
-      (catch clojure.lang.ExceptionInfo exception
-        (is (= :typed-contraction-dispatch-dynamic-scalar
-               (:reason (ex-data exception))))))
+    (let [dispatch (contract-route/route-typed-contraction-dispatch
+                    algorithm operation :dtype :float :desc {})
+          alternative (first (:alternatives dispatch))]
+      (is (= '[A B C m n k] (:arguments alternative)))
+      (is (= [:extent :extent :extent]
+             (mapv :role (drop 3 (:abi alternative)))))
+      (is (kernel-graph-call/kernel-graph-call?
+           (kernel-graph-call/make alternative {'A :a 'B :b 'C :c}
+                                   {'m {:type :int :value 7}
+                                    'n {:type :int :value 5}
+                                    'k {:type :int :value 3}}))))
     (try
       (contract-route/route-typed-contraction
        algorithm operation :dtype :double :desc {})
@@ -1055,9 +1058,9 @@
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (= 1 (get-in emitted [:stats :segop-reused])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))
-    (is (= 1 (get-in emitted [:stats :typed-contraction-dispatch-declines
-                              :typed-contraction-dispatch-dynamic-scalar])))
-    (is (empty? (:dispatches emitted)))
+    (is (zero? (get-in emitted [:stats :typed-contraction-dispatch-declines
+                                :typed-contraction-dispatch-dynamic-scalar] 0)))
+    (is (= 1 (count (:dispatches emitted))))
     (is (= 1 (count (:kernels emitted))))))
 
 (deftest compatibility-contraction-without-source-or-schedule-fails-loud
@@ -1109,7 +1112,7 @@
            :dtype :half :desc descriptor))
         dispatch
         (without-surface
-         #(contract-route/route-static-typed-contraction-dispatch
+         #(contract-route/route-typed-contraction-dispatch
            algorithm operation
            :dtype :half :desc descriptor))
         alternatives (:alternatives dispatch)

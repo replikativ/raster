@@ -18,6 +18,7 @@
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.core.util :as util]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
@@ -327,7 +328,7 @@
         free-bounds (map second free-axes)
         nseg (if (every? number? free-bounds)
                (reduce * 1 free-bounds)
-               (reduce (fn [a b] (list 'clojure.core/* a b)) free-bounds))
+               (apply klaunch/product free-bounds))
         ;; memoized so the cond's test arm doesn't regenerate the kernel
         ;; A TypedSOAC result transform projects to an epilogue in the form's trailing opts;
         ;; an explicit :epilogue kwarg overrides it at this temporary leaf boundary.
@@ -741,8 +742,62 @@
        (filter (comp public-interface-slot? first))
        vec))
 
+(defn- ordered-distinct
+  [values]
+  (reduce (fn [result value]
+            (if (some #(= value %) result) result (conj result value)))
+          [] values))
+
+(defn- semantic-scalar-interface
+  "Construct the scalar part of a typed contraction's public ABI from semantic inputs.
+
+   Axis-bound inputs precede other scalar captures and follow axis order. A target leaf may bake
+   one of these values or expose it under a different parameter name; neither changes the logical
+   call. Conversely, leaf-derived values such as a flattened segment count are deliberately absent
+   and remain graph-private expressions over this interface."
+  [candidates operation operation-id existing-arguments]
+  (let [axis-bounds (mapv :bound (get-in operation [:space :dims]))
+        extent-scalars (ordered-distinct
+                        (mapcat #(sort-by str (util/free-syms %)) axis-bounds))
+        semantic-scalars (segop/operation-scalars operation)
+        parameter-scalars (sort-by str (remove (set extent-scalars) semantic-scalars))
+        ordered-scalars (filterv semantic-scalars (into extent-scalars parameter-scalars))]
+    (into []
+          (comp
+           (remove (set existing-arguments))
+           (map
+            (fn [argument]
+              (let [slots (into []
+                                (comp
+                                 (mapcat (fn [candidate]
+                                           (map vector (get-in candidate [:artifact :abi])
+                                                (get-in candidate [:artifact :arguments]))))
+                                 (filter (fn [[slot value]]
+                                           (and (= :scalar (:kind slot))
+                                                (= argument value))))
+                                 (map first))
+                                candidates)
+                    views (mapv #(select-keys % [:kind :dtype :kernel-dtype]) slots)]
+                (when (empty? slots)
+                  (throw (ex-info
+                          "typed contraction semantic scalar is absent from every candidate ABI"
+                          {:reason :typed-contraction-candidate-missing-semantic-scalar
+                           :operation operation-id :argument argument})))
+                (when-not (apply = views)
+                  (throw (ex-info
+                          "typed contraction candidates disagree on a semantic scalar ABI"
+                          {:reason :typed-contraction-candidate-scalar-semantics
+                           :operation operation-id :argument argument :slots slots})))
+                [(-> (first slots)
+                     (assoc :name argument :c-name (name argument)
+                            :role (if (some #{argument} extent-scalars)
+                                    :extent :parameter))
+                     (dissoc :binding :field :aliasing :alignment))
+                 argument]))))
+          ordered-scalars)))
+
 (defn- common-logical-interface
-  [candidates operation-id]
+  [candidates operation operation-id]
   (let [interfaces (mapv (comp artifact-logical-interface :artifact) candidates)
         arguments (mapv second (first interfaces))]
     (doseq [[candidate interface] (map vector candidates interfaces)]
@@ -773,12 +828,16 @@
                  (nil? aliasing) (dissoc :aliasing)
                  alignment (assoc :alignment alignment)
                  (nil? alignment) (dissoc :alignment))))
-           (range (count arguments)) arguments)]
+           (range (count arguments)) arguments)
+          scalar-interface (semantic-scalar-interface candidates operation operation-id arguments)
+          abi (into abi (map first) scalar-interface)
+          arguments (into arguments (map second) scalar-interface)]
       (kabi/validate! abi)
-      {:abi abi :arguments arguments})))
+      {:abi abi :arguments arguments
+       :public-scalars (into #{} (map second) scalar-interface)})))
 
-(defn- static-private-scalars!
-  [candidate operation-id]
+(defn- bindable-private-scalars!
+  [candidate operation-id public-scalars]
   (when (:invoke candidate)
     (throw (ex-info "typed contraction candidate uses a non-graph leaf invocation protocol"
                     {:reason :typed-contraction-dispatch-invoke-protocol
@@ -791,12 +850,12 @@
           :when (and (= :scalar (:kind slot))
                      (not (public-interface-slot? slot)))]
     (when-not (and (contains? #{:int :long} (:kernel-dtype slot))
-                   (or (integer? compiler-value)
-                       (and (klaunch/expression? compiler-value)
-                            (empty? (klaunch/expression-references compiler-value)))))
+                   (klaunch/expression? compiler-value)
+                   (every? public-scalars
+                           (klaunch/expression-references compiler-value)))
       (throw (ex-info
-              "static typed contraction dispatch has a runtime-dependent private scalar"
-              {:reason :typed-contraction-dispatch-dynamic-scalar
+              "typed contraction candidate has a private scalar outside its semantic ABI"
+              {:reason :typed-contraction-dispatch-unbound-private-scalar
                :operation operation-id
                :family (:family candidate)
                :slot slot
@@ -886,22 +945,21 @@
                       :interface interface}
      :layout {:external-interface interface}}))
 
-(defn route-static-typed-contraction-dispatch
-  "Normalize legal static typed contraction leaves behind one logical ABI-compatible dispatch.
+(defn route-typed-contraction-dispatch
+  "Normalize legal typed contraction leaves behind one logical ABI-compatible dispatch.
 
-   Leaf-only dimensions remain graph-private derived scalars, while typed result-transform scalar
-   captures join operand/result pointers in the shared public ABI. Matrix, register-tiled and
-   portable kernels can therefore compete through the existing KernelDispatch tuning machinery.
-   Runtime-dependent private dimensions are refused until they have a common public ABI rather
-   than silently baking one sample."
+   Semantic scalar inputs join operand/result pointers in the ordered public ABI. Leaf-only values
+   remain graph-private checked expressions over those scalars. Matrix, register-tiled and portable
+   kernels can therefore compete without baking a runtime shape or exposing schedule temporaries."
   [program operation & options]
   (let [operation-id (:id operation)
         schedule (reduction/validate-schedule! (:schedule operation))
         {:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
                program operation options)
-        candidates (mapv #(static-private-scalars! % operation-id) candidates)
-        {:keys [abi arguments]} (common-logical-interface candidates operation-id)
+        {:keys [abi arguments public-scalars]}
+        (common-logical-interface candidates operation operation-id)
+        candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
         default-strategy (:strategy (first candidates))
         dispatch-id (candidate-dispatch-id operation-id candidates)
         candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)

@@ -122,8 +122,9 @@
                                (float-array (* width width)) rows width width]
                    :shapes {'x [rows width] 'W [width width]
                             (:result-sym descriptor) [rows width]}})]
-    ;; linear-nb's BLAS GEMM is a typed contraction step, not a resident :gemm binding.
-    (is (= [:contract] (mapv :convention (:steps descriptor))))
+    ;; linear-nb's BLAS GEMM is a typed contraction dispatch, not a resident :gemm binding.
+    ;; The executable container keeps its semantic extents public for runtime schedule choice.
+    (is (= [:executable] (mapv :convention (:steps descriptor))))
     (is (resident/certified-plan? lowering))
     (is (= [rows width]
            (get-in lowering [:certificate :values (:result-sym descriptor) :shape])))

@@ -57,7 +57,7 @@
         (let [x (rnd (* b i) 1) W (rnd (* o i) 2)
               cpu (nn/linear-nb x W b i o)
               {:keys [descriptor out]} (run-resident #'nn/linear-nb [x W b i o])]
-          (is (= [:contract] (mapv :convention (:steps descriptor)))
+          (is (= [:executable] (mapv :convention (:steps descriptor)))
               "forward projection lowers to a single typed contraction step")
           (is (< (rel-err out cpu) tol)
               (str "forward relerr " (rel-err out cpu)))))
@@ -65,14 +65,14 @@
         (let [dy (rnd (* b o) 3) W (rnd (* o i) 4)
               cpu (nn/linear-dx dy W b i o)
               {:keys [descriptor out]} (run-resident #'nn/linear-dx [dy W b i o])]
-          (is (= [:contract] (mapv :convention (:steps descriptor))))
+          (is (= [:executable] (mapv :convention (:steps descriptor))))
           (is (< (rel-err out cpu) tol)
               (str "linear-dx relerr " (rel-err out cpu)))))
       (testing "backward linear-dW (:tn, weight gradient) on GPU matches CPU BLAS"
         (let [dy (rnd (* b o) 5) x (rnd (* b i) 6)
               cpu (nn/linear-dW dy x b i o)
               {:keys [descriptor out]} (run-resident #'nn/linear-dW [dy x b i o])]
-          (is (= [:contract] (mapv :convention (:steps descriptor)))
+          (is (= [:executable] (mapv :convention (:steps descriptor)))
               "weight-gradient lowers to a single typed contraction step (transpose-A layout)")
           (is (< (rel-err out cpu) tol)
               (str "linear-dW relerr " (rel-err out cpu))))))))
@@ -201,7 +201,7 @@
                 x (rnd (* b i) (+ 100 n)) W (rnd (* o i) (+ 200 n))
                 cpu (nn/linear-nb x W b i o)
                 {:keys [descriptor out]} (run-resident #'nn/linear-nb [x W b i o])]
-            (is (= [:contract] (mapv :convention (:steps descriptor))))
+            (is (= [:executable] (mapv :convention (:steps descriptor))))
             (is (< (rel-err out cpu) tol)
                 (str ":nt n=" n " relerr " (rel-err out cpu)))))
         (testing (str "backward linear-dx (:nn) at in-features n=" n)
@@ -209,7 +209,7 @@
                 dy (rnd (* b o) (+ 300 n)) W (rnd (* o i) (+ 400 n))
                 cpu (nn/linear-dx dy W b i o)
                 {:keys [descriptor out]} (run-resident #'nn/linear-dx [dy W b i o])]
-            (is (= [:contract] (mapv :convention (:steps descriptor))))
+            (is (= [:executable] (mapv :convention (:steps descriptor))))
             (is (< (rel-err out cpu) tol)
                 (str ":nn n=" n " relerr " (rel-err out cpu)))))))))
 
@@ -311,7 +311,7 @@
   (doseq [[v variant] [[#'nn/linear-nb :nt] [#'nn/linear-dx :nn] [#'nn/linear-dW :tn]]]
     (let [p (pl/compile-gpu-program v :ze:0 :dtype :float :on-non-resident :nil)]
       (is (some? p) (str v " (alpha=1, beta=0) must still extract as a resident GEMM"))
-      (is (= [:contract] (mapv :convention (:steps p)))
+      (is (= [:executable] (mapv :convention (:steps p)))
           (str v " (" variant ") must still lower to a single typed contraction step")))))
 
 (deftest gpu-ad-full-train-step-fully-resident
