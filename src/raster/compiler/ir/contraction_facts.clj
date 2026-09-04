@@ -293,6 +293,18 @@
    :quant-naive {:row [:free0 :contract0] :col [:contract0 :free1]}
    :dp4a        {:row [:free0 :contract0] :col [:free1 :contract0]}})
 
+(def dense-matrix-layouts
+  "The four dense two-free/one-contracted matrix storage orientations.
+
+   These are semantic AxisMap requirements, not BLAS call-name patterns.  A contraction may bind
+   either multiplication operand to `:row` or `:col`; `check-layout` proves the assignment against
+   the actual typed operand indices.  Target schedules use the resulting `:variant` only to choose
+   layout adapters before their canonical matrix instruction."
+  {:nn {:row [:free0 :contract0] :col [:contract0 :free1]}
+   :nt {:row [:free0 :contract0] :col [:free1 :contract0]}
+   :tn {:row [:contract0 :free0] :col [:contract0 :free1]}
+   :tt {:row [:contract0 :free0] :col [:free1 :contract0]}})
+
 (defn- role-map
   "The axis-map a role-spec denotes, e.g. [:free0 :contract0] → of-axes [[i M] [l L]] (index i·L+l)."
   [facts axis-roles]
@@ -326,6 +338,51 @@
           {:ok false :reason :layout
            :required (into {} (map (fn [r] [r (am/index-expr (role-map facts (get required r)))])) roles)
            :actual (mapv (juxt :sym :idx) ops)})))))
+
+(defn dense-matrix-view
+  "Recognize the dense matrix view of an ordinary verified product reduction.
+
+   This does not introduce a GEMM semantic node.  It proves that a two-free/one-contracted additive
+   reduction is exactly a product of two dense operands in one of the four AxisMap orientations,
+   and returns the schedule-facing row/column bindings and M/N/K extents.  Anything else returns a
+   structured decline so sparse gathers, extra factors, non-additive monoids, and result transforms
+   remain on their general contraction schedules."
+  [facts]
+  (when-not (facts? facts)
+    (throw (ex-info "dense matrix classification requires verified contraction facts"
+                    {:reason :raster/bug :facts facts})))
+  (let [{:keys [free-axes contract-axes operands epilogue]} facts
+        {:keys [combine neutral element]} (scalar-reduction-view facts)]
+    (cond
+      (not= [2 1] [(count free-axes) (count contract-axes)])
+      {:ok false :reason :not-2-free}
+
+      (not (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
+      {:ok false :reason :non-plus-combine :combine combine}
+
+      (not (and (number? neutral) (zero? neutral)))
+      {:ok false :reason :non-zero-matrix-init :init neutral}
+
+      (nil? (body-product-of element (map :sym operands)))
+      {:ok false :reason :body-has-unmodeled-terms}
+
+      (seq epilogue)
+      {:ok false :reason :matrix-graph-result-transform-not-lowered}
+
+      :else
+      (if-let [[variant verdict]
+               (some (fn [variant]
+                       (let [verdict (check-layout facts (get dense-matrix-layouts variant))]
+                         (when (:ok verdict) [variant verdict])))
+                     [:nn :nt :tn :tt])]
+        {:ok true
+         :variant variant
+         :bindings (:bindings verdict)
+         :dimensions [(second (first free-axes))
+                      (second (second free-axes))
+                      (second (first contract-axes))]}
+        {:ok false :reason :non-dense-matrix-layout
+         :actual (mapv (juxt :sym :idx) operands)}))))
 
 (defn layout-maps
   "For a PASSING `check-layout` verdict, the axis-map of each operand — derived from the layout the

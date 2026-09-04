@@ -38,14 +38,16 @@
            (mapv executable/strategy (:alternatives scheduled))))
     (testing "the matrix-instruction pitch gate is part of the selector, not a runtime binder"
       (is (= :f32-scalar (executable/strategy (select [32 4 4096]))))
-      (is (= :f32-scalar (executable/strategy (select [32 128 4])))))
+      (is (= :f32-scalar (executable/strategy (select [32 128 4]))))
+      (is (= :f32-scalar (executable/strategy (select [32 126 4096]))))
+      (is (= :f32-scalar (executable/strategy (select [32 128 4094])))))
     (testing "a machine-filling shape stays direct"
       (is (= :xmx-direct (executable/strategy (select [512 512 512])))))
     (testing "a low-output-occupancy, deep-K shape selects a graph-private split"
       (is (= :xmx-split-k (executable/strategy (select [13 640 262144])))))))
 
 (deftest scalar-layout-fallbacks-are-portable-typed-contractions
-  (doseq [variant [:nn :nt :tn]]
+  (doseq [variant [:nn :nt :tn :tt]]
     (let [graph (dispatch/alternative (emitted variant) :f32-scalar)
           operation (get-in graph [:nodes 0 :operation])
           kernel-body (artifact/attribute operation :kernel-body)
@@ -186,7 +188,7 @@
 
 (deftest layout-variants-are-graph-topology-not-runtime-conventions
   (doseq [[variant expected-node-count transpose-phase]
-          [[:nn 3 nil] [:nt 4 :transpose-b] [:tn 4 :transpose-a]]]
+          [[:nn 3 nil] [:nt 4 :transpose-b] [:tn 4 :transpose-a] [:tt 5 :transpose-a]]]
     (let [graph (dispatch/alternative (emitted variant) :xmx-direct)
           phases (mapv #(get-in % [:operation :attributes :strategy]) (:nodes graph))]
       (is (= expected-node-count (count (:nodes graph))) (name variant))
@@ -195,7 +197,7 @@
 
 (deftest every-layout-schedule-realizes-to-kernel-calls
   (let [runtime-arguments (arguments 13 640 262144)]
-    (doseq [variant [:nn :nt :tn]
+    (doseq [variant [:nn :nt :tn :tt]
             strategy [:xmx-direct :xmx-split-k]]
       (let [graph (dispatch/alternative (emitted variant) strategy)
             {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)

@@ -107,6 +107,8 @@
 (defn- minimum? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.Minimum" x))
 
+(declare index-expr? index-cast?)
+
 (defn expression?
   "True for explicit symbolic integer-expression nodes and literal integers. Opaque compiler
    values such as symbols are leaves and are therefore also accepted. Sequential Clojure forms
@@ -122,6 +124,8 @@
     (align-up? x) (and (expression? (:value x))
                        (integer? (:alignment x)) (pos? (:alignment x)))
     (minimum? x) (and (seq (:values x)) (every? expression? (:values x)))
+    (index-expr? x) (and (seq (:arguments x)) (every? expression? (:arguments x)))
+    (index-cast? x) (expression? (:argument x))
     (sequential? x) false
     :else (some? x)))
 
@@ -139,6 +143,9 @@
     (product? expression) (reduce into #{} (map expression-references (:factors expression)))
     (align-up? expression) (expression-references (:value expression))
     (minimum? expression) (reduce into #{} (map expression-references (:values expression)))
+    (index-expr? expression)
+    (reduce into #{} (map expression-references (:arguments expression)))
+    (index-cast? expression) (expression-references (:argument expression))
     :else #{expression}))
 
 (defn- dimension-vector!

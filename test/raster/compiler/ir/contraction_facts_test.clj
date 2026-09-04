@@ -117,6 +117,34 @@
 (def ^:private nn-idx '(clojure.core/+ (clojure.core/* l 6) j))   ; B[l,j]
 (def ^:private nt-idx '(clojure.core/+ (clojure.core/* j 8) l))   ; B[j,l] — K-contiguous
 
+(defn- dense-matrix-form
+  [variant]
+  (let [row-idx (if (contains? #{:tn :tt} variant)
+                  '(clojure.core/+ (clojure.core/* l 4) i)
+                  '(clojure.core/+ (clojure.core/* i 8) l))
+        col-idx (if (contains? #{:nt :tt} variant) nt-idx nn-idx)]
+    (list 'raster.par/contract 'C [['i 4] ['j 6]] [['l 8]]
+          (list 'raster.numeric/* (list 'aget 'A row-idx) (list 'aget 'B col-idx)))))
+
+(deftest dense-matrix-view-is-proved-from-axis-algebra
+  (doseq [variant [:nn :nt :tn :tt]]
+    (testing (name variant)
+      (let [view (cf/dense-matrix-view
+                  (cf/contraction-facts (dense-matrix-form variant) :dtype :float))]
+        (is (:ok view))
+        (is (= variant (:variant view)))
+        (is (= '{:row A :col B} (:bindings view)))
+        (is (= [4 6 8] (:dimensions view))))))
+  (testing "an extra factor is a general contraction, not a matrix schedule"
+    (let [base (dense-matrix-form :nn)
+          rejected (cf/dense-matrix-view
+                    (cf/contraction-facts
+                     (apply list
+                            (assoc (vec base) 4
+                                   (list 'raster.numeric/* (nth base 4) 2.0)))
+                     :dtype :float))]
+      (is (= :body-has-unmodeled-terms (:reason rejected))))))
+
 (deftest orientation-is-a-data-row
   (let [nn (cf/contraction-facts (mm-form nn-idx))
         nt (cf/contraction-facts (mm-form nt-idx))]
@@ -157,10 +185,8 @@
                  (cf/check-layout {:operands [] :roles {}} (:dpas cf/leaf-layouts))))))
 
 ;; ── anti-drift: the data table and the predicate it will replace must AGREE ──────────
-;; `check-layout` is not yet consumed by the gates. That is deliberate — four of the six
-;; orientation call sites live in the quant and dp4a generators, which the next increment deletes
-;; outright, and wiring only the fifth (dpas) would create a dual path. But an unconsumed
-;; capability is how this subsystem drifted in the first place, so the equivalence is PINNED here:
+;; The table is consumed by typed dense-matrix classification and the existing leaf gates.  Keep
+;; their equivalence pinned here while the remaining staged quant compatibility leaves migrate:
 ;; if the table and the live predicate ever disagree on a case, this fails.
 (deftest table-agrees-with-the-live-orientation-gate
   (let [cases [[:nn nn-idx :dpas true] [:nn nn-idx :dp4a false]
