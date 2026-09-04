@@ -181,10 +181,14 @@
         row-layout (layout/row-major row-shape dtype)
         col-layout (layout/row-major col-shape dtype)
         out-layout (layout/row-major out-shape dtype)
+        ;; A result transform that reads the destination reads the element this thread stores;
+        ;; the destination is then one read-write parameter.
+        destination-read? (boolean (some #(= out (:sym %)) (:operands epilogue)))
         base-parameters
         [(body/->KernelParameter row :input dtype row-shape :global row-layout :lhs)
          (body/->KernelParameter col :input dtype col-shape :global col-layout :rhs)
-         (body/->KernelParameter out :output dtype out-shape :global out-layout :result)]
+         (body/->KernelParameter out (if destination-read? :inout :output) dtype out-shape
+                                 :global out-layout :result)]
         parameters (into (vec base-parameters) (transform-parameters epilogue base-parameters))
         parameter-map (into {} (map (juxt :id identity)) parameters)
         row-allocation 'register-tile-a
@@ -372,7 +376,8 @@
       {:id [:contraction (or operation-id out) :register-tiled]
        :parameters parameters
        :stable-reads (mapv body/stable-read
-                           (distinct (concat [row col] (map :sym (:operands epilogue)))))
+                           (distinct (remove #{out}
+                                             (concat [row col] (map :sym (:operands epilogue))))))
        :allocations allocations
        :indices indices
        :masks masks

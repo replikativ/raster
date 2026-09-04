@@ -96,3 +96,25 @@
         (contraction)
         {:descriptor {:execution {:max-workgroup-size 8}
                       :shared-local-memory 128}}))))
+
+(deftest a-destination-reading-result-transform-stores-through-one-read-write-parameter
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/+ acc (raster.numeric/* beta (clojure.core/aget C (clojure.core/+ (clojure.core/* i 8) j))))
+                  :operands [{:sym 'C :dtype :float
+                              :map (axis-map/of-axes [['i 8] ['j 8]])}]
+                  :scalars [{:sym 'beta :dtype :float}]
+                  :dtype :float}
+        emitted (segop-emit/generate-register-tiled-kernel-body
+                 (contraction epilogue) 'C :tile small-tile)
+        kernel-body (:kernel-body emitted)]
+    (is (body/kernel-body? kernel-body))
+    (is (= '[[A :input] [B :input] [C :inout] [beta :scalar]]
+           (mapv (juxt :name :kind) (:abi emitted))))
+    (is (empty? (:epilogue-operands emitted)))
+    (is (= '[A B] (mapv :buffer (:stable-reads kernel-body)))
+        "the destination is written, so it carries no stable-read contract")
+    (is (re-find #"__global float\* out" (:source emitted))
+        "the destination pointer is writable: no const qualifier")
+    (is (re-find #"\? out\[" (:source emitted))
+        "the destination element is loaded under the same store mask")
+    (is (str/includes? (:source emitted) "(beta * "))))

@@ -232,3 +232,41 @@
     (is (= :operand-layout (:fallback-reason routed)))
     (is (= :portable-kernel-body (-> routed :declines last :leaf)))
     (is (nil? (:kernel-body routed)))))
+
+(defn- destination-reading-form
+  [dtype]
+  (concat
+   '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
+                         (raster.numeric/*
+                          (clojure.core/aget A (clojure.core/+ (clojure.core/* i 16) l))
+                          (clojure.core/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+   [:epilogue {:acc 'acc
+               :expr '(raster.numeric/+ acc (raster.numeric/* beta (clojure.core/aget C (clojure.core/+ (clojure.core/* i 8) j))))
+               :operands [{:sym 'C :dtype dtype :map (axis-map/of-axes [['i 4] ['j 8]])}]
+               :scalars [{:sym 'beta :dtype dtype}]
+               :dtype dtype}]))
+
+(deftest a-result-transform-reading-the-destination-makes-it-one-read-write-parameter
+  ;; `C := acc + beta·C` (an accumulating GEMM) reads the element this work item stores. The
+  ;; destination is a single `:inout` parameter: no second read-only view of the same storage,
+  ;; no stable-read claim on a buffer the kernel writes, and no `const` on its pointer.
+  (let [routed (route/route-contraction (destination-reading-form :float) :dtype :float :desc {}
+                                        :candidate-families #{:portable})]
+    (is (= :portable-segred (:strategy routed)))
+    (is (= '[[A :input] [B :input] [C :inout] [beta :scalar] [_nseg :scalar]]
+           (mapv (juxt :name :kind) (:abi routed))))
+    (is (= '[A B] (:array-params routed)))
+    (is (empty? (:epilogue-operands routed)))
+    (is (= '[beta] (:epilogue-scalars routed)))
+    (is (= '[A B] (mapv :buffer (get-in routed [:kernel-body :stable-reads]))))
+    (is (re-find #"__global float\* C" (:source routed)))
+    (is (not (re-find #"const float\* C" (:source routed))))))
+
+(deftest the-matrix-leaf-declines-a-destination-reading-transform-by-name
+  ;; The tile store writes whole fragments; reading the destination element inside that store
+  ;; is not expressed yet, so the FP16 product routes to the register-tiled body and says why.
+  (let [routed (route/route-contraction (destination-reading-form :half) :dtype :half)]
+    (is (= :regtiled (:strategy routed)))
+    (is (= [[:dpas :epilogue-reads-destination]]
+           (mapv (juxt :leaf :reason) (:declines routed))))
+    (is (= :inout (:kind (first (filter #(= 'C (:name %)) (:abi routed))))))))

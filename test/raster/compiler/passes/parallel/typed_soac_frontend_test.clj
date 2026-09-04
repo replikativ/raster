@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy-soac]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
@@ -802,15 +803,46 @@
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
 
-(deftest a-blas-gemm-with-a-non-zero-beta-stays-a-host-call
-  (let [call (with-meta
-               (list '.invk
-                     'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
-                     'A 'B 'C 'm 'k 'n '(float 1.0) '(float 1.0))
-               {:raster.op/original 'raster.linalg.blas/dgemm!
-                :raster.type/tag 'floats :tag 'floats})
-        source (list 'let* ['r call] 'r)]
-    (is (= source (frontend/normalize-source source)))))
+(defn- accumulating-gemm-call
+  [beta]
+  (with-meta
+    (list '.invk
+          'raster.linalg.blas/dgemm!_m_floats_floats_floats_long_long_long_float_float-impl
+          'A 'B 'C 'm 'k 'n '(float 1.0) beta)
+    {:raster.op/original 'raster.linalg.blas/dgemm!
+     :raster.type/tag 'floats :tag 'floats}))
+
+(deftest a-blas-gemm-with-a-non-zero-beta-reads-its-destination-in-the-result-transform
+  ;; `(dgemm! A B C m k n 1 beta)` is `C[i,j] := Σ_l A[i,l]·B[l,j] + beta·C[i,j]`: the same
+  ;; contraction, with a result transform that reads the destination element it overwrites.
+  ;; The destination is then read-write storage of one kernel rather than a host BLAS effect.
+  (let [types {:dtype :float :array-types {'A :float 'B :float 'C :float}
+               :scalar-types {'m :long 'k :long 'n :long 'beta :float}}
+        program-for (fn [beta]
+                      (let [source (list 'let* ['r (accumulating-gemm-call beta)] 'r)]
+                        (frontend/form->program (frontend/normalize-source source types) types)))
+        program (program-for '(float 1.0))
+        equation (first (dialect/equations program))
+        {:keys [attributes]} (dialect/operation-parts equation)
+        transform (:result-transform attributes)]
+    (is (= ['segmented-reduce] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= '[[rstr_gemm_i_0 m] [rstr_gemm_j_0 n]] (:segment-axes attributes)))
+    (is (= [{:value 'C :parameter '%result-operand0 :dtype :float
+             :map (axis-map/of-axes '[[rstr_gemm_i_0 m] [rstr_gemm_j_0 n]])}]
+           (:operands transform))
+        "the destination is the one transform operand, read at the store coordinates")
+    (is (= [] (:scalars transform)) "beta = 1 is folded")
+    (is (= [{:destination 'C :access :read-write :host-return :buffer}]
+           (get-in (dialect/facts program)
+                   [:equations (second equation) :attributes :result-storage])))
+    (testing "a scalar beta is a transform scalar"
+      (let [program (program-for 'beta)
+            {:keys [attributes]} (dialect/operation-parts (first (dialect/equations program)))]
+        (is (= [{:value 'beta :parameter '%result-scalar0 :dtype :float}]
+               (:scalars (:result-transform attributes))))))
+    (testing "a beta that is neither a literal nor a scalar value stays a host call"
+      (let [source (list 'let* ['r (accumulating-gemm-call '(clojure.core/aget S 0))] 'r)]
+        (is (= source (frontend/normalize-source source types)))))))
 
 (deftest equal-sizes-spelled-through-host-bindings-are-one-extent
   ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`

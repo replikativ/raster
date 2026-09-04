@@ -3627,6 +3627,18 @@
                     (vreset! output-seg [seg half? esize])
                     seg)
 
+                  ;; Read-write storage: the kernel reads the destination it overwrites (an
+                  ;; accumulating contraction), so a host array is staged in and read back.
+                  :inout
+                  (let [half? (boolean (#{:half :float16} dtype))
+                        esize (long (get dtype-byte-sizes dtype 8))
+                        seg (if (device-buffer? value)
+                              (:segment ^DeviceBuffer value)
+                              (stage-operand! kernel-name :c-out value out-elems half? esize))]
+                    (vreset! output value)
+                    (vreset! output-seg [seg half? esize])
+                    seg)
+
                   :scalar
                   value
 

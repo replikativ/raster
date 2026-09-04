@@ -115,3 +115,21 @@
             f (eval (list 'fn '[A B C] (expand cform)))]
         (f A B C)
         (is (= (vec C) (mapv double [9 12 15 19 26 33 29 40 51 39 54 69])))))))
+
+(deftest contract-result-transform-reads-the-destination
+  (testing ":epilogue is the typed kernels' result transform: C := acc + beta·C on the host too"
+    (let [m 3 k 4 n 2
+          A (double-array (map double (range (* m k))))
+          B (double-array (map #(* 0.5 (double %)) (range (* k n))))
+          C (double-array (map #(* 10.0 (double %)) (range (* m n))))
+          expected (let [product (ref-matmul-nn A B m k n)]
+                     (mapv (fn [p c] (+ p (* 0.5 c))) (vec product) (vec C)))]
+      ;; the operand map is macro-time data: the axis-map of the destination over the free axes
+      (par/contract C [[i m] [j n]] [[l k]]
+                    (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
+                    :epilogue {:acc acc
+                               :expr (+ acc (* 0.5 (aget C (+ (* i n) j))))
+                               :operands [{:sym C :map {:groups [[[i m]] [[j n]]]} :dtype :double}]
+                               :scalars []
+                               :dtype :double})
+      (is (= expected (vec C))))))

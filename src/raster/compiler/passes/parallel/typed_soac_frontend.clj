@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
@@ -1214,8 +1215,11 @@
            ;; Contract is effectful at the source spelling because it writes `out`, but its
            ;; TypedSOAC equation denotes the mathematical output tensor. A terminal reference to
            ;; that physical destination therefore returns the logical value; generic map-void
-           ;; destinations remain `:effect` storage and retain host nil semantics.
-           :result-storage [{:destination out :access :write :host-return :buffer}]})))
+           ;; destinations remain `:effect` storage and retain host nil semantics. A result
+           ;; transform that reads the destination (an accumulating GEMM) makes it read-write.
+           :result-storage [{:destination out
+                             :access (if (contains? epilogue-arrays out) :read-write :write)
+                             :host-return :buffer}]})))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
@@ -1340,17 +1344,38 @@
    is the pure contraction `(raster.par/contract C [[i m] [j n]] [[l k]] (* A[i,l] B[l,j]))`
    scaled by `alpha`, and the typed route can schedule it like any contraction instead of
    leaving the whole block on the host because one binding is an opaque BLAS effect. A non-zero
-   `beta` reads the destination inside its own epilogue and stays a host call for now."
+   `beta` (a literal or a scalar value) is the same contraction with a result transform that
+   reads the destination element it overwrites: `C[i,j] := acc + beta·C[i,j]`. The destination
+   is then read-write storage of one kernel, which the KernelBody builders express as a single
+   `:inout` parameter. A `beta` that is neither a literal nor a scalar value id, or a call whose
+   element type is unknown, stays a host call."
   [ordinal expression]
   (let [variant (when (and (seq? expression) (= '.invk (first expression)))
                   (get descriptor/blas-gemm-ops (:raster.op/original (meta expression))))
         arguments (when variant (vec (drop 2 expression)))
         [A B C m k n alpha beta] arguments
         beta-literal (when variant (descriptor/gemm-scalar-literal beta))
-        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))]
+        alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))
+        ;; `alpha`/`beta` arrive as `(oftype witness value)` from the source spelling; the scalar
+        ;; factor is its value, not the type witness array.
+        scalar-value (fn [argument literal]
+                       (cond
+                         ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
+                         ;; it denotes, not an integer literal that would mistype the product.
+                         (some? literal) literal
+                         (and (seq? argument)
+                              (= 'raster.numeric/oftype (descriptor/semantic-op argument))
+                              (= 2 (count (descriptor/call-args argument))))
+                         (second (descriptor/call-args argument))
+                         :else argument))
+        beta-value (when variant (scalar-value beta beta-literal))
+        accumulate? (not= 0.0 beta-literal)
+        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                          dtype/dtype-for-array-tag dtype/canon)]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
-             (= 0.0 beta-literal))
+             (or (not accumulate?)
+                 (and elem-type (or (number? beta-value) (symbol? beta-value)))))
       (let [i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
             j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
             l (clojure.core/symbol (str "rstr_gemm_l_" ordinal))
@@ -1361,8 +1386,6 @@
             b-index (case variant
                       (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
                       :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l))
-            elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                              dtype/dtype-for-array-tag dtype/canon)
             ;; The walker stamps every arithmetic form with its result dtype; the emitted loads
             ;; and product carry the same stamp so scalar lowering reads the type instead of
             ;; guessing it.
@@ -1374,21 +1397,29 @@
             product (typed (list 'clojure.core/*
                                  (typed (list 'clojure.core/aget A a-index))
                                  (typed (list 'clojure.core/aget B b-index))))
-            ;; `alpha` arrives as `(oftype witness value)` from the source spelling; the scalar
-            ;; factor is its value, not the type witness array.
-            alpha-value (cond
-                          ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
-                          ;; it denotes, not an integer literal that would mistype the product.
-                          (some? alpha-literal) alpha-literal
-                          (and (seq? alpha)
-                               (= 'raster.numeric/oftype (descriptor/semantic-op alpha))
-                               (= 2 (count (descriptor/call-args alpha))))
-                          (second (descriptor/call-args alpha))
-                          :else alpha)
+            alpha-value (scalar-value alpha alpha-literal)
             body (if (= 1.0 alpha-literal)
                    product
-                   (typed (list 'clojure.core/* alpha-value product)))]
-        (with-meta (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+                   (typed (list 'clojure.core/* alpha-value product)))
+            ;; `beta·C[i,j]` is read at the store coordinates of the element being produced;
+            ;; the operand map declares that coordinate, the index inside the read is its
+            ;; row-major spelling for the host expansion.
+            epilogue
+            (when accumulate?
+              (let [acc (clojure.core/symbol (str "rstr_gemm_acc_" ordinal))
+                    destination (typed (list 'clojure.core/aget C
+                                             (list 'clojure.core/+ (list 'clojure.core/* i n) j)))
+                    scaled (if (= 1.0 beta-literal)
+                             destination
+                             (typed (list 'clojure.core/* beta-value destination)))]
+                {:acc acc
+                 :expr (typed (list 'clojure.core/+ acc scaled))
+                 :operands [{:sym C :map (axis-map/of-axes [[i m] [j n]]) :dtype elem-type}]
+                 :scalars (if (symbol? beta-value) [{:sym beta-value :dtype elem-type}] [])
+                 :dtype elem-type}))]
+        (with-meta (cond-> (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+                     epilogue (concat [:epilogue epilogue])
+                     true (->> (apply list)))
           (cond-> {:raster.op/original (:raster.op/original (meta expression))}
             elem-type (assoc :raster.type/elem-type elem-type))))
       expression)))

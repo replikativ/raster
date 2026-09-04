@@ -1152,7 +1152,7 @@
         epilogue-operands
         (vec (map :id (filter #(and (= :input (:kind %))
                                     (= :epilogue (:role %))) parameters)))
-        output-parameter (first (filter #(= :output (:kind %)) parameters))
+        output-parameter (first (filter #(contains? #{:output :inout} (:kind %)) parameters))
         output (:id output-parameter)
         scalar-parameters (vec (filter #(and (= :scalar (:kind %))
                                              (not= :epilogue (:role %))) parameters))

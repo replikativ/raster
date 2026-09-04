@@ -224,7 +224,7 @@
               arguments
               (mapv (fn [{:keys [name kind role] :as slot}]
                       (case kind
-                        (:input :output) name
+                        (:input :output :inout) name
                         :scalar
                         (if (= :epilogue role)
                           name
@@ -991,15 +991,23 @@
   [out-sym dtype desc tile epilogue contract-facts operation-id candidate-families]
   (let [acc (volatile! [])
         note! (fn [d] (vswap! acc conj d) nil)
+        ;; The matrix leaf stores whole tiles through fragment registers; a result transform
+        ;; that reads the destination element would need a fragment-level load of the tile it
+        ;; overwrites, which that store path does not express yet.
+        destination-read? (boolean (some #(= out-sym (:sym %)) (:operands epilogue)))
         matrix? (contains? candidate-families :matrix)
         register-tiled? (contains? candidate-families :register-tiled)]
     (try
-      (let [scheduled (when matrix?
+      (let [scheduled (when (and matrix? (not destination-read?))
                         (contraction-schedule/plan-matrix-body
                          contract-facts desc tile {:operation-id operation-id}))
             dpas (cond
                    (not matrix?)
                    {:tensorized false :reason :schedule-family-disabled :family :matrix}
+
+                   destination-read?
+                   {:tensorized false :reason :epilogue-reads-destination
+                    :family :matrix :destination out-sym}
 
                    (:ok scheduled)
                    (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
