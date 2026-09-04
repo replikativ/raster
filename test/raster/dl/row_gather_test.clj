@@ -5,7 +5,8 @@
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
             [raster.gpu.core :as gpu]
-            [raster.gpu.descriptor-fixture :as fixture]))
+            [raster.gpu.descriptor-fixture :as fixture]
+            [raster.gpu.device-probe :as device-probe]))
 
 (deftm greedy-embedding-tail!
   [logits :- (Array float), token-indices :- (Array int),
@@ -201,10 +202,12 @@
   ;; The consumer's fragmented KV-page path moves FP16 pages as `(Array short)` carriers. The
   ;; typed route must keep that carrier dtype end to end: two effect-only steps in source order
   ;; (scatter, then gather), both lowered through the verified KernelBody, every array ABI slot
-  ;; still `:half`,
-  ;; and no host materialization through a JVM scalar cast (the `main` failure was
-  ;; `:typed-soac-materialization-dtype` for `[:half]`).
-  (doseq [target [:ocl:0 :ze:0]]
+  ;; still `:half`, and no host materialization through a JVM scalar cast (the `main` failure
+  ;; was `:typed-soac-materialization-dtype` for `[:half]`). The roundtrip then runs on the
+  ;; device, so the test needs one.
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "fp16 block transfer typed route")
+    (doseq [target [:ocl:0 :ze:0]]
     (let [descriptor (pipeline/compile-gpu-program #'block-transfer-half-roundtrip! target
                                                    :dtype :float)
           steps (:steps descriptor)
@@ -242,4 +245,4 @@
               (is (= [-1 -1 -1 20 21 22 -1 -1 -1 -1 -1 -1 10 11 12 30 31 32]
                      (vec (get result 'paged))))
               (is (= [10 11 12 20 21 22 30 31 32] (vec (get result 'restored)))))
-            (finally (gpu/close-session! session))))))))
+            (finally (gpu/close-session! session)))))))))
