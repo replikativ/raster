@@ -1859,7 +1859,7 @@
   (let [{:keys [kernel-name phase convention artifact argument-specs arrays n-fn scalar-specs]}
         step]
     (case convention
-      (:map :reduce :map-void :contract :gemm :executable)
+      (:map :reduce :map-void :contract :executable)
       (let [logical-or-physical-args
             (mapv (fn [{:keys [kind sym type value-fn]}]
                     (if (= :scalar kind)
@@ -1939,7 +1939,7 @@
    conventions uniformly—the per-step core used by LinkPlan instantiation and multi-instance
    decoder composition. Does NOT record a graph; the caller collects :phase keys and records once.
 
-     :map/:reduce/:map-void/:contract/:gemm
+     :map/:reduce/:map-void/:contract/:executable
                 Select one ABI-compatible KernelArtifact or KernelGraph schedule. Graph-private
                 conversion/layout/split temporaries remain owned by the bound step.
      :scatter   Expands to zero-fill + scatter behind the same ordered prepared-step boundary.
