@@ -269,8 +269,13 @@
      (compute 'safe-page-end :int
               (expr :min :int (expr :max :int 'page-end (lit 0 :int))
                     (lit capacity :int)))
-     (compute 'routed-page-count :int
+     ;; This subtraction is range-safe but can be negative for malformed raw offsets.  Clamp the
+     ;; derived count before the `(count - 1) * page-size` schedule expression below; validity is
+     ;; still enforced independently by `route-valid`, so clamping cannot admit a malformed row.
+     (compute 'raw-routed-page-count :int
               (bounded-expr :- :int 'safe-page-end 'safe-page-begin))
+     (compute 'routed-page-count :int
+              (expr :max :int 'raw-routed-page-count (lit 0 :int)))
      (compute 'has-routed-pages :predicate
               (expr :gt :predicate 'routed-page-count (lit 0 :int)))
      (compute 'empty-last-page-valid :predicate
@@ -1253,23 +1258,29 @@
         offset (if csr? 'history-tile-offset-int 'history-tile-offset)]
     (vec
      (concat
+      ;; `history-tile` is group axis 2, whose launch extent is the schedule's tile-count.
+      ;; Schedule validation fixes tile-count=ceil(capacity/tile-size), so its product below is
+      ;; strictly below the validated int32 membership capacity.
       [(compute 'history-tile-offset-int :int
                 (bounded-expr :* :int 'history-tile (lit tile-size :int)))]
       (when-not csr?
         [(compute 'history-tile-offset :long
                   (cast-expr 'history-tile-offset-int :long))])
+      ;; Both interval and CSR membership lowering clamp begin/end to their statically validated
+      ;; int32 capacity.  The tile offset is nonnegative and below the same capacity, so each
+      ;; difference/sum below stays within the selected int32/long representation.
       [(compute 'membership-count type
-                (expr :- type 'attention-end 'attention-begin))
+                (bounded-expr :- type 'attention-end 'attention-begin))
        (compute 'tile-relative-begin type
                 (expr :min type 'membership-count offset))
        (compute 'tile-membership-begin type
-                (expr :+ type 'attention-begin 'tile-relative-begin))
+                (bounded-expr :+ type 'attention-begin 'tile-relative-begin))
        (compute 'tile-membership-remaining type
-                (expr :- type 'membership-count 'tile-relative-begin))
+                (bounded-expr :- type 'membership-count 'tile-relative-begin))
        (compute 'tile-membership-width type
                 (expr :min type 'tile-membership-remaining (lit tile-size type)))
        (compute 'tile-membership-end type
-                (expr :+ type 'tile-membership-begin 'tile-membership-width))]))))
+                (bounded-expr :+ type 'tile-membership-begin 'tile-membership-width))]))))
 
 (defn- partial-store-operations
   [partial-ids slots]

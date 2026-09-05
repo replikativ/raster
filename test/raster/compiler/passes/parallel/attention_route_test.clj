@@ -548,7 +548,8 @@
                        "rstr_empty_last_page_valid = (rstr_final_page_length == 0)"))))
 
 (deftest csr-route-sanitizes-untrusted-page-metadata-before-proved-arithmetic
-  (let [{:keys [plan schedule]} (route/route! (problem :route (csr-route)) intel-desc)
+  (let [{:keys [plan artifact]} (route/route! (problem :route (csr-route)) intel-desc)
+        schedule (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
         lowered (swr-body/lower-routed-paged plan schedule)
         operations (operation-tree (:operations lowered))
         compute-by-id (into {}
@@ -556,18 +557,44 @@
                                     (when-let [result (:result operation)]
                                       [(:id result) operation])))
                             operations)
+        raw-routed-count (get compute-by-id 'raw-routed-page-count)
         routed-count (get compute-by-id 'routed-page-count)
         computed-length (get compute-by-id 'computed-kv-length)]
     ;; Raw device page offsets and last-page lengths have no overflow contract.  The only marked
     ;; arithmetic consumes clamped SSA values, while invalid raw metadata remains in route-valid
     ;; and therefore masks all writes.
-    (is (= :no-overflow (get-in routed-count [:expression :options :overflow])))
+    (is (= :no-overflow (get-in raw-routed-count [:expression :options :overflow])))
     (is (= ['safe-page-end 'safe-page-begin]
+           (get-in raw-routed-count [:expression :arguments])))
+    (is (= ['raw-routed-page-count (kbody/literal 0 :int)]
            (get-in routed-count [:expression :arguments])))
     (is (= :no-overflow (get-in computed-length [:expression :options :overflow])))
     (is (= 'safe-final-page-length
            (last (get-in computed-length [:expression :arguments]))))
     (is (some? (get compute-by-id 'route-valid)))))
+
+(deftest csr-route-clamps-an-inverted-row-before-certified-length-arithmetic
+  (let [route (attention/csr-paged-route
+               {:page-offsets 'page-offsets :page-indices 'page-indices
+                :last-page-lengths 'last-page-lengths :start-positions 'kv-start-positions
+                :page-index-capacity 1})
+        problem (problem :route route :page-size Integer/MAX_VALUE :physical-pages 1)
+        {:keys [plan artifact]} (route/route! problem intel-desc)
+        schedule (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
+        lowered (swr-body/lower-routed-paged plan schedule)
+        compute-by-id (into {}
+                            (keep (fn [operation]
+                                    (when-let [result (:result operation)]
+                                      [(:id result) operation])))
+                            (operation-tree (:operations lowered)))
+        count-minus-one (get compute-by-id 'computed-kv-length)]
+    ;; An invalid row with begin=1/end=0 has a raw count of -1.  It is clamped to zero before
+    ;; the certified `count - 1` product, even with the largest legal page size.
+    (is (= 'safe-final-page-length
+           (last (get-in count-minus-one [:expression :arguments]))))
+    (is (= 'routed-page-count
+           (get-in count-minus-one [:expression :arguments 0 :arguments 0 :arguments 0])))
+    (is (= :no-overflow (get-in count-minus-one [:expression :options :overflow])))))
 
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}
