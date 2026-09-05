@@ -63,6 +63,9 @@
         target (dtype/canon target)]
     (cond
       (= source target) nil
+      (and (contains? #{:byte :int :long} source) (dtype/fp-dtype? target))
+      [:nearest-even (if (= :half target) :ieee :exact)]
+
       (and (dtype/fp-dtype? source) (dtype/fp-dtype? target)
            (< (dtype/bytes-of source) (dtype/bytes-of target)))
       [:exact :exact]

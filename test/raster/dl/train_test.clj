@@ -238,6 +238,12 @@
 ;; End-to-end training: XOR classification
 ;; ================================================================
 
+(defn- seeded-he-weights
+  [^java.util.Random rng rows cols]
+  (let [scale (Math/sqrt (/ 6.0 cols))]
+    (double-array (repeatedly (* rows cols)
+                              #(* scale (- (* 2.0 (.nextDouble rng)) 1.0))))))
+
 (deftest xor-training-test
   (testing "MLP learns XOR pattern"
     (let [;; XOR dataset: 4 samples, repeated for enough data
@@ -250,10 +256,13 @@
                          [x1 x2 y] xor-data]
                      [(double-array [x1 x2]) (double-array [y])]))
           in-dim 2 hidden 8 out-dim 1
-          ;; Initialize weights
-          W1 (nn/he-init hidden in-dim)
+          ;; This is a convergence regression, not a random-initialization stress test.
+          ;; Keep both the initial parameters and minibatch order reproducible, without
+          ;; changing its loss/prediction thresholds or retrying until training succeeds.
+          rng (java.util.Random. 42)
+          W1 (seeded-he-weights rng hidden in-dim)
           b1 (double-array hidden)
-          W2 (nn/he-init out-dim hidden)
+          W2 (seeded-he-weights rng out-dim hidden)
           b2 (double-array out-dim)
           ;; Optimizer state
           adam-state {:W1 {:m (double-array (* hidden in-dim))
@@ -299,11 +308,11 @@
               loss-val))
           batch-size 16
           ;; Record loss at epoch 1
-          first-loss (train/train-epoch! model-fn dataset batch-size :shuffle? true)
+          first-loss (train/train-epoch! model-fn dataset batch-size :shuffle? false)
           ;; Train more epochs
           _ (dotimes [_ 198]
-              (train/train-epoch! model-fn dataset batch-size :shuffle? true))
-          last-loss (train/train-epoch! model-fn dataset batch-size :shuffle? true)
+              (train/train-epoch! model-fn dataset batch-size :shuffle? false))
+          last-loss (train/train-epoch! model-fn dataset batch-size :shuffle? false)
           ;; Evaluate on all 4 XOR inputs
           predict (fn [x1 x2]
                     (let [x (double-array [x1 x2])

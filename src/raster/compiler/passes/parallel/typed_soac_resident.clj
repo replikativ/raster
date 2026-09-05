@@ -42,6 +42,11 @@
               (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
                                    (vec body-results)))))
 
+(defn- result-transform-inputs
+  [attributes]
+  (let [{:keys [operands scalars]} (:result-transform attributes)]
+    (map :value (concat operands scalars))))
+
 (defn- use-sites
   [equations]
   (reduce
@@ -50,6 +55,10 @@
        (-> uses
            (into (map (fn [value] [value {:equation id :role :array}]) arrays))
            (into (map (fn [value] [value {:equation id :role :capture}]) captures))
+           ;; The transform has its own typed scalar boundary. Rewriting the primary
+           ;; lambda cannot turn a transform scalar into a resident buffer load.
+           (into (map (fn [value] [value {:equation id :role :result-transform}])
+                      (result-transform-inputs attributes)))
            (cond-> (dialect/value-id? (:extent attributes))
              (conj [(:extent attributes) {:equation id :role :extent}])))))
    [] equations))
@@ -124,7 +133,8 @@
         stable-before (set (get-in info [:attributes :attributes :stable-array-captures]))
         referenced-values (->> (concat (mapcat #(util/free-syms (:init %) bound) global-locals)
                                        (mapcat #(util/free-syms % bound) global-bodies)
-                                       stable-before)
+                                       stable-before
+                                       (result-transform-inputs (:attributes info)))
                                (filter #(contains? values %)) distinct (sort-by pr-str) vec)
         new-parameters (mapv #(symbol (str "%capture" %)) (range (count referenced-values)))
         body-substitutions (zipmap referenced-values new-parameters)
@@ -145,7 +155,8 @@
 (defn realize
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.
 
-   A root declines realization when it is a program result or is used as an element array/extent.
+   A root declines realization when it is a program result or is used as an element array,
+   extent, or result-transform input (which requires a separate scalar-load schedule).
    Scalar chains depending on eligible roots must likewise remain internal and capture-only."
   [program]
   (let [program (dialect/validate! program)
