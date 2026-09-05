@@ -4,7 +4,8 @@
    The target backend may replace scheduled operations, but the retained typed algorithms and
    ordered program dataflow remain authoritative. Host-only scalar equations are the only
    equations with an empty emitted operation sequence."
-  (:require [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as program]
@@ -41,6 +42,46 @@
 
     :else false))
 
+(defn- scheduled-equation-view
+  "The outer equation contract before target emission replaces its operation sequence."
+  [equation]
+  (dissoc equation :operations))
+
+(defn- validate-host-prefix-slices!
+  "Bind every narrowed emitted body to its exact enclosing host-scalar execution prefix.
+
+   An EmittedParallelEquation can validate a self-contained numerical graph, but a graph-storage
+   extent may also use a preceding host scalar.  This outer check prevents an isolated body from
+   substituting a different (though locally valid) prefix: its host equations, terminal numerical
+   equation, inferred inputs, outputs, and effects must be the exact slice of this program."
+  [parallel-program]
+  (loop [host-prefix [] remaining (:equations parallel-program)]
+    (when-let [equation (first remaining)]
+      (if (true? (get-in equation [:attributes :host-only]))
+        (recur (conj host-prefix equation) (next remaining))
+        (let [operation (first (:operations equation))]
+          (when (emitted-equation/emitted-equation? operation)
+            (let [body (:body operation)
+                  body-equations (:equations body)
+                  actual-prefix (vec (butlast body-equations))
+                  terminal-body (last body-equations)
+                  expected-inputs (program/infer-inputs body-equations)
+                  expected-effects (reduce set/union #{} (map :effects body-equations))]
+              (when-not (and (= host-prefix actual-prefix)
+                             (= (scheduled-equation-view equation)
+                                (scheduled-equation-view terminal-body))
+                             (= expected-inputs (:inputs body))
+                             (= (:results equation) (:outputs body))
+                             (= expected-effects (:effects body)))
+                (throw (ex-info "emitted numerical body differs from its enclosing host-scalar prefix slice"
+                                {:reason :emitted-parallel-program-host-prefix
+                                 :outer-equation (:id equation)
+                                 :expected-prefix (mapv :id host-prefix)
+                                 :actual-prefix (mapv :id actual-prefix)
+                                 :expected-inputs expected-inputs :actual-inputs (:inputs body)
+                                 :ir :emitted-parallel-program})))))
+          (recur host-prefix (next remaining)))))))
+
 (defn validate!
   "Validate a fully emitted equation-first program without depending on a target backend."
   [parallel-program]
@@ -53,6 +94,7 @@
   (let [parallel-program
         (program/validate! parallel-program emitted-operation? emitted-boundary?)
         expected-target (get dialect-targets (:dialect parallel-program))
+        _ (validate-host-prefix-slices! parallel-program)
         artifacts
         (vec
          (for [equation (:equations parallel-program)

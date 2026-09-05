@@ -1,15 +1,19 @@
 (ns raster.compiler.passes.parallel.typed-segmented-fold-map-test
   (:require [clojure.string :as str]
+            [clojure.set :as set]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
@@ -319,7 +323,65 @@
            (reason-of #(fold-body/validate-against-node! forged-launch node graph))))
     (doseq [forged [forged-workgroup forged-shared forged-schedule]]
       (is (= :segfoldmap-schedule-source
-             (reason-of #(fold-body/validate-against-node! forged node graph)))))))
+           (reason-of #(fold-body/validate-against-node! forged node graph)))))))
+
+(deftest graph-storage-replays-the-closed-host-scalar-extent-prefix
+  (let [typed (:program (route/attempt source :float {'values :float 'out :float}
+                                      {:scalar-types {'nsegments :int 'width :int}}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0
+                                 :array-types {'values :float 'out :float}
+                                 :scalar-types {'nsegments :int 'width :int}}))
+        numerical (some #(when (seq (:operations %)) %) (:equations scheduled))
+        extent 'derived-extent
+        values (-> (:values scheduled)
+                   (assoc extent (av/tensor {:dtype :int :shape []}))
+                   (update 'values assoc :shape [(list 'value extent)])
+                   ;; Opaque graph extent identities are resolver-owned leaves, not nested
+                   ;; graph-scalar expressions.  Keep one alongside the expanded input extent.
+                   (update 'out assoc :shape [(list 'extent 'input)]))
+        scalar-algorithm
+        (dialect/make
+         (dialect/default-program-facts
+          {:values values :inputs '[nsegments width]
+           :equations {extent (dialect/default-equation-facts)}})
+         [(list '= extent [extent]
+                (list 'scalar {:dtypes [:int]} '[nsegments width]
+                      (dialect/lambda-form '[segments elements]
+                                           '[(clojure.core/* segments elements)])))]
+         [extent])
+        scalar-equation
+        (parallel-program/->ProgramEquation
+         extent [:test :derived-extent] nil '[nsegments width] [extent]
+         scalar-algorithm [] #{} {:source :test} {:host-only true})
+        equations [scalar-equation numerical]
+        closed (assoc scheduled
+                      :values values
+                      :inputs (parallel-program/infer-inputs equations)
+                      :equations equations
+                      :outputs (:results numerical)
+                      :effects (reduce set/union #{} (map :effects equations)))
+        graph (equation-graph/make (:algorithm numerical) closed)
+        values-buffer (some #(when (= 'values (:id %)) %) (:inputs graph))
+        graph-scalar-references
+        (reduce set/union #{}
+                (map #(into #{}
+                             (filter (fn [value] (or (symbol? value) (keyword? value))))
+                             (launch/expression-references (:elements %)))
+                     (concat (:inputs graph) (:outputs graph) (:temporaries graph))))]
+    (is values-buffer)
+    (is (= #{'nsegments 'width}
+           (launch/expression-references (:elements values-buffer)))
+        "the graph allocation replays the preceding typed scalar definition")
+    (is (not-any? #{extent}
+                  (launch/expression-references (:elements values-buffer))))
+    (is (= #{'nsegments 'width}
+           (set (map :id (:scalars graph)))))
+    (is (= (list 'extent 'input)
+           (:elements (some #(when (= 'out (:id %)) %) (:outputs graph))))
+        "a compound resolver identity remains opaque without inventing a GraphScalar")
+    (is (set/subset? graph-scalar-references (set (map :id (:scalars graph))))
+        "every graph-storage extent closes over an explicit integral graph scalar")))
 
 (deftest scalar-captures-retain-their-typed-abi
   (let [scaled-source

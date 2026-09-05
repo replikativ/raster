@@ -5,18 +5,21 @@
    control. It consumes only the retained functional algorithm, ordered SegOps, and AbstractValue
    contracts; source spelling and operation-family names play no role."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.ir.soac-dialect :as soac]))
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]))
 
 (defn- fail!
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :scheduled-equation-graph))))
 
 (defn- value-elements
-  [value]
+  [derived-scalars value]
   (let [dimension-value (fn [dimension]
                           ;; AbstractValue uses `(value id)` to distinguish a compound stable
                           ;; value ID from shape syntax. KernelGraph owns explicit integer
@@ -26,11 +29,115 @@
                                    (= 2 (count dimension)))
                             (second dimension)
                             dimension))
-        shape (mapv dimension-value (:shape value))]
-    (cond
-      (empty? shape) 1
-      (= 1 (count shape)) (first shape)
-      :else (apply launch/product shape))))
+        shape (mapv dimension-value (:shape value))
+        elements (cond
+                   (empty? shape) 1
+                   (= 1 (count shape)) (first shape)
+                   :else (apply launch/product shape))]
+    ;; Shapes retain stable SSA identities.  A preceding pure scalar equation may define one of
+    ;; those identities as checked launch algebra (notably normalised `rstr_extent_n` values).
+    ;; Rebind that compiler-owned definition here, where graph allocation becomes concrete, so a
+    ;; KernelBody's source-derived storage certificate and the graph describe the same extent.
+    (launch/rebind-expression elements derived-scalars)))
+
+(defn- integral-scalar-value?
+  [value]
+  (and value
+       (empty? (:shape value))
+       (contains? #{:int :long} (some-> (:dtype value) dtype/canon))))
+
+(defn- scalar-result-expression
+  "Return one closed typed scalar result with lambda parameters replaced by its stable captures.
+
+   This consumes the retained TypedSOAC scalar equation, rather than source spelling or an
+   emitter-side symbol table.  Locals are expanded in their already-validated SSA order; a value
+   that is not a pure launch expression is simply not a graph-storage definition."
+  [equation]
+  (let [algorithm (:algorithm equation)]
+    (when (and (soac/program-form? algorithm)
+               (= 1 (count (soac/equations algorithm))))
+      (let [semantic-equation (first (soac/equations algorithm))
+            {:keys [kind captures lambda]} (soac/operation-parts semantic-equation)
+            results (nth semantic-equation 2)
+            {:keys [parameters locals body-results]} (soac/lambda-parts lambda)]
+        (when (and (= 'scalar kind)
+                   (= results (:results equation))
+                   (= (:operands equation) (:inputs (soac/facts algorithm)))
+                   (= (:results equation) (soac/outputs algorithm))
+                   (= 1 (count results))
+                   (= 1 (count body-results))
+                   (= (count captures) (count parameters)))
+          (let [substitutions
+                (reduce (fn [bindings {:keys [id init]}]
+                          (assoc bindings id (util/subst-syms bindings init)))
+                        (zipmap parameters captures)
+                        locals)]
+            [(first results)
+             (util/subst-syms substitutions (first body-results))]))))))
+
+(defn- launch-definition
+  [values bindings equation]
+  (when-let [[result expression] (scalar-result-expression equation)]
+    (let [{:keys [captures]} (soac/operation-parts
+                              (first (soac/equations (:algorithm equation))))]
+      (when (and (integral-scalar-value? (get values result))
+                 (every? #(integral-scalar-value? (get values %)) captures))
+        (try
+          (let [narrowing-cast?
+                (boolean
+                 (some (fn [form]
+                         (and (seq? form) (= 2 (count form))
+                              (contains? '#{int clojure.core/int} (first form))))
+                       (tree-seq coll? seq expression)))
+                _ (when narrowing-cast?
+                    (throw (ex-info "launch/storage scalar projection cannot erase narrowing"
+                                    {:reason :derived-scalar-narrowing
+                                     :result result :expression expression})))
+                decline! (fn [rule message data]
+                           (throw (ex-info message
+                                           (assoc data :reason rule
+                                                       :pass :scheduled-equation-graph))))
+                index (index-expression/lower expression (set captures) decline!)
+                projected (launch/rebind-expression
+                           (index-expression/to-launch-expression index decline!) bindings)
+                projected-dtype
+                (launch/typed-expression-dtype
+                 projected #(some-> (get values %) :dtype))]
+            (when-not (= projected-dtype (dtype/canon (get-in values [result :dtype])))
+              (throw (ex-info "launch/storage scalar projection changes its retained width"
+                              {:reason :derived-scalar-dtype
+                               :result result :projected projected
+                               :projected-dtype projected-dtype
+                               :result-dtype (get-in values [result :dtype])})))
+            [result projected])
+          ;; Scalar equations also represent ordinary arithmetic.  Only the monotone, integral
+          ;; subset accepted by KernelLaunch is an allocation definition; other scalar work stays
+          ;; opaque at this boundary exactly as before.
+          (catch clojure.lang.ExceptionInfo _ nil))))))
+
+(defn derived-scalar-expressions
+  "Derive replayable graph-storage expressions from ordered, already-validated scalar equations.
+
+   Definitions are expanded in program order, so a later extent never remains an opaque alias of
+   an earlier one.  This is deliberately a small projection from TypedSOAC scalar equations to
+   KernelLaunch, not a source re-parser or a new scalar registry."
+  [values equations]
+  (reduce (fn [bindings equation]
+            (if-let [[result expression] (launch-definition values bindings equation)]
+              (assoc bindings result expression)
+              bindings))
+          {} equations))
+
+(defn- typed-host-scalar-equation?
+  [values equation algorithm]
+  (when-let [[result _] (scalar-result-expression equation)]
+    (let [semantic-equation (first (soac/equations algorithm))
+          {:keys [attributes captures]} (soac/operation-parts semantic-equation)]
+      (and (= algorithm (soac/validate! algorithm))
+           (= 1 (count (:results equation)))
+           (= (:dtypes attributes) [(get-in values [result :dtype])])
+           (empty? (get-in values [result :shape]))
+           (every? #(contains? values %) captures)))))
 
 (defn- physical-outputs
   [algorithm]
@@ -60,14 +167,14 @@
            operations)))
 
 (defn- storage-spec
-  [values id]
+  [values derived-scalars id]
   (let [value (get values id)]
     (when-not value
       (fail! :scheduled-equation-storage-value
              "scheduled storage lacks an AbstractValue"
              {:value id}))
     {:dtype (:dtype value)
-     :elements (value-elements value)
+     :elements (value-elements derived-scalars value)
      :memory-space (or (:memory-space value) :device)}))
 
 (defn- algorithm-boundary?
@@ -83,8 +190,19 @@
           [] values))
 
 (defn- public-scalars
-  [scheduled operations]
-  (let [required (reduce set/union #{} (map segop/operation-scalars operations))
+  [scheduled operations buffer-specs]
+  (let [operation-required (reduce set/union #{} (map segop/operation-scalars operations))
+        ;; KernelLaunch intentionally permits a compound list identity such as `(extent input)`
+        ;; as one resolver-owned leaf.  It is not a graph scalar and must not be destructured or
+        ;; promoted to a fictitious ABI argument.  Expanded allocation algebra, on the other
+        ;; hand, closes only over stable symbol/keyword scalar identities.
+        storage-required
+        (into #{}
+              (filter #(or (symbol? %) (keyword? %)))
+              (reduce set/union #{}
+                      (map #(launch/expression-references (:elements %))
+                           (vals buffer-specs))))
+        required (set/union operation-required storage-required)
         ordered (ordered-distinct
                  (concat (filter required (:inputs scheduled))
                          (sort-by pr-str (remove (set (:inputs scheduled)) required))))
@@ -99,6 +217,11 @@
                 (fail! :scheduled-equation-scalar-shape
                        "scheduled scalar dependency must have scalar shape"
                        {:value id :shape (:shape value)}))
+              (when (and (contains? storage-required id)
+                         (not (integral-scalar-value? value)))
+                (fail! :scheduled-equation-storage-scalar
+                       "graph storage algebra must close over a declared integral scalar"
+                       {:value id :value-contract value}))
               (graph/scalar id (:dtype value))))
           ordered)))
 
@@ -115,24 +238,32 @@
              (fail! :scheduled-equation-dialect
                     "KernelGraph derivation requires a fully scheduled :segop program"
                     {:dialect (:dialect scheduled)}))
-         retained-equations (vec (mapcat (comp soac/equations :algorithm)
-                                         (:equations scheduled)))
+         host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
+                                      (:equations scheduled)))
+         numerical-equations (vec (drop (count host-prefix) (:equations scheduled)))
+         _ (when-not (and (= 1 (count numerical-equations))
+                          (every? #(typed-host-scalar-equation? (:values scheduled) % (:algorithm %))
+                                  host-prefix))
+             (fail! :scheduled-equation-prefix
+                    "a narrowed graph body requires an earlier-only typed host-scalar prefix and one numerical equation"
+                    {:host-prefix (mapv :id host-prefix)
+                     :numerical-equations (mapv :id numerical-equations)}))
+         target-equation (first numerical-equations)
+         retained-equations (vec (mapcat (comp soac/equations :algorithm) numerical-equations))
          _ (when-not (and (= (soac/equations algorithm) retained-equations)
-                          (= (:inputs (soac/facts algorithm)) (:inputs scheduled))
+                          (= (:operands target-equation) (:inputs (soac/facts algorithm)))
                           (= (soac/outputs algorithm) (:outputs scheduled)))
              (fail! :scheduled-equation-algorithm
                     "scheduled equations or program boundary differ from the retained algorithm"
                     {:algorithm-inputs (:inputs (soac/facts algorithm))
-                     :scheduled-inputs (:inputs scheduled)
+                     :scheduled-inputs (:inputs target-equation)
                      :algorithm-outputs (soac/outputs algorithm)
                      :scheduled-outputs (:outputs scheduled)}))
-         operations (vec (mapcat :operations (:equations scheduled)))
+         operations (vec (mapcat :operations numerical-equations))
          _ (when (empty? operations)
              (fail! :scheduled-equation-empty
                     "a KernelGraph requires at least one scheduled operation" {}))
-         _ (when (some #(get-in % [:attributes :host-only]) (:equations scheduled))
-             (fail! :scheduled-equation-host-scalar
-                    "host scalar equations require an explicit host schedule" {}))
+         derived-scalars (derived-scalar-expressions (:values scheduled) host-prefix)
          inputs (external-inputs operations)
          outputs (set (physical-outputs algorithm))
          operation-values (reduce set/union #{}
@@ -141,10 +272,10 @@
                                        operations))
          temporary-ids (set/difference operation-values inputs outputs)
          values (:values scheduled)
-         scalars (public-scalars scheduled operations)
          buffer-specs (into {}
-                            (map (fn [id] [id (storage-spec values id)]))
-                            (set/union inputs outputs temporary-ids))]
+                            (map (fn [id] [id (storage-spec values derived-scalars id)]))
+                            (set/union inputs outputs temporary-ids))
+         scalars (public-scalars scheduled operations buffer-specs)]
      (graph/from-segops
       operations
       {:inputs inputs
