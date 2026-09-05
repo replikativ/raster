@@ -4,14 +4,17 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.scheduled-graph-refinement :as graph-refinement]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -1109,6 +1112,10 @@
         dispatch (contract-route/route-typed-contraction-dispatch
                   algorithm operation :dtype :float :desc descriptor
                   :precision :mixed-f16-f32)
+        direct-graph (kdispatch/alternative dispatch :xmx-direct)
+        split-graph (kdispatch/alternative dispatch :xmx-split-k)
+        direct-refinement (get-in direct-graph [:attributes :scheduled-graph-refinement])
+        split-refinement (get-in split-graph [:attributes :scheduled-graph-refinement])
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
         select (fn [m n k]
                  (kdispatch/alternative-strategy
@@ -1126,6 +1133,45 @@
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (testing "mixed-precision alternatives refine the exact typed SegRed through stage graphs"
+      (doseq [[graph refinement expected-types]
+              [[direct-graph direct-refinement
+                [raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.matrix_stage.MatrixStage]]
+               [split-graph split-refinement
+                [raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.matrix_stage.MatrixStage
+                 raster.compiler.ir.segop.SegRed]]]]
+        (let [stage-graph (graph-refinement/scheduled-graph refinement)]
+          (is (identical? operation (graph-refinement/source-operation refinement)))
+          (is (= (kernel-graph/boundary-contract (:source refinement))
+                 (kernel-graph/boundary-contract stage-graph)))
+          (is (= expected-types (mapv (comp class :operation) (:nodes stage-graph))))
+          (is (kernel-graph/dataflow-equivalent? stage-graph graph))
+          (is (= (mapv :id (:nodes stage-graph)) (mapv :id (:nodes graph))))
+          (doseq [[stage-node emitted-node] (map vector (:nodes stage-graph) (:nodes graph))]
+            (let [artifact (:operation emitted-node)
+                  certificate (kernel-artifact/attribute artifact :scheduled-kernel-body)]
+              (is (= (:operation stage-node) (:source certificate)))
+              (is (= certificate (get-in artifact [:provenance :scheduled-operation])))
+              (is (= certificate
+                     (scheduled-body/validate-against-node!
+                      certificate stage-node stage-graph)))
+              (is (= artifact
+                     (scheduled-body/validate-artifact-projection! certificate artifact))))))))
+    (testing "an emitted certificate cannot be rebound to a different scheduled stage"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            stage-node (first (:nodes stage-graph))
+            artifact (-> direct-graph :nodes first :operation)
+            certificate (kernel-artifact/attribute artifact :scheduled-kernel-body)
+            tampered (assoc certificate :source (assoc (:source certificate) :id ::tampered))]
+        (try
+          (scheduled-body/validate-against-node! tampered stage-node stage-graph)
+          (is false "tampered source identity must be rejected")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :scheduled-kernel-body-source (:reason (ex-data exception))))))))
     (testing "explicit split factors remain compiler schedule candidates over the same typed equation"
       (let [tunable (contract-route/route-typed-contraction-dispatch
                      algorithm operation :dtype :float :desc descriptor
@@ -1171,6 +1217,8 @@
                    algorithm operation :dtype :float :desc descriptor
                    :precision :mixed-f16-f32)
         matrix-graph (kdispatch/alternative scheduled :xmx-batched)
+        refinement (get-in matrix-graph [:attributes :scheduled-graph-refinement])
+        stage-graph (graph-refinement/scheduled-graph refinement)
         matrix-node (last (:nodes matrix-graph))
         matrix-body (get-in matrix-node [:operation :attributes :kernel-body])
         scheduled-matrix (get-in matrix-node [:operation :attributes :scheduled-kernel-body])
@@ -1188,6 +1236,12 @@
     (is (= :portable-segred (select 4 64 128 62)))
     (is (= {:row true :col false}
            (get-in matrix-graph [:attributes :batching])))
+    (is (identical? operation (graph-refinement/source-operation refinement)))
+    (is (= [raster.compiler.ir.layout_stage.LayoutStage
+            raster.compiler.ir.layout_stage.LayoutStage
+            raster.compiler.ir.matrix_stage.MatrixStage]
+           (mapv (comp class :operation) (:nodes stage-graph))))
+    (is (kernel-graph/dataflow-equivalent? stage-graph matrix-graph))
     (is (scheduled-body/scheduled-kernel-body? scheduled-matrix))
     (is (matrix-stage/matrix-stage? matrix-stage))
     (is (= {:extent 'batch :lhs true :rhs false} (:batching matrix-stage)))

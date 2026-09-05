@@ -152,6 +152,8 @@
                       (mapcat identity
                               (select-keys tile
                                            [:block-m :block-n :sg-m :sg-n :block-k :matrix])))]
+    (is (nil? (get-in graph [:attributes :scheduled-graph-refinement]))
+        "the standalone compatibility API does not invent a semantic-source witness")
     (is (body/kernel-body? kernel-body))
     (is (scheduled-body/scheduled-kernel-body? scheduled))
     (is (matrix-stage/matrix-stage? stage))

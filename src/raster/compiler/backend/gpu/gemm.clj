@@ -730,7 +730,7 @@
                                    split-k? kc splits)
         combine (when split-k?
                   (walk/postwalk-replace
-                   {'mn c-elements 'splits splits}
+                   {'partials partials 'C c 'mn c-elements 'splits splits}
                    (:operation (split-k-combine-plan [:gemm id strategy :combine]))))
         nodes (cond->
                [(stage-node convert-a-id convert-a

@@ -952,19 +952,6 @@
                       :interface interface}
      :layout {:external-interface interface}}))
 
-(defn- reinterface-graph
-  [graph abi arguments effects operation-id]
-  (let [{public-abi :abi public-arguments :arguments}
-        (kgraph/public-interface abi arguments)]
-    (kgraph/validate!
-     (-> graph
-         (assoc :abi public-abi :arguments public-arguments :effects effects
-                :scalars (kgraph/interface-scalars public-abi public-arguments))
-         (update :provenance merge {:operation-id operation-id
-                                    :source-dialect :typed-soac})
-         (update :attributes merge {:candidate-family :matrix
-                                    :semantic-op :contraction})))))
-
 (defn- mixed-dpas-alternatives
   "Derive graph-valued mixed-precision DPAS schedules from ordinary typed contraction facts.
 
