@@ -175,6 +175,25 @@
                       {:reason :product-reduction-attributes :attributes attributes}))))
   reduction)
 
+(defn validate-product-tree!
+  "Validate the algebra required by the lane-strided, halving-tree product schedule.
+   This schedule permutes elements, so associativity alone is insufficient. These are explicit
+   caller-supplied algebra contracts, not a proof of arbitrary combine expressions."
+  [operator schedule]
+  (validate! operator)
+  (validate-schedule! schedule)
+  (when-not (= :segmented-workgroup-tree (:strategy schedule))
+    (throw (ex-info "product tree requires the segmented-workgroup-tree schedule"
+                    {:reason :product-reduction-schedule-not-emittable
+                     :strategy (:strategy schedule)})))
+  (doseq [[property reason] [[:associative? :product-reduction-not-associative]
+                            [:commutative? :product-reduction-not-commutative]]]
+    (when-not (true? (get-in operator [:algebra property]))
+      (throw (ex-info "reordering product tree requires explicit associativity and commutativity"
+                      {:reason reason :required property :algebra (:algebra operator)
+                       :strategy (:strategy schedule) :fallback :none}))))
+  schedule)
+
 (defn make
   [{:keys [components index step element-bindings element-results combine-parameters
            combine-bindings combine-results algebra attributes]

@@ -65,6 +65,30 @@
     (is (= {:acc 'acc :init 0.0 :lambda '(+ acc (aget values i))}
            (reduction/scalar-op operator)))))
 
+(deftest lane-strided-tree-cannot-schedule-associativity-alone
+  ;; Affine-function composition is associative, not commutative. The existing two-lane tree
+  ;; groups e0,e2 then e1,e3 instead of preserving e0,e1,e2,e3.
+  (let [compose (fn [[a b] [c d]] [(* a c) (+ (* a d) b)])
+        [e0 e1 e2 e3 :as values] [[1 1] [2 0] [1 3] [1 0]]]
+    (is (not= (reduce compose [1 0] values)
+              (compose (compose e0 e2) (compose e1 e3)))))
+  (let [node (soac/par-form->soac '_ argmax-product-form 7 :dtype :float)
+        scheduled (first (soac-lower/lower-soac node :cpu:0 :dtype :float))]
+    (doseq [[field expected] [[:associative? :product-reduction-not-associative]
+                             [:commutative? :product-reduction-not-commutative]]
+            flag [false nil]]
+      (let [operator (assoc-in (:reduction node) [:algebra field] flag)]
+        ;; Both initial schedule construction and emission of a changed retained operator must
+        ;; check the same contract; callers cannot bypass it with an already-built schedule.
+        (doseq [attempt [#(soac-lower/lower-soac (assoc node :reduction operator) :cpu:0 :dtype :float)
+                         #(segop-opencl/generate-product-reduction-kernel
+                           (assoc scheduled :reduction operator)
+                           :scalar-types {'nrows :int 'width :int}
+                           :array-types {'values :float})]]
+          (try (attempt) (is false "unsupported algebra must decline")
+               (catch clojure.lang.ExceptionInfo e
+                 (is (= expected (:reason (ex-data e)))))))))))
+
 (deftest scalar-parallel-reduction-requires-the-registered-typed-identity
   (try
     (reduction/scalar

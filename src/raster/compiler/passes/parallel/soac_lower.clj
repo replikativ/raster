@@ -946,6 +946,7 @@
                            :component-dtypes (reduction/dtypes reduction)
                            :scratch-bytes-per-lane (:bytes-per-lane product-grid-info)
                            :slm-budget (:slm-budget product-grid-info)}})))
+        _ (when product? (reduction/validate-product-tree! reduction product-schedule))
         execution (execution-plan/reduce-execution bound grid-1)]
     (if product?
       [(segop/->SegRed (:id description) space (segop/->SegLevel :block :virtual)

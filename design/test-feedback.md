@@ -108,3 +108,10 @@ unwraps arbitrary unary calls or resolves static fields by their unqualified nam
 handwritten exclusive-scan generator has been removed (no Raster/pretrained/finetune callers).
 The retained product leaf still needs destination-dtype literal range validation and migration
 to the common KernelBody emitter; source-constant evaluation alone does not complete that work.
+
+Before that migration, the lane-strided product tree is gated by one IR-owned algebra check
+at scheduling and emission: both associativity and commutativity must be explicitly declared.
+Its lane folds and halving tree permute elements. Associativity alone cannot justify that
+schedule (affine-function composition is a counterexample). Noncommutative products remain
+representable but need an order-preserving schedule; they now decline instead of silently
+being reordered. This checks declared contracts, not arbitrary mathematical proofs.
