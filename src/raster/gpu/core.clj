@@ -1717,10 +1717,13 @@
                       {:dispatch-id dispatch-id :result-slots (mapv first result-pairs)})))
     (with-gpu-session* device-id
       (fn [session]
-        (doseq [{:keys [key value dtype elements resident? read?]} groups]
+        (doseq [{:keys [key value dtype elements resident? read? write?]} groups]
           (if resident?
             (register-buffer! session key value {:ownership :borrowed})
-            (alloc! session {key [dtype elements (when read? value)]})))
+            ;; Write access is not a proof that every supplied element is overwritten:
+            ;; kernels may write a prefix or guarded subset. Full-capacity copy-back must
+            ;; preserve the rest until a verified coverage contract permits eliding upload.
+            (alloc! session {key [dtype elements (when (or read? write?) value)]})))
         (let [handle (bind-kernel-executable! session
                                               [:staged-executable dispatch-id]
                                               executable arguments)]

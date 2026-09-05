@@ -120,12 +120,28 @@
                 (is (= 456.0 (double (aget ^floats actual 1))) "only out[0] is written")))
             (finally (fixture/close! program))))))))
 
+(defn- run-staged! [target]
+  (let [kernel-dispatch (first (:dispatches (emitted 'n)))
+        register! (requiring-resolve
+                   (symbol (if (= target :ocl:0)
+                             "raster.gpu.ocl-runtime" "raster.gpu.ze-runtime")
+                           "register-kernel-dispatch!"))]
+    (register! kernel-dispatch)
+    (doseq [n [0 8 1025]]
+      (let [x (float-array (max 1 n) 1.0)
+            y (float-array (max 1 n) 0.5)
+            out (float-array [123.0 456.0])]
+        (is (identical? out (gpu/invoke-staged-executable!
+                            target (:id kernel-dispatch) [x y out (long n)])))
+        (is (= [(* n 0.5) 456.0] (vec out))
+            "ordinary staged invocation preserves the unwritten output tail")))))
+
 (deftest opencl-rank-zero-contraction-writes-the-resident-result
   (if @opencl-probe/opencl-available?
-    (run-device! :ocl:0)
+    (do (run-device! :ocl:0) (run-staged! :ocl:0))
     (opencl-probe/opencl-skip! "rank-zero contraction graph")))
 
 (deftest level-zero-rank-zero-contraction-writes-the-resident-result
   (if @gpu-probe/gpu-available?
-    (run-device! :ze:0)
+    (do (run-device! :ze:0) (run-staged! :ze:0))
     (gpu-probe/gpu-skip! "rank-zero contraction graph")))
