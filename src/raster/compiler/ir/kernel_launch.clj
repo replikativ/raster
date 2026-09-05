@@ -330,7 +330,12 @@
            (align-up? x)
            (floor-div? x)
            (sum? x)
-           (minimum? x))))
+           (minimum? x)
+           ;; Rebinding an opaque dimension to an exact typed scalar definition may expose a
+           ;; checked KernelBody index node at the root. The same nodes are already accepted
+           ;; inside compound dimensions and must remain legal after substitution.
+           (index-cast? x)
+           (index-expr? x))))
 
 (defn validate-spec!
   "Validate and return a symbolic launch specification."

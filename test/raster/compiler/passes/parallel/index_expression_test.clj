@@ -20,7 +20,7 @@
     (is (= :long (launch/typed-expression-dtype projected dtypes)))
     (is (= #{'rows 'width} (launch/expression-references projected)))))
 
-(deftest typed-launch-projection-declines-integral-narrowing
+(deftest typed-launch-projection-declines-int-overflow-semantics
   (let [reason (try
                  (index-expression/lower-typed
                   (with-meta '(clojure.core/* rows width) {:raster.type/tag 'int})
@@ -28,4 +28,24 @@
                  nil
                  (catch clojure.lang.ExceptionInfo error
                    (:reason (ex-data error))))]
-    (is (= :index-expression-dtype reason))))
+    (is (= :index-expression-overflow reason))))
+
+(deftest typed-launch-projection-requires-authoritative-compound-width
+  (let [reason (try
+                 (index-expression/lower-typed
+                  '(clojure.core/* rows width)
+                  #{'rows 'width} {'rows :int 'width :int} :long fail!)
+                 nil
+                 (catch clojure.lang.ExceptionInfo error
+                   (:reason (ex-data error))))]
+    (is (= :index-expression reason))))
+
+(deftest wrapping-raster-int-arithmetic-is-not-exact-launch-algebra
+  (let [reason (try
+                 (index-expression/lower-typed
+                  (with-meta '(raster.numeric/* rows width) {:raster.type/tag 'int})
+                  #{'rows 'width} {'rows :int 'width :int} :int fail!)
+                 nil
+                 (catch clojure.lang.ExceptionInfo error
+                   (:reason (ex-data error))))]
+    (is (= :index-expression-overflow reason))))

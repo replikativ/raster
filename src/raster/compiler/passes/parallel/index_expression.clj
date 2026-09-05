@@ -136,17 +136,17 @@
   "Lower exact integral arithmetic while preserving its retained Typed Clojure width.
 
    `leaf-dtype` supplies the authoritative dtype for each scalar SSA leaf and `expected-dtype`
-   is the typed scalar equation's result.  The only implicit conversion this projection inserts
-   is exact int-to-long widening; narrowing, missing types, and mixed-width arithmetic decline.
+   is the typed scalar equation's result. Compound arithmetic requires its own retained dtype and
+   must already be long; int arithmetic may wrap or trap before widening and therefore declines.
+   The only implicit conversion this projection inserts is exact int-to-long leaf widening.
    This is the graph-launch counterpart of scalar KernelBody lowering, not source type inference."
   [expression scope leaf-dtype expected-dtype decline!]
-  (letfn [(source-dtype [form fallback]
+  (letfn [(source-dtype [form]
             (or (some-> (or (:raster.type/tag (meta form)) (:tag (meta form)))
                         dtype/dtype-for-scalar-tag dtype/canon)
                 (when (symbol? form) (some-> (leaf-dtype form) dtype/canon))
                 (when (integer? form)
-                  (if (<= Integer/MIN_VALUE form Integer/MAX_VALUE) :int :long))
-                (some-> fallback dtype/canon)))
+                  (if (<= Integer/MIN_VALUE form Integer/MAX_VALUE) :int :long))))
           (coerce [lowered source target form]
             (let [source (dtype/canon source)
                   target (dtype/canon target)]
@@ -162,11 +162,11 @@
             (let [expected (dtype/canon expected)]
               (cond
                 (integer? form)
-                (coerce form (source-dtype form expected) expected form)
+                (coerce form (source-dtype form) expected form)
 
                 (symbol? form)
                 (if (contains? scope form)
-                  (let [source (source-dtype form nil)]
+                  (let [source (source-dtype form)]
                     (when-not (contains? #{:int :long} source)
                       (decline! :index-expression-dtype
                                 "typed launch scalar requires an integral retained dtype"
@@ -181,19 +181,32 @@
                      (= 1 (count (descriptor/call-args form))))
                 (let [target (get cast-dtypes (descriptor/semantic-op form))
                       argument (first (descriptor/call-args form))
-                      source (source-dtype argument target)
+                      source (source-dtype argument)
+                      _ (when-not (contains? #{:int :long} source)
+                          (decline! :index-expression-dtype
+                                    "an exact index cast requires its argument's retained dtype"
+                                    {:expression form :argument argument :dtype source}))
                       lowered (lower* argument source)]
                   (coerce lowered source target form))
 
                 (seq? form)
                 (let [operator (get operators (descriptor/semantic-op form))
                       arguments (vec (descriptor/call-args form))
-                      result-type (source-dtype form expected)]
+                      result-type (source-dtype form)]
                   (when-not (and operator (seq arguments)
                                  (contains? #{:int :long} result-type)
                                  (or (not= :sub operator) (= 2 (count arguments))))
                     (decline! :index-expression
                               "typed launch expression requires explicit integral arithmetic"
+                              {:expression form :operator (descriptor/semantic-op form)
+                               :dtype result-type}))
+                  ;; KernelLaunch is exact checked mathematical-integer algebra. An `int`
+                  ;; operation is not: Raster's numerical overloads wrap, and checked host int
+                  ;; operations can fail where a widened launch computation would succeed. Only
+                  ;; an already-typed long operation may be replayed as storage/launch algebra.
+                  (when (= :int result-type)
+                    (decline! :index-expression-overflow
+                              "int arithmetic cannot be projected into exact launch algebra"
                               {:expression form :operator (descriptor/semantic-op form)
                                :dtype result-type}))
                   (coerce

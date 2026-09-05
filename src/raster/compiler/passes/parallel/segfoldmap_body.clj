@@ -13,6 +13,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn- decline!
@@ -286,11 +287,12 @@
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
                   first-segment
-                  (body/index-cast
-                   (body/expression :add
-                                    (body/expression :mul group-index workgroup-size)
-                                    local-index)
-                   :long :exact))]
+                  (body/expression
+                   :add
+                   (body/expression :mul
+                                    (body/index-cast group-index :long :exact)
+                                    (body/index-cast workgroup-size :long :exact))
+                   (body/index-cast local-index :long :exact)))]
        :masks []
        :operations [segment-loop]
        :schedule {:strategy :grid-stride-one-work-item-per-segment
@@ -403,59 +405,89 @@
 
       :else [:leaf expression])))
 
+(defn- closed-derived-storage-scalars
+  [kernel-graph closed-body]
+  (if-not closed-body
+    {}
+    (let [host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
+                                       (:equations closed-body)))
+          numerical-equations (vec (drop (count host-prefix) (:equations closed-body)))]
+      (when-not (= 1 (count numerical-equations))
+        (throw (ex-info "fold-map storage proof requires exactly one numerical equation"
+                        {:reason :segfoldmap-storage-proof
+                         :host-prefix (mapv :id host-prefix)
+                         :numerical-equations (mapv :id numerical-equations)})))
+      (let [numerical (first numerical-equations)
+            ;; `make` revalidates the complete SegOp program, the retained TypedSOAC boundary,
+            ;; every buffer extent, and graph dataflow. Preserve only descriptive graph context
+            ;; while reconstructing; it cannot contribute a scalar definition.
+            expected-graph
+            (equation-graph/make
+             (:algorithm numerical) closed-body
+             {:effects (:effects kernel-graph)
+              :provenance (:provenance kernel-graph)
+              :attributes (:attributes kernel-graph)})]
+        (when-not (= expected-graph kernel-graph)
+          (throw (ex-info "fold-map graph is not the exact projection of its retained equation body"
+                          {:reason :segfoldmap-storage-proof
+                           :expected expected-graph :actual kernel-graph})))
+        (equation-graph/derived-scalar-expressions (:values closed-body) host-prefix)))))
+
 (defn validate-against-node!
   "Close a fold-map refinement over its exact source grid and graph storage descriptions.
 
    ScheduledKernelBody proves source/effect/scalar closure generically. Fold-map additionally knows
    that every pointer is a dense `[segments, extent]` value and that the source KernelGrid is the
    complete launch schedule, so this validator can derive—not trust—those remaining obligations."
-  [scheduled node kernel-graph]
-  (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
-        source (:source scheduled)
-        _ (when-not (instance? raster.compiler.ir.segop.SegFoldMap source)
-            (throw (ex-info "fold-map storage closure requires an exact SegFoldMap source"
-                            {:reason :segfoldmap-schedule-source :source source})))
-        buffers (into {} (map (juxt :id identity))
-                      (distinct (concat (:inputs kernel-graph)
-                                        (:outputs kernel-graph)
-                                        (:temporaries kernel-graph))))
-        parameters (get-in scheduled [:body :parameters])
-        bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
-                       (map vector parameters (:arguments scheduled)))
-        derived-scalars (get-in kernel-graph [:attributes :derived-storage-scalars] {})
-        expand-derived #(util/subst-syms derived-scalars %)
-        expected-elements (canonical-extent
-                           (expand-derived
-                            (list '* (segop/seg-space-num-segments-expr (:space source))
-                                  (:extent source))))]
-    (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
-            :when (not= :scalar (:kind parameter))]
-      (let [buffer (get buffers argument)
-            parameter-elements
-            (canonical-operation
-             :mul (map #(-> %
-                            (launch/rebind-expression bindings)
-                            expand-derived)
-                       (:shape parameter)))
-            graph-elements (some-> buffer :elements canonical-extent)]
-        (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
-          (throw (ex-info "fold-map KernelBody pointer dtype differs from its graph buffer"
-                          {:reason :segfoldmap-storage-dtype :parameter (:id parameter)
-                           :argument argument :parameter-dtype (:dtype parameter)
-                           :graph-dtype (:dtype buffer)})))
-        (when-not (and graph-elements
-                       (= expected-elements parameter-elements graph-elements))
-          (throw (ex-info "fold-map pointer extent differs across source, body, and graph"
-                          {:reason :segfoldmap-storage-extent :parameter (:id parameter)
-                           :argument argument :source expected-elements
-                           :body parameter-elements :graph graph-elements})))))
-    (let [array-types (into {} (map (juxt :id :dtype)) (vals buffers))
-          scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
-          expected (schedule source {:array-types array-types :scalar-types scalar-types})]
-      (when-not (= expected scheduled)
-        (throw (ex-info "fold-map scheduled body differs from its exact source KernelGrid refinement"
-                        {:reason :segfoldmap-schedule-source
-                         :source-grid (:grid source)
-                         :expected-body (:body expected)
-                         :actual-body (:body scheduled)}))))
-    scheduled))
+  ([scheduled node kernel-graph]
+   (validate-against-node! scheduled node kernel-graph nil))
+  ([scheduled node kernel-graph closed-body]
+   (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
+         source (:source scheduled)
+         _ (when-not (instance? raster.compiler.ir.segop.SegFoldMap source)
+             (throw (ex-info "fold-map storage closure requires an exact SegFoldMap source"
+                             {:reason :segfoldmap-schedule-source :source source})))
+         buffers (into {} (map (juxt :id identity))
+                       (distinct (concat (:inputs kernel-graph)
+                                         (:outputs kernel-graph)
+                                         (:temporaries kernel-graph))))
+         parameters (get-in scheduled [:body :parameters])
+         bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
+                        (map vector parameters (:arguments scheduled)))
+         derived-scalars (closed-derived-storage-scalars kernel-graph closed-body)
+         expand-derived #(util/subst-syms derived-scalars %)
+         expected-elements (canonical-extent
+                            (expand-derived
+                             (list '* (segop/seg-space-num-segments-expr (:space source))
+                                   (:extent source))))]
+     (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
+             :when (not= :scalar (:kind parameter))]
+       (let [buffer (get buffers argument)
+             parameter-elements
+             (canonical-operation
+              :mul (map #(-> %
+                             (launch/rebind-expression bindings)
+                             expand-derived)
+                        (:shape parameter)))
+             graph-elements (some-> buffer :elements canonical-extent)]
+         (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
+           (throw (ex-info "fold-map KernelBody pointer dtype differs from its graph buffer"
+                           {:reason :segfoldmap-storage-dtype :parameter (:id parameter)
+                            :argument argument :parameter-dtype (:dtype parameter)
+                            :graph-dtype (:dtype buffer)})))
+         (when-not (and graph-elements
+                        (= expected-elements parameter-elements graph-elements))
+           (throw (ex-info "fold-map pointer extent differs across source, body, and graph"
+                           {:reason :segfoldmap-storage-extent :parameter (:id parameter)
+                            :argument argument :source expected-elements
+                            :body parameter-elements :graph graph-elements})))))
+     (let [array-types (into {} (map (juxt :id :dtype)) (vals buffers))
+           scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
+           expected (schedule source {:array-types array-types :scalar-types scalar-types})]
+       (when-not (= expected scheduled)
+         (throw (ex-info "fold-map scheduled body differs from its exact source KernelGrid refinement"
+                         {:reason :segfoldmap-schedule-source
+                          :source-grid (:grid source)
+                          :expected-body (:body expected)
+                          :actual-body (:body scheduled)}))))
+     scheduled)))

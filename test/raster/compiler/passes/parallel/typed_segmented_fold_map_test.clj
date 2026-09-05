@@ -119,6 +119,7 @@
                                operation {:array-types {'values :float 'out :float}
                                           :scalar-types {'nsegments :int 'width :int}})
         segment-loop (first (:operations kernel-body))
+        first-segment (-> kernel-body :indices last :expression)
         segment-axis-computes (take (count (segop/seg-space-segment-dims (:space operation)))
                                     (:operations segment-loop))
         source-workgroup (get-in operation [:grid :block-size])
@@ -133,6 +134,14 @@
     (is (= (mapv :name (segop/seg-space-segment-dims (:space operation)))
            (mapv :id segment-axis-computes)))
     (is (instance? raster.compiler.ir.kernel_body.IndexExpr (:step segment-loop)))
+    (is (= :add (:op first-segment)))
+    (is (= :mul (:op (first (:arguments first-segment)))))
+    (is (every? #(and (instance? raster.compiler.ir.kernel_body.IndexCast %)
+                      (= :long (:dtype %))
+                      (= :exact (:overflow %)))
+                (concat (:arguments (first (:arguments first-segment)))
+                        [(second (:arguments first-segment))]))
+        "group, workgroup, and lane indices widen before address arithmetic")
     (is (= [source-workgroup] (get-in kernel-body [:launch :workgroup-size])))
     (is (= [(launch/minimum
              (body/index-cast source-cap :long :exact)
@@ -277,7 +286,17 @@
                            (assoc-in operation [:grid :num-blocks] 1) options))))
     (is (= :source-grid-shared-memory
            (decline-rule #(fold-body/schedule
-                           (assoc-in operation [:grid :shared-mem-bytes] 4) options))))))
+                           (assoc-in operation [:grid :shared-mem-bytes] 4) options))))
+    (let [large-cap-operation
+          (assoc-in operation [:grid :num-blocks]
+                    (list 'min Integer/MAX_VALUE
+                          (nth (get-in operation [:grid :num-blocks]) 2)))
+          first-segment (-> (fold-body/schedule large-cap-operation options)
+                            :body :indices last :expression)
+          multiplied (first (:arguments first-segment))]
+      (is (= :mul (:op multiplied)))
+      (is (every? #(= :long (:dtype %)) (:arguments multiplied))
+          "even an adversarial positive source cap widens grid operands before multiplication"))))
 
 (deftest graph-certification-closes-fold-map-pointer-dtypes-extents-and-schedule
   (let [operation (scheduled-operation)
@@ -318,6 +337,20 @@
       (is (= :segfoldmap-storage-extent
              (reason-of #(fold-body/validate-against-node!
                           scheduled (first (:nodes wrong-extent)) wrong-extent)))))
+    (let [forged-attribute-graph
+          (kgraph/from-segops
+           [operation]
+           {:inputs #{'values} :outputs #{'out} :dtype :float
+            :buffer-specs {'values {:dtype :float :elements 1}
+                           'out {:dtype :float :elements 1}}
+            :scalars [(kgraph/scalar 'nsegments :int)
+                      (kgraph/scalar 'width :int)]
+            :attributes {:derived-storage-scalars {'nsegments 1 'width 1}}})]
+      (is (= :segfoldmap-storage-extent
+             (reason-of #(fold-body/validate-against-node!
+                          scheduled (first (:nodes forged-attribute-graph))
+                          forged-attribute-graph)))
+          "descriptive graph attributes cannot forge the storage proof"))
     (let [wrong-dtype (make-graph :double elements)]
       (is (= :segfoldmap-storage-dtype
              (reason-of #(fold-body/validate-against-node!
@@ -337,8 +370,10 @@
                                  :scalar-types {'nsegments :int 'width :int}}))
         numerical (some #(when (seq (:operations %)) %) (:equations scheduled))
         extent 'derived-extent
+        extent-expression (with-meta '(clojure.core/* segments elements)
+                            {:raster.type/tag 'long})
         values (-> (:values scheduled)
-                   (assoc extent (av/tensor {:dtype :int :shape []}))
+                   (assoc extent (av/tensor {:dtype :long :shape []}))
                    (update 'values assoc :shape [(list 'value extent)])
                    ;; Opaque graph extent identities are resolver-owned leaves, not nested
                    ;; graph-scalar expressions.  Keep one alongside the expanded input extent.
@@ -349,9 +384,9 @@
           {:values values :inputs '[nsegments width]
            :equations {extent (dialect/default-equation-facts)}})
          [(list '= extent [extent]
-                (list 'scalar {:dtypes [:int]} '[nsegments width]
+                (list 'scalar {:dtypes [:long]} '[nsegments width]
                       (dialect/lambda-form '[segments elements]
-                                           '[(clojure.core/* segments elements)])))]
+                                           [extent-expression])))]
          [extent])
         scalar-equation
         (parallel-program/->ProgramEquation
@@ -384,7 +419,84 @@
            (:elements (some #(when (= 'out (:id %)) %) (:outputs graph))))
         "a compound resolver identity remains opaque without inventing a GraphScalar")
     (is (set/subset? graph-scalar-references (set (map :id (:scalars graph))))
-        "every graph-storage extent closes over an explicit integral graph scalar")))
+        "every graph-storage extent closes over an explicit integral graph scalar")
+    (is (nil? (get-in graph [:attributes :derived-storage-scalars]))
+        "the derivation remains a retained program proof, never a graph assertion")
+    (let [proof-values (update values 'out assoc :shape [(list 'value extent)])
+          proof-closed (assoc closed :values proof-values)
+          proof-graph (equation-graph/make (:algorithm numerical) proof-closed)
+          operation (first (:operations numerical))
+          certificate (fold-body/schedule
+                       operation {:array-types {'values :float 'out :float}
+                                  :scalar-types {'nsegments :int 'width :int}})
+          emitted (segop-opencl/generate-kernel-graph
+                   proof-graph
+                   :target-dialect :opencl-portable
+                   :array-types {'values :float 'out :float}
+                   :scalar-types {'nsegments :int 'width :int}
+                   :scheduled-equation-body proof-closed)]
+      (is (= certificate
+             (fold-body/validate-against-node!
+              certificate (first (:nodes proof-graph)) proof-graph proof-closed)))
+      (is (artifact/kernel-artifact? (get-in emitted [:nodes 0 :operation]))
+          "graph emission threads the exact retained equation proof into FoldMap"))))
+
+(deftest host-prefix-does-not-hide-later-numerical-inputs
+  (let [two-map-source
+        '(let* [y (raster.par/pmap i n float
+                                   (clojure.core/* 2.0 (clojure.core/aget x i)))
+                z (raster.par/pmap j n float
+                                   (clojure.core/+ (clojure.core/aget y j)
+                                                   (clojure.core/aget b j)))
+                _effect (dotimes [k n]
+                          (clojure.core/aset
+                           acc 0 (clojure.core/+ (clojure.core/aget acc 0)
+                                                 (clojure.core/aget y k))))]
+               z)
+        options {:dtype :float :target-device :ocl:0
+                 :array-types {'x :float 'b :float 'acc :float}
+                 :scalar-types {'n :long}}
+        typed (:program (route/attempt two-map-source :float (:array-types options)
+                                       {:scalar-types (:scalar-types options)}))
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        numerical-equations (:equations scheduled)
+        host-id 'graph-proof-host
+        values (assoc (:values scheduled) host-id (av/tensor {:dtype :long :shape []}))
+        host-algorithm
+        (dialect/make
+         (dialect/default-program-facts
+          {:values values :inputs []
+           :equations {host-id (dialect/default-equation-facts)}})
+         [(list '= host-id [host-id]
+                (list 'scalar {:dtypes [:long]} []
+                      (dialect/lambda-form [] [1])))]
+         [host-id])
+        host-equation
+        (parallel-program/->ProgramEquation
+         host-id [:test :graph-proof-host] nil [] [host-id]
+         host-algorithm [] #{} {:source :test} {:host-only true})
+        algorithms (mapv :algorithm numerical-equations)
+        numerical-inputs (parallel-program/infer-inputs numerical-equations)
+        combined-algorithm
+        (dialect/make
+         (dialect/default-program-facts
+          {:values values
+           :inputs numerical-inputs
+           :equations (apply merge (map (comp :equations dialect/facts) algorithms))
+           :effects (reduce set/union #{} (map (comp :effects dialect/facts) algorithms))})
+         (vec (mapcat dialect/equations algorithms))
+         (:outputs scheduled))
+        equations (into [host-equation] numerical-equations)
+        closed (assoc scheduled
+                      :values values
+                      :inputs (parallel-program/infer-inputs equations)
+                      :equations equations)
+        graph (equation-graph/make combined-algorithm closed)]
+    (is (= 2 (count numerical-equations)))
+    (is (some #{'b} numerical-inputs)
+        "the second equation introduces an external input absent from the first")
+    (is (= 2 (count (:nodes graph))))
+    (is (some #{'b} (map :id (:inputs graph))))))
 
 (deftest scalar-captures-retain-their-typed-abi
   (let [scaled-source

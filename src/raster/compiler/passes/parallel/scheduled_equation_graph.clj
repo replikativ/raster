@@ -251,16 +251,23 @@
                     {:host-prefix (mapv :id host-prefix)
                      :numerical-equations (mapv :id numerical-equations)}))
          retained-equations (vec (mapcat (comp soac/equations :algorithm) numerical-equations))
-         numerical-inputs (if (seq host-prefix)
-                            (:operands (first numerical-equations))
-                            (:inputs scheduled))
+         ;; A scheduled graph may retain several numerical equations after its host-scalar
+         ;; prefix. Infer the boundary of the complete numerical slice; using only the first
+         ;; equation silently loses external operands first introduced by a later equation.
+         inferred-numerical-inputs (program/infer-inputs numerical-equations)
+         algorithm-inputs (:inputs (soac/facts algorithm))
+         ;; Operand order in a scheduled equation can differ from the semantic program boundary
+         ;; (structured control makes this visible). Compare the complete inferred boundary as a
+         ;; set while retaining the already-validated TypedSOAC order as the canonical interface.
+         numerical-inputs (vec (filter (set inferred-numerical-inputs) algorithm-inputs))
          _ (when-not (and (= (soac/equations algorithm) retained-equations)
-                          (= numerical-inputs (:inputs (soac/facts algorithm)))
+                          (= (set inferred-numerical-inputs) (set algorithm-inputs))
+                          (= numerical-inputs algorithm-inputs)
                           (= (soac/outputs algorithm) (:outputs scheduled)))
              (fail! :scheduled-equation-algorithm
                     "scheduled equations or program boundary differ from the retained algorithm"
-                    {:algorithm-inputs (:inputs (soac/facts algorithm))
-                     :scheduled-inputs numerical-inputs
+                    {:algorithm-inputs algorithm-inputs
+                     :scheduled-inputs inferred-numerical-inputs
                      :algorithm-outputs (soac/outputs algorithm)
                      :scheduled-outputs (:outputs scheduled)}))
          operations (vec (mapcat :operations numerical-equations))
@@ -293,9 +300,7 @@
                            :algorithm-dialect :typed-soac
                            :schedule-dialect :segop}
                           provenance)
-       ;; This map is derived solely from the validated leading host equations above.  It lets a
-       ;; schedule validator normalize its source-level extent identities to the same public
-       ;; launch algebra as the graph's fully expanded storage specs.  Callers cannot override it.
-       :attributes (cond-> attributes
-                     (seq derived-scalars)
-                     (assoc :derived-storage-scalars derived-scalars))}))))
+       ;; Derived scalar definitions are deliberately absent here.  They are proof terms in the
+       ;; retained ParallelProgram prefix, not descriptive KernelGraph attributes.  A schedule
+       ;; validator that needs them must receive and revalidate that exact program slice.
+       :attributes attributes}))))

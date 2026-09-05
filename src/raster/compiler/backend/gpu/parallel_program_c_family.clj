@@ -84,7 +84,8 @@
      :array-types (:array-types opts)
      :target-dialect (get opts :target-dialect :opencl-intel)
      :target-device (:target-device opts)
-     :contraction-facts (:contraction-facts opts))))
+     :contraction-facts (:contraction-facts opts)
+     :scheduled-equation-body (:scheduled-equation-body opts))))
 
 (defn- contraction-facts-by-operation
   "Project typed contraction facts once at the algorithm/schedule boundary.
@@ -158,7 +159,7 @@
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
             emitted (emit-graph scheduled-graph (:values body) operations
-                                (cond-> opts
+                                (cond-> (assoc opts :scheduled-equation-body body)
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations

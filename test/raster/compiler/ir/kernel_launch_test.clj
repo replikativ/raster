@@ -110,6 +110,25 @@
     (is (= #{'batch 'rows 'width} (launch/expression-references expression)))
     (is (= 30 (launch/resolve-expression {'batch 2 'rows 3 'width 5} expression)))))
 
+(deftest launch-rebinding-admits-an-exact-widening-as-the-whole-dimension
+  (let [original (launch/spec
+                  {:workgroup-size [1]
+                   :group-count [(launch/runtime-value 'extent)]})
+        widened (body/index-cast (launch/runtime-value 'rows) :long :exact)
+        rebound (launch/rebind-spec original {'extent widened})]
+    (is (= [widened] (:group-count rebound)))
+    (is (= [7] (:group-count (launch/realize rebound {'rows 7})))))
+  (let [original (launch/spec
+                  {:workgroup-size [1]
+                   :group-count [(launch/runtime-value 'extent)]})
+        product (body/expression
+                 :mul
+                 (body/index-cast (launch/runtime-value 'rows) :long :exact)
+                 (body/index-cast (launch/runtime-value 'width) :long :exact))
+        rebound (launch/rebind-spec original {'extent product})]
+    (is (= [product] (:group-count rebound)))
+    (is (= [21] (:group-count (launch/realize rebound {'rows 3 'width 7}))))))
+
 (deftest runtime-literals-are-specialization-values-not-public-scalar-leaves
   (is (= #{} (launch/expression-references (launch/runtime-value 3))))
   (is (= #{'n} (launch/expression-references (launch/runtime-value 'n)))))
