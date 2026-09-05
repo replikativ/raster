@@ -36,6 +36,24 @@
     {:associative? true :commutative? true
      :order {:nan :highest :tie :lowest-index}}))
 
+(defn- product-source-with-index-neutral [neutral]
+  (let [form (apply list (assoc-in (vec argmax-product-form) [2 1 1] neutral))
+        node (soac/par-form->soac '_ form 7 :dtype :float)
+        scheduled (first (soac-lower/lower-soac node :cpu:0 :dtype :float))]
+    (:source (segop-opencl/generate-product-reduction-kernel
+               scheduled :scalar-types {'nrows :int 'width :int}
+               :array-types {'values :float}))))
+
+(deftest product-neutral-emission-preserves-checked-casts
+  (let [source (product-source-with-index-neutral '(int (float 16777217)))]
+    (is (str/includes? source "= 16777216;"))
+    (is (not (str/includes? source "= 16777217;"))))
+  ;; Unknown callees may be refused earlier by typed scalar binding.
+  (is (thrown? clojure.lang.ExceptionInfo (product-source-with-index-neutral '(unknown 0))))
+  (doseq [neutral '[(byte 256) user/MAX_VALUE (int user/MAX_VALUE)]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"neutral has no OpenCL literal"
+                         (product-source-with-index-neutral neutral)))))
+
 (deftest canonical-scalar-is-one-component-product-test
   (let [operator (reduction/scalar
                   {:accumulator 'acc :neutral 0.0 :dtype :double :result 'sum

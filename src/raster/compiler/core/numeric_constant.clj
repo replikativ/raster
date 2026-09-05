@@ -13,6 +13,12 @@
     (or (integer? expression) (float? expression)) {:value expression}
     (symbol? expression)
     (case expression
+      Byte/MIN_VALUE {:value Byte/MIN_VALUE}
+      Byte/MAX_VALUE {:value Byte/MAX_VALUE}
+      Integer/MIN_VALUE {:value Integer/MIN_VALUE}
+      Integer/MAX_VALUE {:value Integer/MAX_VALUE}
+      Long/MIN_VALUE {:value Long/MIN_VALUE}
+      Long/MAX_VALUE {:value Long/MAX_VALUE}
       Float/POSITIVE_INFINITY {:value Float/POSITIVE_INFINITY}
       Float/NEGATIVE_INFINITY {:value Float/NEGATIVE_INFINITY}
       Double/POSITIVE_INFINITY {:value Double/POSITIVE_INFINITY}

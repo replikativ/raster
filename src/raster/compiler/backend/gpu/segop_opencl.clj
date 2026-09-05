@@ -14,6 +14,7 @@
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.core.hardware :as hw]
@@ -402,25 +403,22 @@
 (defn- product-neutral-c
   [neutral dtype]
   (let [dtype (dt/canon dtype)
-        field (when (symbol? neutral) (name neutral))]
+        original neutral
+        neutral (constant/literal-or-original neutral)]
     (cond
-      (and (contains? #{:float :double :half} dtype) (= "POSITIVE_INFINITY" field)) "INFINITY"
-      (and (contains? #{:float :double :half} dtype) (= "NEGATIVE_INFINITY" field)) "-INFINITY"
-      (and (= :int dtype) (= "MAX_VALUE" field)) "INT_MAX"
-      (and (= :int dtype) (= "MIN_VALUE" field)) "INT_MIN"
-      (and (= :long dtype) (= "MAX_VALUE" field)) "LONG_MAX"
-      (and (= :long dtype) (= "MIN_VALUE" field)) "LONG_MIN"
+      (and (= :int dtype) (= neutral Integer/MAX_VALUE)) "INT_MAX"
+      (and (= :int dtype) (= neutral Integer/MIN_VALUE)) "INT_MIN"
+      (and (= :long dtype) (= neutral Long/MAX_VALUE)) "LONG_MAX"
+      (and (= :long dtype) (= neutral Long/MIN_VALUE)) "LONG_MIN"
       (and (number? neutral) (Double/isInfinite (double neutral)))
       (if (pos? (double neutral)) "INFINITY" "-INFINITY")
       (number? neutral) (case dtype
                           :float (str (float neutral) "f")
                           :double (str (double neutral))
                           (str (long neutral)))
-      (and (seq? neutral) (= 2 (count neutral)))
-      (product-neutral-c (second neutral) dtype)
       :else (throw (ex-info "product reduction neutral has no OpenCL literal"
                             {:reason :product-reduction-neutral-not-emittable
-                             :neutral neutral :dtype dtype})))))
+                             :neutral original :dtype dtype})))))
 
 (defn generate-product-reduction-kernel
   "Lower a typed segmented ProductReduction to one deterministic workgroup tree per segment.
