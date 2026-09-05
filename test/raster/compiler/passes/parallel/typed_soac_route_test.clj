@@ -1341,6 +1341,54 @@
            (get-in matrix-node [:operation :launch :group-count 2 :value]))
         "the third launch dimension is the semantic batch extent")))
 
+(deftest transposed-mixed-contractions-certify-their-physical-storage-order
+  (let [descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        variants
+        [[:nt '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* i k) l))
+                               (clojure.core/aget B (+ (* j k) l))))]
+                 step)
+          (kernel-launch/product 'm 'k) (kernel-launch/product 'n 'k)]
+         [:tn '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* l m) i))
+                               (clojure.core/aget B (+ (* l n) j))))]
+                 step)
+          (kernel-launch/product 'k 'm) (kernel-launch/product 'k 'n)]
+         [:tt '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* l m) i))
+                               (clojure.core/aget B (+ (* j k) l))))]
+                 step)
+          (kernel-launch/product 'k 'm) (kernel-launch/product 'n 'k)]]]
+    (doseq [[variant source expected-a expected-b] variants]
+      (let [{:keys [form]}
+            (pipeline/schedule-parallel-form
+             source {:target-device :ze:0 :dtype :float
+                     :array-types {'A :float 'B :float 'C :float}
+                     :scalar-types {'m :int 'n :int 'k :int}})
+            operation (-> form :equations first :operations first)
+            algorithm (-> form :equations first :algorithm)
+            dispatch (contract-route/route-typed-contraction-dispatch
+                      algorithm operation :dtype :float :desc descriptor
+                      :precision :mixed-f16-f32)
+            refinement (get-in (kdispatch/alternative dispatch :xmx-direct)
+                               [:attributes :scheduled-graph-refinement])
+            inputs (into {} (map (juxt :id identity))
+                         (:inputs (:source refinement)))]
+        (is (= expected-a (get-in inputs ['A :elements])) (name variant))
+        (is (= expected-b (get-in inputs ['B :elements])) (name variant))
+        (is (= (kernel-graph/boundary-contract (:source refinement))
+               (kernel-graph/boundary-contract
+                (graph-refinement/scheduled-graph refinement)))
+            (name variant))))))
+
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]
