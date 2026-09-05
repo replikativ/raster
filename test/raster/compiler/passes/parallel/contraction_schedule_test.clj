@@ -11,7 +11,6 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]
@@ -98,9 +97,11 @@
   (with-redefs [hardware/descriptor-for (constantly nil)]
     (let [contract (matrix-form 128 128 128)
           source (list 'let* ['c contract] 'c)
-          lowered (:form (segop-lower/segop-lower-pass
-                          source {:target-device :ze:0 :dtype :half}))
-          semantic-operation (first (program/operations-for-binding lowered 'c contract))
+          ;; Enter through the production typed scheduler, not the compatibility discovery
+          ;; envelope whose source is deliberately rescheduled at backend re-entry.
+          lowered (:program (segop-lower/schedule-source-program
+                             source {:target-device :ze:0 :dtype :half}))
+          semantic-operation (first (mapcat :operations (:equations lowered)))
           compiled (opencl/opencl-pass lowered :dtype :half :min-elements 0)
           kernel (artifact/attribute (first (:kernels compiled)) :kernel-body)]
       (is (some? semantic-operation))

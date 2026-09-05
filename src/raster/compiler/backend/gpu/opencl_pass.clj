@@ -20,10 +20,14 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -328,6 +332,32 @@
     (list 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
           kernel-name arguments)))
 
+(defn- resident-single-reduction
+  "Refine a scalar reduction to the explicit one-workgroup phase required by reduce-into.
+
+   The output identity is changed here, at the semantic operation boundary, rather than passed as
+   an emitter-only alias. One group folds the complete extent, so the caller-owned one-element
+   result is the scheduled output rather than an undersized partial buffer."
+  [operation output]
+  (let [dtype (dtype/canon (:dtype operation))
+        workgroup-size (get-in operation [:grid :block-size])
+        grid (segop/->KernelGrid 1 workgroup-size
+                                (* workgroup-size (dtype/bytes-of dtype)))
+        operator (-> (:reduction operation)
+                     (update :components
+                             (fn [components]
+                               (mapv #(assoc % :result output) components)))
+                     (assoc-in [:attributes :physical-phase] :single))]
+    (assoc operation
+           :level (segop/->SegLevel :block :none)
+           :reduction operator
+           :lambda nil
+           :outputs #{output}
+           :grid grid
+           :phase :single
+           :schedule (segred-body/scalar-workgroup-tree-schedule
+                      operator grid :single))))
+
 (defn- emit-map-void-invocation
   "Render the staging marker from the artifact's logical argument projection. The marker remains
    useful to the host evaluator, but it no longer owns or reconstructs an argument convention."
@@ -370,8 +400,60 @@
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [supplied-program (when (parallel-program/parallel-program? form)
-                           (parallel-program/validate! form segop/segop-node?))
+  (let [supplied-program0 (when (parallel-program/parallel-program? form)
+                            (parallel-program/validate! form segop/segop-node?))
+        retained-operations (mapcat :operations (:equations supplied-program0))
+        retained-buffer-ids
+        (set (mapcat #(concat (segop/operation-inputs %)
+                              (segop/operation-outputs %))
+                     retained-operations))
+        retained-equation-ids
+        (set (mapcat #(concat (:operands %) (:results %)) (:equations supplied-program0)))
+        ;; Host-only scalar SSA has no SegOp by construction. Classify every equation-boundary
+        ;; value not named by a physical buffer role as scalar; this preserves compound-extent
+        ;; leaves across compatibility re-entry while rank-zero resident buffers remain buffers.
+        retained-scalar-ids
+        (set/union (set (mapcat segop/operation-scalars retained-operations))
+                   (set/difference retained-equation-ids retained-buffer-ids))
+        retained-role-overlap (set/intersection retained-buffer-ids retained-scalar-ids)
+        _ (when (seq retained-role-overlap)
+            (throw (ex-info "retained schedule gives values contradictory ABI roles"
+                            {:reason :parallel-program-parameter-role-conflict
+                             :values retained-role-overlap})))
+        retained-scalar-types
+        (when supplied-program0
+          (parallel-program/known-value-types supplied-program0 retained-scalar-ids))
+        retained-array-types
+        (when supplied-program0
+          (parallel-program/known-value-types supplied-program0 retained-buffer-ids))
+        scalar-type-conflicts
+        (into {}
+              (keep (fn [[id retained]]
+                      (when-let [provided (get scalar-types id)]
+                        (when-not (= (dtype/canon retained) (dtype/canon provided))
+                          [id {:retained retained :provided provided}]))))
+              retained-scalar-types)
+        array-type-conflicts
+        (into {}
+              (keep (fn [[id retained]]
+                      (when-let [provided (get array-types id)]
+                        (when-not (= (dtype/canon retained) (dtype/canon provided))
+                          [id {:retained retained :provided provided}]))))
+              retained-array-types)
+        _ (when (or (seq scalar-type-conflicts) (seq array-type-conflicts))
+            (throw (ex-info "caller type facts contradict the retained scheduled program"
+                            {:reason :parallel-program-type-conflict
+                             :scalar-conflicts scalar-type-conflicts
+                             :array-conflicts array-type-conflicts})))
+        ;; A compatibility ParallelProgram predates the direct TypedSOAC value identities used by
+        ;; graph storage. Re-enter once through its retained source instead of preserving a second
+        ;; backend contract whose operations and SSA results can name different physical values.
+        compatibility-program? (and supplied-program0
+                                    (some? (:source supplied-program0))
+                                    (not= :typed-soac
+                                          (get-in supplied-program0
+                                                  [:provenance :source-dialect])))
+        supplied-program (when-not compatibility-program? supplied-program0)
         direct-mini-program?
         (and (nil? supplied-program)
              (or (par/par-rng-fill-form? form)
@@ -379,6 +461,7 @@
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
                       (:stride (par/extract-par-scatter-info form)))
+                 (par/par-reduce-form? form)
                  ;; A compound source extent normalizes to a preceding typed scalar equation. It
                  ;; cannot be projected as a closed SegMap without losing that SSA definition.
                  (and (par/par-map-form? form)
@@ -386,6 +469,15 @@
                             (:bound (par/extract-par-map-info form)))))))
         direct-schedule
         (cond
+          compatibility-program?
+          (segop-lower-pass/schedule-source-program
+           (:source supplied-program0)
+           {:target-device device-id :dtype dtype
+            ;; A compatibility re-entry may need to rebuild structure, but it may never discard
+            ;; types already retained by the prior middle-end boundary.
+            :scalar-types (merge scalar-types retained-scalar-types)
+            :array-types (merge array-types retained-array-types)})
+
           (and (nil? supplied-program) (form/binding-form? form))
           (segop-lower-pass/schedule-source-program
            form {:target-device device-id :dtype dtype
@@ -457,7 +549,9 @@
             k))
 
         emit-scheduled-graph!
-        (fn [scheduled]
+        (fn emit-scheduled-graph!
+          ([scheduled] (emit-scheduled-graph! scheduled nil false))
+          ([scheduled stat-key host-scalar-result?]
           ;; KernelDispatch is already the verified selection value above both a single artifact
           ;; and a graph.  A one-alternative dispatch therefore gives scheduled equations the same
           ;; registry/selection seam as tuned GEMM without introducing a second graph registry.
@@ -483,11 +577,42 @@
             (swap! kernels into (mapv :operation (:nodes emitted)))
             (swap! dispatches conj dispatch)
             (swap! stats update :kernel-graphs inc)
+            (when stat-key (swap! stats update stat-key inc))
             ;; Staging and resident extraction consume the same registered dispatch and complete
             ;; ordered executable ABI. The device id chooses only the runtime; it is not part of
             ;; the executable's semantic call interface.
-            (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                  device-id (:id dispatch) (vec (:arguments emitted)))))
+            (let [invocation-arguments
+                  (if host-scalar-result?
+                    (let [result-indexes
+                          (keep-indexed (fn [index slot]
+                                          (when (= :result (:role slot)) index))
+                                        (:abi emitted))
+                          _ (when-not (= 1 (count result-indexes))
+                              (throw (ex-info
+                                      "host scalar graph requires exactly one result ABI slot"
+                                      {:reason :scheduled-host-scalar-result
+                                       :result-indexes (vec result-indexes)
+                                       :abi (:abi emitted)})))
+                          result-index (first result-indexes)
+                          result-slot (nth (:abi emitted) result-index)
+                          result-id (nth (:arguments emitted) result-index)
+                          result-buffer (some #(when (= result-id (:id %)) %)
+                                              (:outputs emitted))
+                          constructor ({:float 'float-array :double 'double-array}
+                                       (dtype/canon (:dtype result-slot)))]
+                      (when-not (and result-buffer (= 1 (:elements result-buffer)) constructor)
+                        (throw (ex-info
+                                "scheduled host scalar result must be one FP32/FP64 graph element"
+                                {:reason :scheduled-host-scalar-result
+                                 :slot result-slot :buffer result-buffer})))
+                      (assoc (vec (:arguments emitted)) result-index (list constructor 1)))
+                    (vec (:arguments emitted)))
+                  invocation
+                  (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                        device-id (:id dispatch) invocation-arguments)]
+              (if host-scalar-result?
+                (list 'clojure.core/aget invocation 0)
+                invocation)))))
 
         transform
         (fn transform [form]
@@ -684,33 +809,44 @@
                           (:kernel-name k)
                           (vec (:arguments r)))))))
 
-            ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
-            ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the
-            ;; resident invoke carries the output buffer (4-arg) so it stays device-resident
-            ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
+            ;; === par/reduce-into — resident terminal SegRed writing a caller-owned scalar ===
+            ;; Unlike the occupancy-capped partial phase used by host-scalar reduction, this is an
+            ;; explicit one-group terminal refinement. The generic executable path preserves that
+            ;; launch for staging and resident replay alike. Emitted by the reduce-fusion pass.
             (par/par-reduce-into-form? form)
             (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info form)
-                  segred (par->segred stats reduce-form dtype device-id
+                  segred (resident-single-reduction
+                          (par->segred stats reduce-form dtype device-id
                                       top-scalar-types top-array-types)
+                          out-buf)
                   kernel (segop-cl/generate-segred-kernel
                           segred out-buf :dtype dtype :scalar-types top-scalar-types
                           :array-types top-array-types)
-                  k (register-kernel! kernel :ze-reduces)]
-              (emit-reduction-invocation k out-buf))
+                  k (register-kernel! kernel :ze-reduces)
+                  dispatch (kdispatch/make
+                            {:id (str "resident-single-reduction-"
+                                      (Integer/toUnsignedString (hash k) 16))
+                             :alternatives [k]
+                             :default-strategy :scalar-workgroup-tree
+                             :selector {:kind :fixed-strategy
+                                        :strategy :scalar-workgroup-tree}
+                             :provenance {:pass :opencl
+                                          :source-dialect :segred
+                                          :operation (:id segred)}
+                             :attributes {:operation-family :scalar-reduction
+                                          :resident-result true}})]
+              (swap! dispatches conj dispatch)
+              ;; Unlike the nil-result host-scalar marker, this path is executable both through
+              ;; staging and resident extraction. Both consume the same KernelCall geometry.
+              (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                    device-id (:id dispatch) (vec (:arguments k))))
 
             ;; === par/reduce — SegOp path ===
             (par/par-reduce-form? form)
-            (let [{:keys [bound]} (par/extract-par-reduce-info form)]
-              (if (and (number? bound) (< bound min-elements))
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-reduce form))
-                (let [segred (par->segred stats form dtype device-id
-                                          top-scalar-types top-array-types)
-                      kernel (segop-cl/generate-segred-kernel
-                              segred nil :dtype dtype :scalar-types top-scalar-types
-                              :array-types top-array-types)
-                      k (register-kernel! kernel :ze-reduces)]
-                  (emit-reduction-invocation k nil))))
+            (throw (ex-info
+                    "scalar reduction must enter GPU emission as a complete TypedSOAC graph"
+                    {:reason :scalar-reduction-requires-typed-graph
+                     :source form :target-dialect :kernel-graph :fallback :none}))
 
             ;; Typed segmented product reduction. The portable schedule is one deterministic
             ;; workgroup tree per segment; mixed result components remain separate ABI buffers.
@@ -897,12 +1033,62 @@
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
                   new-bindings (vec (mapcat (fn [[sym expr]]
-                                              (let [scheduled
+                                              (let [equation
                                                     (when parallel-program
-                                                      (parallel-program/kernel-graph-for-binding
-                                                       parallel-program sym expr))]
+                                                      (parallel-program/equation-for-binding
+                                                       parallel-program sym expr))
+                                                    scheduled
+                                                    (let [typed-equation?
+                                                          (and (:algorithm equation)
+                                                               (= :typed-soac
+                                                                  (get-in parallel-program
+                                                                          [:provenance
+                                                                           :source-dialect])))
+                                                          scalar-reduction?
+                                                          (and (seq (:operations equation))
+                                                               (every?
+                                                                #(and (instance?
+                                                                       raster.compiler.ir.segop.SegRed %)
+                                                                      (empty? (segop/seg-space-segment-dims (:space %)))
+                                                                      (reduction/scalar?
+                                                                       (:reduction %)))
+                                                                (:operations equation)))]
+                                                      (if (and typed-equation?
+                                                               (or scalar-reduction?
+                                                                   (get-in equation
+                                                                           [:attributes
+                                                                            :kernel-graph])))
+                                                        (:graph
+                                                         (equation-graph/make-for-equation
+                                                          parallel-program equation))
+                                                        (get-in equation
+                                                                [:attributes :kernel-graph])))]
                                                 [sym (if scheduled
-                                                       (emit-scheduled-graph! scheduled)
+                                                       (do
+                                                         (when (and equation
+                                                                    (every? #(instance?
+                                                                              raster.compiler.ir.segop.SegRed %)
+                                                                            (:operations equation)))
+                                                           (swap! stats update :segop-reused
+                                                                  (fnil inc 0)))
+                                                         (emit-scheduled-graph!
+                                                          scheduled
+                                                          (when (and equation
+                                                                     (every? #(instance?
+                                                                               raster.compiler.ir.segop.SegRed %)
+                                                                             (:operations equation)))
+                                                            :ze-reduces)
+                                                          (boolean
+                                                           (and equation
+                                                                (not (resident/resident-scalar-value?
+                                                                      (get-in parallel-program
+                                                                              [:values (first (:results equation))])))
+                                                                (= [] (get-in parallel-program
+                                                                              [:values
+                                                                               (first
+                                                                                (:results
+                                                                                 equation))
+                                                                               :shape]))))))
                                                        (binding [*bound-segops*
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
@@ -914,15 +1100,48 @@
                                                          (transform expr)))]))
                                             pairs))
                   new-body (mapv (fn [expr]
-                                   (binding [*bound-segops*
-                                             (when parallel-program
-                                               (parallel-program/operations-for-source
-                                                parallel-program expr))
-                                             *bound-algorithm*
-                                             (when parallel-program
-                                               (parallel-program/algorithm-for-source
-                                                parallel-program expr))]
-                                     (transform expr)))
+                                   (let [equation
+                                         (when parallel-program
+                                           (parallel-program/equation-for-source
+                                            parallel-program expr))
+                                         ;; The compatibility discoverer gives value-producing
+                                         ;; body expressions an internal result identity rather
+                                         ;; than a source binding. Its exact algorithm/SegOps can
+                                         ;; therefore be graph-validated directly even though the
+                                         ;; enclosing program predates typed provenance.
+                                         typed-equation?
+                                         (and (:algorithm equation)
+                                              (or (= :typed-soac
+                                                     (get-in parallel-program
+                                                             [:provenance :source-dialect]))
+                                                  (= :body (first (:site equation)))))
+                                         scalar-reduction?
+                                         (and (seq (:operations equation))
+                                              (every?
+                                               #(and (instance?
+                                                      raster.compiler.ir.segop.SegRed %)
+                                                     (empty? (segop/seg-space-segment-dims (:space %)))
+                                                     (reduction/scalar?
+                                                      (:reduction %)))
+                                               (:operations equation)))]
+                                     (if (and typed-equation? scalar-reduction?)
+                                       (do
+                                         (swap! stats update :segop-reused (fnil inc 0))
+                                         (emit-scheduled-graph!
+                                          (:graph
+                                           (equation-graph/make-for-equation
+                                            parallel-program equation))
+                                          :ze-reduces
+                                          (boolean
+                                           (= [] (get-in parallel-program
+                                                         [:values (first (:results equation))
+                                                          :shape])))))
+                                       (binding [*bound-segops* (:operations equation)
+                                                 *bound-algorithm*
+                                                 (when parallel-program
+                                                   (parallel-program/algorithm-for-source
+                                                    parallel-program expr))]
+                                         (transform expr)))))
                                  body-exprs)]
               (with-meta (apply list let-sym new-bindings new-body) (meta form)))
 

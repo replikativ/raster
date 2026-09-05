@@ -37,6 +37,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
 (defn par-contract-form?
@@ -143,7 +144,8 @@
    reuse a contraction input by compiler identity without adding a second ABI slot. Default single-launch
    leaves must also supply matching 1-3D workgroup/grid data; validation closes those fields and the
    ordered compiler values into a KernelArtifact. Full reductions already arrive as a verified
-   artifact and retain their distinct two-phase invoke protocol, whose scheduler owns geometry.
+   artifact and retain their distinct host-terminal invoke protocol; staging realizes that
+   artifact's own symbolic geometry.
 
    Returns the descriptor with `:arguments`, the compiler values in exact ABI order, and an
    executable `:artifact` for every route."
@@ -207,8 +209,9 @@
       (nil? out-elems)
       (throw (ex-info "contract descriptor: :out-elems is required (the artifact sizes the output with it)"
                       {:strategy strategy}))
-      ;; A single-launch descriptor preserves the schedule's actual dimensionality. The reduction
-      ;; invoke computes its own two-phase geometry, so it legitimately carries neither.
+      ;; A single-launch descriptor preserves the schedule's actual dimensionality. A reduction
+      ;; descriptor already carries its complete artifact launch, so this compatibility descriptor
+      ;; legitimately duplicates neither field.
       (and (not= :reduction invoke)
            (not (and (vector? wg) (vector? grid)
                      (<= 1 (count wg) 3)
@@ -216,7 +219,7 @@
       (throw (ex-info "contract descriptor: :wg and :grid must have matching 1-3D geometry"
                       {:strategy strategy :wg wg :grid grid}))
       (and (= :reduction invoke) (or (some? wg) (some? grid)))
-      (throw (ex-info "contract descriptor: :invoke :reduction must not carry :wg/:grid (the invoke owns the two-phase launch)"
+      (throw (ex-info "contract descriptor: :invoke :reduction must not duplicate its artifact launch in :wg/:grid"
                       {:strategy strategy :wg wg :grid grid}))
       (and (= :reduction invoke) (nil? reduce-bound))
       (throw (ex-info "contract descriptor: :invoke :reduction requires :reduce-bound"
@@ -298,6 +301,41 @@
                      :declines (vec (:declines d))})))
   d)
 
+(defn- scalar-contraction-phase
+  "Refine the zero-free-axis contraction cell to the scalar SegRed schedule it executes.
+
+   Typed contraction lowering initially carries the candidate schedule used by tensor-valued
+   contractions. A scalar output has no matrix/register-tiled candidate: it is one block-local
+   workgroup-tree phase followed by the compatibility host combine. Replace the irrelevant
+   thread/virtual level and hardware-family schedule with that exact physical phase before target
+   emission."
+  [operation output dtype reduced-bound]
+  (let [workgroup-size (or (get-in operation [:grid :block-size]) 256)
+        group-count (if-let [existing (get-in operation [:grid :num-blocks])]
+                      (segred-body/launch-group-count existing reduced-bound workgroup-size)
+                      ;; The compatibility front door has no concrete device descriptor. State a
+                      ;; conservative portable occupancy cap instead of leaving the schedule
+                      ;; implicit or accepting an arbitrary caller expression.
+                      (segred-body/capped-group-count 256 reduced-bound workgroup-size))
+        grid (segop/->KernelGrid
+              group-count
+              workgroup-size
+              (* workgroup-size (dtype/bytes-of dtype)))
+        operator (-> (:reduction operation)
+                     (update :components
+                             (fn [components]
+                               (mapv #(assoc % :result output) components)))
+                     (assoc-in [:attributes :physical-phase] :block-local))]
+    (assoc operation
+           :level (segop/->SegLevel :block :virtual)
+           :reduction operator
+           :lambda nil
+           :outputs #{output}
+           :grid grid
+           :phase :block-local
+           :schedule (segred-body/scalar-workgroup-tree-schedule
+                      operator grid :block-local))))
+
 (defn route-contraction
   "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
 
@@ -312,7 +350,7 @@
    consume the same scheduled body vocabulary.  Quantization remains an operand/decode concern,
    not a buffer-ownership or graph-composition concern."
   [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id
-                           candidate-families scheduled-operation]
+                           candidate-families scheduled-operation array-types scalar-types]
                     :or {dtype :half prefer-peak? false}}]
   (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
         contract-form (or contract-form (:form contract-facts))
@@ -348,9 +386,19 @@
                             {:reason :contraction-candidate-families
                              :families candidate-families
                              :allowed contraction-families})))
-        tensorize-plan (memoize #(route-2free-1contract out-sym dtype desc tile
-                                                        epilogue contract-facts operation-id
-                                                        candidate-families))]
+        mixed-core-storage?
+        (some (fn [operand]
+                (when-let [stored (or (get array-types (:sym operand))
+                                      (get array-types (symbol (name (:sym operand)))))]
+                  (not= (dtype/canon dtype) (dtype/canon stored))))
+              (:operands contract-facts))
+        tensorize-plan
+        (memoize
+         #(if mixed-core-storage?
+            {::declines [{:leaf :dpas :reason :mixed-operand-storage}
+                         {:leaf :regtiled :reason :mixed-operand-storage}]}
+            (route-2free-1contract out-sym dtype desc tile
+                                  epilogue contract-facts operation-id candidate-families)))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
@@ -420,16 +468,23 @@
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
       ;; SegSpace then has only the reduced dim — exactly the 1-D shape (seg-space-1d?) that
       ;; generate-segred-kernel's two-phase tree reduction already consumes, so no new emitter.
-      ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
-      ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
+      ;; Its launch protocol differs (one scheduled partial phase plus a host-side terminal
+      ;; combine), so the descriptor says so with :invoke :reduction rather than pretending it is
+      ;; a 2-D kernel launch.
         (zero? n-free)
-        (let [sr (or scheduled-operation
-                     (cl/contract-form->segred
-                      (compatibility-form! contract-form :full-reduce)
-                      :dtype dtype :facts contract-facts))
-              k (sco/generate-segred-kernel sr out-sym :dtype dtype)
-              attrs (:attributes k)
-              red-bound (second (first contract-axes))]
+        (let [semantic-operation
+              (or scheduled-operation
+                  (cl/contract-form->segred
+                   (compatibility-form! contract-form :full-reduce)
+                   :dtype dtype :facts contract-facts))
+              ;; The SegSpace is authoritative here. In particular, two or more contraction axes
+              ;; have already been flattened to their checked row-major product; selecting the
+              ;; first surface bound would schedule only a prefix of the reduction.
+              red-bound (:bound (segop/seg-space-reduced-dim (:space semantic-operation)))
+              sr (scalar-contraction-phase semantic-operation out-sym dtype red-bound)
+              k (sco/generate-segred-kernel
+                 sr out-sym :dtype dtype :coordinate-proof contract-facts)
+              attrs (:attributes k)]
           {:strategy :full-reduce
            :invoke :reduction
            :artifact k
@@ -437,7 +492,6 @@
            :array-params (:array-params attrs)
            :abi (:abi k) :arguments (:arguments k)
            :dtype dtype :out-dtype dtype :out-elems 1
-           :n-phases (:n-phases attrs)
          ;; CARRY THE COMBINE for descriptor inspection as well as in the artifact attributes.
          ;; The staging runtime reads the artifact attributes for its host-side final combine.
            :c-op (:c-op attrs) :identity-val (:identity-val attrs)
@@ -479,7 +533,21 @@
                        (cl/contract-form->segred
                         (compatibility-form! contract-form :portable-segred)
                         :dtype dtype :facts contract-facts))
-                portable (contraction-schedule/plan-portable-body contract-facts sr desc)
+                portable (contraction-schedule/plan-portable-body
+                          contract-facts sr desc
+                          {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
+                _ (when (and (not (:ok portable))
+                             (or mixed-core-storage?
+                                 (some #(contains? #{:float :double}
+                                                   (some-> (get scalar-types %) dtype/canon))
+                                       (:scalars sr))))
+                    (throw (ex-info
+                            "mixed storage or floating captures require a typed portable contraction schedule"
+                            {:reason :no-legal-contraction-family
+                             :operation operation-id :families candidate-families
+                             :declines [{:leaf :portable-kernel-body
+                                         :reason (:reason portable) :data (:detail portable)}]
+                             :fallback :none})))
                 emitted (when (:ok portable)
                           (sco/generate-contraction-kernel-body (:body portable)))
                 {:keys [kernel-name source array-params scalar-params abi
@@ -642,6 +710,14 @@
                                 (assoc options
                                        :dtype dtype
                                        :facts facts
+                                       :array-types (into {} (map (fn [id]
+                                                                  [id (get-in (soac-dialect/facts program)
+                                                                              [:values id :dtype])]))
+                                                          (:inputs operation))
+                                       :scalar-types (into {} (map (fn [id]
+                                                                   [id (get-in (soac-dialect/facts program)
+                                                                               [:values id :dtype])]))
+                                                           (:scalars operation))
                                        :scheduled-operation operation
                                        :candidate-families families
                                        :operation-id operation-id)))
@@ -865,10 +941,11 @@
                                      (get-in candidate [:artifact :arguments]))
           :when (and (= :scalar (:kind slot))
                      (not (public-interface-slot? slot)))]
-    (when-not (and (contains? #{:int :long} (:kernel-dtype slot))
-                   (klaunch/expression? compiler-value)
-                   (every? public-scalars
-                           (klaunch/expression-references compiler-value)))
+    (when-not (or (contains? public-scalars compiler-value)
+                  (and (contains? #{:int :long} (:kernel-dtype slot))
+                       (klaunch/expression? compiler-value)
+                       (every? public-scalars
+                               (klaunch/expression-references compiler-value))))
       (throw (ex-info
               "typed contraction candidate has a private scalar outside its semantic ABI"
               {:reason :typed-contraction-dispatch-unbound-private-scalar
@@ -1135,6 +1212,10 @@
 
       (not (:ok matrix-view))
       {:alternatives [] :decline (dissoc matrix-view :ok)}
+
+      (some #(and (= (:out facts) (:name %)) (= :inout (:kind %))) abi)
+      {:alternatives []
+       :decline {:reason :mixed-dpas-inout-result-transform-not-lowered}}
 
       (and (:batched? matrix-view) (seq (:epilogue matrix-view)))
       {:alternatives []

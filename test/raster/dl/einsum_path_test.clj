@@ -194,5 +194,6 @@
              '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i))) :dtype :double)]
       (is (= :full-reduce (:strategy r)))
       (is (= :reduction (:invoke r)))
-      (is (= 2 (:n-phases r)))
+      (is (nil? (:n-phases r))
+          "one scheduled artifact does not claim ownership of a hidden second phase")
       (is (= 1 (:out-elems r))))))

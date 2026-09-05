@@ -18,8 +18,10 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :scheduled-equation-graph))))
 
+(declare integral-scalar-value?)
+
 (defn- value-elements
-  [derived-scalars value]
+  [values derived-scalars value]
   (let [dimension-value (fn [dimension]
                           ;; AbstractValue uses `(value id)` to distinguish a compound stable
                           ;; value ID from shape syntax. KernelGraph owns explicit integer
@@ -28,7 +30,17 @@
                                    (= 'value (first dimension))
                                    (= 2 (count dimension)))
                             (second dimension)
-                            dimension))
+                            (if (and (seq? dimension)
+                                     (not (contains? '#{extent unknown-dimension} (first dimension))))
+                              (let [decline! (fn [rule message data] (fail! rule message data))
+                                    scope (set (filter #(integral-scalar-value? (get values %))
+                                                       (util/free-syms dimension)))
+                                    ;; This is AbstractValue dimension algebra, not a host
+                                    ;; scalar expression. Its operations are mathematical extents
+                                    ;; (scan's n+1), so no source arithmetic dtype is inferred.
+                                    index (index-expression/lower dimension scope decline!)]
+                                (index-expression/to-launch-expression index decline!))
+                              dimension)))
         shape (mapv dimension-value (:shape value))
         elements (cond
                    (empty? shape) 1
@@ -45,6 +57,16 @@
   (and value
        (empty? (:shape value))
        (contains? #{:int :long} (some-> (:dtype value) dtype/canon))))
+
+(defn- unknown-shape? [value]
+  (some #(and (seq? %) (= 'unknown-dimension (first %))) (:shape value)))
+
+(defn- required-write-extent
+  "Cover every logical write to shared physical storage; an unknown write prevents refinement."
+  [values derived-scalars result-values]
+  (when (and (seq result-values) (every? #(and % (not (unknown-shape? %))) result-values))
+    (let [extents (vec (distinct (map #(value-elements values derived-scalars %) result-values)))]
+      (if (= 1 (count extents)) (first extents) (apply launch/maximum extents)))))
 
 (defn- scalar-result-expression
   "Return one closed typed scalar result with lambda parameters replaced by its stable captures.
@@ -130,6 +152,43 @@
               bindings))
           {} equations))
 
+(defn body-for-equation
+  "Return the dependency-closed scheduled program slice for one numerical equation.
+
+   A graph is emitted one equation at a time, but storage extents may be defined by preceding
+   typed host-scalar equations.  This is the single narrowing operation used by equation-first
+   target emission and compatibility backend entry; neither may discard or reconstruct that
+   prefix independently."
+  [parallel-program equation]
+  (let [;; The enclosing program may also contain scheduled structured loops. Validate its
+        ;; envelope here; the extracted numerical slice below has strict SegOp legality.
+        parallel-program (program/validate! parallel-program)
+        retained (some #(when (= (:id %) (:id equation)) %) (:equations parallel-program))
+        _ (when-not (= retained equation)
+            (fail! :scheduled-equation-membership
+                   "scheduled equation is not an exact member of its parallel program"
+                   {:equation (:id equation)}))
+        preceding (take-while #(not= (:id %) (:id equation)) (:equations parallel-program))
+        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
+        equations (conj scalar-prefix equation)]
+    (program/make
+     {:dialect :segop
+      :source nil
+      :values (:values parallel-program)
+      :inputs (program/infer-inputs equations)
+      :equations equations
+      :outputs (:results equation)
+      :effects (reduce set/union #{} (map :effects equations))
+      :diagnostics []
+      :provenance {:source-dialect :typed-soac
+                   :pass :scheduled-equation-graph}
+      :attributes {:host-control :explicit-typed-algorithm}
+      :operation? segop/segop-node?
+      :algorithm? (fn [candidate algorithm]
+                    (and (= algorithm (soac/validate! algorithm))
+                         (= (:operands candidate) (:inputs (soac/facts algorithm)))
+                         (= (:results candidate) (soac/outputs algorithm))))})))
+
 (defn- typed-host-scalar-equation?
   [values equation algorithm]
   (when-let [[result _] (scalar-result-expression equation)]
@@ -176,7 +235,7 @@
              "scheduled storage lacks an AbstractValue"
              {:value id}))
     {:dtype (:dtype value)
-     :elements (value-elements derived-scalars value)
+     :elements (value-elements values derived-scalars value)
      :memory-space (or (:memory-space value) :device)}))
 
 (defn- algorithm-boundary?
@@ -283,9 +342,29 @@
                                        operations))
          temporary-ids (set/difference operation-values inputs outputs)
          values (:values scheduled)
+         result-storage-values
+         (reduce
+          (fn [by-storage equation]
+            (reduce (fn [by-storage [logical physical]]
+                      (update by-storage physical (fnil conj [])
+                              (get-in (soac/facts algorithm) [:values logical])))
+                    by-storage
+                    (map vector (nth equation 2) (soac/physical-results algorithm equation))))
+          {} retained-equations)
          buffer-specs (into {}
                             (map (fn [id] [id (storage-spec values derived-scalars id)]))
                             (set/union inputs outputs temporary-ids))
+         ;; An aliased destination can have unknown capacity while the typed result has a
+         ;; precise written extent (e.g. an exclusive scan writes n+1 elements). That semantic
+         ;; extent is the required capacity, not a claim about the allocation's full size.
+         buffer-specs (reduce-kv
+                       (fn [specs id result-values]
+                         (if-let [extent (and (contains? specs id)
+                                              (unknown-shape? (get values id))
+                                              (required-write-extent values derived-scalars result-values))]
+                           (assoc-in specs [id :elements] extent)
+                           specs))
+                       buffer-specs result-storage-values)
          scalars (public-scalars scheduled operations buffer-specs)]
      (graph/from-segops
       operations
@@ -304,3 +383,20 @@
        ;; retained ParallelProgram prefix, not descriptive KernelGraph attributes.  A schedule
        ;; validator that needs them must receive and revalidate that exact program slice.
        :attributes attributes}))))
+
+(defn make-for-equation
+  "Derive the exact scheduled KernelGraph for one TypedSOAC numerical equation.
+
+   The equation's optional graph contract contributes only already-validated schedule provenance
+   and attributes; dataflow, storage and scalar closure are always reconstructed from the retained
+   algorithm and its dependency-closed program slice."
+  [parallel-program equation]
+  (let [body (body-for-equation parallel-program equation)
+        algorithm (:algorithm equation)
+        graph-contract (get-in equation [:attributes :kernel-graph])]
+    {:body body
+     :graph (make algorithm body
+                  (cond-> {}
+                    graph-contract
+                    (assoc :provenance (:provenance graph-contract)
+                           :attributes (:attributes graph-contract))))}))

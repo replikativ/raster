@@ -103,7 +103,7 @@
         node (soac/par-form->soac 'result form 901 :dtype :float)
         operation (first (soac-lower/lower-reduce node nil :dtype :float))]
     (segop-emit/generate-segred-kernel-body
-     operation nil :dtype :float :scalar-types {'scale :double}
+     operation nil :dtype :float :scalar-types {'scale :double 'n :long}
      :target-dialect dialect :kernel-name-prefix "workgroup_reduce")))
 
 (defn- contraction-artifact
@@ -128,6 +128,21 @@
     (segop-emit/generate-contraction-kernel-body
      (:body planned) :target-dialect dialect
      :kernel-name-prefix "portable_contraction")))
+
+(defn- mixed-contraction-artifact
+  [dialect descriptor]
+  (let [form '(raster.par/contract y [[i m]] [[l k]] (* scale (aget x l)))
+        verified (contraction-facts/contraction-facts form :dtype :double)
+        segred (update (contract-lower/contract-form->segred
+                        form :dtype :double :facts verified) :scalars conj 'scale)
+        planned (contraction-schedule/plan-portable-body
+                 verified segred descriptor
+                 {:array-types {'x :float}
+                  :scalar-types {'m :long 'k :int 'scale :float}})]
+    (when-not (:ok planned)
+      (throw (ex-info "mixed contraction compile fixture did not schedule" planned)))
+    (segop-emit/generate-contraction-kernel-body
+     (:body planned) :target-dialect dialect :kernel-name-prefix "mixed_contraction")))
 
 (defn- register-tiled-contraction-source
   [dialect]
@@ -309,6 +324,8 @@
                             (reduction-artifact dialect))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
+           (write-artifact! directory suffix "mixed-contraction"
+                            (mixed-contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "segmented-fold-map"
                             (segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"

@@ -235,6 +235,8 @@
                        'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
                       '(raster.par/reduce acc 0.0 i n
                                           (+ acc (clojure.core/aget a i)))
-                      :dtype :float :min-elements 0)]
+                      :dtype :double :min-elements 0
+                      :array-types {'a :double} :scalar-types {'n :long})]
         (is (= 1 (get-in compiled [:stats :ze-reduces])))
-        (is (= 1 (get-in compiled [:stats :segop-relowered])))))))
+        (is (= 1 (get-in compiled [:stats :segop-reused])))
+        (is (nil? (get-in compiled [:stats :segop-relowered])))))))

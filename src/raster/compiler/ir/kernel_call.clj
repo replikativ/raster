@@ -110,6 +110,10 @@
     (throw (ex-info "kernel int scalar argument is outside its physical ABI range"
                     {:reason :kernel-scalar-range :slot slot :value value
                      :minimum Integer/MIN_VALUE :maximum Integer/MAX_VALUE})))
+  (when (and (= :bound (:role slot))
+             (or (not (integer? (:value value))) (neg? (:value value))))
+    (throw (ex-info "kernel extent bound must be a non-negative integer"
+                    {:reason :kernel-bound-range :slot slot :value value})))
   value)
 
 (defn- resident-view
@@ -231,6 +235,18 @@
                              :value compiler-value :indexes (vec indexes) :values values})))
           (first values))))))
 
+(defn realize-launch
+  "Realize an artifact's launch from a complete ABI-ordered runtime argument vector.
+
+   This deliberately does not construct a KernelCall: compatibility staging may reserve the
+   artifact's result pointer itself, but it must still honor the exact symbolic launch (including
+   occupancy caps) before that allocation exists. Scalar representation and pointer checks remain
+   the caller's responsibility and KernelCall performs them for resident execution."
+  [artifact arguments]
+  (let [artifact (kart/validate! artifact)
+        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+    (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))))
+
 (defn resolve-value
   "Resolve one compiler value through a checked call's artifact/runtime argument relation. This
    is used for artifact attributes such as a contraction's logical output extent; backends still
@@ -250,8 +266,15 @@
   ([artifact arguments {:keys [group-count resolve-value]}]
    (let [artifact (kart/validate! artifact)
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
+         ;; Extent/range checks precede launch realization.  Otherwise a negative bound can first
+         ;; fail as an incidental zero-sized grid—or, for a clamped schedule, realize a valid grid.
+         _ (doseq [[slot value] (map vector (:abi artifact) arguments)
+                   :when (= :scalar (:kind slot))]
+             (scalar-value! slot value))
          resolver (or resolve-value (argument-resolver artifact arguments))
-         realized (klaunch/realize (:launch artifact) resolver)
+         realized (if resolve-value
+                    (klaunch/realize (:launch artifact) resolver)
+                    (realize-launch artifact arguments))
          geometry (if group-count
                     (klaunch/geometry
                      {:workgroup-size (:workgroup-size realized)

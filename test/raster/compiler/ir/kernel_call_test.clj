@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.resident-value :as resident-value]
@@ -75,6 +76,26 @@
     (is (= [:resident-x :resident-out] (mapv second (:pointer-pairs plan))))
     (is (= [:float :int] (mapv (comp :type second) (:scalar-pairs plan))))))
 
+(deftest extent-bounds-reject-negative-values-before-launch
+  (let [arguments [:resident-x :resident-out
+                   {:type :float :value 2.0} {:type :int :value -1}]]
+    (try
+      (kcall/make artifact arguments)
+      (is false "a negative semantic extent must not reach launch realization")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-bound-range (:reason (ex-data exception))))))))
+
+(deftest staged-scalar-normalization-cannot-truncate-an-extent
+  (doseq [[value reason] [[-1 :kernel-bound-range]
+                          [-0.5 :kernel-executable-integral-scalar]
+                          [3.5 :kernel-executable-integral-scalar]]]
+    (try
+      (kexec/typed-runtime-arguments
+       artifact [:resident-x :resident-out 2.0 value])
+      (is false "an extent must remain an exact non-negative integer")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= reason (:reason (ex-data exception))))))))
+
 (deftest scheduling-may-change-groups-but-not-emitted-workgroup
   (let [call (kcall/make artifact args {:group-count [1]})]
     (is (= [1] (get-in call [:geometry :group-count]))))
@@ -95,6 +116,32 @@
       (is (= dimensions (klaunch/dimensions (:geometry call))))
       (is (= workgroup (get-in call [:geometry :workgroup-size])))
       (is (= groups (get-in call [:geometry :group-count]))))))
+
+(deftest launch-realization-preserves-the-artifact-occupancy-cap-at-max-int
+  (let [capped
+        (kart/make
+         {:kernel-name "capped_reduction_launch_test"
+          :source "__kernel void capped_reduction_launch_test(__global float* out, int n) {}"
+          :abi [(kabi/slot 'out :output :float :role :result)
+                (kabi/slot 'n :scalar :int :role :bound)]
+          :arguments '[out n]
+          :launch (klaunch/spec
+                   {:workgroup-size [256]
+                    :group-count [(klaunch/minimum
+                                   17 (klaunch/ceil-div 'n 256))]})})
+        geometry (kcall/realize-launch
+                  capped [:resident-out {:type :int :value Integer/MAX_VALUE}])]
+    (is (= [256] (:workgroup-size geometry)))
+    (is (= [17] (:group-count geometry))
+        "staging must not reconstruct an uncapped ceil-div launch")))
+
+(deftest opencl-raw-handles-do-not-claim-device-allocation-capacity
+  (let [capacity (ns-resolve 'raster.gpu.ocl-runtime 'known-buffer-capacity)
+        handle (java.lang.foreign.MemorySegment/ofArray (long-array 1))
+        owned (ocl/->OclBuffer handle handle 1024 4096 :float 64)]
+    (is (nil? (capacity handle))
+        "a MemorySegment accepted as cl_mem describes the handle, not the allocation")
+    (is (= 1024 (capacity owned)))))
 
 (deftest call-rejects-untyped-or-mistyped-scalars
   (testing "runtime scalar typing is part of the call, not a backend guess"

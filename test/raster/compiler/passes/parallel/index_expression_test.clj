@@ -20,6 +20,13 @@
     (is (= :long (launch/typed-expression-dtype projected dtypes)))
     (is (= #{'rows 'width} (launch/expression-references projected)))))
 
+(deftest maximum-round-trips-from-kernel-index-to-launch-algebra
+  (let [projected (index-expression/to-launch-expression
+                   (body/expression :max 1 'rows) fail!)]
+    (is (= #{'rows} (launch/expression-references projected)))
+    (is (= 1 (launch/resolve-expression {'rows 0} projected)))
+    (is (= 7 (launch/resolve-expression {'rows 7} projected)))))
+
 (deftest typed-launch-projection-declines-int-overflow-semantics
   (let [reason (try
                  (index-expression/lower-typed

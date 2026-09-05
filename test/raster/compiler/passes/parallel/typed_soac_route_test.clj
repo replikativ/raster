@@ -1025,9 +1025,9 @@
              (mapv :role (drop 3 (:abi alternative)))))
       (is (kernel-graph-call/kernel-graph-call?
            (kernel-graph-call/make alternative {'A :a 'B :b 'C :c}
-                                   {'m {:type :int :value 7}
-                                    'n {:type :int :value 5}
-                                    'k {:type :int :value 3}}))))
+               {'m {:type :long :value 7}
+                'n {:type :long :value 5}
+                'k {:type :long :value 3}}))))
     (try
       (contract-route/route-typed-contraction
        algorithm operation :dtype :double :desc {})
@@ -1090,6 +1090,36 @@
                (:reason (ex-data exception))))
         (is (= :portable-segred (:leaf (ex-data exception))))
         (is (= :none (:fallback (ex-data exception))))))))
+
+(deftest matrix-graphs-preserve-public-order-independent-of-operand-order
+  (doseq [batched? [false true]]
+    (let [contract (if batched?
+                     '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
+                        (* (aget z (+ (* (+ (* b m) i) k) l))
+                           (aget a (+ (* l n) j))))
+                     '(raster.par/contract C [[i m] [j n]] [[l k]]
+                        (* (aget z (+ (* i k) l)) (aget a (+ (* l n) j)))))
+          {:keys [form]} (pipeline/schedule-parallel-form
+                          (list 'let* ['step contract] 'step)
+                          {:target-device :ze:0 :dtype :float
+                           :array-types {'z :float 'a :float 'C :float}
+                           :scalar-types {'batch :int 'm :int 'n :int 'k :int}})
+          scheduled (contract-route/route-typed-contraction-dispatch
+                     (-> form :equations first :algorithm)
+                     (-> form :equations first :operations first)
+                     :dtype :float :precision :mixed-f16-f32
+                     :desc {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                            :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                            :subgroup-size 16 :max-workgroup-size 1024
+                            :grf-bytes-per-lane 256 :machine-lanes 8192
+                            :shared-local-memory 131072})]
+      (doseq [strategy (if batched? [:xmx-batched] [:xmx-direct :xmx-split-k])]
+        (let [graph (kdispatch/alternative scheduled strategy)
+              refinement (get-in graph [:attributes :scheduled-graph-refinement])]
+          (is (some? graph))
+          (is (= '[a z] (mapv :id (:inputs graph))))
+          (is (= (kernel-graph/boundary-contract (:source refinement))
+                 (kernel-graph/boundary-contract (:graph refinement)))))))))
 
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source
@@ -1631,6 +1661,35 @@
                 scheduled [:a :b :c :bias 0.5 13 128 8192])
                kdispatch/alternative-strategy))
         "low occupancy stays direct rather than transforming split partials")))
+
+(deftest mixed-matrix-routing-declines-a-read-write-result-explicitly
+  (let [transform {:acc 'acc :expr '(+ acc (aget C (+ (* i n) j)))
+                   :operands [{:sym 'C :dtype :float
+                               :map {:groups [[['i 'm] ['j 'n]]]}}]
+                   :scalars [] :dtype :float}
+        contract (concat '(raster.par/contract C [[i m] [j n]] [[l k]]
+                              (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+                         [:epilogue transform])
+        {:keys [form]} (pipeline/schedule-parallel-form
+                        (list 'let* ['step (apply list contract)] 'step)
+                        {:target-device :ze:0 :dtype :float
+                         :array-types {'A :float 'B :float 'C :float}
+                         :scalar-types {'m :int 'n :int 'k :int}})
+        dispatch (contract-route/route-typed-contraction-dispatch
+                  (-> form :equations first :algorithm)
+                  (-> form :equations first :operations first)
+                  :dtype :float :precision :mixed-f16-f32
+                  :desc {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                         :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                         :subgroup-size 16 :max-workgroup-size 1024
+                         :grf-bytes-per-lane 256 :machine-lanes 8192
+                         :shared-local-memory 131072})]
+    (is (= [:portable-segred]
+           (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
+    (is (= :mixed-dpas-inout-result-transform-not-lowered
+           (get-in dispatch [:attributes :matrix-graph-decline :reason])))
+    (is (= :inout (:kind (some #(when (= 'C (:name %)) %)
+                               (:abi (kdispatch/default-alternative dispatch))))))))
 
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source

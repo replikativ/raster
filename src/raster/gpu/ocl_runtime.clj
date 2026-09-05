@@ -551,6 +551,15 @@
 (defn device-buffer? [x]
   (instance? OclBuffer x))
 
+(defn- known-buffer-capacity
+  "Return a device allocation's element capacity when Raster owns that fact.
+
+   A raw MemorySegment accepted by the low-level compatibility API is an opaque cl_mem handle. Its
+   Java segment size describes only the handle representation, never the allocation behind it."
+  [value]
+  (when (device-buffer? value)
+    (:n-elements ^OclBuffer value)))
+
 (defn- physical-pointer-dtypes [arrays]
   (mapv #(cond
            (device-buffer? %) (:dtype ^OclBuffer %)
@@ -1388,12 +1397,20 @@
                               {:kernel-name kernel-name :slot slot :value-type (type value)}))))
         _ (kabi/validate-physical-pointer-dtypes!
            abi (physical-pointer-dtypes pointer-values))
-        _ (when (= :pure-reduction (get-in registered [:effects :kind]))
-            (doseq [[slot value] pointer-pairs
-                    :when (= :result (:role slot))]
-              (when (and (device-buffer? value) (< (:n-elements ^OclBuffer value) 1))
-                (throw (ex-info "resident reduction result buffer must hold at least one element"
-                                {:kernel-name kernel-name :slot slot :buffer-elements 0})))))
+        reduction-kind (get-in registered [:effects :kind])
+        _ (when (contains? #{:pure-reduction :scalar-reduction-phase} reduction-kind)
+            (let [required (if (= :scalar-reduction-phase reduction-kind)
+                             (long (first group-count)) 1)]
+              (doseq [[slot value] pointer-pairs
+                      :when (= :result (:role slot))]
+                ;; A raw MemorySegment here is an opaque cl_mem handle, not the allocation it
+                ;; names. Its byteSize is the handle representation size and says nothing about
+                ;; device capacity. Only OclBuffer carries a checked element count.
+                (let [capacity (known-buffer-capacity value)]
+                  (when (and capacity (< (long capacity) required))
+                    (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
+                                    {:kernel-name kernel-name :slot slot
+                                     :required-elements required :buffer-elements capacity})))))))
         _ (when (= :tensor-contraction (get-in registered [:effects :kind]))
             (let [extent-expr (kart/attribute registered :out-elems)
                   out-elems (long (if (number? extent-expr)
@@ -1403,11 +1420,8 @@
                 (throw (ex-info "resident contraction output extent must be non-negative"
                                 {:kernel-name kernel-name :out-elems out-elems})))
               (doseq [[slot value] pointer-pairs :when (= :result (:role slot))]
-                (let [capacity (cond
-                                 (device-buffer? value) (:n-elements ^OclBuffer value)
-                                 (instance? MemorySegment value)
-                                 (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))]
-                  (when (< (long capacity) out-elems)
+                (let [capacity (known-buffer-capacity value)]
+                  (when (and capacity (< (long capacity) out-elems))
                     (throw (ex-info "contraction output buffer is smaller than its artifact extent"
                                     {:kernel-name kernel-name :slot slot :out-elems out-elems
                                      :buffer-elements capacity})))))))

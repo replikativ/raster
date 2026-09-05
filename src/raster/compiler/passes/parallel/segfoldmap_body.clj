@@ -379,6 +379,7 @@
     "Product" (canonical-operation :mul (:factors expression))
     "Sum" (canonical-operation :add (:terms expression))
     "Minimum" (canonical-operation :min (:values expression))
+    "Maximum" (canonical-operation :max (:values expression))
     "CeilDiv" (canonical-operation :ceil-div [(:value expression) (:divisor expression)])
     "FloorDiv" (canonical-operation :floor-div [(:value expression) (:divisor expression)])
     "AlignUp" (canonical-operation :align-up [(:value expression) (:alignment expression)])

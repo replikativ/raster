@@ -42,6 +42,17 @@
   [id dtype elements role]
   (kgraph/buffer id dtype elements :device role))
 
+(defn- ordered-public-buffers
+  "Preserve the supplied public argument order, independently of matrix lhs/rhs order.
+   Only reorder locally derived buffer descriptions; do not copy facts from the source witness."
+  [buffers arguments]
+  (let [positions (zipmap arguments (range))]
+    (when-not (every? #(contains? positions (:id %)) buffers)
+      (throw (ex-info "matrix schedule buffer is absent from its public interface"
+                      {:reason :gemm-public-buffer-interface
+                       :buffers buffers :arguments arguments})))
+    (vec (sort-by #(get positions (:id %)) buffers))))
+
 (defn- value-use
   [buffer access]
   (kgraph/->ValueUse buffer access))
@@ -805,10 +816,12 @@
                       split-k? (conj (graph-buffer partials :float partial-elements :temporary)))]
     (let [stage-graph
           (kgraph/make
-           {:inputs (into [(graph-buffer a :float a-elements :input)
-                           (graph-buffer b :float b-elements :input)]
-                          (map #(graph-buffer (:id %) (:dtype %) (:elements %) :input))
-                          epilogue-buffers)
+           {:inputs (ordered-public-buffers
+                     (into [(graph-buffer a :float a-elements :input)
+                            (graph-buffer b :float b-elements :input)]
+                           (map #(graph-buffer (:id %) (:dtype %) (:elements %) :input))
+                           epilogue-buffers)
+                     arguments)
             :outputs [(graph-buffer c :float c-elements :output)]
             :temporaries temporaries
             :scalars (kgraph/interface-scalars abi arguments)
@@ -876,8 +889,10 @@
                    :schedule {:kind :matrix-instruction-tiling :tile tile}})
         stage-graph
         (kgraph/make
-         {:inputs [(graph-buffer a :float a-elements :input)
-                   (graph-buffer b :float b-elements :input)]
+         {:inputs (ordered-public-buffers
+                   [(graph-buffer a :float a-elements :input)
+                    (graph-buffer b :float b-elements :input)]
+                   arguments)
           :outputs [(graph-buffer c :float c-elements :output)]
           :temporaries [(graph-buffer a16 :half a-elements :temporary)
                         (graph-buffer b16 :half b-elements :temporary)]

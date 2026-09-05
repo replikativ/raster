@@ -70,7 +70,7 @@
         simd (par-simd/simd-pass
               form :dtype :double :min-elements 0
               :array-types {'X :double} :scalar-types {'n :long})]
-    (is (= 1 (count (:kernels compiled))))
+    (is (= 2 (count (:kernels compiled))))
     (is (= 1 (get-in compiled [:stats :ze-reduces])))
     (is (= 1 (get-in compiled [:stats :segop-reused])))
     (is (nil? (get-in compiled [:stats :segop-relowered])))
@@ -101,17 +101,39 @@
       (is (= 1 (:segop-reused st)) "consumed from the first-class equation")
       (is (nil? (:segop-relowered st))))))
 
-(deftest a-body-position-reduction-keeps-the-existing-resultless-envelope
+(deftest a-body-position-reduction-has-the-same-typed-result-envelope
   (let [form '(let* [n 8192]
                     (raster.par/reduce acc 0.0 i n
                                        (+ acc (clojure.core/aget X i))))
-        program (lowered form)
+        program (:form (slp/segop-lower-pass
+                        form {:target-device :ze:0 :dtype :double
+                              :scalar-types {'n :long}
+                              :array-types {'X :double}}))
         equation (first (:equations program))
-        st (:stats (run program))]
-    (is (empty? (:results equation)))
-    (is (nil? (:algorithm equation)))
-    (is (= 1 (:segop-reused st)))
-    (is (= 1 (:ze-reduces st)))))
+        compiled (run program)]
+    (is (= 1 (count (:results equation))))
+    (is (some? (:algorithm equation)))
+    (is (= 2 (count (:kernels compiled))))
+    (is (= 1 (get-in compiled [:stats :ze-reduces])))
+    (is (= 1 (get-in compiled [:stats :segop-reused])))
+    (is (= 'clojure.core/aget (first (last (:form compiled)))))))
+
+(deftest compatibility-reentry-cannot-overwrite-retained-value-types
+  (let [form '(let* [n 8192]
+                    (raster.par/reduce acc 0.0 i n
+                                       (+ acc (clojure.core/aget X i))))
+        program (:form (slp/segop-lower-pass
+                        form {:target-device :ze:0 :dtype :double
+                              :scalar-types {'n :long}
+                              :array-types {'X :double}}))
+        failure (try
+                  (op/opencl-pass program :device-id :ze:0 :dtype :double :min-elements 0
+                                  :scalar-types {'n :int})
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :parallel-program-type-conflict (:reason (ex-data failure))))
+    (is (= {:retained :long :provided :int}
+           (get-in (ex-data failure) [:scalar-conflicts 'n])))))
 
 (deftest jvm-simd-consumes-the-boundary-too
   (testing "matching map/reduce SegOps are reused rather than independently re-derived"

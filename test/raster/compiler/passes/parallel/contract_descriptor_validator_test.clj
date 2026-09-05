@@ -13,6 +13,7 @@
    actually rejects each historical shape."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.contract-route :as route]))
 
 (defn- mm [m n k]
@@ -107,12 +108,44 @@
       (is (= '[A B O _n_bound] (mapv :name (:abi red))))
       (is (= '[A B O 8] (:arguments red))))
     (testing "…and the validator enforces each of those, so the protocol cannot drift"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not carry"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not"
                             (route/validate-descriptor (assoc red :wg [256 1]))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered :abi is required"
                             (route/validate-descriptor (dissoc red :abi))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires :reduce-bound"
                             (route/validate-descriptor (dissoc red :reduce-bound)))))))
+
+(deftest zero-free-contraction-is-a-real-flat-scalar-segred-schedule
+  (let [routed (route/route-contraction
+                '(raster.par/contract O [] [[i 4] [j 6]]
+                                      (aget A (+ (* i 6) j)))
+                :dtype :float)
+        source (get-in routed [:artifact :provenance :scheduled-operation :source])]
+    (is (= 24 (:reduce-bound routed))
+        "the physical bound is the flattened product, not the first surface axis")
+    (is (= 24 (get-in source [:space :dims 0 :bound])))
+    (is (= :block-local (:phase source)))
+    (is (= [:block :virtual] ((juxt :level :virt) (:level source))))
+    (is (= :scalar-workgroup-tree (get-in source [:schedule :strategy])))
+    (is (= (get-in source [:grid :num-blocks])
+           (get-in source [:schedule :attributes :group-count])))))
+
+(deftest scalar-contraction-affine-coordinates-require-the-exact-facts-proof
+  (let [form '(raster.par/contract O [] [[i 8]] (aget A i))
+        facts (contraction-facts/contraction-facts form :dtype :float)
+        forgeries
+        [(assoc-in facts [:operands 0 :idx] '(+ i 1024))
+         ;; Repeated reads of one array are distinct proof obligations; validating only the first
+         ;; occurrence would admit this unproved second coordinate.
+         (update facts :operands conj {:sym 'A :idx '(+ i 1024) :map nil})]]
+    (doseq [forged forgeries]
+      (let [failure (try
+                      (route/route-contraction nil :facts forged :dtype :float)
+                      nil
+                      (catch clojure.lang.ExceptionInfo exception exception))]
+        (is (= :kernel-graph-target-lowering-missing (:reason (ex-data failure))))
+        (is (= :contraction-coordinate-proof
+               (get-in (ex-data failure) [:kernel-body-decline :missing-rule])))))))
 
 (deftest signature-parser-handles-the-real-kernels
   (testing "the parser finds every param of a multi-line DPAS signature"

@@ -413,7 +413,8 @@
       (try
         (let [program (fixture/instantiate! s descriptor [x out scale n])
               result (get (fixture/run! program [x out scale n]) 'out)
-              red-step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))]
+              red-step (first (filter #(= :executable (:convention %)) (:steps descriptor)))]
+          (is (= 2 (count (get-in red-step [:artifact :nodes]))))
           (is (= [:input :output :scalar :scalar]
                  (mapv :kind (:argument-specs red-step))))
           (is (< (Math/abs (- (double (aget ^floats result 511))

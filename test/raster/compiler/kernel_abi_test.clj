@@ -325,5 +325,24 @@
           (is (some? e))
           (is (= :float (:expected (ex-data e))))
           (is (= :double (:actual (ex-data e))))))
+      (testing "semantic reduction certificates are required before driver loading"
+        (let [e (try
+                  (ze/invoke-registered-reduction-kernel
+                   kernel-name [(float-array 4) nil 2.0 4])
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+          (is (= :reduction-identity-missing (:reason (ex-data e))))))
       (finally
         (ze/register-kernel! kernel-name {:test-tombstone? true})))))
+
+(deftest scalar-reduction-host-combine-obeys-storage-rounding-and-certified-algebra
+  (let [combine (ns-resolve 'raster.gpu.ze-runtime 'combine-scalar-partials)]
+    (is (= 0.0
+           (double (combine :float "+" 0.0
+                            [16777216.0 1.0 -16777216.0])))
+        "FP32 compatibility combine rounds after every certified operation")
+    (is (= 1.0
+           (double (combine :double "+" 0.0
+                            [16777216.0 1.0 -16777216.0]))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown certified combine"
+          (combine :float "fmax" Float/NEGATIVE_INFINITY [3.0])))))

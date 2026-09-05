@@ -25,6 +25,10 @@
                                           (clojure.core/aget B (clojure.core/+ (clojure.core/* l 128) j)))))
 (def ^:private bound (list 'let* ['c cform] 'c))
 
+(deftest attention-jvp-preserves-mixed-contraction-captures
+  (let [v (requiring-resolve 'raster.dl.attention/scaled-dot-product-attn-jvp)]
+    (is (map? (pl/show-pipeline v :target-device :ocl:0 :dtype :float)))))
+
 (deftest a-contraction-is-a-soac-node-carrying-its-facts
   (let [n (soac/par-form->soac 'c cform 1 :dtype :double)]
     (is (soac/contract? n))

@@ -6,7 +6,6 @@
    scalar equations remain explicit host-only steps. OpenCL, CUDA, and HIP differ only at the
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
-            [clojure.set :as set]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -38,42 +37,6 @@
                           {:value id}))
                  [id (:dtype value)])))
         (distinct (mapcat segop/operation-scalars operations))))
-
-(defn- scheduled-body
-  [parallel-program equation]
-  (let [algorithm (:algorithm equation)
-        ;; A graph is emitted one equation at a time, but storage extents may be named by a
-        ;; preceding pure TypedSOAC scalar equation.  Keep the checked launch projection on the
-        ;; narrowed body so later graph re-derivation (including emitted-equation validation)
-        ;; observes exactly the same authoritative definition.
-        preceding-equations
-        (take-while #(not= (:id %) (:id equation)) (:equations parallel-program))
-        ;; A later host scalar may depend on a prior numerical result.  The closed slice names
-        ;; that omitted result as an input, but it must still retain every earlier host equation
-        ;; so the emitted program can bind the slice back to the exact outer execution prefix.
-        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only]))
-                                   preceding-equations))
-        equations (conj scalar-prefix equation)]
-    (program/make
-     {:dialect :segop
-      :source nil
-      :values (:values parallel-program)
-      ;; The body is a normal, dependency-closed Program slice: preceding host scalar equations
-      ;; execute before—and therefore prove—the one emitted numerical equation.  Revalidation
-      ;; never consults an asserted extent map in descriptive attributes.
-      :inputs (program/infer-inputs equations)
-      :equations equations
-      :outputs (:results equation)
-      :effects (reduce set/union #{} (map :effects equations))
-      :diagnostics []
-      :provenance {:source-dialect :typed-soac
-                   :pass :parallel-program-c-family}
-      :attributes {:host-control :explicit-typed-algorithm}
-      :operation? segop/segop-node?
-      :algorithm? (fn [candidate retained]
-                    (and (= retained (soac/validate! retained))
-                         (= (:operands candidate) (:inputs (soac/facts retained)))
-                         (= (:results candidate) (soac/outputs retained))))})))
 
 (defn- emit-graph
   [scheduled-graph values operations opts]
@@ -151,20 +114,14 @@
       equation
 
       (soac/program-form? algorithm)
-      (let [body (scheduled-body parallel-program equation)
+      (let [{:keys [body graph]} (equation-graph/make-for-equation
+                                  parallel-program equation)
             ;; Multi-phase schedules retain family-independent decisions (algebra, phase
             ;; decomposition, tuning choice) on their certified graph. Rebuilding the physical
             ;; dataflow remains generic, but those schedule facts must survive to target lowering.
-            graph-contract (get-in equation [:attributes :kernel-graph])
-            scheduled-graph (equation-graph/make
-                             algorithm body
-                             (cond-> {}
-                               graph-contract
-                               (assoc :provenance (:provenance graph-contract)
-                                      :attributes (:attributes graph-contract))))
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
-            emitted (emit-graph scheduled-graph (:values body) operations
+            emitted (emit-graph graph (:values body) operations
                                 (cond-> (assoc opts
                                                :scheduled-equation-algorithm algorithm
                                                :scheduled-equation-body body)

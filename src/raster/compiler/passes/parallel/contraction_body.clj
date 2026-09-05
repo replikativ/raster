@@ -76,6 +76,7 @@
                                   (conj (mapv second axes) (:body contract-facts))))
         core-scalar-ids (set/difference core-symbols core-operand-ids axis-indices
                                         #{(:out contract-facts)})
+        dimension-scalars (reduce set/union #{} (map (comp util/free-syms second) axes))
         ;; The scheduled TypedSOAC operation exposes its complete physical boundary, including
         ;; result-transform captures. Core contraction loads and epilogue loads have different
         ;; layout/dtype rules, so partition those roles from the verified facts instead of
@@ -100,10 +101,14 @@
         _ (when-not (and (dtype/known? dtype)
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
-                         (every? #(= dtype (array-dtype %)) arrays)
-                         (every? #(contains? #{:int :long} (dtype/canon (scalar-dtype %))) scalars))
+                         (every? #(or (= dtype (array-dtype %))
+                                      (and (contains? #{:float :double} dtype)
+                                           (contains? #{:float :double} (array-dtype %)))) arrays)
+                         (every? #(dtype/known? (scalar-dtype %)) scalars)
+                         (every? #(contains? #{:int :long} (dtype/canon (scalar-dtype %)))
+                                 dimension-scalars))
             (decline! :storage-contract
-                      "portable contraction requires uniform operand dtype and integral dimensions"
+                      "portable contraction requires compatible operand storage and integral dimensions"
                       {:dtype dtype :arrays arrays :array-types array-types
                        :scalars scalars :scalar-types scalar-types
                        :workgroup-size workgroup-size}))
@@ -118,7 +123,27 @@
                        :indices (mapv (juxt :sym :idx) (:operands contract-facts))}))
         reduced-index (:name reduced-dim)
         axis-symbols (set (concat (map :name segment-dims) [reduced-index]))
-        index-scope (into axis-symbols scalars)
+        index-scope (into axis-symbols
+                          (filter #(contains? #{:int :long} (dtype/canon (scalar-dtype %))) scalars))
+        ;; Physical coordinates are wide. Preserve the scalar ABI's retained widths and insert
+        ;; exact widening at index uses rather than pretending every dimension was an int.
+        wide-indices? (boolean (some #(= :long (dtype/canon (scalar-dtype %))) scalars))
+        widen-builtin #(if wide-indices? (body/index-cast % :long :exact) %)
+        widen-index (fn widen-index [expression]
+                      (cond
+                        (not wide-indices?) expression
+                        (integer? expression) (body/index-cast expression :long :exact)
+                        (symbol? expression)
+                        (if (and (not (contains? axis-symbols expression))
+                                 (= :int (dtype/canon (scalar-dtype expression))))
+                          (body/index-cast expression :long :exact)
+                          expression)
+                        (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+                        (apply body/expression (:op expression)
+                               (map widen-index (:arguments expression)))
+                        :else expression))
+        lower-index (fn [expression scope]
+                      (widen-index (lower-index expression scope)))
         segment-count-source (segop/seg-space-num-segments-expr space)
         segment-count (lower-index segment-count-source index-scope)
         launch-segment-count (index-expression/to-launch-expression segment-count decline!)
@@ -159,6 +184,8 @@
                   ;; by their own retained source facts.
                   :declared-result-dtype dtype
                   :arrays (set arrays) :scalars (set scalars)
+                  :array-types (into {} (map (fn [id] [id (array-dtype id)])) arrays)
+                  :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
                   :coordinate-lower element-coordinate-lower
                   :load-predicate active-mask
                   :load-other (body/literal identity dtype)})
@@ -183,10 +210,11 @@
         parameters
         (vec (concat
               (map (fn [array]
-                     (let [extent (physical-extent array)]
+                     (let [extent (physical-extent array)
+                           storage-dtype (array-dtype array)]
                        (body/->KernelParameter
-                        array :input dtype [extent] :global
-                        (layout/row-major [extent] dtype) :operand)))
+                        array :input storage-dtype [extent] :global
+                        (layout/row-major [extent] storage-dtype) :operand)))
                    arrays)
               [(body/->KernelParameter output (if destination-read? :inout :output) dtype
                                        [segment-count] :global
@@ -221,17 +249,20 @@
                          (body/->IndexCompute
                           segment-index
                           (body/expression :add
-                                           (body/expression :mul group-index workgroup-size)
-                                           local-index))]
+                                           (body/expression :mul
+                                                            (widen-builtin group-index)
+                                                            (widen-builtin workgroup-size))
+                                           (widen-builtin local-index)))]
                         decomposition))
          :masks [(body/->Mask active-mask
-                              [(body/predicate :lt segment-index '_nseg)])]
+                              [(body/predicate :lt segment-index
+                                               (widen-builtin '_nseg))])]
          :operations
          (vec
           (concat
            [(body/->ForLoop
-             (body/value reduced-index :int)
-             0 reduced-bound 1
+             (body/value reduced-index (if wide-indices? :long :int))
+             (widen-builtin 0) reduced-bound 1
              [(body/->LoopArg (body/value accumulator dtype)
                               (body/literal identity dtype))]
              (vec (concat
