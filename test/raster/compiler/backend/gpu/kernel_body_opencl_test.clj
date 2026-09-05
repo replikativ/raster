@@ -156,6 +156,29 @@
 (defn- wrapping-arithmetic-kernel-body []
   (integer-arithmetic-kernel-body :wrap))
 
+(defn- bounded-byte-add-kernel-body []
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {'q :byte} :scalar-types {'i :long} :arrays #{'q}
+                  :index-scope #{'i} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        lowered ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
+                 :int {'i :long})]
+    (body/make
+     {:id :bounded-byte-add
+      :parameters [(body/->KernelParameter 'q :input :byte [16] :global
+                                            (layout/row-major [16] :byte) :input)
+                   (body/->KernelParameter 'i :scalar :long [] nil nil :index)
+                   (body/->KernelParameter 'out :output :int [1] :global
+                                            (layout/row-major [1] :int) :result)]
+      :stable-reads [(body/stable-read 'q)]
+      :operations (conj (vec (:operations lowered))
+                        (body/->ScalarStore 'out [0] (:result lowered) nil))
+      :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+      :provenance {:dialect :test}
+      :attributes {:kind :scalar}})))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -317,12 +340,7 @@
         bounded ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
                  :int {'i :long})
         unknown ((:lower lowerer) '(clojure.core/+ a i) :long {'a :long 'i :long})
-        proved-kernel (-> (integer-arithmetic-kernel-body :no-overflow :+ :int)
-                          (assoc-in [:operations 0 :expression :options]
-                                    {:overflow :no-overflow
-                                     :proof {:kind :typed-scalar-range
-                                             :lower -121 :upper 134}})
-                          body/validate!)
+        proved-kernel (bounded-byte-add-kernel-body)
         opencl-source (opencl/emit-scalar-kernel
                        "proved_byte_add" proved-kernel {:target-dialect :opencl-portable})]
     (is (= {:overflow :no-overflow
@@ -332,7 +350,12 @@
            (get-in unknown [:operations 0 :expression :options])))
     (is (= :+ (get-in (peek (:operations bounded)) [:expression :op]))
         "byte storage, exact widening, and a literal prove this OpenCL-safe operation")
-    (is (str/includes? opencl-source "rstr_a + rstr_b")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"not derivable from operand ranges"
+         (integer-arithmetic-kernel-body :no-overflow :+ :int))
+        "a producer cannot certify arbitrary scalar parameters with a bare no-overflow tag")
+    (is (str/includes? opencl-source "+ 7")
         "a range-certified semantic operation remains legal portable OpenCL C"))
   (doseq [[target unsigned-type]
           [[:opencl-portable "ulong"]
@@ -352,9 +375,9 @@
     (testing (name target)
       (let [source (opencl/emit-scalar-kernel
                     "proved_arithmetic"
-                    (integer-arithmetic-kernel-body :no-overflow)
+                    (bounded-byte-add-kernel-body)
                     {:target-dialect target})]
-        (is (str/includes? source "rstr_a + rstr_b")
+        (is (str/includes? source "+ 7")
             "a proved in-range operation may use the target's signed instruction"))))
   (testing "OpenCL C declines a contract for which the language has no standard trap primitive"
     (doseq [target [:opencl-portable :opencl-intel]]

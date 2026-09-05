@@ -15,7 +15,11 @@
 (defn for-dtype
   "The complete representable interval for an integral dtype, else nil."
   [type]
-  (when-let [[lower upper] (get integral-bounds (dtype/canon type))]
+  ;; Predicate values are deliberately outside `dtype/canon`: a predicate is a control
+  ;; value, not a numeric scalar.  Range analysis is optional evidence, so it must be
+  ;; harmless when asked about one.
+  (when-let [[lower upper] (get integral-bounds (when (not= :predicate type)
+                                                   (dtype/canon type)))]
     {:lower lower :upper upper}))
 
 (defn contained-in-dtype?
@@ -50,3 +54,22 @@
                                [(:lower right) (:upper right) (:lower right) (:upper right)])]
              {:lower (reduce min products) :upper (reduce max products)})
         nil))))
+
+(defn hull
+  "The least interval containing every non-nil input interval, or nil when an input is
+  unknown.  It is used for control-flow joins rather than as an assertion mechanism."
+  [ranges]
+  (when (every? some? ranges)
+    {:lower (reduce min (map :lower ranges))
+     :upper (reduce max (map :upper ranges))}))
+
+(defn minmax
+  "Sound interval transfer for canonical integral min/max."
+  [operator operands]
+  (when (every? some? operands)
+    (case operator
+      :min {:lower (reduce min (map :lower operands))
+            :upper (reduce min (map :upper operands))}
+      :max {:lower (reduce max (map :lower operands))
+            :upper (reduce max (map :upper operands))}
+      nil)))

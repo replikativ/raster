@@ -102,6 +102,9 @@
                                     (assoc scalar-types index :long))
         group-index 'stencil-group
         local-index 'stencil-lane
+        ;; The public extent is an ABI scalar.  Clamp it in the body before using it in
+        ;; certified schedule arithmetic: this is a replayable fact, unlike trusting a role.
+        safe-bound 'stencil-safe-bound
         right-limit 'stencil-right-limit
         left-interior 'stencil-left-interior
         right-interior 'stencil-right-interior
@@ -139,12 +142,18 @@
                 [(body/predicate :lt index (body/index-cast '_n_bound :long :exact))])]
        :operations
        [(body/->ScalarCompute
+         (body/value safe-bound :int)
+         (body/scalar-expression
+          :min :int
+          [(body/scalar-expression :max :int ['_n_bound (body/literal 0 :int)])
+           (body/literal Integer/MAX_VALUE :int)]))
+        (body/->ScalarCompute
          (body/value right-limit :long)
          (body/scalar-expression
-          :- :long [(body/cast-expression '_n_bound :long :exact :exact)
+          :- :long [(body/cast-expression safe-bound :long :exact :exact)
                     (body/literal radius :long)]
-          ;; `_n_bound` is a non-negative int extent and radius is a validated static stencil
-          ;; radius, so this widened schedule-bound subtraction cannot overflow long.
+          ;; `safe-bound` was clamped above and the only admitted radius is one, so this
+          ;; widened schedule-bound subtraction is independently derivable by KernelBody.
           {:overflow :no-overflow}))
         (body/->ScalarCompute
          (body/value left-interior :predicate)

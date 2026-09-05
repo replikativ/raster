@@ -1005,7 +1005,10 @@
 (defn- literal-info!
   [literal]
   (literal! literal)
-  {:type (canonical-type (:type literal)) :uniformity all-uniform})
+  (let [type (canonical-type (:type literal))]
+    {:type type
+     :uniformity all-uniform
+     :range (scalar-range/literal (:value literal) type)}))
 
 (defn- scalar-argument-info!
   [argument values]
@@ -1029,6 +1032,37 @@
     (when-not (apply = types)
       (throw (ex-info (str owner " operand types must agree") {:types types})))
     (first types)))
+
+(defn- scalar-result-range
+  "Derive a range from verifier-owned operand facts.  This deliberately knows only canonical
+  scalar semantics; producer-supplied proof maps are diagnostic evidence, never facts."
+  [canonical-op result-type infos]
+  (let [ranges (mapv :range infos)]
+    (cond
+      (contains? #{:+ :- :*} canonical-op)
+      (scalar-range/arithmetic canonical-op ranges)
+
+      (contains? #{:min :max} canonical-op)
+      (scalar-range/minmax canonical-op ranges)
+
+      (= :select canonical-op)
+      (scalar-range/hull (subvec ranges 1))
+
+      :else
+      ;; Operations without an independently modelled transfer function remain unknown.  For
+      ;; integral values that means the complete declared dtype, never a guessed subrange.
+      (scalar-range/for-dtype result-type))))
+
+(defn- proof-covers-derived-range?
+  [proof derived-range result-type]
+  (and (= :typed-scalar-range (:kind proof))
+       (integer? (:lower proof))
+       (integer? (:upper proof))
+       (<= (:lower proof) (:upper proof))
+       (scalar-range/contained-in-dtype? proof result-type)
+       derived-range
+       (<= (:lower proof) (:lower derived-range))
+       (<= (:upper derived-range) (:upper proof))))
 
 (defn- scalar-info!
   [expression values]
@@ -1129,17 +1163,16 @@
             arithmetic-overflow? (and integral? overflow-op?)
             overflow-policy (:overflow options)
             proof (:proof options)
-            valid-proof?
-            (and (= :no-overflow overflow-policy)
-                 (= :typed-scalar-range (:kind proof))
-                 (integer? (:lower proof))
-                 (integer? (:upper proof))
-                 (<= (:lower proof) (:upper proof))
-                 (scalar-range/contained-in-dtype? proof operand-type))
+            derived-range (when arithmetic-overflow?
+                            (scalar-range/arithmetic canonical-op (mapv :range infos)))
+            no-overflow-proved?
+            (and derived-range
+                 (scalar-range/contained-in-dtype? derived-range result-type))
             valid-options?
-            (or (and (= #{:overflow} (set (keys options)))
-                     (contains? arithmetic-overflow-policies overflow-policy))
-                (and (= #{:overflow :proof} (set (keys options))) valid-proof?))]
+            (and (contains? #{#{:overflow} #{:overflow :proof}} (set (keys options)))
+                 (contains? arithmetic-overflow-policies overflow-policy)
+                 (or (not (contains? options :proof))
+                     (proof-covers-derived-range? proof derived-range result-type)))]
         (when-not (= arity (count infos))
           (throw (ex-info "scalar intrinsic arity mismatch"
                           {:operation canonical-op :expected arity :actual (count infos)})))
@@ -1148,6 +1181,14 @@
                           {:reason :kernel-body-intrinsic-overflow
                            :operation canonical-op :operand-type operand-type
                            :options options})))
+        (when (and arithmetic-overflow?
+                   (= :no-overflow overflow-policy)
+                   (not no-overflow-proved?))
+          (throw (ex-info "integral no-overflow contract is not derivable from operand ranges"
+                          {:reason :kernel-body-intrinsic-overflow-proof
+                           :operation canonical-op :operand-type operand-type
+                           :derived-range derived-range :result-type result-type
+                           :proof proof})))
         (when (and (seq options) (not arithmetic-overflow?))
           (throw (ex-info "overflow contracts are only defined for integral add, subtract, and multiply"
                           {:reason :kernel-body-intrinsic-overflow
@@ -1172,13 +1213,26 @@
       :else
       (throw (ex-info "scalar expression has an unknown canonical operation"
                       {:operation op :allowed-special special-scalar-ops})))
-    {:type result-type :uniformity (join-uniformity infos)}))
+    {:type result-type
+     :uniformity (join-uniformity infos)
+     :range
+     (cond
+       (= :cast op)
+       (let [source-range (:range (first infos))]
+         ;; Exact widening retains its fact.  Narrowing, wrapping and floating conversion are
+         ;; intentionally conservative.
+         (when (and source-range
+                    (scalar-range/contained-in-dtype? source-range result-type))
+           source-range))
+
+       (= :isnan op) nil
+       :else (scalar-result-range canonical-op result-type infos))}))
 
 (defn- expression-info!
   [expression values]
   (cond
     (integer? expression)
-    {:type :int :uniformity all-uniform}
+    {:type :int :uniformity all-uniform :range (scalar-range/literal expression :int)}
 
     (value-id? expression)
     (typed-info! values expression "index expression")
@@ -1201,7 +1255,9 @@
                         {:reason :kernel-body-index-cast-semantics
                          :expression expression :source (:type source) :target target
                          :overflow (:overflow expression)})))
-      {:type target :uniformity (:uniformity source)})
+      {:type target :uniformity (:uniformity source)
+       :range (when (scalar-range/contained-in-dtype? (:range source) target)
+                (:range source))})
 
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
     (let [infos (mapv #(expression-info! % values) (:arguments expression))
@@ -1213,7 +1269,19 @@
         (throw (ex-info "index expression mixes integral widths without an explicit conversion"
                         {:reason :kernel-body-index-dtype :expression expression :types types})))
       {:type (or (first types) :int)
-       :uniformity (join-uniformity infos)})
+       :uniformity (join-uniformity infos)
+       ;; Index expressions are scheduling arithmetic; conservatively retain a range only for
+       ;; the canonical operations whose interval transfer is total and explicitly modelled.
+       :range (let [op (:op expression)
+                    result-type (or (first types) :int)
+                    ranges (mapv :range infos)]
+                (case op
+                  :add (scalar-range/arithmetic :+ ranges)
+                  :sub (scalar-range/arithmetic :- ranges)
+                  :mul (scalar-range/arithmetic :* ranges)
+                  :min (scalar-range/minmax :min ranges)
+                  :max (scalar-range/minmax :max ranges)
+                  (scalar-range/for-dtype result-type)))})
 
     :else
     (throw (ex-info "unsupported kernel index expression"
@@ -1337,6 +1405,12 @@
                          :expected result-type :actual (:type other-info)})))
       (assoc values (:id result)
              {:type result-type
+              ;; A device load is unconstrained unless a preceding scalar operation derives a
+              ;; narrower fact.  `other` is included because a masked load may produce it.
+              :range (if other-info
+                       (scalar-range/hull [(scalar-range/for-dtype result-type)
+                                           (:range other-info)])
+                       (scalar-range/for-dtype result-type))
               ;; Only a body-level StableRead contract can establish memory uniformity. Its
               ;; corresponding ABI slot requires no write alias for the whole parallel launch.
               :uniformity (reduce set/intersection
@@ -1387,6 +1461,7 @@
                   (claim-value! claimed reserved values result "kernel if result")
                   (assoc env (:id result)
                          {:type (canonical-type (:type result))
+                          :range (scalar-range/hull [(:range then-info) (:range else-info)])
                           :uniformity (reduce set/intersection (:uniformity condition)
                                               [(:uniformity then-info)
                                                (:uniformity else-info)])}))
@@ -1418,6 +1493,11 @@
                             {:reason :kernel-body-loop-initial :arg arg :initial initial})))))
       (let [loop-values (into (assoc values (:id index)
                                      {:type (canonical-type (:type index))
+                                      ;; The verifier checks these are the actual loop bounds;
+                                      ;; including the upper endpoint is conservative and avoids
+                                      ;; assuming a particular trip-count convention.
+                                      :range (scalar-range/hull [(:range lower-info)
+                                                                 (:range upper-info)])
                                       :uniformity loop-control})
                               (map (fn [arg initial]
                                      [(:id (:binding arg))
@@ -1480,7 +1560,10 @@
             (throw (ex-info "kernel pipelined loop initial value disagrees with its binding"
                             {:reason :kernel-body-loop-initial :arg arg :initial initial})))))
       (let [loop-values (into (assoc values (:id index)
-                                     {:type index-type :uniformity loop-control})
+                                     {:type index-type
+                                      :range (scalar-range/hull [(:range lower-info)
+                                                                 (:range upper-info)])
+                                      :uniformity loop-control})
                               (map (fn [arg initial]
                                      [(:id (:binding arg))
                                       (if (contains? uniform-iter-args (:id (:binding arg)))
@@ -2145,11 +2228,21 @@
                         {:type (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                                  :int
                                  (:type (expression-info! (:expression idx) values)))
+                         :range (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                                  ;; Hardware ids have target-dependent launch ranges.  Until a
+                                  ;; launch contract proves one, they are ordinary full-width
+                                  ;; ints, never implicit no-overflow evidence.
+                                  (scalar-range/for-dtype :int)
+                                  (:range (expression-info! (:expression idx) values)))
                          :uniformity uniformity})))
              (into {}
                    (map (fn [parameter]
                           [(:id parameter)
                            {:type (canonical-type (:dtype parameter))
+                            ;; ABI scalars and all loads begin at their complete dtype range.
+                            ;; Producers may derive a narrower range with real clamp/select
+                            ;; operations; roles alone are not assertions.
+                            :range (scalar-range/for-dtype (:dtype parameter))
                             :uniformity all-uniform}])
                         (filter #(= :scalar (:kind %)) parameters)))
              indices)
