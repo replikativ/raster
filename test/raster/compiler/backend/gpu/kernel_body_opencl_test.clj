@@ -179,6 +179,25 @@
       :provenance {:dialect :test}
       :attributes {:kind :scalar}})))
 
+(defn- forged-no-overflow-kernel-body []
+  (body/make
+   {:id :forged-no-overflow
+    :parameters [(body/->KernelParameter 'a :scalar :int [] nil nil :left)
+                 (body/->KernelParameter 'b :scalar :int [] nil nil :right)
+                 (body/->KernelParameter 'out :output :int [1] :global
+                                          (layout/row-major [1] :int) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'result :int)
+                  (body/scalar-expression
+                   :+ :int ['a 'b]
+                   {:overflow :no-overflow
+                    ;; This looks plausible, but is intentionally unrelated to the operands.
+                    :proof {:kind :typed-scalar-range :lower -121 :upper 134}}))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -355,6 +374,11 @@
          #"not derivable from operand ranges"
          (integer-arithmetic-kernel-body :no-overflow :+ :int))
         "a producer cannot certify arbitrary scalar parameters with a bare no-overflow tag")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"not derivable from operand ranges"
+         (forged-no-overflow-kernel-body))
+        "a producer proof map is evidence to check, never an authority to forge")
     (is (str/includes? opencl-source "+ 7")
         "a range-certified semantic operation remains legal portable OpenCL C"))
   (doseq [[target unsigned-type]
