@@ -97,7 +97,9 @@
                            (throw (ex-info message
                                            (assoc data :reason rule
                                                        :pass :scheduled-equation-graph))))
-                index (index-expression/lower expression (set captures) decline!)
+                index (index-expression/lower-typed
+                       expression (set captures)
+                       #(get-in values [% :dtype]) (get-in values [result :dtype]) decline!)
                 projected (launch/rebind-expression
                            (index-expression/to-launch-expression index decline!) bindings)
                 projected-dtype
@@ -241,22 +243,24 @@
          host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
                                       (:equations scheduled)))
          numerical-equations (vec (drop (count host-prefix) (:equations scheduled)))
-         _ (when-not (and (= 1 (count numerical-equations))
+         _ (when-not (and (seq numerical-equations)
                           (every? #(typed-host-scalar-equation? (:values scheduled) % (:algorithm %))
                                   host-prefix))
              (fail! :scheduled-equation-prefix
-                    "a narrowed graph body requires an earlier-only typed host-scalar prefix and one numerical equation"
+                    "a graph body requires an earlier-only typed host-scalar prefix and numerical equations"
                     {:host-prefix (mapv :id host-prefix)
                      :numerical-equations (mapv :id numerical-equations)}))
-         target-equation (first numerical-equations)
          retained-equations (vec (mapcat (comp soac/equations :algorithm) numerical-equations))
+         numerical-inputs (if (seq host-prefix)
+                            (:operands (first numerical-equations))
+                            (:inputs scheduled))
          _ (when-not (and (= (soac/equations algorithm) retained-equations)
-                          (= (:operands target-equation) (:inputs (soac/facts algorithm)))
+                          (= numerical-inputs (:inputs (soac/facts algorithm)))
                           (= (soac/outputs algorithm) (:outputs scheduled)))
              (fail! :scheduled-equation-algorithm
                     "scheduled equations or program boundary differ from the retained algorithm"
                     {:algorithm-inputs (:inputs (soac/facts algorithm))
-                     :scheduled-inputs (:inputs target-equation)
+                     :scheduled-inputs numerical-inputs
                      :algorithm-outputs (soac/outputs algorithm)
                      :scheduled-outputs (:outputs scheduled)}))
          operations (vec (mapcat :operations numerical-equations))
@@ -289,4 +293,9 @@
                            :algorithm-dialect :typed-soac
                            :schedule-dialect :segop}
                           provenance)
-       :attributes attributes}))))
+       ;; This map is derived solely from the validated leading host equations above.  It lets a
+       ;; schedule validator normalize its source-level extent identities to the same public
+       ;; launch algebra as the graph's fully expanded storage specs.  Callers cannot override it.
+       :attributes (cond-> attributes
+                     (seq derived-scalars)
+                     (assoc :derived-storage-scalars derived-scalars))}))))

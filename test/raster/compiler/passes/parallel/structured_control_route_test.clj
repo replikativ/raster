@@ -488,6 +488,28 @@
         "program shape facts remain available when a later kernel has no ABI use for them")
     (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))
 
+(deftest allocation-shape-definition-remains-an-ordered-host-equation
+  (let [source '(let* [size (clojure.core/* nrows width)
+                       out (clojure.core/float-array size)
+                       effect (raster.par/map-void! i nrows
+                                                    (clojure.core/aset
+                                                     out i (float (clojure.core/aget x i))))]
+                      effect)
+        options {:dtype :float
+                 :public-parameters '[x nrows width]
+                 :array-types {'x :float}
+                 :scalar-types {'nrows :long 'width :long 'size :long}}
+        parallel (:program (typed-route/attempt source :float {'x :float}
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-soac-program parallel options)
+        shape-equation (first (:equations promoted))
+        prefix-symbols (mapv :symbol (get-in promoted [:attributes :invocation-plan :steps]))]
+    (is (= '[size] (:results shape-equation)))
+    (is (true? (get-in shape-equation [:attributes :graph-shape-definition])))
+    (is (true? (get-in shape-equation [:attributes :host-only])))
+    (is (some #{'size} prefix-symbols)
+        "the same pure size is materialized before allocation and retained as graph proof")))
+
 (defn- prepared-mixed-call
   ([trip-count]
    (prepared-mixed-call trip-count (mixed-source-without-induction)))

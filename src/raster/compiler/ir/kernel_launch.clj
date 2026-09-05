@@ -267,7 +267,18 @@
               (integer? value) value
               (runtime-value? value)
               (let [replacement (get bindings (:value value) (:value value))]
-                (if (integer? replacement) replacement (->RuntimeValue replacement)))
+                (cond
+                  (integer? replacement) replacement
+                  ;; Ordered scalar-definition projection can replace one opaque SSA leaf with
+                  ;; an already-checked launch expression. Splice that expression into the tree;
+                  ;; wrapping it as the payload of RuntimeValue would turn executable algebra
+                  ;; back into an invalid opaque identity and stop transitive extent expansion.
+                  (or (runtime-value? replacement) (ceil-div? replacement)
+                      (floor-div? replacement) (sum? replacement) (product? replacement)
+                      (align-up? replacement) (minimum? replacement)
+                      (index-expr? replacement) (index-cast? replacement))
+                  (rebind replacement)
+                  :else (->RuntimeValue replacement)))
               (ceil-div? value) (assoc value :value (rebind (:value value))
                                             :divisor (rebind (:divisor value)))
               (floor-div? value) (assoc value :value (rebind (:value value))

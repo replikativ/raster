@@ -1644,7 +1644,11 @@
                              [symbol (replace-parallel-extent expression extent-id)])
                      (let [extent-id (with-meta
                                        (clojure.core/symbol (str "rstr_extent_" ordinal))
-                                       {:tag 'long :raster.type/tag 'long})]
+                                       {:tag 'long :raster.type/tag 'long
+                                        ;; This SSA value is introduced by the frontend as the
+                                        ;; canonical identity of compound launch/storage algebra.
+                                        ;; Preserve that provenance without relying on its name.
+                                        :raster.compiler/normalized-extent true})]
                        (-> state
                            (assoc-in [:compound-extents canonical-extent] extent-id)
                            (update :normalized into
@@ -2374,6 +2378,23 @@
                              (set/intersection all-definitions body-uses)
                              returned-destination-results)))))
 
+(defn- scalar-dependency-closure
+  [by-symbol roots]
+  (loop [needed (set/intersection (set roots) (set (keys by-symbol)))]
+    (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
+          needed' (set/union needed (set/intersection dependencies (set (keys by-symbol))))]
+      (if (= needed needed') needed (recur needed')))))
+
+(defn- allocation-capacity-scalars
+  [descriptions physical-outputs by-symbol]
+  ;; An allocation binding is generated storage scaffolding, but the typed scalar algebra which
+  ;; computes its capacity is executable proof data.  Keep the transitive scalar definitions and
+  ;; mark them below; no generated-name convention is involved.
+  (scalar-dependency-closure
+   by-symbol
+   (mapcat (comp util/free-syms :expr)
+           (filter #(generated-scaffolding? % physical-outputs) descriptions))))
+
 (defn- selected-scalars
   [descriptions operation-equations outputs]
   (let [physical-outputs (physical-output-symbols descriptions)
@@ -2383,16 +2404,22 @@
                                           (not (generated-scaffolding? % physical-outputs)))
                                  [(:sym %) %]))
                         descriptions)
+        ;; Allocation bindings themselves are generated storage scaffolding and must not become
+        ;; executable scalar steps.  Their capacity algebra is different: it is the authoritative
+        ;; definition of an AbstractValue shape that a later KernelGraph allocates.  Retain just
+        ;; the scalar dependencies of that algebra, so a normalised `rstr_extent_n` (or a user
+        ;; scalar size) remains an ordered, typed host equation rather than an opaque shape name.
+        ;; The ordinary dependency closure below keeps this independent of allocation spelling.
+        allocation-capacity-roots
+        (allocation-capacity-scalars descriptions physical-outputs by-symbol)
         roots (set (concat outputs
+                           allocation-capacity-roots
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)
                                            (filter dialect/value-id?
                                                    (dialect/operation-extents equation))))
                                    operation-equations)))]
-    (loop [needed (set/intersection roots (set (keys by-symbol)))]
-      (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
-            needed' (set/union needed (set/intersection dependencies (set (keys by-symbol))))]
-        (if (= needed needed') needed (recur needed'))))))
+    (scalar-dependency-closure by-symbol roots)))
 
 (defn- tensor-value [dtype shape]
   (av/tensor {:dtype dtype :shape shape :representation {:kind :plain}}))
@@ -2550,6 +2577,23 @@
                                         operation-descriptions)
               outputs (terminal-results descriptions body)
               required-scalars (selected-scalars descriptions operation-equations outputs)
+              scalar-descriptions
+              (into {}
+                    (keep #(when (and (= :scalar (:kind %))
+                                      (supported-description? physical-outputs %)
+                                      (not (generated-scaffolding? % physical-outputs)))
+                             [(:sym %) %]))
+                    descriptions)
+              allocation-capacity-scalar-ids
+              (allocation-capacity-scalars descriptions physical-outputs scalar-descriptions)
+              normalized-extent-scalar-ids
+              (into #{} (keep #(when (and (= :scalar (:kind %))
+                                          (true? (:raster.compiler/normalized-extent
+                                                  (meta (:sym %)))))
+                                 (:sym %)))
+                    descriptions)
+              graph-shape-scalar-ids
+              (set/union allocation-capacity-scalar-ids normalized-extent-scalar-ids)
               {:keys [equations equation-descriptions]}
               (reduce (fn [{:keys [scalar-dtypes] :as state} description]
                         (case (:kind description)
@@ -2626,15 +2670,17 @@
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
                                         :source-binding-id (:id description)})
+                                (contains? graph-shape-scalar-ids (:sym description))
+                                (update :attributes assoc :graph-shape-definition true)
                                 storage
-                                (assoc :effects #{:memory/write}
-                                       :aliases (into {}
-                                                      (map (fn [result {:keys [destination]}]
-                                                             [result destination])
-                                                           (:results description) storage))
-                                       :attributes {:result-storage storage
-                                                    :host-binding
-                                                    (:host-binding description)}))]))
+                                (-> (assoc :effects #{:memory/write}
+                                           :aliases (into {}
+                                                          (map (fn [result {:keys [destination]}]
+                                                                 [result destination])
+                                                               (:results description) storage)))
+                                    (update :attributes merge
+                                            {:result-storage storage
+                                             :host-binding (:host-binding description)})))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
               host-descriptions

@@ -98,6 +98,18 @@
     (is (= [2 3]
            (:group-count (launch/realize specialized {'rows 129}))))))
 
+(deftest launch-rebinding-splices-derived-expression-definitions
+  (let [derived (launch/product
+                 (body/index-cast (launch/runtime-value 'rows) :long :exact)
+                 (body/index-cast (launch/runtime-value 'width) :long :exact))
+        expression (launch/rebind-expression
+                    (launch/product (launch/runtime-value 'batch)
+                                    (launch/runtime-value 'slab))
+                    {'slab derived})]
+    (is (launch/expression? expression))
+    (is (= #{'batch 'rows 'width} (launch/expression-references expression)))
+    (is (= 30 (launch/resolve-expression {'batch 2 'rows 3 'width 5} expression)))))
+
 (deftest runtime-literals-are-specialization-values-not-public-scalar-leaves
   (is (= #{} (launch/expression-references (launch/runtime-value 3))))
   (is (= #{'n} (launch/expression-references (launch/runtime-value 'n)))))

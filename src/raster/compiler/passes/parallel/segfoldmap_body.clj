@@ -403,11 +403,6 @@
 
       :else [:leaf expression])))
 
-(defn- storage-elements
-  [segfold]
-  (canonical-extent
-   (list '* (segop/seg-space-num-segments-expr (:space segfold)) (:extent segfold))))
-
 (defn validate-against-node!
   "Close a fold-map refinement over its exact source grid and graph storage descriptions.
 
@@ -427,13 +422,21 @@
         parameters (get-in scheduled [:body :parameters])
         bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
                        (map vector parameters (:arguments scheduled)))
-        expected-elements (storage-elements source)]
+        derived-scalars (get-in kernel-graph [:attributes :derived-storage-scalars] {})
+        expand-derived #(util/subst-syms derived-scalars %)
+        expected-elements (canonical-extent
+                           (expand-derived
+                            (list '* (segop/seg-space-num-segments-expr (:space source))
+                                  (:extent source))))]
     (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
             :when (not= :scalar (:kind parameter))]
       (let [buffer (get buffers argument)
             parameter-elements
             (canonical-operation
-             :mul (map #(launch/rebind-expression % bindings) (:shape parameter)))
+             :mul (map #(-> %
+                            (launch/rebind-expression bindings)
+                            expand-derived)
+                       (:shape parameter)))
             graph-elements (some-> buffer :elements canonical-extent)]
         (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
           (throw (ex-info "fold-map KernelBody pointer dtype differs from its graph buffer"

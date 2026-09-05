@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -134,8 +135,10 @@
     (is (instance? raster.compiler.ir.kernel_body.IndexExpr (:step segment-loop)))
     (is (= [source-workgroup] (get-in kernel-body [:launch :workgroup-size])))
     (is (= [(launch/minimum
-             source-cap
-             (launch/ceil-div (launch/runtime-value 'nsegments) source-workgroup))]
+             (body/index-cast source-cap :long :exact)
+             (launch/ceil-div
+              (body/index-cast (launch/runtime-value 'nsegments) :long :exact)
+              (body/index-cast source-workgroup :long :exact)))]
            (get-in kernel-body [:launch :group-count])))
     (is (zero? (get-in kernel-body [:launch :shared-memory-bytes])))
     (is (= 3 (count loops)) "maximum, denominator, then the final dense map")
