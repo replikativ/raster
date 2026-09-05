@@ -8,12 +8,13 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]))
 
 (defrecord GraphBuffer [id dtype elements memory-space role])
 (defrecord GraphScalar [id dtype])
 (defrecord ValueUse [buffer access])
-(defrecord ScheduledKernel [id operation uses dependencies])
+(defrecord ScheduledKernel [id operation uses scalar-uses dependencies])
 (defrecord KernelGraph
            [inputs outputs temporaries scalars nodes abi arguments effects provenance attributes])
 
@@ -66,6 +67,50 @@
                     {:id id :dtype scalar-dtype})))
   (->GraphScalar id (dtype/canon scalar-dtype)))
 
+(defn interface-scalars
+  "Project the ordered public scalar values from an ordered logical ABI.
+
+   Target-private scalar expressions do not belong in a KernelGraph boundary; those are introduced
+   by a later ScheduledKernelBody and remain closed over the public identities represented here."
+  [abi arguments]
+  (kabi/validate-arguments! abi arguments)
+  (mapv (fn [[slot argument]]
+          (when-not (or (symbol? argument) (keyword? argument))
+            (throw (ex-info "public graph scalar arguments require stable compiler identities"
+                            {:reason :kernel-graph-scalar-interface
+                             :slot slot :argument argument})))
+          (scalar argument (:dtype slot)))
+        (filter (fn [[slot _]] (= :scalar (:kind slot)))
+                (map vector abi arguments))))
+
+(defn public-interface
+  "Remove target-private scalar literals and arithmetic from an artifact-style interface.
+
+   Pointer arguments and stable symbolic scalar identities form the callable graph boundary.
+   Literal dimensions and derived integer expressions remain node-private specialization facts."
+  [abi arguments]
+  (kabi/validate-arguments! abi arguments)
+  (let [pairs (filterv (fn [[slot argument]]
+                         (or (not= :scalar (:kind slot))
+                             (symbol? argument)
+                             (keyword? argument)))
+                       (mapv vector abi arguments))]
+    {:abi (mapv first pairs)
+     :arguments (mapv second pairs)}))
+
+(defn scalar-argument-uses
+  "Return public compiler-value leaves consumed by scalar ABI arguments.
+
+   Numeric literals and target-private arithmetic nodes are not graph values. Derived expressions
+   contribute only their opaque leaves, which the graph validator then checks against GraphScalar."
+  [abi arguments]
+  (kabi/validate-arguments! abi arguments)
+  (reduce into #{}
+          (map (fn [[_ argument]]
+                 (if (number? argument) #{} (launch/expression-references argument)))
+               (filter (fn [[slot _]] (= :scalar (:kind slot)))
+                       (map vector abi arguments)))))
+
 (defn- reads? [access] (contains? #{:read :read-write} access))
 (defn- writes? [access] (contains? #{:write :read-write} access))
 
@@ -106,6 +151,13 @@
             scalar-pairs (filterv (fn [[slot _]] (= :scalar (:kind slot)))
                                   (mapv vector abi arguments))
             scalar-arguments (mapv second scalar-pairs)]
+        (when-let [[slot argument]
+                   (first (remove (fn [[_ argument]]
+                                    (or (symbol? argument) (keyword? argument)))
+                                  scalar-pairs))]
+          (throw (ex-info "kernel graph public scalar requires a stable compiler identity"
+                          {:reason :kernel-graph-scalar-interface
+                           :slot slot :argument argument})))
         (when-not (= (set (keys external-by-id)) (set pointer-arguments))
           (throw (ex-info "kernel graph pointer interface differs from its external buffers"
                           {:external (set (keys external-by-id))
@@ -228,6 +280,31 @@
               (throw (ex-info "scheduled kernel identities must be unique" {:id (:id node)})))
             (when-not (vector? (:uses node))
               (throw (ex-info "scheduled kernel uses must be an ordered vector" {:node (:id node)})))
+            (when-not (or (nil? (:scalar-uses node)) (set? (:scalar-uses node)))
+              (throw (ex-info "scheduled kernel scalar uses must be a set"
+                              {:node (:id node) :scalar-uses (:scalar-uses node)})))
+            (when-not (= (some? scalars) (some? (:scalar-uses node)))
+              (throw (ex-info "scheduled kernel and graph must agree on explicit scalar dependencies"
+                              {:reason :kernel-graph-node-scalar-interface
+                               :node (:id node) :graph-scalars scalars
+                               :scalar-uses (:scalar-uses node)})))
+            (when (some? (:scalar-uses node))
+              (let [uses (:scalar-uses node)
+                    declared-scalars (set (map :id scalars))]
+                (when-not (set/subset? (set uses) declared-scalars)
+                  (throw (ex-info "scheduled kernel uses an undeclared graph scalar"
+                                  {:reason :kernel-graph-node-scalar-use
+                                   :node (:id node) :scalar-uses uses
+                                   :declared declared-scalars})))))
+            (when (and (some? (:scalar-uses node))
+                       (segop/segop-node? (:operation node))
+                       (not= (:scalar-uses node)
+                             (segop/operation-scalars (:operation node))))
+              (throw (ex-info "scheduled SegOp scalar dependencies differ from its operation"
+                              {:reason :kernel-graph-node-scalar-use
+                               :node (:id node)
+                               :expected (segop/operation-scalars (:operation node))
+                               :actual (:scalar-uses node)})))
             (when-not (vector? (:dependencies node))
               (throw (ex-info "scheduled kernel dependencies must be an ordered vector"
                               {:node (:id node)})))
@@ -309,7 +386,7 @@
      :outputs (:outputs graph)
      :temporaries (:temporaries graph)
      :scalars (:scalars graph)
-     :nodes (mapv #(select-keys % [:id :uses :dependencies]) (:nodes graph))
+     :nodes (mapv #(select-keys % [:id :uses :scalar-uses :dependencies]) (:nodes graph))
      :effects (:effects graph)}))
 
 (defn boundary-contract
@@ -413,7 +490,18 @@
                                      (ordered (set/union ins outs)))
                           ;; A scheduled-node identity is not a SegOp identity. The position makes
                           ;; repeated/colliding source ids safe when larger graphs are assembled.
-                          candidate (->ScheduledKernel [:segop (:id op) index] op uses [])
+                          operation-scalars (segop/operation-scalars op)
+                          scalar-uses (when (some? scalars)
+                                        (let [declared (set (map :id scalars))
+                                              missing (set/difference operation-scalars declared)]
+                                          (when (seq missing)
+                                            (throw (ex-info
+                                                    "scheduled operation uses undeclared graph scalars"
+                                                    {:reason :kernel-graph-node-scalar-use
+                                                     :operation (:id op) :missing missing
+                                                     :declared declared})))
+                                          operation-scalars))
+                          candidate (->ScheduledKernel [:segop (:id op) index] op uses scalar-uses [])
                           dependencies (->> previous
                                             (filter #(hazard? % candidate))
                                             (mapv :id))

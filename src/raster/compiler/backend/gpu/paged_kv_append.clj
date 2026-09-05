@@ -114,9 +114,10 @@
       :outputs output-buffers
       :abi (:abi emitted)
       :arguments (:arguments emitted)
+      :scalars []
       :nodes [(graph/->ScheduledKernel
                [:paged-kv-append id :fp32-to-fp16-reference]
-               emitted uses [])]
+               emitted uses #{} [])]
       :effects {:kind :paged-kv-append :assignment :unique-slot}
       :provenance {:operation-id id :semantic-op :paged-kv-append}
       :attributes {:strategy :fp32-to-fp16-reference :reference? true}})))

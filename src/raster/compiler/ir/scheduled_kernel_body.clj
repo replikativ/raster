@@ -11,8 +11,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.numerical-contract :as numerics]
-            [raster.compiler.ir.segop :as segop]))
+            [raster.compiler.ir.numerical-contract :as numerics]))
 
 (defrecord ScheduledKernelBody
            [source body arguments scalar-bindings effects legality numerics provenance attributes])
@@ -201,9 +200,11 @@
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
         scalar-arguments (mapv :value (:scalar-bindings scheduled))
         actual-scalars (reduce into #{} (map launch/expression-references scalar-arguments))
-        expected-scalars (if (segop/segop-node? (:source scheduled))
-                           (segop/operation-scalars (:source scheduled))
-                           actual-scalars)]
+        expected-scalars (set (:scalar-uses node))]
+    (when (nil? (:scalar-uses node))
+      (fail! :scheduled-kernel-body-node-scalars
+             "scheduled-body certification requires explicit graph-node scalar dependencies"
+             {:node (:id node)}))
     (when-not (= (:source scheduled) (:operation node))
       (fail! :scheduled-kernel-body-source
              "scheduled body does not refine the graph node's exact operation"

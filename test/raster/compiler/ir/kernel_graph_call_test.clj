@@ -24,6 +24,9 @@
         scalars {'n {:type :int :value 1025}}
         call (graph-call/make graph buffers scalars)
         [intra block carry] (mapv :call (:nodes call))]
+    (is (= [['n :int]] (mapv (juxt :id :dtype) (:scalars graph))))
+    (is (every? set? (map :scalar-uses (:nodes graph))))
+    (is (= #{'n} (reduce into #{} (map :scalar-uses (:nodes graph)))))
     (is (graph-call/kernel-graph-call? call))
     (is (every? kcall/kernel-call? [intra block carry]))
     (is (= [[5] [1] [5]]
@@ -42,7 +45,16 @@
                           (graph-call/make graph (dissoc buffers (first ids))
                                            {'n {:type :int :value 1025}})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicitly typed"
-                          (graph-call/make graph buffers {'n 1025})))))
+                          (graph-call/make graph buffers {'n 1025})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exactly every public scalar"
+                          (graph-call/make graph buffers {})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exactly every public scalar"
+                          (graph-call/make graph buffers
+                                           {'n {:type :int :value 1025}
+                                            'extra {:type :int :value 1}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"wrong ABI dtype"
+                          (graph-call/make graph buffers
+                                           {'n {:type :long :value 1025}})))))
 
 (deftest derived-int-scalars-refuse-narrowing-overflow
   (let [graph (emitted-graph)
@@ -61,3 +73,11 @@
     (is (= {'n n} (:scalar-values bindings)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicitly typed"
                           (executable/graph-bindings graph [:values :out 1025])))))
+
+(deftest executable-graphs-cannot-retain-the-pre-emission-nil-scalar-escape
+  (let [graph (emitted-graph)
+        incomplete (-> graph
+                       (assoc :scalars nil)
+                       (update :nodes #(mapv (fn [node] (assoc node :scalar-uses nil)) %)))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicit scalar dependencies"
+                          (executable/validate! incomplete)))))

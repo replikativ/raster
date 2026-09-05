@@ -252,7 +252,7 @@
         membership (:membership plan)
         storage (:storage plan)
         value (:value plan)
-        output-elements (:elements (:output plan))]
+        output-elements (klaunch/product (:extent destination-axis) (:total-dim storage))]
     [{:name 'n_entities :c-name "n_entities" :value (:extent destination-axis)}
      {:name 'n_edges :c-name "n_edges" :value (:edges membership)}
      {:name 'total_dim :c-name "total_dim" :value (:total-dim storage)}
@@ -532,8 +532,10 @@
       :outputs [(graph-buffer output :output)]
       :abi (:abi artifact)
       :arguments (:arguments artifact)
+      :scalars []
       :nodes [(kgraph/->ScheduledKernel
-               [:segmented-weighted-reduction (:id plan) :indexed-reference] artifact uses [])]
+               [:segmented-weighted-reduction (:id plan) :indexed-reference]
+               artifact uses #{} [])]
       :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
       :provenance {:operation-id (get-in plan [:provenance :operation-id])
                    :semantic-op (get-in plan [:provenance :semantic-op])}
@@ -544,6 +546,8 @@
   [plan artifact]
   (let [plan (indexed-attention-plan! plan)
         artifact (kart/validate! artifact)
+        {public-abi :abi public-arguments :arguments}
+        (kgraph/public-interface (:abi artifact) (:arguments artifact))
         inputs (swr/ordered-input-ids plan)
         output (get-in plan [:output :id])
         descriptors (into {} (map (juxt :id identity))
@@ -551,12 +555,15 @@
         edge-ids #{(get-in plan [:membership :destination-indices])
                    (get-in plan [:membership :source-indices])}
         edge-elements (:edges (:membership plan))
-        value-elements (:elements (:output plan))
+        value-elements (klaunch/product
+                        (get-in plan [:segment-axes 0 :extent])
+                        (get-in plan [:storage :total-dim]))
         graph-buffer (fn [id role]
                        (kgraph/buffer
                         id (:dtype (get descriptors id))
-                        (klaunch/runtime-value
-                         (if (contains? edge-ids id) edge-elements value-elements))
+                        (if (contains? edge-ids id)
+                          (klaunch/runtime-value edge-elements)
+                          value-elements)
                         :device role))
         uses (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
                           [(kgraph/->ValueUse output :write)]))
@@ -565,11 +572,13 @@
     (kgraph/make
      {:inputs (mapv #(graph-buffer % :input) inputs)
       :outputs [(graph-buffer output :output)]
-      :abi (:abi artifact)
-      :arguments (:arguments artifact)
+      :abi public-abi
+      :arguments public-arguments
+      :scalars (kgraph/interface-scalars public-abi public-arguments)
       :nodes [(kgraph/->ScheduledKernel
                [:segmented-weighted-reduction (:id plan) :indexed-dynamic-reference]
-               artifact uses [])]
+               artifact uses
+               (kgraph/scalar-argument-uses (:abi artifact) (:arguments artifact)) [])]
       :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
       :provenance {:operation-id (get-in plan [:provenance :operation-id])
                    :semantic-op (get-in plan [:provenance :semantic-op])}

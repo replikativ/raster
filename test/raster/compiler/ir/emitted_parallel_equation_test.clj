@@ -36,6 +36,7 @@
                  [:refined index]
                  [:refined-operation index]
                  (:uses source-node)
+                 (:scalar-uses source-node)
                  (mapv (fn [earlier] [:refined earlier]) (range index))))
               (range 3))
         refined (graph/validate! (assoc source :nodes refined-nodes))
@@ -50,20 +51,27 @@
   (case access :read :input :write :output :read-write :inout))
 
 (defn- test-artifact
-  ([index operation uses buffers]
-   (test-artifact index operation uses buffers :opencl-c))
-  ([index operation uses buffers target]
+  ([index operation uses scalar-uses buffers scalar-types]
+   (test-artifact index operation uses scalar-uses buffers scalar-types :opencl-c))
+  ([index operation uses scalar-uses buffers scalar-types target]
    (let [kernel-name (str "refined_" index)
-         slots (mapv (fn [{:keys [buffer access]}]
-                       (abi/slot buffer (use-kind access) (:dtype (get buffers buffer))
-                                 :c-name (c-emit/c-symbol buffer)))
-                     uses)
+         pointer-slots (mapv (fn [{:keys [buffer access]}]
+                               (abi/slot buffer (use-kind access) (:dtype (get buffers buffer))
+                                         :c-name (c-emit/c-symbol buffer)))
+                             uses)
+         ordered-scalars (vec (sort-by str scalar-uses))
+         scalar-slots (mapv #(abi/slot % :scalar (get scalar-types %)
+                                      :c-name (c-emit/c-symbol %))
+                            ordered-scalars)
+         slots (into pointer-slots scalar-slots)
          parameters
          (mapv (fn [slot]
-                 (str (if (= :opencl-c target)
-                        (if (= :input (:kind slot)) "__global const " "__global ")
-                        (if (= :input (:kind slot)) "const " ""))
-                      "float* " (:c-name slot)))
+                 (if (= :scalar (:kind slot))
+                   (str "long " (:c-name slot))
+                   (str (if (= :opencl-c target)
+                          (if (= :input (:kind slot)) "__global const " "__global ")
+                          (if (= :input (:kind slot)) "const " ""))
+                        "float* " (:c-name slot))))
                slots)
          prefix (if (= :opencl-c target) "__kernel void " "extern \"C\" __global__ void ")]
      (artifact/certify-scheduled-operation
@@ -73,7 +81,7 @@
         :source (str prefix kernel-name "(" (str/join ", " parameters)
                      ") { " (:c-name (first (filter #(not= :input (:kind %)) slots)))
                      "[0] = 0.0f; }")
-        :abi slots :arguments (mapv :buffer uses)
+        :abi slots :arguments (into (mapv :buffer uses) ordered-scalars)
         :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
       operation))))
 
@@ -98,12 +106,13 @@
 (defn- emit-graph
   [scheduled]
   (let [buffers (into {} (map (juxt :id identity))
-                      (concat (:inputs scheduled) (:outputs scheduled) (:temporaries scheduled)))]
+                      (concat (:inputs scheduled) (:outputs scheduled) (:temporaries scheduled)))
+        scalar-types (into {} (map (juxt :id :dtype)) (:scalars scheduled))]
     (graph-interface
      (graph/map-operations
       scheduled
-      (fn [{:keys [id operation uses]}]
-        (test-artifact (last id) operation uses buffers))))))
+      (fn [{:keys [id operation uses scalar-uses]}]
+        (test-artifact (last id) operation uses scalar-uses buffers scalar-types))))))
 
 (defn- append-int-scalar
   [kernel argument]
@@ -160,7 +169,9 @@
                           (assoc-in emitted [:nodes 0 :operation :arguments 0] 'undeclared)
                           {:refinement witness}))))
       (let [output-use (filterv #(not= :read (:access %)) (:uses node))
-            output-only (test-artifact 99 (:operation node) output-use buffers)]
+            scalar-types (into {} (map (juxt :id :dtype)) (:scalars refined))
+            output-only (test-artifact 99 (:operation node) output-use
+                                       (:scalar-uses node) buffers scalar-types)]
         (is (= :kernel-graph-artifact-uses
                (reason-of #(emitted-equation/make
                             algorithm body
@@ -171,8 +182,10 @@
              (reason-of #(emitted-equation/make
                           algorithm body (assoc emitted :abi nil :arguments nil)
                           {:refinement witness}))))
-      (let [{:keys [id operation uses]} node
-            hip (test-artifact (last id) operation uses buffers :hip-cpp)]
+      (let [{:keys [id operation uses scalar-uses]} node
+            scalar-types (into {} (map (juxt :id :dtype)) (:scalars refined))
+            hip (test-artifact (last id) operation uses scalar-uses
+                               buffers scalar-types :hip-cpp)]
         (is (= :kernel-graph-executable-targets
                (reason-of #(emitted-equation/make
                             algorithm body (assoc-in emitted [:nodes 1 :operation] hip)

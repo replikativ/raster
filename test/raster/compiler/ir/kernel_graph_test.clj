@@ -107,6 +107,13 @@
                    [operation]
                    {:inputs #{'values} :outputs #{'out} :dtype :float :scalars scalars})]
     (is (= scalars (:scalars scheduled)))
+    (is (= #{'n 'alpha} (get-in scheduled [:nodes 0 :scalar-uses])))
+    (is (= :kernel-graph-node-scalar-use
+           (try
+             (graph/validate! (assoc-in scheduled [:nodes 0 :scalar-uses] #{'n}))
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))
     (is (not (graph/dataflow-equivalent?
               scheduled (assoc scheduled :scalars (vec (reverse scalars))))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar identities must be unique"

@@ -44,7 +44,15 @@
 
 (defn- node
   [id operation uses dependencies]
-  (kgraph/->ScheduledKernel id operation (vec uses) (vec dependencies)))
+  (let [scheduled (kart/attribute operation :scheduled-kernel-body)]
+    (when-not (scheduled-body/scheduled-kernel-body? scheduled)
+      (throw (ex-info "production GEMM graph node requires a scheduled-body certificate"
+                      {:reason :gemm-scheduled-body :node id})))
+    (kgraph/->ScheduledKernel
+     id operation (vec uses)
+     (reduce into #{} (map (comp klaunch/expression-references :value)
+                           (:scalar-bindings scheduled)))
+     (vec dependencies))))
 
 (defn- epilogue-interface
   [epilogue]
@@ -87,6 +95,16 @@
          (kabi/slot n :scalar :int :c-name "N" :role :extent)
          (kabi/slot k :scalar :int :c-name "K" :role :extent)]
    :arguments [a b c batch m n k]})
+
+(defn- public-outer-interface
+  [spec]
+  (let [{:keys [abi arguments]} (outer-interface spec)]
+    (kgraph/public-interface abi arguments)))
+
+(defn- public-batched-outer-interface
+  [spec]
+  (let [{:keys [abi arguments]} (batched-outer-interface spec)]
+    (kgraph/public-interface abi arguments)))
 
 (defn- extents
   [{:keys [m n k variant]}]
@@ -173,7 +191,7 @@
 
 (defn- scalar-graph
   [{:keys [id a b c m n k variant] :as spec}]
-  (let [{:keys [abi arguments]} (outer-interface spec)
+  (let [{:keys [abi arguments]} (public-outer-interface spec)
         {:keys [a-elements b-elements c-elements]} (extents spec)
         prefix (identifier (str id "_scalar"))
         kernel-name (str prefix "_gemm")
@@ -194,6 +212,7 @@
      {:inputs [(graph-buffer a :float a-elements :input)
                (graph-buffer b :float b-elements :input)]
       :outputs [(graph-buffer c :float c-elements :output)]
+      :scalars (kgraph/interface-scalars abi arguments)
       :nodes [(node stage-id gemm
                     [(value-use a :read) (value-use b :read) (value-use c :write)] [])]
       :abi abi :arguments arguments
@@ -256,25 +275,31 @@
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
            k-range launch-group-count attributes epilogue]
     :or {result-dtype :float provenance {}}}]
-  (contraction-schedule/matrix-body
-   {:id (or id [:gemm kernel-name])
-    :row a :col b :out c
-    :dimensions [m n k]
-    :dimension-parameters (or dimension-parameters [m n k])
-    :axis-symbols ['i 'j 'l]
-    :tile tile
-    :bindings {:row a :col b}
-    :epilogue epilogue
-    :result-dtype result-dtype
-    :additional-parameters additional-parameters
-    :additional-indices additional-indices
-    :buffer-shapes buffer-shapes
-    :buffer-views buffer-views
-    :operation-buffers operation-buffers
-    :k-range k-range
-    :launch-group-count launch-group-count
-    :attributes attributes
-    :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)}))
+  (let [dimension-parameters
+        (or dimension-parameters
+            (if (and (every? #(or (symbol? %) (keyword? %)) [m n k])
+                     (= 3 (count (set [m n k]))))
+              [m n k]
+              ['M 'N 'K]))]
+    (contraction-schedule/matrix-body
+     {:id (or id [:gemm kernel-name])
+      :row a :col b :out c
+      :dimensions [m n k]
+      :dimension-parameters dimension-parameters
+      :axis-symbols ['i 'j 'l]
+      :tile tile
+      :bindings {:row a :col b}
+      :epilogue epilogue
+      :result-dtype result-dtype
+      :additional-parameters additional-parameters
+      :additional-indices additional-indices
+      :buffer-shapes buffer-shapes
+      :buffer-views buffer-views
+      :operation-buffers operation-buffers
+      :k-range k-range
+      :launch-group-count launch-group-count
+      :attributes attributes
+      :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})))
 
 (defn emit-scheduled-matrix-kernel
   "Build and directly lower one canonical f16 matrix contraction.
@@ -513,7 +538,7 @@
   [{:keys [id a b c m n k variant tile vector-width requested-splits split-k? epilogue
            strategy]
     :as spec}]
-  (let [{:keys [abi arguments]} (outer-interface spec)
+  (let [{:keys [abi arguments]} (public-outer-interface spec)
         {:keys [a-elements b-elements c-elements]} (extents spec)
         epilogue-buffers (epilogue-buffer-specs epilogue)
         strategy (or strategy (if split-k? :xmx-split-k :xmx-direct))
@@ -588,6 +613,7 @@
                    epilogue-buffers)
       :outputs [(graph-buffer c :float c-elements :output)]
       :temporaries temporaries
+      :scalars (kgraph/interface-scalars abi arguments)
       :nodes nodes
       :abi abi :arguments arguments
       :effects (effects spec)
@@ -636,7 +662,7 @@
     (when (nil? value)
       (throw (ex-info "batched matrix schedule is missing a required field"
                       {:reason :raster/bug :field field :spec spec}))))
-  (let [{:keys [abi arguments]} (batched-outer-interface spec)
+  (let [{:keys [abi arguments]} (public-batched-outer-interface spec)
         a-elements (if (get batching :row true)
                      (klaunch/product batch m k)
                      (klaunch/product m k))
@@ -665,6 +691,7 @@
           :outputs [(graph-buffer c :float c-elements :output)]
           :temporaries [(graph-buffer a16 :half a-elements :temporary)
                         (graph-buffer b16 :half b-elements :temporary)]
+          :scalars (kgraph/interface-scalars abi arguments)
           :nodes [(node convert-a-id convert-a
                         [(value-use a :read) (value-use a16 :write)] [])
                   (node convert-b-id convert-b

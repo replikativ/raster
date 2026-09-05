@@ -65,6 +65,16 @@
       (is (= [256] (get-in kernel-body [:launch :workgroup-size])))
       (is (graph-call/kernel-graph-call? call)))))
 
+(deftest literal-dimensions-are-private-specialization-facts
+  (let [scheduled (gemm/emit-executable
+                   {:id "literal-gemm" :a 'a :b 'b :c 'c
+                    :m 3 :n 2 :k 4 :variant :nn :precision :mixed-f16-f32
+                    :tile (hardware/derive-gemm-tile {}) :fill-workgroups 32})
+        graph (dispatch/select-alternative scheduled [:a-buffer :b-buffer :c-buffer])]
+    (is (= '[a b c] (:arguments graph)))
+    (is (= [] (:scalars graph)))
+    (is (every? empty? (map :scalar-uses (:nodes graph))))))
+
 (deftest explicit-split-factors-are-finite-schedule-alternatives
   (let [scheduled (emitted :nn {:split-factors [2 8 32]})
         by-strategy (into {} (map (juxt executable/strategy identity))

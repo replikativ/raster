@@ -634,15 +634,18 @@
                           partial-specs)
        :abi external-abi
        :arguments (conj inputs output)
+       :scalars []
        :nodes [(kgraph/->ScheduledKernel
                 partial-node partial-artifact
                 (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
                              (map #(kgraph/->ValueUse % :write) partial-ids)))
+                #{}
                 [])
                (kgraph/->ScheduledKernel
                 merge-node merge-artifact
                 (vec (concat (map #(kgraph/->ValueUse % :read) partial-ids)
                              [(kgraph/->ValueUse output :write)]))
+                #{}
                 [partial-node])]
        :effects {:kind :attention :logical-visibility true :ordered-page-routing true}
        :provenance {:operation-id id :semantic-op :attention
@@ -690,7 +693,8 @@
       :outputs [(graph-buffer output)]
       :abi (:abi artifact)
       :arguments (:arguments artifact)
-      :nodes [(kgraph/->ScheduledKernel node-id artifact uses [])]
+      :scalars []
+      :nodes [(kgraph/->ScheduledKernel node-id artifact uses #{} [])]
       :effects {:kind :attention :logical-visibility true :ordered-page-routing true}
       :provenance {:operation-id id :semantic-op :attention}
       :attributes {:strategy strategy :reference? reference?

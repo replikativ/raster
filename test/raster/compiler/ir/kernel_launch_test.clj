@@ -98,6 +98,10 @@
     (is (= [2 3]
            (:group-count (launch/realize specialized {'rows 129}))))))
 
+(deftest runtime-literals-are-specialization-values-not-public-scalar-leaves
+  (is (= #{} (launch/expression-references (launch/runtime-value 3))))
+  (is (= #{'n} (launch/expression-references (launch/runtime-value 'n)))))
+
 (deftest concrete-geometry-rejects-invalid-backend-launches
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
                         (launch/geometry {:workgroup-size [0] :group-count [1]})))
