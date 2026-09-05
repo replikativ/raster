@@ -674,17 +674,21 @@
           (is (= :nonterminal-result-transform
                  (:missing-rule (ex-data exception)))))))))
 
-(deftest mixed-index-scalars-stay-on-the-portable-reduction-route
+(deftest unproved-affine-loads-decline-the-pointwise-reduction-route
   (let [form '(raster.par/reduce acc 0.0 i n
                                  (+ acc (clojure.core/aget a (+ i offset))))
         node (soac/par-form->soac 'result form 22 :dtype :float)
-        operation (first (lower/lower-reduce node nil :dtype :float))
-        artifact (sg/generate-segred-kernel
-                  operation nil :dtype :float :scalar-types {'offset :int 'n :int})]
-    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
-    (is (= :int (some #(when (= 'offset (:name %)) (:dtype %)) (:abi artifact))))
-    (is (re-find #"rstr_element_index.*offset" (:source artifact)))
-    (is (nil? (get-in artifact [:attributes :kernel-body-decline])))))
+        operation (first (lower/lower-reduce node nil :dtype :float))]
+    (try
+      (sg/generate-segred-kernel
+       operation nil :dtype :float :scalar-types {'offset :int 'n :int})
+      (is false "an n-element buffer does not prove i+offset is in bounds")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-graph-target-lowering-missing
+               (:reason (ex-data exception))))
+        (is (= :indexed-load
+               (get-in (ex-data exception)
+                       [:kernel-body-decline :missing-rule])))))))
 
 (deftest mixed-floating-reduction-arithmetic-is-explicit-typed-ssa
   (let [product (with-meta

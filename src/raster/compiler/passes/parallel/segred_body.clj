@@ -13,6 +13,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
@@ -326,7 +327,7 @@
     expression))
 
 (defn- widen-index-expression
-  "Make array-coordinate arithmetic uniformly 64-bit without changing public scalar ABI types."
+  "Make certified contraction-coordinate arithmetic uniformly 64-bit."
   [expression value-types]
   (cond
     (integer? expression) (body/index-cast expression :long :exact)
@@ -510,7 +511,7 @@
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
    accumulator remain uniform; integral scalar parameters may participate in index expressions."
-  [segred out-sym & {:keys [dtype array-types scalar-types]
+  [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof]
                      :or {dtype :double array-types {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region}
         (validate-scalar-segred! segred out-sym array-types)
@@ -538,6 +539,28 @@
                       {:segred-id (:id segred) :dtype dtype :bound bound
                        :workgroup-size workgroup-size :arrays arrays :scalars scalars}))
         {:keys [operator identity element]} (scalar-plan segred)
+        contraction-coordinate-proof?
+        (when coordinate-proof
+          (let [view (when (contraction-facts/facts? coordinate-proof)
+                       (contraction-facts/scalar-reduction-view coordinate-proof))
+                [proof-index proof-bound] (:flat-contract-axis coordinate-proof)
+                operand-ids (set (map :sym (:operands coordinate-proof)))]
+            (when-not (and view
+                           (zero? (:n-free coordinate-proof))
+                           (= [index bound] [proof-index proof-bound])
+                           (= (set arrays) operand-ids)
+                           (every? #(contraction-facts/operand-axis-map coordinate-proof %)
+                                   arrays)
+                           (= element (:element view))
+                           (= (literal-value identity) (literal-value (:neutral view)))
+                           (= operator (intrinsics/canonical (:combine view)))
+                           (= (dtype/canon dtype) (dtype/canon (:dtype view))))
+              (decline! :contraction-coordinate-proof
+                        "affine scalar-contraction coordinates disagree with retained facts"
+                        {:segred-id (:id segred) :facts coordinate-proof
+                         :index index :bound bound :arrays arrays
+                         :operator operator :identity identity :element element}))
+            true))
         _ (when (contains? #{:min :max} operator)
             (decline! :floating-minmax-semantics
                       "portable scalar reduction needs an explicit NaN and signed-zero policy for min/max"
@@ -563,12 +586,19 @@
           :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
           :coordinate-lower
           (fn [source-coordinate]
-            (widen-index-expression
-             (index-expression/lower
-              (util/subst-syms {index element-index} source-coordinate)
-              (conj (set scalars) element-index)
-              decline!)
-             (assoc scalar-types element-index :long)))})
+            ;; The first complete vertical proves every input has at least `bound` elements.
+            ;; That proves only the pointwise coordinate. Affine/gathered reads need an explicit
+            ;; view extent plus a range proof; admitting `i+offset` from expression syntax would
+            ;; turn an n-element capacity check into a false memory-safety certificate.
+            (if contraction-coordinate-proof?
+              ;; Verified contraction facts prove every operand's AxisMap and physical extent.
+              (widen-index-expression
+               (index-expression/lower
+                (util/subst-syms {index element-index} source-coordinate)
+                (conj (set scalars) element-index)
+                decline!)
+               (assoc scalar-types element-index :long))
+              (when (= index source-coordinate) element-index)))})
         group-count (if (= :block-local (:phase segred))
                       (launch/rebind-expression
                        (launch-group-count (get-in segred [:grid :num-blocks])
@@ -741,7 +771,7 @@
    (let [{:keys [kernel-body operator identity arrays scalars output bound group-count result-region]}
         (lower segred out-sym
                :dtype (:dtype options) :array-types (:array-types options)
-               :scalar-types scalar-types)
+               :scalar-types scalar-types :coordinate-proof (:coordinate-proof options))
         arguments (mapv (fn [parameter]
                           (if (= '_n_bound (:id parameter)) bound (:id parameter)))
                         (:parameters kernel-body))

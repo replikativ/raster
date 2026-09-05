@@ -609,13 +609,13 @@
    body without a device. It throws only structured `:segred-kernel-body-declined` exceptions for
    unsupported scalar regions; verified-body or emitter failures remain compiler errors."
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
-                            graph-node kernel-graph]
+                            graph-node kernel-graph coordinate-proof]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
   (let [scheduled
         (segred-body/schedule segred out-sym
                              {:dtype dtype :array-types array-types
-                              :scalar-types scalar-types})
+                              :scalar-types scalar-types :coordinate-proof coordinate-proof})
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "scalar reduction graph certification requires both node and graph"
                             {:reason :segred-graph-context
@@ -684,7 +684,7 @@
    phase contract. Unsupported scalar regions fail with their structured KernelBody decline;
    no target may recover semantics by reparsing a source-shaped lambda."
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
-                            graph-node kernel-graph]
+                            graph-node kernel-graph coordinate-proof]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
   (when (seq (segop/seg-space-segment-dims (:space segred)))
@@ -696,7 +696,7 @@
     (generate-segred-kernel-body
      segred out-sym :dtype dtype :kernel-name-prefix kernel-name-prefix
      :scalar-types scalar-types :array-types array-types :target-dialect target-dialect
-     :graph-node graph-node :kernel-graph kernel-graph)
+     :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof)
     (catch clojure.lang.ExceptionInfo exception
       (when-not (segred-body/declined? exception) (throw exception))
       (let [decline (assoc (ex-data exception) :fallback :none)]

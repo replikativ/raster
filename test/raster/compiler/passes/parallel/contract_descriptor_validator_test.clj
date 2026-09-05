@@ -13,6 +13,7 @@
    actually rejects each historical shape."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.contract-route :as route]))
 
 (defn- mm [m n k]
@@ -128,6 +129,18 @@
     (is (= :scalar-workgroup-tree (get-in source [:schedule :strategy])))
     (is (= (get-in source [:grid :num-blocks])
            (get-in source [:schedule :attributes :group-count])))))
+
+(deftest scalar-contraction-affine-coordinates-require-the-exact-facts-proof
+  (let [form '(raster.par/contract O [] [[i 8]] (aget A i))
+        facts (contraction-facts/contraction-facts form :dtype :float)
+        forged (assoc-in facts [:operands 0 :idx] '(+ i 1024))
+        failure (try
+                  (route/route-contraction nil :facts forged :dtype :float)
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :kernel-graph-target-lowering-missing (:reason (ex-data failure))))
+    (is (= :contraction-coordinate-proof
+           (get-in (ex-data failure) [:kernel-body-decline :missing-rule])))))
 
 (deftest signature-parser-handles-the-real-kernels
   (testing "the parser finds every param of a multi-line DPAS signature"

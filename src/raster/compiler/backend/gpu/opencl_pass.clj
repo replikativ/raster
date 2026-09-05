@@ -401,18 +401,49 @@
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
   (let [supplied-program0 (when (parallel-program/parallel-program? form)
                             (parallel-program/validate! form segop/segop-node?))
+        retained-operations (mapcat :operations (:equations supplied-program0))
+        retained-buffer-ids
+        (set (mapcat #(concat (segop/operation-inputs %)
+                              (segop/operation-outputs %))
+                     retained-operations))
+        retained-equation-ids
+        (set (mapcat #(concat (:operands %) (:results %)) (:equations supplied-program0)))
+        ;; Host-only scalar SSA has no SegOp by construction. Classify every equation-boundary
+        ;; value not named by a physical buffer role as scalar; this preserves compound-extent
+        ;; leaves across compatibility re-entry while rank-zero resident buffers remain buffers.
+        retained-scalar-ids
+        (set/union (set (mapcat segop/operation-scalars retained-operations))
+                   (set/difference retained-equation-ids retained-buffer-ids))
+        retained-role-overlap (set/intersection retained-buffer-ids retained-scalar-ids)
+        _ (when (seq retained-role-overlap)
+            (throw (ex-info "retained schedule gives values contradictory ABI roles"
+                            {:reason :parallel-program-parameter-role-conflict
+                             :values retained-role-overlap})))
         retained-scalar-types
-        (into {}
-              (keep (fn [[id value]]
-                      (when (and (symbol? id) (empty? (:shape value)))
-                        [id (:dtype value)])))
-              (:values supplied-program0))
+        (when supplied-program0
+          (parallel-program/known-value-types supplied-program0 retained-scalar-ids))
         retained-array-types
+        (when supplied-program0
+          (parallel-program/known-value-types supplied-program0 retained-buffer-ids))
+        scalar-type-conflicts
         (into {}
-              (keep (fn [[id value]]
-                      (when (and (symbol? id) (seq (:shape value)))
-                        [id (:dtype value)])))
-              (:values supplied-program0))
+              (keep (fn [[id retained]]
+                      (when-let [provided (get scalar-types id)]
+                        (when-not (= (dtype/canon retained) (dtype/canon provided))
+                          [id {:retained retained :provided provided}]))))
+              retained-scalar-types)
+        array-type-conflicts
+        (into {}
+              (keep (fn [[id retained]]
+                      (when-let [provided (get array-types id)]
+                        (when-not (= (dtype/canon retained) (dtype/canon provided))
+                          [id {:retained retained :provided provided}]))))
+              retained-array-types)
+        _ (when (or (seq scalar-type-conflicts) (seq array-type-conflicts))
+            (throw (ex-info "caller type facts contradict the retained scheduled program"
+                            {:reason :parallel-program-type-conflict
+                             :scalar-conflicts scalar-type-conflicts
+                             :array-conflicts array-type-conflicts})))
         ;; A compatibility ParallelProgram predates the direct TypedSOAC value identities used by
         ;; graph storage. Re-enter once through its retained source instead of preserving a second
         ;; backend contract whose operations and SSA results can name different physical values.
@@ -443,8 +474,8 @@
            {:target-device device-id :dtype dtype
             ;; A compatibility re-entry may need to rebuild structure, but it may never discard
             ;; types already retained by the prior middle-end boundary.
-            :scalar-types (merge retained-scalar-types scalar-types)
-            :array-types (merge retained-array-types array-types)})
+            :scalar-types (merge scalar-types retained-scalar-types)
+            :array-types (merge array-types retained-array-types)})
 
           (and (nil? supplied-program) (form/binding-form? form))
           (segop-lower-pass/schedule-source-program

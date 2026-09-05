@@ -472,7 +472,8 @@
               ;; first surface bound would schedule only a prefix of the reduction.
               red-bound (:bound (segop/seg-space-reduced-dim (:space semantic-operation)))
               sr (scalar-contraction-phase semantic-operation out-sym dtype red-bound)
-              k (sco/generate-segred-kernel sr out-sym :dtype dtype)
+              k (sco/generate-segred-kernel
+                 sr out-sym :dtype dtype :coordinate-proof contract-facts)
               attrs (:attributes k)]
           {:strategy :full-reduce
            :invoke :reduction

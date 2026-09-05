@@ -118,6 +118,23 @@
     (is (= 1 (get-in compiled [:stats :segop-reused])))
     (is (= 'clojure.core/aget (first (last (:form compiled)))))))
 
+(deftest compatibility-reentry-cannot-overwrite-retained-value-types
+  (let [form '(let* [n 8192]
+                    (raster.par/reduce acc 0.0 i n
+                                       (+ acc (clojure.core/aget X i))))
+        program (:form (slp/segop-lower-pass
+                        form {:target-device :ze:0 :dtype :double
+                              :scalar-types {'n :long}
+                              :array-types {'X :double}}))
+        failure (try
+                  (op/opencl-pass program :device-id :ze:0 :dtype :double :min-elements 0
+                                  :scalar-types {'n :int})
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :parallel-program-type-conflict (:reason (ex-data failure))))
+    (is (= {:retained :long :provided :int}
+           (get-in (ex-data failure) [:scalar-conflicts 'n])))))
+
 (deftest jvm-simd-consumes-the-boundary-too
   (testing "matching map/reduce SegOps are reused rather than independently re-derived"
     (doseq [[label form stat-key]
