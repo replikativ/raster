@@ -17,6 +17,7 @@
             [raster.runtime.hardware :as hw]
             [raster.compiler.core.hardware :as chw]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]))
 
 ;; ================================================================
@@ -165,6 +166,17 @@
     #{(get-in operation [:facts :out])}
     (set (or (:outputs operation) #{}))))
 
+(defn- scalar-entry-references
+  "Project one scalar expression to the stable compiler identities it reads."
+  [value]
+  (cond
+    (or (symbol? value) (keyword? value)) #{value}
+    (number? value) #{}
+    (launch/expression? value) (launch/expression-references value)
+    (or (seq? value) (vector? value) (map? value) (set? value))
+    (util/free-syms value)
+    :else #{}))
+
 (defn operation-scalars
   "Scalar shape operands of a scheduled operation.
 
@@ -178,15 +190,17 @@
           axis-indices (set (map first axes))
           expressions (conj (mapv second axes) (:body facts))]
       (set/difference
-       (reduce set/union #{} (map util/free-syms expressions))
+       (reduce set/union #{} (map scalar-entry-references expressions))
        arrays axis-indices))
     (let [space (:space operation)
           axes (into #{(:flat-idx space)} (map :name) (:dims space))
           arrays (set/union (operation-inputs operation) (operation-outputs operation))
           extent-expressions (cond-> (mapv :bound (:dims space))
                                (:extent operation) (conj (:extent operation)))
-          extent-scalars (reduce set/union #{} (map util/free-syms extent-expressions))]
-      (set/union (or (:scalars operation) #{})
+          extent-scalars (reduce set/union #{} (map scalar-entry-references extent-expressions))
+          explicit-scalars (reduce set/union #{}
+                                   (map scalar-entry-references (or (:scalars operation) #{})))]
+      (set/union explicit-scalars
                  (set/difference extent-scalars arrays axes)))))
 
 (defn segop-grid

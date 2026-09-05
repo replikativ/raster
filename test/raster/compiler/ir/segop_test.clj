@@ -45,6 +45,19 @@
           "a contract is legal SegOp dialect input but not yet a scheduled KernelGraph operation")
       (is (not (segop/segop? {:not "a segop"}))))))
 
+(deftest operation-scalars-normalize-derived-expressions-to-public-leaves
+  (let [space (segop/make-seg-space 'i (launch/product :m :n))
+        operation (segop/->SegMap
+                   :derived-scalars space (segop/->SegLevel :thread :none)
+                   '(aget input i) nil #{'input} #{'output}
+                   #{(launch/ceil-div :k 16) '(+ width padding) :scale 4}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)]
+    (is (= #{:m :n :k 'width 'padding :scale}
+           (segop/operation-scalars operation)))
+    (is (every? #(or (symbol? %) (keyword? %))
+                (segop/operation-scalars operation))
+        "scheduled arithmetic is projected to its stable public scalar identities")))
+
 ;; ================================================================
 ;; Launch parameter computation
 ;; ================================================================

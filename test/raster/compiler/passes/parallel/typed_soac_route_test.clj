@@ -1,17 +1,21 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.scheduled-graph-refinement :as graph-refinement]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -1109,6 +1113,10 @@
         dispatch (contract-route/route-typed-contraction-dispatch
                   algorithm operation :dtype :float :desc descriptor
                   :precision :mixed-f16-f32)
+        direct-graph (kdispatch/alternative dispatch :xmx-direct)
+        split-graph (kdispatch/alternative dispatch :xmx-split-k)
+        direct-refinement (get-in direct-graph [:attributes :scheduled-graph-refinement])
+        split-refinement (get-in split-graph [:attributes :scheduled-graph-refinement])
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
         select (fn [m n k]
                  (kdispatch/alternative-strategy
@@ -1126,6 +1134,124 @@
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (testing "logical effects come from TypedSOAC rather than any fallback artifact"
+      (let [semantic-effects (get-in direct-refinement [:source :effects])]
+        (is (= :typed-soac-contraction (:kind semantic-effects)))
+        (is (= (get-in (dialect/facts algorithm)
+                       [:equations (:id operation) :effects])
+               (:effects semantic-effects)))
+        (is (every? #(= semantic-effects (:effects %)) (:alternatives dispatch)))
+        (is (not= semantic-effects
+                  (get-in (first (:alternatives dispatch)) [:nodes 0 :operation :effects]))
+            "artifact effects remain a distinct physical certificate")
+        (try
+          (graph-refinement/validate-against!
+           direct-refinement
+           (assoc-in (:source direct-refinement) [:effects :effects] #{:tampered}))
+          (is false "a source graph with different semantic effects must not validate")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :scheduled-graph-refinement-source (:reason (ex-data exception))))))))
+    (testing "mixed-precision alternatives refine the exact typed SegRed through stage graphs"
+      (doseq [[graph refinement expected-types]
+              [[direct-graph direct-refinement
+                [raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.matrix_stage.MatrixStage]]
+               [split-graph split-refinement
+                [raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.layout_stage.LayoutStage
+                 raster.compiler.ir.matrix_stage.MatrixStage
+                 raster.compiler.ir.segop.SegRed]]]]
+        (let [stage-graph (graph-refinement/scheduled-graph refinement)]
+          (is (identical? operation (graph-refinement/source-operation refinement)))
+          (is (= (kernel-graph/boundary-contract (:source refinement))
+                 (kernel-graph/boundary-contract stage-graph)))
+          (is (= expected-types (mapv (comp class :operation) (:nodes stage-graph))))
+          (is (kernel-graph/dataflow-equivalent? stage-graph graph))
+          (is (= (mapv :id (:nodes stage-graph)) (mapv :id (:nodes graph))))
+          (doseq [[stage-node emitted-node] (map vector (:nodes stage-graph) (:nodes graph))]
+            (let [artifact (:operation emitted-node)
+                  certificate (kernel-artifact/attribute artifact :scheduled-kernel-body)]
+              (is (= (:operation stage-node) (:source certificate)))
+              (is (= certificate (get-in artifact [:provenance :scheduled-operation])))
+              (is (= certificate
+                     (scheduled-body/validate-against-node!
+                      certificate stage-node stage-graph)))
+              (is (= artifact
+                     (scheduled-body/validate-artifact-projection! certificate artifact))))))))
+    (testing "an emitted certificate cannot be rebound to a different scheduled stage"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            stage-node (first (:nodes stage-graph))
+            artifact (-> direct-graph :nodes first :operation)
+            certificate (kernel-artifact/attribute artifact :scheduled-kernel-body)
+            tampered (assoc certificate :source (assoc (:source certificate) :id ::tampered))]
+        (try
+          (scheduled-body/validate-against-node! tampered stage-node stage-graph)
+          (is false "tampered source identity must be rejected")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :scheduled-kernel-body-source (:reason (ex-data exception))))))))
+    (testing "the retained schedule graph is independently replayable and emission-closed"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            replay (gpu-gemm/emit-scheduled-stage-graph
+                    stage-graph {:prefix "typed_contraction_replay"})
+            descriptive-tamper (assoc-in stage-graph [:attributes :tile] {:ignored true})
+            replay-after-tamper (gpu-gemm/emit-scheduled-stage-graph
+                                 descriptive-tamper {:prefix "typed_contraction_replay"})
+            bodies (fn [graph]
+                     (mapv #(get-in % [:operation :attributes :scheduled-kernel-body :body])
+                           (:nodes graph)))]
+        (is (= (bodies direct-graph) (bodies replay)))
+        (is (= (bodies replay) (bodies replay-after-tamper))
+            "unverified graph descriptions cannot steer target emission")
+        (doseq [[stage-node emitted-node] (map vector (:nodes stage-graph) (:nodes replay))
+                :when (layout-stage/layout-stage? (:operation stage-node))]
+          (is (= (get-in stage-node [:operation :id])
+                 (get-in emitted-node
+                         [:operation :attributes :scheduled-kernel-body :body :id]))
+              "a LayoutStage identity survives exactly into KernelBody"))
+        (try
+          (gpu-gemm/emit-scheduled-stage-graph
+           descriptive-tamper {:prefix "typed_contraction_replay"
+                               :refinement direct-refinement})
+          (is false "a refinement cannot certify a merely boundary-compatible graph")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :gemm-emission-refinement (:reason (ex-data exception))))))))
+    (testing "tampering with a stage-owned physical choice is rejected"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            without-vector-width
+            (update-in stage-graph [:nodes 0 :operation :policy] dissoc :vector-width)
+            matrix-index (first (keep-indexed
+                                 #(when (matrix-stage/matrix-stage? (:operation %2)) %1)
+                                 (:nodes stage-graph)))
+            without-tile (update-in stage-graph
+                                    [:nodes matrix-index :operation :schedule] dissoc :tile)]
+        (doseq [tampered [without-vector-width without-tile]]
+          (try
+            (gpu-gemm/emit-scheduled-stage-graph tampered {:prefix "tampered_schedule"})
+            (is false "an emission-open scheduled stage must be rejected")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :gemm-stage-emission-open (:reason (ex-data exception)))))))))
+    (testing "valid but unsupported stage semantics cannot be silently hardcoded away"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            matrix-index (first (keep-indexed
+                                 #(when (matrix-stage/matrix-stage? (:operation %2)) %1)
+                                 (:nodes stage-graph)))
+            unsupported
+            [(assoc-in stage-graph [:nodes 0 :operation :input-dtype] :double)
+             (assoc-in stage-graph [:nodes 0 :operation :policy :rounding] :toward-zero)
+             (assoc-in stage-graph [:nodes matrix-index :operation :schedule :kind]
+                       :different-matrix-schedule)
+             (assoc-in stage-graph [:nodes matrix-index :operation :accumulator-dtype] :double)]]
+        (doseq [tampered unsupported]
+          (try
+            (gpu-gemm/emit-scheduled-stage-graph tampered {:prefix "unsupported_schedule"})
+            (is false "an unsupported scheduled semantic must be rejected")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :gemm-stage-emission-unsupported (:reason (ex-data exception)))))))))
+    (is (= {:kind :split-k
+            :within-partition :tiled
+            :partial-combine :ordered-sequential}
+           (get-in split-refinement [:numerics :error-model :reduction-order])))
     (testing "explicit split factors remain compiler schedule candidates over the same typed equation"
       (let [tunable (contract-route/route-typed-contraction-dispatch
                      algorithm operation :dtype :float :desc descriptor
@@ -1171,6 +1297,8 @@
                    algorithm operation :dtype :float :desc descriptor
                    :precision :mixed-f16-f32)
         matrix-graph (kdispatch/alternative scheduled :xmx-batched)
+        refinement (get-in matrix-graph [:attributes :scheduled-graph-refinement])
+        stage-graph (graph-refinement/scheduled-graph refinement)
         matrix-node (last (:nodes matrix-graph))
         matrix-body (get-in matrix-node [:operation :attributes :kernel-body])
         scheduled-matrix (get-in matrix-node [:operation :attributes :scheduled-kernel-body])
@@ -1188,6 +1316,12 @@
     (is (= :portable-segred (select 4 64 128 62)))
     (is (= {:row true :col false}
            (get-in matrix-graph [:attributes :batching])))
+    (is (identical? operation (graph-refinement/source-operation refinement)))
+    (is (= [raster.compiler.ir.layout_stage.LayoutStage
+            raster.compiler.ir.layout_stage.LayoutStage
+            raster.compiler.ir.matrix_stage.MatrixStage]
+           (mapv (comp class :operation) (:nodes stage-graph))))
+    (is (kernel-graph/dataflow-equivalent? stage-graph matrix-graph))
     (is (scheduled-body/scheduled-kernel-body? scheduled-matrix))
     (is (matrix-stage/matrix-stage? matrix-stage))
     (is (= {:extent 'batch :lhs true :rhs false} (:batching matrix-stage)))
@@ -1206,6 +1340,54 @@
     (is (= 'batch
            (get-in matrix-node [:operation :launch :group-count 2 :value]))
         "the third launch dimension is the semantic batch extent")))
+
+(deftest transposed-mixed-contractions-certify-their-physical-storage-order
+  (let [descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        variants
+        [[:nt '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* i k) l))
+                               (clojure.core/aget B (+ (* j k) l))))]
+                 step)
+          (kernel-launch/product 'm 'k) (kernel-launch/product 'n 'k)]
+         [:tn '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* l m) i))
+                               (clojure.core/aget B (+ (* l n) j))))]
+                 step)
+          (kernel-launch/product 'k 'm) (kernel-launch/product 'k 'n)]
+         [:tt '(let* [step (raster.par/contract
+                            C [[i m] [j n]] [[l k]]
+                            (* (clojure.core/aget A (+ (* l m) i))
+                               (clojure.core/aget B (+ (* j k) l))))]
+                 step)
+          (kernel-launch/product 'k 'm) (kernel-launch/product 'n 'k)]]]
+    (doseq [[variant source expected-a expected-b] variants]
+      (let [{:keys [form]}
+            (pipeline/schedule-parallel-form
+             source {:target-device :ze:0 :dtype :float
+                     :array-types {'A :float 'B :float 'C :float}
+                     :scalar-types {'m :int 'n :int 'k :int}})
+            operation (-> form :equations first :operations first)
+            algorithm (-> form :equations first :algorithm)
+            dispatch (contract-route/route-typed-contraction-dispatch
+                      algorithm operation :dtype :float :desc descriptor
+                      :precision :mixed-f16-f32)
+            refinement (get-in (kdispatch/alternative dispatch :xmx-direct)
+                               [:attributes :scheduled-graph-refinement])
+            inputs (into {} (map (juxt :id identity))
+                         (:inputs (:source refinement)))]
+        (is (= expected-a (get-in inputs ['A :elements])) (name variant))
+        (is (= expected-b (get-in inputs ['B :elements])) (name variant))
+        (is (= (kernel-graph/boundary-contract (:source refinement))
+               (kernel-graph/boundary-contract
+                (graph-refinement/scheduled-graph refinement)))
+            (name variant))))))
 
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source

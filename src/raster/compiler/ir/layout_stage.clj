@@ -46,6 +46,11 @@
         (when-not (and (numerics/rounding-policy? (:rounding policy))
                        (numerics/cast-overflow-policy? (:overflow policy)))
           (throw (ex-info "layout cast requires supported rounding and overflow semantics"
+                          {:reason :layout-stage-policy :policy policy})))
+        (when (and (contains? policy :vector-width)
+                   (not (and (integer? (:vector-width policy))
+                             (pos? (:vector-width policy)))))
+          (throw (ex-info "layout cast vector width must be a positive integer"
                           {:reason :layout-stage-policy :policy policy}))))
 
       :transpose

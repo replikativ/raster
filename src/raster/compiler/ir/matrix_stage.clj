@@ -9,7 +9,7 @@
 
 (defrecord MatrixStage
            [id lhs rhs result dimensions batching reduction result-shape epilogue
-            operand-dtype accumulator-dtype result-dtype])
+            operand-dtype accumulator-dtype result-dtype schedule])
 
 (defn matrix-stage?
   [value]
@@ -22,7 +22,7 @@
     (throw (ex-info "expected a MatrixStage"
                     {:reason :matrix-stage-type :actual (type stage)})))
   (let [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
-                operand-dtype accumulator-dtype result-dtype]} stage]
+                operand-dtype accumulator-dtype result-dtype schedule]} stage]
     (doseq [[field value] [[:id id] [:lhs lhs] [:rhs rhs] [:result result]]]
       (when (nil? value)
         (throw (ex-info "matrix stage is missing an identity"
@@ -52,6 +52,9 @@
     (when-not (or (nil? epilogue) (map? epilogue))
       (throw (ex-info "matrix stage epilogue must be an exact transform description"
                       {:reason :matrix-stage-epilogue :epilogue epilogue})))
+    (when-not (or (nil? schedule) (map? schedule))
+      (throw (ex-info "matrix stage schedule must be an explicit map"
+                      {:reason :matrix-stage-schedule :schedule schedule})))
     (doseq [[field value] [[:operand-dtype operand-dtype]
                            [:accumulator-dtype accumulator-dtype]
                            [:result-dtype result-dtype]]]
@@ -62,9 +65,9 @@
 
 (defn make
   [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
-           operand-dtype accumulator-dtype result-dtype]
+           operand-dtype accumulator-dtype result-dtype schedule]
     :or {operand-dtype :half accumulator-dtype :float result-dtype :float}}]
   (validate!
    (->MatrixStage id lhs rhs result (vec dimensions) batching reduction (vec result-shape)
                   epilogue (dtype/canon operand-dtype) (dtype/canon accumulator-dtype)
-                  (dtype/canon result-dtype))))
+                  (dtype/canon result-dtype) schedule)))
