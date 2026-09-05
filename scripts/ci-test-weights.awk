@@ -32,8 +32,9 @@ BEGIN {
 END {
   if (bad) exit 2
   for (i = 1; i <= NR; i++) {
-    estimate = paths[i] in costs ? costs[paths[i]] :
-      (known_bytes > 0 ? int(bytes[i] * known_ms / known_bytes + 0.5) : bytes[i])
+    if (paths[i] in costs) estimate = costs[paths[i]]
+    else if (known_bytes > 0) estimate = int(bytes[i] * known_ms / known_bytes + 0.5)
+    else estimate = bytes[i]
     if (estimate < 1) estimate = 1
     printf "%.0f\t%s\n", estimate, paths[i]
   }
