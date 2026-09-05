@@ -16,7 +16,16 @@
   (body/literal value type))
 
 (defn- expr [op type & arguments]
-  (body/scalar-expression op type arguments))
+  ;; This body owns only bounded route, page, membership and loop cursor arithmetic.  The
+  ;; schedule validates their int-width capacities before lowering and widens intermediate route
+  ;; values to long; these are address calculations, not the attention value algebra.  Preserve
+  ;; that certificate explicitly for the verifier and target emitter.
+  (body/scalar-expression
+   op type arguments
+   (if (and (contains? #{:byte :int :long} type)
+            (contains? #{:+ :- :*} op))
+     {:overflow :no-overflow}
+     {})))
 
 (defn- select-expr [condition if-true if-false type]
   (body/scalar-expression :select type [condition if-true if-false]))

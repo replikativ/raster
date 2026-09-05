@@ -142,7 +142,10 @@
          (body/value right-limit :long)
          (body/scalar-expression
           :- :long [(body/cast-expression '_n_bound :long :exact :exact)
-                    (body/literal radius :long)]))
+                    (body/literal radius :long)]
+          ;; `_n_bound` is a non-negative int extent and radius is a validated static stencil
+          ;; radius, so this widened schedule-bound subtraction cannot overflow long.
+          {:overflow :no-overflow}))
         (body/->ScalarCompute
          (body/value left-interior :predicate)
          (body/scalar-expression :le :predicate

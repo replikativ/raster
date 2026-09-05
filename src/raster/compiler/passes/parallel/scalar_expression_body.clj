@@ -331,7 +331,16 @@
                                               operand-type expression)
                                             arguments)
                               result-type (if comparison? :predicate operand-type)
-                              overflow (intrinsics/source-overflow-policy semantic-operation)
+                              ;; Typed source arithmetic has a semantic overflow contract: normal
+                              ;; Clojure integral arithmetic is checked, while the explicitly
+                              ;; `unchecked-*` forms wrap.  Retain that distinction in KernelBody
+                              ;; rather than leaving a C-family emitter to choose signed overflow.
+                              integral-arithmetic?
+                              (and (contains? #{:byte :int :long} operand-type)
+                                   (contains? #{:+ :- :*} operator))
+                              overflow (when integral-arithmetic?
+                                         (or (intrinsics/source-overflow-policy semantic-operation)
+                                             :trap))
                               options (cond-> {} overflow (assoc :overflow overflow))
                               _ (when-not (every? #(= operand-type (:type %)) lowered)
                                   (decline! :operand-dtype

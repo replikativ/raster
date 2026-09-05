@@ -117,6 +117,13 @@
                                                    :parameter)
                           scalar-ids)
                      [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
+    ;; Scan's combine is semantic value arithmetic.  Its association certification does not prove
+    ;; a finite-width overflow algebra, so a schedule may not label it `:no-overflow`.
+    (when (dtype/integral? result-type)
+      (decline! :integral-overflow-algebra
+                "portable integer scan requires an explicit combine overflow contract"
+                {:phase phase :mode scan-mode :algebra scan-algebra
+                 :result-type result-type}))
     (when-not (and (contains? #{:single :intra-block :block-scan :carry-in} phase)
                    (contains? #{:inclusive :exclusive} scan-mode)
                    (scan/associative-scan? scan-algebra)

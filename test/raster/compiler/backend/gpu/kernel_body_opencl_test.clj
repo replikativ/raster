@@ -288,15 +288,23 @@
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
 
-(deftest unchecked-source-arithmetic-retains-wrapping-semantics
+(deftest source-integral-arithmetic-retains-its-overflow-semantics
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :rule rule))))
         lowerer (scalar-expression/make-lowerer
                  {:array-types {} :scalar-types {'a :long 'b :long} :arrays #{}
                   :index-scope #{} :lower-index (fn [value _] value)
                   :decline! decline!})
+        checked (mapv #((:lower lowerer) % :long {'a :long 'b :long})
+                      ['(clojure.core/+ a b)
+                       '(clojure.core/- a b)
+                       '(clojure.core/* a b)])
         lowered ((:lower lowerer) '(unchecked-add a b) :long
                  {'a :long 'b :long})]
+    (is (every? #(= {:overflow :trap}
+                     (get-in % [:operations 0 :expression :options]))
+                checked)
+        "ordinary Clojure integer arithmetic is checked, never target-signed overflow")
     (is (= {:overflow :wrap}
            (get-in lowered [:operations 0 :expression :options])))
     (is (= :+ (get-in lowered [:operations 0 :expression :op]))))

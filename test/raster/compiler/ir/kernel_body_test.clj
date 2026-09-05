@@ -324,6 +324,14 @@
              :* :long [(body/literal Long/MAX_VALUE :long)
                        (body/literal 2 :long)]
              {:overflow :wrap}))]))))
+  (testing "integral arithmetic cannot omit its overflow semantics"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"requires exactly one overflow contract"
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'ambiguous :long)
+            (body/scalar-expression
+             :+ :long [(body/literal 1 :long) (body/literal 2 :long)]))]))))
   (testing "trapping and compiler-proved arithmetic are distinct legal contracts"
     (doseq [policy [:trap :no-overflow]]
       (is (body/kernel-body?
