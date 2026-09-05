@@ -434,10 +434,12 @@
                    :target-dialect :opencl-portable
                    :array-types {'values :float 'out :float}
                    :scalar-types {'nsegments :int 'width :int}
+                   :scheduled-equation-algorithm (:algorithm numerical)
                    :scheduled-equation-body proof-closed)]
       (is (= certificate
              (fold-body/validate-against-node!
-              certificate (first (:nodes proof-graph)) proof-graph proof-closed)))
+              certificate (first (:nodes proof-graph)) proof-graph
+              (:algorithm numerical) proof-closed)))
       (is (artifact/kernel-artifact? (get-in emitted [:nodes 0 :operation]))
           "graph emission threads the exact retained equation proof into FoldMap"))))
 

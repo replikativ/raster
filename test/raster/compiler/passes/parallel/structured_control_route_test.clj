@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
@@ -303,6 +304,29 @@
                (reason-of #(program-opencl/validate-program!
                             (assoc-in program [:equations 0 :operations]
                                       [suffix-operation])))))))))
+
+(deftest structured-emission-threads-the-exact-iteration-graph-proof
+  (let [initial (av/tensor {:dtype :double :shape ['extent]
+                            :representation {:kind :plain}})
+        options {:dtype :double
+                 :target-device :ocl:0
+                 :values {'u0 initial 'steps (av/tensor {:dtype :long :shape []})}
+                 :scalar-types {'steps :long}}
+        scheduled (:form (pipeline/schedule-parallel-form (mixed-source) options))
+        scheduled-loop (get-in scheduled [:equations 0 :operations 0])
+        calls (atom [])
+        emit-graph segop-opencl/generate-kernel-graph]
+    (with-redefs [segop-opencl/generate-kernel-graph
+                  (fn [graph & arguments]
+                    (swap! calls conj (apply hash-map arguments))
+                    (apply emit-graph graph arguments))]
+      (program-opencl/emit-program scheduled options))
+    (let [iteration-call
+          (some #(when (= (:body scheduled-loop) (:scheduled-equation-body %)) %) @calls)]
+      (is iteration-call)
+      (is (= (control/body (:algorithm scheduled-loop))
+             (:scheduled-equation-algorithm iteration-call)))
+      (is (= (:body scheduled-loop) (:scheduled-equation-body iteration-call))))))
 
 (deftest real-rk4-pde-reaches-the-equation-first-opencl-vertical
   (let [arguments [(double-array 8) (double-array 8) 0.1 1.0 0.01 3]

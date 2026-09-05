@@ -338,7 +338,8 @@
 (defn generate-segfoldmap-kernel
   "Schedule and emit one certified ordered SegFoldMap through the canonical KernelBody target."
   [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
-                        graph-node kernel-graph scheduled-equation-body]
+                        graph-node kernel-graph scheduled-equation-algorithm
+                        scheduled-equation-body]
                  :or {kernel-name-prefix "segmented_fold_map"
                       target-dialect :opencl-intel
                       scalar-types {} array-types {}}}]
@@ -352,7 +353,8 @@
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
             (segfoldmap-body/validate-against-node!
-             scheduled graph-node kernel-graph scheduled-equation-body))
+             scheduled graph-node kernel-graph
+             scheduled-equation-algorithm scheduled-equation-body))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
     artifact))
@@ -1077,7 +1079,8 @@
      scalar-types)))
 
 (defn- generate-fold-map-kernel-graph
-  [graph {:keys [scalar-types array-types target-dialect scheduled-equation-body]
+  [graph {:keys [scalar-types array-types target-dialect scheduled-equation-algorithm
+                 scheduled-equation-body]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
         array-types (graph-array-types graph array-types)
@@ -1092,6 +1095,7 @@
               :kernel-name-prefix "graph_segmented_fold_map"
               :graph-node node
               :kernel-graph graph
+              :scheduled-equation-algorithm scheduled-equation-algorithm
               :scheduled-equation-body scheduled-equation-body)
              (catch clojure.lang.ExceptionInfo exception
                (if (and (not (kernel-body-c-dialect/opencl? target))

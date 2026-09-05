@@ -85,6 +85,7 @@
      :target-dialect (get opts :target-dialect :opencl-intel)
      :target-device (:target-device opts)
      :contraction-facts (:contraction-facts opts)
+     :scheduled-equation-algorithm (:scheduled-equation-algorithm opts)
      :scheduled-equation-body (:scheduled-equation-body opts))))
 
 (defn- contraction-facts-by-operation
@@ -136,7 +137,12 @@
       (let [scheduled (schedule/validate! (first (:operations equation)))
             body (:body scheduled)
             operations (vec (mapcat :operations (:equations body)))
-            emitted (emit-graph (:graph scheduled) (:values body) operations opts)]
+            emitted (emit-graph
+                     (:graph scheduled) (:values body) operations
+                     (assoc opts
+                            :scheduled-equation-algorithm
+                            (control/body (:algorithm scheduled))
+                            :scheduled-equation-body body))]
         (assoc equation :operations
                [(emitted-loop/make scheduled emitted {:provenance provenance})]))
 
@@ -159,7 +165,9 @@
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
             emitted (emit-graph scheduled-graph (:values body) operations
-                                (cond-> (assoc opts :scheduled-equation-body body)
+                                (cond-> (assoc opts
+                                               :scheduled-equation-algorithm algorithm
+                                               :scheduled-equation-body body)
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations

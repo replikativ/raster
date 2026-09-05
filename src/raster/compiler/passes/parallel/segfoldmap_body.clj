@@ -406,24 +406,21 @@
       :else [:leaf expression])))
 
 (defn- closed-derived-storage-scalars
-  [kernel-graph closed-body]
+  [kernel-graph closed-algorithm closed-body]
+  (when-not (= (some? closed-algorithm) (some? closed-body))
+    (throw (ex-info "fold-map graph proof requires both algorithm and scheduled body"
+                    {:reason :segfoldmap-storage-proof
+                     :algorithm closed-algorithm :body closed-body})))
   (if-not closed-body
     {}
     (let [host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
-                                       (:equations closed-body)))
-          numerical-equations (vec (drop (count host-prefix) (:equations closed-body)))]
-      (when-not (= 1 (count numerical-equations))
-        (throw (ex-info "fold-map storage proof requires exactly one numerical equation"
-                        {:reason :segfoldmap-storage-proof
-                         :host-prefix (mapv :id host-prefix)
-                         :numerical-equations (mapv :id numerical-equations)})))
-      (let [numerical (first numerical-equations)
-            ;; `make` revalidates the complete SegOp program, the retained TypedSOAC boundary,
+                                       (:equations closed-body)))]
+      (let [;; `make` revalidates the complete SegOp program, the retained TypedSOAC boundary,
             ;; every buffer extent, and graph dataflow. Preserve only descriptive graph context
             ;; while reconstructing; it cannot contribute a scalar definition.
             expected-graph
             (equation-graph/make
-             (:algorithm numerical) closed-body
+             closed-algorithm closed-body
              {:effects (:effects kernel-graph)
               :provenance (:provenance kernel-graph)
               :attributes (:attributes kernel-graph)})]
@@ -440,8 +437,8 @@
    that every pointer is a dense `[segments, extent]` value and that the source KernelGrid is the
    complete launch schedule, so this validator can derive—not trust—those remaining obligations."
   ([scheduled node kernel-graph]
-   (validate-against-node! scheduled node kernel-graph nil))
-  ([scheduled node kernel-graph closed-body]
+   (validate-against-node! scheduled node kernel-graph nil nil))
+  ([scheduled node kernel-graph closed-algorithm closed-body]
    (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
          source (:source scheduled)
          _ (when-not (instance? raster.compiler.ir.segop.SegFoldMap source)
@@ -454,7 +451,8 @@
          parameters (get-in scheduled [:body :parameters])
          bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
                         (map vector parameters (:arguments scheduled)))
-         derived-scalars (closed-derived-storage-scalars kernel-graph closed-body)
+         derived-scalars (closed-derived-storage-scalars
+                          kernel-graph closed-algorithm closed-body)
          expand-derived #(util/subst-syms derived-scalars %)
          expected-elements (canonical-extent
                             (expand-derived
