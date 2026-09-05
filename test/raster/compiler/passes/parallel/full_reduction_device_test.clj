@@ -120,9 +120,36 @@
                 (is (= 456.0 (double (aget ^floats actual 1))) "only out[0] is written")))
             (finally (fixture/close! program))))))))
 
-(defn- run-staged! [target]
-  (let [kernel-dispatch (first (:dispatches (emitted 'n)))
-        register! (requiring-resolve
+(defn- emitted-reduce-into [n combine identity]
+  (opencl/opencl-pass
+   (with-meta
+     (list 'raster.par/reduce-into 'out 'acc identity 'i n
+           (list combine 'acc '(* (aget x i) (aget y i))))
+     {:raster.type/elem-type :float})
+   :device-id :ze:0 :dtype :float :compile-spirv? false
+   :array-types {'x :float 'y :float 'out :float} :scalar-types {'n :long}))
+
+(deftest direct-reduce-into-reuses-typed-storage-and-monoid-scheduling
+  (doseq [[combine identity] [['+ 0.0] ['* 1.0]]
+          [n phases] [[0 [:single]] [8 [:single]]
+                      [1025 [:block-local :cross-block]] ['n [:block-local :cross-block]]]]
+    (let [result (emitted-reduce-into n combine identity)
+          graph (dispatch/default-alternative (first (:dispatches result)))]
+      (is (= :typed-soac (get-in result [:stats :direct-scheduling :route])))
+      (is (= phases (mapv #(get-in % [:operation :attributes :phase]) (:nodes graph))))
+      (is (= ['out] (mapv :id (:outputs graph))))
+      (is (= 1 (get-in graph [:outputs 0 :elements])))
+      (is (zero? (get-in result [:stats :segop-relowered] 0))))))
+
+(deftest direct-reduce-into-rejects-unproved-storage-and-coordinates
+  (doseq [body ['(+ acc (aget out i)) '(+ acc (aget x (* i 2)))]]
+    (is (nil? (frontend/form->program
+               (list 'let* ['result (list 'raster.par/reduce-into 'out 'acc 0.0 'i 8 body)]
+                     'out)
+               {:dtype :float :array-types {'x :float 'out :float}})))))
+
+(defn- run-staged-dispatch! [target kernel-dispatch combine identity]
+  (let [register! (requiring-resolve
                    (symbol (if (= target :ocl:0)
                              "raster.gpu.ocl-runtime" "raster.gpu.ze-runtime")
                            "register-kernel-dispatch!"))]
@@ -133,8 +160,14 @@
             out (float-array [123.0 456.0])]
         (is (identical? out (gpu/invoke-staged-executable!
                             target (:id kernel-dispatch) [x y out (long n)])))
-        (is (= [(* n 0.5) 456.0] (vec out))
+        (is (= [(float (reduce combine identity (repeat n 0.5))) 456.0] (vec out))
             "ordinary staged invocation preserves the unwritten output tail")))))
+
+(defn- run-staged! [target]
+  (doseq [[result combine identity] [[(emitted 'n) + 0.0]
+                                     [(emitted-reduce-into 'n '+ 0.0) + 0.0]
+                                     [(emitted-reduce-into 'n '* 1.0) * 1.0]]]
+    (run-staged-dispatch! target (first (:dispatches result)) combine identity)))
 
 (deftest opencl-rank-zero-contraction-writes-the-resident-result
   (if @opencl-probe/opencl-available?
