@@ -6,9 +6,19 @@ and share runtime/dispatch state. Keep local JVM concurrency bounded by availabl
 
 ## Measure before repartitioning
 
-`scripts/ci-test-shard.sh` currently balances four processes by source bytes, not observed cost.
+`scripts/ci-test-shard.sh` balances four processes with reviewed load+test timing weights.
 On CI run 6675, the test phases took 143, 221, 242 and 566 seconds. This shows an imbalance; it
 does not identify which tests are redundant or prove that the compiler itself became slower.
+The bootstrap weights come from instrumented CI job 6687 and are committed in
+`test/resources/ci_test_timings.tsv`. New test files receive a source-size estimate calibrated
+against measured files still present in the checkout. No files are dropped when weights are
+missing; a missing default baseline uses the original size policy. An explicitly requested
+missing/invalid baseline fails before selection.
+
+Regenerate weights explicitly with `raster.ci.timing-weights OUTPUT SOURCE REPORT...` using
+downloaded EDN reports from comparable general-suite CI runs, not the OpenCL lane. Review the
+result; no test run updates the baseline automatically. Repeated namespace samples use their
+maximum as a conservative seed. This remains a heuristic for placement, not a performance gate.
 
 Both the general shards and OpenCL CPU job now use `raster.ci.timed-runner`, a scoped timing
 wrapper around the existing Cognitect runner. Test selection, metadata exclusions, fixtures,
@@ -27,7 +37,8 @@ wall-time regression assertion.
 Landing order:
 
 1. Collect load/test timings without dropping coverage.
-2. Rebalance processes using measured costs and verify every namespace remains assigned once.
+2. Rebalance processes using measured costs and verify every namespace remains assigned once
+   (implemented; remeasure and refresh after observing the new placement).
 3. Isolate measured corpus/compiled-training bottlenecks; split indivisible work with an explicit
    completeness check if necessary.
 4. Avoid repeating device-free structural tests in the OpenCL lane, while preserving actual

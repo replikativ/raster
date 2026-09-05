@@ -24,11 +24,17 @@ case "${mode}" in
     ;;
 esac
 
-# Greedy largest-processing-time assignment, using source bytes as a stable
-# approximation until CI publishes per-namespace timings.  The file-name tie
-# break keeps the plan reproducible on every machine.
+# Greedy largest-processing-time assignment from reviewed CI measurements. New files use a
+# source-size estimate in the same units; an absent default baseline retains byte balancing.
+# No test is selected or excluded based on its timing.
+timings="${RASTER_TEST_TIMINGS-test/resources/ci_test_timings.tsv}"
+if [[ ! -f "${timings}" && -z "${RASTER_TEST_TIMINGS+x}" ]]; then
+  timings=""
+fi
+
 plan() {
   find test -type f -name '*_test.clj' -printf '%s\t%p\n' \
+    | awk -F '\t' -v timings="${timings}" -f scripts/ci-test-weights.awk \
     | sort -t $'\t' -k1,1nr -k2,2 \
     | awk -F '\t' -v shards="${shard_count}" '
         BEGIN {
@@ -43,6 +49,10 @@ plan() {
           print selected "\t" $1 "\t" $2
         }'
 }
+
+# Capture the pipeline status. A failed planner inside process substitution would otherwise
+# look like an empty successful plan to the consuming while loop.
+plan_rows="$(plan)"
 
 namespace_of() {
   awk '
@@ -62,7 +72,7 @@ if [[ "${mode}" == "--plan" ]]; then
       exit 2
     fi
     printf '%s\t%s\t%s\t%s\n' "${node}" "${bytes}" "${namespace}" "${file}"
-  done < <(plan)
+  done <<< "${plan_rows}"
   exit 0
 fi
 
@@ -78,7 +88,7 @@ while IFS=$'\t' read -r node bytes file; do
     namespaces+=("${namespace}")
     estimated_bytes=$((estimated_bytes + bytes))
   fi
-done < <(plan)
+done <<< "${plan_rows}"
 
 if (( ${#namespaces[@]} == 0 )); then
   echo "test shard ${shard_index}/${shard_count} is empty" >&2
@@ -90,7 +100,7 @@ if [[ "${mode}" == "--list" ]]; then
   exit 0
 fi
 
-echo "Running test shard $((shard_index + 1))/${shard_count}: ${#namespaces[@]} namespaces, ${estimated_bytes} estimated source bytes"
+echo "Running test shard $((shard_index + 1))/${shard_count}: ${#namespaces[@]} namespaces, ${estimated_bytes} estimated work units (timings: ${timings:-source bytes})"
 
 runner_args=()
 for namespace in "${namespaces[@]}"; do
