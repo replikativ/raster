@@ -1016,6 +1016,8 @@
                        :precision :mixed-f16-f32
                        :tile (:tile target-schedule)
                        :fill-workgroups (:fill-workgroups target-schedule)
+                       :source-operation operation
+                       :external-interface {:abi abi :arguments arguments :effects effects}
                        :split-factors (or (:split-factors options) [])}
             emitted (if (:batched? matrix-view)
                       (gpu-gemm/emit-batched-matrix-alternative
@@ -1026,7 +1028,15 @@
             raw-alternatives (if (:batched? matrix-view)
                                [(:graph emitted)]
                                (:alternatives emitted))
-            alternatives (mapv #(reinterface-graph % abi arguments effects operation-id)
+            alternatives (mapv (fn [graph]
+                                 (let [graph (kgraph/validate! graph)]
+                                   (when-not (= [abi arguments effects]
+                                                [(:abi graph) (:arguments graph) (:effects graph)])
+                                     (throw (ex-info
+                                             "typed matrix schedule changed its supplied public interface"
+                                             {:reason :typed-contraction-matrix-interface
+                                              :operation operation-id})))
+                                   graph))
                                raw-alternatives)
             selector (:selector emitted)]
         {:alternatives alternatives
