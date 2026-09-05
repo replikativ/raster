@@ -6,6 +6,7 @@
    Driver allocation, registration, recording and events remain runtime concerns."
   (:require [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]))
 
@@ -103,7 +104,13 @@
       (when-not (and (map? value) (contains? value :type) (contains? value :value))
         (throw (ex-info "graph symbolic scalar requires an explicitly typed runtime value"
                         {:compiler-value compiler-value :slot slot :value value})))
-      value)
+      (if (= (:type value) (:kernel-dtype slot))
+        value
+        (if (every? #{:int :long} [(:type value) (:kernel-dtype slot)])
+          (executable/physical-runtime-scalar slot (:value value))
+          (throw (ex-info "graph scalar requires an unsupported physical conversion"
+                          {:reason :kernel-graph-call-scalar-conversion
+                           :slot slot :value value})))))
     (let [value (resolve-integer scalar-values compiler-value)]
       {:type (:kernel-dtype slot)
        :value (cast-scalar (:kernel-dtype slot) value)})))
@@ -154,7 +161,7 @@
    symbolic scalar values. Derived integer arguments such as a block-count CeilDiv are resolved
    from the typed scalar environment and receive the ABI slot's integer type."
   [graph buffers scalar-values]
-  (let [graph (kgraph/validate! graph)
+  (let [graph (executable/validate! graph)
         declared (declared-buffer-ids graph)
         scalar-values (validate-scalar-values! graph (or scalar-values {}))]
     (when-not (= declared (set (keys buffers)))

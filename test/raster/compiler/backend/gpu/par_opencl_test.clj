@@ -265,14 +265,14 @@
       (is (= [1] (get-in result [:kernels 0 :launch :group-count])))
       (is (= :single (get-in result [:kernels 0 :attributes :phase])))))))
 
-(deftest opencl-pass-full-contraction-reduction-uses-ordered-marker
+(deftest opencl-pass-full-contraction-reduction-uses-a-complete-executable
   (let [product (with-meta '(* (aget A i) (aget B i)) {:raster.type/tag 'float})
         form (list 'raster.par/contract 'O [] '[[i 8]] product)
         result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float)
         kernel (first (:kernels result))]
-    (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
-           (first (:form result))))
-    (is (= '[A B nil 8] (nth (:form result) 2)))
+    (is (= 'raster.compiler.pipeline/invoke-scheduled-executable!
+           (first (second (second (:form result))))))
+    (is (= '[A B O] (nth (second (second (:form result))) 3)))
     (is (= '[A B O _n_bound] (mapv :name (:abi kernel))))
     (is (= [:operand :operand :result :bound] (mapv :role (:abi kernel))))))
 

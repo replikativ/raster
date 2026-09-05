@@ -798,7 +798,7 @@
                              :expected scalar-arguments
                              :actual (vec (sort-by pr-str (keys scalar-groups)))})))
         _ (doseq [[argument pairs] scalar-groups]
-            (when-not (apply = (map (comp :kernel-dtype first) pairs))
+            (when-not (apply = (map (comp :dtype first) pairs))
               (throw (ex-info "kernel graph scalar has inconsistent emitted ABI dtypes"
                               {:reason :kernel-graph-scalar-dtype
                                :argument argument :slots (mapv first pairs)}))))
@@ -816,7 +816,12 @@
         scalar-abi (mapv (fn [argument]
                            (let [slots (mapv first (get scalar-groups argument))
                                  declared (some #(when (= argument (:id %)) %) declared-scalars)
-                                 kernel-dtype (or (:kernel-dtype (first slots)) (:dtype declared))
+                                 ;; A graph is not a physical kernel. Each node preserves its
+                                 ;; own checked conversion (e.g. long parameter versus int bound).
+                                 physical-types (distinct (map :kernel-dtype slots))
+                                 kernel-dtype (if (= 1 (count physical-types))
+                                                (first physical-types)
+                                                (or (:dtype declared) (:dtype (first slots))))
                                  logical-dtype (or (:dtype declared)
                                                    (get scalar-types argument)
                                                    kernel-dtype)

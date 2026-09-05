@@ -702,6 +702,12 @@ TypedSOAC subset directly. Certified inclusive and exclusive scans also cross th
 algorithm and scheduled-program boundary, retaining explicit destination, result-layout, and
 graph-owned temporary-storage contracts. Migration is complete when hardware-costed multi-consumer
 fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted.
+Full contractions with one pointwise reduction axis and disjoint caller-owned output now use the
+same TypedSOAC segmented reduction with an empty segment space. They lower to the complete scalar
+reduction graph (including cross-block finalization) and write only `out[0]`; rank zero does not
+imply a host scalar download. Affine/multi-axis and aliased full contractions remain outside this
+admission boundary. Public graph scalars retain their logical dtype while individual kernel nodes
+may use checked integer narrowing for physical launch bounds.
 Nested scalar folds inside a retained map are now explicit typed scalar-region terms. Monoid-shaped
 folds carry an `AssociativeScan` certificate and an implementation-defined association contract, so
 the JVM may select its multi-accumulator SIMD reduction. General recurrences carry an ordered
