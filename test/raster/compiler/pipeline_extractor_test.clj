@@ -11,11 +11,45 @@
    form extracted to a (wrong) step with no ::non-resident."
   (:require [clojure.test :refer [deftest testing is]]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.kernel-abi :as kabi]))
 
 (def ^:private nr-key :raster.compiler.pipeline/non-resident)
 
 (defn- why [form] (get-in (pipeline/extract-gpu-program form) [nr-key :why]))
+
+(deftest scheduled-results-use-the-dispatch-common-abi
+  (let [artifact (kart/make
+                  {:kernel-name "alias_fixture"
+                   :source "__kernel void alias_fixture(__global const float* x, __global float* out) {}"
+                   :abi [(kabi/slot 'x :input :float :role :operand)
+                         (kabi/slot 'out :output :float :role :result)]
+                   :arguments '[x out]
+                   :launch (klaunch/spec {:workgroup-size [1] :group-count [1]})
+                   :effects {:kind :map :reads ['x] :writes ['out]}
+                   :attributes {:strategy :fixture}})
+        dispatch (kdispatch/make {:id "alias-dispatch" :alternatives [artifact]
+                                  :default-strategy :fixture :selector {:kind :fixed-strategy :strategy :fixture}})
+        lookup (fn [id] (when (= "alias-dispatch" id) dispatch))
+        kernel-lookup (fn [_] (throw (ex-info "must not resolve a graph through a kernel name" {})))
+        direct (pipeline/extract-gpu-program
+                 '(let* [returned (raster.compiler.pipeline/invoke-scheduled-executable!
+                                   :ocl:0 "alias-dispatch" [A C])]
+                    returned)
+                 kernel-lookup lookup)
+        chained (pipeline/extract-gpu-program
+                  '(let* [returned (raster.compiler.pipeline/invoke-scheduled-executable!
+                                    :ocl:0 "alias-dispatch" [A C])
+                          final (raster.compiler.pipeline/invoke-scheduled-executable!
+                                 :ocl:0 "alias-dispatch" [returned D])]
+                     final)
+                  kernel-lookup lookup)]
+    (is (= 'C (:result direct)))
+    (is (= 'D (:result chained)))
+    (is (= '[C D] (:arguments (second (:steps chained)))))
+    (is (every? #(= :executable (:convention %)) (:steps chained)))))
 
 (deftest map-void-arity
   (doseq [head '[raster.gpu.ze-runtime/invoke-registered-map-void-kernel

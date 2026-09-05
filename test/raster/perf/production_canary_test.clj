@@ -28,6 +28,12 @@
       (is (:validated? result))
       (is (= :sumsq-aot (get-in result [:identity :workload]))))))
 
+(deftest direct-contraction-result-is-a-public-resident-buffer
+  (let [p (canary/prepare-gemm :ocl:0 (canary/gemm-arguments))]
+    (is (= 'C (get-in p [:descriptor :result-sym])))
+    (is (= ['C] (mapv :sym (:out-tree p))))
+    (is (every? #(= :executable (:convention %)) (get-in p [:descriptor :steps])))))
+
 (deftest opencl-resident-gemm-canary-numerics
   (if-not @probe/opencl-available?
     (probe/opencl-skip! "production canary resident GEMM numerics")

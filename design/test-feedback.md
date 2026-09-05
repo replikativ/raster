@@ -94,8 +94,8 @@ exit nonzero. A stationary median above 115% of baseline also fails. Review repe
 measurements and explicitly designate a separate baseline file; the runner never seeds or
 updates it. Compilation/binding timings are diagnostic, not yet regression-gated.
 
-Known public-boundary follow-up discovered by this canary: a direct returned scheduled
-contraction currently retains a synthetic result name instead of resolving its common ABI
-`:result` buffer. The canary uses explicit `write C; return C`; fix result alias propagation
-without weakening resident-plan validation. Also review cast-wrapped zero identities, which
+The canary directly returns its scheduled contraction: result alias propagation resolves the
+common ABI's `:result` buffer without weakening resident-plan validation. This also covers
+the public-boundary defect discovered while introducing the canary.
+Remaining follow-up: review cast-wrapped zero identities, which
 currently decline the register-tiled route even though they are numerically zero.
