@@ -20,6 +20,50 @@
 (def ^:private casts
   '#{int long clojure.core/int clojure.core/long})
 
+(def ^:private floating-casts
+  '#{double clojure.core/double})
+
+(def ^:private ceil-operators
+  '#{Math/ceil java.lang.Math/ceil})
+
+(def ^:private division-operators
+  '#{/ clojure.core//})
+
+(defn- unwrap-floating-cast
+  [expression]
+  (if (and (seq? expression)
+           (contains? floating-casts (first expression))
+           (= 2 (count expression)))
+    (second expression)
+    expression))
+
+(defn- exact-positive-integer
+  [value]
+  (when (and (number? value)
+             (pos? value)
+             (== (double value) (Math/rint (double value)))
+             (<= (double value) (double Long/MAX_VALUE)))
+    (long value)))
+
+(defn- floating-ceil-div
+  "Recognize the legacy scheduling spelling `(Math/ceil (/ (double n) (double d)))`.
+
+   KernelGrid predates the explicit launch algebra and still carries this exact source form.
+   Lowering it here retains the source schedule while replacing host floating-point arithmetic
+   with the checked integer `ceil-div` operation used by KernelBody and KernelLaunch."
+  [expression]
+  (when (and (seq? expression)
+             (contains? ceil-operators (descriptor/semantic-op expression))
+             (= 1 (count (descriptor/call-args expression))))
+    (let [division (first (descriptor/call-args expression))]
+      (when (and (seq? division)
+                 (contains? division-operators (descriptor/semantic-op division))
+                 (= 2 (count (descriptor/call-args division))))
+        (let [[numerator divisor] (mapv unwrap-floating-cast
+                                       (descriptor/call-args division))]
+          (when-let [divisor (exact-positive-integer divisor)]
+            [numerator divisor]))))))
+
 (defn lower
   "Translate a typed source index expression whose symbols are members of `scope`.
 
@@ -29,6 +73,14 @@
   (let [expression (descriptor/unwrap-int-cast expression)]
     (cond
       (integer? expression) expression
+
+      (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+      (apply body/expression (:op expression)
+             (map #(lower % scope decline!) (:arguments expression)))
+
+      (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+      (body/index-cast (lower (:argument expression) scope decline!)
+                       (:dtype expression) (:overflow expression))
 
       (symbol? expression)
       (if (contains? scope expression)
@@ -54,6 +106,10 @@
       (body/expression :sub
                        (lower (first (descriptor/call-args expression)) scope decline!)
                        1)
+
+      (floating-ceil-div expression)
+      (let [[numerator divisor] (floating-ceil-div expression)]
+        (body/expression :ceil-div (lower numerator scope decline!) divisor))
 
       (seq? expression)
       (let [operator (get operators (descriptor/semantic-op expression))

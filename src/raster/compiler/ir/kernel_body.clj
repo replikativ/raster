@@ -768,7 +768,8 @@
           (throw (ex-info "kernel for-loop index must have an integral dtype"
                           {:index index})))
         (when-not (and (expression? (:lower operation)) (expression? (:upper operation))
-                       (integer? (:step operation)) (pos? (:step operation))
+                       (expression? (:step operation))
+                       (or (not (integer? (:step operation))) (pos? (:step operation)))
                        (vector? (:iter-args operation))
                        (every? #(record-kind? "raster.compiler.ir.kernel_body.LoopArg" %)
                                (:iter-args operation))
@@ -777,6 +778,12 @@
                        (map? (:attributes operation)))
           (throw (ex-info "kernel for-loop requires typed carried values and explicit bounds"
                           {:loop operation})))
+        (let [outside (remove scope (expression-references (:step operation)))]
+          (when (seq outside)
+            (throw (ex-info "kernel for-loop step references values outside its invariant scope"
+                            {:reason :kernel-body-loop-step-scope
+                             :step (:step operation) :references (vec outside)
+                             :scope scope}))))
         (doseq [arg (:iter-args operation)]
           (value-spec! "loop carried binding" (:binding arg)))
         (let [uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
@@ -1075,6 +1082,50 @@
   (if (contains? #{:byte :int :long} (canonical-type type))
     (assoc info :range (scalar-range/for-dtype type))
     info))
+
+(declare positive-index-expression?)
+
+(defn- nonnegative-index-expression?
+  [expression values]
+  (cond
+    (integer? expression) (not (neg? expression))
+    (value-id? expression) (boolean (:nonnegative? (get values expression)))
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" expression)
+    (nonnegative-index-expression? (:argument expression) values)
+    (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
+    (let [arguments (:arguments expression)]
+      (case (:op expression)
+        (:add :mul :min) (every? #(nonnegative-index-expression? % values) arguments)
+        :max (boolean (some #(nonnegative-index-expression? % values) arguments))
+        :ceil-div (and (nonnegative-index-expression? (first arguments) values)
+                       (positive-index-expression? (second arguments) values))
+        false))
+    :else false))
+
+(defn- positive-index-expression?
+  "Conservatively prove that an invariant index expression advances a loop.
+
+   Hardware group counts are positive in every executing work item. Other hardware indices are
+   merely non-negative. The small transfer algebra below is intentionally one-way: an expression
+   outside it is not rejected as an index, but cannot serve as a dynamic loop step."
+  [expression values]
+  (cond
+    (integer? expression) (pos? expression)
+    (value-id? expression) (boolean (:positive? (get values expression)))
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" expression)
+    (positive-index-expression? (:argument expression) values)
+    (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
+    (let [arguments (:arguments expression)]
+      (case (:op expression)
+        :add (and (every? #(nonnegative-index-expression? % values) arguments)
+                  (boolean (some #(positive-index-expression? % values) arguments)))
+        :mul (every? #(positive-index-expression? % values) arguments)
+        :min (every? #(positive-index-expression? % values) arguments)
+        :max (boolean (some #(positive-index-expression? % values) arguments))
+        :ceil-div (and (positive-index-expression? (first arguments) values)
+                       (positive-index-expression? (second arguments) values))
+        false))
+    :else false))
 
 (defn- scalar-info!
   [expression values]
@@ -1495,6 +1546,8 @@
     (let [index (:index operation)
           lower-info (expression-info! (:lower operation) values)
           upper-info (expression-info! (:upper operation) values)
+          step-info (when-not (integer? (:step operation))
+                      (expression-info! (:step operation) values))
           index-type (canonical-type (:type index))
           lower-uniformity (:uniformity lower-info)
           upper-uniformity (:uniformity upper-info)
@@ -1508,6 +1561,15 @@
         (throw (ex-info "kernel for-loop index and bounds must have one integral type"
                         {:reason :kernel-body-loop-index-dtype :index index
                          :lower-type (:type lower-info) :upper-type (:type upper-info)})))
+      (when (and step-info (not= index-type (:type step-info)))
+        (throw (ex-info "kernel for-loop dynamic step must use the induction dtype"
+                        {:reason :kernel-body-loop-step-dtype :index index
+                         :index-type index-type :step (:step operation)
+                         :step-type (:type step-info)})))
+      (when-not (positive-index-expression? (:step operation) values)
+        (throw (ex-info "kernel for-loop dynamic step is not provably positive"
+                        {:reason :kernel-body-loop-step-positive
+                         :index index :step (:step operation)})))
       (claim-value! claimed reserved values index "kernel for-loop index")
       (doseq [[arg initial] (map vector iter-args initials)]
         (let [binding (:binding arg)]
@@ -2262,6 +2324,14 @@
                                   ;; ints, never implicit no-overflow evidence.
                                   (scalar-range/for-dtype :int)
                                   (:range (expression-info! (:expression idx) values)))
+                         :nonnegative?
+                         (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                           true
+                           (nonnegative-index-expression? (:expression idx) values))
+                         :positive?
+                         (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                           (= :group-count (:source idx))
+                           (positive-index-expression? (:expression idx) values))
                          :uniformity uniformity})))
              (into {}
                    (map (fn [parameter]

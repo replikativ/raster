@@ -990,12 +990,24 @@
           yield-op (peek (:operations operation))
           [body-source body-context] (emit-scalar-operations body-operations loop-context
                                                              (inc depth))
-          loop-header (str "for (" (target-type (get-in loop-context [:types (:id index)]))
+          index-type (get-in loop-context [:types (:id index)])
+          unsigned-index-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)
+          upper-source (emit-index-expression (:upper operation) (:names context))
+          step-source (if (integer? (:step operation))
+                        (str (:step operation))
+                        (emit-index-expression (:step operation) (:names context)))
+          loop-header (str "for (" (target-type index-type)
                            " " index-name " = "
                            (emit-index-expression (:lower operation) (:names context)) "; "
                            index-name " < "
-                           (emit-index-expression (:upper operation) (:names context)) "; "
-                           index-name " += " (:step operation) ") {")]
+                           upper-source ";) {")
+          checked-advance
+          (str (indent-lines
+                (inc depth)
+                (str "if ((" unsigned-index-type ")(" upper-source ") - ("
+                     unsigned-index-type ")(" index-name ") <= ("
+                     unsigned-index-type ")(" step-source ")) break;"))
+               (indent-lines (inc depth) (str index-name " += " step-source ";")))]
       [(str initializers
             (when (get-in operation [:attributes :unroll])
               (indent-lines depth "#pragma unroll"))
@@ -1004,6 +1016,7 @@
             (emit-yield-assignments results (:values yield-op)
                                     (update body-context :names merge (:names result-context))
                                     (inc depth))
+            checked-advance
             (indent-lines depth "}"))
        result-context])
 
@@ -1088,12 +1101,22 @@
                                             (str binding-event " = " temporary ";")))
                             (:events binding-group) temporaries))
                      binding-groups next-event-names))))
-          loop-header (str "for (" (target-type (get-in loop-context [:types (:id index)]))
+          index-type (get-in loop-context [:types (:id index)])
+          unsigned-index-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)
+          upper-source (emit-index-expression (:upper operation) (:names context))
+          step-source (str (:step operation))
+          loop-header (str "for (" (target-type index-type)
                            " " index-name " = "
                            (emit-index-expression (:lower operation) (:names context)) "; "
                            index-name " < "
-                           (emit-index-expression (:upper operation) (:names context)) "; "
-                           index-name " += " (:step operation) ") {")
+                           upper-source ";) {")
+          checked-advance
+          (str (indent-lines
+                (inc depth)
+                (str "if ((" unsigned-index-type ")(" upper-source ") - ("
+                     unsigned-index-type ")(" index-name ") <= ("
+                     unsigned-index-type ")(" step-source ")) break;"))
+               (indent-lines (inc depth) (str index-name " += " step-source ";")))
           output-groups
           (mapv (fn [result binding-group]
                   (assoc binding-group :id result))
@@ -1109,6 +1132,7 @@
                                     (update body-context :names merge (:names result-context))
                                     (inc depth))
             event-backedge
+            checked-advance
             (indent-lines depth "}"))
        next-context])
 

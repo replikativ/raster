@@ -2,8 +2,10 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
@@ -58,6 +60,25 @@
       (when (fold-body/declined? exception)
         (:missing-rule (ex-data exception))))))
 
+(defn- reason-of
+  [thunk]
+  (try (thunk) nil
+       (catch clojure.lang.ExceptionInfo exception
+         (:reason (ex-data exception)))))
+
+(defn- operation-tree
+  [operations]
+  (mapcat (fn [operation]
+            (cons operation
+                  (cond
+                    (instance? raster.compiler.ir.kernel_body.ForLoop operation)
+                    (operation-tree (:operations operation))
+                    (instance? raster.compiler.ir.kernel_body.IfRegion operation)
+                    (concat (operation-tree (:then-operations operation))
+                            (operation-tree (:else-operations operation)))
+                    :else [])))
+          operations))
+
 (deftest interpreted-segmented-fold-map-preserves-dependent-fold-order
   (let [values (float-array [1.0 3.0, 2.0 2.0])
         out (float-array 4)]
@@ -86,14 +107,25 @@
     (is (= :int (:dtype (get-in (dialect/facts program) [:values 'width])))
         "launch dimensions retain their declared ABI representation")))
 
-(deftest portable-schedule-is-three-explicit-ordered-loops
+(deftest portable-schedule-is-a-capped-grid-stride-loop-over-three-ordered-loops
   (let [operation (scheduled-operation)
         {:keys [kernel-body]} (fold-body/lower
-                               operation {:workgroup-size 64
-                                          :array-types {'values :float 'out :float}
+                               operation {:array-types {'values :float 'out :float}
                                           :scalar-types {'nsegments :int 'width :int}})
-        loops (filterv #(instance? raster.compiler.ir.kernel_body.ForLoop %)
-                       (:operations kernel-body))]
+        segment-loop (first (:operations kernel-body))
+        source-workgroup (get-in operation [:grid :block-size])
+        source-cap (first (rest (get-in operation [:grid :num-blocks])))
+        loops (filterv #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
+                             (not= :segment-grid-stride (get-in % [:attributes :role])))
+                       (operation-tree (:operations kernel-body)))]
+    (is (= :segment-grid-stride (get-in segment-loop [:attributes :role])))
+    (is (instance? raster.compiler.ir.kernel_body.IndexExpr (:step segment-loop)))
+    (is (= [source-workgroup] (get-in kernel-body [:launch :workgroup-size])))
+    (is (= [(launch/minimum
+             source-cap
+             (launch/ceil-div (launch/runtime-value 'nsegments) source-workgroup))]
+           (get-in kernel-body [:launch :group-count])))
+    (is (zero? (get-in kernel-body [:launch :shared-memory-bytes])))
     (is (= 3 (count loops)) "maximum, denominator, then the final dense map")
     (is (= [:ordered :ordered :ordered]
            (mapv #(get-in % [:attributes :association]) loops)))
@@ -105,13 +137,12 @@
 
 (deftest ordered-fold-map-has-one-complete-scheduled-body-certificate
   (let [operation (scheduled-operation)
-        options {:workgroup-size 64
-                 :array-types {'values :float 'out :float}
+        options {:array-types {'values :float 'out :float}
                  :scalar-types {'nsegments :int 'width :int}}
         lowered (fold-body/lower operation options)
         scheduled (fold-body/schedule operation options)
         artifact (segop-opencl/generate-segfoldmap-kernel
-                  operation :workgroup-size 64 :target-dialect :opencl-portable
+                  operation :target-dialect :opencl-portable
                   :array-types (:array-types options) :scalar-types (:scalar-types options))]
     (is (scheduled-body/scheduled-kernel-body? scheduled))
     (is (identical? operation (:source scheduled)))
@@ -128,8 +159,9 @@
            (:effects scheduled)))
     (is (= {:kind :segfoldmap-body-lowering
             :launch-rank 1
-            :segment-parallelism :independent
+            :segment-parallelism :grid-stride-independent
             :association :ordered
+            :source-grid (:grid operation)
             :aliasing :no-write-alias}
            (:legality scheduled)))
     (is (= {:mode :exact :policy :declaration-order :reassociation :none}
@@ -164,6 +196,10 @@
                  (scheduled-body/validate-artifact-projection!
                   (get-in kernel [:provenance :scheduled-operation]) kernel)))
           (is (= :no-write-alias (get-in kernel [:abi 0 :aliasing])))
+          (is (str/includes? (:source kernel) "foldmap_segment +="))
+          (is (if (contains? #{:cuda :hip} target)
+                (str/includes? (:source kernel) "gridDim.x")
+                (str/includes? (:source kernel) "get_num_groups(0)")))
           (is (every? #(<= (int %) 127) (:source kernel))))))))
 
 (deftest graph-emission-closes-the-fold-map-certificate-over-node-scalars-and-effects
@@ -172,8 +208,10 @@
         graph (kgraph/from-segops
                [operation]
                {:inputs #{'values} :outputs #{'out} :dtype :float
-                :buffer-specs {'values {:dtype :float :elements 'elements}
-                               'out {:dtype :float :elements 'elements}}
+                :buffer-specs {'values {:dtype :float
+                                        :elements (launch/product 'nsegments 'width)}
+                               'out {:dtype :float
+                                     :elements (launch/product 'nsegments 'width)}}
                 :scalars [(kgraph/scalar 'nsegments :int)
                           (kgraph/scalar 'width :int)]})
         emitted (segop-opencl/generate-kernel-graph
@@ -185,7 +223,7 @@
     (is (identical? operation (:source certificate)))
     (is (= certificate (get-in artifact [:attributes :scheduled-kernel-body])))
     (is (= certificate
-           (scheduled-body/validate-against-node! certificate (first (:nodes graph)) graph)))
+           (fold-body/validate-against-node! certificate (first (:nodes graph)) graph)))
     (is (= #{'nsegments 'width} (get-in graph [:nodes 0 :scalar-uses])))
     (is (= artifact
            (scheduled-body/validate-artifact-projection! certificate artifact)))))
@@ -210,6 +248,70 @@
     (doseq [[rule malformed] cases]
       (testing (name rule)
         (is (= rule (decline-rule #(fold-body/schedule malformed options))))))))
+
+(deftest source-kernel-grid-is-an-exact-capped-zero-shared-memory-contract
+  (let [operation (scheduled-operation)
+        options {:array-types {'values :float 'out :float}
+                 :scalar-types {'nsegments :int 'width :int}}
+        source-workgroup (get-in operation [:grid :block-size])]
+    (is (= :source-grid
+           (decline-rule #(fold-body/schedule
+                           operation (assoc options :workgroup-size (inc source-workgroup))))))
+    (is (= :source-grid-count
+           (decline-rule #(fold-body/schedule
+                           (assoc-in operation [:grid :num-blocks] 1) options))))
+    (is (= :source-grid-shared-memory
+           (decline-rule #(fold-body/schedule
+                           (assoc-in operation [:grid :shared-mem-bytes] 4) options))))))
+
+(deftest graph-certification-closes-fold-map-pointer-dtypes-extents-and-schedule
+  (let [operation (scheduled-operation)
+        scalar-types {'nsegments :int 'width :int}
+        elements (launch/product 'nsegments 'width)
+        make-graph
+        (fn [input-dtype input-elements]
+          (kgraph/from-segops
+           [operation]
+           {:inputs #{'values} :outputs #{'out} :dtype :float
+            :buffer-specs {'values {:dtype input-dtype :elements input-elements}
+                           'out {:dtype :float :elements elements}}
+            :scalars [(kgraph/scalar 'nsegments :int)
+                      (kgraph/scalar 'width :int)]}))
+        graph (make-graph :float elements)
+        scheduled (fold-body/schedule
+                   operation {:array-types {'values :float 'out :float}
+                              :scalar-types scalar-types})
+        node (first (:nodes graph))
+        first-parameter (first (get-in scheduled [:body :parameters]))
+        forged-shape
+        (-> scheduled
+            (assoc-in [:body :parameters 0 :shape] [1])
+            (assoc-in [:body :parameters 0 :layout]
+                      (layout/row-major [1] (:dtype first-parameter))))
+        forged-launch
+        (assoc-in scheduled [:body :launch :group-count] [1])
+        forged-workgroup
+        (assoc-in scheduled [:body :launch :workgroup-size] [1])
+        forged-shared
+        (assoc-in scheduled [:body :launch :shared-memory-bytes] 4)
+        forged-schedule
+        (assoc-in scheduled [:body :schedule :workgroup-size] 1)]
+    (is (= scheduled (fold-body/validate-against-node! scheduled node graph)))
+    (is (= :segfoldmap-storage-extent
+           (reason-of #(fold-body/validate-against-node! forged-shape node graph))))
+    (let [wrong-extent (make-graph :float (launch/sum elements 1))]
+      (is (= :segfoldmap-storage-extent
+             (reason-of #(fold-body/validate-against-node!
+                          scheduled (first (:nodes wrong-extent)) wrong-extent)))))
+    (let [wrong-dtype (make-graph :double elements)]
+      (is (= :segfoldmap-storage-dtype
+             (reason-of #(fold-body/validate-against-node!
+                          scheduled (first (:nodes wrong-dtype)) wrong-dtype)))))
+    (is (= :segfoldmap-schedule-source
+           (reason-of #(fold-body/validate-against-node! forged-launch node graph))))
+    (doseq [forged [forged-workgroup forged-shared forged-schedule]]
+      (is (= :segfoldmap-schedule-source
+             (reason-of #(fold-body/validate-against-node! forged node graph)))))))
 
 (deftest scalar-captures-retain-their-typed-abi
   (let [scaled-source

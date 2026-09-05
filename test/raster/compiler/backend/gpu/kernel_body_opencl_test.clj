@@ -275,6 +275,42 @@
 (defn- command-available? [command]
   (zero? (:exit (shell/sh "sh" "-c" (str "command -v " command)))))
 
+(defn- near-signed-limit-loop-body []
+  (body/make
+   {:id :near-signed-limit-loop
+    :operations
+    [(body/->ForLoop
+      (body/value 'edge-iteration :int)
+      2147483646 2147483647 2 []
+      [(body/->Yield [])] []
+      {:association :ordered})]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(deftest positive-loop-steps-cannot-overflow-the-signed-induction-variable
+  (let [kernel (near-signed-limit-loop-body)
+        sources (mapv (fn [target]
+                        (opencl/emit-scalar-kernel
+                         "near_signed_limit" kernel {:target-dialect target}))
+                      [:opencl-portable :cuda :hip])]
+    (testing "all C-family targets guard the update in same-width unsigned arithmetic"
+      (is (str/includes? (first sources)
+                         "(uint)(2147483647) - (uint)(rstr_edge_iteration) <= (uint)(2)"))
+      (doseq [source (rest sources)]
+        (is (str/includes?
+             source
+             (str "(unsigned int)(2147483647) - (unsigned int)(rstr_edge_iteration)"
+                  " <= (unsigned int)(2)"))))
+      (doseq [source sources]
+        (is (str/includes? source "if ("))
+        (is (str/includes? source "rstr_edge_iteration += 2;"))))
+    (testing "the guarded boundary case remains valid OpenCL C"
+      (when (command-available? "clang")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in (first sources))]
+          (is (zero? exit) err))))))
+
 (defn- compile-c-family-source
   [target source]
   (let [suffix (case target :cuda ".cu" :hip ".hip")

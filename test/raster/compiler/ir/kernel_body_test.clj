@@ -229,6 +229,41 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn- dynamic-step-body
+  [step]
+  (let [kernel (scalar-body [])
+        loop (body/->ForLoop
+              (body/value 'grid-item :long)
+              (body/index-cast 0 :long :exact)
+              (body/index-cast 16 :long :exact)
+              step [] [(body/->Yield [])] [] {:role :grid-stride})]
+    (body/validate!
+     (-> kernel
+         (update :indices conj (body/->IndexBinding 'group-count :group-count 0))
+         (assoc :operations [loop])))))
+
+(deftest dynamic-for-loop-steps-require-an-invariant-positive-proof
+  (let [group-count-long (body/index-cast 'group-count :long :exact)
+        long-literal #(body/index-cast % :long :exact)
+        valid (body/expression :mul group-count-long (long-literal 16))]
+    (is (body/kernel-body? (dynamic-step-body valid)))
+    (testing "zero and sign-unknown dynamic steps cannot make a progress claim"
+      (doseq [step [(body/expression :mul group-count-long (long-literal 0))
+                    (body/expression :sub group-count-long group-count-long)]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"provably positive"
+                              (dynamic-step-body step)))))
+    (testing "literal zero and negative steps remain structurally illegal"
+      (doseq [step [0 -1]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicit bounds"
+                              (dynamic-step-body step)))))
+    (testing "a dynamic step is loop-invariant and uses the induction representation"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"outside its invariant scope"
+           (dynamic-step-body (body/index-cast 'missing-step :long :exact))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"induction dtype"
+           (dynamic-step-body 'group-count))))))
+
 (defn- load-x
   ([] (load-x (body/value 'x-value :float)))
   ([result]

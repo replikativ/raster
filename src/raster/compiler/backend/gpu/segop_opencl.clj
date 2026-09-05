@@ -340,7 +340,7 @@
   [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
                         graph-node kernel-graph]
                  :or {kernel-name-prefix "segmented_fold_map"
-                      target-dialect :opencl-intel workgroup-size 256
+                      target-dialect :opencl-intel
                       scalar-types {} array-types {}}}]
   (let [scheduled
         (segfoldmap-body/schedule
@@ -351,7 +351,7 @@
                             {:reason :segfoldmap-graph-context
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
-            (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
+            (segfoldmap-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
     artifact))
