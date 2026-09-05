@@ -3,10 +3,21 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]))
 
 (def ^:private reduce-source
   '(raster.par/reduce acc 0.0 i n (clojure.core/+ acc (clojure.core/aget values i))))
+
+(deftest physical-write-capacity-covers-every-aliased-result
+  (let [value #(av/tensor {:dtype :float :shape [%]})
+        extent #'equation-graph/required-write-extent]
+    (is (= 100 (launch/resolve-expression {} (extent {} {} [(value 100) (value 10)]))))
+    (is (= 100 (launch/resolve-expression {} (extent {} {} [(value 10) (value 100)]))))
+    (is (= 100 (extent {} {} [(value 100) (value 100)])))
+    (is (nil? (extent {} {} [(value 100) (value '(unknown-dimension out))])))
+    (is (nil? (extent {} {} [nil (value 100)])))))
 
 (defn- lowered-program []
   (:form (segop-lower/segop-lower-pass (list 'let* ['total reduce-source] 'total)
@@ -47,7 +58,7 @@
     (is (= [[:binding 'total]] (:outputs p)))
     (is (= [reduce-source] (mapv :source (:equations p))))
     (is (every? av/abstract-value? (vals (:values p))))
-    (is (= ['?] (:shape (get (:values p) 'values))))
+    (is (= ['n] (:shape (get (:values p) 'values))))
     (is (= [] (:shape (get (:values p) [:binding 'total]))))
     (is (= {'n :int 'values :double}
            (program/declared-value-types (assoc-in p [:values 'n :dtype] :int)

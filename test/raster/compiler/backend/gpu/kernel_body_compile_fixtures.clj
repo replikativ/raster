@@ -103,7 +103,7 @@
         node (soac/par-form->soac 'result form 901 :dtype :float)
         operation (first (soac-lower/lower-reduce node nil :dtype :float))]
     (segop-emit/generate-segred-kernel-body
-     operation nil :dtype :float :scalar-types {'scale :double}
+     operation nil :dtype :float :scalar-types {'scale :double 'n :long}
      :target-dialect dialect :kernel-name-prefix "workgroup_reduce")))
 
 (defn- contraction-artifact

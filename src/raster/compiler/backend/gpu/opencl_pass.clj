@@ -27,6 +27,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -1048,6 +1049,7 @@
                                                                (every?
                                                                 #(and (instance?
                                                                        raster.compiler.ir.segop.SegRed %)
+                                                                      (empty? (segop/seg-space-segment-dims (:space %)))
                                                                       (reduction/scalar?
                                                                        (:reduction %)))
                                                                 (:operations equation)))]
@@ -1078,6 +1080,9 @@
                                                             :ze-reduces)
                                                           (boolean
                                                            (and equation
+                                                                (not (resident/resident-scalar-value?
+                                                                      (get-in parallel-program
+                                                                              [:values (first (:results equation))])))
                                                                 (= [] (get-in parallel-program
                                                                               [:values
                                                                                (first
@@ -1115,6 +1120,7 @@
                                               (every?
                                                #(and (instance?
                                                       raster.compiler.ir.segop.SegRed %)
+                                                     (empty? (segop/seg-space-segment-dims (:space %)))
                                                      (reduction/scalar?
                                                       (:reduction %)))
                                                (:operations equation)))]

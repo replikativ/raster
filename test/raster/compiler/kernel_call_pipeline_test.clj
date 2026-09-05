@@ -61,7 +61,10 @@
         executable (:artifact step)]
     (is (= [:executable] (mapv :convention (:steps descriptor))))
     (is (= :exclusive (get-in executable [:attributes :scan-mode])))
-    (is (= (kernel-launch/sum 'n 1) (:elements (first (:outputs executable)))))
+    (doseq [n [0 1 513]]
+      (is (= (inc n)
+             (kernel-launch/resolve-expression {'n n}
+                                               (:elements (first (:outputs executable)))))))
     (is (empty? (:allocs descriptor)))))
 
 (deftest resident-segmap-step-carries-one-executable-call-template
@@ -116,11 +119,14 @@
     (is (= {'state :output} (:array-roles descriptor)))
     (is (= :state (:output step)))))
 
-(deftest resident-segred-schedule-is-an-explicit-kernel-call-override
+(deftest resident-segred-keeps-its-complete-two-phase-schedule
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-reduce
                                                  :ze:0 :dtype :float)
-        step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))
-        workgroup-size (first (get-in step [:artifact :launch :workgroup-size]))
+        step (first (filter #(= :executable (:convention %)) (:steps descriptor)))
+        graph (:artifact step)
+        partial (get-in graph [:nodes 0 :operation])
+        terminal (get-in graph [:nodes 1 :operation])
+        workgroup-size (first (get-in partial [:launch :workgroup-size]))
         n (inc (* 2 workgroup-size))
         runtime-params [(float-array n) (float-array n) 0.75 n]
         ordered-values
@@ -129,13 +135,18 @@
                   {:type type :value (value-fn runtime-params)}
                   (keyword (name sym))))
               (:argument-specs step))
-        default-call (kcall/make (:artifact step) ordered-values)
-        resident-call (kcall/make (:artifact step) ordered-values {:group-count [1]})]
-    (is (kart/kernel-artifact? (:artifact step)))
+        scalars (into {} (keep identity)
+                      (map (fn [slot value]
+                             (when (= :scalar (:kind slot)) [(:name slot) (:value value)]))
+                           (:abi graph) ordered-values))]
+    (is (kernel-graph/kernel-graph? graph))
+    (is (= 2 (count (:nodes graph))))
+    (is (= 1 (count (:temporaries graph))))
     (is (= [:input :output :scalar :scalar]
            (mapv :kind (:argument-specs step))))
-    (is (= [3] (get-in default-call [:geometry :group-count])))
-    (is (= [1] (get-in resident-call [:geometry :group-count])))))
+    (is (= 3 (kernel-launch/resolve-expression
+              scalars (first (get-in partial [:launch :group-count])))))
+    (is (= [1] (get-in terminal [:launch :group-count])))))
 
 (deftest resident-map-void-step-carries-a-logical-plan-for-one-physical-call
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map-void

@@ -102,17 +102,26 @@
   ;; descriptor through. That was a no-op: the descriptor did not contain :c-op/:identity-val —
   ;; generate-segred-kernel returned them into a local that route-contraction discarded. The
   ;; consumer-side assertion could not catch it; only this producer-side one can.
-  (testing ":combine max reaches the descriptor as fmax + its identity, not defaulted to +/0.0"
+  (testing "product reaches the descriptor with its identity, not defaulted to +/0.0"
     (let [r (cr/route-contraction
              (list 'raster.par/contract 'O [] [['l 8]]
                    (list 'raster.numeric/* (list 'aget 'a 'l) (list 'aget 'b 'l))
-                   :combine 'max :init 'Double/NEGATIVE_INFINITY)
+                   :combine '* :init 1.0)
              :dtype :double)]
       (is (= :full-reduce (:strategy r)))
-      (is (= "fmax" (:c-op r)))
-      (is (= Double/NEGATIVE_INFINITY (:identity-val r))
-          "the identity must be the op's, not 0.0 — summing max-partials from 0.0 is wrong for
-           all-negative data"))))
+      (is (= "*" (:c-op r)))
+      (is (= 1.0 (:identity-val r))
+          "the product identity must not become the sum identity")))
+  (testing "floating max cannot silently acquire C fmax's different NaN semantics"
+    (try
+      (cr/route-contraction
+       '(raster.par/contract O [] [[l 8]] (* (aget a l) (aget b l))
+                             :combine max :init Double/NEGATIVE_INFINITY)
+       :dtype :double)
+      (is false "requires an explicit floating min/max numerical policy")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :floating-minmax-semantics
+               (get-in (ex-data exception) [:kernel-body-decline :missing-rule])))))))
 
 (deftest fp64-result-transform-uses-the-typed-register-tiled-store
   (testing "an f64 two-free/one-contract result transform executes on the register-tiled leaf"

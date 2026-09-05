@@ -219,7 +219,7 @@
   ;; (the resident TypedSOAC realization gives it a device one-element output buffer)
   ;; threw at bind time even though bind-step! already handled :reduce. This pins the
   ;; wiring: scale*sum(a) (a captured reduction scalar) feeding an elementwise scale compiles to
-  ;; [:reduce :map] steps, binds its full ordered ABI,
+  ;; a two-phase reduction graph followed by a map, binds its full ordered ABI,
   ;; and replays with the correct output. (An ESCAPING tail reduce — a loss returned as
   ;; the scalar result — still doesn't bind: that is the remaining #42 leftover, same as
   ;; bind-step!.)
@@ -244,8 +244,9 @@
           cpu (float-array (map #(float (* (double %) s)) (seq a)))
           {:keys [descriptor] :as r} (run-resident probe [a out n scale])
           gpu (:out r)]
-      (let [red-step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))]
-        (is (some? red-step) "resident-consumed par/reduce compiles to a :reduce step")
+      (let [red-step (first (filter #(= :executable (:convention %)) (:steps descriptor)))]
+        (is (some? red-step) "resident-consumed par/reduce compiles to a graph-backed step")
+        (is (= 2 (count (get-in red-step [:artifact :nodes]))))
         (is (= [:input :output :scalar :scalar]
                (mapv :kind (:argument-specs red-step))))
         (is (= [:float :float :float :int]
