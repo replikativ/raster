@@ -549,8 +549,11 @@
                            (zero? (:n-free coordinate-proof))
                            (= [index bound] [proof-index proof-bound])
                            (= (set arrays) operand-ids)
+                           ;; Facts retain every load occurrence. Validate each occurrence rather
+                           ;; than looking up by symbol, which would select only the first read of
+                           ;; an array and could hide a later unproved coordinate.
                            (every? #(contraction-facts/operand-axis-map coordinate-proof %)
-                                   arrays)
+                                   (:operands coordinate-proof))
                            (= element (:element view))
                            (= (literal-value identity) (literal-value (:neutral view)))
                            (= operator (intrinsics/canonical (:combine view)))

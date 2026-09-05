@@ -133,14 +133,19 @@
 (deftest scalar-contraction-affine-coordinates-require-the-exact-facts-proof
   (let [form '(raster.par/contract O [] [[i 8]] (aget A i))
         facts (contraction-facts/contraction-facts form :dtype :float)
-        forged (assoc-in facts [:operands 0 :idx] '(+ i 1024))
-        failure (try
-                  (route/route-contraction nil :facts forged :dtype :float)
-                  nil
-                  (catch clojure.lang.ExceptionInfo exception exception))]
-    (is (= :kernel-graph-target-lowering-missing (:reason (ex-data failure))))
-    (is (= :contraction-coordinate-proof
-           (get-in (ex-data failure) [:kernel-body-decline :missing-rule])))))
+        forgeries
+        [(assoc-in facts [:operands 0 :idx] '(+ i 1024))
+         ;; Repeated reads of one array are distinct proof obligations; validating only the first
+         ;; occurrence would admit this unproved second coordinate.
+         (update facts :operands conj {:sym 'A :idx '(+ i 1024) :map nil})]]
+    (doseq [forged forgeries]
+      (let [failure (try
+                      (route/route-contraction nil :facts forged :dtype :float)
+                      nil
+                      (catch clojure.lang.ExceptionInfo exception exception))]
+        (is (= :kernel-graph-target-lowering-missing (:reason (ex-data failure))))
+        (is (= :contraction-coordinate-proof
+               (get-in (ex-data failure) [:kernel-body-decline :missing-rule])))))))
 
 (deftest signature-parser-handles-the-real-kernels
   (testing "the parser finds every param of a multi-line DPAS signature"
