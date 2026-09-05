@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -113,12 +114,19 @@
                                operation {:array-types {'values :float 'out :float}
                                           :scalar-types {'nsegments :int 'width :int}})
         segment-loop (first (:operations kernel-body))
+        segment-axis-computes (take (count (segop/seg-space-segment-dims (:space operation)))
+                                    (:operations segment-loop))
         source-workgroup (get-in operation [:grid :block-size])
         source-cap (first (rest (get-in operation [:grid :num-blocks])))
         loops (filterv #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
                              (not= :segment-grid-stride (get-in % [:attributes :role])))
                        (operation-tree (:operations kernel-body)))]
     (is (= :segment-grid-stride (get-in segment-loop [:attributes :role])))
+    (is (every? #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                segment-axis-computes)
+        "grid-stride segment axes are lexically recomputed as typed index SSA")
+    (is (= (mapv :name (segop/seg-space-segment-dims (:space operation)))
+           (mapv :id segment-axis-computes)))
     (is (instance? raster.compiler.ir.kernel_body.IndexExpr (:step segment-loop)))
     (is (= [source-workgroup] (get-in kernel-body [:launch :workgroup-size])))
     (is (= [(launch/minimum

@@ -392,6 +392,7 @@
                "raster.compiler.ir.kernel_body.Loop"
                "raster.compiler.ir.kernel_body.Guard"
                "raster.compiler.ir.kernel_body.TileStore"
+               "raster.compiler.ir.kernel_body.IndexCompute"
                "raster.compiler.ir.kernel_body.ScalarCompute"
                "raster.compiler.ir.kernel_body.ScalarLoad"
                "raster.compiler.ir.kernel_body.ScalarStore"
@@ -693,6 +694,15 @@
           (throw (ex-info "scalar compute requires an explicit ScalarExpr"
                           {:operation operation}))))
 
+      ;; Index computations are legal both in the kernel's index declaration section and
+      ;; lexically inside scalar control regions.  The latter is needed when a grid-stride loop
+      ;; recomputes a decomposed logical coordinate on each iteration.  Keeping this as explicit
+      ;; index IR prevents schedule arithmetic from being smuggled into a scalar expression.
+      (record-kind? "raster.compiler.ir.kernel_body.IndexCompute" operation)
+      (when-not (and (value-id? (:id operation)) (expression? (:expression operation)))
+        (throw (ex-info "kernel index compute requires a named explicit index expression"
+                        {:reason :kernel-body-index-compute :operation operation})))
+
       (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
       (let [p (parameter (:buffer operation))]
         (value-spec! "scalar load result" (:result operation))
@@ -982,10 +992,18 @@
 (defn- validate-operations! [operations storage fragments masks scope epilogue-abi]
   (when-not (vector? operations)
     (throw (ex-info "kernel operations must be an ordered vector" {:operations operations})))
-  (doseq [operation operations]
-    (when-not (operation? operation)
-      (throw (ex-info "kernel body contains a non-operation value" {:operation operation})))
-    (validate-operation! operation storage fragments masks scope epilogue-abi)))
+  ;; A nested IndexCompute is a lexical index binding, rather than a kernel-wide declaration.
+  ;; Extend the structural coordinate scope in source order so a following load/store may address
+  ;; through it; SSA dataflow independently rejects duplicate or forward uses.
+  (loop [remaining operations scope scope]
+    (when-let [operation (first remaining)]
+      (when-not (operation? operation)
+        (throw (ex-info "kernel body contains a non-operation value" {:operation operation})))
+      (validate-operation! operation storage fragments masks scope epilogue-abi)
+      (recur (next remaining)
+             (if (record-kind? "raster.compiler.ir.kernel_body.IndexCompute" operation)
+               (conj scope (:id operation))
+               scope)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Typed SSA and convergence verification for the general scalar vocabulary.
@@ -1450,6 +1468,12 @@
                             schedule]
                      :as context}]
   (cond
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCompute" operation)
+    (let [info (expression-info! (:expression operation) values)
+          result (value (:id operation) (:type info))]
+      (claim-value! claimed reserved values result "index compute")
+      (assoc values (:id result) info))
+
     (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
     (let [result (claim-value! claimed reserved values (:result operation) "scalar compute")
           info (scalar-info! (:expression operation) values)

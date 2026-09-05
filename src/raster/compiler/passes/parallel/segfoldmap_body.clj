@@ -181,16 +181,19 @@
         group-index 'foldmap-group
         group-count 'foldmap-group-count
         local-index 'foldmap-lane
-        segment-axis-expressions
-        (into {}
-         (map
+        ;; A grid-stride work item advances `segment-index` each iteration, so logical segment
+        ;; axes must be recomputed *inside* that loop.  Keep them as named IndexCompute values:
+        ;; ScalarExpr consumes typed SSA identities, never raw IndexExpr trees.
+        segment-axis-computes
+        (mapv
          (fn [position {:keys [name bound]}]
            (let [following (subvec (vec segment-dims) (inc position))
                  divisor (product-expression (mapv #(lower-index (:bound %)) following))
                  quotient (if (= 1 divisor) segment-index
                               (body/expression :floor-div segment-index divisor))]
-             [name (body/expression :mod quotient (lower-index bound))]))
-         (range) segment-dims))
+             (body/->IndexCompute name
+                                  (body/expression :mod quotient (lower-index bound)))))
+         (range) segment-dims)
         base-coordinate (body/expression :mul segment-index map-extent)
         parameters
         (vec (concat
@@ -228,8 +231,7 @@
                  carry (symbol (str "foldmap-carry-" ordinal))
                  accumulator (:accumulator fold)
                  fold-dtype (dtype/canon (:dtype fold))
-                 expression (util/subst-syms (merge segment-axis-expressions
-                                                     {source-index loop-index accumulator carry})
+                 expression (util/subst-syms {source-index loop-index accumulator carry}
                                              (:step fold))
                  lowered ((:lower scalar-lower) expression fold-dtype
                                                 (assoc env loop-index :long carry fold-dtype))
@@ -251,9 +253,7 @@
         map-operations
         (mapcat
          (fn [_ordinal output output-dtype expression]
-           (let [expression (util/subst-syms (merge segment-axis-expressions
-                                                     {(:index segfold) map-index})
-                                             expression)
+           (let [expression (util/subst-syms {(:index segfold) map-index} expression)
                  lowered ((:lower scalar-lower) expression output-dtype
                                                 (assoc (:env fold-state) map-index :long))]
              (concat (:operations lowered)
@@ -273,7 +273,8 @@
         segment-loop
         (body/->ForLoop
          (body/value segment-index :long) first-segment '_nseg segment-step []
-         (vec (concat (:operations fold-state) [final-loop (body/->Yield [])])) []
+         (vec (concat segment-axis-computes (:operations fold-state)
+                      [final-loop (body/->Yield [])])) []
          {:association :independent :role :segment-grid-stride})]
     {:kernel-body
      (body/make

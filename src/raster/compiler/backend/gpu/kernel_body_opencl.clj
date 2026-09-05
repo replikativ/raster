@@ -370,7 +370,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private scalar-operation-kinds
-  #{"ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
+  #{"IndexCompute" "ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
     "PipelineYield" "PipelinedFor"
     "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
 
@@ -419,6 +419,9 @@
   (mapcat
    (fn [operation]
      (cond
+       (record-kind? "IndexCompute" operation)
+       [(:id operation)]
+
        (contains? #{"ScalarCompute" "ScalarLoad" "Collective"}
                   (some-> operation class .getSimpleName))
        [(:id (:result operation))]
@@ -863,6 +866,16 @@
 (defn- emit-scalar-operation
   [operation context depth]
   (cond
+    (record-kind? "IndexCompute" operation)
+    (let [type (index-expression-dtype (:expression operation) (:types context))
+          result (body/value (:id operation) type)
+          next-context (add-value context result)]
+      [(indent-lines depth
+                     (str (target-type type) " "
+                          (get-in next-context [:names (:id result)]) " = "
+                          (emit-index-expression (:expression operation) (:names context)) ";"))
+       next-context])
+
     (record-kind? "ScalarCompute" operation)
     (let [result (:result operation)
           next-context (add-value context result)]
