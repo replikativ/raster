@@ -291,10 +291,19 @@
                   operations))))
     (testing "block totals are scanned in one chunked workgroup for unbounded symbolic sizes"
       (is (= [1] (get-in block [:launch :group-count])))
-      (let [loop (some #(when (= "ForLoop" (operation-kind %)) %) (kernel-body-operations block))]
-        (is (= [0 '_n_bound 256 :ordered]
+      (let [operations (kernel-body-operations block)
+            loop (some #(when (= "ForLoop" (operation-kind %)) %) operations)
+            safe-bound (some #(when (and (= "ScalarCompute" (operation-kind %))
+                                         (= 'scan-safe-bound (get-in % [:result :id])))
+                                %)
+            safe-expression (:expression safe-bound)]
+        (is (= [0 'scan-safe-bound 256 :ordered]
                [(:lower loop) (:upper loop) (:step loop)
-                (get-in loop [:attributes :association])]))))
+                (get-in loop [:attributes :association])]))
+        (is (= :min (:op safe-expression)))
+        (is (= :max (get-in safe-expression [:arguments 0 :op])))
+        (is (= '_n_bound (get-in safe-expression [:arguments 0 :arguments 0]))
+            "the in-body clamp, rather than an ABI role assertion, proves the loop extent")))
     (testing "carry consumes the scanned total of the preceding block"
       (let [loads (filter #(= "ScalarLoad" (operation-kind %))
                           (kernel-body-operations carry))]
