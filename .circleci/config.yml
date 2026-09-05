@@ -92,6 +92,9 @@ jobs:
       - run:
           name: Run deterministic test shard
           command: scripts/ci-test-shard.sh
+      - store_artifacts:
+          path: test-results
+          destination: test-timings
 
   emit-gpu-compile-fixtures:
     executor: clojure-java24
@@ -177,6 +180,9 @@ jobs:
       - run:
           name: Run OpenCL-gated tests on the CPU OpenCL device
           command: scripts/ci-opencl-cpu.sh
+      - store_artifacts:
+          path: test-results
+          destination: test-timings
 
   deploy:
     executor: clojure-java24

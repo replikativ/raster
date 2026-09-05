@@ -97,4 +97,4 @@ for namespace in "${namespaces[@]}"; do
   runner_args+=("-n" "${namespace}")
 done
 
-clojure -M:test "${runner_args[@]}"
+clojure -M:test:ci-timed "${runner_args[@]}"
