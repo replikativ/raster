@@ -1,5 +1,9 @@
 (ns raster.perf.regression-gate-test
-  "B0.5 — the perf-regression RATCHET. The one gate that catches wall-time
+  "Historical raw-Clojure timing control, NOT a Raster compiler or generated GEMM gate.
+   For production-route canaries use raster.perf.production-canary and design/test-feedback.md.
+   The historical methodology description below must not be interpreted as compiler coverage.
+
+   B0.5 — the perf-regression RATCHET. The one gate that catches wall-time
    regressions the structural proxies (buffer counts, split-k policy, tile-fits-budget)
    cannot see: a GEMM-leaf rewrite, epilogue fusion, or cost-guided fusion can keep
    every proxy identical while regressing µs. This closes that blind spot.
@@ -83,7 +87,7 @@
                  (format "%.1f%%" (* 100.0 (dec (/ (double median-ns) (double prev)))))))))))
 
 ;; --- Canary 1 (device-free): a C2-vectorizable double reduction ---
-;; Guards the JVM-SIMD lowering path and proves the ratchet end-to-end without a device.
+;; Raw Clojure control only: does not call Raster's JVM-SIMD lowering path.
 ;; A tight sum-of-products over a fixed array — the shape C2 SuperWord vectorizes; a
 ;; regression here (e.g. a boxing or a lost FloatVector selection) shows as µs growth.
 (deftest ^:perf cpu-simd-reduce-canary

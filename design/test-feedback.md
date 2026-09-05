@@ -60,3 +60,42 @@ and transfer/allocation costs. Keep a small stable-machine canary set outside or
 run broader differential workloads against external libraries periodically. Missing measurements
 or hardware are missing evidence, not successful performance gates. Never update a baseline
 merely to accept a slowdown.
+
+## Opt-in production-route canaries
+
+`clojure -M:test:production-canary /path/to/options.edn` runs either `:case :cpu`
+(Raster AOT sum-of-squares) or `:case :gemm` (public compiled/lower, instantiate, resident
+LinkPlan replay of a 64×64×64 contraction). Example options:
+
+```clojure
+{:case :gemm :target :ocl:0
+ :environment-tag "machine-name; driver-version; power-mode"
+ :compiler-revision "exact-commit-and-any-local-patch-label"
+ :baseline "/path/to/reviewed-gemm-baseline.edn"
+ :output "/path/to/new-gemm-measurement.edn"}
+```
+
+Both routes validate against independent numerical references before measuring. CI executes
+the CPU route and, in the OpenCL lane, the resident GEMM route with timing replaced by one
+replay: these are correctness checks, not performance gates. There is no GPU timing claim
+when hardware is unavailable.
+
+The GPU metric is **host-synchronized warm resident replay**, including runtime submission
+overhead, not device-only kernel latency or peak GEMM throughput. Compilation and binding
+are reported separately; upload/download are outside timed replay. This tiny shape catches
+route/runtime regressions but does not establish SOTA performance. Device-event profiling of
+equation-first prepared programs is not yet supported by `link/measure!`.
+
+The comparison identity includes shape, dtype, numerical policy, device/host/JVM signatures,
+timing scope and an explicit machine/driver tag. Compiler revision and emitted executable
+signatures are evidence, not comparison keys: a source change must not bypass the old baseline.
+Missing baselines, incomparable environments, noisy measurements and invalid measurements
+exit nonzero. A stationary median above 115% of baseline also fails. Review repeated initial
+measurements and explicitly designate a separate baseline file; the runner never seeds or
+updates it. Compilation/binding timings are diagnostic, not yet regression-gated.
+
+Known public-boundary follow-up discovered by this canary: a direct returned scheduled
+contraction currently retains a synthetic result name instead of resolving its common ABI
+`:result` buffer. The canary uses explicit `write C; return C`; fix result alias propagation
+without weakening resident-plan validation. Also review cast-wrapped zero identities, which
+currently decline the register-tiled route even though they are numerically zero.
