@@ -1388,12 +1388,21 @@
                               {:kernel-name kernel-name :slot slot :value-type (type value)}))))
         _ (kabi/validate-physical-pointer-dtypes!
            abi (physical-pointer-dtypes pointer-values))
-        _ (when (= :pure-reduction (get-in registered [:effects :kind]))
-            (doseq [[slot value] pointer-pairs
-                    :when (= :result (:role slot))]
-              (when (and (device-buffer? value) (< (:n-elements ^OclBuffer value) 1))
-                (throw (ex-info "resident reduction result buffer must hold at least one element"
-                                {:kernel-name kernel-name :slot slot :buffer-elements 0})))))
+        reduction-kind (get-in registered [:effects :kind])
+        _ (when (contains? #{:pure-reduction :scalar-reduction-phase} reduction-kind)
+            (let [required (if (= :scalar-reduction-phase reduction-kind)
+                             (long (first group-count)) 1)]
+              (doseq [[slot value] pointer-pairs
+                      :when (= :result (:role slot))]
+                (let [capacity (cond
+                                 (device-buffer? value) (:n-elements ^OclBuffer value)
+                                 (instance? MemorySegment value)
+                                 (quot (.byteSize ^MemorySegment value)
+                                       (dt/bytes-of (:dtype slot))))]
+                  (when (and capacity (< (long capacity) required))
+                    (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
+                                    {:kernel-name kernel-name :slot slot
+                                     :required-elements required :buffer-elements capacity})))))))
         _ (when (= :tensor-contraction (get-in registered [:effects :kind]))
             (let [extent-expr (kart/attribute registered :out-elems)
                   out-elems (long (if (number? extent-expr)

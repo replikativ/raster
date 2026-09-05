@@ -427,6 +427,13 @@
                      (cl/contract-form->segred
                       (compatibility-form! contract-form :full-reduce)
                       :dtype dtype :facts contract-facts))
+              ;; A zero-free-axis contraction is physically the nonterminal phase consumed by the
+              ;; registered host-combine protocol. The old contraction/segmented tags carried no
+              ;; scalar reduction schedule and are outside the canonical SegRed phase vocabulary.
+              sr (if (and (empty? (segop/seg-space-segment-dims (:space sr)))
+                          (not (contains? #{:single :block-local :cross-block} (:phase sr))))
+                   (assoc sr :phase :block-local)
+                   sr)
               k (sco/generate-segred-kernel sr out-sym :dtype dtype)
               attrs (:attributes k)
               red-bound (second (first contract-axes))]

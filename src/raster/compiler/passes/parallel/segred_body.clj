@@ -15,7 +15,9 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
@@ -30,6 +32,79 @@
 (defn declined?
   [exception]
   (= :segred-kernel-body-declined (:reason (ex-data exception))))
+
+(def ^:private scalar-phases #{:single :block-local :cross-block})
+
+(defn- validate-scalar-segred!
+  "Validate the complete semantic/schedule subset implemented by the portable workgroup tree."
+  [segred out-sym array-types]
+  (when-not (instance? raster.compiler.ir.segop.SegRed segred)
+    (throw (ex-info "scalar reduction scheduling requires a SegRed"
+                    {:reason :raster/bug :operation segred})))
+  (let [operator (reduction/validate! (:reduction segred))
+        dimensions (segop/seg-space-segment-dims (:space segred))
+        phase (:phase segred)
+        outputs (vec (:outputs segred))
+        component (first (:components operator))
+        accumulator-dtype (dtype/canon (:dtype component))
+        workgroup-size (or (get-in segred [:grid :block-size]) 256)
+        num-blocks (get-in segred [:grid :num-blocks])
+        result-region (get-in operator [:attributes :result-region])
+        output (or out-sym (first outputs))
+        declared-type (fn [id]
+                        (some-> (or (get array-types id)
+                                    (get array-types
+                                         (when (or (symbol? id) (keyword? id))
+                                           (symbol (name id)))))
+                                dtype/canon))
+        input-types (mapv (fn [input]
+                            (or (declared-type input) accumulator-dtype))
+                          (:inputs segred))
+        output-type (or (declared-type output) accumulator-dtype)]
+    (when-not (reduction/scalar? operator)
+      (decline! :scalar-product-reduction
+                "portable scalar SegRed scheduling requires one ProductReduction component"
+                {:operation (:id segred) :components (count (:components operator))}))
+    (when (seq dimensions)
+      (decline! :zero-segment-dimensions
+                "portable scalar SegRed cannot schedule a segmented result space"
+                {:operation (:id segred) :segment-dimensions dimensions}))
+    (when-not (contains? scalar-phases phase)
+      (decline! :scalar-reduction-phase
+                "portable scalar SegRed has an unsupported reduction phase"
+                {:operation (:id segred) :phase phase :supported scalar-phases}))
+    (when-not (and (= 1 (count outputs)) (some? (first outputs)) (some? output))
+      (decline! :single-physical-output
+                "portable scalar SegRed requires one stable physical output identity"
+                {:operation (:id segred) :outputs outputs :requested-output out-sym}))
+    (when-not (contains? #{:float :double} accumulator-dtype)
+      (decline! :uniform-scalar-storage
+                "portable scalar SegRed supports FP32 or FP64 storage and accumulation"
+                {:operation (:id segred) :accumulator-dtype accumulator-dtype}))
+    (when-not (and (= accumulator-dtype (dtype/canon (:dtype segred)))
+                   (= accumulator-dtype output-type)
+                   (every? #{accumulator-dtype} input-types))
+      (decline! :uniform-scalar-storage
+                "portable scalar SegRed requires uniform storage and accumulator dtypes"
+                {:operation (:id segred) :segred-dtype (:dtype segred)
+                 :accumulator-dtype accumulator-dtype :input-dtypes input-types
+                 :output-dtype output-type}))
+    (when-not (and (integer? workgroup-size) (pos? workgroup-size)
+                   (zero? (bit-and workgroup-size (dec workgroup-size))))
+      (decline! :workgroup-size
+                "portable scalar SegRed requires a positive power-of-two workgroup"
+                {:operation (:id segred) :workgroup-size workgroup-size}))
+    (when (and (contains? #{:single :cross-block} phase) (not= 1 num-blocks))
+      (decline! :terminal-phase-groups
+                "terminal scalar SegRed phases must launch exactly one workgroup"
+                {:operation (:id segred) :phase phase :num-blocks num-blocks}))
+    (when (and (= :block-local phase) result-region)
+      (decline! :nonterminal-result-transform
+                "a completed reduction transform may run only in a terminal SegRed phase"
+                {:operation (:id segred) :phase phase :result-region result-region}))
+    {:operator operator :component component :dtype accumulator-dtype
+     :workgroup-size workgroup-size :phase phase :output output
+     :result-region result-region}))
 
 (defn- retained-expression-dtype
   "Read the walker/TypedClojure result fact carried by a scalar expression.
@@ -285,7 +360,6 @@
                                       "scalar arithmetic requires its retained walker/TypedClojure result dtype"
                                       {:expression expression :operator operator}))
                         typed-inputs (mapv #(lower % nil) arguments)
-                        input-dtypes (mapv :dtype typed-inputs)
                         result-dtype retained-dtype]
                     (when (dtype/integral? result-dtype)
                       (decline! :integral-scalar-arithmetic
@@ -321,11 +395,13 @@
 (defn lower
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
-   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
+  `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
    accumulator remain uniform; integral scalar parameters may participate in index expressions."
   [segred out-sym & {:keys [dtype array-types scalar-types]
                      :or {dtype :double array-types {} scalar-types {}}}]
-  (let [dtype (or (:dtype segred) dtype)
+  (let [{validated-dtype :dtype output :output result-region :result-region}
+        (validate-scalar-segred! segred out-sym array-types)
+        dtype (or validated-dtype (:dtype segred) dtype)
         index (:name (segop/seg-space-reduced-dim (:space segred)))
         bound (:bound (segop/seg-space-reduced-dim (:space segred)))
         ;; Direct compatibility-front-door reductions can arrive before target scheduling. Keep
@@ -338,13 +414,10 @@
                                   (get scalar-types (symbol (name id))) dtype))
         array-dtype (fn [id] (or (get array-types id)
                                  (get array-types (symbol (name id))) dtype))
-        bound-dimension (if (or (symbol? bound) (keyword? bound) (vector? bound))
-                          (launch/runtime-value bound)
-                          bound)
+        bound-dimension '_n_bound
         _ (when-not (and (contains? #{:float :double} (dtype/canon dtype))
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
-                         (launch/dimension-expression? bound-dimension)
                          (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
                          (every? #(dtype/known? (dtype/canon (scalar-dtype %))) scalars))
             (decline! :uniform-scalar-storage
@@ -377,9 +450,8 @@
              (util/subst-syms {index element-index} source-coordinate)
              (conj (set scalars) element-index)
              decline!))})
-        output (or out-sym 'output)
         group-count (if-let [grid-expression (get-in segred [:grid :num-blocks])]
-                      (launch-group-count grid-expression bound workgroup-size)
+                      (launch-group-count grid-expression bound-dimension workgroup-size)
                       (launch/ceil-div bound-dimension workgroup-size))
         scratch 'workgroup-reduction-scratch
         barrier (fn [] (body/->WorkgroupBarrier
@@ -410,12 +482,11 @@
                      % :input dtype ['_n_bound] :global
                      (layout/row-major ['_n_bound] dtype) :operand)
                    arrays)
-              [(body/->KernelParameter output :output dtype ['partial-count] :global
-                                       (layout/row-major ['partial-count] dtype) :result)]
+              [(body/->KernelParameter output :output dtype [group-count] :global
+                                       (layout/row-major [group-count] dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
-        result-region (get-in segred [:reduction :attributes :result-region])
         _ (when (and result-region (seq (:operands result-region)))
             (decline! :full-reduction-result-operands
                       "full-reduction result transforms cannot address tensor operands"
@@ -502,4 +573,128 @@
      :arrays arrays
      :scalars scalars
      :output output
-     :bound bound}))
+     :bound bound
+     :group-count group-count
+     :result-region result-region}))
+
+(defn- logical-bound-dtype
+  [bound scalar-types]
+  (let [references (launch/expression-references bound)
+        scalar-dtype (fn [id]
+                       (or (get scalar-types id)
+                           (get scalar-types (when (or (symbol? id) (keyword? id))
+                                               (symbol (name id))))
+                           ;; Compatibility reductions predate GraphScalar. Their only omitted
+                           ;; shape representation was the historical physical int bound.
+                           (when (= references #{id}) :int)))]
+    (try
+      (launch/typed-expression-dtype bound scalar-dtype)
+      (catch clojure.lang.ExceptionInfo exception
+        (decline! :phase-bound-dtype
+                  "scalar SegRed phase bound lacks a complete checked integer type"
+                  {:bound bound :scalar-types scalar-types
+                   :type-error (ex-data exception)})))))
+
+(defn schedule
+  "Refine one scalar SegRed phase into a complete target-neutral ScheduledKernelBody.
+
+   The exact SegRed is the semantic source. `_n_bound` is target-private int storage bound to the
+   phase's exact logical extent; a wider public extent carries an explicit checked-range proof.
+   Each artifact writes exactly its launch group count, while only terminal phases may apply the
+   typed completed-result transform."
+  ([segred options]
+   (schedule segred nil options))
+  ([segred out-sym {:keys [scalar-types] :as options}]
+   (let [{:keys [kernel-body operator identity arrays scalars output bound group-count result-region]}
+        (lower segred out-sym
+               :dtype (:dtype options) :array-types (:array-types options)
+               :scalar-types scalar-types)
+        arguments (mapv (fn [parameter]
+                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
+                        (:parameters kernel-body))
+        bound-dtype (logical-bound-dtype bound scalar-types)
+        scalar-bindings
+        (mapv (fn [[parameter argument]]
+                (let [kernel-dtype (dtype/canon (:dtype parameter))
+                      logical-dtype (if (= '_n_bound (:id parameter))
+                                      bound-dtype kernel-dtype)]
+                  {:parameter (:id parameter) :value argument
+                   :dtype logical-dtype :kernel-dtype kernel-dtype
+                   :conversion (if (= logical-dtype kernel-dtype)
+                                 :identity :checked-range)}))
+              (filterv (fn [[parameter _]] (= :scalar (:kind parameter)))
+                       (map vector (:parameters kernel-body) arguments)))
+        phase (:phase segred)
+        output-elements (launch/rebind-expression group-count {'_n_bound bound})
+        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)
+        result-dtype (dtype/canon (or (:result-dtype result-region) (:dtype segred)))]
+    (scheduled-body/make
+     {:source segred
+      :body kernel-body
+      :arguments arguments
+      :scalar-bindings scalar-bindings
+      :effects {:kind :scalar-reduction-phase
+                :phase phase
+                :uses (scheduled-body/derive-uses kernel-body arguments)}
+      :legality {:kind :scalar-segred-workgroup-tree
+                 :product-components 1
+                 :segment-dimensions 0
+                 :phase phase
+                 :workgroup-size (get-in kernel-body [:schedule :workgroup-size])
+                 :power-of-two-workgroup true
+                 :terminal (contains? #{:single :cross-block} phase)
+                 :certified-monoid (get-in segred [:reduction :algebra])
+                 :identity identity
+                 :uniform-dtype (dtype/canon (:dtype segred))}
+      :numerics (cond-> {:mode :reassociated
+                         :policy :certified-workgroup-tree
+                         :rounding :implementation-defined
+                         :accumulator-dtype (dtype/canon (:dtype segred))}
+                  result-region
+                  (assoc :result-transform
+                         {:kind :typed-scalar-region
+                          :policy :same-typed-ssa-evaluation-order
+                          :input-dtype (dtype/canon (:dtype segred))
+                          :result-dtype result-dtype}))
+      :provenance {:dialect :kernel-body :source-dialect :segred
+                   :segop-id (:id segred) :phase phase}
+      :attributes {:array-params arrays
+                   :scalar-params scalars
+                   :dtype (dtype/canon (:dtype segred))
+                   :phase phase
+                   :group-count output-elements
+                   :output-elements output-elements
+                   :physical-result output
+                   ;; Compatibility staging still combines partials on the host and consumes these
+                   ;; values. They are projections of the proved monoid, not emitter inference.
+                   :identity-val identity
+                   :c-op c-op}}))))
+
+(defn validate-against-node!
+  "Close scalar SegRed output geometry over its complete KernelGraph context."
+  [scheduled node kernel-graph]
+  (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
+        output-use (first (filter #(contains? #{:write :read-write} (:access %))
+                                  (:uses node)))
+        output-buffer (some #(when (= (:buffer output-use) (:id %)) %)
+                            (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                                    (:temporaries kernel-graph)))
+        output-parameter (some #(when (= :result (:role %)) %)
+                               (get-in scheduled [:body :parameters]))
+        bound-binding (some #(when (= '_n_bound (:parameter %)) %)
+                            (:scalar-bindings scheduled))
+        realized-shape (mapv #(launch/rebind-expression
+                               % {'_n_bound (:value bound-binding)})
+                             (:shape output-parameter))
+        output-elements (get-in scheduled [:attributes :output-elements])
+        group-count (get-in (scheduled-body/realized-launch scheduled) [:group-count 0])]
+    (when-not (and output-use output-buffer output-parameter bound-binding
+                   (= [output-elements] realized-shape)
+                   (= output-elements group-count)
+                   (= output-elements (:elements output-buffer)))
+      (decline! :output-elements
+                "scalar SegRed output extent differs from its launch or KernelGraph storage"
+                {:node (:id node) :output-use output-use :output-buffer output-buffer
+                 :output-parameter output-parameter :realized-shape realized-shape
+                 :output-elements output-elements :group-count group-count}))
+    scheduled))

@@ -53,7 +53,11 @@
         emitted (sg/generate-kernel-graph
                  graph :array-types {'a :double} :scalar-types {'n :long})
         [phase-one phase-two] (mapv :operation (:nodes emitted))
+        source-nodes (:nodes graph)
+        certificates (mapv #(get-in % [:provenance :scheduled-operation])
+                           [phase-one phase-two])
         partials (first (:inputs (second (mapv :operation (:nodes graph)))))
+        result-id (:id (first (:outputs graph)))
         temporary-specs (graph-call/temporary-specs
                          emitted {'n {:type :long :value 1025}})]
     (is (= [(kgraph/scalar 'n :long)] (:scalars graph)))
@@ -72,6 +76,27 @@
           "a target-private derived bound closes over the public logical scalar"))
     (is (= 2 (count (:nodes emitted))))
     (is (every? kart/kernel-artifact? [phase-one phase-two]))
+    (is (= [] (:dependencies (first source-nodes))))
+    (is (= [(:id (first source-nodes))] (:dependencies (second source-nodes))))
+    (is (= [:block-local :cross-block]
+           (mapv #(get-in % [:effects :phase]) [phase-one phase-two])))
+    (is (= [[{:value 'a :access :read} {:value partials :access :write}]
+            [{:value partials :access :read} {:value result-id :access :write}]]
+           (mapv #(get-in % [:effects :uses]) [phase-one phase-two])))
+    (is (= (mapv :operation source-nodes) (mapv :source certificates))
+        "each scheduled body retains its exact scalar SegRed phase")
+    (doseq [[certificate node] (map vector certificates source-nodes)]
+      (is (= certificate (segred-body/validate-against-node! certificate node graph))))
+    (is (= [(first (get-in phase-one [:attributes :kernel-body :launch :group-count]))]
+           (-> phase-one :attributes :kernel-body :parameters second :shape))
+        "the partial output is closed over the actual checked group-count expression")
+    (is (= [1] (-> phase-two :attributes :kernel-body :parameters second :shape)))
+    (is (= [:checked-range :checked-range]
+           (mapv #(->> % :scalar-bindings
+                       (some (fn [binding]
+                               (when (= '_n_bound (:parameter binding))
+                                 (:conversion binding)))))
+                 certificates)))
     (is (str/includes? (:source phase-two) (str (name partials) "[")))
     (is (not (re-find #"\ba\[" (:source phase-two)))
         "the cross-block target kernel must not resurrect the original reduction body")
@@ -457,16 +482,77 @@
       (is (klaunch/launch-spec? (:launch k)))
       (is (= [256] (get-in k [:launch :workgroup-size])))
       (is (= 1024 (get-in k [:launch :shared-memory-bytes])))
-      (is (= {:dialect :segred :segop-id (:id segred)} (:provenance k)))
+      (is (= :kernel-body (get-in k [:provenance :dialect])))
+      (is (= (:id segred) (get-in k [:provenance :segop-id])))
+      (is (= :scheduled-kernel-body (get-in k [:provenance :lowering])))
       (is (= :float (get-in k [:attributes :dtype])))
       (is (= :kernel-body (get-in k [:attributes :emission-route])))
-      (is (some? (get-in k [:attributes :kernel-body])))))
-  (testing "host-scalar staging retains the result position as an explicit nil placeholder"
+      (is (some? (get-in k [:attributes :kernel-body])))
+      (is (nil? (get-in k [:attributes :n-phases]))
+          "one phase artifact does not claim that it owns two phases")))
+  (testing "the artifact retains a physical result identity; only the host marker substitutes nil"
     (let [form '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
           s (soac/par-form->soac 'result form 0)
           k (sg/generate-segred-kernel (first (lower/lower-reduce s nil)) nil :dtype :float)]
-      (is (= '[a output _n_bound] (mapv :name (:abi k))))
-      (is (= '[a nil n] (:arguments k))))))
+      (is (= '[a result _n_bound] (mapv :name (:abi k))))
+      (is (= '[a result n] (:arguments k))))))
+
+(deftest scalar-segred-schedule-rejects-a-forged-graph-source
+  (let [source '(let* [result (raster.par/reduce acc 0.0 i n
+                                                 (+ acc (clojure.core/aget a i)))]
+                      result)
+        options {:dtype :double :array-types {'a :double} :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :double {'a :double} options))
+        algorithm (get-in typed [:equations 0 :algorithm])
+        scheduled-program (:form (segop-lower/segop-lower-pass typed options))
+        graph (equation-graph/make algorithm scheduled-program)
+        node (last (:nodes graph))
+        operation (:operation node)
+        certificate (segred-body/schedule operation (first (:outputs operation)) options)
+        forged-node (assoc node :operation (assoc operation :id :forged-reduction))
+        forged-storage (update graph :outputs
+                               #(mapv (fn [buffer] (assoc buffer :elements 2)) %))]
+    (is (identical? operation (:source certificate)))
+    (try
+      (segred-body/validate-against-node! certificate forged-node graph)
+      (is false "a boundary-compatible but different SegRed must not reuse the certificate")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :scheduled-kernel-body-source (:reason (ex-data exception))))))
+    (try
+      (segred-body/validate-against-node! certificate node forged-storage)
+      (is false "the graph result allocation must equal the scheduled output group count")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :output-elements (:missing-rule (ex-data exception))))))))
+
+(deftest completed-scalar-reduction-transform-is-terminal-and-numerically-explicit
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))
+               {:raster.type/elem-type :float})
+        base (first (lower/lower-reduce (soac/par-form->soac 'result form 91) nil
+                                        :dtype :float))
+        transform (kernel-body/->ScalarRegion
+                   '[completed scale] '(clojure.core/* completed scale) [] :float)
+        terminal (-> base
+                     (assoc-in [:reduction :attributes :result-region] transform)
+                     (assoc :scalars #{'scale}))
+        certificate (segred-body/schedule
+                     terminal nil {:array-types {'a :float}
+                                   :scalar-types {'scale :float}})]
+    (is (= :single (:phase terminal)))
+    (is (= {:kind :typed-scalar-region
+            :policy :same-typed-ssa-evaluation-order
+            :input-dtype :float :result-dtype :float}
+           (get-in certificate [:numerics :result-transform])))
+    (is (= :certified-workgroup-tree (get-in certificate [:numerics :policy])))
+    (let [nonterminal (assoc terminal :phase :block-local)]
+      (try
+        (segred-body/schedule nonterminal nil
+                             {:array-types {'a :float}
+                              :scalar-types {'scale :float}})
+        (is false "a block-local phase must not apply the completed transform")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :nonterminal-result-transform
+                 (:missing-rule (ex-data exception)))))))))
 
 (deftest mixed-index-scalars-stay-on-the-portable-reduction-route
   (let [form '(raster.par/reduce acc 0.0 i n

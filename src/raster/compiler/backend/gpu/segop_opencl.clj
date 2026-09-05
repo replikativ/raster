@@ -603,62 +603,36 @@
                    :schedule schedule}})))
 
 (defn generate-segred-kernel-body
-  "Lower an eligible scalar SegRed through verified KernelBody and a thin C-family dialect.
+  "Schedule and emit an eligible scalar SegRed through the canonical KernelBody target.
 
    This function is public so CUDA/HIP compiler fixtures can validate the exact same scheduled
    body without a device. It throws only structured `:segred-kernel-body-declined` exceptions for
    unsupported scalar regions; verified-body or emitter failures remain compiler errors."
-  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
+  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
+                            graph-node kernel-graph]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
-  (let [{:keys [kernel-body operator identity arrays scalars output bound]}
-        (segred-body/lower segred out-sym :dtype dtype :array-types array-types
-                           :scalar-types scalar-types)
-        dtype (or (:dtype segred) dtype)
+  (let [scheduled
+        (segred-body/schedule segred out-sym
+                             {:dtype dtype :array-types array-types
+                              :scalar-types scalar-types})
+        _ (when (not= (some? graph-node) (some? kernel-graph))
+            (throw (ex-info "scalar reduction graph certification requires both node and graph"
+                            {:reason :segred-graph-context
+                             :graph-node graph-node :kernel-graph kernel-graph})))
+        _ (when graph-node
+            (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        parameter-names (into {output "output" '_n_bound "_n_bound"}
-                              (map (fn [id] [id (ce/c-symbol id)]))
-                              (concat arrays scalars))
-        source (kernel-body-opencl/emit-scalar-kernel
-                kernel-name kernel-body
-                {:target-dialect target-dialect :parameter-names parameter-names})
-        scalar-dtype (fn [id]
-                       (or (get scalar-types id)
-                           (get scalar-types (symbol (name id)))
-                           (throw (ex-info "kernel scalar parameter has no declared dtype"
-                                           {:reason :kernel-scalar-dtype-unknown :symbol id
-                                            :declared (vec (keys scalar-types))}))))
-        result-name (or out-sym 'output)
-        abi (kabi/validate!
-             (vec (concat
-                   (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand
-                                    :aliasing :no-write-alias)
-                        arrays)
-                   [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
-                   (map #(kabi/slot % :scalar (scalar-dtype %)
-                                    :c-name (ce/c-symbol %) :role :parameter)
-                        scalars)
-                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
-        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)]
-    (kart/make
-     {:kernel-name kernel-name
-      :target (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
-      :source source
-      :abi abi
-      :arguments (vec (concat arrays [out-sym] scalars [bound]))
-      :launch (:launch kernel-body)
-      :temporaries []
-      :effects {:kind :pure-reduction}
-      :provenance {:dialect :segred :segop-id (:id segred)}
-      :attributes {:array-params arrays
-                   :scalar-params scalars
-                   :dtype dtype
-                   :n-phases 2
-                   :identity-val identity
-                   :c-op c-op
-                   :kernel-body kernel-body
-                   :emission-route :kernel-body
-                   :target-dialect target-dialect}})))
+        output (some #(when (= :result (:role %)) (:id %))
+                     (get-in scheduled [:body :parameters]))
+        parameter-names (merge
+                         (into {}
+                               (map (fn [parameter]
+                                      [(:id parameter) (ce/c-symbol (:id parameter))]))
+                               (get-in scheduled [:body :parameters]))
+                         {output "output" '_n_bound "_n_bound"})]
+    (kernel-body-target/emit-artifact
+     kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn generate-scheduled-segmap-kernel
   "Emit one scheduled SegMap through the single KernelBody-first C-family boundary.
@@ -706,10 +680,11 @@
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
 
-   The artifact carries the complete ordered ABI, symbolic launch, workgroup scratch and two-phase
-   reduction protocol. Unsupported scalar regions fail with their structured KernelBody decline;
+   The artifact carries the complete ordered ABI, symbolic launch, workgroup scratch and exact
+   phase contract. Unsupported scalar regions fail with their structured KernelBody decline;
    no target may recover semantics by reparsing a source-shaped lambda."
-  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
+  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
+                            graph-node kernel-graph]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
   (when (seq (segop/seg-space-segment-dims (:space segred)))
@@ -720,7 +695,8 @@
   (try
     (generate-segred-kernel-body
      segred out-sym :dtype dtype :kernel-name-prefix kernel-name-prefix
-     :scalar-types scalar-types :array-types array-types :target-dialect target-dialect)
+     :scalar-types scalar-types :array-types array-types :target-dialect target-dialect
+     :graph-node graph-node :kernel-graph kernel-graph)
     (catch clojure.lang.ExceptionInfo exception
       (when-not (segred-body/declined? exception) (throw exception))
       (let [decline (assoc (ex-data exception) :fallback :none)]
@@ -1041,38 +1017,41 @@
         emitted
         (kgraph/map-operations
          graph
-         (fn [{:keys [id operation]}]
+         (fn [{:keys [id operation] :as node}]
            (let [outputs (vec (:outputs operation))]
              (when-not (= 1 (count outputs))
                (throw (ex-info "scalar SegRed graph node requires exactly one scheduled output"
                                {:reason :kernel-graph-reduction-output
                                 :target :opencl-c :node id :outputs outputs})))
-             (kart/certify-scheduled-operation
-              (if (seq (segop/seg-space-segment-dims (:space operation)))
-                (let [facts (or (get contraction-facts (:id operation))
-                                (throw (ex-info
-                                        "segmented reduction lacks verified contraction facts"
-                                        {:reason :kernel-graph-segmented-reduction-facts
-                                         :operation (:id operation) :fallback :none})))
-                      descriptor (hw/descriptor-for target-device)
-                      planned (contraction-schedule/plan-portable-body
-                               facts operation descriptor
-                               {:array-types array-types :scalar-types scalar-types})]
-                  (when-not (:ok planned)
-                    (throw (ex-info
-                            "segmented reduction has no portable KernelBody schedule"
-                            {:reason :kernel-graph-segmented-reduction-body
-                             :operation (:id operation) :schedule-decline planned
-                             :fallback :none})))
+             (if (seq (segop/seg-space-segment-dims (:space operation)))
+               (let [facts (or (get contraction-facts (:id operation))
+                               (throw (ex-info
+                                       "segmented reduction lacks verified contraction facts"
+                                       {:reason :kernel-graph-segmented-reduction-facts
+                                        :operation (:id operation) :fallback :none})))
+                     descriptor (hw/descriptor-for target-device)
+                     planned (contraction-schedule/plan-portable-body
+                              facts operation descriptor
+                              {:array-types array-types :scalar-types scalar-types})]
+                 (when-not (:ok planned)
+                   (throw (ex-info
+                           "segmented reduction has no portable KernelBody schedule"
+                           {:reason :kernel-graph-segmented-reduction-body
+                            :operation (:id operation) :schedule-decline planned
+                            :fallback :none})))
+                 (kart/certify-scheduled-operation
                   (generate-contraction-kernel-artifact
                    (:body planned) :target-dialect target-dialect
-                   :kernel-name-prefix "graph_contraction"))
-                (generate-segred-kernel
-                 operation (first outputs)
-                 :dtype (:dtype operation)
-                 :scalar-types scalar-types :array-types array-types
-                 :target-dialect target-dialect))
-              operation))))]
+                   :kernel-name-prefix "graph_contraction")
+                  operation))
+               ;; Scalar reductions are certified against their complete graph context before
+               ;; projection. Do not add the older artifact-only operation wrapper outside it.
+               (generate-segred-kernel
+                operation (first outputs)
+                :dtype (:dtype operation)
+                :scalar-types scalar-types :array-types array-types
+                :target-dialect target-dialect
+                :graph-node node :kernel-graph graph)))))]
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))

@@ -165,7 +165,8 @@
       (is (not (str/includes? (:source kernel) "cl_intel_subgroups")))
       ;; Must NOT have CUDA
       (is (not (str/includes? (:source kernel) "__syncthreads()")))
-      (is (= :segred (get-in kernel [:provenance :dialect])))
+      (is (= :kernel-body (get-in kernel [:provenance :dialect])))
+      (is (= :segred (get-in kernel [:provenance :source-dialect])))
       (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
       (let [workgroup-size (first (get-in kernel [:launch :workgroup-size]))]
         (is (pos-int? workgroup-size))
@@ -233,8 +234,11 @@
       (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
              (first (:form result))))
       (is (= '[a nil scale n] (nth (:form result) 2)))
-      (is (= '[a output scale _n_bound]
-             (mapv :name (:abi (first (:kernels result))))))))
+      (let [artifact (first (:kernels result))
+            result-slot (some #(when (= :result (:role %)) %) (:abi artifact))]
+        (is (some? (:name result-slot))
+            "the artifact retains its scheduled physical result identity")
+        (is (= (:name result-slot) (second (:arguments artifact)))))))
   (testing "reduce-into supplies its resident result at the same ordered ABI slot"
     (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
           form (with-meta
