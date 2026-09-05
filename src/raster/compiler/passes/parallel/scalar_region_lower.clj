@@ -196,7 +196,8 @@
                   (cast (lower-expression (second expression) env) target))
 
                 (seq? expression)
-                (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
+                (let [semantic-operation (descriptor/semantic-op expression)
+                      operator (intrinsics/canonical semantic-operation)
                       intrinsic (intrinsics/descriptor operator)
                       arguments (vec (descriptor/call-args expression))]
                   (when-not (and intrinsic
@@ -208,10 +209,19 @@
                               {:expression expression :operator operator
                                :result-dtype result-dtype}))
                   (let [inputs (mapv #(:value (lower-expression % env)) arguments)
+                        ;; Result transforms retain the same source contract as ordinary scalar
+                        ;; regions.  Their arithmetic is not schedule index arithmetic and may
+                        ;; therefore never be silently certified as `:no-overflow`.
+                        overflow (when (and (contains? #{:byte :int :long} result-dtype)
+                                            (contains? #{:+ :- :*} operator))
+                                   (or (intrinsics/source-overflow-policy semantic-operation)
+                                       :trap))
                         result (fresh "result-transform-value")]
                     (emit! (body/->ScalarCompute
                             (body/value result result-dtype)
-                            (body/scalar-expression operator result-dtype inputs))
+                            (body/scalar-expression
+                             operator result-dtype inputs
+                             (cond-> {} overflow (assoc :overflow overflow))))
                            result result-dtype)))
 
                 :else

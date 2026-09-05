@@ -419,7 +419,31 @@
            (get-in (route/route
                     (problem)
                     (assoc desc :segmented-weighted-reduction-history-tile-size 0))
-                   [:declines 0 :reason])))))
+                   [:declines 0 :reason])))
+    (testing "a self-consistent tile plan cannot forge the source membership capacity"
+      (let [plan (:plan reference)
+            lower! (fn [candidate]
+                     (try
+                       (swr-body/lower-routed-paged-partial plan candidate)
+                       :accepted
+                       (catch clojure.lang.ExceptionInfo exception
+                         (:reason (ex-data exception)))))
+            under (assoc scheduled :membership-tiling
+                         {:kind :static-contiguous-tiles :tile-size 2 :tile-count 2
+                          :membership-capacity 4 :merge-order :increasing-membership-tile})
+            over (assoc scheduled :membership-tiling
+                        {:kind :static-contiguous-tiles :tile-size 2 :tile-count 4
+                         :membership-capacity 8 :merge-order :increasing-membership-tile})
+            oversized-capacity (inc (long Integer/MAX_VALUE))
+            oversized (assoc scheduled :membership-tiling
+                            {:kind :static-contiguous-tiles :tile-size 2
+                             :tile-count (quot (+ oversized-capacity 1) 2)
+                             :membership-capacity oversized-capacity
+                             :merge-order :increasing-membership-tile})]
+        (is (= :segmented-weighted-reduction-body-membership-capacity (lower! under)))
+        (is (= :segmented-weighted-reduction-body-membership-capacity (lower! over)))
+        (is (= :segmented-weighted-reduction-membership-tiling (lower! oversized))
+            "values that become int literals are rejected before lowering")))))
 
 (deftest tiled-history-sources-cover-route-and-visibility-products
   (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
@@ -546,6 +570,55 @@
     (is (str/includes? (:source artifact) "page_indices["))
     (is (str/includes? (:source artifact)
                        "rstr_empty_last_page_valid = (rstr_final_page_length == 0)"))))
+
+(deftest csr-route-sanitizes-untrusted-page-metadata-before-proved-arithmetic
+  (let [{:keys [plan artifact]} (route/route! (problem :route (csr-route)) intel-desc)
+        schedule (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
+        lowered (swr-body/lower-routed-paged plan schedule)
+        operations (operation-tree (:operations lowered))
+        compute-by-id (into {}
+                            (keep (fn [operation]
+                                    (when-let [result (:result operation)]
+                                      [(:id result) operation])))
+                            operations)
+        raw-routed-count (get compute-by-id 'raw-routed-page-count)
+        routed-count (get compute-by-id 'routed-page-count)
+        computed-length (get compute-by-id 'computed-kv-length)]
+    ;; Raw device page offsets and last-page lengths have no overflow contract.  The only marked
+    ;; arithmetic consumes clamped SSA values, while invalid raw metadata remains in route-valid
+    ;; and therefore masks all writes.
+    (is (= :no-overflow (get-in raw-routed-count [:expression :options :overflow])))
+    (is (= ['safe-page-end 'safe-page-begin]
+           (get-in raw-routed-count [:expression :arguments])))
+    (is (= ['raw-routed-page-count (kbody/literal 0 :int)]
+           (get-in routed-count [:expression :arguments])))
+    (is (= :no-overflow (get-in computed-length [:expression :options :overflow])))
+    (is (= 'safe-final-page-length
+           (last (get-in computed-length [:expression :arguments]))))
+    (is (some? (get compute-by-id 'route-valid)))))
+
+(deftest csr-route-clamps-an-inverted-row-before-certified-length-arithmetic
+  (let [route (attention/csr-paged-route
+               {:page-offsets 'page-offsets :page-indices 'page-indices
+                :last-page-lengths 'last-page-lengths :start-positions 'kv-start-positions
+                :page-index-capacity 1})
+        problem (problem :route route :page-size Integer/MAX_VALUE :physical-pages 1)
+        {:keys [plan artifact]} (route/route! problem intel-desc)
+        schedule (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
+        lowered (swr-body/lower-routed-paged plan schedule)
+        compute-by-id (into {}
+                            (keep (fn [operation]
+                                    (when-let [result (:result operation)]
+                                      [(:id result) operation])))
+                            (operation-tree (:operations lowered)))
+        count-minus-one (get compute-by-id 'computed-kv-length)]
+    ;; An invalid row with begin=1/end=0 has a raw count of -1.  It is clamped to zero before
+    ;; the certified `count - 1` product, even with the largest legal page size.
+    (is (= 'safe-final-page-length
+           (last (get-in count-minus-one [:expression :arguments]))))
+    (is (= 'routed-page-count
+           (get-in count-minus-one [:expression :arguments 0 :arguments 0 :arguments 0])))
+    (is (= :no-overflow (get-in count-minus-one [:expression :options :overflow])))))
 
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}

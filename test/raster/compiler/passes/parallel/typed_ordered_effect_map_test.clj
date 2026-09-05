@@ -268,9 +268,19 @@
                           program {:target-device :ze:0 :dtype :float}))
         operation (first (get-in scheduled [:equations 0 :operations]))
         artifact (segop-opencl/generate-scheduled-segmap-kernel
-                  operation :dtype :float :target-dialect :opencl-portable
+                  ;; The scheduled device is :ze:0. `r * feat` is ordinary long arithmetic,
+                  ;; so this concrete artifact uses Intel OpenCL's checked-trap contract.
+                  operation :dtype :float :target-dialect :opencl-intel
                   :array-types {'x :float 'out :float}
                   :scalar-types {'rows :long 'feat :long})
+        portable-reason (try
+                          (segop-opencl/generate-scheduled-segmap-kernel
+                           operation :dtype :float :target-dialect :opencl-portable
+                           :array-types {'x :float 'out :float}
+                           :scalar-types {'rows :long 'feat :long})
+                          nil
+                          (catch clojure.lang.ExceptionInfo exception
+                            (:reason (ex-data exception))))
         jvm (par-simd/simd-pass scheduled :min-elements 1)
         execute (eval (list 'fn '[x out rows feat] (:form jvm)))
         x (float-array [1.0 2.0 3.0 4.0])
@@ -288,6 +298,8 @@
     (testing "the device kernel is a verified KernelBody with a nested loop"
       (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
       (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
+      (is (= :kernel-body-c-trap-unsupported portable-reason)
+          "portable OpenCL does not pretend it can preserve checked long arithmetic")
       (is (str/includes? (:source artifact) "for (")))
     (testing "the JVM schedule executes the loop"
       (is (nil? (execute x out 2 2)))

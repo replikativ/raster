@@ -9,6 +9,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
 (def ^:private cast-heads
@@ -72,6 +73,15 @@
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         counter (atom 0)
         fresh (fn [prefix] (symbol (str id-prefix "-" prefix "-" (swap! counter inc))))
+        ;; Lowered SSA names retain their exact interval here.  The public local environment still
+        ;; carries only authoritative dtypes; this private table is a proof cache, not a type or
+        ;; function registry, and a missing entry simply declines certification.
+        value-ranges (atom {})
+        remember-range! (fn [id range]
+                          (when range (swap! value-ranges assoc id range))
+                          range)
+        known-range (fn [value type]
+                      (or (get @value-ranges value) (scalar-range/for-dtype type)))
         source-type
         (fn source-type [expression expected env]
           (let [expression (inline-lets expression)]
@@ -122,12 +132,15 @@
                                     "scalar cast has no portable rounding and overflow policy"
                                     {:expression expression :source source :target target}))
                         id (fresh "cast")]
-                    {:operations (conj (:operations lowered)
+                    (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
+                                  (:range lowered))]
+                      (remember-range! id (or range (scalar-range/for-dtype target)))
+                      {:operations (conj (:operations lowered)
                                        (body/->ScalarCompute
                                         (body/value id target)
                                         (body/cast-expression (:result lowered) target
                                                               rounding overflow)))
-                     :result id :type target}))))
+                       :result id :type target :range (or range (scalar-range/for-dtype target))})))))
 
             (lower [expression expected env]
               (let [expression (inline-lets expression)
@@ -135,7 +148,8 @@
                 (cond
                   (instance? raster.compiler.ir.kernel_body.Literal expression)
                   {:operations [] :result expression
-                   :type (canon-type (:type expression))}
+                   :type (canon-type (:type expression))
+                   :range (scalar-range/literal (:value expression) (:type expression))}
 
                   (and (= :predicate expected) (number? expression))
                   (if (contains? #{0 1} expression)
@@ -146,14 +160,18 @@
                               {:expression expression}))
 
                   (number? expression)
-                  {:operations [] :result (body/literal expression expected) :type expected}
+                  (let [range (scalar-range/literal expression expected)]
+                    {:operations [] :result (body/literal expression expected)
+                     :type expected :range range})
 
                   (boolean? expression)
                   {:operations [] :result (body/literal expression :predicate) :type :predicate}
 
                   (symbol? expression)
                   (if-let [actual (or (get env expression) (get scalar-types expression))]
-                    {:operations [] :result expression :type (canon-type actual)}
+                    (let [type (canon-type actual)]
+                      {:operations [] :result expression :type type
+                       :range (known-range expression type)})
                     (decline! :unbound-scalar
                               "scalar expression references an undeclared value"
                               {:expression expression :environment (set (keys env))}))
@@ -178,12 +196,14 @@
                             (:result coordinate-value)
                             (lower-index coordinate (set (keys env))))
                           id (fresh "load")]
-                      {:operations (conj (vec (:operations coordinate-value))
+                      (let [range (scalar-range/for-dtype array-type)]
+                        (remember-range! id range)
+                        {:operations (conj (vec (:operations coordinate-value))
                                          (body/->ScalarLoad
                                           (body/value id array-type) array
                                           [coordinate-expression] predicate
                                           (when predicate (body/literal 0 array-type)) :cached))
-                       :result id :type array-type}))
+                         :result id :type array-type :range range})))
 
                   (and (seq? expression) (contains? cast-heads (first expression))
                        (= 2 (count expression)))
@@ -331,22 +351,42 @@
                                               operand-type expression)
                                             arguments)
                               result-type (if comparison? :predicate operand-type)
-                              overflow (intrinsics/source-overflow-policy semantic-operation)
-                              options (cond-> {} overflow (assoc :overflow overflow))
+                              ;; Typed source arithmetic has a semantic overflow contract: normal
+                              ;; Clojure integral arithmetic is checked, while the explicitly
+                              ;; `unchecked-*` forms wrap.  Retain that distinction in KernelBody
+                              ;; rather than leaving a C-family emitter to choose signed overflow.
+                              integral-arithmetic?
+                              (and (contains? #{:byte :int :long} operand-type)
+                                   (contains? #{:+ :- :*} operator))
+                              operand-ranges (mapv :range lowered)
+                              proven-range (when integral-arithmetic?
+                                             (scalar-range/arithmetic operator operand-ranges))
+                              overflow (when integral-arithmetic?
+                                         (or (intrinsics/source-overflow-policy semantic-operation)
+                                             (when (scalar-range/contained-in-dtype? proven-range operand-type)
+                                               :no-overflow)
+                                             :trap))
+                              options (cond-> {} overflow (assoc :overflow overflow)
+                                               (= :no-overflow overflow)
+                                               (assoc :proof (assoc proven-range
+                                                              :kind :typed-scalar-range)))
                               _ (when-not (every? #(= operand-type (:type %)) lowered)
                                   (decline! :operand-dtype
                                             "scalar intrinsic operands require one dtype"
                                             {:expression expression :operand-type operand-type
                                              :actual (mapv :type lowered)}))
                               result (fresh "value")]
-                          {:operations
-                           (conj (vec (mapcat :operations lowered))
-                                 (body/->ScalarCompute
-                                 (body/value result result-type)
-                                  (body/scalar-expression operator result-type
-                                                          (mapv :result lowered)
-                                                          options)))
-                           :result result :type result-type}))))
+                          (let [range (when (= :no-overflow overflow) proven-range)]
+                            (remember-range! result (or range (scalar-range/for-dtype result-type)))
+                            {:operations
+                             (conj (vec (mapcat :operations lowered))
+                                   (body/->ScalarCompute
+                                    (body/value result result-type)
+                                    (body/scalar-expression operator result-type
+                                                            (mapv :result lowered)
+                                                            options)))
+                             :result result :type result-type
+                             :range (or range (scalar-range/for-dtype result-type))})))))
 
                   :else
                   (decline! :scalar-expression

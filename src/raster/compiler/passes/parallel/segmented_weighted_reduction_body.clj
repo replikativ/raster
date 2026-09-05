@@ -16,7 +16,19 @@
   (body/literal value type))
 
 (defn- expr [op type & arguments]
+  ;; Arithmetic over raw device metadata intentionally carries no implied proof.  Callers must
+  ;; sanitize/bound its operands and use `bounded-expr` before claiming `:no-overflow`.
   (body/scalar-expression op type arguments))
+
+(defn- bounded-expr
+  "Build an integral schedule calculation after its local range proof has bounded every operand."
+  [op type & arguments]
+  (body/scalar-expression
+   op type arguments
+   (if (and (contains? #{:byte :int :long} type)
+            (contains? #{:+ :- :*} op))
+     {:overflow :no-overflow}
+     {})))
 
 (defn- select-expr [condition if-true if-false type]
   (body/scalar-expression :select type [condition if-true if-false]))
@@ -217,7 +229,7 @@
               (expr :ge :predicate 'kv-start-position (lit 0 :int)))
      (compute 'kv-start-long :long (cast-expr 'kv-start-position :long))
      (compute 'kv-length-long :long (cast-expr 'kv-length :long))
-     (compute 'kv-end-long :long (expr :+ :long 'kv-start-long 'kv-length-long))
+     (compute 'kv-end-long :long (bounded-expr :+ :long 'kv-start-long 'kv-length-long))
      (compute 'kv-end-bounded :predicate
               (expr :le :predicate 'kv-end-long (lit 2147483648 :long)))
      (compute 'route-valid :predicate
@@ -248,7 +260,22 @@
               (expr :le :predicate 'page-end (lit capacity :int)))
      (compute 'kv-start-nonnegative :predicate
               (expr :ge :predicate 'kv-start-position (lit 0 :int)))
-     (compute 'routed-page-count :int (expr :- :int 'page-end 'page-begin))
+     ;; Raw offsets are untrusted device metadata. Clamp both endpoints before deriving a count;
+     ;; each resulting operand lies in [0, capacity] and attention validation proves that the
+     ;; static capacity itself fits int32.
+     (compute 'safe-page-begin :int
+              (expr :min :int (expr :max :int 'page-begin (lit 0 :int))
+                    (lit capacity :int)))
+     (compute 'safe-page-end :int
+              (expr :min :int (expr :max :int 'page-end (lit 0 :int))
+                    (lit capacity :int)))
+     ;; This subtraction is range-safe but can be negative for malformed raw offsets.  Clamp the
+     ;; derived count before the `(count - 1) * page-size` schedule expression below; validity is
+     ;; still enforced independently by `route-valid`, so clamping cannot admit a malformed row.
+     (compute 'raw-routed-page-count :int
+              (bounded-expr :- :int 'safe-page-end 'safe-page-begin))
+     (compute 'routed-page-count :int
+              (expr :max :int 'raw-routed-page-count (lit 0 :int)))
      (compute 'has-routed-pages :predicate
               (expr :gt :predicate 'routed-page-count (lit 0 :int)))
      (compute 'empty-last-page-valid :predicate
@@ -257,32 +284,31 @@
               (expr :ge :predicate 'final-page-length (lit 1 :int)))
      (compute 'last-page-bounded :predicate
               (expr :le :predicate 'final-page-length (lit page-size :int)))
+     (compute 'safe-final-page-length :int
+              (expr :min :int (expr :max :int 'final-page-length (lit 0 :int))
+                    (lit page-size :int)))
      (compute 'nonempty-last-page-valid :predicate
               (and-expr 'last-page-positive 'last-page-bounded))
      (compute 'last-page-valid :predicate
               (select-expr 'has-routed-pages 'nonempty-last-page-valid
                            'empty-last-page-valid :predicate))
      (compute 'computed-kv-length :int
-              (expr :+ :int
-                    (expr :* :int
-                          (expr :- :int 'routed-page-count (lit 1 :int))
+              (bounded-expr :+ :int
+                    (bounded-expr :* :int
+                          (bounded-expr :- :int 'routed-page-count (lit 1 :int))
                           (lit page-size :int))
-                    'final-page-length))
+                    'safe-final-page-length))
      (compute 'kv-length :int
               (select-expr 'has-routed-pages 'computed-kv-length (lit 0 :int) :int))
      (compute 'kv-start-long :long (cast-expr 'kv-start-position :long))
      (compute 'kv-length-long :long (cast-expr 'kv-length :long))
-     (compute 'kv-end-long :long (expr :+ :long 'kv-start-long 'kv-length-long))
+     (compute 'kv-end-long :long (bounded-expr :+ :long 'kv-start-long 'kv-length-long))
      (compute 'kv-end-bounded :predicate
               (expr :le :predicate 'kv-end-long (lit 2147483648 :long)))
      (compute 'route-valid :predicate
               (all-expr ['page-zero-valid 'page-begin-nonnegative 'page-order-valid
                          'page-end-bounded 'kv-start-nonnegative 'last-page-valid
                          'kv-end-bounded]))
-     (compute 'safe-page-begin :int
-              (expr :min :int
-                    (expr :max :int 'page-begin (lit 0 :int))
-                    (lit (dec capacity) :int)))
      (compute 'safe-kv-length :int
               (expr :min :int
                     (expr :max :int 'kv-length (lit 0 :int))
@@ -291,12 +317,17 @@
 (defn- interval-membership-operations
   [{:keys [visibility]}]
   (let [{:keys [causal? window-left window-right]} visibility
+        ;; Query positions are int32 device values.  A larger static window is observationally
+        ;; equivalent to this cap for the validated int32 logical route, and retaining that cap
+        ;; keeps every widened long calculation within a four-int32 range.
+        window-left (when (some? window-left) (long (min window-left Integer/MAX_VALUE)))
+        window-right (when (some? window-right) (long (min window-right Integer/MAX_VALUE)))
         begin-expression
         (if (some? window-left)
           (expr :min :long
                 (expr :max :long
-                      (expr :- :long
-                            (expr :- :long 'query-position-long (lit window-left :long))
+                      (bounded-expr :- :long
+                            (bounded-expr :- :long 'query-position-long (lit window-left :long))
                             'kv-start-long)
                       (lit 0 :long))
                 'safe-kv-length-long)
@@ -306,17 +337,17 @@
           causal?
           (expr :max :long
                 (expr :min :long 'safe-kv-length-long
-                      (expr :+ :long
-                            (expr :- :long 'query-position-long 'kv-start-long)
+                      (bounded-expr :+ :long
+                            (bounded-expr :- :long 'query-position-long 'kv-start-long)
                             (lit 1 :long)))
                 (lit 0 :long))
 
           (some? window-right)
           (expr :max :long
                 (expr :min :long 'safe-kv-length-long
-                      (expr :+ :long
-                            (expr :- :long
-                                  (expr :+ :long 'query-position-long
+                      (bounded-expr :+ :long
+                            (bounded-expr :- :long
+                                  (bounded-expr :+ :long 'query-position-long
                                         (lit window-right :long))
                                   'kv-start-long)
                             (lit 1 :long)))
@@ -325,9 +356,9 @@
           :else 'safe-kv-length-long)]
     [(compute 'safe-kv-length-long :long (cast-expr 'safe-kv-length :long))
      (compute 'attention-begin :long
-              (expr :+ :long begin-expression (lit 0 :long)))
+              (bounded-expr :+ :long begin-expression (lit 0 :long)))
      (compute 'attention-end :long
-              (expr :+ :long end-expression (lit 0 :long)))
+              (bounded-expr :+ :long end-expression (lit 0 :long)))
      (compute 'membership-valid :predicate (true-expr))]))
 
 (defn- csr-membership-operations
@@ -359,18 +390,20 @@
 
 (defn- position-visible-expression
   [{:keys [causal? window-left window-right]}]
-  (all-expr
-   (cond-> []
-     causal?
-     (conj (expr :le :predicate 'kv-position 'query-position-long))
+  (let [window-left (when (some? window-left) (long (min window-left Integer/MAX_VALUE)))
+        window-right (when (some? window-right) (long (min window-right Integer/MAX_VALUE)))]
+    (all-expr
+     (cond-> []
+       causal?
+       (conj (expr :le :predicate 'kv-position 'query-position-long))
 
-     (some? window-left)
-     (conj (expr :ge :predicate 'kv-position
-                 (expr :- :long 'query-position-long (lit window-left :long))))
+       (some? window-left)
+       (conj (expr :ge :predicate 'kv-position
+                   (bounded-expr :- :long 'query-position-long (lit window-left :long))))
 
-     (some? window-right)
-     (conj (expr :le :predicate 'kv-position
-                 (expr :+ :long 'query-position-long (lit window-right :long)))))))
+       (some? window-right)
+       (conj (expr :le :predicate 'kv-position
+                   (bounded-expr :+ :long 'query-position-long (lit window-right :long))))))))
 
 (defn- cache-coordinates
   [layout kv-head physical-page page-token component]
@@ -390,7 +423,7 @@
               (and-expr 'logical-token-nonnegative 'logical-token-bounded))
      (compute 'logical-token-long :long (cast-expr 'logical-token :long))]
     [(compute 'logical-token-long :long
-              (expr :+ :long member (lit 0 :long)))
+              (bounded-expr :+ :long member (lit 0 :long)))
      (compute 'logical-token-valid :predicate (true-expr))]))
 
 (defn- physical-page-operations
@@ -405,8 +438,8 @@
      (load-value 'physical-page :int (:page-table route)
                  ['safe-query-batch 'safe-logical-page])
      (compute 'page-token :long
-              (expr :- :long 'logical-token-long
-                    (expr :* :long 'safe-logical-page (lit page-size :long))))
+              (bounded-expr :- :long 'logical-token-long
+                    (bounded-expr :* :long 'safe-logical-page (lit page-size :long))))
      (compute 'physical-page-nonnegative :predicate
               (expr :ge :predicate 'physical-page (lit 0 :int)))
      (compute 'physical-page-bounded :predicate
@@ -416,15 +449,15 @@
                 (expr :quot :long 'logical-token-long (lit page-size :long)))
        (compute 'safe-page-begin-long :long (cast-expr 'safe-page-begin :long))
        (compute 'raw-page-index :long
-                (expr :+ :long 'safe-page-begin-long 'logical-page))
+                (bounded-expr :+ :long 'safe-page-begin-long 'logical-page))
        (compute 'safe-page-index :long
                 (expr :min :long
                       (expr :max :long 'raw-page-index (lit 0 :long))
                       (lit (dec capacity) :long)))
        (load-value 'physical-page :int (:page-indices route) ['safe-page-index])
        (compute 'page-token :long
-                (expr :- :long 'logical-token-long
-                      (expr :* :long 'logical-page (lit page-size :long))))
+                (bounded-expr :- :long 'logical-token-long
+                      (bounded-expr :* :long 'logical-page (lit page-size :long))))
        (compute 'physical-page-nonnegative :predicate
                 (expr :ge :predicate 'physical-page (lit 0 :int)))
        (compute 'physical-page-bounded :predicate
@@ -544,7 +577,7 @@
          (concat
           token-ops
           [(compute 'kv-position :long
-                    (expr :+ :long 'kv-start-long 'logical-token-long))
+                    (bounded-expr :+ :long 'kv-start-long 'logical-token-long))
            (compute 'position-visible :predicate
                     (and-expr filter-expr (true-expr)))]
           page-ops
@@ -696,8 +729,8 @@
       (load-value physical-page :int (get-in problem [:route :page-table])
                   ['safe-query-batch safe-logical-page])
       (compute page-token :long
-               (expr :- :long member
-                     (expr :* :long safe-logical-page (lit page-size :long))))
+               (bounded-expr :- :long member
+                     (bounded-expr :* :long safe-logical-page (lit page-size :long))))
       (compute physical-page-nonnegative :predicate
                (expr :ge :predicate physical-page (lit 0 :int)))
       (compute physical-page-bounded :predicate
@@ -908,22 +941,22 @@
           (body/->AsyncLoopArg 'pipeline-carry-b (:group warm-b))]
          (flatten-operations
           [(compute current-a :long
-                    (expr :+ :long 'attention-begin
-                          (expr :* :long pair-index (lit 2 :long))))
-           (compute current-b :long (expr :+ :long current-a (lit 1 :long)))
+                    (bounded-expr :+ :long 'attention-begin
+                          (bounded-expr :* :long pair-index (lit 2 :long))))
+           (compute current-b :long (bounded-expr :+ :long current-a (lit 1 :long)))
            (body/->AsyncWait ['pipeline-carry-a] 1 :acquire
                              (body/full-participation))
            (workgroup-barrier)
            (:operations consume-a)
            (workgroup-barrier)
-           (compute next-a :long (expr :+ :long current-a (lit 2 :long)))
+           (compute next-a :long (bounded-expr :+ :long current-a (lit 2 :long)))
            (:operations refill-a)
            (body/->AsyncWait ['pipeline-carry-b] 1 :acquire
                              (body/full-participation))
            (workgroup-barrier)
            (:operations consume-b)
            (workgroup-barrier)
-           (compute next-b :long (expr :+ :long current-b (lit 2 :long)))
+           (compute next-b :long (bounded-expr :+ :long current-b (lit 2 :long)))
            (:operations refill-b)
            (body/->PipelineYield (pipeline-state-values (:state consume-b))
                                  [(:group refill-a) (:group refill-b)])])
@@ -939,14 +972,14 @@
      :operations
      (flatten-operations
       [(compute 'pipeline-membership-count :long
-                (expr :- :long 'attention-end 'attention-begin))
+                (bounded-expr :- :long 'attention-end 'attention-begin))
        (compute 'pipeline-zero :long
-                (expr :- :long 'attention-begin 'attention-begin))
+                (bounded-expr :- :long 'attention-begin 'attention-begin))
        (compute 'pipeline-pair-count :long
                 (expr :quot :long 'pipeline-membership-count (lit 2 :long)))
        (compute 'pipeline-refill-pairs :long
                 (expr :max :long
-                      (expr :- :long 'pipeline-pair-count (lit 1 :long))
+                      (bounded-expr :- :long 'pipeline-pair-count (lit 1 :long))
                       (lit 0 :long)))
        (compute 'pipeline-has-pair :predicate
                 (expr :ge :predicate 'pipeline-membership-count (lit 2 :long)))
@@ -954,9 +987,9 @@
         'pipeline-has-pair
         (flatten-operations
          [(compute warm-a-member :long
-                   (expr :+ :long 'attention-begin (lit 0 :long)))
+                   (bounded-expr :+ :long 'attention-begin (lit 0 :long)))
           (compute warm-b-member :long
-                   (expr :+ :long 'attention-begin (lit 1 :long)))
+                   (bounded-expr :+ :long 'attention-begin (lit 1 :long)))
           (:operations warm-a)
           (:operations warm-b)
           pipeline
@@ -964,12 +997,12 @@
                             0 :acquire (body/full-participation))
           (workgroup-barrier)
           (compute 'pipeline-final-pair :long
-                   (expr :- :long 'pipeline-pair-count (lit 1 :long)))
+                   (bounded-expr :- :long 'pipeline-pair-count (lit 1 :long)))
           (compute epilogue-a-member :long
-                   (expr :+ :long 'attention-begin
-                         (expr :* :long 'pipeline-final-pair (lit 2 :long))))
+                   (bounded-expr :+ :long 'attention-begin
+                         (bounded-expr :* :long 'pipeline-final-pair (lit 2 :long))))
           (compute epilogue-b-member :long
-                   (expr :+ :long epilogue-a-member (lit 1 :long)))
+                   (bounded-expr :+ :long epilogue-a-member (lit 1 :long)))
           (:operations epilogue-a)
           (:operations epilogue-b)
           (compute 'pipeline-has-odd :predicate
@@ -977,8 +1010,8 @@
                          (expr :rem :long 'pipeline-membership-count (lit 2 :long))
                          (lit 1 :long)))
           (compute odd-member :long
-                   (expr :+ :long 'attention-begin
-                         (expr :* :long 'pipeline-pair-count (lit 2 :long))))
+                   (bounded-expr :+ :long 'attention-begin
+                         (bounded-expr :* :long 'pipeline-pair-count (lit 2 :long))))
           (body/->IfRegion
            'pipeline-has-odd
            (flatten-operations
@@ -997,6 +1030,29 @@
         [fallback-loop
          (body/->Yield (pipeline-state-values fallback-state))]
         (pipeline-state-specs final-state))])}))
+
+(defn- source-membership-capacity
+  "The semantic membership extent represented by this concrete routed attention problem.
+
+  A tiled schedule may be self-consistent while still naming a different extent.  Keep this
+  computation adjacent to lowering rather than trusting a schedule-private copy of the fact."
+  [problem]
+  (if (attention/csr-visibility? (:visibility problem))
+    (get-in problem [:visibility :key-index-capacity])
+    (let [page-size (:page-size problem)]
+      (* page-size
+         (case (attention/route-kind (:route problem))
+           :dense-paged (get-in problem [:route :pages-per-sequence])
+           :csr-paged (get-in problem [:route :page-index-capacity]))))))
+
+(defn- int-literal-range!
+  [field value plan scheduled problem]
+  (when-not (and (integer? value) (<= 0 value Integer/MAX_VALUE))
+    (throw (ex-info "tiled weighted-reduction schedule exceeds portable int literal range"
+                    {:reason :segmented-weighted-reduction-body-int-literal-range
+                     :field field :value value :maximum Integer/MAX_VALUE
+                     :plan-id (:id plan) :schedule scheduled
+                     :operation-id (:id problem)}))))
 
 (defn- lowering-row!
   [plan scheduled problem]
@@ -1048,6 +1104,25 @@
     (throw (ex-info "partial/merge bodies require a tiled weighted-reduction schedule"
                     {:reason :segmented-weighted-reduction-body-schedule-phase
                      :expected :tiled :schedule scheduled})))
+  (let [tiling (:membership-tiling scheduled)
+        actual-capacity (source-membership-capacity problem)
+        scheduled-capacity (:membership-capacity tiling)
+        csr-capacity (when (attention/csr-visibility? (:visibility problem))
+                       (get-in problem [:visibility :key-index-capacity]))]
+    ;; Equality, not a lower/upper relation: either mismatch changes which source members the
+    ;; tiled graph visits and is therefore a semantic schedule forgery.
+    (when-not (= actual-capacity scheduled-capacity)
+      (throw (ex-info "tiled weighted-reduction schedule capacity disagrees with source problem"
+                      {:reason :segmented-weighted-reduction-body-membership-capacity
+                       :plan-id (:id plan) :operation-id (:id problem)
+                       :actual-capacity actual-capacity
+                       :scheduled-capacity scheduled-capacity
+                       :schedule scheduled})))
+    (doseq [[field value] [[:membership-capacity scheduled-capacity]
+                           [:tile-count (:tile-count tiling)]
+                           [:csr-key-index-capacity csr-capacity]]
+            :when (some? value)]
+      (int-literal-range! field value plan scheduled problem)))
   [plan scheduled problem])
 
 (defn- pipelined-lowering-row!
@@ -1222,26 +1297,38 @@
   (let [csr? (attention/csr-visibility? (:visibility problem))
         type (if csr? :int :long)
         tile-size (get-in scheduled [:membership-tiling :tile-size])
+        tile-count (get-in scheduled [:membership-tiling :tile-count])
         offset (if csr? 'history-tile-offset-int 'history-tile-offset)]
     (vec
      (concat
-      [(compute 'history-tile-offset-int :int
-                (expr :* :int 'history-tile (lit tile-size :int)))]
+      ;; Hardware ids are typed ints, but their launch range is not an arithmetic proof.  Tie the
+      ;; schedule's static tile-count to a real clamp before the certified product.  Schedule
+      ;; validation fixes tile-count=ceil(capacity/tile-size), so the resulting literal interval
+      ;; has a representable int32 product.
+      [(compute 'safe-history-tile :int
+                (expr :min :int
+                      (expr :max :int 'history-tile (lit 0 :int))
+                      (lit (max 0 (dec tile-count)) :int)))
+       (compute 'history-tile-offset-int :int
+                (bounded-expr :* :int 'safe-history-tile (lit tile-size :int)))]
       (when-not csr?
         [(compute 'history-tile-offset :long
                   (cast-expr 'history-tile-offset-int :long))])
+      ;; Both interval and CSR membership lowering clamp begin/end to their statically validated
+      ;; int32 capacity.  The tile offset is nonnegative and below the same capacity, so each
+      ;; difference/sum below stays within the selected int32/long representation.
       [(compute 'membership-count type
-                (expr :- type 'attention-end 'attention-begin))
+                (bounded-expr :- type 'attention-end 'attention-begin))
        (compute 'tile-relative-begin type
                 (expr :min type 'membership-count offset))
        (compute 'tile-membership-begin type
-                (expr :+ type 'attention-begin 'tile-relative-begin))
+                (bounded-expr :+ type 'attention-begin 'tile-relative-begin))
        (compute 'tile-membership-remaining type
-                (expr :- type 'membership-count 'tile-relative-begin))
+                (bounded-expr :- type 'membership-count 'tile-relative-begin))
        (compute 'tile-membership-width type
                 (expr :min type 'tile-membership-remaining (lit tile-size type)))
        (compute 'tile-membership-end type
-                (expr :+ type 'tile-membership-begin 'tile-membership-width))]))))
+                (bounded-expr :+ type 'tile-membership-begin 'tile-membership-width))]))))
 
 (defn- partial-store-operations
   [partial-ids slots]

@@ -156,6 +156,51 @@
 (defn- wrapping-arithmetic-kernel-body []
   (integer-arithmetic-kernel-body :wrap))
 
+(defn- bounded-byte-add-kernel-body []
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {'q :byte} :scalar-types {'i :long} :arrays #{'q}
+                  :index-scope #{'i} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        lowered ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
+                 :int {'i :long})]
+    (body/make
+     {:id :bounded-byte-add
+      :parameters [(body/->KernelParameter 'q :input :byte [16] :global
+                                            (layout/row-major [16] :byte) :input)
+                   (body/->KernelParameter 'i :scalar :long [] nil nil :index)
+                   (body/->KernelParameter 'out :output :int [1] :global
+                                            (layout/row-major [1] :int) :result)]
+      :stable-reads [(body/stable-read 'q)]
+      :operations (conj (vec (:operations lowered))
+                        (body/->ScalarStore 'out [0] (:result lowered) nil))
+      :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+      :provenance {:dialect :test}
+      :attributes {:kind :scalar}})))
+
+(defn- forged-no-overflow-kernel-body []
+  (body/make
+   {:id :forged-no-overflow
+    :parameters [(body/->KernelParameter 'a :scalar :int [] nil nil :left)
+                 (body/->KernelParameter 'b :scalar :int [] nil nil :right)
+                 (body/->KernelParameter 'out :output :int [1] :global
+                                          (layout/row-major [1] :int) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'result :int)
+                  (body/scalar-expression
+                   :+ :int ['a 'b]
+                   {:overflow :no-overflow
+                    ;; This contains the verifier's full operand result interval, but cannot
+                    ;; make that interval fit in int.  Evidence may describe a derivation; it
+                    ;; cannot turn overflow-prone arithmetic into `:no-overflow`.
+                    :proof {:kind :typed-scalar-range
+                            :lower Integer/MIN_VALUE :upper Integer/MAX_VALUE}}))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -288,18 +333,57 @@
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
 
-(deftest unchecked-source-arithmetic-retains-wrapping-semantics
+(deftest source-integral-arithmetic-retains-its-overflow-semantics
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :rule rule))))
         lowerer (scalar-expression/make-lowerer
                  {:array-types {} :scalar-types {'a :long 'b :long} :arrays #{}
                   :index-scope #{} :lower-index (fn [value _] value)
                   :decline! decline!})
+        checked (mapv #((:lower lowerer) % :long {'a :long 'b :long})
+                      ['(clojure.core/+ a b)
+                       '(clojure.core/- a b)
+                       '(clojure.core/* a b)])
         lowered ((:lower lowerer) '(unchecked-add a b) :long
                  {'a :long 'b :long})]
+    (is (every? #(= {:overflow :trap}
+                     (get-in % [:operations 0 :expression :options]))
+                checked)
+        "ordinary Clojure integer arithmetic is checked, never target-signed overflow")
     (is (= {:overflow :wrap}
            (get-in lowered [:operations 0 :expression :options])))
     (is (= :+ (get-in lowered [:operations 0 :expression :op]))))
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {'q :byte} :scalar-types {'i :long} :arrays #{'q}
+                  :index-scope #{'i} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        bounded ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
+                 :int {'i :long})
+        unknown ((:lower lowerer) '(clojure.core/+ a i) :long {'a :long 'i :long})
+        proved-kernel (bounded-byte-add-kernel-body)
+        opencl-source (opencl/emit-scalar-kernel
+                       "proved_byte_add" proved-kernel {:target-dialect :opencl-portable})]
+    (is (= {:overflow :no-overflow
+            :proof {:kind :typed-scalar-range :lower -121 :upper 134}}
+           (get-in (peek (:operations bounded)) [:expression :options])))
+    (is (= {:overflow :trap}
+           (get-in unknown [:operations 0 :expression :options])))
+    (is (= :+ (get-in (peek (:operations bounded)) [:expression :op]))
+        "byte storage, exact widening, and a literal prove this OpenCL-safe operation")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"not derivable from operand ranges"
+         (integer-arithmetic-kernel-body :no-overflow :+ :int))
+        "a producer cannot certify arbitrary scalar parameters with a bare no-overflow tag")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"integral arithmetic"
+         (forged-no-overflow-kernel-body))
+        "a producer proof map is evidence to check, never an authority to forge")
+    (is (str/includes? opencl-source "+ 7")
+        "a range-certified semantic operation remains legal portable OpenCL C"))
   (doseq [[target unsigned-type]
           [[:opencl-portable "ulong"]
            [:cuda "unsigned long long"]
@@ -318,20 +402,24 @@
     (testing (name target)
       (let [source (opencl/emit-scalar-kernel
                     "proved_arithmetic"
-                    (integer-arithmetic-kernel-body :no-overflow)
+                    (bounded-byte-add-kernel-body)
                     {:target-dialect target})]
-        (is (str/includes? source "rstr_a + rstr_b")
+        (is (str/includes? source "+ 7")
             "a proved in-range operation may use the target's signed instruction"))))
-  (testing "OpenCL C declines a contract for which the language has no standard trap primitive"
-    (doseq [target [:opencl-portable :opencl-intel]]
-      (try
-        (opencl/emit-scalar-kernel
-         "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
-         {:target-dialect target})
-        (is false "trapping arithmetic must not silently become signed target overflow")
-        (catch clojure.lang.ExceptionInfo exception
-          (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))
-              (name target))))))
+  (testing "portable OpenCL declines a contract for which the language has no standard trap primitive"
+    (try
+      (opencl/emit-scalar-kernel
+       "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+       {:target-dialect :opencl-portable})
+      (is false "trapping arithmetic must not silently become signed target overflow")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))))))
+  (testing "Intel OpenCL uses its explicit vendor trap contract"
+    (let [source (opencl/emit-scalar-kernel
+                  "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+                  {:target-dialect :opencl-intel})]
+      (is (str/includes? source "rstr_trap_add_i64(rstr_a, rstr_b)"))
+      (is (str/includes? source "__builtin_trap();"))))
   (doseq [[target compiler trap-spelling]
           [[:cuda "nvcc" "asm volatile(\"trap;\")"]
            [:hip "hipcc" "__builtin_trap()"]]]
@@ -352,6 +440,13 @@
           (is (str/includes? source trap-spelling))
           (is (= 2 (count (re-seq (re-pattern (str helper-name "\\(")) source)))
               "one checked definition accompanies one typed call")))
+      ;; `trapping-arithmetic-body` puts an add expression directly in ScalarStore.value.  This
+      ;; keeps helper discovery honest for legal non-ScalarCompute expression placements.
+      (let [source (opencl/emit-scalar-kernel
+                    "trapping_arithmetic" (fixtures/trapping-arithmetic-body)
+                    {:target-dialect target})]
+        (is (= 3 (count (re-seq #"rstr_trap_add_i32\(" source)))
+            "direct ScalarStore and nested LoopArg trap expressions receive their CUDA/HIP helper"))
       (when (command-available? compiler)
         (let [source (opencl/emit-scalar-kernel
                       "trapping_arithmetic" (fixtures/trapping-arithmetic-body)

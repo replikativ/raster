@@ -324,6 +324,14 @@
              :* :long [(body/literal Long/MAX_VALUE :long)
                        (body/literal 2 :long)]
              {:overflow :wrap}))]))))
+  (testing "integral arithmetic cannot omit its overflow semantics"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"requires exactly one overflow contract"
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'ambiguous :long)
+            (body/scalar-expression
+             :+ :long [(body/literal 1 :long) (body/literal 2 :long)]))]))))
   (testing "trapping and compiler-proved arithmetic are distinct legal contracts"
     (doseq [policy [:trap :no-overflow]]
       (is (body/kernel-body?
@@ -674,6 +682,35 @@
             [(reduce-x 'x-value) (body/->Yield [])]
             [(body/->Yield [])]
             [])])))))
+
+(deftest loop-carried-integral-ranges-do-not-become-unchecked-proofs
+  (testing "a single checked body pass cannot certify repeated increment"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not derivable from operand ranges"
+         (scalar-body
+          [(body/->ForLoop
+            (body/value 'i :int) 0 4 1
+            [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+            [(body/->ScalarCompute
+              (body/value 'next-carry :int)
+              (body/scalar-expression :+ :int ['carry (body/literal 1 :int)]
+                                      {:overflow :no-overflow}))
+             (body/->Yield ['next-carry])]
+            [(body/value 'loop-result :int)] {})]))))
+  (testing "a zero-trip loop cannot borrow its body yield's narrow range"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not derivable from operand ranges"
+         (scalar-body
+          [(body/->ForLoop
+            (body/value 'i :int) 0 0 1
+            [(body/->LoopArg (body/value 'carry :int)
+                             (body/literal Integer/MIN_VALUE :int))]
+            [(body/->Yield [(body/literal 0 :int)])]
+            [(body/value 'loop-result :int)] {})
+           (body/->ScalarCompute
+            (body/value 'unsafe-after-zero-trip :int)
+            (body/scalar-expression :- :int ['loop-result (body/literal 1 :int)]
+                                    {:overflow :no-overflow}))])))))
 
 (deftest scalar-and-collective-operators-have-semantic-dtype-domains
   (testing "floating intrinsics do not accept integers"

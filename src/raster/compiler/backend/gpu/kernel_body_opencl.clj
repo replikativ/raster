@@ -389,14 +389,24 @@
 
 (defn- scalar-expressions
   [value]
-  (when (record-kind? "ScalarExpr" value)
-    (cons value (mapcat scalar-expressions (:arguments value)))))
+  ;; ScalarExpr is legal in any scalar-valued operation field, not only ScalarCompute: masked
+  ;; load fallbacks, stores/atomics, loop arguments and yields, and collective inputs all carry
+  ;; values.  Traverse the complete verified operation tree so helper discovery is not coupled to
+  ;; one convenient placement of an expression.
+  (cond
+    (record-kind? "ScalarExpr" value)
+    (cons value (mapcat scalar-expressions (:arguments value)))
+
+    (map? value) (mapcat scalar-expressions (vals value))
+    ;; Keep this deliberately broader than vectors/lists: the verifier may add a scalar-valued
+    ;; collection field to a legal operation without making helper discovery placement-sensitive.
+    (coll? value) (mapcat scalar-expressions value)
+    :else []))
 
 (defn- trapping-arithmetic-requirements
   [operations]
   (->> operations
-       (filter #(record-kind? "ScalarCompute" %))
-       (mapcat #(scalar-expressions (:expression %)))
+       (mapcat scalar-expressions)
        (keep (fn [expression]
                (when (= :trap (get-in expression [:options :overflow]))
                  [(intrinsics/canonical (:op expression))

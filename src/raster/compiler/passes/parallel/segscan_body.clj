@@ -117,6 +117,13 @@
                                                    :parameter)
                           scalar-ids)
                      [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
+    ;; Scan's combine is semantic value arithmetic.  Its association certification does not prove
+    ;; a finite-width overflow algebra, so a schedule may not label it `:no-overflow`.
+    (when (dtype/integral? result-type)
+      (decline! :integral-overflow-algebra
+                "portable integer scan requires an explicit combine overflow contract"
+                {:phase phase :mode scan-mode :algebra scan-algebra
+                 :result-type result-type}))
     (when-not (and (contains? #{:single :intra-block :block-scan :carry-in} phase)
                    (contains? #{:inclusive :exclusive} scan-mode)
                    (scan/associative-scan? scan-algebra)
@@ -253,6 +260,9 @@
         identity (identity-value (:identity scan-algebra) result-type)
         scratch 'scan-workgroup-values
         carry 'scan-workgroup-carry
+        ;; Do not treat the ABI's `:bound` role as a proof.  The loop owns this clamp, so the
+        ;; verifier can replay the non-negative extent fact used by its schedule arithmetic.
+        safe-bound 'scan-safe-bound
         offsets (take-while #(< % workgroup-size) (iterate #(* 2 %) 1))
         masks (vec
                (concat
@@ -260,6 +270,9 @@
                  (body/->Mask :scan-loop-active
                               [(body/predicate
                                 :lt (body/expression :add 'scan-base 'scan-lane)
+                                ;; Masks are declared outside dataflow operation scope.  The
+                                ;; loop itself is clamped below; this raw bound remains only a
+                                ;; memory guard and establishes no arithmetic range fact.
                                 '_n_bound)])]
                 (map #(body/->Mask (offset-mask %)
                                    [(body/predicate :lte % 'scan-lane)])
@@ -289,7 +302,7 @@
             (body/scalar-expression :min :int
                                     [(body/literal workgroup-size :int)
                                      (body/scalar-expression :- :int
-                                                             ['_n_bound 'scan-base]
+                                                             [safe-bound 'scan-base]
                                                              {:overflow :no-overflow})]))
            (body/->ScalarLoad
             (body/value 'scan-chunk-last result-type) scratch
@@ -318,10 +331,17 @@
                      (dtype/bytes-of result-type))]
       :indices [(body/->IndexBinding 'scan-lane :local 0)]
       :masks masks
-      :operations [(body/->ScalarStore carry [0] identity :scan-lane-zero)
+      :operations [(body/->ScalarCompute
+                    (body/value safe-bound :int)
+                    (body/scalar-expression
+                     :min :int
+                     [(body/scalar-expression :max :int
+                                              ['_n_bound (body/literal 0 :int)])
+                      (body/literal Integer/MAX_VALUE :int)]))
+                   (body/->ScalarStore carry [0] identity :scan-lane-zero)
                    (barrier)
                    (body/->ForLoop
-                    (body/value 'scan-base :int) 0 '_n_bound workgroup-size []
+                    (body/value 'scan-base :int) 0 safe-bound workgroup-size []
                     loop-body [] {:association :ordered
                                   :uniform-iter-args #{}})]
       :schedule {:strategy :ordered-workgroup-chunks :association :certified

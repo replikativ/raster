@@ -47,7 +47,12 @@
       (and (pos-int? tile-size)
            (<= tile-size Integer/MAX_VALUE)
            (pos-int? tile-count)
+           ;; These values become launch dimensions and scalar int literals in the portable
+           ;; tiled body.  Keep the schedule target-neutral, but never permit a value the body
+           ;; cannot represent without narrowing.
+           (<= tile-count Integer/MAX_VALUE)
            (pos-int? membership-capacity)
+           (<= membership-capacity Integer/MAX_VALUE)
            (= tile-count (quot (+ membership-capacity (dec tile-size)) tile-size))
            (= :increasing-membership-tile merge-order)))
 

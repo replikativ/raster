@@ -54,19 +54,38 @@
         types))
       :operations
       (vec
-       (mapcat
-        (fn [[type suffix]]
-          (mapcat
-           (fn [index [operation operation-name]]
-             (let [result (symbol-of operation-name "_" suffix)]
-               [(body/->ScalarCompute
-                 (body/value result type)
-                 (body/scalar-expression
-                  operation type [(symbol-of "a_" suffix) (symbol-of "b_" suffix)]
-                  {:overflow :trap}))
-                (body/->ScalarStore (symbol-of "out_" suffix) [index] result nil)]))
-           (range) operations))
-        types))
+       (concat
+        (mapcat
+         (fn [[type suffix]]
+           (mapcat
+            (fn [index [operation operation-name]]
+              (let [result (symbol-of operation-name "_" suffix)]
+                ;; The add helper is referenced directly by a store, exercising complete helper
+                ;; discovery rather than relying on ScalarCompute as a privileged expression site.
+                (if (= :+ operation)
+                  [(body/->ScalarStore
+                    (symbol-of "out_" suffix) [index]
+                    (body/scalar-expression
+                     operation type [(symbol-of "a_" suffix) (symbol-of "b_" suffix)]
+                     {:overflow :trap}) nil)]
+                  [(body/->ScalarCompute
+                    (body/value result type)
+                    (body/scalar-expression
+                     operation type [(symbol-of "a_" suffix) (symbol-of "b_" suffix)]
+                     {:overflow :trap}))
+                   (body/->ScalarStore (symbol-of "out_" suffix) [index] result nil)])))
+            (range) operations))
+         types)
+        ;; LoopArg.initial is another legal, nested scalar-expression placement.  Retain it in
+        ;; the compiler fixture so CUDA/HIP helper discovery traverses region metadata as well.
+        [(body/->ForLoop
+          (body/value 'trap-loop-index :int) 0 1 1
+          [(body/->LoopArg
+            (body/value 'trap-loop-carry :int)
+            (body/scalar-expression :+ :int ['a_i32 'b_i32] {:overflow :trap}))]
+          [(body/->Yield ['trap-loop-carry])]
+          [(body/value 'trap-loop-result :int)]
+          {})]))
       :schedule {}
       :launch (launch/spec {:workgroup-size [1] :group-count [1]})
       :provenance {:dialect :compile-gate}
