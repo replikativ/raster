@@ -181,6 +181,28 @@
     (throw (ex-info "kernel executable has no runtime scalar representation for ABI dtype"
                     {:dtype dtype :value value}))))
 
+(defn physical-runtime-scalar
+  "Normalize one raw or already-physical scalar for an ABI slot.
+
+   This is the fail-before-driver boundary used by compatibility binders that already split
+   pointers, user scalars, and the implicit bound. In particular, an `:int` slot uses
+   `Math/toIntExact`; Clojure's unchecked `(int value)` is never an ABI conversion proof."
+  [slot value]
+  (when-not (= :scalar (:kind slot))
+    (throw (ex-info "physical runtime scalar requires a scalar ABI slot"
+                    {:reason :kernel-executable-scalar-slot :slot slot :value value})))
+  (let [kernel-dtype (:kernel-dtype slot)
+        raw (if (and (map? value) (contains? value :type) (contains? value :value))
+              (do
+                (when-not (= (dtype/canon kernel-dtype) (dtype/canon (:type value)))
+                  (throw (ex-info "physical runtime scalar has the wrong kernel ABI dtype"
+                                  {:reason :kernel-executable-scalar-type
+                                   :slot slot :expected kernel-dtype
+                                   :actual (:type value) :value value})))
+                (:value value))
+              value)]
+    {:type kernel-dtype :value (cast-runtime-scalar kernel-dtype raw)}))
+
 (defn typed-runtime-arguments
   "Normalize raw caller scalars to the explicit values required by KernelCall/KernelGraphCall.
 
@@ -200,10 +222,8 @@
                     (throw (ex-info "kernel executable scalar argument has the wrong logical ABI dtype"
                                     {:slot slot :expected (:dtype slot)
                                      :actual (:type value) :value value})))
-                  {:type (:kernel-dtype slot)
-                   :value (cast-runtime-scalar (:kernel-dtype slot) (:value value))})
-                {:type (:kernel-dtype slot)
-                 :value (cast-runtime-scalar (:kernel-dtype slot) value)})
+                  (physical-runtime-scalar slot (:value value)))
+                (physical-runtime-scalar slot value))
               value))
           abi runtime-arguments)))
 

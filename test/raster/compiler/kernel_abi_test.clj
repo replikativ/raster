@@ -281,6 +281,29 @@
       (finally
         (ocl/register-kernel! kernel-name {:test-tombstone? true})))))
 
+(deftest direct-compiled-map-staging-range-checks-every-physical-int-before-driver-loading
+  (let [abi [(kabi/slot 'x :input :float :role :operand)
+             (kabi/slot 'out :output :float :role :result)
+             (kabi/slot 'offset :scalar :int :role :parameter)
+             (kabi/slot '_n_bound :scalar :long :kernel-dtype :int :role :bound)]
+        too-large (inc (long Integer/MAX_VALUE))]
+    (doseq [[runtime register! invoke!]
+            [[:level-zero ze/register-kernel! ze/invoke-registered-kernel]
+             [:opencl ocl/register-kernel! ocl/invoke-registered-kernel]]]
+      (let [kernel-name (str "direct_int_range_" (name runtime) "_" (gensym))]
+        (register! kernel-name {:abi abi :dtype :float})
+        (try
+          (testing (str (name runtime) " captured scalar")
+            (is (thrown? ArithmeticException
+                  (invoke! kernel-name [(float-array 1)] (float-array 1)
+                           [too-large] 1))))
+          (testing (str (name runtime) " logical-long/physical-int bound")
+            (is (thrown? ArithmeticException
+                  (invoke! kernel-name [(float-array 1)] (float-array 1)
+                           [0] too-large))))
+          (finally
+            (register! kernel-name {:test-tombstone? true})))))))
+
 (deftest reduction-staging-rejects-abi-errors-before-driver-loading
   (let [kernel-name (str "reduction_abi_mismatch_" (gensym))
         abi [(kabi/slot 'x :input :float :role :operand)

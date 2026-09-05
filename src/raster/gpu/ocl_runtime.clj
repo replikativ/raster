@@ -24,6 +24,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.resident-value :as resident-value]))
 
@@ -993,7 +994,7 @@
     (try
       (case type
         :int    (let [seg (.allocate arena I32)]
-                  (.set seg I32 0 (int value))
+                  (.set seg I32 0 (Math/toIntExact (long value)))
                   (cl-call! "clSetKernelArg" @h-clSetKernelArg
                             [kernel (int arg-idx) (long 4) seg]))
         :long   (let [seg (.allocate arena I64)]
@@ -1050,9 +1051,17 @@
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
    (let [abi (:abi (get @kernel-registry kernel-name))
-         _ (when abi
-             (kabi/validate-split-binding! abi arrays scalar-args)
-             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
+         split-binding (when abi
+                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
+                           (kabi/validate-physical-pointer-dtypes!
+                            abi (physical-pointer-dtypes arrays))
+                           binding))
+         checked-scalars (when split-binding
+                           (mapv kexec/physical-runtime-scalar
+                                 (:scalar-slots split-binding) scalar-args))
+         checked-bound (if split-binding
+                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
+                         {:type :int :value (Math/toIntExact (long n))})
          {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
          dtype (kernel-info-value info :dtype :float)
@@ -1112,13 +1121,13 @@
        (swap! arg-idx inc))
 
      ;; Scalar args
-     (doseq [scalar scalar-args]
+     (doseq [scalar (or checked-scalars scalar-args)]
        (let [s (if (map? scalar) scalar {:type (if (= dtype :float) :float :double) :value scalar})]
          (set-kernel-arg-scalar! kernel-handle @arg-idx s)
          (swap! arg-idx inc)))
 
-     ;; n argument (always int, always last)
-     (set-kernel-arg-scalar! kernel-handle @arg-idx {:type :int :value (int n)})
+     ;; The implicit bound is normalized against its physical ABI before kernel loading.
+     (set-kernel-arg-scalar! kernel-handle @arg-idx checked-bound)
      (swap! arg-idx inc)
 
      ;; Enqueue NDRange
@@ -1422,9 +1431,18 @@
   ([^String kernel-name arrays scalar-args n]
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
-             (kabi/validate-split-binding! abi arrays scalar-args)
-             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
+   (let [abi (:abi (get @kernel-registry kernel-name))
+         split-binding (when abi
+                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
+                           (kabi/validate-physical-pointer-dtypes!
+                            abi (physical-pointer-dtypes arrays))
+                           binding))
+         checked-scalars (when split-binding
+                           (mapv kexec/physical-runtime-scalar
+                                 (:scalar-slots split-binding) scalar-args))
+         checked-bound (if split-binding
+                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
+                         {:type :int :value (Math/toIntExact (long n))})
          {:keys [program] :as loaded} (ensure-kernel-loaded! kernel-name)
          dtype (kernel-info-value loaded :dtype :float)
          kh (create-kernel-fresh program kernel-name)
@@ -1435,12 +1453,12 @@
          next-idx! #(swap! idx inc)]
      (doseq [arr arrays]
        (set-kernel-arg-buffer! kh (next-idx!) (device-mem-of arr)))
-     (doseq [v scalar-args]
+     (doseq [v (or checked-scalars scalar-args)]
        (set-kernel-arg-scalar! kh (next-idx!)
                                (if (map? v) v
                                    {:type scalar-type
                                     :value (if (= scalar-type :float) (float v) (double v))})))
-     (set-kernel-arg-scalar! kh (next-idx!) {:type :int :value (int n)})
+     (set-kernel-arg-scalar! kh (next-idx!) checked-bound)
      {:bound {:kernel kh :wg wg}
       :group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
       :kernel-name kernel-name
