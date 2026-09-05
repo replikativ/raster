@@ -263,7 +263,7 @@
   (let [form (list 'raster.par/reduce 'acc 0.0 'j 'n body-expr)
         s (soac/par-form->soac 'result form 0)
         segops (lower/lower-reduce s nil)]
-    (:source (sg/generate-segred-kernel (first segops) 'out :dtype :float))))
+    (:source (sg/generate-segred-kernel (first segops) 'result :dtype :float))))
 
 (defn- emitted-scan-graph
   ([form] (emitted-scan-graph form {}))
@@ -466,15 +466,15 @@
                {:raster.type/elem-type :float})
         s (soac/par-form->soac 'result form 0)
         segred (first (lower/lower-reduce s nil))
-        k (sg/generate-segred-kernel segred 'result-buffer :dtype :float
+        k (sg/generate-segred-kernel segred 'result :dtype :float
                                      :scalar-types {'scale :float 'n :int})]
     (is (kart/kernel-artifact? k))
     (testing "signature, ABI and compiler values have one identical order"
-      (is (= '[a result-buffer scale _n_bound] (mapv :name (:abi k))))
+      (is (= '[a result scale _n_bound] (mapv :name (:abi k))))
       (is (= [:input :output :scalar :scalar] (mapv :kind (:abi k))))
       (is (= [:float :float :float :int] (mapv :kernel-dtype (:abi k))))
       (is (= [:operand :result :parameter :bound] (mapv :role (:abi k))))
-      (is (= '[a result-buffer scale n] (:arguments k)))
+      (is (= '[a result scale n] (:arguments k)))
       (is (= (kabi/signature-shape (:abi k))
              (kabi/source-signature-shape (:kernel-name k) (:source k))))
       (is (= :no-write-alias (get-in k [:abi 0 :aliasing]))))
@@ -497,6 +497,28 @@
       (is (= '[a result _n_bound] (mapv :name (:abi k))))
       (is (= '[a result n] (:arguments k))))))
 
+(deftest one-scalar-segred-schedule-emits-through-every-c-family-fixture
+  (let [operation (first (lower/lower-reduce
+                          (soac/par-form->soac
+                           'result
+                           '(raster.par/reduce acc 0.0 i n
+                                               (+ acc (clojure.core/aget a i)))
+                           90)
+                          nil :dtype :float))]
+    (doseq [[target expected]
+            [[:opencl-portable :opencl-c]
+             [:cuda :cuda-c]
+             [:hip :hip-cpp]]]
+      (testing (name target)
+        (let [artifact (sg/generate-segred-kernel
+                        operation nil :dtype :float :target-dialect target)
+              certificate (get-in artifact [:provenance :scheduled-operation])]
+          (is (= expected (:target artifact)))
+          (is (identical? operation (:source certificate)))
+          (is (= artifact
+                 (scheduled-body/validate-artifact-projection!
+                  certificate artifact))))))))
+
 (deftest scalar-segred-schedule-rejects-a-forged-graph-source
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
@@ -514,6 +536,14 @@
                                #(mapv (fn [buffer] (assoc buffer :elements 2)) %))]
     (is (identical? operation (:source certificate)))
     (try
+      (sg/generate-segred-kernel operation 'forged-result
+                                 :dtype :double :array-types {'a :double})
+      (is false "production scalar emission cannot replace the semantic output identity")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :physical-output-remap
+               (get-in (ex-data exception)
+                       [:kernel-body-decline :missing-rule])))))
+    (try
       (segred-body/validate-against-node! certificate forged-node graph)
       (is false "a boundary-compatible but different SegRed must not reuse the certificate")
       (catch clojure.lang.ExceptionInfo exception
@@ -522,7 +552,65 @@
       (segred-body/validate-against-node! certificate node forged-storage)
       (is false "the graph result allocation must equal the scheduled output group count")
       (catch clojure.lang.ExceptionInfo exception
+        (is (= :output-elements (:missing-rule (ex-data exception))))))
+    (try
+      (sg/generate-kernel-graph forged-storage
+                                :array-types {'a :double}
+                                :scalar-types {'n :long})
+      (is false "production graph emission must apply the SegRed/node storage validator")
+      (catch clojure.lang.ExceptionInfo exception
         (is (= :output-elements (:missing-rule (ex-data exception))))))))
+
+(deftest scalar-segred-schedule-rejects-forged-phase-and-tree-facts
+  (let [operation (first (lower/lower-reduce
+                          (soac/par-form->soac
+                           'result
+                           '(raster.par/reduce acc 0.0 i 4096
+                                               (+ acc (clojure.core/aget a i)))
+                           92)
+                          nil :dtype :float))
+        options {:array-types {'a :float}}
+        missing-rule
+        (fn [candidate]
+          (try
+            (segred-body/schedule candidate nil options)
+            nil
+            (catch clojure.lang.ExceptionInfo exception
+              (:missing-rule (ex-data exception)))))
+        cases
+        [[:fused-map-representation (assoc operation :lambda '(identity element))]
+         [:phase-level (assoc operation :level (segop/->SegLevel :block :none))]
+         [:grid-shared-memory (assoc-in operation [:grid :shared-mem-bytes] 0)]
+         [:schedule-grid (assoc-in operation [:schedule :workgroup-size] 128)]
+         [:schedule-grid (assoc-in operation [:schedule :attributes :group-count] 1)]]]
+    (doseq [[expected candidate] cases]
+      (testing (name expected)
+        (is (= expected (missing-rule candidate)))))))
+
+(deftest scalar-segred-max-int-bound-uses-wide-overflow-free-schedule-arithmetic
+  (let [operation (first (lower/lower-reduce
+                          (soac/par-form->soac
+                           'result
+                           (list 'raster.par/reduce 'acc 0.0 'i Integer/MAX_VALUE
+                                 '(+ acc (clojure.core/aget a i)))
+                           93)
+                          nil :dtype :float))
+        kernel-body (:kernel-body
+                     (segred-body/lower operation nil
+                                        :dtype :float :array-types {'a :float}))
+        casts (filterv #(instance? raster.compiler.ir.kernel_body.IndexCast
+                                   (:expression %))
+                       (:indices kernel-body))
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                            (:operations kernel-body)))
+        index-expressions (into {} (map (juxt :id :expression) (:indices kernel-body)))]
+    (is (= '[wide-bound wide-group-index wide-group-count wide-local-index]
+           (mapv :id casts)))
+    (is (every? #(= :long (get-in % [:expression :dtype])) casts))
+    (is (= :long (get-in loop [:index :type])))
+    (is (= :sub (get-in index-expressions ['group-chunk :arguments 1 :arguments 0 :op]))
+        "ceil-div is expressed as 1+(n-1)/groups, never n+groups-1")
+    (is (= :add (:op (get index-expressions 'group-end))))))
 
 (deftest completed-scalar-reduction-transform-is-terminal-and-numerically-explicit
   (let [form (with-meta
@@ -544,7 +632,11 @@
             :input-dtype :float :result-dtype :float}
            (get-in certificate [:numerics :result-transform])))
     (is (= :certified-workgroup-tree (get-in certificate [:numerics :policy])))
-    (let [nonterminal (assoc terminal :phase :block-local)]
+    (let [nonterminal (assoc terminal
+                             :phase :block-local
+                             :level (segop/->SegLevel :block :virtual)
+                             :schedule (segred-body/scalar-workgroup-tree-schedule
+                                        (:reduction terminal) (:grid terminal) :block-local))]
       (try
         (segred-body/schedule nonterminal nil
                              {:array-types {'a :float}

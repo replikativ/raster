@@ -929,17 +929,20 @@
                        grid-1 :product product-schedule dtype)]
       (case (:strategy execution)
         :single
-        [(segop/->SegRed (:id description)
-                         space
-                         (segop/->SegLevel :block :none)
-                         reduction
-                         map-lambda
-                         (:inputs description)
-                         (:outputs description)
-                         (:scalars description)
-                         (single-block-grid grid-1)
-                         :single nil
-                         dtype)]
+        (let [grid (single-block-grid grid-1)]
+          [(segop/->SegRed (:id description)
+                           space
+                           (segop/->SegLevel :block :none)
+                           reduction
+                           map-lambda
+                           (:inputs description)
+                           (:outputs description)
+                           (:scalars description)
+                           grid
+                           :single
+                           (segred-body/scalar-workgroup-tree-schedule
+                            reduction grid :single)
+                           dtype)])
 
         :two-phase
         (let [level-1 (segop/->SegLevel :block :virtual)
@@ -953,13 +956,16 @@
               fold-scalars (if result-region
                              (set/intersection (set (:scalars description)) fold-symbols)
                              (:scalars description))
-              phase-1 (segop/->SegRed (:id description) space level-1
-                                      phase-1-reduction map-lambda
-                                      (:inputs description)
-                                      #{partials-sym}
-                                      fold-scalars
-                                      grid-1 :block-local nil
-                                      dtype)
+              phase-1 (segop/->SegRed
+                       (:id description) space level-1
+                       phase-1-reduction map-lambda
+                       (:inputs description)
+                       #{partials-sym}
+                       fold-scalars
+                       grid-1 :block-local
+                       (segred-body/scalar-workgroup-tree-schedule
+                        phase-1-reduction grid-1 :block-local)
+                       dtype)
               phase-2-idx (gensym "j_")
               phase-2-bound (segred-body/launch-group-count
                              (:num-blocks grid-1) bound (:block-size grid-1))
@@ -985,12 +991,15 @@
                 :algebra (:algebra reduction)
                 :attributes (assoc (:attributes reduction)
                                    :physical-phase :cross-block)})
-              phase-2 (segop/->SegRed [:reduction-phase (:id description) :cross-block]
-                                      phase-2-space level-2
-                                      phase-2-reduction nil
-                                      #{partials-sym} #{(:sym description)}
-                                      result-scalars grid-2 :cross-block nil
-                                      dtype)]
+              phase-2 (segop/->SegRed
+                       [:reduction-phase (:id description) :cross-block]
+                       phase-2-space level-2
+                       phase-2-reduction nil
+                       #{partials-sym} #{(:sym description)}
+                       result-scalars grid-2 :cross-block
+                       (segred-body/scalar-workgroup-tree-schedule
+                        phase-2-reduction grid-2 :cross-block)
+                       dtype)]
           [phase-1 phase-2])))))
 
 ;; ================================================================

@@ -231,6 +231,18 @@
                              :value compiler-value :indexes (vec indexes) :values values})))
           (first values))))))
 
+(defn realize-launch
+  "Realize an artifact's launch from a complete ABI-ordered runtime argument vector.
+
+   This deliberately does not construct a KernelCall: compatibility staging may reserve the
+   artifact's result pointer itself, but it must still honor the exact symbolic launch (including
+   occupancy caps) before that allocation exists. Scalar representation and pointer checks remain
+   the caller's responsibility and KernelCall performs them for resident execution."
+  [artifact arguments]
+  (let [artifact (kart/validate! artifact)
+        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+    (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))))
+
 (defn resolve-value
   "Resolve one compiler value through a checked call's artifact/runtime argument relation. This
    is used for artifact attributes such as a contraction's logical output extent; backends still
@@ -251,7 +263,9 @@
    (let [artifact (kart/validate! artifact)
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
          resolver (or resolve-value (argument-resolver artifact arguments))
-         realized (klaunch/realize (:launch artifact) resolver)
+         realized (if resolve-value
+                    (klaunch/realize (:launch artifact) resolver)
+                    (realize-launch artifact arguments))
          geometry (if group-count
                     (klaunch/geometry
                      {:workgroup-size (:workgroup-size realized)

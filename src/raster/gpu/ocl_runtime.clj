@@ -551,6 +551,15 @@
 (defn device-buffer? [x]
   (instance? OclBuffer x))
 
+(defn- known-buffer-capacity
+  "Return a device allocation's element capacity when Raster owns that fact.
+
+   A raw MemorySegment accepted by the low-level compatibility API is an opaque cl_mem handle. Its
+   Java segment size describes only the handle representation, never the allocation behind it."
+  [value]
+  (when (device-buffer? value)
+    (:n-elements ^OclBuffer value)))
+
 (defn- physical-pointer-dtypes [arrays]
   (mapv #(cond
            (device-buffer? %) (:dtype ^OclBuffer %)
@@ -1394,11 +1403,10 @@
                              (long (first group-count)) 1)]
               (doseq [[slot value] pointer-pairs
                       :when (= :result (:role slot))]
-                (let [capacity (cond
-                                 (device-buffer? value) (:n-elements ^OclBuffer value)
-                                 (instance? MemorySegment value)
-                                 (quot (.byteSize ^MemorySegment value)
-                                       (dt/bytes-of (:dtype slot))))]
+                ;; A raw MemorySegment here is an opaque cl_mem handle, not the allocation it
+                ;; names. Its byteSize is the handle representation size and says nothing about
+                ;; device capacity. Only OclBuffer carries a checked element count.
+                (let [capacity (known-buffer-capacity value)]
                   (when (and capacity (< (long capacity) required))
                     (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
                                     {:kernel-name kernel-name :slot slot
@@ -1412,11 +1420,8 @@
                 (throw (ex-info "resident contraction output extent must be non-negative"
                                 {:kernel-name kernel-name :out-elems out-elems})))
               (doseq [[slot value] pointer-pairs :when (= :result (:role slot))]
-                (let [capacity (cond
-                                 (device-buffer? value) (:n-elements ^OclBuffer value)
-                                 (instance? MemorySegment value)
-                                 (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))]
-                  (when (< (long capacity) out-elems)
+                (let [capacity (known-buffer-capacity value)]
+                  (when (and capacity (< (long capacity) out-elems))
                     (throw (ex-info "contraction output buffer is smaller than its artifact extent"
                                     {:kernel-name kernel-name :slot slot :out-elems out-elems
                                      :buffer-elements capacity})))))))

@@ -327,3 +327,17 @@
           (is (= :double (:actual (ex-data e))))))
       (finally
         (ze/register-kernel! kernel-name {:test-tombstone? true})))))
+
+(deftest scalar-reduction-host-combine-obeys-storage-rounding-and-c-family-nans
+  (let [combine (ns-resolve 'raster.gpu.ze-runtime 'combine-scalar-partials)]
+    (is (= 0.0
+           (double (combine :float "+" 0.0
+                            [16777216.0 1.0 -16777216.0])))
+        "FP32 compatibility combine rounds after every certified operation")
+    (is (= 1.0
+           (double (combine :double "+" 0.0
+                            [16777216.0 1.0 -16777216.0]))))
+    (is (= 3.0 (double (combine :float "fmax" Float/NEGATIVE_INFINITY
+                                [Float/NaN 3.0]))))
+    (is (= 3.0 (double (combine :float "fmin" Float/POSITIVE_INFINITY
+                                [Float/NaN 3.0]))))))

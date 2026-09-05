@@ -247,11 +247,16 @@
                  {:raster.type/elem-type :float})
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
-      (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+      (is (= 'raster.compiler.pipeline/invoke-scheduled-executable!
              (first (:form result))))
-      (is (= '[a obuf scale n] (nth (:form result) 2)))
+      (is (= '[a obuf scale n] (nth (:form result) 3)))
+      (is (= 1 (count (:dispatches result))))
+      (is (= :scalar-workgroup-tree
+             (:default-strategy (first (:dispatches result)))))
       (is (= '[a obuf scale _n_bound]
-             (mapv :name (:abi (first (:kernels result)))))))))
+             (mapv :name (:abi (first (:kernels result))))))
+      (is (= [1] (get-in result [:kernels 0 :launch :group-count])))
+      (is (= :single (get-in result [:kernels 0 :attributes :phase]))))))
 
 (deftest opencl-pass-full-contraction-reduction-uses-ordered-marker
   (let [product (with-meta '(* (aget A i) (aget B i)) {:raster.type/tag 'float})

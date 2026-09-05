@@ -114,6 +114,21 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires :reduce-bound"
                             (route/validate-descriptor (dissoc red :reduce-bound)))))))
 
+(deftest zero-free-contraction-is-a-real-flat-scalar-segred-schedule
+  (let [routed (route/route-contraction
+                '(raster.par/contract O [] [[i 4] [j 6]]
+                                      (aget A (+ (* i 6) j)))
+                :dtype :float)
+        source (get-in routed [:artifact :provenance :scheduled-operation :source])]
+    (is (= 24 (:reduce-bound routed))
+        "the physical bound is the flattened product, not the first surface axis")
+    (is (= 24 (get-in source [:space :dims 0 :bound])))
+    (is (= :block-local (:phase source)))
+    (is (= [:block :virtual] ((juxt :level :virt) (:level source))))
+    (is (= :scalar-workgroup-tree (get-in source [:schedule :strategy])))
+    (is (= (get-in source [:grid :num-blocks])
+           (get-in source [:schedule :attributes :group-count])))))
+
 (deftest signature-parser-handles-the-real-kernels
   (testing "the parser finds every param of a multi-line DPAS signature"
     (let [d (route/route-contraction (mm 256 512 128) :dtype :half)

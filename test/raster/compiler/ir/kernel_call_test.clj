@@ -96,6 +96,31 @@
       (is (= workgroup (get-in call [:geometry :workgroup-size])))
       (is (= groups (get-in call [:geometry :group-count]))))))
 
+(deftest launch-realization-preserves-the-artifact-occupancy-cap-at-max-int
+  (let [capped
+        (kart/make
+         {:kernel-name "capped_reduction_launch_test"
+          :source "__kernel void capped_reduction_launch_test(int n) {}"
+          :abi [(kabi/slot 'n :scalar :int :role :bound)]
+          :arguments '[n]
+          :launch (klaunch/spec
+                   {:workgroup-size [256]
+                    :group-count [(klaunch/minimum
+                                   17 (klaunch/ceil-div 'n 256))]})})
+        geometry (kcall/realize-launch
+                  capped [{:type :int :value Integer/MAX_VALUE}])]
+    (is (= [256] (:workgroup-size geometry)))
+    (is (= [17] (:group-count geometry))
+        "staging must not reconstruct an uncapped ceil-div launch")))
+
+(deftest opencl-raw-handles-do-not-claim-device-allocation-capacity
+  (let [capacity (ns-resolve 'raster.gpu.ocl-runtime 'known-buffer-capacity)
+        handle (java.lang.foreign.MemorySegment/ofArray (long-array 1))
+        owned (ocl/->OclBuffer handle handle 1024 4096 :float 64)]
+    (is (nil? (capacity handle))
+        "a MemorySegment accepted as cl_mem describes the handle, not the allocation")
+    (is (= 1024 (capacity owned)))))
+
 (deftest call-rejects-untyped-or-mistyped-scalars
   (testing "runtime scalar typing is part of the call, not a backend guess"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"typed value"

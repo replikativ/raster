@@ -621,7 +621,7 @@
                             {:reason :segred-graph-context
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
-            (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
+            (segred-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         output (some #(when (= :result (:role %)) (:id %))
                      (get-in scheduled [:body :parameters]))

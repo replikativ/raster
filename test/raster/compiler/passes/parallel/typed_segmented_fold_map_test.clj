@@ -15,6 +15,7 @@
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
@@ -251,6 +252,25 @@
     (is (= #{'nsegments 'width} (get-in graph [:nodes 0 :scalar-uses])))
     (is (= artifact
            (scheduled-body/validate-artifact-projection! certificate artifact)))))
+
+(deftest fold-map-graph-emission-keeps-the-generic-scheduled-body-validator
+  (let [operation (scheduled-operation)
+        graph (kgraph/from-segops
+               [operation]
+               {:inputs #{'values} :outputs #{'out} :dtype :float
+                :buffer-specs {'values {:dtype :float :elements 'elements}
+                               'out {:dtype :float :elements 'elements}}
+                :scalars [(kgraph/scalar 'nsegments :int)
+                          (kgraph/scalar 'width :int)]})]
+    (with-redefs [segred-body/validate-against-node!
+                  (fn [& _]
+                    (throw (ex-info "SegRed validator used for SegFoldMap" {})))]
+      (is (artifact/kernel-artifact?
+           (get-in (segop-opencl/generate-kernel-graph
+                    graph :target-dialect :opencl-portable
+                    :array-types {'values :float 'out :float}
+                    :scalar-types {'nsegments :int 'width :int})
+                   [:nodes 0 :operation]))))))
 
 (deftest malformed-fold-map-contracts-decline-before-a-refinement-witness
   (let [operation (scheduled-operation)

@@ -37,6 +37,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
 (defn par-contract-form?
@@ -143,7 +144,8 @@
    reuse a contraction input by compiler identity without adding a second ABI slot. Default single-launch
    leaves must also supply matching 1-3D workgroup/grid data; validation closes those fields and the
    ordered compiler values into a KernelArtifact. Full reductions already arrive as a verified
-   artifact and retain their distinct two-phase invoke protocol, whose scheduler owns geometry.
+   artifact and retain their distinct host-terminal invoke protocol; staging realizes that
+   artifact's own symbolic geometry.
 
    Returns the descriptor with `:arguments`, the compiler values in exact ABI order, and an
    executable `:artifact` for every route."
@@ -207,8 +209,9 @@
       (nil? out-elems)
       (throw (ex-info "contract descriptor: :out-elems is required (the artifact sizes the output with it)"
                       {:strategy strategy}))
-      ;; A single-launch descriptor preserves the schedule's actual dimensionality. The reduction
-      ;; invoke computes its own two-phase geometry, so it legitimately carries neither.
+      ;; A single-launch descriptor preserves the schedule's actual dimensionality. A reduction
+      ;; descriptor already carries its complete artifact launch, so this compatibility descriptor
+      ;; legitimately duplicates neither field.
       (and (not= :reduction invoke)
            (not (and (vector? wg) (vector? grid)
                      (<= 1 (count wg) 3)
@@ -216,7 +219,7 @@
       (throw (ex-info "contract descriptor: :wg and :grid must have matching 1-3D geometry"
                       {:strategy strategy :wg wg :grid grid}))
       (and (= :reduction invoke) (or (some? wg) (some? grid)))
-      (throw (ex-info "contract descriptor: :invoke :reduction must not carry :wg/:grid (the invoke owns the two-phase launch)"
+      (throw (ex-info "contract descriptor: :invoke :reduction must not duplicate its artifact launch in :wg/:grid"
                       {:strategy strategy :wg wg :grid grid}))
       (and (= :reduction invoke) (nil? reduce-bound))
       (throw (ex-info "contract descriptor: :invoke :reduction requires :reduce-bound"
@@ -297,6 +300,34 @@
                     {:reason :epilogue-unsupported-by-this-leaf :strategy (:strategy d)
                      :declines (vec (:declines d))})))
   d)
+
+(defn- scalar-contraction-phase
+  "Refine the zero-free-axis contraction cell to the scalar SegRed schedule it executes.
+
+   Typed contraction lowering initially carries the candidate schedule used by tensor-valued
+   contractions. A scalar output has no matrix/register-tiled candidate: it is one block-local
+   workgroup-tree phase followed by the compatibility host combine. Replace the irrelevant
+   thread/virtual level and hardware-family schedule with that exact physical phase before target
+   emission."
+  [operation output dtype reduced-bound]
+  (let [workgroup-size (or (get-in operation [:grid :block-size]) 256)
+        grid (segop/->KernelGrid
+              (or (get-in operation [:grid :num-blocks])
+                  (klaunch/ceil-div reduced-bound workgroup-size))
+              workgroup-size
+              (* workgroup-size (dtype/bytes-of dtype)))
+        operator (update (:reduction operation) :components
+                         (fn [components]
+                           (mapv #(assoc % :result output) components)))]
+    (assoc operation
+           :level (segop/->SegLevel :block :virtual)
+           :reduction operator
+           :lambda nil
+           :outputs #{output}
+           :grid grid
+           :phase :block-local
+           :schedule (segred-body/scalar-workgroup-tree-schedule
+                      operator grid :block-local))))
 
 (defn route-contraction
   "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
@@ -420,23 +451,22 @@
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
       ;; SegSpace then has only the reduced dim — exactly the 1-D shape (seg-space-1d?) that
       ;; generate-segred-kernel's two-phase tree reduction already consumes, so no new emitter.
-      ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
-      ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
+      ;; Its launch protocol differs (one scheduled partial phase plus a host-side terminal
+      ;; combine), so the descriptor says so with :invoke :reduction rather than pretending it is
+      ;; a 2-D kernel launch.
         (zero? n-free)
-        (let [sr (or scheduled-operation
-                     (cl/contract-form->segred
-                      (compatibility-form! contract-form :full-reduce)
-                      :dtype dtype :facts contract-facts))
-              ;; A zero-free-axis contraction is physically the nonterminal phase consumed by the
-              ;; registered host-combine protocol. The old contraction/segmented tags carried no
-              ;; scalar reduction schedule and are outside the canonical SegRed phase vocabulary.
-              sr (if (and (empty? (segop/seg-space-segment-dims (:space sr)))
-                          (not (contains? #{:single :block-local :cross-block} (:phase sr))))
-                   (assoc sr :phase :block-local)
-                   sr)
+        (let [semantic-operation
+              (or scheduled-operation
+                  (cl/contract-form->segred
+                   (compatibility-form! contract-form :full-reduce)
+                   :dtype dtype :facts contract-facts))
+              ;; The SegSpace is authoritative here. In particular, two or more contraction axes
+              ;; have already been flattened to their checked row-major product; selecting the
+              ;; first surface bound would schedule only a prefix of the reduction.
+              red-bound (:bound (segop/seg-space-reduced-dim (:space semantic-operation)))
+              sr (scalar-contraction-phase semantic-operation out-sym dtype red-bound)
               k (sco/generate-segred-kernel sr out-sym :dtype dtype)
-              attrs (:attributes k)
-              red-bound (second (first contract-axes))]
+              attrs (:attributes k)]
           {:strategy :full-reduce
            :invoke :reduction
            :artifact k
@@ -444,7 +474,6 @@
            :array-params (:array-params attrs)
            :abi (:abi k) :arguments (:arguments k)
            :dtype dtype :out-dtype dtype :out-elems 1
-           :n-phases (:n-phases attrs)
          ;; CARRY THE COMBINE for descriptor inspection as well as in the artifact attributes.
          ;; The staging runtime reads the artifact attributes for its host-side final combine.
            :c-op (:c-op attrs) :identity-val (:identity-val attrs)

@@ -35,20 +35,60 @@
 
 (def ^:private scalar-phases #{:single :block-local :cross-block})
 
+(defn scalar-workgroup-tree-schedule
+  "Construct the canonical schedule carried by one ordinary scalar SegRed phase.
+
+   This is shared by semantic-to-SegOp lowering and the zero-free contraction compatibility
+   projection. The source operation therefore states the workgroup tree that KernelBody later
+   verifies; KernelBody scheduling does not manufacture a second, implicit schedule."
+  [operator grid phase]
+  (let [operator (reduction/validate! operator)
+        workgroup-size (:block-size grid)
+        accumulator-dtype (dtype/canon (:dtype (first (:components operator))))
+        shared-memory-bytes (* workgroup-size (dtype/bytes-of accumulator-dtype))
+        terminal? (contains? #{:single :cross-block} phase)]
+    (reduction/schedule
+     {:strategy :scalar-workgroup-tree
+      :workgroup-size workgroup-size
+      :stages [:lane-fold :workgroup-tree (if terminal? :terminal-store :partial-store)]
+      :tuning-space {}
+      :numerical-mode (select-keys (if (scan/associative-scan? (:algebra operator))
+                                     (:algebra operator)
+                                     (first (:components (:algebra operator))))
+                                   [:order :reassociation :overflow])
+      :attributes {:phase phase
+                   :group-count (:num-blocks grid)
+                   :shared-memory-bytes shared-memory-bytes}})))
+
 (defn- validate-scalar-segred!
   "Validate the complete semantic/schedule subset implemented by the portable workgroup tree."
   [segred out-sym array-types]
   (when-not (instance? raster.compiler.ir.segop.SegRed segred)
     (throw (ex-info "scalar reduction scheduling requires a SegRed"
                     {:reason :raster/bug :operation segred})))
-  (let [operator (reduction/validate! (:reduction segred))
+  (let [operator (try
+                   (reduction/validate! (:reduction segred))
+                   (catch clojure.lang.ExceptionInfo exception
+                     (decline! :scalar-product-reduction
+                               "portable scalar SegRed requires a canonical ProductReduction"
+                               {:operation (:id segred) :reduction (:reduction segred)
+                                :reduction-error (ex-data exception)})))
         dimensions (segop/seg-space-segment-dims (:space segred))
         phase (:phase segred)
         outputs (vec (:outputs segred))
         component (first (:components operator))
         accumulator-dtype (dtype/canon (:dtype component))
-        workgroup-size (or (get-in segred [:grid :block-size]) 256)
+        grid (:grid segred)
+        workgroup-size (:block-size grid)
         num-blocks (get-in segred [:grid :num-blocks])
+        shared-memory-bytes (get-in segred [:grid :shared-mem-bytes])
+        schedule (try
+                   (reduction/validate-schedule! (:schedule segred))
+                   (catch clojure.lang.ExceptionInfo exception
+                     (decline! :scalar-workgroup-tree-schedule
+                               "portable scalar SegRed requires an explicit reduction schedule"
+                               {:operation (:id segred) :schedule (:schedule segred)
+                                :schedule-error (ex-data exception)})))
         result-region (get-in operator [:attributes :result-region])
         output (or out-sym (first outputs))
         declared-type (fn [id]
@@ -69,6 +109,10 @@
       (decline! :zero-segment-dimensions
                 "portable scalar SegRed cannot schedule a segmented result space"
                 {:operation (:id segred) :segment-dimensions dimensions}))
+    (when-not (nil? (:lambda segred))
+      (decline! :fused-map-representation
+                "scalar SegRed requires its element expression in ProductReduction, not map-lambda"
+                {:operation (:id segred) :map-lambda (:lambda segred)}))
     (when-not (contains? scalar-phases phase)
       (decline! :scalar-reduction-phase
                 "portable scalar SegRed has an unsupported reduction phase"
@@ -77,6 +121,11 @@
       (decline! :single-physical-output
                 "portable scalar SegRed requires one stable physical output identity"
                 {:operation (:id segred) :outputs outputs :requested-output out-sym}))
+    (when-not (= (first outputs) output)
+      (decline! :physical-output-remap
+                "scalar SegRed emission cannot silently replace its semantic output identity"
+                {:operation (:id segred) :semantic-output (first outputs)
+                 :requested-output out-sym}))
     (when-not (contains? #{:float :double} accumulator-dtype)
       (decline! :uniform-scalar-storage
                 "portable scalar SegRed supports FP32 or FP64 storage and accumulation"
@@ -94,6 +143,38 @@
       (decline! :workgroup-size
                 "portable scalar SegRed requires a positive power-of-two workgroup"
                 {:operation (:id segred) :workgroup-size workgroup-size}))
+    (let [expected-level (if (= :block-local phase)
+                           (segop/->SegLevel :block :virtual)
+                           (segop/->SegLevel :block :none))
+          expected-shared-memory (* workgroup-size (dtype/bytes-of accumulator-dtype))
+          expected-stages [:lane-fold :workgroup-tree
+                           (if (contains? #{:single :cross-block} phase)
+                             :terminal-store :partial-store)]]
+      (when-not (= expected-level (:level segred))
+        (decline! :phase-level
+                  "scalar SegRed phase and execution level disagree"
+                  {:operation (:id segred) :phase phase
+                   :expected expected-level :actual (:level segred)}))
+      (when-not (= expected-shared-memory shared-memory-bytes)
+        (decline! :grid-shared-memory
+                  "scalar SegRed grid shared memory differs from its workgroup tree"
+                  {:operation (:id segred) :expected expected-shared-memory
+                   :actual shared-memory-bytes}))
+      (when-not (= {:strategy :scalar-workgroup-tree
+                    :workgroup-size workgroup-size
+                    :stages expected-stages
+                    :phase phase
+                    :group-count num-blocks
+                    :shared-memory-bytes expected-shared-memory}
+                   {:strategy (:strategy schedule)
+                    :workgroup-size (:workgroup-size schedule)
+                    :stages (:stages schedule)
+                    :phase (get-in schedule [:attributes :phase])
+                    :group-count (get-in schedule [:attributes :group-count])
+                    :shared-memory-bytes (get-in schedule [:attributes :shared-memory-bytes])})
+        (decline! :schedule-grid
+                  "scalar SegRed schedule does not describe its emitted grid/workgroup tree"
+                  {:operation (:id segred) :phase phase :grid grid :schedule schedule})))
     (when (and (contains? #{:single :cross-block} phase) (not= 1 num-blocks))
       (decline! :terminal-phase-groups
                 "terminal scalar SegRed phases must launch exactly one workgroup"
@@ -104,7 +185,7 @@
                 {:operation (:id segred) :phase phase :result-region result-region}))
     {:operator operator :component component :dtype accumulator-dtype
      :workgroup-size workgroup-size :phase phase :output output
-     :result-region result-region}))
+     :result-region result-region :schedule schedule}))
 
 (defn- retained-expression-dtype
   "Read the walker/TypedClojure result fact carried by a scalar expression.
@@ -215,6 +296,11 @@
          (pos? (second grid-expression)))
     (launch/minimum (second grid-expression)
                     (launch/ceil-div bound workgroup-size))
+
+    ;; A compatibility or prior scheduling pass may already have constructed canonical launch IR.
+    ;; Preserve that inspectable expression instead of accepting only its historical source form.
+    (and (not (integer? grid-expression)) (launch/expression? grid-expression))
+    grid-expression
 
     :else
     (decline! :launch-grid
@@ -515,17 +601,35 @@
           :indices [(body/->IndexBinding 'group-index :group 0)
                     (body/->IndexBinding 'group-count :group-count 0)
                     (body/->IndexBinding 'local-index :local 0)
+                    ;; Widen schedule arithmetic before multiplying or adding. An int32 bound may
+                    ;; equal Integer/MAX_VALUE; inactive final-group lanes must not overflow while
+                    ;; merely forming the coordinate that the loop predicate excludes.
+                    (body/->IndexCompute
+                     'wide-bound (body/index-cast '_n_bound :long :exact))
+                    (body/->IndexCompute
+                     'wide-group-index (body/index-cast 'group-index :long :exact))
+                    (body/->IndexCompute
+                     'wide-group-count (body/index-cast 'group-count :long :exact))
+                    (body/->IndexCompute
+                     'wide-local-index (body/index-cast 'local-index :long :exact))
                     (body/->IndexCompute
                      'group-chunk
-                     (body/expression :ceil-div '_n_bound 'group-count))
+                     ;; For a positive extent, 1 + (n-1)/groups is overflow-free.
+                     (body/expression
+                      :add 1
+                      (body/expression :floor-div
+                                       (body/expression :sub 'wide-bound 1)
+                                       'wide-group-count)))
                     (body/->IndexCompute
-                     'group-start (body/expression :mul 'group-index 'group-chunk))
+                     'group-start (body/expression :mul 'wide-group-index 'group-chunk))
                     (body/->IndexCompute
-                     'group-end
-                     (body/expression :min '_n_bound
-                                      (body/expression :add 'group-start 'group-chunk)))
+                     'group-length
+                     (body/expression :min 'group-chunk
+                                      (body/expression :sub 'wide-bound 'group-start)))
                     (body/->IndexCompute
-                     'global-index (body/expression :add 'group-start 'local-index))]
+                     'global-index (body/expression :add 'group-start 'wide-local-index))
+                    (body/->IndexCompute
+                     'group-end (body/expression :add 'group-start 'group-length))]
           :masks (vec (concat
                        [(body/->Mask :lane-zero [(body/predicate :eq 'local-index 0)])]
                        (map (fn [stride]
@@ -535,7 +639,7 @@
                                         (iterate #(quot % 2) (quot workgroup-size 2))))))
           :operations (vec (concat
                             [(body/->ForLoop
-                              (body/value element-index :int)
+                              (body/value element-index :long)
                               'global-index 'group-end workgroup-size
                               [(body/->LoopArg (body/value lane-accumulator dtype)
                                                (body/literal identity dtype))]
@@ -660,6 +764,7 @@
                    :segop-id (:id segred) :phase phase}
       :attributes {:array-params arrays
                    :scalar-params scalars
+                   :strategy :scalar-workgroup-tree
                    :dtype (dtype/canon (:dtype segred))
                    :phase phase
                    :group-count output-elements
@@ -674,8 +779,13 @@
   "Close scalar SegRed output geometry over its complete KernelGraph context."
   [scheduled node kernel-graph]
   (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
-        output-use (first (filter #(contains? #{:write :read-write} (:access %))
-                                  (:uses node)))
+        source (:source scheduled)
+        semantic-output (first (:outputs source))
+        physical-result (get-in scheduled [:attributes :physical-result])
+        output-use (some #(when (and (= semantic-output (:buffer %))
+                                     (contains? #{:write :read-write} (:access %)))
+                            %)
+                         (:uses node))
         output-buffer (some #(when (= (:buffer output-use) (:id %)) %)
                             (concat (:inputs kernel-graph) (:outputs kernel-graph)
                                     (:temporaries kernel-graph)))
@@ -687,8 +797,13 @@
                                % {'_n_bound (:value bound-binding)})
                              (:shape output-parameter))
         output-elements (get-in scheduled [:attributes :output-elements])
-        group-count (get-in (scheduled-body/realized-launch scheduled) [:group-count 0])]
-    (when-not (and output-use output-buffer output-parameter bound-binding
+        realized-launch (scheduled-body/realized-launch scheduled)
+        group-count (get-in realized-launch [:group-count 0])
+        workgroup-size (get-in source [:grid :block-size])
+        shared-memory-bytes (get-in source [:grid :shared-mem-bytes])]
+    (when-not (and (= 1 (count (:outputs source)))
+                   (= semantic-output physical-result (:id output-parameter))
+                   output-use output-buffer output-parameter bound-binding
                    (= [output-elements] realized-shape)
                    (= output-elements group-count)
                    (= output-elements (:elements output-buffer)))
@@ -697,4 +812,16 @@
                 {:node (:id node) :output-use output-use :output-buffer output-buffer
                  :output-parameter output-parameter :realized-shape realized-shape
                  :output-elements output-elements :group-count group-count}))
+    (when-not (and (= (:phase source) (get-in scheduled [:effects :phase]))
+                   (= (:phase source) (get-in scheduled [:legality :phase]))
+                   (= (:phase source) (get-in scheduled [:attributes :phase]))
+                   (= workgroup-size (get-in scheduled [:body :schedule :workgroup-size]))
+                   (= [workgroup-size] (:workgroup-size realized-launch))
+                   (= shared-memory-bytes (:shared-memory-bytes realized-launch)))
+      (decline! :schedule-projection
+                "scalar SegRed certificate changes its source phase or workgroup-tree geometry"
+                {:node (:id node) :phase (:phase source)
+                 :effects (:effects scheduled) :legality (:legality scheduled)
+                 :attributes (:attributes scheduled) :launch realized-launch
+                 :grid (:grid source)}))
     scheduled))

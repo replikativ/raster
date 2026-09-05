@@ -1884,11 +1884,10 @@
                     (keep (fn [{:keys [id]}]
                             (when (= :constant (get roles id)) id)))
                     (:inputs selected)))
-            ;; A resident SegRed is deliberately a single-workgroup schedule. KernelGraphs own
-            ;; their complete launch geometry and therefore cannot accept this artifact override.
-            group-count (when (and (= :reduce convention)
-                                   (= :kernel-artifact (kexec/kind selected)))
-                          [1])]
+            ;; Launch geometry belongs to the selected executable. A resident scalar reduction
+            ;; that needs one group must arrive as an explicit :single SegRed refinement; the
+            ;; binder cannot reinterpret an occupancy-capped partial-reduction artifact.
+            group-count nil]
         (bind-selected-executable
          device-id selected ordered-args phase constant-buffer-ids group-count))
 
