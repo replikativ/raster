@@ -6,6 +6,7 @@
    scalar equations remain explicit host-only steps. OpenCL, CUDA, and HIP differ only at the
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [clojure.set :as set]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -40,15 +41,30 @@
 
 (defn- scheduled-body
   [parallel-program equation]
-  (let [algorithm (:algorithm equation)]
+  (let [algorithm (:algorithm equation)
+        ;; A graph is emitted one equation at a time, but storage extents may be named by a
+        ;; preceding pure TypedSOAC scalar equation.  Keep the checked launch projection on the
+        ;; narrowed body so later graph re-derivation (including emitted-equation validation)
+        ;; observes exactly the same authoritative definition.
+        preceding-equations
+        (take-while #(not= (:id %) (:id equation)) (:equations parallel-program))
+        ;; A later host scalar may depend on a prior numerical result.  The closed slice names
+        ;; that omitted result as an input, but it must still retain every earlier host equation
+        ;; so the emitted program can bind the slice back to the exact outer execution prefix.
+        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only]))
+                                   preceding-equations))
+        equations (conj scalar-prefix equation)]
     (program/make
      {:dialect :segop
       :source nil
       :values (:values parallel-program)
-      :inputs (:operands equation)
-      :equations [equation]
+      ;; The body is a normal, dependency-closed Program slice: preceding host scalar equations
+      ;; execute before—and therefore prove—the one emitted numerical equation.  Revalidation
+      ;; never consults an asserted extent map in descriptive attributes.
+      :inputs (program/infer-inputs equations)
+      :equations equations
       :outputs (:results equation)
-      :effects (:effects equation)
+      :effects (reduce set/union #{} (map :effects equations))
       :diagnostics []
       :provenance {:source-dialect :typed-soac
                    :pass :parallel-program-c-family}
@@ -68,7 +84,9 @@
      :array-types (:array-types opts)
      :target-dialect (get opts :target-dialect :opencl-intel)
      :target-device (:target-device opts)
-     :contraction-facts (:contraction-facts opts))))
+     :contraction-facts (:contraction-facts opts)
+     :scheduled-equation-algorithm (:scheduled-equation-algorithm opts)
+     :scheduled-equation-body (:scheduled-equation-body opts))))
 
 (defn- contraction-facts-by-operation
   "Project typed contraction facts once at the algorithm/schedule boundary.
@@ -119,7 +137,12 @@
       (let [scheduled (schedule/validate! (first (:operations equation)))
             body (:body scheduled)
             operations (vec (mapcat :operations (:equations body)))
-            emitted (emit-graph (:graph scheduled) (:values body) operations opts)]
+            emitted (emit-graph
+                     (:graph scheduled) (:values body) operations
+                     (assoc opts
+                            :scheduled-equation-algorithm
+                            (control/body (:algorithm scheduled))
+                            :scheduled-equation-body body))]
         (assoc equation :operations
                [(emitted-loop/make scheduled emitted {:provenance provenance})]))
 
@@ -142,7 +165,9 @@
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
             emitted (emit-graph scheduled-graph (:values body) operations
-                                (cond-> opts
+                                (cond-> (assoc opts
+                                               :scheduled-equation-algorithm algorithm
+                                               :scheduled-equation-body body)
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations

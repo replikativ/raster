@@ -52,7 +52,9 @@
 
     (soac/program-form? algorithm)
     (and (soac-boundary? equation algorithm)
-         (= (soac/equations algorithm) (:operations equation)))
+         (or (and (true? (get-in equation [:attributes :host-only]))
+                  (empty? (:operations equation)))
+             (= (soac/equations algorithm) (:operations equation))))
 
     :else false))
 
@@ -227,15 +229,33 @@
   (let [program-outputs (:outputs parallel-program)
         {:keys [hoisted retained]}
         (reduce (fn [{:keys [available] :as state} equation]
-                  (if (host-invocation-equation? available program-outputs equation)
-                    (-> state
-                        (update :hoisted conj equation)
-                        (update :available into (:results equation)))
-                    (update state :retained conj equation)))
+                  (let [host? (host-invocation-equation? available program-outputs equation)
+                        graph-shape? (true? (get-in equation
+                                                    [:attributes :graph-shape-definition]))]
+                    (cond
+                      (and host? (not graph-shape?))
+                      (-> state
+                          (update :hoisted conj equation)
+                          (update :available into (:results equation)))
+
+                      (and host? graph-shape?)
+                      ;; Allocation consumes this scalar on the host and target narrowing
+                      ;; consumes its exact typed equation as proof. Keep one explicit host-only
+                      ;; equation in program order; the invocation prefix materializes the same
+                      ;; pure definition before allocating storage.
+                      (-> state
+                          (update :retained conj
+                                  (-> equation
+                                      (assoc :operations [])
+                                      (update :attributes assoc :host-only true)))
+                          (update :available into (:results equation)))
+
+                      :else
+                      (update state :retained conj equation))))
                 {:available (set (:inputs parallel-program))
                  :hoisted [] :retained []}
                 (:equations parallel-program))]
-    (if (empty? hoisted)
+    (if (and (empty? hoisted) (= retained (:equations parallel-program)))
       parallel-program
       (let [inputs (program/infer-inputs retained)
             shape-equations (count (filter (comp shape-projection-source
@@ -279,8 +299,18 @@
                                            (when (= :binding (first (:site equation)))
                                              (second (:site equation)))))
                                (:equations parallel-program))
+          graph-shape-definitions
+          (into #{} (comp (filter #(true? (get-in %
+                                                   [:attributes :graph-shape-definition])))
+                          (mapcat :results))
+                (:equations parallel-program))
           candidates (filterv (fn [[symbol _]]
-                                (not (contains? equation-sites symbol)))
+                                ;; A graph-shape scalar remains an ordered TypedSOAC equation so
+                                ;; target narrowing can prove its exact algebra.  Host allocation
+                                ;; also needs the same pure value before numerical execution, so
+                                ;; materialize that one definition in the invocation prefix too.
+                                (or (contains? graph-shape-definitions symbol)
+                                    (not (contains? equation-sites symbol))))
                               source-pairs)
           shape-roots
           (into #{}
@@ -589,7 +619,11 @@
         (reduce
          (fn [{:keys [equations values]} equation]
            (let [algorithm (:algorithm equation)]
-             (if (control/loop-program? algorithm)
+             (cond
+               (true? (get-in equation [:attributes :host-only]))
+               {:equations (conj equations equation) :values values}
+
+               (control/loop-program? algorithm)
                (let [scheduled (lower/schedule algorithm opts)]
                  {:equations
                   (conj equations
@@ -601,6 +635,8 @@
                                     :schedule-dialect :segop
                                     :graph-dialect :kernel-graph)))
                   :values values})
+
+               :else
                (let [algorithm-values (:values (soac/facts algorithm))
                      schedule-options
                      (assoc opts

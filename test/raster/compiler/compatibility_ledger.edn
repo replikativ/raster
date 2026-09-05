@@ -19,7 +19,7 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0
+              :host-scalar-equations 1
               :emission-routes {:kernel-body 1}
               :kernel-body-declines {}}}
 
@@ -32,7 +32,7 @@
               :outputs 0 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0
+              :host-scalar-equations 1
               :emission-routes {:kernel-body 1}
               :kernel-body-declines {}}}
 
@@ -45,7 +45,7 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 7
-              :host-scalar-equations 0
+              :host-scalar-equations 17
               :emission-routes {:kernel-body 7}
               :kernel-body-declines {}}}
 
@@ -81,7 +81,7 @@
               :outputs 1 :driver-allocations 0}
    :emission {:structured-loops-emitted 0
               :typed-equations-emitted 1
-              :host-scalar-equations 0
+              :host-scalar-equations 1
               :emission-routes {:kernel-body 1}
               :kernel-body-declines {}}}
 

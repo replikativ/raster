@@ -103,15 +103,35 @@
                      'result)
         direct (frontend/form->program
                 source {:dtype :float :array-types {'x :float 'out :float}
-                        :scalar-types {'m :long 'n :long}})
+                        :scalar-types {'m :long 'n :long 'size :long}})
         routed (route/attempt source :float {'x :float 'out :float}
-                              {:scalar-types {'m :long 'n :long}})]
-    (is (= ['map] (mapv dialect/operation-kind (dialect/equations direct))))
+                              {:scalar-types {'m :long 'n :long 'size :long}})]
+    (is (= ['scalar 'map] (mapv dialect/operation-kind (dialect/equations direct))))
     (is (= :analyzed-source
            (get-in routed [:stats :front-end])))
     (is (= ['size '(clojure.core/* m n)]
            (vec (take 2 (second (get-in routed [:program :source])))))
         "host allocation retains the transitive scalar binding that computes its extent")))
+
+(deftest untyped-physical-allocation-capacity-fails-closed
+  ;; Retaining allocation capacity must not reintroduce a local expression-type guess.  The
+  ;; regular typed-analysis path stamps this binding; direct callers must supply the same fact.
+  (let [allocation (with-meta
+                     '(.invk raster.arrays/alloc-like_m_array_long-impl x size)
+                     {:raster.op/original 'raster.arrays/alloc-like})
+        source (list 'let*
+                     (vector 'size '(clojure.core/* m n)
+                             'out allocation
+                             'result '(raster.par/map! out i n float
+                                                       (clojure.core/aget x i)))
+                     'result)
+        reason (try
+                 (frontend/form->program source {:dtype :float :array-types {'x :float 'out :float}
+                                                 :scalar-types {'m :long 'n :long}})
+                 nil
+                 (catch clojure.lang.ExceptionInfo error
+                   (:reason (ex-data error))))]
+    (is (= :unsupported-scalar-binding reason))))
 
 (deftest guarded-dense-write-is-an-explicit-inout-map
   (let [program
@@ -774,6 +794,25 @@
     (is (= :typed-soac (get-in routed [:stats :route])))
     (is (= '[y (clojure.core/float-array n) out y]
            (vec (take 4 (second (get-in routed [:program :source]))))))))
+
+(deftest physical-allocation-capacity-retains-its-typed-scalar-definition
+  ;; The allocation remains scaffolding, but its size is an AbstractValue shape consumed by
+  ;; later graph allocation.  Dropping this pure scalar equation leaves a stable extent name
+  ;; with no executable/provable definition at the C-family graph boundary.
+  (let [source '(let* [rstr_extent_0 (* nrows width)
+                       out (clojure.core/float-array rstr_extent_0)
+                       step (raster.par/map-void! i nrows
+                                                  (clojure.core/aset
+                                                   out i (float (clojure.core/aget x i))))]
+                      step)
+        program (frontend/form->program source {:dtype :float :array-types {'x :float}
+                                                :scalar-types {'nrows :long 'width :long
+                                                               'rstr_extent_0 :long}})
+        equations (dialect/equations program)]
+    (is (= ['scalar 'map] (mapv dialect/operation-kind equations)))
+    (is (= 'rstr_extent_0 (first (nth (first equations) 2))))
+    (is (= :long (get-in (dialect/facts program) [:values 'rstr_extent_0 :dtype])))
+    (is (= program (dialect/validate! program)))))
 
 (deftest a-blas-gemm-call-is-the-contraction-it-computes
   ;; `(dgemm-nt! A B C m k n 1 0)` is `C[m,n] = A[m,k]·B[n,k]ᵀ`: the devirtualized BLAS effect
