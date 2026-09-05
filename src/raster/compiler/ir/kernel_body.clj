@@ -1045,6 +1045,9 @@
       (contains? #{:min :max} canonical-op)
       (scalar-range/minmax canonical-op ranges)
 
+      (= :quot canonical-op)
+      (scalar-range/quotient ranges)
+
       (= :select canonical-op)
       (scalar-range/hull (subvec ranges 1))
 
@@ -1063,6 +1066,15 @@
        derived-range
        (<= (:lower proof) (:lower derived-range))
        (<= (:upper derived-range) (:upper proof))))
+
+(defn- conservative-loop-info
+  "A loop body is checked once, not interpreted to an inductive fixed point.  In particular a
+  carried integer can change on every backedge and a loop may execute zero times.  Preserve only
+  its dtype fact until a future verifier grows explicit checked invariants."
+  [info type]
+  (if (contains? #{:byte :int :long} (canonical-type type))
+    (assoc info :range (scalar-range/for-dtype type))
+    info))
 
 (defn- scalar-info!
   [expression values]
@@ -1513,12 +1525,14 @@
                                       :uniformity loop-control})
                               (map (fn [arg initial]
                                      [(:id (:binding arg))
-                                      (if (contains? uniform-iter-args (:id (:binding arg)))
+                                      (let [initial (conservative-loop-info
+                                                     initial (:type (:binding arg)))]
+                                        (if (contains? uniform-iter-args (:id (:binding arg)))
                                         ;; This is an inductive claim, checked against the
                                         ;; backedge yield below. Unclaimed carries remain
                                         ;; conservative because a later iteration may diverge.
                                         initial
-                                        (assoc initial :uniformity lane-varying))])
+                                        (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
             yielded (validate-region! "kernel for-loop body" (:operations operation)
                                       (mapv :binding iter-args) loop-values
@@ -1539,7 +1553,7 @@
                                     {:reason :kernel-body-loop-result
                                      :result result :yielded yielded-info})))
                   (assoc env (:id result)
-                         (assoc yielded-info :uniformity
+                         (assoc (conservative-loop-info yielded-info (:type result)) :uniformity
                                 ;; The loop may execute zero times, so its result cannot be
                                 ;; more uniform than either the initial or backedge value.
                                 (reduce set/intersection loop-control
@@ -1578,9 +1592,11 @@
                                       :uniformity loop-control})
                               (map (fn [arg initial]
                                      [(:id (:binding arg))
-                                      (if (contains? uniform-iter-args (:id (:binding arg)))
+                                      (let [initial (conservative-loop-info
+                                                     initial (:type (:binding arg)))]
+                                        (if (contains? uniform-iter-args (:id (:binding arg)))
                                         initial
-                                        (assoc initial :uniformity lane-varying))])
+                                        (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
             body-values (validate-dataflow-operations!
                          (pop (:operations operation)) loop-values
@@ -1611,7 +1627,7 @@
                             {:reason :kernel-body-loop-result
                              :result result :yielded yielded-info})))
                   (assoc env (:id result)
-                         (assoc yielded-info :uniformity
+                         (assoc (conservative-loop-info yielded-info (:type result)) :uniformity
                                 (reduce set/intersection loop-control
                                         [(:uniformity initial-info)
                                          (:uniformity yielded-info)]))))

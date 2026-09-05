@@ -1255,14 +1255,20 @@
   (let [csr? (attention/csr-visibility? (:visibility problem))
         type (if csr? :int :long)
         tile-size (get-in scheduled [:membership-tiling :tile-size])
+        tile-count (get-in scheduled [:membership-tiling :tile-count])
         offset (if csr? 'history-tile-offset-int 'history-tile-offset)]
     (vec
      (concat
-      ;; `history-tile` is group axis 2, whose launch extent is the schedule's tile-count.
-      ;; Schedule validation fixes tile-count=ceil(capacity/tile-size), so its product below is
-      ;; strictly below the validated int32 membership capacity.
-      [(compute 'history-tile-offset-int :int
-                (bounded-expr :* :int 'history-tile (lit tile-size :int)))]
+      ;; Hardware ids are typed ints, but their launch range is not an arithmetic proof.  Tie the
+      ;; schedule's static tile-count to a real clamp before the certified product.  Schedule
+      ;; validation fixes tile-count=ceil(capacity/tile-size), so the resulting literal interval
+      ;; has a representable int32 product.
+      [(compute 'safe-history-tile :int
+                (expr :min :int
+                      (expr :max :int 'history-tile (lit 0 :int))
+                      (lit (max 0 (dec tile-count)) :int)))
+       (compute 'history-tile-offset-int :int
+                (bounded-expr :* :int 'safe-history-tile (lit tile-size :int)))]
       (when-not csr?
         [(compute 'history-tile-offset :long
                   (cast-expr 'history-tile-offset-int :long))])

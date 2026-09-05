@@ -270,7 +270,10 @@
                  (body/->Mask :scan-loop-active
                               [(body/predicate
                                 :lt (body/expression :add 'scan-base 'scan-lane)
-                                safe-bound)])]
+                                ;; Masks are declared outside dataflow operation scope.  The
+                                ;; loop itself is clamped below; this raw bound remains only a
+                                ;; memory guard and establishes no arithmetic range fact.
+                                '_n_bound)])]
                 (map #(body/->Mask (offset-mask %)
                                    [(body/predicate :lte % 'scan-lane)])
                      offsets)))

@@ -73,3 +73,17 @@
       :max {:lower (reduce max (map :lower operands))
             :upper (reduce max (map :upper operands))}
       nil)))
+
+(defn quotient
+  "Interval transfer for truncating quotient by one statically positive divisor.
+
+  Truncation toward zero is monotone for a positive divisor, including negative numerators.  We
+  intentionally require an exact divisor literal/range: a zero or sign-varying denominator has
+  distinct exceptional semantics and carries no schedule proof here."
+  [operands]
+  (when (every? some? operands)
+    (let [[numerator divisor] operands
+          divisor-value (:lower divisor)]
+      (when (and (= divisor-value (:upper divisor)) (pos? divisor-value))
+        {:lower (quot (:lower numerator) divisor-value)
+         :upper (quot (:upper numerator) divisor-value)}))))

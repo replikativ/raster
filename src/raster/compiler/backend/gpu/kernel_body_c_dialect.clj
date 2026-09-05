@@ -165,11 +165,11 @@
 (defn trapping-arithmetic-name
   "Name a checked signed-integer operation only when the target can terminate the invocation.
 
-  OpenCL C has no standard trap operation.  A portable OpenCL dialect must therefore decline this
-  contract instead of quietly depending on one vendor compiler's builtin or turning the operation
-  into undefined signed arithmetic."
+  OpenCL C has no standard trap operation.  The Intel dialect deliberately names the vendor
+  builtin contract used by Raster's production OpenCL row; portable OpenCL must still decline
+  rather than quietly depending on it or turning the operation into undefined signed arithmetic."
   [dialect operation type]
-  (when (opencl? dialect)
+  (when (= :opencl-portable (:id dialect))
     (throw (ex-info "OpenCL C has no portable trapping-arithmetic primitive"
                     {:reason :kernel-body-c-trap-unsupported
                      :dialect (:id dialect) :operation operation :type (dtype/canon type)})))
@@ -191,6 +191,10 @@
         helper-name (trapping-arithmetic-name dialect operation type)
         sign-bit (str "((" unsigned-type ")1 << " (dec (* 8 (dtype/bytes-of type))) ")")
         trap-source (case (:id dialect)
+                      ;; Intel's OpenCL frontend accepts this Clang builtin and lowers it to a
+                      ;; terminating device trap.  It is intentionally unavailable to the
+                      ;; portable dialect above.
+                      :opencl-intel "__builtin_trap();"
                       :cuda "asm volatile(\"trap;\");"
                       :hip "__builtin_trap();")
         arithmetic ({:+ "+" :- "-" :* "*"} operation)]

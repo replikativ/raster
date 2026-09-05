@@ -406,16 +406,20 @@
                     {:target-dialect target})]
         (is (str/includes? source "+ 7")
             "a proved in-range operation may use the target's signed instruction"))))
-  (testing "OpenCL C declines a contract for which the language has no standard trap primitive"
-    (doseq [target [:opencl-portable :opencl-intel]]
-      (try
-        (opencl/emit-scalar-kernel
-         "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
-         {:target-dialect target})
-        (is false "trapping arithmetic must not silently become signed target overflow")
-        (catch clojure.lang.ExceptionInfo exception
-          (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))
-              (name target))))))
+  (testing "portable OpenCL declines a contract for which the language has no standard trap primitive"
+    (try
+      (opencl/emit-scalar-kernel
+       "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+       {:target-dialect :opencl-portable})
+      (is false "trapping arithmetic must not silently become signed target overflow")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception))))))
+  (testing "Intel OpenCL uses its explicit vendor trap contract"
+    (let [source (opencl/emit-scalar-kernel
+                  "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
+                  {:target-dialect :opencl-intel})]
+      (is (str/includes? source "rstr_trap_add_i64(rstr_a, rstr_b)"))
+      (is (str/includes? source "__builtin_trap();"))))
   (doseq [[target compiler trap-spelling]
           [[:cuda "nvcc" "asm volatile(\"trap;\")"]
            [:hip "hipcc" "__builtin_trap()"]]]
