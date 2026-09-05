@@ -5,10 +5,10 @@
 
 (defn cast-body
   "Build the target-neutral body for one dense representation conversion."
-  [{:keys [kernel-name input output source-dtype destination-dtype vector-width rounding overflow]
+  [{:keys [id kernel-name input output source-dtype destination-dtype vector-width rounding overflow]
     :or {vector-width 1}}]
   (schedule/cast-body
-   {:id [:layout-transform kernel-name]
+   {:id (or id [:layout-transform kernel-name])
     :input input :output output
     :source-dtype source-dtype :destination-dtype destination-dtype
     :vector-width vector-width
@@ -16,9 +16,9 @@
 
 (defn transpose-body
   "Build the target-neutral body for one dense row-major matrix transpose."
-  [{:keys [kernel-name input output element-dtype]}]
+  [{:keys [id kernel-name input output element-dtype]}]
   (schedule/transpose-body
-   {:id [:layout-transform kernel-name]
+   {:id (or id [:layout-transform kernel-name])
     :input input :output output
     :element-dtype element-dtype}))
 

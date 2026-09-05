@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
@@ -1172,6 +1173,51 @@
           (is false "tampered source identity must be rejected")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :scheduled-kernel-body-source (:reason (ex-data exception))))))))
+    (testing "the retained schedule graph is independently replayable and emission-closed"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            replay (gpu-gemm/emit-scheduled-stage-graph
+                    stage-graph {:prefix "typed_contraction_replay"})
+            descriptive-tamper (assoc-in stage-graph [:attributes :tile] {:ignored true})
+            replay-after-tamper (gpu-gemm/emit-scheduled-stage-graph
+                                 descriptive-tamper {:prefix "typed_contraction_replay"})
+            bodies (fn [graph]
+                     (mapv #(get-in % [:operation :attributes :scheduled-kernel-body :body])
+                           (:nodes graph)))]
+        (is (= (bodies direct-graph) (bodies replay)))
+        (is (= (bodies replay) (bodies replay-after-tamper))
+            "unverified graph descriptions cannot steer target emission")
+        (doseq [[stage-node emitted-node] (map vector (:nodes stage-graph) (:nodes replay))
+                :when (layout-stage/layout-stage? (:operation stage-node))]
+          (is (= (get-in stage-node [:operation :id])
+                 (get-in emitted-node
+                         [:operation :attributes :scheduled-kernel-body :body :id]))
+              "a LayoutStage identity survives exactly into KernelBody"))
+        (try
+          (gpu-gemm/emit-scheduled-stage-graph
+           descriptive-tamper {:prefix "typed_contraction_replay"
+                               :refinement direct-refinement})
+          (is false "a refinement cannot certify a merely boundary-compatible graph")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :gemm-emission-refinement (:reason (ex-data exception))))))))
+    (testing "tampering with a stage-owned physical choice is rejected"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            without-vector-width
+            (update-in stage-graph [:nodes 0 :operation :policy] dissoc :vector-width)
+            matrix-index (first (keep-indexed
+                                 #(when (matrix-stage/matrix-stage? (:operation %2)) %1)
+                                 (:nodes stage-graph)))
+            without-tile (update-in stage-graph
+                                    [:nodes matrix-index :operation :schedule] dissoc :tile)]
+        (doseq [tampered [without-vector-width without-tile]]
+          (try
+            (gpu-gemm/emit-scheduled-stage-graph tampered {:prefix "tampered_schedule"})
+            (is false "an emission-open scheduled stage must be rejected")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :gemm-stage-emission-open (:reason (ex-data exception)))))))))
+    (is (= {:kind :split-k
+            :within-partition :tiled
+            :partial-combine :ordered-sequential}
+           (get-in split-refinement [:numerics :error-model :reduction-order])))
     (testing "explicit split factors remain compiler schedule candidates over the same typed equation"
       (let [tunable (contract-route/route-typed-contraction-dispatch
                      algorithm operation :dtype :float :desc descriptor
