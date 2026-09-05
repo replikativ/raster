@@ -110,6 +110,10 @@
     (throw (ex-info "kernel int scalar argument is outside its physical ABI range"
                     {:reason :kernel-scalar-range :slot slot :value value
                      :minimum Integer/MIN_VALUE :maximum Integer/MAX_VALUE})))
+  (when (and (= :bound (:role slot))
+             (or (not (integer? (:value value))) (neg? (:value value))))
+    (throw (ex-info "kernel extent bound must be a non-negative integer"
+                    {:reason :kernel-bound-range :slot slot :value value})))
   value)
 
 (defn- resident-view
@@ -262,6 +266,11 @@
   ([artifact arguments {:keys [group-count resolve-value]}]
    (let [artifact (kart/validate! artifact)
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
+         ;; Extent/range checks precede launch realization.  Otherwise a negative bound can first
+         ;; fail as an incidental zero-sized grid—or, for a clamped schedule, realize a valid grid.
+         _ (doseq [[slot value] (map vector (:abi artifact) arguments)
+                   :when (= :scalar (:kind slot))]
+             (scalar-value! slot value))
          resolver (or resolve-value (argument-resolver artifact arguments))
          realized (if resolve-value
                     (klaunch/realize (:launch artifact) resolver)

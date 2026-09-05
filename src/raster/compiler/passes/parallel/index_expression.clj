@@ -248,6 +248,7 @@
         :floor-div (apply launch/floor-div arguments)
         :ceil-div (apply launch/ceil-div arguments)
         :min (apply launch/minimum arguments)
+        :max (apply launch/maximum arguments)
         (decline! :launch-index-expression
                   "kernel index operation is not a non-negative launch extent"
                   {:expression expression :operation (:op expression)})))

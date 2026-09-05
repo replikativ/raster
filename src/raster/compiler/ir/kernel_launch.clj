@@ -13,6 +13,7 @@
 (defrecord Product [factors])
 (defrecord AlignUp [value alignment])
 (defrecord Minimum [values])
+(defrecord Maximum [values])
 (defrecord LaunchSpec [workgroup-size group-count shared-memory-bytes])
 (defrecord LaunchGeometry [workgroup-size group-count shared-memory-bytes])
 
@@ -81,6 +82,13 @@
     (throw (ex-info "minimum requires one or more non-nil values" {:values values})))
   (->Minimum (vec values)))
 
+(defn maximum
+  "The maximum of one or more integer expressions."
+  [& values]
+  (when-not (and (seq values) (every? some? values))
+    (throw (ex-info "maximum requires one or more non-nil values" {:values values})))
+  (->Maximum (vec values)))
+
 (defn launch-spec? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.LaunchSpec" x))
 
@@ -107,6 +115,9 @@
 
 (defn- minimum? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.Minimum" x))
+
+(defn- maximum? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.Maximum" x))
 
 (declare index-expr? index-cast? validate-spec! spec)
 
@@ -140,6 +151,7 @@
     (align-up? x) (and (expression? (:value x))
                        (integer? (:alignment x)) (pos? (:alignment x)))
     (minimum? x) (and (seq (:values x)) (every? expression? (:values x)))
+    (maximum? x) (and (seq (:values x)) (every? expression? (:values x)))
     (index-expr? x) (and (contains? index-operations (:op x))
                          (valid-index-arity? (:op x) (:arguments x))
                          (every? expression? (:arguments x)))
@@ -173,6 +185,7 @@
     (align-up? x) (and (resolvable-expression? (:value x))
                        (integer? (:alignment x)) (pos? (:alignment x)))
     (minimum? x) (and (seq (:values x)) (every? resolvable-expression? (:values x)))
+    (maximum? x) (and (seq (:values x)) (every? resolvable-expression? (:values x)))
     (or (index-expr? x) (index-cast? x)) (expression? x)
     :else (some? x)))
 
@@ -201,6 +214,7 @@
               (product? value) (promote (map infer (:factors value)))
               (align-up? value) (promote [(infer (:value value)) :int])
               (minimum? value) (promote (map infer (:values value)))
+              (maximum? value) (promote (map infer (:values value)))
 
               (index-expr? value)
               (let [types (set (map infer (:arguments value)))]
@@ -249,6 +263,7 @@
     (product? expression) (reduce into #{} (map expression-references (:factors expression)))
     (align-up? expression) (expression-references (:value expression))
     (minimum? expression) (reduce into #{} (map expression-references (:values expression)))
+    (maximum? expression) (reduce into #{} (map expression-references (:values expression)))
     (index-expr? expression)
     (reduce into #{} (map expression-references (:arguments expression)))
     (index-cast? expression) (expression-references (:argument expression))
@@ -275,7 +290,7 @@
                   ;; back into an invalid opaque identity and stop transitive extent expansion.
                   (or (runtime-value? replacement) (ceil-div? replacement)
                       (floor-div? replacement) (sum? replacement) (product? replacement)
-                      (align-up? replacement) (minimum? replacement)
+                      (align-up? replacement) (minimum? replacement) (maximum? replacement)
                       (index-expr? replacement) (index-cast? replacement))
                   (rebind replacement)
                   :else (->RuntimeValue replacement)))
@@ -287,6 +302,7 @@
               (product? value) (assoc value :factors (mapv rebind (:factors value)))
               (align-up? value) (assoc value :value (rebind (:value value)))
               (minimum? value) (assoc value :values (mapv rebind (:values value)))
+              (maximum? value) (assoc value :values (mapv rebind (:values value)))
               (index-expr? value) (assoc value :arguments (mapv rebind (:arguments value)))
               (index-cast? value) (assoc value :argument (rebind (:argument value)))
               :else (get bindings value value)))]
@@ -331,6 +347,7 @@
            (floor-div? x)
            (sum? x)
            (minimum? x)
+           (maximum? x)
            ;; Rebinding an opaque dimension to an exact typed scalar definition may expose a
            ;; checked KernelBody index node at the root. The same nodes are already accepted
            ;; inside compound dimensions and must remain legal after substitution.
@@ -489,6 +506,8 @@
                   (long alignment)))
                (minimum? expression)
                (reduce min (map resolve* (:values expression)))
+               (maximum? expression)
+               (reduce max (map resolve* (:values expression)))
                ;; KernelBody index algebra may reach a launch dimension when a scheduled body
                ;; projects its own extent expressions into the launch spec. Evaluate it here with
                ;; the same exact-overflow discipline rather than asking the runtime binder to

@@ -1971,32 +1971,13 @@
     (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
         output-array)))
 
-(defn- fmax-number
-  [a b]
-  (cond
-    (Double/isNaN (double a)) b
-    (Double/isNaN (double b)) a
-    :else (Math/max (double a) (double b))))
-
-(defn- fmin-number
-  [a b]
-  (cond
-    (Double/isNaN (double a)) b
-    (Double/isNaN (double b)) a
-    :else (Math/min (double a) (double b))))
-
 (defn- combine-scalar-partials
-  "Compatibility terminal combine with the storage dtype's operation-by-operation rounding.
-
-   OpenCL fmin/fmax ignore one NaN operand; Java Math/min/max propagate it, so use the C-family
-   numerical contract explicitly rather than treating their spellings as Java operators."
+  "Compatibility terminal combine with the storage dtype's operation-by-operation rounding."
   [result-dtype c-op identity-val partials]
   (let [coerce (if (= :float (dt/canon result-dtype))
                  (fn [value] (float value))
                  (fn [value] (double value)))
         combine (case c-op
-                  "fmax" fmax-number
-                  "fmin" fmin-number
                   "*" *
                   "+" +
                   (throw (ex-info "staged reduction has an unknown certified combine operator"
@@ -2051,11 +2032,30 @@
             (throw (ex-info "reduction ABI bound binding has the wrong kernel dtype"
                             {:kernel-name kernel-name :slot bound-slot
                              :expected (:kernel-dtype bound-slot) :actual (:type bound-value)})))
-        _ (kexec/physical-runtime-scalar bound-slot bound-value)
+        physical-bound (kexec/physical-runtime-scalar bound-slot bound-value)
+        n (long (:value physical-bound))
+        _ (doseq [[slot value] non-result-pointers
+                  :let [capacity (if (device-buffer? value)
+                                   (:n-elements ^DeviceBuffer value)
+                                   (java.lang.reflect.Array/getLength value))]]
+            (when (< (long capacity) n)
+              (throw (ex-info "reduction input is shorter than its certified bound"
+                               {:reason :reduction-input-capacity
+                                :kernel-name kernel-name :slot slot
+                               :required-elements n :buffer-elements capacity}))))
         result-dtype (:dtype (first result-pair))
         _ (when-not (#{:float :double} result-dtype)
             (throw (ex-info "host partial combine currently supports only float/double SegRed results"
                             {:kernel-name kernel-name :dtype result-dtype})))
+        attributes (:attributes registered)
+        _ (when-not (contains? attributes :identity-val)
+            (throw (ex-info "staged reduction artifact lacks its certified identity"
+                            {:kernel-name kernel-name :reason :reduction-identity-missing})))
+        _ (when-not (contains? attributes :c-op)
+            (throw (ex-info "staged reduction artifact lacks its certified combine operator"
+                            {:kernel-name kernel-name :reason :reduction-combine-missing})))
+        identity-val (:identity-val attributes)
+        c-op (:c-op attributes)
         geometry (kcall/realize-launch registered arguments)
         _ (when-not (= 1 (count (:workgroup-size geometry)))
             (throw (ex-info "staging scalar reduction requires a one-dimensional artifact launch"
@@ -2065,9 +2065,6 @@
         ;; Native driver/loading begins only after every ABI/value/launch check above.
         loaded (ensure-kernel-loaded! kernel-name)
         kernel-handle (:kernel-handle loaded)
-        identity-val (or (get-in loaded [:attributes :identity-val])
-                         (:identity-val loaded) 0.0)
-        c-op (or (get-in loaded [:attributes :c-op]) (:c-op loaded) "+")
         dtype-size (long (get dtype-byte-sizes result-dtype))
         value-layout (if (= result-dtype :float) ValueLayout/JAVA_FLOAT ValueLayout/JAVA_DOUBLE)
         staged-inputs

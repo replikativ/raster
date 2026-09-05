@@ -130,6 +130,41 @@
               bindings))
           {} equations))
 
+(defn body-for-equation
+  "Return the dependency-closed scheduled program slice for one numerical equation.
+
+   A graph is emitted one equation at a time, but storage extents may be defined by preceding
+   typed host-scalar equations.  This is the single narrowing operation used by equation-first
+   target emission and compatibility backend entry; neither may discard or reconstruct that
+   prefix independently."
+  [parallel-program equation]
+  (let [parallel-program (program/validate! parallel-program segop/segop-node?)
+        retained (some #(when (= (:id %) (:id equation)) %) (:equations parallel-program))
+        _ (when-not (= retained equation)
+            (fail! :scheduled-equation-membership
+                   "scheduled equation is not an exact member of its parallel program"
+                   {:equation (:id equation)}))
+        preceding (take-while #(not= (:id %) (:id equation)) (:equations parallel-program))
+        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
+        equations (conj scalar-prefix equation)]
+    (program/make
+     {:dialect :segop
+      :source nil
+      :values (:values parallel-program)
+      :inputs (program/infer-inputs equations)
+      :equations equations
+      :outputs (:results equation)
+      :effects (reduce set/union #{} (map :effects equations))
+      :diagnostics []
+      :provenance {:source-dialect :typed-soac
+                   :pass :scheduled-equation-graph}
+      :attributes {:host-control :explicit-typed-algorithm}
+      :operation? segop/segop-node?
+      :algorithm? (fn [candidate algorithm]
+                    (and (= algorithm (soac/validate! algorithm))
+                         (= (:operands candidate) (:inputs (soac/facts algorithm)))
+                         (= (:results candidate) (soac/outputs algorithm))))})))
+
 (defn- typed-host-scalar-equation?
   [values equation algorithm]
   (when-let [[result _] (scalar-result-expression equation)]
@@ -304,3 +339,20 @@
        ;; retained ParallelProgram prefix, not descriptive KernelGraph attributes.  A schedule
        ;; validator that needs them must receive and revalidate that exact program slice.
        :attributes attributes}))))
+
+(defn make-for-equation
+  "Derive the exact scheduled KernelGraph for one TypedSOAC numerical equation.
+
+   The equation's optional graph contract contributes only already-validated schedule provenance
+   and attributes; dataflow, storage and scalar closure are always reconstructed from the retained
+   algorithm and its dependency-closed program slice."
+  [parallel-program equation]
+  (let [body (body-for-equation parallel-program equation)
+        algorithm (:algorithm equation)
+        graph-contract (get-in equation [:attributes :kernel-graph])]
+    {:body body
+     :graph (make algorithm body
+                  (cond-> {}
+                    graph-contract
+                    (assoc :provenance (:provenance graph-contract)
+                           :attributes (:attributes graph-contract))))}))

@@ -16,6 +16,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.runtime.hardware :as hw]))
@@ -276,9 +277,9 @@
        (invoke! (:kernel-name kernel) [out q] [{:type :int :value 7}] n)
        (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out)))))))
 
-(deftest gpu-segred-staging-captured-scalar-test
+(deftest gpu-segred-graph-captured-scalar-test
   (when-ze
-   (testing "ordered SegRed staging inserts its partial output and binds captured scalars"
+   (testing "the generated two-phase SegRed graph owns its partial and binds captured scalars"
      (require 'raster.gpu.ze-runtime)
      ((resolve 'raster.gpu.ze-runtime/init!))
      (let [n 1024
@@ -291,12 +292,17 @@
            compiled (opencl-pass/opencl-pass
                      form :device-id :ze:0 :dtype :float
                      :scalar-types {'scale :float 'n :int})
-           kernel (first (:kernels compiled))
-           invoke (resolve 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel)
-           register! (resolve 'raster.gpu.ze-runtime/register-kernel!)
-           _ (register! (:kernel-name kernel) kernel)
-           actual (invoke (:kernel-name kernel) [input nil scale n])
+           dispatch (first (:dispatches compiled))
+           output (float-array 1)
+           register! (resolve 'raster.gpu.ze-runtime/register-kernel-dispatch!)
+           _ (register! dispatch)
+           _ (pipeline/invoke-scheduled-executable!
+              :ze:0 (:id dispatch) [input output scale n])
+           actual (aget output 0)
            expected (reduce + 0.0 (map #(* scale (double %)) (seq input)))]
+       (is (= 2 (count (:kernels compiled))))
+       (is (= [:block-local :cross-block]
+              (mapv #(get-in % [:attributes :phase]) (:kernels compiled))))
        (is (< (Math/abs (- (double actual) expected)) 1e-3)
            (str "captured-scalar SegRed expected " expected ", got " actual))))))
 

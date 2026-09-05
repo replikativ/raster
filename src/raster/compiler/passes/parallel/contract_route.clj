@@ -311,14 +311,21 @@
    emission."
   [operation output dtype reduced-bound]
   (let [workgroup-size (or (get-in operation [:grid :block-size]) 256)
+        group-count (if-let [existing (get-in operation [:grid :num-blocks])]
+                      (segred-body/launch-group-count existing reduced-bound workgroup-size)
+                      ;; The compatibility front door has no concrete device descriptor. State a
+                      ;; conservative portable occupancy cap instead of leaving the schedule
+                      ;; implicit or accepting an arbitrary caller expression.
+                      (segred-body/capped-group-count 256 reduced-bound workgroup-size))
         grid (segop/->KernelGrid
-              (or (get-in operation [:grid :num-blocks])
-                  (klaunch/ceil-div reduced-bound workgroup-size))
+              group-count
               workgroup-size
               (* workgroup-size (dtype/bytes-of dtype)))
-        operator (update (:reduction operation) :components
-                         (fn [components]
-                           (mapv #(assoc % :result output) components)))]
+        operator (-> (:reduction operation)
+                     (update :components
+                             (fn [components]
+                               (mapv #(assoc % :result output) components)))
+                     (assoc-in [:attributes :physical-phase] :block-local))]
     (assoc operation
            :level (segop/->SegLevel :block :virtual)
            :reduction operator

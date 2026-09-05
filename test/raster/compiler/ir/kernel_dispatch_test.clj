@@ -288,6 +288,73 @@
         (is (= 2 (count (filter #(= :alloc (first %)) @calls))))
         (is (= 1 (count (filter #(= :download (first %)) @calls))))))))
 
+(deftest staged-graph-capacities-fail-before-opening-a-device-session
+  (let [graph (staged-graph)
+        graph-dispatch (kdispatch/make
+                        {:id "staged-capacity-dispatch"
+                         :alternatives [graph]
+                         :default-strategy :two-stage
+                         :selector {:kind :fixed-strategy :strategy :two-stage}})
+        opened? (atom false)]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly graph-dispatch)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session*
+       (fn [& _] (reset! opened? true) (throw (ex-info "session opened" {})))}
+      (fn []
+        (doseq [[arguments reason]
+                [[[ (float-array 2) (float-array 3) 3]
+                  :staged-graph-buffer-capacity]
+                 [[(float-array 3) (float-array 3) -1]
+                  :staged-graph-buffer-extent]]]
+          (try
+            (gpu/invoke-staged-executable! :probe "staged-capacity-dispatch" arguments)
+            (is false "invalid graph storage must fail in pure preflight")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= reason (:reason (ex-data exception)))))))
+        (is (false? @opened?))))))
+
+(deftest staged-preflight-resolves-opaque-external-extent-leaves
+  (let [graph (-> (staged-graph)
+                  (assoc-in [:inputs 0 :elements] '(extent x))
+                  (assoc-in [:outputs 0 :elements] '(extent x))
+                  kgraph/validate!)
+        graph-dispatch (kdispatch/make
+                        {:id "staged-opaque-extent-dispatch"
+                         :alternatives [graph]
+                         :default-strategy :two-stage
+                         :selector {:kind :fixed-strategy :strategy :two-stage}})
+        opened? (atom false)
+        invoke (fn [out]
+                 (gpu/invoke-staged-executable!
+                  :probe "staged-opaque-extent-dispatch"
+                  [(float-array 3) out 3]))]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly graph-dispatch)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session*
+       (fn [& _]
+         (reset! opened? true)
+         (throw (ex-info "past pure preflight" {:reason :past-preflight})))}
+      (fn []
+        (try (invoke (float-array 3))
+             (catch clojure.lang.ExceptionInfo exception
+               (is (= :past-preflight (:reason (ex-data exception))))))
+        (is @opened?)
+        (reset! opened? false)
+        (try
+          (invoke (float-array 2))
+          (is false "cross-buffer opaque extent must still validate output capacity")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :staged-graph-buffer-capacity (:reason (ex-data exception))))))
+        (is (false? @opened?))))))
+
 (deftest staged-executable-preserves-pointer-identity-for-in-place-calls
   (let [same (float-array 3)
         calls (atom [])]

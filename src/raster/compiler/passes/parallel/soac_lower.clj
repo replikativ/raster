@@ -929,7 +929,8 @@
                        grid-1 :product product-schedule dtype)]
       (case (:strategy execution)
         :single
-        (let [grid (single-block-grid grid-1)]
+        (let [grid (single-block-grid grid-1)
+              reduction (assoc-in reduction [:attributes :physical-phase] :single)]
           [(segop/->SegRed (:id description)
                            space
                            (segop/->SegLevel :block :none)
@@ -947,7 +948,9 @@
         :two-phase
         (let [level-1 (segop/->SegLevel :block :virtual)
               partials-sym (gensym "partials_")
-              phase-1-reduction (update reduction :attributes dissoc :result-region)
+              phase-1-reduction (-> reduction
+                                    (update :attributes dissoc :result-region)
+                                    (assoc-in [:attributes :physical-phase] :block-local))
               result-region (get-in reduction [:attributes :result-region])
               fold-symbols (reduce set/union #{}
                                    (map util/free-syms

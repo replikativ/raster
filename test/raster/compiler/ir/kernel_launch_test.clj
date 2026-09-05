@@ -66,6 +66,12 @@
     (is (= #{'m 'n 'k} (launch/expression-references requested-splits)))
     (is (= 26 (launch/resolve-expression {'m 13 'n 640 'k 262144}
                                          requested-splits))))
+  (let [nonempty-groups (launch/maximum
+                         1 (launch/minimum 256 (launch/ceil-div 'n 256)))]
+    (is (= #{'n} (launch/expression-references nonempty-groups)))
+    (is (= 1 (launch/resolve-expression {'n 0} nonempty-groups)))
+    (is (= 5 (launch/resolve-expression {'n 1025} nonempty-groups)))
+    (is (= 256 (launch/resolve-expression {'n (* 1024 1024)} nonempty-groups))))
   (let [remainder (body/expression :mod 'k 16)]
     (is (launch/expression? remainder))
     (is (= #{'k} (launch/expression-references remainder)))

@@ -86,6 +86,12 @@
                     :else [])))
           operations))
 
+(deftest launch-and-kernel-index-maximum-have-one-canonical-storage-form
+  (let [canonical-extent (ns-resolve 'raster.compiler.passes.parallel.segfoldmap-body
+                                     'canonical-extent)]
+    (is (= (canonical-extent (launch/maximum 'n 1))
+           (canonical-extent (body/expression :max 'n 1))))))
+
 (deftest interpreted-segmented-fold-map-preserves-dependent-fold-order
   (let [values (float-array [1.0 3.0, 2.0 2.0])
         out (float-array 4)]
@@ -253,13 +259,14 @@
     (is (= artifact
            (scheduled-body/validate-artifact-projection! certificate artifact)))))
 
-(deftest fold-map-graph-emission-keeps-the-generic-scheduled-body-validator
+(deftest fold-map-graph-emission-never-uses-the-segred-validator
   (let [operation (scheduled-operation)
+        elements (launch/product 'nsegments 'width)
         graph (kgraph/from-segops
                [operation]
                {:inputs #{'values} :outputs #{'out} :dtype :float
-                :buffer-specs {'values {:dtype :float :elements 'elements}
-                               'out {:dtype :float :elements 'elements}}
+                :buffer-specs {'values {:dtype :float :elements elements}
+                               'out {:dtype :float :elements elements}}
                 :scalars [(kgraph/scalar 'nsegments :int)
                           (kgraph/scalar 'width :int)]})]
     (with-redefs [segred-body/validate-against-node!

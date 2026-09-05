@@ -222,7 +222,7 @@
       (is (= 0 (:ze-maps (:stats result)))))))
 
 (deftest opencl-pass-reduce-test
-  (testing "par/reduce gets replaced with the ordered registered reduction marker"
+  (testing "par/reduce executes its complete scheduled graph and materializes one host scalar"
     (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
           form (with-meta
                  (list 'raster.par/reduce 'acc 0.0 'i 'n (list '+ 'acc product))
@@ -230,15 +230,22 @@
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]
       (is (= 1 (:ze-reduces (:stats result))))
-      (is (= 1 (count (:kernels result))))
-      (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
-             (first (:form result))))
-      (is (= '[a nil scale n] (nth (:form result) 2)))
-      (let [artifact (first (:kernels result))
-            result-slot (some #(when (= :result (:role %)) %) (:abi artifact))]
-        (is (some? (:name result-slot))
-            "the artifact retains its scheduled physical result identity")
-        (is (= (:name result-slot) (second (:arguments artifact)))))))
+      (is (= 2 (count (:kernels result))))
+      (let [invocation (some #(when (and (seq? %)
+                                         (= 'raster.compiler.pipeline/invoke-scheduled-executable!
+                                            (first %))) %)
+                             (tree-seq coll? seq (:form result)))
+            dispatch (first (:dispatches result))
+            graph (first (:alternatives dispatch))
+            scalar-read (some #(when (and (seq? %)
+                                          (= 'clojure.core/aget (first %))) %)
+                              (tree-seq coll? seq (:form result)))]
+        (is invocation)
+        (is (= '[a (float-array 1) scale n] (nth invocation 3)))
+        (is (= [:block-local :cross-block]
+               (mapv #(get-in % [:operation :attributes :phase]) (:nodes graph))))
+        (is (= 1 (count (:temporaries graph))))
+        (is (= 'clojure.core/aget (first scalar-read)))))
   (testing "reduce-into supplies its resident result at the same ordered ABI slot"
     (let [product (with-meta '(* scale (aget a i)) {:raster.type/tag 'float})
           form (with-meta
@@ -256,7 +263,7 @@
       (is (= '[a obuf scale _n_bound]
              (mapv :name (:abi (first (:kernels result))))))
       (is (= [1] (get-in result [:kernels 0 :launch :group-count])))
-      (is (= :single (get-in result [:kernels 0 :attributes :phase]))))))
+      (is (= :single (get-in result [:kernels 0 :attributes :phase])))))))
 
 (deftest opencl-pass-full-contraction-reduction-uses-ordered-marker
   (let [product (with-meta '(* (aget A i) (aget B i)) {:raster.type/tag 'float})

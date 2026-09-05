@@ -174,8 +174,14 @@
   (case dtype
     :int (if (integer? value)
            (Math/toIntExact (long value))
-           (int value))
-    :long (long value)
+           (throw (ex-info "kernel integral scalar requires an integer value"
+                           {:reason :kernel-executable-integral-scalar
+                            :dtype dtype :value value})))
+    :long (if (integer? value)
+            (long value)
+            (throw (ex-info "kernel integral scalar requires an integer value"
+                            {:reason :kernel-executable-integral-scalar
+                             :dtype dtype :value value})))
     :float (float value)
     :double (double value)
     (throw (ex-info "kernel executable has no runtime scalar representation for ABI dtype"
@@ -200,8 +206,12 @@
                                    :slot slot :expected kernel-dtype
                                    :actual (:type value) :value value})))
                 (:value value))
-              value)]
-    {:type kernel-dtype :value (cast-runtime-scalar kernel-dtype raw)}))
+              value)
+        physical (cast-runtime-scalar kernel-dtype raw)]
+    (when (and (= :bound (:role slot)) (neg? physical))
+      (throw (ex-info "kernel extent bound must be non-negative"
+                      {:reason :kernel-bound-range :slot slot :value raw})))
+    {:type kernel-dtype :value physical}))
 
 (defn typed-runtime-arguments
   "Normalize raw caller scalars to the explicit values required by KernelCall/KernelGraphCall.

@@ -107,7 +107,7 @@
       (is (= '[A B O _n_bound] (mapv :name (:abi red))))
       (is (= '[A B O 8] (:arguments red))))
     (testing "…and the validator enforces each of those, so the protocol cannot drift"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not carry"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not"
                             (route/validate-descriptor (assoc red :wg [256 1]))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered :abi is required"
                             (route/validate-descriptor (dissoc red :abi))))

@@ -65,7 +65,7 @@
    NB success/failure is carried in an explicit `{:ok …}`/`{:err …}` rather than a truthy value: a
    SOAC node is a RECORD, and records satisfy `map?` and are always truthy, so a compact
    `or`/`if-let` version silently misread every successful lowering as a decline marker."
-  [sym form device-id dtype array-types]
+  [sym form device-id dtype array-types scalar-types]
   (when (seq? form)
     (let [par? (par/par-form? form)
           decline (fn [stage e] (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
@@ -99,7 +99,8 @@
                           (typed-frontend/form->program
                            (list 'let* [sym form] sym)
                            {:dtype (or dtype :double)
-                            :array-types array-types}))
+                            :array-types array-types
+                            :scalar-types scalar-types}))
               segops (attempt #(if algorithm
                                  (soac-lower/lower-typed-reduce
                                   algorithm (or device-id :cpu:0) :dtype (or dtype :double))
@@ -127,15 +128,20 @@
     :else (unknown-vector-shape)))
 
 (defn- value-contract
-  [id node dtype array-types result?]
+  [id node dtype array-types scalar-types result?]
   (let [array-ids (set/union (or (soac/soac-inputs node) #{})
                              (or (soac/soac-outputs node) #{}))
         shape (cond
                 result? (result-shape node)
+                ;; A scalar reduction's indexed reads are certified over its reduction extent.
+                ;; Retain that minimum physical capacity instead of the compatibility `?` shape;
+                ;; graph staging can then prove the input is large enough without guessing.
+                (and (contains? array-ids id) (soac/soac-reduce? node)) [(:bound node)]
                 (contains? array-ids id) (unknown-vector-shape)
                 :else [])
-        value-dtype (or (get array-types id)
-                        (when (symbol? id) (get array-types (symbol (name id))))
+        declared-types (if (contains? array-ids id) array-types scalar-types)
+        value-dtype (or (get declared-types id)
+                        (when (symbol? id) (get declared-types (symbol (name id))))
                         (:elem-type node)
                         dtype
                         :double)]
@@ -145,21 +151,27 @@
                 :effects #{}})))
 
 (defn- equation
-  [equation-id site sym source {:keys [soac algorithm segops kernel-graph]} dtype array-types]
-  (let [;; Body-position equations currently have no ParallelProgram result ID; retain the typed
-        ;; algorithm only where its result has an authoritative envelope identity.
-        algorithm (when (= :binding (first site)) algorithm)
+  [equation-id site sym source {:keys [soac algorithm segops kernel-graph]}
+   dtype array-types scalar-types]
+  (let [;; A scalar reduction is value-producing even in body position. Give that expression the
+        ;; same internal SSA envelope as a source binding: whether an algorithm can be scheduled
+        ;; must not depend on surface syntax. Effect-only body operations still have no result.
+        value-producing? (or (= :binding (first site))
+                             (and (soac/soac-reduce? soac)
+                                  (empty? (:segment-axes soac))
+                                  (reduction/scalar? (:reduction soac))))
+        algorithm (when value-producing? algorithm)
         operands (-> (soac/node-all-free-syms soac) (disj sym) (->> (sort-by str) vec))
-        result-ids (if (= :binding (first site)) [sym] [])
+        result-ids (if value-producing? [sym] [])
         effects (cond-> #{:memory/read}
                   (seq (soac/soac-outputs soac)) (conj :memory/write))
         operand-values (into {}
                              (map (fn [id]
-                                    [id (value-contract id soac dtype array-types false)]))
+                                    [id (value-contract id soac dtype array-types scalar-types false)]))
                              operands)
         result-values (into {}
                             (map (fn [id]
-                                   [id (value-contract id soac dtype array-types true)]))
+                                   [id (value-contract id soac dtype array-types scalar-types true)]))
                             result-ids)
         eq (program/->ProgramEquation
             equation-id site source operands result-ids algorithm (vec segops) effects
@@ -193,6 +205,50 @@
                        :id id :definition defined :use inferred}))))
   definition)
 
+(defn- declare-scheduled-temporaries
+  "Declare physical SSA storage introduced by a multi-phase schedule.
+
+   Both typed whole-program lowering and compatibility discovery use this one rule. A backend must
+   never learn a partial buffer's dtype or extent from its generated name."
+  [values equations]
+  (reduce
+   (fn [values equation]
+     (let [values
+           (reduce (fn [values temporary]
+                     (let [id (:id temporary)]
+                       (if (contains? values id)
+                         values
+                         (assoc values id
+                                (av/tensor
+                                 {:dtype (:dtype temporary)
+                                  :shape (soac-dialect/extent-shape (:elements temporary))
+                                  :representation {:kind :plain}
+                                  :memory-space (:memory-space temporary)})))))
+                   values
+                   (get-in equation [:attributes :kernel-graph :temporaries]))]
+       (reduce
+        (fn [values operation]
+          (if (and (instance? raster.compiler.ir.segop.SegRed operation)
+                   (= :block-local (:phase operation)))
+            (let [grid (:grid operation)
+                  reduced-bound (-> operation :space segop/seg-space-reduced-dim :bound)
+                  partial-extent
+                  (segred-body/launch-group-count
+                   (:num-blocks grid) reduced-bound (:block-size grid))]
+              (reduce (fn [values id]
+                        (if (contains? values id)
+                          values
+                          (assoc values id
+                                 (av/tensor
+                                  {:dtype (:dtype operation)
+                                   :shape (soac-dialect/extent-shape partial-extent)
+                                   :representation {:kind :plain}
+                                   :memory-space :device}))))
+                      values (:outputs operation)))
+            values))
+        values (:operations equation))))
+   values equations))
+
 (defn- build-program
   [source lowered-equations declined device-id dtype]
   (let [{:keys [equations values]}
@@ -204,7 +260,12 @@
                  ;; Source binders and pre-existing buffers may share a spelling in imperative IR.
                  ;; Give equation results their own SSA-like IDs so a scalar binding can never
                  ;; collide with an array operand of the same name.
-                 results (mapv (fn [source-id] [:binding source-id]) source-results)
+                 ;; A body-position result is already an internal compiler identity and has no
+                 ;; user binding whose successive definitions need disambiguation. Keeping that
+                 ;; symbol also matches the typed reduction component's physical result contract.
+                 results (if (= :body (first (:site equation)))
+                           source-results
+                           (mapv (fn [source-id] [:binding source-id]) source-results))
                  values-with-operands
                  (reduce (fn [values [source-id value-id]]
                            ;; A mapped operand already has the defining equation's authoritative
@@ -234,6 +295,7 @@
                  (update :environment into (map vector source-results results)))))
          {:environment {} :values {} :equations []}
          lowered-equations)
+        values (declare-scheduled-temporaries values equations)
         result-ids (set (mapcat :results equations))
         operand-ids (set (mapcat :operands equations))
         inputs (->> (set/difference operand-ids result-ids) (sort-by str) vec)
@@ -349,45 +411,7 @@
           ;; A multi-phase schedule introduces physical SSA values that do not exist in the
           ;; functional algorithm. They still require explicit contracts; an emitter must never
           ;; infer their dtype or extent from a generated name.
-          scheduled-values
-          (reduce
-           (fn [values equation]
-             (let [values
-                   (reduce (fn [values temporary]
-                             (let [id (:id temporary)]
-                               (if (contains? values id)
-                                 values
-                                 (assoc values id
-                                        (av/tensor
-                                         {:dtype (:dtype temporary)
-                                          :shape (soac-dialect/extent-shape
-                                                  (:elements temporary))
-                                          :representation {:kind :plain}
-                                          :memory-space (:memory-space temporary)})))))
-                           values
-                           (get-in equation [:attributes :kernel-graph :temporaries]))]
-               (reduce
-                (fn [values operation]
-                  (if (and (instance? raster.compiler.ir.segop.SegRed operation)
-                           (= :block-local (:phase operation)))
-                    (let [grid (:grid operation)
-                          reduced-bound (-> operation :space segop/seg-space-reduced-dim :bound)
-                          partial-extent
-                          (segred-body/launch-group-count
-                           (:num-blocks grid) reduced-bound (:block-size grid))]
-                      (reduce (fn [values id]
-                                (if (contains? values id)
-                                  values
-                                  (assoc values id
-                                         (av/tensor
-                                          {:dtype (:dtype operation)
-                                           :shape (soac-dialect/extent-shape partial-extent)
-                                           :representation {:kind :plain}
-                                           :memory-space :device}))))
-                              values (:outputs operation)))
-                    values))
-                values (:operations equation))))
-           (:values form) equations)
+          scheduled-values (declare-scheduled-temporaries (:values form) equations)
           ;; Scheduled operations are not exempt from SSA validation merely because they are
           ;; records nested inside an equation. Every physical operand/result—including generated
           ;; partial arrays and aliased destinations—must have an AbstractValue contract.
@@ -450,6 +474,7 @@
             device-id (:target-device opts)
             dtype (:dtype opts)
             array-types (:array-types opts)
+            scalar-types (:scalar-types opts)
             lowered (atom 0)
             graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
@@ -457,7 +482,7 @@
           ;; anyone diagnosing why a kernel took the legacy path.
             declined (atom [])
             attempt (fn [sym init]
-                      (let [r (lower-attempt sym init device-id dtype array-types)]
+                      (let [r (lower-attempt sym init device-id dtype array-types scalar-types)]
                         (when-let [d (:declined r)] (swap! declined conj d))
                         (when (:segops r) r)))
             binding-equations
@@ -466,7 +491,8 @@
                (when-let [lowered-values (attempt sym init)]
                  (swap! lowered inc)
                  (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
-                 (equation idx [:binding sym] sym init lowered-values dtype array-types)))
+                 (equation idx [:binding sym] sym init lowered-values
+                           dtype array-types scalar-types)))
              pairs)
           ;; Also check body expressions for par forms
             body-equations
@@ -477,7 +503,7 @@
                    (swap! lowered inc)
                    (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
                    (equation (+ (count pairs) idx) [:body idx] tmp-sym expr
-                             lowered-values dtype array-types))))
+                             lowered-values dtype array-types scalar-types))))
              body-exprs)
             equations (vec (concat binding-equations body-equations))]
         {:form (build-program (list* let-sym bindings-vec body-exprs)

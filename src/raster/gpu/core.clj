@@ -1655,6 +1655,33 @@
               (vswap! groups conj {:key key :value value :dtype actual-dtype
                                    :elements elements :resident? resident?
                                    :indexes [index] :read? read? :write? write?}))))))
+    (when (= :kernel-graph (kexec/kind executable))
+      (let [{:keys [buffers scalar-values]} (kexec/graph-bindings executable typed-arguments)
+            capacity-of (fn [value]
+                          (if (dtype/dtype-for-jvm-array value)
+                            (java.lang.reflect.Array/getLength value)
+                            (:n-elements value)))
+            ;; `(extent id)` is an intentionally opaque, resolver-owned graph leaf. Supply the
+            ;; concrete capacity fact here rather than destructuring it into fictitious scalars.
+            extent-values (into {}
+                                (map (fn [[id value]] [(list 'extent id) (capacity-of value)]))
+                                buffers)
+            resolver-values (merge scalar-values extent-values)]
+        (doseq [{:keys [id elements] :as graph-buffer}
+                (concat (:inputs executable) (:outputs executable))
+                :when (some? elements)
+                :let [value (get buffers id)
+                      actual-elements (capacity-of value)
+                      expected-elements (kgcall/resolve-integer resolver-values elements)]]
+          (when (neg? expected-elements)
+            (throw (ex-info "staged graph buffer extent must be non-negative"
+                            {:reason :staged-graph-buffer-extent
+                             :buffer id :elements elements :resolved expected-elements})))
+          (when (> expected-elements actual-elements)
+            (throw (ex-info "staged graph buffer extent exceeds its supplied capacity"
+                            {:reason :staged-graph-buffer-capacity
+                             :buffer id :elements elements :resolved expected-elements
+                             :capacity actual-elements :graph-buffer graph-buffer}))))))
     (let [groups @groups
           key-by-index (reduce (fn [result {:keys [key indexes]}]
                                  (reduce #(assoc %1 %2 key) result indexes))
