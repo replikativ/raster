@@ -25,6 +25,8 @@
          :exec-fn cognitect.test-runner.api/test
          :exec-args {:excludes [:perf]}}
   :ci-timed {:main-opts ["-m" "raster.ci.timed-runner" "-e" ":perf"]}
+  ;; Combine with :test for the normal compiler JVM options; explicitly opt in to timing.
+  :production-canary {:main-opts ["-m" "raster.perf.production-canary"]}
   ;; The perf-regression ratchet — INCLUDES only ^:perf, opposite of :test. Local
   ;; only (Valhalla+GPU). `-M:perf` gates against the committed baseline;
   ;; `-M:perf --update-baseline` re-seeds after an intended speedup.
