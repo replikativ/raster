@@ -191,8 +191,11 @@
                   (body/scalar-expression
                    :+ :int ['a 'b]
                    {:overflow :no-overflow
-                    ;; This looks plausible, but is intentionally unrelated to the operands.
-                    :proof {:kind :typed-scalar-range :lower -121 :upper 134}}))
+                    ;; This contains the verifier's full operand result interval, but cannot
+                    ;; make that interval fit in int.  Evidence may describe a derivation; it
+                    ;; cannot turn overflow-prone arithmetic into `:no-overflow`.
+                    :proof {:kind :typed-scalar-range
+                            :lower Integer/MIN_VALUE :upper Integer/MAX_VALUE}}))
                  (body/->ScalarStore 'out [0] 'result nil)]
     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
     :provenance {:dialect :test}
@@ -376,7 +379,7 @@
         "a producer cannot certify arbitrary scalar parameters with a bare no-overflow tag")
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
-         #"not derivable from operand ranges"
+         #"integral arithmetic"
          (forged-no-overflow-kernel-body))
         "a producer proof map is evidence to check, never an authority to forge")
     (is (str/includes? opencl-source "+ 7")

@@ -1221,12 +1221,24 @@
        (let [source-range (:range (first infos))]
          ;; Exact widening retains its fact.  Narrowing, wrapping and floating conversion are
          ;; intentionally conservative.
-         (when (and source-range
-                    (scalar-range/contained-in-dtype? source-range result-type))
-           source-range))
+         (if (and source-range
+                  (scalar-range/contained-in-dtype? source-range result-type))
+           source-range
+           (scalar-range/for-dtype result-type)))
 
        (= :isnan op) nil
-       :else (scalar-result-range canonical-op result-type infos))}))
+       :else
+       (let [integral-arithmetic?
+             (and (contains? #{:byte :int :long} result-type)
+                  (contains? #{:+ :- :*} canonical-op))]
+         (if integral-arithmetic?
+           ;; A checked operation may trap and a wrapping operation may narrow modulo its
+           ;; representation.  Neither permits downstream arithmetic to borrow an unbounded
+           ;; mathematical interval; only an independently proved operation retains it.
+           (if (= :no-overflow (:overflow options))
+             (scalar-result-range canonical-op result-type infos)
+             (scalar-range/for-dtype result-type))
+           (scalar-result-range canonical-op result-type infos))))}))
 
 (defn- expression-info!
   [expression values]
