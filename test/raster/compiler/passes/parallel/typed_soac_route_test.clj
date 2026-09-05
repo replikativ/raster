@@ -1025,9 +1025,9 @@
              (mapv :role (drop 3 (:abi alternative)))))
       (is (kernel-graph-call/kernel-graph-call?
            (kernel-graph-call/make alternative {'A :a 'B :b 'C :c}
-                                   {'m {:type :int :value 7}
-                                    'n {:type :int :value 5}
-                                    'k {:type :int :value 3}}))))
+               {'m {:type :long :value 7}
+                'n {:type :long :value 5}
+                'k {:type :long :value 3}}))))
     (try
       (contract-route/route-typed-contraction
        algorithm operation :dtype :double :desc {})

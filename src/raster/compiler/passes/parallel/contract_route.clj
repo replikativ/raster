@@ -350,7 +350,7 @@
    consume the same scheduled body vocabulary.  Quantization remains an operand/decode concern,
    not a buffer-ownership or graph-composition concern."
   [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id
-                           candidate-families scheduled-operation]
+                           candidate-families scheduled-operation array-types scalar-types]
                     :or {dtype :half prefer-peak? false}}]
   (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
         contract-form (or contract-form (:form contract-facts))
@@ -386,9 +386,19 @@
                             {:reason :contraction-candidate-families
                              :families candidate-families
                              :allowed contraction-families})))
-        tensorize-plan (memoize #(route-2free-1contract out-sym dtype desc tile
-                                                        epilogue contract-facts operation-id
-                                                        candidate-families))]
+        mixed-core-storage?
+        (some (fn [operand]
+                (when-let [stored (or (get array-types (:sym operand))
+                                      (get array-types (symbol (name (:sym operand)))))]
+                  (not= (dtype/canon dtype) (dtype/canon stored))))
+              (:operands contract-facts))
+        tensorize-plan
+        (memoize
+         #(if mixed-core-storage?
+            {::declines [{:leaf :dpas :reason :mixed-operand-storage}
+                         {:leaf :regtiled :reason :mixed-operand-storage}]}
+            (route-2free-1contract out-sym dtype desc tile
+                                  epilogue contract-facts operation-id candidate-families)))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
@@ -523,7 +533,21 @@
                        (cl/contract-form->segred
                         (compatibility-form! contract-form :portable-segred)
                         :dtype dtype :facts contract-facts))
-                portable (contraction-schedule/plan-portable-body contract-facts sr desc)
+                portable (contraction-schedule/plan-portable-body
+                          contract-facts sr desc
+                          {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
+                _ (when (and (not (:ok portable))
+                             (or mixed-core-storage?
+                                 (some #(contains? #{:float :double}
+                                                   (some-> (get scalar-types %) dtype/canon))
+                                       (:scalars sr))))
+                    (throw (ex-info
+                            "mixed storage or floating captures require a typed portable contraction schedule"
+                            {:reason :no-legal-contraction-family
+                             :operation operation-id :families candidate-families
+                             :declines [{:leaf :portable-kernel-body
+                                         :reason (:reason portable) :data (:detail portable)}]
+                             :fallback :none})))
                 emitted (when (:ok portable)
                           (sco/generate-contraction-kernel-body (:body portable)))
                 {:keys [kernel-name source array-params scalar-params abi
@@ -686,6 +710,14 @@
                                 (assoc options
                                        :dtype dtype
                                        :facts facts
+                                       :array-types (into {} (map (fn [id]
+                                                                  [id (get-in (soac-dialect/facts program)
+                                                                              [:values id :dtype])]))
+                                                          (:inputs operation))
+                                       :scalar-types (into {} (map (fn [id]
+                                                                   [id (get-in (soac-dialect/facts program)
+                                                                               [:values id :dtype])]))
+                                                           (:scalars operation))
                                        :scheduled-operation operation
                                        :candidate-families families
                                        :operation-id operation-id)))
@@ -909,10 +941,11 @@
                                      (get-in candidate [:artifact :arguments]))
           :when (and (= :scalar (:kind slot))
                      (not (public-interface-slot? slot)))]
-    (when-not (and (contains? #{:int :long} (:kernel-dtype slot))
-                   (klaunch/expression? compiler-value)
-                   (every? public-scalars
-                           (klaunch/expression-references compiler-value)))
+    (when-not (or (contains? public-scalars compiler-value)
+                  (and (contains? #{:int :long} (:kernel-dtype slot))
+                       (klaunch/expression? compiler-value)
+                       (every? public-scalars
+                               (klaunch/expression-references compiler-value))))
       (throw (ex-info
               "typed contraction candidate has a private scalar outside its semantic ABI"
               {:reason :typed-contraction-dispatch-unbound-private-scalar

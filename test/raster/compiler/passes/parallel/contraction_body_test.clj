@@ -40,6 +40,52 @@
         segred (lower/contract-form->segred form :dtype :half :facts verified)]
     (schedule/plan-portable-body verified segred nil)))
 
+(deftest portable-contraction-retains-load-scalar-and-index-widths
+  (let [form '(raster.par/contract y [[i m]] [[l k]] (* scale (aget x l)))
+        verified (facts/contraction-facts form :dtype :double)
+        segred (update (lower/contract-form->segred form :dtype :double :facts verified)
+                       :scalars conj 'scale)
+        plan (schedule/plan-portable-body
+              verified segred nil
+              {:array-types {'x :float}
+               :scalar-types {'m :long 'k :int 'scale :float}})
+        kernel (:body plan)
+        parameters (into {} (map (juxt :id :dtype)) (:parameters kernel))
+        loop (first (:operations kernel))]
+    (is (:ok plan))
+    (is (= kernel (body/validate! kernel)))
+    (is (= :float (get parameters 'x)))
+    (is (= :float (get parameters 'scale)))
+    (is (= :double (get parameters 'y)))
+    (is (= :long (get-in loop [:index :type])))
+    (is (some #(and (= :cast (get-in % [:expression :op]))
+                    (= :double (get-in % [:expression :result-type])))
+              (:operations loop)))
+    (doseq [target [:opencl-intel :cuda :hip]]
+      (is (string? (:source (emit/generate-contraction-kernel-artifact
+                            kernel :target-dialect target)))))))
+
+(deftest mixed-storage-cannot-select-a-uniform-pointer-leaf
+  (let [form '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
+                                 (* (aget A (+ (* i 16) l)) (aget B (+ (* l 8) j))))
+        routed (route/route-contraction form :dtype :double
+                                        :array-types {'A :float 'B :float})
+        kernel (artifact/attribute (:artifact routed) :kernel-body)]
+    (is (= :portable-segred (:strategy routed)))
+    (is (body/kernel-body? kernel))
+    (is (= [:float :float] (mapv :dtype (take 2 (:parameters kernel)))))
+    (with-redefs [schedule/plan-portable-body (fn [& _] {:ok false :reason :test-decline})]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"mixed storage or floating captures require a typed portable"
+           (route/route-contraction form :dtype :double
+                                    :array-types {'A :float 'B :float}))))
+    (doseq [family [:matrix :register-tiled]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"no enabled contraction schedule family"
+           (route/route-contraction form :dtype :double
+                                    :array-types {'A :float 'B :float}
+                                    :candidate-families #{family}))))))
+
 (deftest portable-contraction-is-a-complete-scheduled-kernel-body
   (let [plan (portable-plan)
         kernel (:body plan)

@@ -386,7 +386,7 @@
    accumulator dtype; this pass never invents a final narrowing conversion. A typed region owner
    may provide `declared-result-dtype` for the outer expression only; nested calls still require
    their own retained facts."
-  [expression {:keys [index coordinate dtype arrays scalars scalar-types coordinate-lower
+  [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
                       load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         operations (atom [])
@@ -440,14 +440,17 @@
                                 "KernelBody reduction cannot prove this array load coordinate"
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
-                    (let [result (fresh "element-load")]
+                    (let [result (fresh "element-load")
+                          load-dtype (dtype/canon (get array-types array dtype))
+                          other (or load-other (body/literal 0 load-dtype))]
                       (emit! (body/->ScalarLoad
-                              (body/value result dtype) array [lowered-coordinate]
+                              (body/value result load-dtype) array [lowered-coordinate]
                               load-predicate
                               (when load-predicate
-                                (or load-other (body/literal 0 dtype)))
+                                (if (= load-dtype (:type other)) other
+                                    (body/literal (:value other) load-dtype)))
                               :cached)
-                             result dtype)))
+                             result load-dtype)))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
