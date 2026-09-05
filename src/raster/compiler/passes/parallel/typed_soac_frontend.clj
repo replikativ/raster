@@ -1179,6 +1179,27 @@
                                  {:destination output :access :write :host-return :effect})
                                outputs)}))
 
+    (par/par-reduce-into-form? expression)
+    (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info expression)
+          elem-type (or (:raster.type/elem-type (meta expression))
+                        (get array-types out-buf) default-dtype :double)
+          description (operation-description
+                       id symbol
+                       (vary-meta reduce-form assoc :raster.type/elem-type elem-type)
+                       default-dtype array-types)
+          {:keys [product inputs scalars index extent]} description
+          expressions (:results (reduction/fold-region product))]
+      ;; This internal compatibility spelling owns storage, not a second reduction algebra.
+      ;; Alias/coordinate cases outside the pointwise scalar schedule must decline explicitly.
+      (when (and (symbol? out-buf) (not (contains? inputs out-buf))
+                 (every? #(pointwise-input? expressions % index) inputs))
+        {:kind :segmented-reduce :id id :sym symbol
+         :segment-axes [] :reduce-index index :reduce-extent extent
+         :results [(effect-result-id id 0)] :product product
+         :inputs inputs :outputs #{out-buf} :scalars (disj scalars out-buf)
+         :effect-only? true :host-binding symbol
+         :result-storage [{:destination out-buf :access :write :host-return :buffer}]}))
+
     (par/par-reduce-form? expression)
     (let [{:keys [acc init idx bound body elem-type]} (par/extract-par-reduce-info expression)
           io (extract-io body idx [symbol] :accumulator acc)
@@ -1336,6 +1357,7 @@
     (par/par-map-form? expression) (nth expression 3)
     (par/par-map2-form? expression) (nth expression 4)
     (par/par-reduce-form? expression) (nth expression 4)
+    (par/par-reduce-into-form? expression) (nth expression 5)
     (or (par/par-scan-form? expression) (par/par-scan-exclusive-form? expression))
     (nth expression 5)
     (par/par-stencil-form? expression) (nth expression 7)
@@ -1351,6 +1373,7 @@
                    (par/par-map-form? expression) 3
                    (par/par-map2-form? expression) 4
                    (par/par-reduce-form? expression) 4
+                   (par/par-reduce-into-form? expression) 5
                    (or (par/par-scan-form? expression)
                        (par/par-scan-exclusive-form? expression)) 5
                    (par/par-stencil-form? expression) 7

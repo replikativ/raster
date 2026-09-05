@@ -708,6 +708,10 @@ reduction graph (including cross-block finalization) and write only `out[0]`; ra
 imply a host scalar download. Affine/multi-axis and aliased full contractions remain outside this
 admission boundary. Public graph scalars retain their logical dtype while individual kernel nodes
 may use checked integer narrowing for physical launch bounds.
+The internal direct `reduce-into` spelling enters that same rank-zero typed storage contract;
+its separate backend one-workgroup refinement and dispatch constructor are deleted. Small and
+empty reductions use one terminal phase, while large/dynamic reductions retain the complete
+partial/finalization graph. Pointwise, disjoint-output admission remains explicit.
 Nested scalar folds inside a retained map are now explicit typed scalar-region terms. Monoid-shaped
 folds carry an `AssociativeScan` certificate and an implementation-defined association contract, so
 the JVM may select its multi-accumulator SIMD reduction. General recurrences carry an ordered

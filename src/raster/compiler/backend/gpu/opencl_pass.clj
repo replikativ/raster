@@ -26,7 +26,6 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
-            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
@@ -344,32 +343,6 @@
     (list 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
           kernel-name arguments)))
 
-(defn- resident-single-reduction
-  "Refine a scalar reduction to the explicit one-workgroup phase required by reduce-into.
-
-   The output identity is changed here, at the semantic operation boundary, rather than passed as
-   an emitter-only alias. One group folds the complete extent, so the caller-owned one-element
-   result is the scheduled output rather than an undersized partial buffer."
-  [operation output]
-  (let [dtype (dtype/canon (:dtype operation))
-        workgroup-size (get-in operation [:grid :block-size])
-        grid (segop/->KernelGrid 1 workgroup-size
-                                (* workgroup-size (dtype/bytes-of dtype)))
-        operator (-> (:reduction operation)
-                     (update :components
-                             (fn [components]
-                               (mapv #(assoc % :result output) components)))
-                     (assoc-in [:attributes :physical-phase] :single))]
-    (assoc operation
-           :level (segop/->SegLevel :block :none)
-           :reduction operator
-           :lambda nil
-           :outputs #{output}
-           :grid grid
-           :phase :single
-           :schedule (segred-body/scalar-workgroup-tree-schedule
-                      operator grid :single))))
-
 (defn- emit-map-void-invocation
   "Render the staging marker from the artifact's logical argument projection. The marker remains
    useful to the host evaluator, but it no longer owns or reconstructs an argument convention."
@@ -474,6 +447,7 @@
                  (and (par/par-scatter-form? form)
                       (:stride (par/extract-par-scatter-info form)))
                  (par/par-reduce-form? form)
+                 (par/par-reduce-into-form? form)
                  (and (croute/par-contract-form? form) (empty? (nth form 2)))
                  ;; A compound source extent normalizes to a preceding typed scalar equation. It
                  ;; cannot be projected as a closed SegMap without losing that SSA definition.
@@ -822,37 +796,11 @@
                           (:kernel-name k)
                           (vec (:arguments r)))))))
 
-            ;; === par/reduce-into — resident terminal SegRed writing a caller-owned scalar ===
-            ;; Unlike the occupancy-capped partial phase used by host-scalar reduction, this is an
-            ;; explicit one-group terminal refinement. The generic executable path preserves that
-            ;; launch for staging and resident replay alike. Emitted by the reduce-fusion pass.
+            ;; A direct resident reduction must retain its complete scheduled typed graph.
             (par/par-reduce-into-form? form)
-            (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info form)
-                  segred (resident-single-reduction
-                          (par->segred stats reduce-form dtype device-id
-                                      top-scalar-types top-array-types)
-                          out-buf)
-                  kernel (segop-cl/generate-segred-kernel
-                          segred out-buf :dtype dtype :scalar-types top-scalar-types
-                          :array-types top-array-types)
-                  k (register-kernel! kernel :ze-reduces)
-                  dispatch (kdispatch/make
-                            {:id (str "resident-single-reduction-"
-                                      (Integer/toUnsignedString (hash k) 16))
-                             :alternatives [k]
-                             :default-strategy :scalar-workgroup-tree
-                             :selector {:kind :fixed-strategy
-                                        :strategy :scalar-workgroup-tree}
-                             :provenance {:pass :opencl
-                                          :source-dialect :segred
-                                          :operation (:id segred)}
-                             :attributes {:operation-family :scalar-reduction
-                                          :resident-result true}})]
-              (swap! dispatches conj dispatch)
-              ;; Unlike the nil-result host-scalar marker, this path is executable both through
-              ;; staging and resident extraction. Both consume the same KernelCall geometry.
-              (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                    device-id (:id dispatch) (vec (:arguments k))))
+            (throw (ex-info "resident reduction must enter GPU emission as a complete TypedSOAC graph"
+                            {:reason :resident-reduction-requires-typed-graph
+                             :source form :target-dialect :kernel-graph :fallback :none}))
 
             ;; === par/reduce — SegOp path ===
             (par/par-reduce-form? form)
