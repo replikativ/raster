@@ -1091,6 +1091,36 @@
         (is (= :portable-segred (:leaf (ex-data exception))))
         (is (= :none (:fallback (ex-data exception))))))))
 
+(deftest matrix-graphs-preserve-public-order-independent-of-operand-order
+  (doseq [batched? [false true]]
+    (let [contract (if batched?
+                     '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
+                        (* (aget z (+ (* (+ (* b m) i) k) l))
+                           (aget a (+ (* l n) j))))
+                     '(raster.par/contract C [[i m] [j n]] [[l k]]
+                        (* (aget z (+ (* i k) l)) (aget a (+ (* l n) j)))))
+          {:keys [form]} (pipeline/schedule-parallel-form
+                          (list 'let* ['step contract] 'step)
+                          {:target-device :ze:0 :dtype :float
+                           :array-types {'z :float 'a :float 'C :float}
+                           :scalar-types {'batch :int 'm :int 'n :int 'k :int}})
+          scheduled (contract-route/route-typed-contraction-dispatch
+                     (-> form :equations first :algorithm)
+                     (-> form :equations first :operations first)
+                     :dtype :float :precision :mixed-f16-f32
+                     :desc {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                            :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                            :subgroup-size 16 :max-workgroup-size 1024
+                            :grf-bytes-per-lane 256 :machine-lanes 8192
+                            :shared-local-memory 131072})]
+      (doseq [strategy (if batched? [:xmx-batched] [:xmx-direct :xmx-split-k])]
+        (let [graph (kdispatch/alternative scheduled strategy)
+              refinement (get-in graph [:attributes :scheduled-graph-refinement])]
+          (is (some? graph))
+          (is (= '[a z] (mapv :id (:inputs graph))))
+          (is (= (kernel-graph/boundary-contract (:source refinement))
+                 (kernel-graph/boundary-contract (:graph refinement)))))))))
+
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
