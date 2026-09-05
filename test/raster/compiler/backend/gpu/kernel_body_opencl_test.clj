@@ -413,7 +413,7 @@
        {:target-dialect :opencl-portable})
       (is false "trapping arithmetic must not silently become signed target overflow")
       (catch clojure.lang.ExceptionInfo exception
-        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception))))))
+        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))))))
   (testing "Intel OpenCL uses its explicit vendor trap contract"
     (let [source (opencl/emit-scalar-kernel
                   "trapping_arithmetic" (integer-arithmetic-kernel-body :trap)
