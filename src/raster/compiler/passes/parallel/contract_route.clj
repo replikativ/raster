@@ -979,10 +979,17 @@
         batching (:batching matrix-view)
         {:keys [row col]} (:bindings matrix-view)
         batched? (:batched? matrix-view)
+        variant (:variant matrix-view)
         counts {row (if (and batched? (get batching :row true))
-                      (klaunch/product batch m k) (klaunch/product m k))
+                      (klaunch/product batch m k)
+                      (if (contains? #{:tn :tt} variant)
+                        (klaunch/product k m)
+                        (klaunch/product m k)))
                 col (if (and batched? (get batching :col true))
-                      (klaunch/product batch k n) (klaunch/product k n))
+                      (klaunch/product batch k n)
+                      (if (contains? #{:nt :tt} variant)
+                        (klaunch/product n k)
+                        (klaunch/product k n)))
                 (:out facts) (if batched?
                                (klaunch/product batch m n) (klaunch/product m n))}]
     (reduce
