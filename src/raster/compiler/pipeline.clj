@@ -1530,6 +1530,8 @@
    bare nil (the silent-empty-graph footgun)."
   ([form] (extract-gpu-program form nil))
   ([form kernel-info-fn]
+   (extract-gpu-program form kernel-info-fn nil))
+  ([form kernel-info-fn dispatch-info-fn]
    (if-not (and (seq? form) (#{'let* 'let} (first form)))
      {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
      (let [bindings (partition 2 (second form))
@@ -1577,8 +1579,14 @@
              (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
              (if-let [s (parse-gpu-step sym expr)]
                (let [ordered-result
-                     (when (and (:arguments s) kernel-info-fn)
-                       (let [abi (:abi (kernel-info-fn (:kernel-name s)))
+                     (when (:arguments s)
+                       (let [abi (if (and (:dispatch-id s) dispatch-info-fn)
+                                   ;; Graph schedules have no single kernel name. Their validated
+                                   ;; common ABI owns the return value just as it owns binding.
+                                   (some-> (dispatch-info-fn (:dispatch-id s))
+                                           kdispatch/default-alternative kexec/abi)
+                                   (when kernel-info-fn
+                                     (:abi (kernel-info-fn (:kernel-name s)))))
                              result-indexes (keep-indexed
                                              (fn [i slot]
                                                (when (= :result (:role slot)) i))
@@ -1865,7 +1873,7 @@
         reg-entry (requiring-resolve (symbol (str runtime-ns) "kernel-registry-entry"))
         dispatch-entry (requiring-resolve
                         (symbol (str runtime-ns) "kernel-dispatch-registry-entry"))
-        extracted (extract-gpu-program form reg-entry)
+        extracted (extract-gpu-program form reg-entry dispatch-entry)
         prog (if-let [nr (::non-resident extracted)]
                (if (= on-non-resident :throw)
                  (throw (ex-info

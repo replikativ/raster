@@ -18,10 +18,9 @@
     (+ acc (* (arrays/aget x i) (arrays/aget x i)))))
 
 (deftm gemm64! [A :- (Array float) B :- (Array float) C :- (Array float)] :- (Array float)
-  (let [_ (raster.par/contract C [[i 64] [j 64]] [[k 64]]
-            (* (arrays/aget A (+ (* i 64) k)) (arrays/aget B (+ (* k 64) j)))
-            :init 0.0)]
-    C))
+  (raster.par/contract C [[i 64] [j 64]] [[k 64]]
+    (* (arrays/aget A (+ (* i 64) k)) (arrays/aget B (+ (* k 64) j)))
+    :init 0.0))
 
 (defn- valid-measurement? [result]
   (let [median (get-in result [:measurement :median-ns])]
