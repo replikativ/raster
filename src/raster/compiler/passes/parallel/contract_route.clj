@@ -1213,6 +1213,10 @@
       (not (:ok matrix-view))
       {:alternatives [] :decline (dissoc matrix-view :ok)}
 
+      (some #(and (= (:out facts) (:name %)) (= :inout (:kind %))) abi)
+      {:alternatives []
+       :decline {:reason :mixed-dpas-inout-result-transform-not-lowered}}
+
       (and (:batched? matrix-view) (seq (:epilogue matrix-view)))
       {:alternatives []
        :decline {:reason :batched-matrix-result-transform-not-lowered}}

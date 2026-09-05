@@ -1632,6 +1632,35 @@
                kdispatch/alternative-strategy))
         "low occupancy stays direct rather than transforming split partials")))
 
+(deftest mixed-matrix-routing-declines-a-read-write-result-explicitly
+  (let [transform {:acc 'acc :expr '(+ acc (aget C (+ (* i n) j)))
+                   :operands [{:sym 'C :dtype :float
+                               :map {:groups [[['i 'm] ['j 'n]]]}}]
+                   :scalars [] :dtype :float}
+        contract (concat '(raster.par/contract C [[i m] [j n]] [[l k]]
+                              (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+                         [:epilogue transform])
+        {:keys [form]} (pipeline/schedule-parallel-form
+                        (list 'let* ['step (apply list contract)] 'step)
+                        {:target-device :ze:0 :dtype :float
+                         :array-types {'A :float 'B :float 'C :float}
+                         :scalar-types {'m :int 'n :int 'k :int}})
+        dispatch (contract-route/route-typed-contraction-dispatch
+                  (-> form :equations first :algorithm)
+                  (-> form :equations first :operations first)
+                  :dtype :float :precision :mixed-f16-f32
+                  :desc {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                         :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                         :subgroup-size 16 :max-workgroup-size 1024
+                         :grf-bytes-per-lane 256 :machine-lanes 8192
+                         :shared-local-memory 131072})]
+    (is (= [:portable-segred]
+           (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
+    (is (= :mixed-dpas-inout-result-transform-not-lowered
+           (get-in dispatch [:attributes :matrix-graph-decline :reason])))
+    (is (= :inout (:kind (some #(when (= 'C (:name %)) %)
+                               (:abi (kdispatch/default-alternative dispatch))))))))
+
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source
         '(let* [total (raster.par/reduce acc 0.0 i n
