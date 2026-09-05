@@ -474,7 +474,14 @@
                             :argument argument :parameter-dtype (:dtype parameter)
                             :graph-dtype (:dtype buffer)})))
          (when-not (and graph-elements
-                        (= expected-elements parameter-elements graph-elements))
+                        (= expected-elements parameter-elements)
+                        (or (= expected-elements graph-elements)
+                            ;; An externally supplied array may have only a runtime capacity
+                            ;; contract at compile time. The graph reconstruction above proves
+                            ;; this exact sentinel came from the retained AbstractValue; binding
+                            ;; checks the concrete capacity before launch.
+                            (and (contains? #{:input :output :inout} (:role buffer))
+                                 (= (list 'extent argument) (:elements buffer)))))
            (throw (ex-info "fold-map pointer extent differs across source, body, and graph"
                            {:reason :segfoldmap-storage-extent :parameter (:id parameter)
                             :argument argument :source expected-elements

@@ -173,6 +173,13 @@
                                                  {:node id :compiler-value compiler-value
                                                   :declared declared})))))
                          (:abi artifact) (:arguments artifact))]
-               (->ScheduledKernelCall id (kcall/make artifact arguments) dependencies)))
+               ;; A node may bind a private scalar expression (for example M*K) while its launch
+               ;; still names the public leaves M and K. Resolve launch algebra from the graph's
+               ;; typed scalar environment, not by searching only the node's narrowed ABI.
+               (->ScheduledKernelCall
+                id
+                (kcall/make artifact arguments
+                            {:resolve-value #(resolve-integer scalar-values %)})
+                dependencies)))
            (:nodes graph))]
       (validate! (->KernelGraphCall graph buffers scalar-values nodes)))))
