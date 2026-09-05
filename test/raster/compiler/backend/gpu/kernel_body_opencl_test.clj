@@ -360,6 +360,13 @@
           (is (str/includes? source trap-spelling))
           (is (= 2 (count (re-seq (re-pattern (str helper-name "\\(")) source)))
               "one checked definition accompanies one typed call")))
+      ;; `trapping-arithmetic-body` puts an add expression directly in ScalarStore.value.  This
+      ;; keeps helper discovery honest for legal non-ScalarCompute expression placements.
+      (let [source (opencl/emit-scalar-kernel
+                    "trapping_arithmetic" (fixtures/trapping-arithmetic-body)
+                    {:target-dialect target})]
+        (is (= 3 (count (re-seq #"rstr_trap_add_i32\(" source)))
+            "direct ScalarStore and nested LoopArg trap expressions receive their CUDA/HIP helper"))
       (when (command-available? compiler)
         (let [source (opencl/emit-scalar-kernel
                       "trapping_arithmetic" (fixtures/trapping-arithmetic-body)

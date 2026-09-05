@@ -547,6 +547,28 @@
     (is (str/includes? (:source artifact)
                        "rstr_empty_last_page_valid = (rstr_final_page_length == 0)"))))
 
+(deftest csr-route-sanitizes-untrusted-page-metadata-before-proved-arithmetic
+  (let [{:keys [plan schedule]} (route/route! (problem :route (csr-route)) intel-desc)
+        lowered (swr-body/lower-routed-paged plan schedule)
+        operations (operation-tree (:operations lowered))
+        compute-by-id (into {}
+                            (keep (fn [operation]
+                                    (when-let [result (:result operation)]
+                                      [(:id result) operation])))
+                            operations)
+        routed-count (get compute-by-id 'routed-page-count)
+        computed-length (get compute-by-id 'computed-kv-length)]
+    ;; Raw device page offsets and last-page lengths have no overflow contract.  The only marked
+    ;; arithmetic consumes clamped SSA values, while invalid raw metadata remains in route-valid
+    ;; and therefore masks all writes.
+    (is (= :no-overflow (get-in routed-count [:expression :options :overflow])))
+    (is (= ['safe-page-end 'safe-page-begin]
+           (get-in routed-count [:expression :arguments])))
+    (is (= :no-overflow (get-in computed-length [:expression :options :overflow])))
+    (is (= 'safe-final-page-length
+           (last (get-in computed-length [:expression :arguments]))))
+    (is (some? (get compute-by-id 'route-valid)))))
+
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}
         (route/route! (problem :visibility (csr-visibility)) intel-desc)]
