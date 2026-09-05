@@ -397,46 +397,25 @@
 
 (defn generate-segstencil-kernel-body
   "Schedule and emit one certified SegStencil through portable KernelBody."
-  [stencil & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
+  [stencil & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
+                     graph-node kernel-graph]
               :or {kernel-name-prefix "segstencil"
                    target-dialect :opencl-intel
                    scalar-types {} array-types {}}}]
   (let [workgroup-size (or workgroup-size (get-in stencil [:grid :block-size]) 256)
-        {:keys [kernel-body bound inputs outputs scalars]}
-        (segstencil-body/lower
+        scheduled
+        (segstencil-body/schedule
          stencil {:workgroup-size workgroup-size
                   :scalar-types scalar-types :array-types array-types})
-        parameters (:parameters kernel-body)
+        _ (when (not= (some? graph-node) (some? kernel-graph))
+            (throw (ex-info "stencil graph certification requires both node and graph"
+                            {:reason :segstencil-graph-context
+                             :graph-node graph-node :kernel-graph kernel-graph})))
+        _ (when graph-node
+            (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        parameter-names (into {}
-                              (map (fn [parameter]
-                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
-                              parameters)
-        source (kernel-body-opencl/emit-scalar-kernel
-                kernel-name kernel-body
-                {:target-dialect target-dialect :parameter-names parameter-names})
-        abi (body-abi/project-contracts
-             (mapv (fn [{:keys [id kind dtype role]}]
-                     (kabi/slot id kind dtype :c-name (get parameter-names id)
-                                :role (if (= id '_n_bound) :bound role)))
-                   parameters)
-             kernel-body)
-        arguments (mapv (fn [parameter]
-                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
-                        parameters)]
-    (kart/make
-     {:kernel-name kernel-name :source source :abi abi :arguments arguments
-      :launch (:launch kernel-body) :temporaries []
-      :effects {:kind :stencil :boundary (:boundary stencil) :radius (:radius stencil)}
-      :target (kernel-body-c-dialect/target
-               (kernel-body-c-dialect/resolve! target-dialect))
-      :provenance {:dialect :kernel-body :source-dialect :segstencil
-                   :segop-id (:id stencil)}
-      :attributes {:kernel-body kernel-body
-                   :array-params (vec (concat inputs outputs))
-                   :scalar-params scalars :dtype (:dtype stencil)
-                   :boundary (:boundary stencil) :radius (:radius stencil)
-                   :aliasing :no-write-alias}})))
+        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
+    artifact))
 
 ;; ================================================================
 ;; SegRed → OpenCL kernel (two-phase reduction)
@@ -1051,7 +1030,7 @@
         emitted
         (kgraph/map-operations
          graph
-         (fn [{:keys [id operation]}]
+         (fn [{:keys [id operation] :as node}]
            (cond
              (instance? raster.compiler.ir.segop.SegMap operation)
              (generate-scheduled-segmap-kernel
@@ -1061,12 +1040,12 @@
               :kernel-name-prefix "graph_segmap")
 
              (instance? raster.compiler.ir.segop.SegStencil operation)
-             (kart/certify-scheduled-operation
-              (generate-segstencil-kernel-body
-               operation :scalar-types scalar-types :array-types array-types
-               :target-dialect target-dialect
-               :kernel-name-prefix "graph_segstencil")
-              operation)
+             (generate-segstencil-kernel-body
+              operation :scalar-types scalar-types :array-types array-types
+              :target-dialect target-dialect
+              :kernel-name-prefix "graph_segstencil"
+              :graph-node node
+              :kernel-graph graph)
 
              :else
              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"

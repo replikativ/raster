@@ -6,6 +6,7 @@
    named legality witness, and one shared numerical contract.  Target emitters consume this value;
    they must not reconstruct any of these facts from operation names or generated source."
   (:require [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-graph :as graph]
@@ -93,10 +94,31 @@
 
 (defn- validate-scalar-bindings!
   [kernel-body arguments scalar-bindings]
-  (let [expected (derive-scalar-bindings kernel-body arguments)]
-    (when-not (= expected scalar-bindings)
+  (let [expected (derive-scalar-bindings kernel-body arguments)
+        valid-binding?
+        (fn [identity-binding actual]
+          (let [logical-dtype (some-> (:dtype actual) dtype/canon)
+                kernel-dtype (some-> (:kernel-dtype actual) dtype/canon)
+                physical-dtype (:dtype identity-binding)
+                same-identity? (= (select-keys identity-binding [:parameter :value])
+                                  (select-keys actual [:parameter :value]))]
+            (and same-identity?
+                 (= physical-dtype kernel-dtype)
+                 (= (:dtype actual) logical-dtype)
+                 (= (:kernel-dtype actual) kernel-dtype)
+                 (case (:conversion actual)
+                   :identity (= logical-dtype kernel-dtype)
+                   ;; A logical graph extent may deliberately use a wider host representation
+                   ;; than a target-private ABI slot. The graph-call boundary range-checks this
+                   ;; conversion before driver contact; schedules must state the proof rather
+                   ;; than obtaining a narrowing from target emission by accident.
+                   :checked-range (and (= :long logical-dtype) (= :int kernel-dtype))
+                   false))))]
+    (when-not (and (vector? scalar-bindings)
+                   (= (count expected) (count scalar-bindings))
+                   (every? true? (map valid-binding? expected scalar-bindings)))
       (fail! :scheduled-kernel-body-scalar-bindings
-             "scheduled scalar bindings must explicitly preserve logical and kernel dtypes"
+             "scheduled scalar bindings must explicitly preserve or prove logical-to-kernel dtype conversion"
              {:expected expected :actual scalar-bindings}))
     scalar-bindings))
 

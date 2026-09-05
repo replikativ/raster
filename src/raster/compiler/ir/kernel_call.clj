@@ -104,6 +104,12 @@
     (throw (ex-info "kernel scalar argument has the wrong kernel dtype"
                     {:slot slot :expected (:kernel-dtype slot) :actual (:type value)
                      :value value})))
+  (when (and (= :int (:kernel-dtype slot))
+             (not (and (integer? (:value value))
+                       (<= Integer/MIN_VALUE (:value value) Integer/MAX_VALUE))))
+    (throw (ex-info "kernel int scalar argument is outside its physical ABI range"
+                    {:reason :kernel-scalar-range :slot slot :value value
+                     :minimum Integer/MIN_VALUE :maximum Integer/MAX_VALUE})))
   value)
 
 (defn- resident-view

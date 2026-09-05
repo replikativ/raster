@@ -16,11 +16,13 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
@@ -117,11 +119,12 @@
                    source :double {'du :double 'u :double}
                    {:scalar-types {'n :long 'alpha :double 'inv-dx2 :double}})
                   :program :equations first :algorithm)
-        scheduled (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
+        stencil (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
         artifact (sg/generate-segstencil-kernel-body
-                  scheduled
+                  stencil
                   :array-types {'du :double 'u :double}
                   :scalar-types {'n :long 'alpha :double 'inv-dx2 :double})
+        certificate (get-in artifact [:provenance :scheduled-operation])
         kernel-body (get-in artifact [:attributes :kernel-body])
         if-region (some #(when (= "IfRegion" (some-> % class .getSimpleName)) %)
                         (:operations kernel-body))
@@ -130,14 +133,106 @@
         loads (filterv #(= "ScalarLoad" (some-> % class .getSimpleName))
                        (:then-operations interior-region))]
     (is (kart/kernel-artifact? artifact))
+    (is (scheduled-body/scheduled-kernel-body? certificate))
+    (is (identical? stencil (:source certificate)))
+    (is (= :scheduled-kernel-body (get-in artifact [:provenance :lowering])))
+    (is (= certificate (get-in artifact [:attributes :scheduled-kernel-body])))
+    (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
     (is (= '[u du alpha inv-dx2 _n_bound] (mapv :name (:abi artifact))))
     (is (= [:input :output :scalar :scalar :scalar] (mapv :kind (:abi artifact))))
-    (is (= [:double :double :double :double :int] (mapv :dtype (:abi artifact))))
+    (is (= [:double :double :double :double :long] (mapv :dtype (:abi artifact))))
+    (is (= [:double :double :double :double :int]
+           (mapv :kernel-dtype (:abi artifact))))
+    (is (= '[u du alpha inv-dx2 n] (:arguments artifact)))
     (is (= :no-write-alias (get-in artifact [:abi 0 :aliasing])))
-    (is (= {:kind :stencil :boundary :dirichlet :radius 1} (:effects artifact)))
+    (is (= [{:value 'u :access :read} {:value 'du :access :write}]
+           (get-in artifact [:effects :uses])))
+    (is (= {:kind :stencil :boundary :dirichlet :radius 1}
+           (dissoc (:effects artifact) :uses)))
+    (is (= [{:parameter 'alpha :value 'alpha :dtype :double :kernel-dtype :double
+             :conversion :identity}
+            {:parameter 'inv-dx2 :value 'inv-dx2 :dtype :double :kernel-dtype :double
+             :conversion :identity}
+            {:parameter '_n_bound :value 'n :dtype :long :kernel-dtype :int
+             :conversion :checked-range}]
+           (:scalar-bindings certificate)))
     (is (= :portable-segstencil (get-in kernel-body [:attributes :kind])))
     (is (= 3 (count loads))
         "the interior control region must dominate every neighborhood read")))
+
+(deftest typed-stencil-graph-preserves-its-scheduled-certificate
+  (let [source '(let* [result
+                       (raster.par/stencil!
+                        du [u] 1 :dirichlet double i n
+                        (* alpha (clojure.core/aget u i)))]
+                      result)
+        scalar-types {'n :long 'alpha :double}
+        typed (-> (typed-route/attempt source :double {'du :double 'u :double}
+                                      {:scalar-types scalar-types})
+                  :program :equations first :algorithm)
+        stencil (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
+        graph (kgraph/from-segops
+               [stencil]
+               {:inputs #{'u} :outputs #{'du} :dtype :double
+                :buffer-specs {'u {:dtype :double :elements 'n}
+                               'du {:dtype :double :elements 'n}}
+                :scalars [(kgraph/scalar 'alpha :double)
+                          (kgraph/scalar 'n :long)]})
+        emitted (sg/generate-kernel-graph
+                 graph :array-types {'du :double 'u :double}
+                 :scalar-types scalar-types)
+        artifact (get-in emitted [:nodes 0 :operation])
+        certificate (get-in artifact [:provenance :scheduled-operation])]
+    (is (kgraph/kernel-graph? emitted))
+    (is (identical? stencil (:source certificate)))
+    (is (= certificate (get-in artifact [:attributes :scheduled-kernel-body])))
+    (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+    (is (= [:double :long] (mapv :dtype (:scalars emitted))))
+    (is (= :long (some #(when (= '_n_bound (:name %)) (:dtype %)) (:abi artifact))))
+    (is (= :int (some #(when (= '_n_bound (:name %)) (:kernel-dtype %)) (:abi artifact))))
+    (is (= certificate
+           (scheduled-body/validate-against-node! certificate (first (:nodes graph)) graph)))))
+
+(deftest stencil-bound-conversion-is-proof-carrying-and-range-checked
+  (let [source '(let* [result
+                       (raster.par/stencil!
+                        du [u] 1 :dirichlet double i n
+                        (clojure.core/aget u i))]
+                      result)
+        scalar-types {'n :long}
+        typed (-> (typed-route/attempt source :double {'du :double 'u :double}
+                                      {:scalar-types scalar-types})
+                  :program :equations first :algorithm)
+        stencil (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
+        scheduled (segstencil-body/schedule
+                   stencil {:array-types {'du :double 'u :double}
+                            :scalar-types scalar-types})
+        missing-proof (update scheduled :scalar-bindings
+                              (fn [bindings]
+                                (mapv #(if (= '_n_bound (:parameter %))
+                                         (assoc % :conversion :identity)
+                                         %)
+                                      bindings)))
+        graph (kgraph/from-segops
+               [stencil]
+               {:inputs #{'u} :outputs #{'du} :dtype :double
+                :buffer-specs {'u {:dtype :double :elements 'n}
+                               'du {:dtype :double :elements 'n}}
+                :scalars [(kgraph/scalar 'n :long)]})
+        emitted (sg/generate-kernel-graph
+                 graph :array-types {'du :double 'u :double}
+                 :scalar-types scalar-types)]
+    (try
+      (scheduled-body/validate! missing-proof)
+      (is false "logical long to physical int requires an explicit checked-range proof")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :scheduled-kernel-body-scalar-bindings (:reason (ex-data exception))))))
+    (try
+      (graph-call/make emitted {'u :resident-u 'du :resident-du}
+                       {'n {:type :int :value (inc (long Integer/MAX_VALUE))}})
+      (is false "a proved narrowing still rejects an out-of-range runtime extent")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-scalar-range (:reason (ex-data exception))))))))
 
 (defn- segred-source [body-expr]
   (let [form (list 'raster.par/reduce 'acc 0.0 'j 'n body-expr)
