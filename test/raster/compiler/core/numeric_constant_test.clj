@@ -23,3 +23,13 @@
   (is (constant/equivalent? 'Float/POSITIVE_INFINITY Double/POSITIVE_INFINITY))
   (is (not (constant/equivalent? 'Float/POSITIVE_INFINITY 'Double/NEGATIVE_INFINITY)))
   (is (not (constant/equivalent? ##NaN ##NaN))))
+
+(deftest only-known-static-limits-are-constants
+  (is (constant/equivalent? '(int Integer/MAX_VALUE) Integer/MAX_VALUE))
+  (is (constant/equivalent? 'Long/MIN_VALUE Long/MIN_VALUE))
+  (is (constant/equivalent? 'Byte/MAX_VALUE Byte/MAX_VALUE))
+  (is (constant/equivalent? '(float java.lang.Float/NEGATIVE_INFINITY) Float/NEGATIVE_INFINITY))
+  (is (constant/equivalent? '(int java.lang.Integer/MAX_VALUE) Integer/MAX_VALUE))
+  (is (nil? (constant/value 'java.lang.user/MAX_VALUE)))
+  (is (nil? (constant/value 'user/MAX_VALUE)))
+  (is (nil? (constant/value '(int user/MAX_VALUE)))))

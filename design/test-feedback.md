@@ -102,3 +102,9 @@ certification, SegRed identity emission and matrix schedule legality. It evaluat
 Clojure casts rather than stripping them, and compares integer/floating values exactly. Unknown
 or failing conversions provide no evidence. The canary uses `(float 0.0)` to exercise this
 path; original initializer expressions remain in the retained IR.
+
+The legacy product-reduction OpenCL leaf also consumes checked constant evidence; it no longer
+unwraps arbitrary unary calls or resolves static fields by their unqualified name. The unused
+handwritten exclusive-scan generator has been removed (no Raster/pretrained/finetune callers).
+The retained product leaf still needs destination-dtype literal range validation and migration
+to the common KernelBody emitter; source-constant evaluation alone does not complete that work.
