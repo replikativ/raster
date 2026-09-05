@@ -5,8 +5,7 @@
    scalar kernel or a graph containing conversion, layout conversion, matrix contraction, and
    split-K combination. All mixed-precision scratch and derived scheduling scalars are private to
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
-  (:require [clojure.set :as set]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
@@ -252,6 +251,12 @@
         (layout-stage/validate! stage)
         elements (first input-shape)
         vector-width (:vector-width policy)
+        _ (when-not (and (= :float (:input-dtype stage)) (= :half (:output-dtype stage))
+                         (= :nearest-even (:rounding policy)) (= :ieee (:overflow policy)))
+            (throw (ex-info "GEMM cast emitter does not implement the scheduled representation"
+                            {:reason :gemm-stage-emission-unsupported :stage stage-id
+                             :input-dtype (:input-dtype stage)
+                             :output-dtype (:output-dtype stage) :policy policy})))
         _ (when-not (and (integer? vector-width) (pos? vector-width))
             (throw (ex-info "scheduled layout cast does not close its emission choices"
                             {:reason :gemm-stage-emission-open :stage stage-id
@@ -282,6 +287,12 @@
   [kernel-name stage phase target-dialect]
   (let [{stage-id :id in :input out :output
          [rows cols] :input-shape} (layout-stage/validate! stage)
+        _ (when-not (and (= :half (:input-dtype stage)) (= :half (:output-dtype stage))
+                         (= [1 0] (get-in stage [:policy :permutation])))
+            (throw (ex-info "GEMM transpose emitter does not implement the scheduled representation"
+                            {:reason :gemm-stage-emission-unsupported :stage stage-id
+                             :input-dtype (:input-dtype stage)
+                             :output-dtype (:output-dtype stage) :policy (:policy stage)})))
         kernel-name (c-emit/c-symbol kernel-name)
         kernel-body
         (layout-emitter/transpose-body
@@ -503,6 +514,16 @@
          [m n k] :dimensions reduction :reduction epilogue :epilogue
          batching :batching schedule :schedule} (matrix-stage/validate! stage)
         tile (:tile schedule)
+        _ (when-not (and (= :matrix-instruction-tiling (:kind schedule))
+                         (= :half (:operand-dtype stage))
+                         (= :float (:accumulator-dtype stage))
+                         (= :float (:result-dtype stage)))
+            (throw (ex-info "GEMM matrix emitter does not implement the scheduled numerical form"
+                            {:reason :gemm-stage-emission-unsupported :stage stage-id
+                             :schedule schedule
+                             :operand-dtype (:operand-dtype stage)
+                             :accumulator-dtype (:accumulator-dtype stage)
+                             :result-dtype (:result-dtype stage)})))
         _ (when-not (map? tile)
             (throw (ex-info "scheduled matrix stage does not close its emission choices"
                             {:reason :gemm-stage-emission-open :stage stage-id
@@ -590,41 +611,6 @@
                     {:split-factor factor})))
   (keyword (str "xmx-split-k-" factor)))
 
-(defn- semantic-source-graph
-  [stage-graph operation]
-  (when-not (instance? raster.compiler.ir.segop.SegRed operation)
-    (throw (ex-info "mixed-precision graph refinement requires its exact semantic SegRed"
-                    {:reason :gemm-refinement-source :operation operation})))
-  (let [stage-graph (kgraph/validate! stage-graph)
-        inputs (set (map :id (:inputs stage-graph)))
-        outputs (set (map :id (:outputs stage-graph)))
-        expected-inputs (segop/operation-inputs operation)
-        expected-outputs (segop/operation-outputs operation)
-        scalar-uses (segop/operation-scalars operation)
-        declared-scalars (set (map :id (:scalars stage-graph)))]
-    (when-not (and (= inputs expected-inputs) (= outputs expected-outputs))
-      (throw (ex-info "mixed-precision stage graph changed the semantic storage boundary"
-                      {:reason :gemm-refinement-storage
-                       :expected-inputs expected-inputs :actual-inputs inputs
-                       :expected-outputs expected-outputs :actual-outputs outputs})))
-    (when-not (set/subset? scalar-uses declared-scalars)
-      (throw (ex-info "mixed-precision source uses undeclared graph scalars"
-                      {:reason :gemm-refinement-scalars :uses scalar-uses
-                       :declared declared-scalars})))
-    (kgraph/make
-     {:inputs (:inputs stage-graph)
-      :outputs (:outputs stage-graph)
-      :scalars (:scalars stage-graph)
-      :nodes [(kgraph/->ScheduledKernel
-               [:semantic-contraction (:id operation)] operation
-               (vec (concat (map #(value-use (:id %) :read) (:inputs stage-graph))
-                            (map #(value-use (:id %) :write) (:outputs stage-graph))))
-               scalar-uses [])]
-      :abi (:abi stage-graph) :arguments (:arguments stage-graph)
-      :effects (:effects stage-graph)
-      :provenance {:semantic-op :contraction :source-dialect :typed-soac}
-      :attributes {:semantic-operation (:id operation)}})))
-
 (defn- refinement-numerics
   [{:keys [epilogue]} split-k?]
   (cond-> {:mode :bounded-error
@@ -647,20 +633,29 @@
             :input-dtype :float :result-dtype :float})))
 
 (defn- make-refinement
-  [stage-graph source-operation {:keys [strategy variant tile vector-width requested-splits
-                                        split-k?] :as spec}]
+  [stage-graph source-operation source-graph
+   {:keys [strategy variant tile vector-width requested-splits split-k?] :as spec}]
   (when source-operation
-    (graph-refinement/make
-     {:source (semantic-source-graph stage-graph source-operation)
-      :graph stage-graph
-      :schedule {:kind :mixed-precision-contraction
-                 :strategy strategy :variant variant :tile tile
-                 :vector-width vector-width :split-k? (boolean split-k?)
-                 :requested-splits requested-splits}
-      :numerics (refinement-numerics spec split-k?)
-      :provenance {:operation-id (:id source-operation)
-                   :source-dialect :typed-soac}
-      :attributes {:compiler-stage :gemm-graph-schedule}})))
+    (when-not source-graph
+      (throw (ex-info "typed mixed-precision scheduling requires its independent source graph"
+                      {:reason :gemm-refinement-source-graph
+                       :operation (:id source-operation)})))
+    (let [source-graph (kgraph/validate! source-graph)]
+      (when-not (identical? source-operation (-> source-graph :nodes first :operation))
+        (throw (ex-info "mixed-precision refinement source graph lost exact SegRed identity"
+                        {:reason :gemm-refinement-source
+                         :operation (:id source-operation)})))
+      (graph-refinement/make
+       {:source source-graph
+        :graph stage-graph
+        :schedule {:kind :mixed-precision-contraction
+                   :strategy strategy :variant variant :tile tile
+                   :vector-width vector-width :split-k? (boolean split-k?)
+                   :requested-splits requested-splits}
+        :numerics (refinement-numerics spec split-k?)
+        :provenance {:operation-id (:id source-operation)
+                     :source-dialect :typed-soac}
+        :attributes {:compiler-stage :gemm-graph-schedule}}))))
 
 (defn- split-combine-values
   [operation]
@@ -739,7 +734,7 @@
 
 (defn- xmx-graph
   [{:keys [id a b c m n k variant tile vector-width requested-splits split-k? epilogue
-           strategy source-operation external-interface]
+           strategy source-operation source-graph external-interface]
     :as spec}]
   (let [{:keys [abi arguments effects]}
         (or external-interface (assoc (public-outer-interface spec) :effects (effects spec)))
@@ -826,7 +821,7 @@
                          :tile tile :vector-width vector-width
                          :requested-splits requested-splits}})
           emit-spec (assoc spec :strategy strategy)
-          refinement (make-refinement stage-graph source-operation emit-spec)]
+          refinement (make-refinement stage-graph source-operation source-graph emit-spec)]
       (emit-scheduled-stage-graph
        stage-graph {:target-dialect (get spec :target-dialect :opencl-intel)
                     :prefix prefix :refinement refinement}))))
@@ -840,7 +835,7 @@
    standalone dispatch: the originating typed contraction supplies its general fallback and this
    schedule contributes the alignment selector that chooses between them."
   [{:keys [id a b c batch m n k variant tile vector-width batching
-           source-operation external-interface]
+           source-operation source-graph external-interface]
     :or {vector-width 4 batching {:row true :col true}}
     :as spec}]
   (when-not (= :nn variant)
@@ -912,7 +907,7 @@
                        :tile tile}})
         emit-spec (assoc spec :strategy :xmx-batched
                          :vector-width vector-width :batching batching)
-        refinement (make-refinement stage-graph source-operation emit-spec)
+        refinement (make-refinement stage-graph source-operation source-graph emit-spec)
         graph (emit-scheduled-stage-graph
                stage-graph {:target-dialect (get spec :target-dialect :opencl-intel)
                             :prefix prefix :refinement refinement})]

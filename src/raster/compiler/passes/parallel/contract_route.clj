@@ -24,6 +24,7 @@
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -32,6 +33,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scheduled-graph-refinement :as graph-refinement]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
@@ -749,6 +751,15 @@
             (if (some #(= value %) result) result (conj result value)))
           [] values))
 
+(defn- semantic-scalar-order
+  [operation]
+  (let [axis-bounds (mapv :bound (get-in operation [:space :dims]))
+        extent-scalars (ordered-distinct
+                        (mapcat #(sort-by str (util/free-syms %)) axis-bounds))
+        semantic-scalars (segop/operation-scalars operation)
+        parameter-scalars (sort-by str (remove (set extent-scalars) semantic-scalars))]
+    (filterv semantic-scalars (into extent-scalars parameter-scalars))))
+
 (defn- semantic-scalar-interface
   "Construct the scalar part of a typed contraction's public ABI from semantic inputs.
 
@@ -761,8 +772,7 @@
         extent-scalars (ordered-distinct
                         (mapcat #(sort-by str (util/free-syms %)) axis-bounds))
         semantic-scalars (segop/operation-scalars operation)
-        parameter-scalars (sort-by str (remove (set extent-scalars) semantic-scalars))
-        ordered-scalars (filterv semantic-scalars (into extent-scalars parameter-scalars))]
+        ordered-scalars (semantic-scalar-order operation)]
     (into []
           (comp
            (remove (set existing-arguments))
@@ -871,7 +881,7 @@
     :inout :inout))
 
 (defn- candidate-graph
-  [candidate operation-id common-abi common-arguments]
+  [candidate operation-id common-abi common-arguments semantic-effects]
   (let [{:keys [family strategy artifact candidate-schedule]} candidate
         artifact (kart/validate! artifact)
         {public-abi :abi public-arguments :arguments}
@@ -904,7 +914,7 @@
       :nodes [(kgraph/->ScheduledKernel
                [:typed-contraction operation-id family strategy] artifact uses
                (kgraph/scalar-argument-uses (:abi artifact) (:arguments artifact)) [])]
-      :effects (:effects artifact)
+      :effects semantic-effects
       :provenance {:operation-id operation-id
                    :semantic-op :contraction
                    :lowering :typed-contraction-candidate}
@@ -952,6 +962,138 @@
                       :interface interface}
      :layout {:external-interface interface}}))
 
+(defn- semantic-equation-effects
+  [program operation-id]
+  (let [equation-facts (or (get-in (soac-dialect/facts program) [:equations operation-id])
+                           (throw (ex-info "typed contraction lacks independent equation facts"
+                                           {:reason :typed-contraction-semantic-effects
+                                            :operation operation-id})))]
+    {:kind :typed-soac-contraction
+     :effects (:effects equation-facts)
+     :aliases (:aliases equation-facts)}))
+
+(defn- exact-element-counts
+  [facts matrix-view]
+  (let [[m n k] (:dimensions matrix-view)
+        batch (:batch matrix-view)
+        batching (:batching matrix-view)
+        {:keys [row col]} (:bindings matrix-view)
+        batched? (:batched? matrix-view)
+        counts {row (if (and batched? (get batching :row true))
+                      (klaunch/product batch m k) (klaunch/product m k))
+                col (if (and batched? (get batching :col true))
+                      (klaunch/product batch k n) (klaunch/product k n))
+                (:out facts) (if batched?
+                               (klaunch/product batch m n) (klaunch/product m n))}]
+    (reduce
+     (fn [counts {:keys [sym map]}]
+       (let [shape (am/shape map)
+             elements (if (seq shape) (apply klaunch/product shape) 1)]
+         (if-let [prior (get counts sym)]
+           (if (= prior elements)
+             counts
+             (throw (ex-info "typed contraction gives one value incompatible exact extents"
+                             {:reason :typed-contraction-semantic-elements
+                              :value sym :first prior :second elements})))
+           (assoc counts sym elements))))
+     counts (get-in facts [:epilogue :operands]))))
+
+(defn- semantic-source-graph
+  "Build the semantic graph from TypedSOAC/SegRed facts, independently of emitted candidates."
+  [{:keys [program operation operation-id facts equation]} matrix-view abi arguments]
+  (let [program-facts (soac-dialect/facts program)
+        values (:values program-facts)
+        {public-abi :abi public-arguments :arguments}
+        (kgraph/public-interface abi arguments)
+        interface (mapv vector public-abi public-arguments)
+        pointer-interface (filterv #(not= :scalar (:kind (first %))) interface)
+        scalar-interface (filterv #(= :scalar (:kind (first %))) interface)
+        input-ids (segop/operation-inputs operation)
+        output-ids (segop/operation-outputs operation)
+        storage-ids (into input-ids output-ids)
+        pointer-ids (mapv second pointer-interface)
+        scalar-order (semantic-scalar-order operation)
+        element-counts (exact-element-counts facts matrix-view)
+        semantic-effects (semantic-equation-effects program operation-id)]
+    (when-not (= storage-ids (set pointer-ids))
+      (throw (ex-info "candidate-derived pointer ABI differs from TypedSOAC storage"
+                      {:reason :typed-contraction-semantic-pointer-identity
+                       :operation operation-id :expected storage-ids :actual pointer-ids})))
+    (when-not (= scalar-order (mapv second scalar-interface))
+      (throw (ex-info "candidate-derived scalar ABI differs from TypedSOAC scalar order"
+                      {:reason :typed-contraction-semantic-scalar-order
+                       :operation operation-id :expected scalar-order
+                       :actual (mapv second scalar-interface)})))
+    (doseq [[slot id] interface]
+      (let [value (some-> (get values id) av/validate!)]
+        (when-not value
+          (throw (ex-info "typed contraction public ABI value lacks an AbstractValue"
+                          {:reason :typed-contraction-semantic-abstract-value
+                           :operation operation-id :value id})))
+        (when-not (= (dtype/canon (:dtype value)) (:dtype slot))
+          (throw (ex-info "candidate-derived ABI dtype differs from its AbstractValue"
+                          {:reason :typed-contraction-semantic-dtype
+                           :operation operation-id :value id
+                           :expected (dtype/canon (:dtype value)) :actual (:dtype slot)})))
+        (if (= :scalar (:kind slot))
+          (when-not (= [] (:shape value))
+            (throw (ex-info "typed contraction scalar ABI names a non-scalar AbstractValue"
+                            {:reason :typed-contraction-semantic-scalar-shape
+                             :operation operation-id :value id :shape (:shape value)})))
+          (do
+            (when-not (= :tensor (:kind value))
+              (throw (ex-info "typed contraction pointer ABI requires a tensor AbstractValue"
+                              {:reason :typed-contraction-semantic-storage-kind
+                               :operation operation-id :value id :kind (:kind value)})))
+            (when-not (contains? #{nil :device} (:memory-space value))
+              (throw (ex-info "mixed GPU contraction requires device-compatible memory semantics"
+                              {:reason :typed-contraction-semantic-memory
+                               :operation operation-id :value id
+                               :memory-space (:memory-space value)})))
+            (when-not (contains? #{nil {:kind :plain}} (:representation value))
+              (throw (ex-info "mixed GPU contraction requires plain tensor representation"
+                              {:reason :typed-contraction-semantic-representation
+                               :operation operation-id :value id
+                               :representation (:representation value)})))
+            (when-not (= (:kind slot)
+                         (cond
+                           (and (contains? input-ids id) (contains? output-ids id)) :inout
+                           (contains? input-ids id) :input
+                           :else :output))
+              (throw (ex-info "candidate-derived pointer direction differs from TypedSOAC"
+                              {:reason :typed-contraction-semantic-pointer-kind
+                               :operation operation-id :value id :actual (:kind slot)})))
+            (when-not (contains? element-counts id)
+              (throw (ex-info "typed contraction pointer lacks a verified matrix extent"
+                              {:reason :typed-contraction-semantic-elements
+                               :operation operation-id :value id})))))))
+    (let [buffers (into {}
+                        (map (fn [[slot id]]
+                               [id (kgraph/buffer id (:dtype slot) (get element-counts id)
+                                                  :device (graph-buffer-role (:kind slot)))])
+                             pointer-interface))
+          inputs (into [] (comp (filter #(contains? #{:input :inout} (:kind (first %))))
+                                (map #(get buffers (second %))))
+                       pointer-interface)
+          outputs (into [] (comp (filter #(contains? #{:output :inout} (:kind (first %))))
+                                 (map #(get buffers (second %))))
+                        pointer-interface)
+          uses (mapv (fn [[slot id]]
+                       (kgraph/->ValueUse id (kabi/slot-access slot)))
+                     pointer-interface)]
+      (kgraph/make
+       {:inputs inputs :outputs outputs
+        :scalars (kgraph/interface-scalars public-abi public-arguments)
+        :nodes [(kgraph/->ScheduledKernel
+                 [:typed-contraction-semantic operation-id]
+                 operation uses (set scalar-order) [])]
+        :abi public-abi :arguments public-arguments
+        :effects semantic-effects
+        :provenance {:operation-id operation-id :source-dialect :typed-soac
+                     :equation (second equation)}
+        :attributes {:semantic-op :contraction
+                     :abstract-values (select-keys values (into storage-ids scalar-order))}}))))
+
 (defn- mixed-dpas-alternatives
   "Derive graph-valued mixed-precision DPAS schedules from ordinary typed contraction facts.
 
@@ -959,8 +1101,8 @@
    explicit f32→f16 layout adapters, a canonical matrix KernelBody, and an optional typed split-K
    reduction.  It declines as data when the algebra, layout, precision policy, enabled families,
    or target capability does not justify that transformation."
-  [program operation options abi arguments effects]
-  (let [{:keys [facts dtype operation-id]}
+  [program operation options abi arguments]
+  (let [{:keys [facts dtype operation-id] :as context}
         (scheduled-typed-contraction-context program operation)
         precision (or (:precision options) :mixed-f16-f32)
         matrix-enabled? (contains? (set (get-in operation [:schedule :tuning-space :families]))
@@ -995,6 +1137,8 @@
       :else
       (let [[m n k] (:dimensions matrix-view)
             {:keys [row col]} (:bindings matrix-view)
+            source-graph (semantic-source-graph context matrix-view abi arguments)
+            semantic-effects (:effects source-graph)
             emit-spec {:id [:typed-contraction operation-id]
                        :a row :b col :c (:out facts)
                        :m m :n n :k k
@@ -1004,7 +1148,9 @@
                        :tile (:tile target-schedule)
                        :fill-workgroups (:fill-workgroups target-schedule)
                        :source-operation operation
-                       :external-interface {:abi abi :arguments arguments :effects effects}
+                       :source-graph source-graph
+                       :external-interface {:abi abi :arguments arguments
+                                            :effects semantic-effects}
                        :split-factors (or (:split-factors options) [])}
             emitted (if (:batched? matrix-view)
                       (gpu-gemm/emit-batched-matrix-alternative
@@ -1017,16 +1163,23 @@
                                (:alternatives emitted))
             alternatives (mapv (fn [graph]
                                  (let [graph (kgraph/validate! graph)]
-                                   (when-not (= [abi arguments effects]
+                                   (when-not (= [abi arguments semantic-effects]
                                                 [(:abi graph) (:arguments graph) (:effects graph)])
                                      (throw (ex-info
                                              "typed matrix schedule changed its supplied public interface"
                                              {:reason :typed-contraction-matrix-interface
                                               :operation operation-id})))
+                                   (graph-refinement/validate-against!
+                                    (or (get-in graph [:attributes :scheduled-graph-refinement])
+                                        (throw (ex-info "typed matrix graph lacks its refinement"
+                                                        {:reason :typed-contraction-matrix-refinement
+                                                         :operation operation-id})))
+                                    source-graph)
                                    graph))
                                raw-alternatives)
             selector (:selector emitted)]
         {:alternatives alternatives
+         :source-graph source-graph
          :selector selector
          :schedule {:family :matrix
                     :precision :mixed-f16-f32
@@ -1061,6 +1214,9 @@
   [program operation & options]
   (let [options (apply hash-map options)
         operation-id (:id operation)
+        semantic-effects (semantic-equation-effects
+                          (:program (scheduled-typed-contraction-context program operation))
+                          operation-id)
         schedule (reduction/validate-schedule! (:schedule operation))
         {:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
@@ -1069,14 +1225,14 @@
         (common-logical-interface candidates operation operation-id)
         candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
         fallback-strategy (:strategy (first candidates))
-        common-effects (:effects (:artifact (first candidates)))
-        mixed (mixed-dpas-alternatives program operation options abi arguments common-effects)
+        mixed (mixed-dpas-alternatives program operation options abi arguments)
         matrix-default (some-> mixed :alternatives first kdispatch/alternative-strategy)
         default-strategy (or matrix-default fallback-strategy)
         schedule-identity (select-keys mixed [:schedule :decline])
         dispatch-id (candidate-dispatch-id operation-id candidates schedule-identity)
         candidates (mapv #(deterministic-candidate-entry-point % dispatch-id) candidates)
-        alternatives (into (mapv #(candidate-graph % operation-id abi arguments) candidates)
+        alternatives (into (mapv #(candidate-graph % operation-id abi arguments semantic-effects)
+                                 candidates)
                            (:alternatives mixed))
         selector (if (seq (:alternatives mixed))
                    (replace-selector-strategy (:selector mixed)

@@ -1134,6 +1134,23 @@
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (testing "logical effects come from TypedSOAC rather than any fallback artifact"
+      (let [semantic-effects (get-in direct-refinement [:source :effects])]
+        (is (= :typed-soac-contraction (:kind semantic-effects)))
+        (is (= (get-in (dialect/facts algorithm)
+                       [:equations (:id operation) :effects])
+               (:effects semantic-effects)))
+        (is (every? #(= semantic-effects (:effects %)) (:alternatives dispatch)))
+        (is (not= semantic-effects
+                  (get-in (first (:alternatives dispatch)) [:nodes 0 :operation :effects]))
+            "artifact effects remain a distinct physical certificate")
+        (try
+          (graph-refinement/validate-against!
+           direct-refinement
+           (assoc-in (:source direct-refinement) [:effects :effects] #{:tampered}))
+          (is false "a source graph with different semantic effects must not validate")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :scheduled-graph-refinement-source (:reason (ex-data exception))))))))
     (testing "mixed-precision alternatives refine the exact typed SegRed through stage graphs"
       (doseq [[graph refinement expected-types]
               [[direct-graph direct-refinement
@@ -1214,6 +1231,23 @@
             (is false "an emission-open scheduled stage must be rejected")
             (catch clojure.lang.ExceptionInfo exception
               (is (= :gemm-stage-emission-open (:reason (ex-data exception)))))))))
+    (testing "valid but unsupported stage semantics cannot be silently hardcoded away"
+      (let [stage-graph (graph-refinement/scheduled-graph direct-refinement)
+            matrix-index (first (keep-indexed
+                                 #(when (matrix-stage/matrix-stage? (:operation %2)) %1)
+                                 (:nodes stage-graph)))
+            unsupported
+            [(assoc-in stage-graph [:nodes 0 :operation :input-dtype] :double)
+             (assoc-in stage-graph [:nodes 0 :operation :policy :rounding] :toward-zero)
+             (assoc-in stage-graph [:nodes matrix-index :operation :schedule :kind]
+                       :different-matrix-schedule)
+             (assoc-in stage-graph [:nodes matrix-index :operation :accumulator-dtype] :double)]]
+        (doseq [tampered unsupported]
+          (try
+            (gpu-gemm/emit-scheduled-stage-graph tampered {:prefix "unsupported_schedule"})
+            (is false "an unsupported scheduled semantic must be rejected")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :gemm-stage-emission-unsupported (:reason (ex-data exception)))))))))
     (is (= {:kind :split-k
             :within-partition :tiled
             :partial-combine :ordered-sequential}
