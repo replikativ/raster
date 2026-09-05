@@ -28,4 +28,4 @@ for file in "${files[@]}"; do
 done
 
 echo "running ${#files[@]} OpenCL-gated namespaces on ${RASTER_OCL_DEVICE_TYPE} device(s)"
-exec clojure -M:test "${args[@]}"
+exec clojure -M:test:ci-timed "${args[@]}"
