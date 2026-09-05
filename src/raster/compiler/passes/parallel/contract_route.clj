@@ -752,27 +752,31 @@
           [] values))
 
 (defn- semantic-scalar-order
-  [operation]
+  [operation epilogue]
   (let [axis-bounds (mapv :bound (get-in operation [:space :dims]))
         extent-scalars (ordered-distinct
                         (mapcat #(sort-by str (util/free-syms %)) axis-bounds))
         semantic-scalars (segop/operation-scalars operation)
-        parameter-scalars (sort-by str (remove (set extent-scalars) semantic-scalars))]
-    (filterv semantic-scalars (into extent-scalars parameter-scalars))))
+        epilogue-scalars (filterv semantic-scalars (mapv :sym (:scalars epilogue)))
+        already-ordered (into (set extent-scalars) epilogue-scalars)
+        parameter-scalars (sort-by str (remove already-ordered semantic-scalars))]
+    ;; Existing resident calls place a result transform's explicit captures before dimensions.
+    ;; Preserve that semantic order, then append axis bounds and any remaining scalar captures.
+    (filterv semantic-scalars
+             (into epilogue-scalars (concat extent-scalars parameter-scalars)))))
 
 (defn- semantic-scalar-interface
   "Construct the scalar part of a typed contraction's public ABI from semantic inputs.
 
-   Axis-bound inputs precede other scalar captures and follow axis order. A target leaf may bake
-   one of these values or expose it under a different parameter name; neither changes the logical
-   call. Conversely, leaf-derived values such as a flattened segment count are deliberately absent
-   and remain graph-private expressions over this interface."
-  [candidates operation operation-id existing-arguments]
+   Result-transform captures preserve their established call order, followed by axis bounds and
+   remaining captures. A target leaf may bake one of these values or expose it under a different
+   parameter name; neither changes the logical call. Conversely, leaf-derived values such as a
+   flattened segment count are deliberately absent and remain graph-private expressions."
+  [candidates operation operation-id epilogue existing-arguments]
   (let [axis-bounds (mapv :bound (get-in operation [:space :dims]))
         extent-scalars (ordered-distinct
                         (mapcat #(sort-by str (util/free-syms %)) axis-bounds))
-        semantic-scalars (segop/operation-scalars operation)
-        ordered-scalars (semantic-scalar-order operation)]
+        ordered-scalars (semantic-scalar-order operation epilogue)]
     (into []
           (comp
            (remove (set existing-arguments))
@@ -808,7 +812,7 @@
           ordered-scalars)))
 
 (defn- common-logical-interface
-  [candidates operation operation-id]
+  [candidates operation operation-id epilogue]
   (let [interfaces (mapv (comp artifact-logical-interface :artifact) candidates)
         arguments (mapv second (first interfaces))]
     (doseq [[candidate interface] (map vector candidates interfaces)]
@@ -840,7 +844,8 @@
                  alignment (assoc :alignment alignment)
                  (nil? alignment) (dissoc :alignment))))
            (range (count arguments)) arguments)
-          scalar-interface (semantic-scalar-interface candidates operation operation-id arguments)
+          scalar-interface (semantic-scalar-interface candidates operation operation-id
+                                                      epilogue arguments)
           abi (into abi (map first) scalar-interface)
           arguments (into arguments (map second) scalar-interface)]
       (kabi/validate! abi)
@@ -1019,7 +1024,7 @@
         output-ids (segop/operation-outputs operation)
         storage-ids (into input-ids output-ids)
         pointer-ids (mapv second pointer-interface)
-        scalar-order (semantic-scalar-order operation)
+        scalar-order (semantic-scalar-order operation (:epilogue facts))
         element-counts (exact-element-counts facts matrix-view)
         semantic-effects (semantic-equation-effects program operation-id)]
     (when-not (= storage-ids (set pointer-ids))
@@ -1221,15 +1226,17 @@
   [program operation & options]
   (let [options (apply hash-map options)
         operation-id (:id operation)
+        context (scheduled-typed-contraction-context program operation)
         semantic-effects (semantic-equation-effects
-                          (:program (scheduled-typed-contraction-context program operation))
+                          (:program context)
                           operation-id)
         schedule (reduction/validate-schedule! (:schedule operation))
         {:keys [candidates] :as routed}
         (apply route-typed-contraction-candidates!
                program operation (mapcat identity options))
         {:keys [abi arguments public-scalars]}
-        (common-logical-interface candidates operation operation-id)
+        (common-logical-interface candidates operation operation-id
+                                  (get-in context [:facts :epilogue]))
         candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
         fallback-strategy (:strategy (first candidates))
         mixed (mixed-dpas-alternatives program operation options abi arguments)
