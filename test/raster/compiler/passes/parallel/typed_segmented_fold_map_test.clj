@@ -3,6 +3,8 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -46,6 +48,15 @@
                              :array-types {'values :float 'out :float}
                              :scalar-types {'nsegments :int 'width :int}}))]
     (first (:operations (first (:equations scheduled))))))
+
+(defn- decline-rule
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch clojure.lang.ExceptionInfo exception
+      (when (fold-body/declined? exception)
+        (:missing-rule (ex-data exception))))))
 
 (deftest interpreted-segmented-fold-map-preserves-dependent-fold-order
   (let [values (float-array [1.0 3.0, 2.0 2.0])
@@ -92,6 +103,48 @@
     (is (= :final-map (get-in (last loops) [:attributes :role])))
     (is (= ['values] (mapv :buffer (:stable-reads kernel-body))))))
 
+(deftest ordered-fold-map-has-one-complete-scheduled-body-certificate
+  (let [operation (scheduled-operation)
+        options {:workgroup-size 64
+                 :array-types {'values :float 'out :float}
+                 :scalar-types {'nsegments :int 'width :int}}
+        lowered (fold-body/lower operation options)
+        scheduled (fold-body/schedule operation options)
+        artifact (segop-opencl/generate-segfoldmap-kernel
+                  operation :workgroup-size 64 :target-dialect :opencl-portable
+                  :array-types (:array-types options) :scalar-types (:scalar-types options))]
+    (is (scheduled-body/scheduled-kernel-body? scheduled))
+    (is (identical? operation (:source scheduled)))
+    (is (= (vec (concat (:arrays lowered) (:outputs lowered) (:scalars lowered)
+                        [(:segment-count lowered)]))
+           (:arguments scheduled))
+        "the private _nseg parameter binds to the derived segment count")
+    (is (= (scheduled-body/derive-scalar-bindings (:body scheduled) (:arguments scheduled))
+           (:scalar-bindings scheduled)))
+    (is (every? #(= :identity (:conversion %)) (:scalar-bindings scheduled)))
+    (is (= {:kind :segmented-fold-map
+            :uses [{:value 'values :access :read} {:value 'out :access :write}]
+            :association :ordered}
+           (:effects scheduled)))
+    (is (= {:kind :segfoldmap-body-lowering
+            :launch-rank 1
+            :segment-parallelism :independent
+            :association :ordered
+            :aliasing :no-write-alias}
+           (:legality scheduled)))
+    (is (= {:mode :exact :policy :declaration-order :reassociation :none}
+           (:numerics scheduled)))
+    (is (= :scheduled-kernel-body (get-in artifact [:provenance :lowering])))
+    (let [certificate (get-in artifact [:provenance :scheduled-operation])]
+      (is (identical? operation (:source certificate)))
+      (is (= '[values out nsegments width _nseg] (mapv :name (:abi artifact))))
+      (is (= [:input :output :scalar :scalar :scalar] (mapv :kind (:abi artifact))))
+      (is (= [:float :float :int :int :long] (mapv :dtype (:abi artifact))))
+      (is (= (:arguments certificate) (:arguments artifact)))
+      (is (= (scheduled-body/realized-launch certificate) (:launch artifact)))
+      (is (= artifact
+             (scheduled-body/validate-artifact-projection! certificate artifact))))))
+
 (deftest one-certified-schedule-emits-for-all-c-family-targets
   (let [operation (scheduled-operation)]
     (doseq [[target expected]
@@ -105,8 +158,58 @@
                       :scalar-types {'nsegments :int 'width :int})]
           (is (artifact/kernel-artifact? kernel))
           (is (= expected (:target kernel)))
+          (is (= :scheduled-kernel-body (get-in kernel [:provenance :lowering])))
+          (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+          (is (= kernel
+                 (scheduled-body/validate-artifact-projection!
+                  (get-in kernel [:provenance :scheduled-operation]) kernel)))
           (is (= :no-write-alias (get-in kernel [:abi 0 :aliasing])))
           (is (every? #(<= (int %) 127) (:source kernel))))))))
+
+(deftest graph-emission-closes-the-fold-map-certificate-over-node-scalars-and-effects
+  (let [operation (scheduled-operation)
+        scalar-types {'nsegments :int 'width :int}
+        graph (kgraph/from-segops
+               [operation]
+               {:inputs #{'values} :outputs #{'out} :dtype :float
+                :buffer-specs {'values {:dtype :float :elements 'elements}
+                               'out {:dtype :float :elements 'elements}}
+                :scalars [(kgraph/scalar 'nsegments :int)
+                          (kgraph/scalar 'width :int)]})
+        emitted (segop-opencl/generate-kernel-graph
+                 graph :target-dialect :opencl-portable
+                 :array-types {'values :float 'out :float}
+                 :scalar-types scalar-types)
+        artifact (get-in emitted [:nodes 0 :operation])
+        certificate (get-in artifact [:provenance :scheduled-operation])]
+    (is (identical? operation (:source certificate)))
+    (is (= certificate (get-in artifact [:attributes :scheduled-kernel-body])))
+    (is (= certificate
+           (scheduled-body/validate-against-node! certificate (first (:nodes graph)) graph)))
+    (is (= #{'nsegments 'width} (get-in graph [:nodes 0 :scalar-uses])))
+    (is (= artifact
+           (scheduled-body/validate-artifact-projection! certificate artifact)))))
+
+(deftest malformed-fold-map-contracts-decline-before-a-refinement-witness
+  (let [operation (scheduled-operation)
+        options {:array-types {'values :float 'out :float}
+                 :scalar-types {'nsegments :int 'width :int}}
+        result (first (:map-results operation))
+        cases
+        [[:aliasing-contract (assoc operation :aliasing :may-alias)]
+         [:storage-contract (update operation :inputs conj 'out)]
+         [:result-contract (assoc operation :outputs [] :dtypes [] :map-results [])]
+         [:result-contract (assoc operation :dtypes [])]
+         [:result-contract (assoc operation :map-results [])]
+         [:mapped-extent (assoc operation :extent 'other-width)]
+         [:fold-association (assoc-in operation [:folds 0 :association] :associative)]
+         [:distinct-outputs (assoc operation
+                                   :outputs ['out 'out]
+                                   :dtypes [:float :float]
+                                   :map-results [result result])]]]
+    (doseq [[rule malformed] cases]
+      (testing (name rule)
+        (is (= rule (decline-rule #(fold-body/schedule malformed options))))))))
 
 (deftest scalar-captures-retain-their-typed-abi
   (let [scaled-source

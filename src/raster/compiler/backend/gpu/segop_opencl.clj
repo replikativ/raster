@@ -336,50 +336,25 @@
        :dtype out-dtype}})))
 
 (defn generate-segfoldmap-kernel
-  "Schedule and emit one ordered SegFoldMap through the shared scalar KernelBody dialect."
-  [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types]
+  "Schedule and emit one certified ordered SegFoldMap through the canonical KernelBody target."
+  [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
+                        graph-node kernel-graph]
                  :or {kernel-name-prefix "segmented_fold_map"
                       target-dialect :opencl-intel workgroup-size 256
                       scalar-types {} array-types {}}}]
-  (let [{:keys [kernel-body segment-count]}
-        (segfoldmap-body/lower segfoldmap
-                               {:workgroup-size workgroup-size
-                                :scalar-types scalar-types :array-types array-types})
-        parameters (:parameters kernel-body)
+  (let [scheduled
+        (segfoldmap-body/schedule
+         segfoldmap {:workgroup-size workgroup-size
+                     :scalar-types scalar-types :array-types array-types})
+        _ (when (not= (some? graph-node) (some? kernel-graph))
+            (throw (ex-info "fold-map graph certification requires both node and graph"
+                            {:reason :segfoldmap-graph-context
+                             :graph-node graph-node :kernel-graph kernel-graph})))
+        _ (when graph-node
+            (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        parameter-names (into {}
-                              (map (fn [parameter]
-                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
-                              parameters)
-        source (kernel-body-opencl/emit-scalar-kernel
-                kernel-name kernel-body
-                {:target-dialect target-dialect :parameter-names parameter-names})
-        abi (body-abi/project-contracts
-             (mapv (fn [{:keys [id kind dtype role]}]
-                     (kabi/slot id kind dtype :c-name (get parameter-names id)
-                                :role (if (= id '_nseg) :bound role)))
-                   parameters)
-             kernel-body)
-        arguments (mapv (fn [parameter]
-                          (if (= '_nseg (:id parameter)) segment-count (:id parameter)))
-                        parameters)]
-    (kart/make
-     {:kernel-name kernel-name
-      :source source
-      :abi abi
-      :arguments arguments
-      :launch (:launch kernel-body)
-      :temporaries []
-      :effects {:kind :segmented-fold-map :association :ordered}
-      :target (kernel-body-c-dialect/target
-               (kernel-body-c-dialect/resolve! target-dialect))
-      :provenance {:dialect :kernel-body :source-dialect :segfoldmap
-                   :segop-id (:id segfoldmap)}
-      :attributes {:kernel-body kernel-body
-                   :array-params (vec (concat (:inputs segfoldmap) (:outputs segfoldmap)))
-                   :scalar-params (vec (:scalars segfoldmap))
-                   :dtype (first (:dtypes segfoldmap))
-                   :aliasing :no-write-alias}})))
+        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
+    artifact))
 
 (defn generate-segmap-kernel-body
   "Schedule and emit one typed SegMap through the shared scalar KernelBody dialect."
@@ -1108,14 +1083,14 @@
         emitted
         (kgraph/map-operations
          graph
-         (fn [{:keys [operation]}]
+         (fn [{:keys [operation] :as node}]
            (try
-             (kart/certify-scheduled-operation
-              (generate-segfoldmap-kernel
-               operation :scalar-types scalar-types :array-types array-types
-               :target-dialect target-dialect
-               :kernel-name-prefix "graph_segmented_fold_map")
-              operation)
+             (generate-segfoldmap-kernel
+              operation :scalar-types scalar-types :array-types array-types
+              :target-dialect target-dialect
+              :kernel-name-prefix "graph_segmented_fold_map"
+              :graph-node node
+              :kernel-graph graph)
              (catch clojure.lang.ExceptionInfo exception
                (if (and (not (kernel-body-c-dialect/opencl? target))
                         (segfoldmap-body/declined? exception))

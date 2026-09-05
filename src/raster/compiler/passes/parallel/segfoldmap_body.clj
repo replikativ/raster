@@ -10,6 +10,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
@@ -17,7 +18,7 @@
 (defn- decline!
   [rule message data]
   (throw (ex-info message (assoc data :reason :segfoldmap-kernel-body-declined
-                                 :missing-rule rule))))
+                                 :missing-rule rule :fallback :none))))
 
 (defn declined? [exception]
   (= :segfoldmap-kernel-body-declined (:reason (ex-data exception))))
@@ -65,6 +66,37 @@
         inputs (vec (sort-by name (:inputs segfold)))
         outputs (vec (:outputs segfold))
         scalars (vec (sort-by name (:scalars segfold)))
+        _ (when-not (= :no-write-alias (:aliasing segfold))
+            (decline! :aliasing-contract
+                      "fold-map requires a no-write-alias source contract"
+                      {:operation (:id segfold) :aliasing (:aliasing segfold)}))
+        _ (when (seq (set/intersection (set inputs) (set outputs)))
+            (decline! :storage-contract
+                      "fold-map stable inputs must be disjoint from its destinations"
+                      {:operation (:id segfold) :inputs inputs :outputs outputs}))
+        _ (when-not (= (count outputs) (count (distinct outputs)))
+            (decline! :distinct-outputs
+                      "fold-map destinations must have distinct identities"
+                      {:operation (:id segfold) :outputs outputs}))
+        _ (when-not (and (seq outputs) (seq (:dtypes segfold)) (seq (:map-results segfold))
+                         (= (count outputs) (count (:dtypes segfold))
+                            (count (:map-results segfold))))
+            (decline! :result-contract
+                      "fold-map requires aligned non-empty outputs, dtypes, and map results"
+                      {:operation (:id segfold) :outputs outputs
+                       :dtypes (:dtypes segfold) :map-results (:map-results segfold)}))
+        _ (when-not (= (:extent segfold) (:bound mapped-dim))
+            (decline! :mapped-extent
+                      "fold-map semantic extent must equal its reduced-space bound"
+                      {:operation (:id segfold) :extent (:extent segfold)
+                       :reduced-bound (:bound mapped-dim)}))
+        _ (when-let [[ordinal fold]
+                     (first (remove (fn [[_ fold]] (= :ordered (:association fold)))
+                                    (map-indexed vector (:folds segfold))))]
+            (decline! :fold-association
+                      "every fold-map accumulator must retain declared order"
+                      {:operation (:id segfold) :fold ordinal
+                       :association (:association fold)}))
         output-dtypes (mapv dtype/canon (:dtypes segfold))
         default-dtype (or (first output-dtypes) :float)
         array-types (into {}
@@ -172,7 +204,7 @@
         output-coordinate (body/expression :add base-coordinate map-index)
         map-operations
         (mapcat
-         (fn [ordinal output output-dtype expression]
+         (fn [_ordinal output output-dtype expression]
            (let [expression (util/subst-syms {(:index segfold) map-index} expression)
                  lowered ((:lower scalar-lower) expression output-dtype
                                                 (assoc (:env fold-state) map-index :long))]
@@ -217,3 +249,38 @@
      :arrays inputs :outputs outputs :scalars scalars
      :segment-count segment-count :map-extent map-extent
      :workgroup-size workgroup-size}))
+
+(defn schedule
+  "Refine one ordered SegFoldMap into a complete target-neutral ScheduledKernelBody.
+
+   The exact SegFoldMap remains the semantic source. One-dimensional launch geometry assigns an
+   independent work item to each segment, while all folds and final map results retain declaration
+   order without reassociation. Stable reads and distinct writes are derived from the body rather
+   than inferred by a target emitter."
+  [segfold options]
+  (let [{:keys [kernel-body segment-count inputs outputs scalars]} (lower segfold options)
+        arguments (mapv (fn [parameter]
+                          (if (= '_nseg (:id parameter)) segment-count (:id parameter)))
+                        (:parameters kernel-body))]
+    (scheduled-body/make
+     {:source segfold
+      :body kernel-body
+      :arguments arguments
+      :scalar-bindings (scheduled-body/derive-scalar-bindings kernel-body arguments)
+      :effects {:kind :segmented-fold-map
+                :uses (scheduled-body/derive-uses kernel-body arguments)
+                :association :ordered}
+      :legality {:kind :segfoldmap-body-lowering
+                 :launch-rank 1
+                 :segment-parallelism :independent
+                 :association :ordered
+                 :aliasing :no-write-alias}
+      :numerics {:mode :exact
+                 :policy :declaration-order
+                 :reassociation :none}
+      :provenance {:dialect :kernel-body :source-dialect :segfoldmap
+                   :segop-id (:id segfold)}
+      :attributes {:array-params (vec (concat inputs outputs))
+                   :scalar-params scalars
+                   :dtype (first (:dtypes segfold))
+                   :aliasing :no-write-alias}})))
