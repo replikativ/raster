@@ -499,7 +499,9 @@
           segment-axes (:segment-axes attributes)
           reduced-index (:index attributes)
           reduced-extent (:extent attributes)
-          dense-coordinate (flat-segment-coordinate segment-axes reduced-index reduced-extent)
+          dense-coordinate (if (seq segment-axes)
+                             (flat-segment-coordinate segment-axes reduced-index reduced-extent)
+                             reduced-index)
           substitutions
           (into (zipmap capture-parameters captures)
                 (map (fn [parameter array]
@@ -515,13 +517,29 @@
                    :result result})
                 (range) accumulators (:identities attributes) (:dtypes attributes)
                 physical-results)
-          operator (reduction/make
-                    {:components components
-                     :index reduced-index
-                     :step (reduction/->ReductionRegion [] step-results {})
-                     :algebra {:components (:algebra attributes)}
-                     :attributes {:source :typed-soac :equation equation-id
-                                  :segmented true}})
+          operator (if (empty? segment-axes)
+                     (do
+                       (when-not (= 1 (count components))
+                         (throw (ex-info "rank-zero reduction requires one scalar component"
+                                         {:reason :typed-soac-rank-zero-reduction-components
+                                          :equation equation-id})))
+                       (let [{:keys [accumulator neutral dtype result]} (first components)]
+                         (reduction/scalar
+                          {:accumulator accumulator :neutral neutral :dtype dtype :result result
+                           :index reduced-index :step-result (first step-results)
+                           :algebra (first (:algebra attributes))
+                           :attributes (cond-> {:source :typed-soac :equation equation-id}
+                                         (:result-transform attributes)
+                                         (assoc :result-region
+                                                (scalar-region-lower/from-typed-result-transform
+                                                 (:result-transform attributes))))})))
+                     (reduction/make
+                      {:components components
+                       :index reduced-index
+                       :step (reduction/->ReductionRegion [] step-results {})
+                       :algebra {:components (:algebra attributes)}
+                       :attributes {:source :typed-soac :equation equation-id
+                                    :segmented true}}))
           values (:values facts)
           stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
           inputs (set/union (set arrays) stable-captures)
@@ -564,11 +582,18 @@
                                 {:reason :typed-soac-segmented-reduce-input
                                  :equation equation-id :input input
                                  :value (get values input)}))))]
-      [(segop/->SegRed equation-id space
+      (if (empty? segment-axes)
+        (lower-reduce-description
+         {:id equation-id :sym (first physical-results)
+          :reduction operator :segment-axes [] :bound reduced-extent :idx reduced-index
+          :inputs inputs :outputs (set physical-results) :scalars scalars
+          :elem-type output-dtype}
+         device-id :dtype output-dtype)
+        [(segop/->SegRed equation-id space
                        (segop/->SegLevel :thread :virtual)
                        operator nil inputs (set physical-results) scalars planned-grid
                        (if contraction? :contraction :segmented)
-                       contraction-schedule output-dtype)])))
+                       contraction-schedule output-dtype)]))))
 
 (defn typed-product-reduce-program?
   "Whether a validated one-equation TypedSOAC program is a product reduction."

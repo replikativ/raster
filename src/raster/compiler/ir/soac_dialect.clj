@@ -355,7 +355,7 @@
   (let [axes (:segment-axes value)
         indices (mapv first axes)]
     (and (reduce-attributes? (dissoc value :segment-axes))
-         (vector? axes) (seq axes)
+         (vector? axes)
          (every? #(and (vector? %) (= 2 (count %))
                        (symbol? (first %)) (extent? (second %)))
                  axes)

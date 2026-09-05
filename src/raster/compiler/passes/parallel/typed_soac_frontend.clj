@@ -265,7 +265,7 @@
           (list head bindings stripped)))
       :else nil)))
 
-(declare store-region)
+(declare store-region pointwise-input?)
 
 (defn- counted-store-loop
   "Recognize a counted loop of stores inside an effect-map body.
@@ -1227,7 +1227,16 @@
       ;; The direct slice is scalar segmented-reduction algebra plus an optional closed typed
       ;; result transform. Staged quantization carries additional schedule/load contracts and must
       ;; not be admitted by dropping those facts.
-      (when (and (seq free-axes) (seq contract-axes)
+      (when (and (seq contract-axes)
+                 (or (seq free-axes)
+                     ;; The first rank-zero tensor reduction uses the ordinary pointwise
+                     ;; scalar tree. Affine/multi-axis loads need their own coordinate witness.
+                     (and (= 1 (count contract-axes)) (nil? epilogue)
+                          (not-any? #(= out (:sym %)) (:operands facts))
+                          (every? #(pointwise-input?
+                                    (:results (reduction/fold-region (:reduction facts)))
+                                    (:sym %) (ffirst contract-axes))
+                                  (:operands facts))))
                  ;; Decode lambdas, declared physical maps, staged accumulators and output
                  ;; conversions are not scalar fold syntax. Keep them on the certified
                  ;; contraction route until TypedSOAC represents those facts explicitly.
@@ -1830,7 +1839,7 @@
     :stencil (and (= 1 (count (:result-storage description)))
                   (symbol? (get-in description [:result-storage 0 :destination])))
     :reduce true
-    :segmented-reduce (and (seq (:segment-axes description))
+    :segmented-reduce (and (vector? (:segment-axes description))
                            (symbol? (get-in description [:result-storage 0 :destination])))
     :product-reduce (and (seq (:segment-axes description))
                          (seq (:result-components description))
@@ -2163,11 +2172,17 @@
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
            result-transform]}]
   (let [component (first (:components product))
-        stable (vec (sort-by pr-str inputs))
+        expressions (:results (reduction/fold-region product))
+        arrays (if (empty? segment-axes)
+                 (vec (sort-by pr-str
+                               (filter #(pointwise-input? expressions % reduce-index) inputs)))
+                 [])
+        elements (element-symbols (count arrays))
+        stable (vec (sort-by pr-str (set/difference (set inputs) (set arrays))))
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         capture-parameters (capture-symbols (count captures))
         step-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
-                           (:results (reduction/fold-region product)))
+                           (elementize expressions arrays elements reduce-index))
         algebra (scan/certify-reassociation
                  {:acc (:accumulator component)
                   :init (:neutral component)
@@ -2184,9 +2199,9 @@
                  :dtypes [(:dtype component)]
                  :algebra [algebra]
                  :result-transform result-transform}
-                [] captures
+                arrays captures
                 (dialect/lambda-form
-                 (vec (concat [(:accumulator component)] capture-parameters))
+                 (vec (concat [(:accumulator component)] elements capture-parameters))
                  step-results)))))
 
 (defn- product-reduce-equation

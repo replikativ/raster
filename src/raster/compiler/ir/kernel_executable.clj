@@ -89,8 +89,12 @@
         (doseq [[slot argument] (filterv (fn [[slot _]] (= :scalar (:kind slot)))
                                          (mapv vector (:abi artifact) (:arguments artifact)))]
           (if-let [public-slot (get public-scalars argument)]
-            (when-not (= (select-keys slot [:dtype :kernel-dtype])
-                         (select-keys public-slot [:dtype :kernel-dtype]))
+            (when-not (and (= (:dtype slot) (:dtype public-slot))
+                           (or (= (:kernel-dtype slot) (:kernel-dtype public-slot))
+                               ;; GraphCall performs checked integral conversion per node.
+                               ;; Other precision changes still need an explicit numerical policy.
+                               (every? #{:int :long}
+                                       [(:kernel-dtype slot) (:kernel-dtype public-slot)])))
               (throw (ex-info "kernel artifact scalar dtype differs from its graph interface"
                               {:reason :kernel-graph-artifact-scalar-dtype
                                :node id :argument argument

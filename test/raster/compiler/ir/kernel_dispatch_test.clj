@@ -246,7 +246,7 @@
                          :default-strategy :two-stage
                          :selector {:kind :fixed-strategy :strategy :two-stage}})
         x (float-array [1.0 2.0 3.0])
-        out (float-array 3)
+        out (float-array [123.0 456.0 789.0])
         calls (atom [])
         session (atom {:device-id :probe})]
     (with-redefs-fn
@@ -285,7 +285,11 @@
           (is (= [:staged-executable-pointer 0] (first bound-arguments)))
           (is (= [:staged-executable-pointer 1] (second bound-arguments)))
           (is (= {:type :long :value 3} (nth bound-arguments 2))))
-        (is (= 2 (count (filter #(= :alloc (first %)) @calls))))
+        (let [allocations (filter #(= :alloc (first %)) @calls)
+              output-spec (get (second (second allocations)) [:staged-executable-pointer 1])]
+          (is (= 2 (count allocations)))
+          (is (identical? out (nth output-spec 2))
+              "write-only ABI access does not prove full overwrite of caller storage"))
         (is (= 1 (count (filter #(= :download (first %)) @calls))))))))
 
 (deftest staged-graph-capacities-fail-before-opening-a-device-session

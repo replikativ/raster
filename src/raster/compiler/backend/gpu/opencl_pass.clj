@@ -36,6 +36,18 @@
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
 
+(defn- host-scalar-result?
+  [program equation]
+  (let [value (get-in program [:values (first (:results equation))])
+        algorithm (:algorithm equation)]
+    (and (= [] (:shape value))
+         (not (resident/resident-scalar-value? value))
+         ;; A rank-zero tensor written to caller-owned storage still returns a buffer,
+         ;; not an implicitly downloaded host scalar.
+         (or (nil? algorithm)
+             (not-any? #(soac-dialect/result-storage (soac-dialect/facts algorithm) (second %))
+                       (soac-dialect/equations algorithm))))))
+
 ;; Buffer semantics of the emitted kernel-invoke marker: invoke-registered-kernel
 ;; WRITES its `out` arg in place (arg 2 of [kname inputs out scalars n]) and
 ;; RETURNS it, so the binding sym is a pure alias of the out buffer. Declared in
@@ -462,6 +474,7 @@
                  (and (par/par-scatter-form? form)
                       (:stride (par/extract-par-scatter-info form)))
                  (par/par-reduce-form? form)
+                 (and (croute/par-contract-form? form) (empty? (nth form 2)))
                  ;; A compound source extent normalizes to a preceding typed scalar equation. It
                  ;; cannot be projected as a closed SegMap without losing that SSA definition.
                  (and (par/par-map-form? form)
@@ -1078,17 +1091,8 @@
                                                                                raster.compiler.ir.segop.SegRed %)
                                                                              (:operations equation)))
                                                             :ze-reduces)
-                                                          (boolean
-                                                           (and equation
-                                                                (not (resident/resident-scalar-value?
-                                                                      (get-in parallel-program
-                                                                              [:values (first (:results equation))])))
-                                                                (= [] (get-in parallel-program
-                                                                              [:values
-                                                                               (first
-                                                                                (:results
-                                                                                 equation))
-                                                                               :shape]))))))
+                                                          (boolean (host-scalar-result?
+                                                                    parallel-program equation))))
                                                        (binding [*bound-segops*
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
@@ -1132,10 +1136,8 @@
                                            (equation-graph/make-for-equation
                                             parallel-program equation))
                                           :ze-reduces
-                                          (boolean
-                                           (= [] (get-in parallel-program
-                                                         [:values (first (:results equation))
-                                                          :shape])))))
+                                          (boolean (host-scalar-result?
+                                                    parallel-program equation))))
                                        (binding [*bound-segops* (:operations equation)
                                                  *bound-algorithm*
                                                  (when parallel-program

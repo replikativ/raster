@@ -23,24 +23,16 @@
       (throw (ex-info "resident realization received an unknown TypedSOAC equation"
                       {:reason :typed-soac-resident-equation :equation equation}))))
 
-(defn- parameter-parts
-  [{:keys [kind attributes arrays parameters]}]
-  (let [accumulator-count (if (= :reduce kind)
-                            (count (:accumulators attributes))
-                            0)
-        array-count (count arrays)
-        accumulator-end accumulator-count
-        element-end (+ accumulator-count array-count)]
-    {:accumulators (subvec (vec parameters) 0 accumulator-end)
-     :elements (subvec (vec parameters) accumulator-end element-end)
-     :capture-parameters (subvec (vec parameters) element-end)}))
-
 (defn- emit-equation
   [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
   (list '= id (vec results)
         (list (symbol (name kind)) attributes (vec arrays) (vec captures)
               (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
                                    (vec body-results)))))
+
+(defn- parameter-parts
+  [info]
+  (dialect/parameter-layout (emit-equation info)))
 
 (defn- result-transform-inputs
   [attributes]
@@ -129,7 +121,8 @@
                                        (util/subst-syms capture-substitutions init)))
                             (:locals info))
         global-bodies (mapv #(util/subst-syms capture-substitutions %) (:body-results info))
-        bound (set (concat accumulators elements [(get-in info [:attributes :index])]))
+        bound (set (concat accumulators elements [(get-in info [:attributes :index])]
+                           (map first (get-in info [:attributes :segment-axes]))))
         stable-before (set (get-in info [:attributes :attributes :stable-array-captures]))
         referenced-values (->> (concat (mapcat #(util/free-syms (:init %) bound) global-locals)
                                        (mapcat #(util/free-syms % bound) global-bodies)
