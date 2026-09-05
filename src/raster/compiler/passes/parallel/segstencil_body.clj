@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
@@ -163,9 +164,66 @@
        :schedule {:strategy :one-work-item-per-element :association :independent
                   :workgroup-size workgroup-size :boundary :dirichlet :radius radius}
        :launch (launch/spec {:workgroup-size [workgroup-size]
-                             :group-count [(launch/ceil-div bound workgroup-size)]})
+                             :group-count [(launch/ceil-div '_n_bound workgroup-size)]})
        :provenance {:dialect :kernel-body :source-dialect :segstencil
                     :segop-id (:id stencil)}
        :attributes {:kind :portable-segstencil :extent bound
                     :boundary :dirichlet :radius radius :no-write-alias true}})
      :bound bound :inputs inputs :outputs outputs :scalars scalars}))
+
+(defn schedule
+  "Refine one SegStencil into a complete, target-neutral ScheduledKernelBody.
+
+   The exact SegStencil remains the semantic source. The schedule fixes radius-one Dirichlet
+   guards, stable neighborhood reads, one independent result store, scalar order, and any checked
+   logical-to-physical bound conversion before target emission."
+  [stencil {:keys [scalar-types] :as options}]
+  (let [{:keys [kernel-body bound inputs outputs scalars]} (lower stencil options)
+        parameters (:parameters kernel-body)
+        arguments (mapv (fn [parameter]
+                          (if (= '_n_bound (:id parameter)) bound (:id parameter)))
+                        parameters)
+        logical-bound-dtype
+        (some-> (or (get scalar-types bound)
+                    (get scalar-types (when (or (symbol? bound) (keyword? bound))
+                                        (symbol (name bound)))))
+                dtype/canon)
+        scalar-bindings
+        (mapv (fn [[parameter argument]]
+                (let [kernel-dtype (dtype/canon (:dtype parameter))
+                      logical-dtype (if (and (= '_n_bound (:id parameter))
+                                             (contains? #{:int :long} logical-bound-dtype))
+                                      logical-bound-dtype
+                                      kernel-dtype)]
+                  {:parameter (:id parameter)
+                   :value argument
+                   :dtype logical-dtype
+                   :kernel-dtype kernel-dtype
+                   :conversion (if (= logical-dtype kernel-dtype)
+                                 :identity
+                                 :checked-range)}))
+              (filterv (fn [[parameter _]] (= :scalar (:kind parameter)))
+                       (map vector parameters arguments)))]
+    (scheduled-body/make
+     {:source stencil
+      :body kernel-body
+      :arguments arguments
+      :scalar-bindings scalar-bindings
+      :effects {:kind :stencil
+                :uses (scheduled-body/derive-uses kernel-body arguments)
+                :boundary (:boundary stencil)
+                :radius (:radius stencil)}
+      :legality {:kind :segstencil-body-lowering
+                 :iteration-rank 1
+                 :boundary :dirichlet
+                 :radius 1
+                 :aliasing :no-write-alias}
+      :numerics {:mode :exact :policy :same-scalar-evaluation-order}
+      :provenance {:dialect :kernel-body :source-dialect :segstencil
+                   :segop-id (:id stencil)}
+      :attributes {:array-params (vec (concat inputs outputs))
+                   :scalar-params scalars
+                   :dtype (:dtype stencil)
+                   :boundary (:boundary stencil)
+                   :radius (:radius stencil)
+                   :aliasing :no-write-alias}})))

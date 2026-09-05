@@ -60,9 +60,10 @@
   (let [graph (emitted-graph)
         ids (set (map :id (concat (:inputs graph) (:outputs graph) (:temporaries graph))))
         buffers (zipmap ids (repeatedly #(Object.)))]
-    (is (thrown? ArithmeticException
-                 (graph-call/make graph buffers
-                                  {'n {:type :int :value Long/MAX_VALUE}})))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"outside its physical ABI range"
+                          (graph-call/make graph buffers
+                                           {'n {:type :int :value Long/MAX_VALUE}})))))
 
 (deftest emitted-graph-projects-one-ordered-public-call-to-runtime-binding-maps
   (let [graph (emitted-graph)

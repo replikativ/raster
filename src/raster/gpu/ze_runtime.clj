@@ -739,7 +739,7 @@
         (let [{:keys [type value]} arg]
           (case type
             :int    (let [s (.allocate ^Arena arena I32)]
-                      (.set s I32 0 (int value))
+                      (.set s I32 0 (Math/toIntExact (long value)))
                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
                                 [kernel (int idx) (long 4) s]))
             :long   (let [s (.allocate ^Arena arena I64)]
@@ -1475,7 +1475,7 @@
         (let [{:keys [type value]} arg]
           (case type
             :int    (let [s (.allocate ^Arena arena I32)]
-                      (.set s I32 0 (int value))
+                      (.set s I32 0 (Math/toIntExact (long value)))
                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
                                 [kernel (int idx) (long 4) s]))
             :float  (let [s (.allocate ^Arena arena ValueLayout/JAVA_FLOAT)]
@@ -1547,7 +1547,7 @@
          (let [{:keys [type value]} arg]
            (case type
              :int    (let [s (.allocate ^Arena arena I32)]
-                       (.set s I32 0 (int value))
+                       (.set s I32 0 (Math/toIntExact (long value)))
                        (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
                                  [kernel (int idx) (long 4) s]))
              :float  (let [s (.allocate ^Arena arena ValueLayout/JAVA_FLOAT)]
@@ -1912,7 +1912,11 @@
         abi (kabi/validate! abi)
         arguments (vec (concat input-arrays [output-array] scalar-args [n]))
         _ (kabi/validate-arguments! abi arguments)
-        pairs (mapv vector abi arguments)
+        pairs (mapv (fn [slot value]
+                      [slot (if (= :scalar (:kind slot))
+                              (kexec/physical-runtime-scalar slot value)
+                              value)])
+                    abi arguments)
         pointer-count (count (kabi/pointer-slots abi))
         scalar-user-count (count (remove #(= :bound (:role %)) (kabi/scalar-slots abi)))
         _ (when-not (= pointer-count (inc (count input-arrays)))
@@ -1941,14 +1945,7 @@
         staged (mapv
                 (fn [idx [slot value]]
                   (if (= :scalar (:kind slot))
-                    (let [t (:kernel-dtype slot)]
-                      {:arg {:type t
-                             :value (case t
-                                      :int (int value)
-                                      :long (long value)
-                                      :float (float value)
-                                      :double (double value)
-                                      value)}})
+                    {:arg value}
                     (if (device-buffer? value)
                       {:arg (:segment ^DeviceBuffer value) :value value :slot slot}
                       (let [host (MemorySegment/ofArray value)
@@ -1962,7 +1959,7 @@
         bound-pair (first (filter #(= :bound (:role (first %))) pairs))
         _ (when-not bound-pair
             (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
-        n (long (second bound-pair))
+        n (long (:value (second bound-pair)))
         wg (registered-1d-workgroup-size loaded)
         group-count (long (Math/ceil (/ (double n) wg)))]
     (launch! kernel-handle group-count wg all-args)
@@ -2012,6 +2009,8 @@
                 (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
                                 {:kernel-name kernel-name :slot slot
                                  :expected (:kernel-dtype slot) :actual (:type value)})))))
+        _ (doseq [[slot value] scalar-pairs]
+            (kexec/physical-runtime-scalar slot value))
         [bound-slot bound-value] bound-pair
         _ (when (and (map? bound-value)
                      (not= (:kernel-dtype bound-slot) (:type bound-value)))
@@ -2054,16 +2053,7 @@
         partial-bytes (* group-count dtype-size)
         dev-partial (ensure-seg kernel-name :partial-seg partial-bytes)
         scalar-arg (fn [slot value]
-                     (if (map? value)
-                       value
-                       (let [t (:kernel-dtype slot)]
-                         {:type t
-                          :value (case t
-                                   :int (int value)
-                                   :long (long value)
-                                   :float (float value)
-                                   :double (double value)
-                                   value)})))
+                     (kexec/physical-runtime-scalar slot value))
         all-args
         (mapv (fn [[slot value]]
                 (cond
@@ -2191,9 +2181,17 @@
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
    (let [abi (:abi (get @kernel-registry kernel-name))
-         _ (when abi
-             (kabi/validate-split-binding! abi arrays scalar-args)
-             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
+         split-binding (when abi
+                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
+                           (kabi/validate-physical-pointer-dtypes!
+                            abi (physical-pointer-dtypes arrays))
+                           binding))
+         checked-scalars (when split-binding
+                           (mapv kexec/physical-runtime-scalar
+                                 (:scalar-slots split-binding) scalar-args))
+         checked-bound (if split-binding
+                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
+                         {:type :int :value (Math/toIntExact (long n))})
          {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          dtype (kernel-info-value info :dtype :float)
          workgroup-size (long (get opts :workgroup-size
@@ -2250,16 +2248,17 @@
          dev-segs (mapv :seg expanded-entries)
         ;; Scalar args
          scalar-type (if (= dtype :float) :float :double)
-         scalar-kernel-args (mapv (fn [v]
-                                    (if (map? v)
-                                      v  ;; pre-typed scalar: {:type :int :value 4}
-                                      {:type scalar-type
-                                       :value (if (= scalar-type :float)
-                                                (float v) (double v))}))
-                                  scalar-args)
+         scalar-kernel-args (or checked-scalars
+                                (mapv (fn [v]
+                                        (if (map? v)
+                                          v
+                                          {:type scalar-type
+                                           :value (if (= scalar-type :float)
+                                                    (float v) (double v))}))
+                                      scalar-args))
          all-args (vec (concat dev-segs
                                scalar-kernel-args
-                               [{:type :int :value (int n)}]))
+                               [checked-bound]))
          wg (long (or workgroup-size 256))
          group-count (long (Math/ceil (/ (double n) wg)))]
      (launch! kernel-handle group-count wg all-args)
@@ -2343,9 +2342,18 @@
   ([^String kernel-name arrays scalar-args n]
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
-             (kabi/validate-split-binding! abi arrays scalar-args)
-             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
+   (let [abi (:abi (get @kernel-registry kernel-name))
+         split-binding (when abi
+                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
+                           (kabi/validate-physical-pointer-dtypes!
+                            abi (physical-pointer-dtypes arrays))
+                           binding))
+         checked-scalars (when split-binding
+                           (mapv kexec/physical-runtime-scalar
+                                 (:scalar-slots split-binding) scalar-args))
+         checked-bound (if split-binding
+                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
+                         {:type :int :value (Math/toIntExact (long n))})
          {:keys [module] :as loaded} (ensure-kernel-loaded! kernel-name)
          dtype (kernel-info-value loaded :dtype :float)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
@@ -2367,12 +2375,14 @@
                                              {:arr-type (type arr)}))))
                    [] arrays)
          scalar-type (if (= dtype :float) :float :double)
-         scalar-kernel-args (mapv (fn [v]
-                                    (if (map? v) v
-                                        {:type scalar-type
-                                         :value (if (= scalar-type :float) (float v) (double v))}))
-                                  scalar-args)
-         all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
+         scalar-kernel-args (or checked-scalars
+                                (mapv (fn [v]
+                                        (if (map? v) v
+                                            {:type scalar-type
+                                             :value (if (= scalar-type :float)
+                                                      (float v) (double v))}))
+                                      scalar-args))
+         all-args (vec (concat dev-segs scalar-kernel-args [checked-bound]))
          wg (long workgroup-size)
          ;; A reduction binds via this same path (arrays..., scalars..., _n_bound) but launches a
          ;; SINGLE workgroup so the kernel's grid-stride loop covers all n and writes output[0] —
