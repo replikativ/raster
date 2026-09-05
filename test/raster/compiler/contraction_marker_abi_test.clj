@@ -236,7 +236,13 @@
                                  (Object.)))
                              (:argument-specs step))
         {:keys [buffers scalar-values]} (kexec/graph-bindings executable call-arguments)
-        call (kgcall/make executable buffers scalar-values)
+        ;; `graph-bindings` exposes only the public interface.  The graph runner owns the
+        ;; XMX staging allocations; a direct KernelGraphCall test supplies equivalent mock
+        ;; values for each declared private temporary.
+        temporary-buffers (into {}
+                                (map (fn [id] [id [:temporary-buffer id]]))
+                                (keys (kgcall/temporary-specs executable scalar-values)))
+        call (kgcall/make executable (merge buffers temporary-buffers) scalar-values)
         kernel-call (get-in call [:nodes 0 :call])]
     (is (= :executable (:convention step)))
     (is (kgraph/kernel-graph? executable)

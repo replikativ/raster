@@ -12,6 +12,8 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.parallel-program :as parallel-program]
@@ -402,6 +404,24 @@
                        [value])))))
              (:argument-specs step) logical-arguments))))
 
+(defn- realize-derived-scalar
+  "Turn a target-private integer-expression into the concrete scalar required by a resident ABI.
+
+   KernelGraphs deliberately retain products, alignment and division as inspectable compiler IR
+   until graph binding.  A descriptor dispatch has no graph binder, however: its ordered ABI is
+   submitted immediately.  Resolve only explicit non-literal KernelLaunch expressions here from
+   the descriptor's public scalar environment; ordinary scalar values remain untouched."
+  [scalar-environment type value]
+  (if (and (not (number? value)) (klaunch/expression? value))
+    (let [resolved (kgcall/resolve-integer scalar-environment value)]
+      {:type type
+       :value (case type
+                :int (Math/toIntExact resolved)
+                :long resolved
+                (throw (ex-info "derived resident scalar must use an integer ABI dtype"
+                                {:type type :expression value :resolved resolved})))})
+    {:type type :value value}))
+
 (defn- resident-fields [value]
   (if (resident-value/resident-composite? value)
     (:fields value)
@@ -506,7 +526,7 @@
          logical-arguments
          (mapv (fn [{:keys [kind sym type value-fn]}]
                  (if (= :scalar kind)
-                   {:type type :value (value-fn descriptor-arguments)}
+                   (realize-derived-scalar argmap type (value-fn descriptor-arguments))
                    (resident-of sym)))
                (:argument-specs step))
          arguments (physical-step-arguments step logical-arguments)
