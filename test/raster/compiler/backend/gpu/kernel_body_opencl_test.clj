@@ -308,6 +308,32 @@
     (is (= {:overflow :wrap}
            (get-in lowered [:operations 0 :expression :options])))
     (is (= :+ (get-in lowered [:operations 0 :expression :op]))))
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lowerer (scalar-expression/make-lowerer
+                 {:array-types {'q :byte} :scalar-types {'i :long} :arrays #{'q}
+                  :index-scope #{'i} :lower-index (fn [value _] value)
+                  :decline! decline!})
+        bounded ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
+                 :int {'i :long})
+        unknown ((:lower lowerer) '(clojure.core/+ a i) :long {'a :long 'i :long})
+        proved-kernel (-> (integer-arithmetic-kernel-body :no-overflow :+ :int)
+                          (assoc-in [:operations 0 :expression :options]
+                                    {:overflow :no-overflow
+                                     :proof {:kind :typed-scalar-range
+                                             :lower -121 :upper 134}})
+                          body/validate!)
+        opencl-source (opencl/emit-scalar-kernel
+                       "proved_byte_add" proved-kernel {:target-dialect :opencl-portable})]
+    (is (= {:overflow :no-overflow
+            :proof {:kind :typed-scalar-range :lower -121 :upper 134}}
+           (get-in (peek (:operations bounded)) [:expression :options])))
+    (is (= {:overflow :trap}
+           (get-in unknown [:operations 0 :expression :options])))
+    (is (= :+ (get-in (peek (:operations bounded)) [:expression :op]))
+        "byte storage, exact widening, and a literal prove this OpenCL-safe operation")
+    (is (str/includes? opencl-source "rstr_a + rstr_b")
+        "a range-certified semantic operation remains legal portable OpenCL C"))
   (doseq [[target unsigned-type]
           [[:opencl-portable "ulong"]
            [:cuda "unsigned long long"]

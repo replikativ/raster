@@ -11,7 +11,8 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.numerical-contract :as numerics]))
+            [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.scalar-range :as scalar-range]))
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
@@ -1126,13 +1127,23 @@
             integral? (contains? #{:byte :int :long} operand-type)
             overflow-op? (contains? #{:+ :- :*} canonical-op)
             arithmetic-overflow? (and integral? overflow-op?)
-            overflow-policy (:overflow options)]
+            overflow-policy (:overflow options)
+            proof (:proof options)
+            valid-proof?
+            (and (= :no-overflow overflow-policy)
+                 (= :typed-scalar-range (:kind proof))
+                 (integer? (:lower proof))
+                 (integer? (:upper proof))
+                 (<= (:lower proof) (:upper proof))
+                 (scalar-range/contained-in-dtype? proof operand-type))
+            valid-options?
+            (or (and (= #{:overflow} (set (keys options)))
+                     (contains? arithmetic-overflow-policies overflow-policy))
+                (and (= #{:overflow :proof} (set (keys options))) valid-proof?))]
         (when-not (= arity (count infos))
           (throw (ex-info "scalar intrinsic arity mismatch"
                           {:operation canonical-op :expected arity :actual (count infos)})))
-        (when (and arithmetic-overflow?
-                   (not (and (= #{:overflow} (set (keys options)))
-                             (contains? arithmetic-overflow-policies overflow-policy))))
+        (when (and arithmetic-overflow? (not valid-options?))
           (throw (ex-info "integral arithmetic requires exactly one overflow contract"
                           {:reason :kernel-body-intrinsic-overflow
                            :operation canonical-op :operand-type operand-type
