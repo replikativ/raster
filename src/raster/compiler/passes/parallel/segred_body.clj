@@ -9,6 +9,7 @@
    explicitly; scheduled graphs have no source-shaped target fallback."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -226,20 +227,6 @@
       (recur (util/subst-syms (util/binding-env bindings) (first body))))
     expression))
 
-(defn- literal-value
-  [value]
-  (if (and (seq? value)
-           (= 2 (count value))
-           (descriptor/cast-op? (first value))
-           (number? (second value)))
-    (second value)
-    (case value
-      Double/POSITIVE_INFINITY Double/POSITIVE_INFINITY
-      Double/NEGATIVE_INFINITY Double/NEGATIVE_INFINITY
-      Float/POSITIVE_INFINITY Float/POSITIVE_INFINITY
-      Float/NEGATIVE_INFINITY Float/NEGATIVE_INFINITY
-      value)))
-
 (defn scalar-plan
   "Project one scalar SegRed into an explicit combine operator, identity and element expression."
   [segred]
@@ -265,7 +252,7 @@
                 {:segred-id (:id segred) :declared declared :derived derived}))
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
-    {:operator operator :identity (literal-value init) :element (:element derived)
+    {:operator operator :identity (constant/literal-or-original init) :element (:element derived)
      :accumulator acc}))
 
 (defn capped-group-count
@@ -558,7 +545,7 @@
                            (every? #(contraction-facts/operand-axis-map coordinate-proof %)
                                    (:operands coordinate-proof))
                            (= element (:element view))
-                           (= (literal-value identity) (literal-value (:neutral view)))
+                           (constant/equivalent? identity (:neutral view))
                            (= operator (intrinsics/canonical (:combine view)))
                            (= (dtype/canon dtype) (dtype/canon (:dtype view))))
               (decline! :contraction-coordinate-proof
@@ -571,7 +558,7 @@
             (decline! :floating-minmax-semantics
                       "portable scalar reduction needs an explicit NaN and signed-zero policy for min/max"
                       {:segred-id (:id segred) :operator operator}))
-        identity (literal-value identity)
+        identity (constant/literal-or-original identity)
         _ (when-not (number? identity)
             (decline! :literal-identity
                       "KernelBody scalar reduction requires a numeric identity"

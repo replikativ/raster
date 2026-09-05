@@ -6,6 +6,7 @@
   all inspectable compiler values.  A backend may decline an instruction family it cannot lower,
   but it must consume this body rather than reconstructing the schedule from the source form."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -20,9 +21,6 @@
 
 (defn- additive? [combine]
   (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
-
-(defn- zero-init? [init]
-  (and (number? init) (zero? init)))
 
 (defn- compiler-id? [value]
   (or (symbol? value) (keyword? value)))
@@ -334,7 +332,7 @@
        (not (additive? combine))
        (decline :non-plus-combine {:combine combine})
 
-       (not (zero-init? neutral))
+       (not (constant/zero-value? neutral))
        (decline :non-zero-matrix-init {:init neutral})
 
        (nil? (facts/body-product-of element (map :sym operands)))

@@ -20,7 +20,7 @@
 (deftm gemm64! [A :- (Array float) B :- (Array float) C :- (Array float)] :- (Array float)
   (raster.par/contract C [[i 64] [j 64]] [[k 64]]
     (* (arrays/aget A (+ (* i 64) k)) (arrays/aget B (+ (* k 64) j)))
-    :init 0.0))
+    :init (float 0.0)))
 
 (defn- valid-measurement? [result]
   (let [median (get-in result [:measurement :median-ns])]

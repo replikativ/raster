@@ -23,6 +23,7 @@
    symbols is how a transpose rewrite risked a silent miscompile."
   (:require [clojure.walk :as walk]
             [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as contract-stages]
             [raster.compiler.ir.reduction :as reduction]))
@@ -379,7 +380,7 @@
       (not (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
       {:ok false :reason :non-plus-combine :combine combine}
 
-      (not (and (number? neutral) (zero? neutral)))
+      (not (constant/zero-value? neutral))
       {:ok false :reason :non-zero-matrix-init :init neutral}
 
       (nil? (body-product-of element (map :sym operands)))

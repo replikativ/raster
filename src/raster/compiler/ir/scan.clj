@@ -6,6 +6,7 @@
    only when the body is an associative combine of the prior accumulator and an accumulator-free
    element expression. This boundary proves that property before SegScan scheduling."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]))
@@ -15,19 +16,13 @@
 (defn associative-scan? [x]
   (and x (= "raster.compiler.ir.scan.AssociativeScan" (.getName (class x)))))
 
-(def ^:private cast-dtypes
-  {'float :float, 'clojure.core/float :float
-   'double :double, 'clojure.core/double :double
-   'int :int, 'clojure.core/int :int
-   'long :long, 'clojure.core/long :long})
-
 (defn- acc-ref?
   [expr acc reduction-dtype]
   (or (= expr acc)
       (and (seq? expr)
            (= 2 (count expr))
            (= (dtype/canon reduction-dtype)
-              (some-> (get cast-dtypes (first expr)) dtype/canon))
+              (some-> (descriptor/cast-result-tag (first expr)) keyword dtype/canon))
            (= acc (second expr)))))
 
 (defn- contains-symbol?
@@ -36,27 +31,6 @@
     (= expr target) true
     (coll? expr) (boolean (some #(contains-symbol? % target) expr))
     :else false))
-
-(defn- literal-value
-  [expr _reduction-dtype]
-  (if (and (seq? expr)
-           (= 2 (count expr))
-           ;; Casts around literal identities are representation spelling, not accumulator
-           ;; evidence. Compare the literal exactly in the reduction domain below; unlike
-           ;; acc-ref?, accepting `(double 0.0)` for an explicitly float scan cannot change which
-           ;; value is carried or hide a cross-dtype accumulator.
-           (contains? cast-dtypes (first expr))
-           (number? (second expr)))
-    (second expr)
-    expr))
-
-(defn- identity-equivalent?
-  [left right reduction-dtype]
-  (let [left (literal-value left reduction-dtype)
-        right (literal-value right reduction-dtype)]
-    (if (and (number? left) (number? right))
-      (== left right)
-      (= left right))))
 
 (defn- pure-element?
   [expr]
@@ -110,7 +84,7 @@
                         {:reason (reason operation "element-impure-or-unknown")
                          :element element :body lambda :reduction-op reduction-op})))
       (let [identity (descriptor/typed-reduce-identity combine dtype)]
-        (when-not (identity-equivalent? init identity dtype)
+        (when-not (constant/equivalent? init identity)
           (throw (ex-info "parallel reduction with a non-identity init requires a distinct schedule"
                           {:reason (reason operation "nonidentity-init")
                            :combine combine :init init :identity identity :dtype dtype})))
@@ -140,8 +114,8 @@
        (= (:dtype declared) (:dtype derived))
        (= (some-> (:combine declared) name symbol)
           (some-> (:combine derived) name symbol))
-       (identity-equivalent? (:init declared) (:init derived) (:dtype declared))
-       (identity-equivalent? (:identity declared) (:identity derived) (:dtype declared))))
+       (constant/equivalent? (:init declared) (:init derived))
+       (constant/equivalent? (:identity declared) (:identity derived))))
 
 (defn certify
   "Certify `scan-op` as a parallel associative scan or throw a structured conversion decline.
