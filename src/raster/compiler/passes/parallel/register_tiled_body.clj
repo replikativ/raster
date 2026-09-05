@@ -6,6 +6,7 @@
    microtile and 2-D launch explicit so every C-family target consumes the same scheduled value."
   (:require [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
@@ -170,7 +171,7 @@
             (decline! :non-plus-combine
                       "register-tiled contraction combine must be +"
                       {:combine combine}))
-        _ (when-not (and (number? neutral) (zero? neutral))
+        _ (when-not (constant/zero-value? neutral)
             (decline! :non-zero-matrix-init
                       "register-tiled contraction requires a zero reduction identity"
                       {:neutral neutral}))

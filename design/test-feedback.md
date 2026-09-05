@@ -97,5 +97,8 @@ updates it. Compilation/binding timings are diagnostic, not yet regression-gated
 The canary directly returns its scheduled contraction: result alias propagation resolves the
 common ABI's `:result` buffer without weakening resident-plan validation. This also covers
 the public-boundary defect discovered while introducing the canary.
-Remaining follow-up: review cast-wrapped zero identities, which
-currently decline the register-tiled route even though they are numerically zero.
+Primitive literal casts now pass through one checked constant boundary shared by scan/reduction
+certification, SegRed identity emission and matrix schedule legality. It evaluates supported
+Clojure casts rather than stripping them, and compares integer/floating values exactly. Unknown
+or failing conversions provide no evidence. The canary uses `(float 0.0)` to exercise this
+path; original initializer expressions remain in the retained IR.

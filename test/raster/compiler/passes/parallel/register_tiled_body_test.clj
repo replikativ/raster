@@ -14,7 +14,7 @@
   {:block-m 4 :block-n 4 :block-k 2 :thread-m 2 :thread-n 2})
 
 (defn- contraction
-  [& [epilogue]]
+  [& [epilogue init]]
   (facts/from-components
    {:out 'C
     :free-axes [['i 8] ['j 8]]
@@ -22,7 +22,8 @@
     :body '(raster.numeric/*
             (clojure.core/aget A (clojure.core/+ (clojure.core/* i 8) k))
             (clojure.core/aget B (clojure.core/+ (clojure.core/* k 8) j)))
-    :opts (cond-> {} epilogue (assoc :epilogue epilogue))
+    :opts (cond-> {} epilogue (assoc :epilogue epilogue)
+                  (some? init) (assoc :init init))
     :dtype :float}))
 
 (defn- operation-kinds
@@ -33,6 +34,13 @@
              (when (instance? raster.compiler.ir.kernel_body.ForLoop operation)
                (operation-kinds (:operations operation)))))
    operations))
+
+(deftest checked-zero-identities-reach-the-register-tiled-body
+  (doseq [init '[0.0 (float 0.0) (double (float 0))]]
+    (let [proof (contraction nil init)
+          emitted (segop-emit/generate-register-tiled-kernel-body proof 'C :tile small-tile)]
+      (is (body/kernel-body? (:kernel-body emitted)))
+      (is (= init (:neutral (facts/scalar-reduction-view proof)))))))
 
 (deftest cooperative-register-tile-is-a-verified-scalar-kernel-body
   (let [kernel-body (:kernel-body

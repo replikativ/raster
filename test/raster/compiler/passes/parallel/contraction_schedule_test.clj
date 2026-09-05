@@ -48,6 +48,15 @@
     (is (= :dot-operand (get-in kernel [:fragments 8 :layout :kind])))
     (is (= :mma-frag (get-in kernel [:fragments 0 :layout :kind])))))
 
+(deftest checked-zero-identities-reach-the-matrix-schedule
+  (doseq [init '[(float 0.0) (double (float 0))]]
+    (let [proof (facts/contraction-facts (matrix-form 128 128 128 init) :dtype :half)
+          planned (schedule/plan-matrix-body proof nil nil)]
+      (is (:ok (facts/dense-matrix-view proof)))
+      (is (:ok planned))
+      (is (body/kernel-body? (:body planned)))
+      (is (= init (:neutral (facts/scalar-reduction-view proof)))))))
+
 (deftest matrix-fragment-boundaries-are-a-legality-policy
   (testing "K=24 meets the old 16-byte pitch test but cannot form a final K16 instruction"
     (let [planned (schedule/plan-matrix-body

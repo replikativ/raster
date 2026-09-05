@@ -3,6 +3,20 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.scan :as scan]))
 
+(deftest rounded-or-failing-casts-do-not-prove-integer-identities
+  (doseq [[dtype init] [[:int '(float 2147483647)]
+                       [:long (list 'double Long/MAX_VALUE)]
+                       [:long (double Long/MAX_VALUE)]
+                       [:int '(int Double/POSITIVE_INFINITY)]]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-identity init"
+          (scan/certify {:acc 'acc :init init :lambda '(min acc x)} dtype)))))
+
+(deftest checked-nested-casts-retain-the-original-init
+  (let [init '(double (float 0.0))
+        certificate (scan/certify {:acc 'acc :init init :lambda '(+ acc x)} :double)]
+    (is (= init (:init certificate)))
+    (is (scan/associative-scan? certificate))))
+
 (deftest associative-scan-certification
   (let [facts (scan/certify {:acc 'acc :init 0.0
                              :lambda '(+ acc (clojure.core/aget values i))}
