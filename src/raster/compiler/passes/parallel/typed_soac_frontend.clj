@@ -265,7 +265,7 @@
           (list head bindings stripped)))
       :else nil)))
 
-(declare store-region)
+(declare store-region pointwise-input?)
 
 (defn- counted-store-loop
   "Recognize a counted loop of stores inside an effect-map body.
