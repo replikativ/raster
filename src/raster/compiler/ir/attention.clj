@@ -93,6 +93,21 @@
                      :owner owner :field field :value value})))
   value)
 
+(defn- int32-offset-capacity!
+  "Validate capacities addressed by the public int32 CSR metadata ABI.
+
+  Page/key offsets are uploaded and consumed as `int` values in every current routed-attention
+  backend.  Accepting a larger descriptor would make an otherwise semantic value impossible to
+  represent before any target schedule is selected."
+  [owner field value]
+  (positive-integer! owner field value)
+  (when (> value Integer/MAX_VALUE)
+    (throw (ex-info (str owner " exceeds the int32 offset capacity")
+                    {:reason :attention-int32-offset-capacity
+                     :owner owner :field field :value value
+                     :maximum Integer/MAX_VALUE})))
+  value)
+
 (defn- finite-positive!
   [field value]
   (when-not (and (number? value)
@@ -145,7 +160,7 @@
   (when (some nil? [row-offsets key-indices])
     (throw (ex-info "CSR visibility requires row offsets and logical key indices"
                     {:reason :attention-csr-visibility-missing-buffer})))
-  (positive-integer! "CSR visibility" :key-index-capacity key-index-capacity)
+  (int32-offset-capacity! "CSR visibility" :key-index-capacity key-index-capacity)
   (when-not (contains? #{:set :multiset} duplicate-policy)
     (throw (ex-info "CSR visibility requires a set or multiset duplicate policy"
                     {:reason :attention-invalid-duplicate-policy
@@ -176,7 +191,7 @@
   (when (some nil? [page-offsets page-indices last-page-lengths start-positions])
     (throw (ex-info "CSR page route requires offsets, indices, final lengths and start positions"
                     {:reason :attention-csr-route-missing-buffer})))
-  (positive-integer! "CSR page route" :page-index-capacity page-index-capacity)
+  (int32-offset-capacity! "CSR page route" :page-index-capacity page-index-capacity)
   (->CSRPagedRoute page-offsets page-indices last-page-lengths start-positions
                    page-index-capacity))
 
@@ -258,6 +273,14 @@
     (when-not (paged-route? route)
       (throw (ex-info "attention requires a dense or CSR paged route"
                       {:reason :attention-unsupported-route :route route})))
+    ;; Check the descriptor-level int32 ABI before derived token-capacity arithmetic so callers
+    ;; receive the representation error rather than an incidental later overflow diagnosis.
+    (when (csr-paged-route? route)
+      (int32-offset-capacity! "CSR page route" :page-index-capacity
+                              (:page-index-capacity route)))
+    (when (csr-visibility? visibility)
+      (int32-offset-capacity! "CSR visibility" :key-index-capacity
+                              (:key-index-capacity visibility)))
     (doseq [[field value] [[:batch-size batch-size] [:q-heads q-heads]
                            [:kv-heads kv-heads] [:qk-head-dim qk-head-dim]
                            [:value-head-dim value-head-dim] [:page-size page-size]
@@ -313,13 +336,8 @@
         (throw (ex-info "page route lengths use int32 and exceed their token capacity"
                         {:reason :attention-route-token-capacity-overflow
                          :page-capacity page-capacity :page-size page-size}))))
-    (if (dense-paged-route? route)
-      (checked-product :page-table [batch-size (:pages-per-sequence route)])
-      (positive-integer! "CSR page route" :page-index-capacity
-                         (:page-index-capacity route)))
-    (when (csr-visibility? visibility)
-      (positive-integer! "CSR visibility" :key-index-capacity
-                         (:key-index-capacity visibility)))
+    (when (dense-paged-route? route)
+      (checked-product :page-table [batch-size (:pages-per-sequence route)]))
     problem))
 
 (defn make

@@ -296,6 +296,7 @@
             safe-bound (some #(when (and (= "ScalarCompute" (operation-kind %))
                                          (= 'scan-safe-bound (get-in % [:result :id])))
                                 %)
+                             operations)
             safe-expression (:expression safe-bound)]
         (is (= [0 'scan-safe-bound 256 :ordered]
                [(:lower loop) (:upper loop) (:step loop)

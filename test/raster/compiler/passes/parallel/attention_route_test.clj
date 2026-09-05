@@ -419,7 +419,31 @@
            (get-in (route/route
                     (problem)
                     (assoc desc :segmented-weighted-reduction-history-tile-size 0))
-                   [:declines 0 :reason])))))
+                   [:declines 0 :reason])))
+    (testing "a self-consistent tile plan cannot forge the source membership capacity"
+      (let [plan (:plan reference)
+            lower! (fn [candidate]
+                     (try
+                       (swr-body/lower-routed-paged-partial plan candidate)
+                       :accepted
+                       (catch clojure.lang.ExceptionInfo exception
+                         (:reason (ex-data exception)))))
+            under (assoc scheduled :membership-tiling
+                         {:kind :static-contiguous-tiles :tile-size 2 :tile-count 2
+                          :membership-capacity 4 :merge-order :increasing-membership-tile})
+            over (assoc scheduled :membership-tiling
+                        {:kind :static-contiguous-tiles :tile-size 2 :tile-count 4
+                         :membership-capacity 8 :merge-order :increasing-membership-tile})
+            oversized-capacity (inc (long Integer/MAX_VALUE))
+            oversized (assoc scheduled :membership-tiling
+                            {:kind :static-contiguous-tiles :tile-size 2
+                             :tile-count (quot (+ oversized-capacity 1) 2)
+                             :membership-capacity oversized-capacity
+                             :merge-order :increasing-membership-tile})]
+        (is (= :segmented-weighted-reduction-body-membership-capacity (lower! under)))
+        (is (= :segmented-weighted-reduction-body-membership-capacity (lower! over)))
+        (is (= :segmented-weighted-reduction-membership-tiling (lower! oversized))
+            "values that become int literals are rejected before lowering")))))
 
 (deftest tiled-history-sources-cover-route-and-visibility-products
   (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))

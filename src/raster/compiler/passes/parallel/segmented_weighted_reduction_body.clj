@@ -1031,6 +1031,29 @@
          (body/->Yield (pipeline-state-values fallback-state))]
         (pipeline-state-specs final-state))])}))
 
+(defn- source-membership-capacity
+  "The semantic membership extent represented by this concrete routed attention problem.
+
+  A tiled schedule may be self-consistent while still naming a different extent.  Keep this
+  computation adjacent to lowering rather than trusting a schedule-private copy of the fact."
+  [problem]
+  (if (attention/csr-visibility? (:visibility problem))
+    (get-in problem [:visibility :key-index-capacity])
+    (let [page-size (:page-size problem)]
+      (* page-size
+         (case (attention/route-kind (:route problem))
+           :dense-paged (get-in problem [:route :pages-per-sequence])
+           :csr-paged (get-in problem [:route :page-index-capacity]))))))
+
+(defn- int-literal-range!
+  [field value plan scheduled problem]
+  (when-not (and (integer? value) (<= 0 value Integer/MAX_VALUE))
+    (throw (ex-info "tiled weighted-reduction schedule exceeds portable int literal range"
+                    {:reason :segmented-weighted-reduction-body-int-literal-range
+                     :field field :value value :maximum Integer/MAX_VALUE
+                     :plan-id (:id plan) :schedule scheduled
+                     :operation-id (:id problem)}))))
+
 (defn- lowering-row!
   [plan scheduled problem]
   (let [visibility-kind (attention/visibility-kind (:visibility problem))
@@ -1081,6 +1104,25 @@
     (throw (ex-info "partial/merge bodies require a tiled weighted-reduction schedule"
                     {:reason :segmented-weighted-reduction-body-schedule-phase
                      :expected :tiled :schedule scheduled})))
+  (let [tiling (:membership-tiling scheduled)
+        actual-capacity (source-membership-capacity problem)
+        scheduled-capacity (:membership-capacity tiling)
+        csr-capacity (when (attention/csr-visibility? (:visibility problem))
+                       (get-in problem [:visibility :key-index-capacity]))]
+    ;; Equality, not a lower/upper relation: either mismatch changes which source members the
+    ;; tiled graph visits and is therefore a semantic schedule forgery.
+    (when-not (= actual-capacity scheduled-capacity)
+      (throw (ex-info "tiled weighted-reduction schedule capacity disagrees with source problem"
+                      {:reason :segmented-weighted-reduction-body-membership-capacity
+                       :plan-id (:id plan) :operation-id (:id problem)
+                       :actual-capacity actual-capacity
+                       :scheduled-capacity scheduled-capacity
+                       :schedule scheduled})))
+    (doseq [[field value] [[:membership-capacity scheduled-capacity]
+                           [:tile-count (:tile-count tiling)]
+                           [:csr-key-index-capacity csr-capacity]]
+            :when (some? value)]
+      (int-literal-range! field value plan scheduled problem)))
   [plan scheduled problem])
 
 (defn- pipelined-lowering-row!

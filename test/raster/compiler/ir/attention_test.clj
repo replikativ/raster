@@ -169,6 +169,31 @@
            (try
              (problem :batch-size Long/MAX_VALUE)
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+  (testing "CSR metadata capacities remain representable by their int32 offset ABI"
+    (let [oversized (inc (long Integer/MAX_VALUE))]
+      (is (= :attention-int32-offset-capacity
+             (try
+               (csr-visibility :key-index-capacity oversized)
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (= :attention-int32-offset-capacity
+             (try
+               (csr-route :page-index-capacity oversized)
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      ;; Records can be associated after construction, so `validate!` repeats the descriptor
+      ;; invariant before any route/schedule chooses an emitter.
+      (is (= :attention-int32-offset-capacity
+             (try
+               (attention/validate!
+                (assoc (problem :visibility (csr-visibility))
+                       :visibility
+                       (assoc (csr-visibility) :key-index-capacity oversized)))
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (= :attention-int32-offset-capacity
+             (try
+               (attention/validate!
+                (assoc (problem :route (csr-route))
+                       :route (assoc (csr-route) :page-index-capacity oversized)))
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
   (testing "K and V layouts are independent and explicit"
     (is (= :attention-unsupported-cache-layout
            (try
