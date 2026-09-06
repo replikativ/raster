@@ -238,6 +238,8 @@
     (is (= (:launch (:kernel-body routed))
            (:launch (:artifact routed)))
         "routing preserves the schedule's actual 1-D launch contract")
+    (is (= :kernel-body (artifact/emission-route (:artifact routed)))
+        "the descriptor must preserve the emitter route independently of semantic provenance")
     (is (empty? (:declines routed)))))
 
 (deftest eligible-affine-contractions-never-reenter-the-source-template
@@ -275,6 +277,7 @@
                 (* (aget A (aget indices i)) (aget x l)))
         routed (route/route-contraction form :dtype :float :desc {})]
     (is (= :naive-segred (:strategy routed)))
+    (is (= :verified-segmented-opencl (artifact/emission-route (:artifact routed))))
     (is (= :operand-layout (:fallback-reason routed)))
     (is (= :portable-kernel-body (-> routed :declines last :leaf)))
     (is (nil? (:kernel-body routed)))))
