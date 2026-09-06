@@ -143,6 +143,15 @@
           result (pe/pe-walked-body '[a b] {} body)]
       (is (= ['(+ a b)] result)))))
 
+(deftest known-false-and-nil-specialize-like-other-values
+  (let [body '[(if flag yes no)]]
+    (doseq [flag [false nil]]
+      (is (= '[no] (pe/pe-walked-body '[flag] {'flag flag} body))))
+    (is (= '[yes] (pe/pe-walked-body '[flag] {'flag true} body)))
+    (is (= body (pe/pe-walked-body '[flag] {} body)))
+    (is (= body (pe/pe-walked-body '[flag] nil body)))
+    (is (= body (pe/pe-walked-body '[flag] {'unrelated false} body)))))
+
 ;; ================================================================
 ;; .invk preservation
 ;; ================================================================

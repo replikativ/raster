@@ -484,14 +484,15 @@
   "Partially evaluate a walked deftm body with known parameter values.
 
   params: vector of parameter symbols
-  values: map of {param -> known-value} (nil for unknown)
+  values: map of {param -> known-value}; omitted keys are unknown. Present nil and false
+  are known values. A nil map means no known parameters.
   body: the walked body forms (as from ::deftm-walked-body)
 
   Returns the simplified body forms."
   [params values body]
   (let [const-env (reduce (fn [env p]
-                            (if-let [v (get values p)]
-                              (assoc env p v)
+                            (if (contains? values p)
+                              (assoc env p (get values p))
                               env))
                           {} params)]
     (mapv #(pe % const-env) body)))
