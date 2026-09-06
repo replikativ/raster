@@ -2,10 +2,13 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-opencl :as emit]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
+            [raster.compiler.passes.parallel.segred-body :as segred]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -21,6 +24,47 @@
      :results [(if better candidate old-value) (if better i old-index)]}
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
+
+(deftest shared-conversion-policy-keeps-narrowing-an-explicit-owner-decision
+  (let [types [:byte :int :long :half :float :double]
+        exact [:exact :exact]
+        rounded [:nearest-even :exact]
+        ieee [:nearest-even :ieee]
+        wrap [:exact :wrap]
+        ;; Independent complete matrix: rows are source types, columns target types.
+        expected [[exact exact exact ieee rounded exact]
+                  [wrap exact exact ieee rounded exact]
+                  [wrap wrap exact ieee rounded rounded]
+                  [nil nil nil exact exact exact]
+                  [nil nil nil ieee exact exact]
+                  [nil nil nil ieee ieee exact]]]
+    (is (= (set types) (set (keys dtype/dtype-info))))
+    (doseq [[row source] (map-indexed vector types)
+            [column target] (map-indexed vector types)]
+      (let [policy (get-in expected [row column])]
+        (is (= policy (conversion/policy source target :wrap)) (str source " → " target))
+        (is (= (when-not (= wrap policy) policy) (conversion/policy source target))
+            (str "checked owner: " source " → " target))))
+    (is (= exact (conversion/policy :i32 :f64)))
+    (is (= ieee (conversion/policy :f64 :f16)))
+    (is (thrown? clojure.lang.ExceptionInfo (conversion/policy :missing :float)))
+    (is (thrown? clojure.lang.ExceptionInfo (conversion/policy :int :float :unchecked)))))
+
+(deftest reduction-element-conversions-retain-their-stricter-admission
+  (let [expression (with-meta '(+ (aget x i) scale) {:raster.type/tag 'double})
+        options {:index 'i :coordinate 'i :dtype :double
+                 :arrays #{'x} :array-types {'x :float}
+                 :scalars #{'scale} :scalar-types {'scale :int}}
+        result (segred/lower-element-operations expression options)
+        casts (filter #(= :cast (get-in % [:expression :op])) (:operations result))]
+    (is (= [:double :double] (mapv #(get-in % [:result :type]) casts)))
+    (is (every? #(= {:rounding :exact :overflow :exact}
+                   (get-in % [:expression :options])) casts))
+    ;; The source-level checked-cast gate remains independent from implicit promotion policy.
+    (doseq [expression ['(int scale) '(long scale) '(float (int scale))]]
+      (is (= :checked-scalar-cast
+             (try (segred/lower-element-operations expression options) nil
+                  (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e)))))))))
 
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]

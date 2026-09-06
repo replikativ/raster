@@ -9,6 +9,7 @@
    explicitly; scheduled graphs have no source-shaped target fallback."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -335,35 +336,13 @@
   [source target]
   (let [source (dtype/canon source)
         target (dtype/canon target)]
-    (cond
-      (= source target) nil
-
-      (and (dtype/fp-dtype? source) (dtype/fp-dtype? target))
-      (if (< (dtype/bytes-of source) (dtype/bytes-of target))
-        [:exact :exact]
-        [:nearest-even :ieee])
-
-      (and (dtype/integral? source) (dtype/fp-dtype? target))
-      (if (and (= :double target) (<= (dtype/bytes-of source) 4))
-        [:exact :exact]
-        [:nearest-even (if (= :half target) :ieee :exact)])
-
-      (and (dtype/fp-dtype? source) (dtype/integral? target))
-      (decline! :checked-scalar-cast
-                "KernelBody reduction cannot preserve a checked floating-to-integral cast"
-                {:source-dtype source :target-dtype target})
-
-      (and (dtype/integral? source) (dtype/integral? target))
-      (if (< (dtype/bytes-of source) (dtype/bytes-of target))
-        [:exact :exact]
-        (decline! :checked-scalar-cast
-                  "KernelBody reduction cannot preserve a checked narrowing integral cast"
-                  {:source-dtype source :target-dtype target}))
-
-      :else
-      (decline! :scalar-cast
-                "KernelBody reduction has no explicit numerical cast policy"
-                {:source-dtype source :target-dtype target}))))
+    (when-not (= source target)
+      (or (scalar-conversion/policy source target)
+          (decline! :checked-scalar-cast
+                    (if (dtype/fp-dtype? source)
+                      "KernelBody reduction cannot preserve a checked floating-to-integral cast"
+                      "KernelBody reduction cannot preserve a checked narrowing integral cast")
+                    {:source-dtype source :target-dtype target})))))
 
 (defn lower-element-operations
   "Lower a scalar reduction element into typed SSA. coordinate-lower may translate a verified
