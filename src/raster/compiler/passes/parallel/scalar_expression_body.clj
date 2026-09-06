@@ -6,6 +6,7 @@
    this pass performs no source-level type or function inference."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
@@ -108,28 +109,13 @@
                 (if (= target (:type lowered))
                   lowered
                   (let [source (dtype/canon (:type lowered))
-                        fp-source? (dtype/fp-dtype? source)
-                        fp-target? (dtype/fp-dtype? target)
-                        widening? (<= (dtype/bytes-of source) (dtype/bytes-of target))
                         [rounding overflow]
-                        (cond
-                          (and fp-source? fp-target? widening?) [:exact :exact]
-                          (and fp-source? fp-target?) [:nearest-even :ieee]
-                          (and (not fp-source?) (not fp-target?) widening?) [:exact :exact]
-                          ;; Integral narrowing (`(int j)` on a long counter) keeps the two's
-                          ;; complement bits. The JVM source cast is range-checked and throws
-                          ;; on overflow; kernels state `:wrap` because no portable target traps
-                          ;; inside a conversion, so an out-of-range narrowing is loud on the
-                          ;; JVM and modular on the device. In-range values agree everywhere.
-                          (and (not fp-source?) (not fp-target?)) [:exact :wrap]
-                          (and (not fp-source?) fp-target? (= :double target)
-                               (<= (dtype/bytes-of source) 4)) [:exact :exact]
-                          (and (not fp-source?) fp-target?)
-                          [:nearest-even (if (= :half target) :ieee :exact)]
-                          :else
-                          (decline! :cast-policy
-                                    "scalar cast has no portable rounding and overflow policy"
-                                    {:expression expression :source source :target target}))
+                        ;; Keep this owner's existing device-wrap policy explicit. Reduction
+                        ;; lowering must not inherit it merely by sharing conversion machinery.
+                        (or (scalar-conversion/policy source target :wrap)
+                            (decline! :cast-policy
+                                      "scalar cast has no portable rounding and overflow policy"
+                                      {:expression expression :source source :target target}))
                         id (fresh "cast")]
                     (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
                                   (:range lowered))]

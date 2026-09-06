@@ -164,6 +164,14 @@ capacities and a data-dependent index-range contract. A dense AxisMap or an inde
 dtype does not prove its contents are in bounds. Keep the production operand-layout gate until
 those obligations are represented and enforced, reusing existing typed loads and graph capacities.
 
+The scalar conversion prerequisite now derives common rounding/overflow choices from dtype facets
+in one pure helper, used by map/fold expression lowering and reduction element lowering. Integral
+narrowing defaults to rejection; the existing map/fold device-wrap behavior is an explicit owner
+opt-in, not an inferred equivalence to checked Clojure casts. Reduction's source checked-cast gate
+is unchanged. Exhaustive primitive conversion pairs and owner-admission checks protect this seam.
+This does not unify the full scalar lowerers, change epilogue conversion labeling, or admit new
+indirect accesses; those remaining differences must be closed separately.
+
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved
 int range. It also inherited unconditional cast erasure on seed/population captures. Passing
