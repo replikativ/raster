@@ -290,7 +290,69 @@
           (is (= 2 (count allocations)))
           (is (identical? out (nth output-spec 2))
               "write-only ABI access does not prove full overwrite of caller storage"))
+        (is (= 1 (count (filter #(= :download (first %)) @calls))))
+        (reset! calls [])
+        (is (nil? (gpu/invoke-staged-executable!
+                   :probe "staged-graph-dispatch" [x out 3] :none)))
         (is (= 1 (count (filter #(= :download (first %)) @calls))))))))
+
+(deftest direct-descriptor-graph-binding-checks-capacities-before-driver-work
+  (let [graph (assoc-in (staged-graph) [:inputs 0 :elements] (klaunch/product 'width 2))
+        step {:convention :executable :artifact graph :phase :test
+              :argument-specs [{:kind :input :sym 'x} {:kind :output :sym 'out}
+                               {:kind :scalar :type :long :value-fn first}]}
+        driver-calls (atom [])]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name] (fn [& _] (swap! driver-calls conj function-name)))}
+      (fn []
+        (doseq [[input-capacity output-capacity input-dtype width]
+                [[5 3 :float 3] [6 2 :float 3] [6 3 :double 3]
+                 [Long/MAX_VALUE Long/MAX_VALUE :float Long/MAX_VALUE]]]
+          (let [session (atom {:device-id :probe
+                               :buffers {:x {:dtype input-dtype :n-elements input-capacity}
+                                         :out {:dtype :float :n-elements output-capacity}}})]
+            (is (thrown? Exception
+                         (gpu/bind-step! session step [width] {'x :x 'out :out})))
+            (is (empty? @driver-calls))))))))
+
+(deftest effect-only-staging-copies-every-output-without-a-primary-result
+  (let [base (staged-graph)
+        extra 'dispatch-temporary
+        graph (kexec/validate!
+               (-> base
+                   (assoc :temporaries [])
+                   (update :outputs conj (assoc (first (:temporaries base)) :role :output))
+                   (assoc :abi [(first abi) (second abi)
+                                (kabi/slot extra :output :float :role :result) (last abi)]
+                          :arguments ['x 'out extra 'width])))
+        dispatch (kdispatch/make
+                  {:id "multi-effect" :alternatives [graph] :default-strategy :two-stage
+                   :selector {:kind :fixed-strategy :strategy :two-stage}})
+        out (float-array 3)
+        intermediate (float-array 3)
+        args [(float-array [1 2 3]) out intermediate 3]
+        copies (atom [])]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly dispatch)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session* (fn [_ f] (f (atom {})))
+       #'gpu/alloc! (fn [& _])
+       #'gpu/bind-kernel-executable! (fn [& _] :handle)
+       #'gpu/run-kernel-graph! (fn [& _])
+       #'gpu/download-range! (fn [_ _ array _]
+                              (swap! copies conj array)
+                              (aset ^floats array 0 (float 7)))}
+      (fn []
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"more than one primary result"
+                             (gpu/invoke-staged-executable! :probe "multi-effect" args)))
+        (is (empty? @copies))
+        (is (nil? (gpu/invoke-staged-executable! :probe "multi-effect" args :none)))
+        (is (= [out intermediate] @copies))
+        (is (= 7.0 (aget out 0) (aget intermediate 0)))))))
 
 (deftest staged-graph-capacities-fail-before-opening-a-device-session
   (let [graph (staged-graph)
@@ -427,7 +489,8 @@
                                {:kind :scalar :type :long
                                 :value-fn (fn [args] (:width args))}]}
         session (atom {:device-id :probe
-                       :buffers {'x :resident-x 'out :resident-out}
+                       :buffers {'x {:id :resident-x :dtype :float :n-elements 256}
+                                 'out {:id :resident-out :dtype :float :n-elements 256}}
                        :prepared {} :graphs {}})
         recorded (atom [])
         destroyed (atom [])

@@ -69,9 +69,10 @@
       (.checkcast code target-cd))))
 
 (defn- emit-box
-  "Emit bytecode to box a primitive stack value to Object."
+  "Box a primitive result, or supply nil after a void invocation, for the IFn Object ABI."
   [code stack-type empty-cds]
   (case stack-type
+    :void (.aconst_null code)
     :double (.invokestatic code dbl-box-cd "valueOf"
                            (MethodTypeDesc/of dbl-box-cd (into-array ClassDesc [D-cd])))
     :long (.invokestatic code long-box-cd "valueOf"

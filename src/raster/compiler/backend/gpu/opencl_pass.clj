@@ -363,6 +363,14 @@
           (mapv :value user-scalars)
           (:value (first bound-entries)))))
 
+(defn- graph-reduction-equation? [equation]
+  (and (seq (:operations equation))
+       (every? #(and (instance? raster.compiler.ir.segop.SegRed %)
+                     (or (= :product (:phase %))
+                         (and (empty? (segop/seg-space-segment-dims (:space %)))
+                              (reduction/scalar? (:reduction %)))))
+               (:operations equation))))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -448,6 +456,7 @@
                       (:stride (par/extract-par-scatter-info form)))
                  (par/par-reduce-form? form)
                  (par/par-reduce-into-form? form)
+                 (par/par-product-reduce-form? form)
                  (and (croute/par-contract-form? form) (empty? (nth form 2)))
                  ;; A compound source extent normalizes to a preceding typed scalar equation. It
                  ;; cannot be projected as a closed SegMap without losing that SSA definition.
@@ -539,13 +548,18 @@
         (fn emit-scheduled-graph!
           ([scheduled] (emit-scheduled-graph! scheduled nil false))
           ([scheduled stat-key host-scalar-result?]
+           (emit-scheduled-graph! scheduled stat-key host-scalar-result? nil))
+          ([scheduled stat-key host-scalar-result? equation]
           ;; KernelDispatch is already the verified selection value above both a single artifact
           ;; and a graph.  A one-alternative dispatch therefore gives scheduled equations the same
           ;; registry/selection seam as tuned GEMM without introducing a second graph registry.
           ;; Scan is the first graph target-lowering; later graph families extend this backend
           ;; dispatcher rather than adding source/runtime conventions per operation.
           (let [emitted0 (segop-cl/generate-kernel-graph
-                          scheduled :scalar-types top-scalar-types)
+                          scheduled :scalar-types top-scalar-types
+                          :scheduled-equation-algorithm (:algorithm equation)
+                          :scheduled-equation-body
+                          (when equation (equation-graph/body-for-equation parallel-program equation)))
                 emitted (-> emitted0
                             (kgraph/map-operations
                              (fn [node]
@@ -595,8 +609,11 @@
                       (assoc (vec (:arguments emitted)) result-index (list constructor 1)))
                     (vec (:arguments emitted)))
                   invocation
-                  (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                        device-id (:id dispatch) invocation-arguments)]
+                  (apply list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                         device-id (:id dispatch) invocation-arguments
+                         (when (and (seq (:operations equation))
+                                    (every? #(= :product (:phase %)) (:operations equation)))
+                           [:none]))]
               (if host-scalar-result?
                 (list 'clojure.core/aget invocation 0)
                 invocation)))))
@@ -809,15 +826,11 @@
                     {:reason :scalar-reduction-requires-typed-graph
                      :source form :target-dialect :kernel-graph :fallback :none}))
 
-            ;; Typed segmented product reduction. The portable schedule is one deterministic
-            ;; workgroup tree per segment; mixed result components remain separate ABI buffers.
+            ;; Product reduction uses the same complete graph boundary as scalar reduction.
             (par/par-product-reduce-form? form)
-            (let [segred (par->segred stats form dtype device-id
-                                      top-scalar-types top-array-types)
-                  kernel (segop-cl/generate-product-reduction-kernel
-                          segred :scalar-types top-scalar-types :array-types top-array-types)
-                  k (register-kernel! kernel :ze-reduces)]
-              (emit-map-void-invocation k device-id))
+            (throw (ex-info "product reduction requires its complete TypedSOAC graph"
+                            {:reason :product-reduction-requires-typed-graph
+                             :source form :fallback :none}))
 
             ;; Ordered segmented fold-map. The source spelling is only a host fallback; GPU
             ;; emission must consume the bound TypedSOAC SegFoldMap and its verified KernelBody.
@@ -1006,14 +1019,7 @@
                                                                           [:provenance
                                                                            :source-dialect])))
                                                           scalar-reduction?
-                                                          (and (seq (:operations equation))
-                                                               (every?
-                                                                #(and (instance?
-                                                                       raster.compiler.ir.segop.SegRed %)
-                                                                      (empty? (segop/seg-space-segment-dims (:space %)))
-                                                                      (reduction/scalar?
-                                                                       (:reduction %)))
-                                                                (:operations equation)))]
+                                                          (graph-reduction-equation? equation)]
                                                       (if (and typed-equation?
                                                                (or scalar-reduction?
                                                                    (get-in equation
@@ -1040,7 +1046,8 @@
                                                                              (:operations equation)))
                                                             :ze-reduces)
                                                           (boolean (host-scalar-result?
-                                                                    parallel-program equation))))
+                                                                    parallel-program equation))
+                                                          equation))
                                                        (binding [*bound-segops*
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
@@ -1068,14 +1075,7 @@
                                                              [:provenance :source-dialect]))
                                                   (= :body (first (:site equation)))))
                                          scalar-reduction?
-                                         (and (seq (:operations equation))
-                                              (every?
-                                               #(and (instance?
-                                                      raster.compiler.ir.segop.SegRed %)
-                                                     (empty? (segop/seg-space-segment-dims (:space %)))
-                                                     (reduction/scalar?
-                                                      (:reduction %)))
-                                               (:operations equation)))]
+                                         (graph-reduction-equation? equation)]
                                      (if (and typed-equation? scalar-reduction?)
                                        (do
                                          (swap! stats update :segop-reused (fnil inc 0))
@@ -1085,7 +1085,8 @@
                                             parallel-program equation))
                                           :ze-reduces
                                           (boolean (host-scalar-result?
-                                                    parallel-program equation))))
+                                                    parallel-program equation))
+                                          equation))
                                        (binding [*bound-segops* (:operations equation)
                                                  *bound-algorithm*
                                                  (when parallel-program

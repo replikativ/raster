@@ -63,6 +63,11 @@
 (defn- unknown-shape? [value]
   (some #(and (seq? %) (= 'unknown-dimension (first %))) (:shape value)))
 
+(defn- unresolved-capacity? [id value elements]
+  ;; An analyzed array parameter can explicitly name its runtime allocation extent. That is
+  ;; not an independent minimum shape requirement; a proven read/write requirement replaces it.
+  (or (unknown-shape? value) (= elements (list 'extent id))))
+
 (defn- required-write-extent
   "Cover every logical write to shared physical storage; an unknown write prevents refinement."
   [values derived-scalars result-values]
@@ -258,7 +263,7 @@
                 operation
                 {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
                  :scalar-types (into {} (keep (fn [[id v]]
-                                               (when (integral-scalar-value? v)
+                                               (when (empty? (:shape v))
                                                  [id (:dtype v)]))) values)}
                 (fn [rule message data] (fail! rule message data)))
                ;; This is an optional refinement. Unsupported source access stays unknown;
@@ -392,7 +397,8 @@
                        (fn [specs id requirements]
                          (let [extents (vec (distinct
                                              (cond-> requirements
-                                               (not (unknown-shape? (get values id)))
+                                               (not (unresolved-capacity?
+                                                     id (get values id) (get-in specs [id :elements])))
                                                (conj (get-in specs [id :elements])))))
                                required (if (= 1 (count extents)) (first extents)
                                             (apply launch/maximum extents))]
@@ -404,7 +410,9 @@
          buffer-specs (reduce-kv
                        (fn [specs id result-values]
                          (if-let [extent (and (contains? specs id)
-                                              (unknown-shape? (get values id))
+                                              (unresolved-capacity?
+                                               id (get values id)
+                                               (:elements (storage-spec values derived-scalars id)))
                                               (required-write-extent values derived-scalars result-values))]
                            (assoc-in specs [id :elements]
                                      (if (contains? read-requirements id)

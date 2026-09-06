@@ -443,28 +443,32 @@ now proves direct analyzed-source-to-TypedSOAC routing, typed schedule reuse and
 fallback. Subgroup/shuffle and multi-workgroup alternatives remain schedule candidates, not new
 semantic primitives.
 
-The product workgroup schedule still uses its source emitter; migrating it to KernelBody must
-preserve the simultaneous tuple update, hidden components, independent dtypes and logical ABI.
+The dense row-product workgroup schedule now uses KernelBody through the common graph emitter,
+preserving simultaneous tuple updates, hidden components, independent dtypes and logical ABI.
 The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
 types: each local is lowered once to SSA and shared across results, without inferring its type from
-a consuming component. The candidate `product-reduction-body` now expresses lane folds, a fixed
+a consuming component. `product-reduction-body` expresses lane folds, a fixed
 workgroup tree and final stores with typed carries, independent scratch allocations and shared
 scalar/control target emission. Its mixed float/int argmax fixture is compared against both the
 retained emitter and a host oracle on CPU OpenCL (empty/short/tail rows, ties, NaNs and infinities),
 and joins the hardware-free CUDA/HIP compile gates. This is not a throughput benchmark.
 
-It is deliberately not yet a production route: it accepts one segment axis, integral int/long row/column
+The initial production subset accepts one segment axis, integral int/long row/column
 bounds, retained region-binding types and long-width address expressions. TypedSOAC local dtypes
 now survive SegRed projection and scalar SSA substitution, so computed local address bindings and
 typed integral constants use those same facts rather than a reconstructed type map. Contradictory
 candidate overrides decline. Caller-supplied storage shapes are not a source/storage
-certificate (`:source-storage-certified? false`). Exact graph/source/body storage correspondence is
-available for retained plain capacities; unknown indexed input requirements still need derivation.
+certificate (`:source-storage-certified? false`). Production admission additionally replays the exact
+graph/source/body projection, derives dense read minima from the same typed scalar lowering, and
+checks that graph capacities cover those minima. Unsupported gathers, broadcasts, combine reads
+and unlowered storage layouts decline; known capacity alone is not access evidence. Graph binding
+checks capacities before submission on session, staged and direct descriptor-step paths.
 Zero-row kernels use one physical group with a uniform guard around all computation, barriers and
 stores; zero-width rows produce the neutral tuple. This is a no-op over existing resident storage,
-not graph-node elision or support for allocating zero-byte device buffers. Next: close the remaining
-storage and public-binding obligations over the public
-TypedSOAC route, switch only certified candidates, then delete the retained source emitter.
+not graph-node elision or support for allocating zero-byte device buffers. Public argmax uses the
+common executable binder; effect-only staging copies all writes and returns nil explicitly. The
+public equation-first workload joins CUDA/HIP compilation gates. Next: finish the coverage audit
+and retire the retained source emitter, which is now only a differential/test oracle.
 The retained product `KernelGrid` now describes its actual guarded segment-count launch and tuple scratch,
 not the scalar width-reduction grid formerly used only to seed workgroup sizing. The candidate
 checks that grid against the selected tree. `validate-source!` additionally replays the body and

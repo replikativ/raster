@@ -263,3 +263,42 @@
                     "product output must retain the exact segment extent and component dtype"
                     {:output result :rows rows :dtype dtype :buffer buffer}))))
     (validate-source! candidate source options)))
+
+(defn schedule-for-node
+  "Admit the deterministic product body through the exact source/graph and typed-access checks.
+   Graph capacities remain runtime preconditions, enforced before resident or staged submission."
+  [node kernel-graph algorithm scheduled-body]
+  (let [options (graph-options node kernel-graph algorithm scheduled-body)
+        source (:operation node)
+        candidate (schedule source options)
+        _ (validate-against-node! candidate node kernel-graph algorithm scheduled-body)
+        requirements (regions/dense-read-requirements source options decline!)
+        scalar-definitions (equation-graph/derived-scalar-expressions
+                            (:values scheduled-body)
+                            (take-while #(true? (get-in % [:attributes :host-only]))
+                                        (:equations scheduled-body)))
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))
+        covers? (fn covers? [capacity required]
+                  (or (= capacity required)
+                      (and (= "raster.compiler.ir.kernel_launch.Maximum"
+                              (some-> capacity class .getName))
+                           (some #(covers? % required) (:values capacity)))))]
+    ;; Optional graph refinement can decline while scalar lowering later succeeds. Admission
+    ;; must therefore check the resulting capacity, not assume the optional step ran. Exact
+    ;; equality or membership in a checked maximum suffices for this graph projection; do not
+    ;; invent a general symbolic inequality from guessed positivity or stripped casts.
+    (doseq [[id extent] requirements
+            :let [required (launch/rebind-expression extent scalar-definitions)
+                  capacity (:elements (get buffers id))]]
+      (when-not (covers? capacity required)
+        (decline! :graph-read-capacity "product graph does not cover its typed read requirement"
+                  {:input id :required required :capacity capacity})))
+    ;; Replaying graph construction above derives these minima from the same typed loads; it
+    ;; cannot accept a caller annotation in their place. Replaying schedule construction fixes
+    ;; the uniform row guard and positive column-loop domain that justify the access proof.
+    (-> candidate
+        (assoc-in [:legality :read-requirements] requirements)
+        (assoc-in [:attributes :candidate-only] false)
+        (assoc-in [:attributes :source-storage-certified?] true))))
