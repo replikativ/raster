@@ -33,6 +33,11 @@ vertical. The north star remains the architectural specification.
   a separate, potentially stricter contract.
 - Select the certified body and delete the old product algorithm emitter once its coverage is
   replaced. Keep necessary target instruction lowering.
+- Typed access follow-up extends the existing AxisMap relation with a bounded conditional
+  intermediate-range proof over KernelBody indices. Exact polynomial coefficients prevent host
+  overflow; every add/multiply subtree is checked before affine normalization. The proof assumes
+  active positive axis domains and checked resident capacity; deriving those access requirements
+  from scalar lowering and enforcing them in graph binding remain production obligations.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 

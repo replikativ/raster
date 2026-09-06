@@ -3,7 +3,73 @@
    Covers the cases that used to be ad-hoc special cases (:nn/:nt, transposed output) plus the
    ones that were not expressible at all (merge/split, broadcast, diagonal, batch)."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.ir.axis-map :as am]))
+            [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.kernel-body :as kb]))
+
+(deftest typed-index-proof-checks-intermediates-before-normalizing
+  (let [layout (am/of-axes '[[row rows] [col width]])
+        types {'row :int 'col :long 'rows :long 'width :long}
+        row (kb/index-cast 'row :long :exact)
+        wide #(kb/index-cast % :long :exact)
+        add #(apply kb/expression :add %&)
+        mul #(apply kb/expression :mul %&)
+        index (add (mul row 'width) 'col)
+        accepts? #(am/bounded-typed-index-matches? layout % types)]
+    (is (accepts? index))
+    (is (accepts? (add 'col (mul 'width row))))
+    (is (accepts? (add (wide 0) index)))
+    (is (not (accepts? (add index (wide 1)))) "strict final bound")
+    (is (not (accepts? (add (mul row 'rows) 'col))))
+    (is (not (accepts? (kb/index-cast index :int :exact))))
+    (is (not (accepts? (add (mul 'row 'width) 'col))) "mixed widths are not inferred")
+    (doseq [unsafe [(add index (mul (mul Long/MAX_VALUE Long/MAX_VALUE) (wide 0)))
+                    (add index (wide -1) (wide 1))
+                    (add index (mul (mul 'width 'width) (wide 0)))
+                    (add index (mul 'unknown (wide 0)))
+                    (kb/expression :mod index 'width)]]
+      (is (not (accepts? unsafe)))))
+  (let [types {'i :int 'n :int}]
+    (is (not (am/bounded-typed-index-matches?
+              (am/of-axes '[[i n]]) (kb/expression :add 'i 0) types)))
+    (is (am/bounded-typed-index-matches? (am/of-axes '[[i n]]) 'i types))))
+
+(deftest typed-index-proof-shares-axis-map-algebra
+  (let [types (zipmap '[b i j B M N] (repeat :long))
+        mul #(apply kb/expression :mul %&)
+        add #(apply kb/expression :add %&)
+        index (add (mul 'b (mul 'M 'N)) (mul 'i 'N) 'j)]
+    (is (am/bounded-typed-index-matches?
+         (am/of-groups '[[[b B]] [[i M] [j N]]]) index types))
+    (is (am/bounded-typed-index-matches?
+         (am/of-axes '[[i N] [j N]]) (add (mul 'i 'N) 'j) types))
+    (is (am/bounded-typed-index-matches?
+         (am/of-axes '[[i 4] [j 8]])
+         (add (mul 'i (kb/index-cast 8 :long :exact)) 'j) types))
+    (doseq [layout [(am/of-axes '[[i N] [i N]])
+                    (am/of-axes '[[i i]])
+                    (am/of-axes '[[i 0]])
+                    (am/of-axes '[[i -1]])
+                    (am/of-axes '[[i (+ N 1)]])]]
+      (is (not (am/bounded-typed-index-matches? layout 'i types))))
+    (is (not (am/bounded-typed-index-matches?
+              (am/of-axes '[[i N]])
+              (reduce (fn [x _] (add x (kb/index-cast 0 :long :exact))) 'i (range 130))
+              types)))
+    (is (not (am/bounded-typed-index-matches?
+              (am/of-axes '[[i missing]]) 'i types)))
+    (is (not (am/bounded-typed-index-matches?
+              (am/of-groups [[['i Long/MAX_VALUE] ['j 2]]])
+              (add (mul 'i (kb/index-cast 2 :long :exact)) 'j) types)))
+    (is (not (am/bounded-typed-index-matches?
+              {:groups (repeat [['i 'N]])} 'i types)))
+    (is (not (am/bounded-typed-index-matches?
+              {:groups [(repeat ['i 'N])]} 'i types)))))
+
+(deftest exact-affine-coefficients-and-zero-normalization
+  (is (am/index= '(+ i 0) 'i '[i]))
+  (is (am/index= (list '* 'i Long/MAX_VALUE Long/MAX_VALUE)
+                 (list '* (*' Long/MAX_VALUE Long/MAX_VALUE) 'i) '[i]))
+  (is (not (am/index= (list '* 'i Long/MAX_VALUE Long/MAX_VALUE) 'i '[i]))))
 
 (deftest plain-row-major-index
   (testing "A[i,l] over [M K] → i*K + l"
