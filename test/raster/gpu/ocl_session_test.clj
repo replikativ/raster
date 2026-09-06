@@ -9,6 +9,7 @@
   POCL's malloc does not)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pl]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
@@ -382,6 +383,32 @@
               "the hoisted IFn applyTo bridge also boxes void as nil")
           (is (= [3 255 411] (vec staged-indices))))
         (finally (gpu/close-session! s))))))
+
+(deftest ocl-strided-transfers-retain-host-control-and-accumulation
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "typed strided transfers in host control")
+    (let [register! (requiring-resolve 'raster.gpu.ocl-runtime/register-kernel!)]
+      (doseq [op '[raster.par/gather raster.par/scatter!]]
+        (let [emitted (opencl-pass/opencl-pass
+                       (list 'if 'enabled (list op 'out 'src 'indices 'n 'stride) nil)
+                       :device-id :ocl:0 :min-elements 0 :dtype :float
+                       :array-types {'out :float 'src :float 'indices :int}
+                       :scalar-types {'n :long 'stride :long 'enabled :boolean})
+              execute (eval (list 'fn '[out src indices n stride enabled] (:form emitted)))
+              source (float-array [1 2 3 4 5 6])
+              indices (int-array [2 0 2])
+              output (float-array [10 20 30 40 50 60])]
+          (doseq [artifact (:kernels emitted)]
+            (register! (:kernel-name artifact) artifact))
+          ;; nil dimensions would fail extent evaluation: the inactive branch must not touch it.
+          (is (nil? (execute output source indices nil nil false)))
+          (is (= [10.0 20.0 30.0 40.0 50.0 60.0] (vec output)))
+          (is (identical? output (execute output source indices 3 2 true)))
+          (is (= (if (= op 'raster.par/gather)
+                   [5.0 6.0 1.0 2.0 5.0 6.0]
+                   [13.0 24.0 30.0 40.0 56.0 68.0])
+                 (vec output))
+              "scatter adds colliding rows to existing storage; gather overwrites"))))))
 
 (deftest ocl-resident-row-gather-roundtrip
   (if-not @device-probe/opencl-available?

@@ -114,7 +114,7 @@ The next caller audit distinguishes a remaining source edge from demonstrated ru
 |---|---|---|
 | General contractions | `generate-segmented-reduce-kernel` → `contract_route` | Nested gather selects the source fallback after `:operand-layout` decline. |
 | Unscheduled effects | `generate-par-map-void-kernel` → `opencl_pass` | Raw/unbound effect fallback still present. |
-| Strided transfers | `par_opencl` stride emitters → `opencl_pass` | Bare gather/scatter probes already take typed mini-programs; remaining source edges need retirement proof. |
+| Strided transfers | Typed mini-program → KernelBody | Bare and host-wrapped leaves share typed scheduling; source generators moved to test-only oracles. |
 | Active IDs | `generate-par-active-ids-kernel` → `opencl_pass` | ABM firms uses seeded agent indices, not arbitrary visibility compaction. |
 | Compound local | `generate-compound-local-kernel` → `opencl_pass` | Compatibility markers remain; structured typed programs bypass detection. |
 | Staged/quantized contractions | `generate-staged-contraction-kernel` → `contract_route` | Device-tested staged/lift/quantized source assembly remains. |
@@ -125,6 +125,13 @@ Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions,
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through
 the adapter; semantic provenance remains separate. No schedule or precision changes.
+
+Strided transfer retirement also closes the raw host-wrapper entry: `do`, conditional and
+body-position leaves schedule their scalar extent beside the invocation, without moving it out
+of the branch. Supplied typed programs are consumed without re-analysis and reject missing
+equations. Existing source-oracle assertions remain test-only. CPU OpenCL checks inactive branches,
+output identity, gather overwrite and repeated-index scatter accumulation into nonzero storage;
+this is correctness evidence, not an accelerator performance measurement.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
