@@ -29,10 +29,19 @@
       (is (= :sumsq-aot (get-in result [:identity :workload]))))))
 
 (deftest direct-contraction-result-is-a-public-resident-buffer
-  (let [p (canary/prepare-gemm :ocl:0 (canary/gemm-arguments))]
+  (let [p (canary/prepare-gemm :ocl:0 (canary/gemm-arguments))
+        evidence (canary/compilation-evidence p)
+        candidates (mapcat :alternatives (:steps evidence))]
     (is (= 'C (get-in p [:descriptor :result-sym])))
     (is (= ['C] (mapv :sym (:out-tree p))))
-    (is (every? #(= :executable (:convention %)) (get-in p [:descriptor :steps])))))
+    (is (every? #(= :executable (:convention %)) (get-in p [:descriptor :steps])))
+    (is (= 1 (:resident-step-count evidence)))
+    (is (= 0 (:descriptor-scratch-count evidence)))
+    (is (seq candidates))
+    (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %)) candidates))
+    (is (every? #(string? (get-in % [:signature :source-hash])) candidates))
+    (is (= evidence (canary/compilation-evidence p))
+        "evidence identifies the same already-compiled alternatives")))
 
 (deftest opencl-resident-gemm-canary-numerics
   (if-not @probe/opencl-available?

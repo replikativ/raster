@@ -6,7 +6,8 @@
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.compiler.pipeline :as pipeline]
-            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.link :as link]
@@ -87,6 +88,31 @@
   (compiled/lower #'gemm64! args {:target target :dtype :float :on-non-resident :throw
                                  :constants ['A 'B]}))
 
+(defn compilation-evidence
+  "Describe alternatives from the exact prepared program, without recompiling it.
+   Entry-point counts include candidate graphs; they are not measured launch counts. Descriptor
+   scratch excludes graph-owned temporaries and is not a peak-memory measurement."
+  [prepared]
+  (let [descriptor (:descriptor prepared)]
+    {:version 1
+     :resident-step-count (count (:steps descriptor))
+     :descriptor-scratch-count (count (:allocs descriptor))
+     :steps
+     (mapv (fn [step]
+             {:convention (:convention step)
+              :alternatives
+              (mapv (fn [candidate]
+                      (let [artifacts (executable/artifacts candidate)]
+                        {:strategy (executable/strategy candidate)
+                         :signature (tuning/executable-signature candidate)
+                         :entry-point-count (count artifacts)
+                         :emission-routes (frequencies (map artifact/emission-route artifacts))}))
+                    (if-let [choice (:dispatch step)]
+                      (:alternatives choice)
+                      (when (executable/kernel-executable? (:artifact step))
+                        [(:artifact step)])))})
+           (:steps descriptor))}))
+
 (defn gemm! [{:keys [environment-tag target compiler-revision] :or {target :ocl:0}}]
   (let [identity (identity-for :gemm64-resident target :float [64 64 64]
                                :host-synchronized-replay environment-tag)
@@ -108,16 +134,13 @@
             _ (when-not (= expected actual)
                 (throw (ex-info "production GEMM canary failed independent numerical reference"
                                 {:expected-head (take 8 expected) :actual-head (take 8 actual)})))
-            alternatives (keep :dispatch (get-in prepared [:descriptor :steps]))]
+            evidence (compilation-evidence prepared)]
         {:identity (assoc identity :numerical-policy (get-in prepared [:schedule :precision]))
          :compiler-revision compiler-revision
          :compile-ns compile-ns :bind-ns bind-ns :validated? true
          :schedule (:schedule prepared)
          :execution (compiled/ir c)
-         :candidate-strategies (mapv #(mapv dispatch/alternative-strategy (:alternatives %))
-                                     alternatives)
-         :candidate-signatures (mapv #(mapv tuning/executable-signature (:alternatives %))
-                                     alternatives)
+         :compilation evidence
          :measurement (measure #(link/run! resident))})
       (finally (compiled/close! c)))))
 

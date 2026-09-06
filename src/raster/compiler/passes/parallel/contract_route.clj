@@ -1499,6 +1499,7 @@
                :abi (:abi rt)
                :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
                :kernel-body (:kernel-body rt)
+               :emission-route (:emission-route rt)
                :fused-epilogue (boolean epilogue)
                :epilogue-operands (:epilogue-operands rt)
                :epilogue-scalars (:epilogue-scalars rt)
