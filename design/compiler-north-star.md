@@ -447,9 +447,19 @@ The product workgroup schedule still uses its source emitter; migrating it to Ke
 preserve the simultaneous tuple update, hidden components, independent dtypes and logical ABI.
 The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
 types: each local is lowered once to SSA and shared across results, without inferring its type from
-a consuming component. This is a prerequisite, not yet a production product KernelBody route.
-Next: express the lane folds and workgroup tree with typed carries and per-component scratch,
-compare numerically with the retained implementation, then switch the route and delete that oracle.
+a consuming component. The candidate `product-reduction-body` now expresses lane folds, a fixed
+workgroup tree and final stores with typed carries, independent scratch allocations and shared
+scalar/control target emission. Its mixed float/int argmax fixture is compared against both the
+retained emitter and a host oracle on CPU OpenCL (empty/short/tail rows, ties, NaNs and infinities),
+and joins the hardware-free CUDA/HIP compile gates. This is not a throughput benchmark.
+
+It is deliberately not yet a production route: it accepts one segment axis, int32 row/column
+bounds, explicitly retained region-binding types and long-width address expressions. Computed
+local address bindings still decline. Caller-supplied storage shapes are not a source/storage
+certificate (`:source-storage-certified? false`); exact graph/source/body storage closure must be
+added before selection. Zero-row calls retain the existing zero-group rejection and need planner
+elision; zero-width rows produce the neutral tuple. Next: close those obligations over the public
+TypedSOAC route, switch only certified candidates, then delete the retained source emitter.
 
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
