@@ -75,6 +75,22 @@
                (raster.par/atomic-add! total 0 (float (clojure.core/aget x i))))))]
          effect))
 
+(deftest map-owner-reserves-all-local-binders-before-emission
+  (let [operation (first (soac-lower/lower-typed-effect-map
+                          (effect-program) :ze:0 :dtype :float))
+        operation (assoc-in operation [:scalar-region :locals]
+                            [{:id 'shifted :dtype :float :init '(+ 1.0 2.0)}
+                             {:id 'map-value-1 :dtype :float :init '(+ shifted 3.0)}])
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                   operation :dtype :float :target-dialect :opencl-portable
+                   :array-types {'x :float 'out :float 'total :float}
+                   :scalar-types {'n :long})
+        operations (nested-operations (get-in artifact [:attributes :kernel-body :operations]))
+        ids (keep #(get-in % [:result :id]) operations)]
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (not-any? #{'map-value-1} ids))
+    (is (seq ids))))
+
 (deftest ordered-effects-lower-to-portable-kernelbody-control-and-atomics
   (let [program (effect-program)
         operation (first (soac-lower/lower-typed-effect-map

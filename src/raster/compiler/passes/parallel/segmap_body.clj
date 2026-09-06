@@ -201,6 +201,7 @@
                  {:array-types array-types :scalar-types scalar-types
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate :map-active
+                  :source-region [locals result effects]
                   :id-prefix "map" :decline! decline!})
         base-environment (assoc scalar-types index :long)
         lower-locals

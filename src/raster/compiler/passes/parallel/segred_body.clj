@@ -358,13 +358,13 @@
                       load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         operations (atom [])
-        environment (atom (into {} (map (fn [id] [id (dtype/canon (get scalar-types id dtype))]))
-                                scalars))
         lowerer (scalar-expression/make-lowerer
                  {:arrays (set arrays)
                   :array-types (into {} (map (fn [id] [id (dtype/canon (get array-types id dtype))]))
                                      arrays)
-                  :scalar-types @environment
+                  :scalar-types (into {} (map (fn [id] [id (dtype/canon (get scalar-types id dtype))]))
+                                      scalars)
+                  :source-region expression
                   ;; Only this adapter's already-approved coordinates reach the SSA builder.
                   :lower-index (fn [coordinate _] coordinate)
                   :predicate load-predicate
@@ -375,7 +375,6 @@
                   :conversion-policy cast-policy :decline! decline! :id-prefix "element"})
         append! (fn [lowered]
                   (let [{:keys [result type]} lowered]
-                    (when (symbol? result) (swap! environment assoc result type))
                     (swap! operations into (:operations lowered))
                     {:value result :dtype type}))]
     (letfn [(cast! [{:keys [value dtype] :as typed} target]
@@ -420,7 +419,7 @@
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
                     (append! ((:lower lowerer) (list 'aget array lowered-coordinate)
-                              (dtype/canon (get array-types array dtype)) @environment)))
+                              (dtype/canon (get array-types array dtype)) {})))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
@@ -464,7 +463,10 @@
                     (append! ((:lower lowerer)
                               (apply list (descriptor/semantic-op expression)
                                      (map :value typed-inputs))
-                              result-dtype @environment)))
+                              result-dtype
+                              (into {} (keep (fn [{:keys [value dtype]}]
+                                               (when (symbol? value) [value dtype])))
+                                    typed-inputs))))
 
                   :else
                   (decline! :scalar-expression
