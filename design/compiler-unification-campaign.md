@@ -75,6 +75,15 @@ before treating a definition as live or dead:
 Audit apparent unused wrappers separately. A source oracle is not a production fallback; removing
 one must not erase its independent numerical evidence. Track JVM and C/SIMD compatibility as well
 as GPU paths, using the same production corpus and retained TypedSOAC facts.
+
+A repository caller audit found four orphan NN source generators (row softmax, group norm,
+vector scatter-reduce and scalar scatter-reduce): their only source callers were unreferenced
+adapter wrappers, while tests inspected generated strings. The wrappers are removed and the
+unchanged generator bodies live in a test-only reference namespace. Existing source assertions
+remain, with scalar-scatter coverage added; these are source-shape oracles, not numerical or
+accelerator performance evidence. Shared dtype/extension helpers remain production infrastructure.
+This removes dead algorithms from production, not a live workload's fallback or an optimization.
+
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
 FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three

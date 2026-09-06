@@ -359,9 +359,9 @@
 ;; ================================================================
 
 (deftest scatter-reduce-kernel-test
-  (testing "scatter-reduce kernel generates valid OpenCL"
-    (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-scatter-reduce-kernel)
+  (testing "scatter-reduce kernel retains its source oracle"
+    (require 'raster.compiler.reference.legacy-nn-opencl)
+    (let [emit (resolve 'raster.compiler.reference.legacy-nn-opencl/emit-scatter-reduce-kernel)
           src (emit "scatter_test" :double :atomic :with-weights? true)]
       (is (string? src))
       (is (.contains src "scatter_test"))
@@ -369,17 +369,37 @@
       (is (.contains src "dst_edges"))
       (is (.contains src "weights"))))
 
-  (testing "sorted variant generates valid OpenCL"
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-scatter-reduce-kernel)
+  (testing "sorted variant retains its source oracle"
+    (let [emit (resolve 'raster.compiler.reference.legacy-nn-opencl/emit-scatter-reduce-kernel)
           src (emit "scatter_sorted" :float :sorted :with-weights? false)]
       (is (string? src))
       (is (.contains src "seg_offsets"))
-      (is (not (.contains src "weights"))))))
+      (is (not (.contains src "weights")))))
+  (testing "scalar scatter source oracle is retained too"
+    (doseq [dtype [:float :double]]
+      (let [emit (resolve 'raster.compiler.reference.legacy-nn-opencl/emit-scatter-reduce-scalar-kernel)
+            src (emit "scatter_scalar" dtype)]
+        (is (.contains src "scatter_scalar"))
+        (is (.contains src "dst_edges"))
+        (is (.contains src "values"))))))
+
+(deftest retired-nn-source-generators-are-test-only
+  (require 'raster.compiler.backend.gpu.opencl-codegen
+           'raster.compiler.backend.gpu.par-opencl)
+  (doseq [[ns-sym names]
+          [['raster.compiler.backend.gpu.opencl-codegen
+            '[emit-row-softmax-kernel emit-group-norm-kernel
+              emit-scatter-reduce-kernel emit-scatter-reduce-scalar-kernel]]
+           ['raster.compiler.backend.gpu.par-opencl
+            '[generate-row-softmax-kernel generate-group-norm-kernel
+              generate-scatter-reduce-kernel generate-scatter-reduce-scalar-kernel]]]
+          name names]
+    (is (nil? (ns-resolve ns-sym name)) (str ns-sym "/" name))))
 
 (deftest row-softmax-kernel-test
-  (testing "row-softmax kernel generates valid OpenCL"
-    (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-row-softmax-kernel)
+  (testing "row-softmax kernel retains its source oracle"
+    (require 'raster.compiler.reference.legacy-nn-opencl)
+    (let [emit (resolve 'raster.compiler.reference.legacy-nn-opencl/emit-row-softmax-kernel)
           src (emit "softmax_test" :double)]
       (is (string? src))
       (is (.contains src "softmax_test"))
@@ -388,9 +408,9 @@
       (is (.contains src "exp")))))
 
 (deftest group-norm-kernel-test
-  (testing "GroupNorm kernel generates valid OpenCL"
-    (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-group-norm-kernel)
+  (testing "GroupNorm kernel retains its source oracle"
+    (require 'raster.compiler.reference.legacy-nn-opencl)
+    (let [emit (resolve 'raster.compiler.reference.legacy-nn-opencl/emit-group-norm-kernel)
           src (emit "gn_test" :double)]
       (is (string? src))
       (is (.contains src "gn_test"))

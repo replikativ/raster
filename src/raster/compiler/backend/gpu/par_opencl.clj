@@ -257,66 +257,6 @@
 
 
 ;; ================================================================
-;; Row-softmax kernel generator
-;; ================================================================
-
-(defn generate-row-softmax-kernel
-  "Generate an OpenCL row-softmax kernel.
-  Returns {:kernel-name str :source str :dtype kw :workgroup-size int}."
-  [& {:keys [dtype kernel-name-prefix workgroup-size]
-      :or {dtype :double kernel-name-prefix "row_softmax" workgroup-size 256}}]
-  (let [kernel-name (str kernel-name-prefix "_" (gensym ""))]
-    {:kernel-name kernel-name
-     :source (codegen/emit-row-softmax-kernel kernel-name dtype
-                                              :workgroup-size workgroup-size)
-     :dtype dtype
-     :workgroup-size workgroup-size}))
-
-;; ================================================================
-;; GroupNorm kernel generator
-;; ================================================================
-
-(defn generate-group-norm-kernel
-  "Generate an OpenCL GroupNorm kernel.
-  Returns {:kernel-name str :source str :dtype kw :workgroup-size int}."
-  [& {:keys [dtype kernel-name-prefix workgroup-size eps]
-      :or {dtype :double kernel-name-prefix "group_norm" workgroup-size 256 eps 1e-5}}]
-  (let [kernel-name (str kernel-name-prefix "_" (gensym ""))]
-    {:kernel-name kernel-name
-     :source (codegen/emit-group-norm-kernel kernel-name dtype
-                                             :workgroup-size workgroup-size :eps eps)
-     :dtype dtype
-     :workgroup-size workgroup-size}))
-
-;; ================================================================
-;; Scatter-reduce kernel generator
-;; ================================================================
-
-(defn generate-scatter-reduce-kernel
-  "Generate an OpenCL scatter-reduce kernel for graph attention.
-  Returns {:kernel-name str :source str :variant kw :dtype kw}."
-  [& {:keys [dtype variant with-weights? kernel-name-prefix]
-      :or {dtype :double variant :atomic with-weights? true
-           kernel-name-prefix "scatter_reduce"}}]
-  (let [kernel-name (str kernel-name-prefix "_" (gensym ""))]
-    {:kernel-name kernel-name
-     :source (codegen/emit-scatter-reduce-kernel
-              kernel-name dtype variant
-              :with-weights? with-weights?)
-     :variant variant
-     :dtype dtype}))
-
-(defn generate-scatter-reduce-scalar-kernel
-  "Generate a scalar scatter-reduce kernel.
-  Returns {:kernel-name str :source str :dtype kw}."
-  [& {:keys [dtype kernel-name-prefix]
-      :or {dtype :double kernel-name-prefix "scatter_reduce_scalar"}}]
-  (let [kernel-name (str kernel-name-prefix "_" (gensym ""))]
-    {:kernel-name kernel-name
-     :source (codegen/emit-scatter-reduce-scalar-kernel kernel-name dtype)
-     :dtype dtype}))
-
-;; ================================================================
 ;; SPIR-V compilation (cached)
 ;; ================================================================
 
