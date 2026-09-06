@@ -1090,6 +1090,28 @@ numerical or resource checks. Logical events, measurements, hardware descriptors
 `LinkPlan` and `ExecutionPlan` are the compiler/runtime seam to OpenCL, Level Zero, CUDA/HIP and
 future collective or cluster runtimes.
 
+Partial evaluation complements the SSA-based KernelBody; it does not replace it. The existing
+source fixpoint already combines call/AD expansion, type-aware rewalking, PE and CSE. The explicit
+PE API also accepts known parameters and dimensions. General runtime-driven respecialization is
+the direction of this contract, not a claim that every runtime fact already feeds every pass.
+
+Use binding-time information at three boundaries: specialize static model/simulator structure
+before TypedSOAC fusion; specialize shapes, layouts and hardware choices before scheduling;
+then simplify the chosen KernelBody with typed constant/range facts. Keep large iteration spaces
+as structured loops/SOACs until a schedule makes bounded unrolling profitable. Daphne's repeated
+desugaring, partial evaluation and symbolic simplification are a useful strategy reference; Raster
+must additionally preserve numerical conversion rules, effects and mutable/resident storage.
+Known shape/layout does not imply known buffer contents. Captured contents require immutable or
+versioned ownership evidence; facts learned at binding need guards and a generic fallback.
+For training, values fixed within an invocation may still be differentiation inputs: specialization
+must preserve the declared AD boundary and cannot silently turn trainable parameters into constants.
+
+Extend this incrementally through workload-backed specializations, not another parallel IR or an
+unrestricted host evaluator. Each specialization should carry its assumptions and validation,
+respect code-size/compile-time/search budgets, and enter a bounded versioned artifact cache.
+Measure cold compilation, generated size and warm execution together: eliminating dynamic work
+can still lose end-to-end if compilation or instruction footprint grows too much.
+
 The search state should include both kernel and graph choices. Per-kernel axes
 include tile, vector width, instruction family, workgroup geometry, layout,
 staging, pipeline depth, and reduction strategy. Graph axes include fusion,
