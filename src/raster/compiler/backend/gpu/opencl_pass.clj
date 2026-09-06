@@ -547,17 +547,17 @@
             (swap! kernels conj k)
             k))
 
-        emit-nested-indexed!
+        emit-nested-map!
         (fn [form]
-          ;; Raw host control flow can contain a strided transfer without a surrounding
+          ;; Raw host control flow can contain an indexed/RNG map without a surrounding
           ;; ParallelProgram. Schedule that leaf at its original control-flow position: its
           ;; hoisted extent belongs beside the invocation, never outside the host branch.
           ;; A supplied typed program must already account for every scheduled operation; do
           ;; not re-analyze a missing equation at that verified boundary. Source scheduling may
           ;; still leave a body-position operation outside its binding equations.
-          (when supplied-program
-            (throw (ex-info "Strided transfer is missing its retained typed equation"
-                            {:reason :unscheduled-indexed-transfer :form form})))
+          (when (or supplied-program direct-mini-program?)
+            (throw (ex-info "Map leaf is missing its retained typed equation"
+                            {:reason :unscheduled-map-leaf :form form})))
           (let [emitted (binding [*bound-segops* nil *bound-algorithm* nil]
                           (opencl-pass form :device-id device-id :dtype dtype
                                        :min-elements min-elements :compile-spirv? compile-spirv?
@@ -921,9 +921,7 @@
                             :scalar-types top-scalar-types :array-types top-array-types)
                     k (register-kernel! kernel :ze-maps)]
                 (emit-map-invocation k device-id))
-              (throw (ex-info "GPU RNG fill source has no verified TypedSOAC map schedule"
-                              {:reason :unscheduled-rng-fill
-                               :target-dialect :kernel-body :form form :fallback :none})))
+              (emit-nested-map! form))
 
             ;; par/active-ids!
             (par/par-active-ids-form? form)
@@ -957,7 +955,7 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-scatter! form))
                 (if stride
-                  (emit-nested-indexed! form)
+                  (emit-nested-map! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "scatter_result_") form
                                               dtype device-id top-scalar-types array-types)
@@ -976,7 +974,7 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-gather! form))
                 (if stride
-                  (emit-nested-indexed! form)
+                  (emit-nested-map! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "gather_result_") form
                                               dtype device-id top-scalar-types array-types)

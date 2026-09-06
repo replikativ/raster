@@ -114,6 +114,35 @@
       (is (= ['base-seed] (:captures operation)))
       (is (= 'n (get-in operation [:attributes :extent]))))))
 
+(deftest materialized-scalars-preserve-their-typed-result-conversions
+  (let [program (:program (route/attempt
+                           '(let* [^long value (long (int seed))
+                                    result (raster.par/map! out i n long value)] result)
+                           :long {'out :long} {:scalar-types {'seed :long 'n :int}}))
+        source (get-in program [:equations 0 :source])
+        execute (eval (list 'fn '[seed long] source))
+        scalar-bindings (vec (take 2 (second (:source program))))
+        execute-binding (eval (list 'fn '[seed] (list 'let* scalar-bindings 'value)))]
+    (is (= '(clojure.core/long (int seed)) source))
+    (is (= :long (get-in program [:values 'value :dtype])))
+    (is (nil? (:tag (meta (first scalar-bindings))))
+        "the primitive initializer, not a redundant binding hint, types the JVM local")
+    (is (instance? Long (execute-binding -1)))
+    (is (thrown? ArithmeticException (execute-binding (inc (long Integer/MAX_VALUE)))))
+    (is (= (long -1) (execute -1 (fn [& _] (throw (ex-info "shadowed long" {}))))))
+    (is (instance? Long (execute Integer/MAX_VALUE nil)))
+    (is (thrown? ArithmeticException (execute (inc (long Integer/MAX_VALUE)) nil))))
+  (let [program (:program (route/attempt
+                           '(let* [^float value (float seed)
+                                    result (raster.par/map! out i n float value)] result)
+                           :float {'out :float} {:scalar-types {'seed :double 'n :int}}))
+        execute (eval (list 'fn '[seed] (get-in program [:equations 0 :source])))]
+    (is (instance? Float (execute 1.00000001)))
+    (is (= (Float/floatToRawIntBits (float 1.00000001))
+           (Float/floatToRawIntBits (execute 1.00000001))))
+    (is (= (Float/floatToRawIntBits (float -0.0))
+           (Float/floatToRawIntBits (execute -0.0))))))
+
 (deftest production-route-retains-hardware-costed-placement-witnesses
   (let [poor (route/attempt expensive-fanout :float {'x :float}
                             {:abstract-machine {:ridge {:float 2.0}}})
@@ -590,7 +619,7 @@
         algorithm (:algorithm map-equation)]
     (is (= :typed-soac (:dialect program)))
     (is (= [:binding 'n] (:site scalar-equation)))
-    (is (= '(clojure.core/alength x)
+    (is (= '(clojure.core/long (clojure.core/alength x))
            (:source scalar-equation)))
     (is (= 'n (dialect/operation-extent (first (dialect/equations algorithm)))))
     (is (= :double (get-in (dialect/facts algorithm) [:values 'x :dtype])))
@@ -640,7 +669,7 @@
     (is (:typed-validated stats))
     (is (= 1 (:vertical stats)))
     (is (= ['scalar 'scalar 'map 'scalar 'scalar 'map] equation-kinds))
-    (is (= 'rows (get-in program [:equations 4 :source]))
+    (is (= '(clojure.core/long rows) (get-in program [:equations 4 :source]))
         "alength of the produced activation is value-numbered to its certified extent")
     (is (not-any? #{'raster.par/reduce} (mapcat flatten scheduled-lambdas))
         "nested source reductions are represented by typed scalar Fold terms")

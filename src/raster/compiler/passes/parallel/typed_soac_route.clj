@@ -138,10 +138,17 @@
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results})))
             result (first results)
-            source (materialize-region region-locals (first bodies))]
+            result-dtype (:dtype (get values result))
+            ;; The shared dtype vocabulary rejects storage-only/unknown JVM scalar types.
+            scalar-tag (dtype/scalar-tag-for-dtype result-dtype)
+            source (materialize-region
+                    region-locals
+                    (typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))]
         {:equation-id equation-id
          :placement placement
-         :pairs [[result source]]
+         ;; The explicit conversion carries the JVM initializer type. Clojure rejects an
+         ;; additional primitive :tag on that binding; retain Raster's independent type facts.
+         :pairs [[(vary-meta result dissoc :tag) source]]
          :site [:binding result]
          :source source})
 

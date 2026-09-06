@@ -967,8 +967,8 @@
                            (with-meta value (merge (meta value)
                                                   {:tag tag :raster.type/tag tag}))
                            value))
-          extent (typed-symbol (descriptor/unwrap-int-cast n) 'int)
-          base (typed-symbol (descriptor/unwrap-int-cast base-seed) 'long)
+          extent (typed-symbol n 'int)
+          base (typed-symbol base-seed 'long)
           index (with-meta (clojure.core/symbol (str "rstr_rng_index_" id))
                   {:tag 'long :raster.type/tag 'long})
           local (fn [name]
@@ -1601,6 +1601,28 @@
 
         :else nil))))
 
+(defn- normalize-fixed-scalar-inputs
+  "Expose source-signature conversions as ordinary host scalar equations, in evaluation order.
+   In particular, a captured `(int seed)` must not be erased merely because the primitive then
+   consumes a long. Known, correctly typed scalar ids need no new equation on re-entry."
+  [state expression inputs]
+  (reduce
+   (fn [[state expression] [position scalar-dtype]]
+     (let [operand (normalize-scalar-casts (nth expression position) (:local-scalar-types state))
+           operand-dtype (retained-scalar-dtype operand (:local-scalar-types state))
+           tag (dtype/scalar-tag-for-dtype scalar-dtype)]
+       (if (and (symbol? operand) (= scalar-dtype operand-dtype))
+         [state (with-meta (apply list (assoc (vec expression) position operand)) (meta expression))]
+         (let [id (with-meta (gensym "rstr_scalar_input_") {:tag tag :raster.type/tag tag})
+               conversion (if (= scalar-dtype operand-dtype)
+                            operand
+                            (list (symbol "clojure.core" (name tag)) operand))]
+           [(-> state
+                (update :normalized conj [id conversion])
+                (assoc-in [:local-scalar-types id] scalar-dtype))
+            (with-meta (apply list (assoc (vec expression) position id)) (meta expression))]))))
+   [state expression] inputs))
+
 (defn- normalize-source*
   [source scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
@@ -1618,7 +1640,13 @@
                          local-scalar-types]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [expression (->> expression
+               (let [[state expression] (if (par/par-rng-fill-form? expression)
+                                          ;; rng-fill! evaluates its int count before its long seed.
+                                          (normalize-fixed-scalar-inputs state expression
+                                                                         [[2 :int] [3 :long]])
+                                          [state expression])
+                     local-scalar-types (:local-scalar-types state)
+                     expression (->> expression
                                      (canonicalize-strided-indexed-operation ordinal)
                                      (canonicalize-blas-gemm ordinal))
                      ;; Host scalar identities: a binding that renames a scalar, or recomputes
@@ -1944,7 +1972,7 @@
                    (filter symbol? (take-nth 2 (second source))))
          tagged (fn [kind?]
                   (set (filter #(kind? (types/sym-type-tag %)) binders)))]
-     (binding [util/*shadowing-locals* (source-shadowing-locals source)
+     (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
                *declared-kinds*
                {:arrays (into (set (keys array-types))
                               (tagged #(some? (dtype/dtype-for-array-tag %))))

@@ -214,6 +214,37 @@
       (is (thrown? ArithmeticException (execute submit! n nil nil nil))))
     (is (zero? @submissions) "the retained checked conversion runs before any kernel call")))
 
+(deftest an-uncertified-direct-map-leaf-does-not-reschedule-recursively
+  (let [attempts (atom 0)]
+    (with-redefs [segop-lower/schedule-single-program (fn [& _] (swap! attempts inc) {})]
+      (is (= :unscheduled-map-leaf
+             (try (opencl-pass/opencl-pass '(raster.par/rng-fill! seeds n seed)
+                                           :dtype :long :array-types {'seeds :long}
+                                           :scalar-types {'n :int 'seed :long})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (= 1 @attempts)))))
+
+(deftest inactive-rng-leaves-do-not-evaluate-capture-checks
+  (let [emitted (opencl-pass/opencl-pass
+                 '(if enabled (raster.par/rng-fill! seeds n (int seed)) nil)
+                 :min-elements 0 :dtype :long :array-types {'seeds :long}
+                 :scalar-types {'enabled :boolean 'n :long 'seed :long})
+        host-form (walk/postwalk
+                   #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                   (walk/postwalk-replace
+                    {'raster.gpu.ze-runtime/invoke-registered-kernel 'submit!} (:form emitted)))
+        execute (eval (list 'fn '[submit! enabled seeds n seed] host-form))
+        calls (atom 0)
+        submit! (fn [_ _ output _ _] (swap! calls inc) output)
+        output (long-array 3)]
+    (is (nil? (execute submit! false nil nil nil)))
+    (is (thrown? ArithmeticException
+                 (execute submit! true output 3 (inc (long Integer/MAX_VALUE)))))
+    (is (zero? @calls))
+    (is (identical? output (execute submit! true output 3 -1)))
+    (is (= 1 @calls))))
+
 (deftest inactive-host-branch-does-not-evaluate-its-checked-count
   (let [emitted (opencl-pass/opencl-pass
                  '(if enabled
@@ -250,7 +281,7 @@
                     (fn [& _] (throw (ex-info "typed program reparsed" {})))]
         (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route])
                                    (:kernels (emit program)))))
-        (is (= :unscheduled-indexed-transfer
+        (is (= :unscheduled-map-leaf
                (try (emit (assoc program :source (list 'do source))) nil
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
       (let [emitted (emit (assoc-in program [:provenance :source-dialect] :soac))]
