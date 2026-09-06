@@ -137,9 +137,15 @@
                     ;; integers around narrower intrinsic results and need separate reconciliation.
                     expected (canon-type expected)
                     retained (when (seq? expression) (retained-type expression))
-                    expected (if (and (dtype/fp-dtype? expected)
-                                      retained (dtype/fp-dtype? retained))
-                               retained expected)]
+                    operation-type (if (and (dtype/fp-dtype? expected)
+                                            retained (dtype/fp-dtype? retained))
+                                     retained expected)
+                    lowered (lower-value expression operation-type env)]
+                (if (not= operation-type expected)
+                  (cast-lowered lowered expected expression)
+                  lowered)))
+
+            (lower-value [expression expected env]
                 (cond
                   (instance? raster.compiler.ir.kernel_body.Literal expression)
                   {:operations [] :result expression
@@ -400,7 +406,7 @@
                   :else
                   (decline! :scalar-expression
                             "scalar expression has an unsupported value"
-                            {:expression expression :type (type expression)}))))]
+                            {:expression expression :type (type expression)})))]
       {:lower lower
        :lower-region
        (fn [{:keys [bindings results]} result-types binding-types env]

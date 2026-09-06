@@ -177,6 +177,9 @@ floating type must govern its arithmetic before a wider consumer converts its re
 map/fold lowerer regression exposed early promotion of a Float-tagged addition inside a Double
 addition. Lowering now respects retained expression metadata, including unary/variadic
 normalization and branch results; missing metadata still uses the owner's contextual type.
+The lowerer explicitly converts the completed floating result back to the owner's declared
+dtype, including narrowing before stores and loop yields; preserving inner precision must not
+violate those boundaries. Public softmax and heat-equation corpus checks exposed this obligation.
 Integral contexts retain their existing behavior: the public Q4 projection has widened loop carries
 around narrower dp4a result metadata. Reconciling that boundary is a separate prerequisite, not
 permission to silently change accumulator widths in this floating-precision increment.

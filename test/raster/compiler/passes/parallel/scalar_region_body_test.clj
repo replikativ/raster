@@ -43,13 +43,12 @@
              (get-in (first casts) [:expression :arguments])))
       (is (= {:rounding :exact :overflow :exact}
              (get-in (first casts) [:expression :options])))))
-  ;; A retained region result cannot silently change its declared binding type either.
-  (let [expression (with-meta '(+ a b) {:raster.type/tag 'float})]
-    (is (= :scalar-region-dtype
-           (try ((:lower-region (lowerer)) {:bindings [] :results [expression]}
-                 [:double] {} {'a :float 'b :float})
-                nil
-                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e))))))))
+  ;; Region consumers also receive an explicit conversion, not a mismatched store/yield.
+  (let [expression (with-meta '(+ a b) {:raster.type/tag 'float})
+        result ((:lower-region (lowerer)) {:bindings [] :results [expression]}
+                [:double] {} {'a :float 'b :float})]
+    (is (= [:float :double] (mapv #(get-in % [:result :type]) (:operations result))))
+    (is (= :cast (get-in result [:operations 1 :expression :op])))))
 
 (deftest retained-precision-composes-with-branches-and-predicates
   (let [inner (with-meta '(if (> a b) (+ a b) (- a b))
@@ -78,6 +77,19 @@
     (is (= :long (:type result)))
     (is (= :long (get-in loop [:results 0 :type])))
     (is (= :long (get-in loop [:operations 0 :result :type])))))
+
+(deftest retained-wide-arithmetic-converts-before-a-narrow-loop-yield
+  (let [update (with-meta '(+ acc x) {:raster.type/tag 'double})
+        expression (list 'loop '[j 0 acc 0.0]
+                         (list 'if '(< j n) (list 'recur '(inc j) update) 'acc))
+        result ((:lower (lowerer)) expression :float {'x :float 'n :long})
+        loop (last (:operations result))
+        operations (butlast (:operations loop))]
+    (is (= :float (:type result)))
+    (is (= [:double :double :double :float]
+           (mapv #(get-in % [:result :type]) operations)))
+    (is (= {:rounding :nearest-even :overflow :ieee}
+           (get-in (last operations) [:expression :options])))))
 
 (deftest shared-conversion-policy-keeps-narrowing-an-explicit-owner-decision
   (let [types [:byte :int :long :half :float :double]
