@@ -20,10 +20,13 @@ vertical. The north star remains the architectural specification.
   production selection; those obligations remain explicit.
 - Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
 - Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
+- Empty-domain kernel follow-up uses one physical group and a workgroup-uniform guard enclosing
+  every reduction operation, barrier and store. CPU differential tests execute this path and verify
+  untouched outputs. This does not implement zero-byte device allocation or graph-node elision.
 - Long-bound follow-up preserves independent row/column int or long facts through the public
   scalar ABI and widened induction. CPU differential execution includes Long dimensions and
   retained local addresses; CUDA/HIP fixtures compile the same candidate. This is still not the
-  production route, and zero-row elision and source access requirements remain open.
+  production route; source access requirements remain open, as does eventual zero-row elision.
 - Before widening public dimension support, bind concrete launch geometry to KernelBody's int
   hardware-index representation, including scheduler overrides and compatibility staging. Logical
   Long dimensions must not silently overflow group/local indices; target resource limits remain

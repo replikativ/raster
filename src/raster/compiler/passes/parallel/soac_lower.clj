@@ -935,9 +935,10 @@
         planned-grid (phase-grid :reduce device-id bound dtype)
         product-grid-info (when product? (product-grid device-id planned-grid reduction))
         grid-1 (cond-> (or (:grid product-grid-info) planned-grid)
-                 ;; Product schedules own one workgroup per segment. The scalar reduction's
-                 ;; capped width-based grid is only a workgroup-size seed, not their launch.
-                 product? (assoc :num-blocks (segop/seg-space-num-segments-expr space)))
+                 ;; Product schedules own one workgroup per segment, or one uniformly guarded
+                 ;; group for an empty domain. The scalar grid only seeds workgroup sizing.
+                 product? (assoc :num-blocks
+                                 (list 'max 1 (segop/seg-space-num-segments-expr space))))
         product-schedule
         (when product?
           (let [workgroup-size (:block-size grid-1)
