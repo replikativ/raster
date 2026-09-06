@@ -6,12 +6,16 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
 (defn- argmax-form []
@@ -41,7 +45,7 @@
    :element-binding-types {'candidate :float}
    :combine-binding-types {'left-nan :int 'right-nan :int 'better :int}})
 
-(defn typed-argmax-segred []
+(defn- typed-argmax-program [values]
   (let [tag-bindings (fn [bindings dtypes]
                        (vec (mapcat (fn [[id init]]
                                       [(with-meta id {:raster.type/tag
@@ -57,8 +61,12 @@
         program (frontend/form->program
                  (list 'let* ['effect (apply list form)] 'effect)
                  {:dtype :float :array-types {'values :float 'indices :int}
-                  :scalar-types (:scalar-types options)})]
-    (small-workgroup (first (soac-lower/lower-typed-product-reduce program :cpu:0 :dtype :float)))))
+                  :values values :scalar-types (:scalar-types options)})]
+    program))
+
+(defn typed-argmax-segred []
+  (small-workgroup
+   (first (soac-lower/lower-typed-product-reduce (typed-argmax-program {}) :cpu:0 :dtype :float))))
 
 (defn typed-local-address-segred []
   (let [segred (typed-argmax-segred)
@@ -183,3 +191,92 @@
       (is false "changed independent storage facts require a different refinement")
       (catch clojure.lang.ExceptionInfo e
         (is (= :source-refinement (:missing-rule (ex-data e))))))))
+
+(defn- graph-context [known-input? & [input-options output-options]]
+  (let [algorithm (typed-argmax-program
+                   (if known-input?
+                     {'values (av/tensor {:dtype :float :shape ['nrows 'width]})}
+                     {}))
+        ;; Model a compiler-generated typed program as well as the analyzed-source frontend,
+        ;; which already declines non-plain aget storage before this boundary.
+        algorithm (if input-options
+                    (apply list (update-in (vec algorithm) [1 :values 'values] merge input-options))
+                    algorithm)
+        algorithm (if output-options
+                    (apply list
+                           (-> (vec algorithm)
+                               (update-in [1 :values 'indices] merge output-options)
+                               (update-in [1 :values (first (nth (first (nth algorithm 2)) 2))] merge
+                                          (select-keys output-options
+                                                       [:logical-layout :representation]))))
+                    algorithm)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (route/program-envelope algorithm)
+                          {:dtype :float :target-device :cpu:0
+                           :array-types (:array-types options)
+                           :scalar-types (:scalar-types options)}))
+        equation (first (:equations scheduled))
+        {:keys [graph body]} (equation-graph/make-for-equation scheduled equation)]
+    {:algorithm (:algorithm equation) :body body :graph graph :node (first (:nodes graph))}))
+
+(deftest graph-storage-facts-are-derived-from-the-retained-program
+  (let [{:keys [algorithm body graph node]} (graph-context true)
+        derived (product/graph-options node graph algorithm body)
+        candidate (product/schedule (:operation node) derived)]
+    (is (= [(launch/product 'nrows 'width)] (get-in derived [:array-shapes 'values])))
+    (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
+    (is (false? (get-in candidate [:attributes :source-storage-certified?]))
+        "storage correspondence alone does not prove arbitrary indexed reads safe")
+    (doseq [forged [(assoc-in graph [:inputs 0 :elements] 1)
+                    (assoc-in graph [:inputs 0 :dtype] :double)]]
+      (try
+        (product/validate-against-node! candidate node forged algorithm body)
+        (is false "a graph annotation must not replace the retained storage contract")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :scheduled-equation-projection (:reason (ex-data e)))))))
+    (try
+      (product/graph-options (assoc node :id :unrelated) graph algorithm body)
+      (is false "the exact node must belong to the graph")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :graph-node (:missing-rule (ex-data e))))))))
+
+(deftest unknown-product-input-storage-is-not-assumed-dense
+  (let [{:keys [algorithm body graph node]} (graph-context false)]
+    (try
+      (product/graph-options node graph algorithm body)
+      (is false "unknown capacity cannot be replaced by rows*width for an indexed read")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :graph-input-extent (:missing-rule (ex-data e))))))))
+
+(deftest graph-capacity-is-not-an-index-safety-certificate
+  (let [{:keys [algorithm body graph node]} (graph-context true {:shape [1]})
+        candidate (product/schedule (:operation node)
+                                    (product/graph-options node graph algorithm body))]
+    ;; The source's row-major read may exceed this capacity for runtime rows/width > 1.
+    ;; Do not execute it: correspondence preserves that source, it does not prove it safe.
+    (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
+    (is (true? (get-in candidate [:attributes :candidate-only])))
+    (is (false? (get-in candidate [:attributes :source-storage-certified?])))))
+
+(deftest logical-representations-must-be-lowered-before-raw-product-storage
+  (doseq [storage-options [{:representation {:kind :quantized :scheme :q4-k}}
+                          {:logical-layout {:kind :strided :strides [2]}}]
+          input? [true false]]
+    (let [{:keys [algorithm body graph node]}
+          (if input? (graph-context true storage-options)
+              (graph-context true nil storage-options))]
+      (try
+        (product/graph-options node graph algorithm body)
+        (is false "logical element counts are not raw packed or strided storage capacities")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :graph-storage-representation (:missing-rule (ex-data e)))))))))
+
+(deftest output-capacity-needs-an-explicit-relation-to-the-written-segment-domain
+  (let [{:keys [algorithm body graph node]} (graph-context true nil {:shape [1]})
+        candidate (product/schedule (:operation node)
+                                    (product/graph-options node graph algorithm body))]
+    (try
+      (product/validate-against-node! candidate node graph algorithm body)
+      (is false "a retained but unrelated output capacity does not establish the row write contract")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :graph-output-storage (:missing-rule (ex-data e))))))))

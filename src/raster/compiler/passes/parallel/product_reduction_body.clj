@@ -16,6 +16,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- decline! [rule message data]
@@ -230,3 +231,62 @@
                 "product body or contracts differ from the retained source refinement"
                 {:source (:id source)})))
   candidate)
+
+(defn graph-options
+  "Derive candidate storage/type facts from an exact retained graph projection.
+
+   Unknown input capacities are not dense-access evidence. This deliberately declines them,
+   rather than inventing rows*width for arbitrary indexed reads. Shapes describe flat physical
+   storage; this is not an index-bounds proof."
+  [node kernel-graph algorithm scheduled-body]
+  (equation-graph/validate-projection! kernel-graph algorithm scheduled-body)
+  (when-not (some #(= node %) (:nodes kernel-graph))
+    (decline! :graph-node "product node must belong to its exact retained graph" {}))
+  (let [source (:operation node)
+        _ (doseq [id (set/union (set (:inputs source)) (set (:outputs source)))]
+            (let [value (get-in scheduled-body [:values id])]
+              (when-not (and (= {:kind :plain} (:representation value))
+                             (nil? (:logical-layout value)))
+                (decline! :graph-storage-representation
+                          "product raw pointers require plain storage with no unlowered layout"
+                          {:value id :representation (:representation value)
+                           :logical-layout (:logical-layout value)}))))
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))
+        array-shapes
+        (into {}
+              (map (fn [id]
+                     (let [elements (:elements (get buffers id))
+                           references (launch/expression-references elements)]
+                       (when (or (nil? elements) (some seq? references))
+                         (decline! :graph-input-extent
+                                   "product graph input requires a known storage extent"
+                                   {:input id :elements elements}))
+                       [id [elements]])))
+              (:inputs source))]
+    {:array-types (into {} (map (juxt :id :dtype)) (vals buffers))
+     :array-shapes array-shapes
+     :scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))}))
+
+(defn validate-against-node!
+  "Close source/body/graph storage correspondence, not arbitrary source index safety.
+
+   Production admission still requires access legality and runtime capacity checks. In particular,
+   this does not promote candidate-only or source-storage-certified attributes."
+  [candidate node kernel-graph algorithm scheduled-body]
+  (let [options (graph-options node kernel-graph algorithm scheduled-body)
+        candidate (scheduled/validate-against-node! candidate node kernel-graph)
+        source (:operation node)
+        rows (segop/seg-space-num-segments-expr (:space source))
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))]
+    (doseq [{:keys [result dtype]} (get-in source [:reduction :components]) :when result]
+      (let [buffer (get buffers result)]
+        ;; The initial certificate requires exact equality, not an unproved capacity inequality.
+        (when-not (and (= rows (:elements buffer)) (= dtype (:dtype buffer)))
+          (decline! :graph-output-storage
+                    "product output must retain the exact segment extent and component dtype"
+                    {:output result :rows rows :dtype dtype :buffer buffer}))))
+    (validate-source! candidate source options)))
