@@ -93,7 +93,7 @@
                                                   :target-device :ze:0 :dtype :float))]
     (is (= 1 (count kernels)))
     (is (= '[[positions :input :int] [x :input :float] [out :output :float]
-             [head-dim :scalar :int] [heads :scalar :int] [theta :scalar :float]
+             [head-dim :scalar :long] [heads :scalar :long] [theta :scalar :float]
              [_n_bound :scalar :long]]
            (mapv (juxt :name :kind :dtype) (:abi (first kernels))))
         "KernelBody orders inputs, outputs, then scalars; row count is specialized out"))

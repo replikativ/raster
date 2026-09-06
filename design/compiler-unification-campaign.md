@@ -133,6 +133,15 @@ equations. Existing source-oracle assertions remain test-only. CPU OpenCL checks
 output identity, gather overwrite and repeated-index scatter accumulation into nonzero storage;
 this is correctness evidence, not an accelerator performance measurement.
 
+Active-ID retirement uncovered a shared source/ABI type bug: `derive-param-types` narrowed every
+declared Long to int before TypedSOAC, including random seeds. The prerequisite now retains
+declared integral widths at every caller of that common derivation. This changes affected scalar
+ABIs; consumers must bind the emitted ABI, not assume an int slot for a Long parameter. Hardware
+group/local index types are unchanged; schedules requiring int parameters still need explicit
+checked narrowing. Public equation-first, resident and session paths are tested with 64-bit state
+and wrapping arithmetic. The active-ID prototype remains unshipped until its checked int count
+conversion is also retained; this prerequisite alone does not retire that kernel.
+
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.

@@ -11,9 +11,11 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pl]
+            [raster.compiler.equation-first :as equation-first]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
+            [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as device-probe]
             [raster.gpu.descriptor-fixture :as fixture]))
@@ -39,6 +41,45 @@
 (deftm ocl-session-negate!
   [x :- (Array float) out :- (Array float) n :- Long] :- Void
   (raster.par/map-void! i n (ra/aset out i (- (ra/aget x i)))))
+
+(deftm ocl-session-long-state
+  [out :- (Array long) state :- Long n :- Long] :- (Array long)
+  (raster.par/map! out i n long (unchecked-add state (long i))))
+
+(deftest public-compiler-entry-points-preserve-declared-long-scalars
+  (let [emitted (equation-first/compile #'ocl-session-long-state
+                                       {:target :ocl:0 :dtype :float})
+        resident (pl/compile-gpu-program #'ocl-session-long-state :ocl:0 :dtype :float)
+        scalar-dtypes #(mapv :dtype (filter (fn [slot] (= :scalar (:kind slot))) (:abi %)))]
+    (is (= [[:long :long]] (mapv scalar-dtypes (:kernels emitted))))
+    (is (= {:kernel-body 1}
+           (get-in (pl/compile-report #'ocl-session-long-state
+                                      :target-device :ocl:0 :dtype :float)
+                   [:emission :routes])))
+    (is (= [:map] (mapv :convention (:steps resident))))))
+
+(deftest ocl-session-long-scalars-survive-session-and-resident-binding
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "declared Long scalar state")
+    (let [s (gpu/make-session :ocl:0)]
+      (try
+        (let [artifacts (gpu/compile! s :long-state #'ocl-session-long-state
+                                      {:dtype :float :min-elements 0})
+              invoke! (requiring-resolve 'raster.gpu.ocl-runtime/invoke-registered-kernel)
+              descriptor (pl/compile-gpu-program #'ocl-session-long-state :ocl:0 :dtype :float)
+              out (long-array 3)]
+          (is (= [[:long :long :long]] (mapv #(mapv :dtype (:abi %)) artifacts)))
+          (gpu/alloc! s {:state [:long 3 nil]})
+          (doseq [state [4294967297 Long/MIN_VALUE Long/MAX_VALUE]]
+            (let [expected (mapv #(unchecked-add (long state) (long %)) (range 3))]
+              (invoke! (:kernel-name (first artifacts)) [] (gpu/buffer s :state)
+                       [{:type :long :value state}] 3)
+              (is (= expected (vec (gpu/download s :state))))
+              (let [program (fixture/instantiate! s descriptor [out state 3])]
+                (try
+                  (is (= expected (vec (get (fixture/run! program [out state 3]) 'out))))
+                  (finally (fixture/close! program)))))))
+        (finally (gpu/close-session! s))))))
 
 (deftest scale-clamp-exp-uses-the-common-scalar-body
   (let [report (pl/compile-report #'ops/scale-clamp-exp
@@ -239,7 +280,7 @@
         ;; mixed byte/int/float storage lowers through the verified KernelBody: the int8 store
         ;; is a stated narrowing cast, not a source spelling the SegMap generator reparses
         (is (= :kernel-body (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
-        (is (= [:byte :float :int :float :int]
+        (is (= [:byte :float :int :float :long]
                (mapv :dtype (get-in descriptor [:steps 0 :abi]))))
         (let [program (fixture/instantiate! session descriptor [x q y labels n]
                                             {'x :input 'q :input
@@ -477,6 +518,23 @@
           result (execute state (float 3.0) n)]
       (is (identical? state result))
       (is (= (float (* 3.0 513.0)) (aget state 512))))))
+
+(deftest ocl-resident-contraction-binds-public-long-dimensions
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "public Long contraction dimensions")
+    (let [descriptor (pl/compile-gpu-program #'nn/linear-nb :ocl:0 :dtype :float
+                                            :gemm-precision :f32-scalar)
+          x (float-array [1 2 3 4 5 6])
+          weights (float-array [1 0 0 0 1 1])
+          arguments [x weights (long 2) (long 3) (long 2)]
+          s (gpu/make-session :ocl:0)]
+      (try
+        (let [program (fixture/instantiate! s descriptor arguments)]
+          (try
+            (is (= [1.0 5.0 4.0 11.0]
+                   (vec (get (fixture/run! program arguments) (:result-sym descriptor)))))
+            (finally (fixture/close! program))))
+        (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-contraction-roundtrip
   (if-not @device-probe/opencl-available?

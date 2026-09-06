@@ -157,7 +157,7 @@
       (is (= :kernel-body (get-in step [:artifact :provenance :dialect])))
       (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
       (is (= '[indices src out width _n_bound] (mapv :name (:abi step))))
-      (is (= [:int :float :float :int :long] (mapv :dtype (:abi step))))
+      (is (= [:int :float :float :long :long] (mapv :dtype (:abi step))))
       (is (= 'rstr_extent_0 (last (get-in step [:artifact :arguments])))
           "the schedule names the typed scalar extent instead of embedding host code")
       (is (= 15 ((:value-fn (last (:argument-specs step)))

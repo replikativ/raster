@@ -141,8 +141,10 @@
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
   (the typed-dispatch system already knows these — we read them instead of letting the emitter
-  guess from parameter names). Scalar params: long/int→:int, floating scalars specialize to the
-  selected kernel dtype. Array params: the tag's element dtype, with float-family (float/double)
+  guess from parameter names). Scalar params retain their declared integral width; floating
+  scalars specialize to the selected kernel dtype. Physical narrowing belongs to a scheduled
+  ABI conversion with a range check, not source type derivation.
+  Array params: the tag's element dtype, with float-family (float/double)
   mapped to the KERNEL dtype (a single-precision kernel reads float buffers regardless of a
   parametric (All [T]) param's default).
   Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
@@ -151,7 +153,8 @@
   (when (and params tags)
     {:scalar-types (into {} (keep (fn [[p t]]
                                     (case (dtype/dtype-for-scalar-tag t)
-                                      (:long :int) [p :int]
+                                      :long [p :long]
+                                      :int [p :int]
                                       (:double :float) [p dtype]
                                       nil))
                                   (map vector params tags)))

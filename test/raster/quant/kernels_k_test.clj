@@ -216,11 +216,11 @@
     (is (= 2 (count quant-kernels)) "Q8_K remains an ordered two-phase reduction")
     (is (= '[[[submax :float] [x :float] [_n_bound :int]]
              [[bsums :int] [submax :float] [x :float] [xp :int]
-              [xs :float] [in :int] [_n_bound :int]]]
+              [xs :float] [in :long] [_n_bound :int]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) quant-kernels)))
-    (is (= '[[[submax :float] [x :float] [padded-in :int] [width :int] [_n_bound :int]]
+    (is (= '[[[submax :float] [x :float] [padded-in :long] [width :long] [_n_bound :int]]
              [[bsums :int] [submax :float] [x :float] [xp :int] [xs :float]
-              [padded-in :int] [width :int] [_n_bound :int]]]
+              [padded-in :long] [width :long] [_n_bound :int]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) padded-kernels))
         "the adapter changes layout indexing without changing the two-phase Q8_K representation")
     (is (every? #(re-find #"col\).*<.*width" (:source %)) padded-kernels)
@@ -239,7 +239,7 @@
         "the scheduled SegMap is preserved through OpenCL emission")
     (is (= '[[aq :byte] [bq :byte] [bsums :int] [da :float] [db :float]
              [wp :int] [xp :int] [xs :float] [y :float]
-             [in :int] [out :int] [_n_bound :long]]
+             [in :long] [out :long] [_n_bound :long]]
            (mapv (juxt :name :dtype) (:abi (first projection-kernels)))))
     (is (re-find #"rstr_dp4a" (:source (first projection-kernels)))
         "Q4_K row projection reaches the target-neutral integer-dot intrinsic")
@@ -266,10 +266,10 @@
             :backend-reused 1 :backend-relowered 0 :fallback 0}
            (:lowering i8-report)))
     (is (= '[[[bsums :int] [ds :float] [sc :byte] [wp :int] [xp :int]
-              [xs :float] [y :float] [in :int] [_n_bound :int]]]
+              [xs :float] [y :float] [in :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels q6-pipeline))))
     (is (= '[[[wp :int] [ws :float] [xp :int] [xs :float] [y :float]
-              [in :int] [out :int] [_n_bound :long]]]
+              [in :long] [out :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels i8-pipeline))))
     (is (every? #(re-find #"rstr_dp4a" (:source %))
                 (concat (:kernels q6-pipeline) (:kernels i8-pipeline)))
