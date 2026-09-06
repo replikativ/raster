@@ -429,15 +429,7 @@
   [segred & {:keys [kernel-name-prefix scalar-types array-types]
              :or {kernel-name-prefix "product_reduce" scalar-types {} array-types {}}}]
   (let [operator (reduction/validate! (:reduction segred))
-        schedule (reduction/validate-schedule! (:schedule segred))
-        _ (when-not (= :segmented-workgroup-tree (:strategy schedule))
-            (throw (ex-info "product reduction schedule has no OpenCL lowering"
-                            {:reason :product-reduction-schedule-not-emittable
-                             :strategy (:strategy schedule)})))
-        _ (when-not (true? (get-in operator [:algebra :associative?]))
-            (throw (ex-info "parallel product schedule requires an explicit associative algebra"
-                            {:reason :product-reduction-not-associative
-                             :algebra (:algebra operator)})))
+        schedule (reduction/validate-product-tree! operator (:schedule segred))
         components (:components operator)
         element (reduction/element-region operator)
         combine (reduction/combine-region operator)
