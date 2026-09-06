@@ -1004,6 +1004,7 @@
      :epilogue-scalars epilogue-scalars
      :output output
      :kernel-body kernel-body
+     :emission-route :kernel-body
      :launch (:launch kernel-body)}))
 
 (defn generate-contraction-kernel-artifact

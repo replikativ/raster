@@ -1,5 +1,8 @@
 (ns raster.compiler.backend.gpu.hip-compile-gate-test
-  "The HIP/CUDA COMPILE-GATE — the validation-ladder bottom rung (.internal/cuda_hip_plan.md §65).
+  "Historical source-oracle compile checks. Production CUDA/HIP gates compile the public
+   equation-first KernelBody fixtures in kernel-body-compile-fixtures instead.
+
+   Original HIP/CUDA COMPILE-GATE — the validation-ladder bottom rung (.internal/cuda_hip_plan.md §65).
 
    Proves raster's portable elementwise kernels (emitted by par_hip, body = the shared c-emit)
    are LEGAL CUDA-C and HIP by running them through nvcc and hipcc — pure host compilers, NO
@@ -13,7 +16,7 @@
             [clojure.java.shell :as sh]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [raster.compiler.backend.gpu.par-hip :as hip]))
+            [raster.compiler.reference.elementwise-cuda :as hip]))
 
 ;; ── compiler probes ──────────────────────────────────────────────────────────────
 (defn- on-path? [bin]

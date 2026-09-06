@@ -4,11 +4,11 @@ Authorized scope: complete the four stages below in order. Each production migra
 its numerical, ABI, ownership and resource contracts; isolated emitter coverage is not a completed
 vertical. The north star remains the architectural specification.
 
-## 1. Close product reduction production lowering — active
+## 1. Close product reduction production lowering — landed for the dense row subset
 
 - Landed #382: shared typed multi-result scalar-region lowering.
 - Landed #383: candidate row-product KernelBody, CPU OpenCL differential execution, CUDA/HIP
-  compilation. Production still uses the retained source emitter.
+  compilation. At that stage production still used the retained source emitter.
 - Landed #384: preserve TypedSOAC local dtypes through SegRed and subsequent
   scalar/index lowering; compare both direct and local-address candidates on CPU OpenCL.
 - Landed #385: align the retained product KernelGrid with the segment-count launch,
@@ -58,7 +58,7 @@ vertical. The north star remains the architectural specification.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 
-## 2. Retire the remaining compatibility paths — queued
+## 2. Retire the remaining compatibility paths — active
 
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
@@ -68,7 +68,7 @@ before treating a definition as live or dead:
 | 1 | General contraction fallback in `contract_route` / `segop_opencl` | General/scientific contractions, exact decline inventory |
 | 2 | Unscheduled effect maps in `opencl_pass` / `par_opencl` | Resident mutation, aliasing, nil/buffer returns |
 | 3 | Strided scatter/gather source emission | Block transfers, collision and view contracts |
-| 4 | Active-ID compaction | ABM firms, stable output order and count/capacity |
+| 4 | Seeded active-ID generation | ABM firms, stable order and count/capacity; not general predicate compaction |
 | 5 | Compound-local algorithm emission | Structured loop dependencies, storage and barriers |
 | 6 | Staged/quantized contractions | Decode/lift algebra, typed accumulators and overflow |
 
@@ -95,6 +95,36 @@ zero-origin SOAC recognition is unchanged. New nonzero coverage requires direct 
 binding-slot updates, one loop body and no narrowing induction test. Public GQA fan-in, group-one
 signed-zero preservation and cancellation-sensitive accumulation are checked on CPU OpenCL.
 This does not authorize reassociation or arbitrary symbolic/negative loop origins.
+
+Coverage reporting now retains the normalized emission routes and decline details from each
+existing corpus compilation. TypedSOAC frontend coverage alone cannot distinguish generated
+KernelBody from a compatibility emitter. Aggregate counts explicitly describe emitted artifacts,
+including dispatch alternatives, not executed launches. The portable baseline remains unchanged;
+target-specific route evidence stays in the report and CI output. No extra compile is required.
+
+Static caller audit found the old `par-hip` elementwise source emitter referenced only by its
+historical compile-gate test, not by any production routing path. It is moved to the test-only
+`reference.elementwise-cuda` namespace with the algorithm unchanged. Historical ABI/math compile
+checks remain; mandatory CUDA/HIP CI continues to compile public equation-first KernelBody
+fixtures. This removes a misleading second production emitter, not a supported runtime target.
+
+The next caller audit distinguishes a remaining source edge from demonstrated runtime reachability:
+
+| Boundary | Retained owner / consumer | Current evidence |
+|---|---|---|
+| General contractions | `generate-segmented-reduce-kernel` → `contract_route` | Nested gather selects the source fallback after `:operand-layout` decline. |
+| Unscheduled effects | `generate-par-map-void-kernel` → `opencl_pass` | Raw/unbound effect fallback still present. |
+| Strided transfers | `par_opencl` stride emitters → `opencl_pass` | Bare gather/scatter probes already take typed mini-programs; remaining source edges need retirement proof. |
+| Active IDs | `generate-par-active-ids-kernel` → `opencl_pass` | ABM firms uses seeded agent indices, not arbitrary visibility compaction. |
+| Compound local | `generate-compound-local-kernel` → `opencl_pass` | Compatibility markers remain; structured typed programs bypass detection. |
+| Staged/quantized contractions | `generate-staged-contraction-kernel` → `contract_route` | Device-tested staged/lift/quantized source assembly remains. |
+| JVM SIMD / scalar | `pipeline` → `par_simd` or source expansion | Bound SegOps coexist with traversal of the retained source projection. |
+| CPU C/SIMD | `cpu/aot` → `cpu/csimd` | Bound SegOps preferred; compatibility reconstruction and distinct vector emission remain. |
+
+Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
+handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
+provenance as the emission route. The follow-up propagates the actual emitter's route through
+the adapter; semantic provenance remains separate. No schedule or precision changes.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring

@@ -109,7 +109,7 @@
             :dtype dtype
             :out-dtype out-dtype}
            (select-keys descriptor [:fallback-reason :declines :tile :tensorized :packed
-                                    :fused-epilogue :dims :stages :kernel-body]))}))
+                                    :fused-epilogue :dims :stages :kernel-body :emission-route]))}))
 
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
@@ -567,6 +567,7 @@
                 workgroup-size (or (:workgroup-size portable) 256)]
             (cond->
              {:strategy (if (:ok portable) :portable-segred :naive-segred)
+              :emission-route (if emitted (:emission-route emitted) :verified-segmented-opencl)
               :declines declines
               :kernel-name kernel-name :source source :array-params array-params :abi abi
               :epilogue-operands epilogue-operands
