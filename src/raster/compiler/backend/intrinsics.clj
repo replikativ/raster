@@ -234,7 +234,8 @@
   #{:bit-and :bit-or :bit-xor :shl :shr :ushr :rem :mod :quot :wi8-dot :dp4a})
 
 (def ^:private floating-ops
-  #{:sqrt :floor :ceil :trunc :round :sin :cos :tan :exp :log :pow :fma
+  ;; Integral negation is 0-x with an explicit overflow contract, never a bare C prefix.
+  #{:neg :sqrt :floor :ceil :trunc :round :sin :cos :tan :exp :log :pow :fma
     :asin :acos :atan :atan2 :sinh :cosh :tanh :asinh :acosh :atanh :cbrt
     :log2 :log10 :exp2 :exp10 :expm1 :log1p :hypot :deg2rad :rad2deg
     :copysign :flipsign})

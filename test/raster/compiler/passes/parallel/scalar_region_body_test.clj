@@ -47,6 +47,17 @@
             (is (string? (emit/emit-scalar-kernel "unary_minus" kernel
                                                 {:target-dialect target})))))))))
 
+(deftest integer-prefix-negation-cannot-bypass-the-overflow-contract
+  (doseq [type [:byte :int :long]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (body/make
+                  {:id :invalid-integer-prefix
+                   :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :parameter)]
+                   :operations [(body/->ScalarCompute (body/value 'negative type)
+                                                      (body/scalar-expression :neg type ['a]))]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                   :provenance {:dialect :test} :attributes {}})))))
+
 (deftest coupled-results-share-bindings-without-sharing-component-types
   (let [{:keys [operations results types] :as lowered} (mixed-region (lowerer))
         kernel
