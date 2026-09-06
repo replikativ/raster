@@ -193,7 +193,15 @@ comparisons, proves load coordinates through the existing owner callback, and ch
 accumulator dtype. The shared builder accepts explicit owner conversion and masked-load policies;
 map/fold defaults are unchanged. This serves existing scalar reductions and portable contractions,
 without adding indirect-access admission or retiring their remaining source fallbacks. Result
-transform lowering and deterministic SSA-name hygiene remain separate consolidation work.
+transform lowering remains separate consolidation work.
+
+The shared scalar builder now reserves source, parameter and owner-scope identities before fresh
+SSA allocation, including future local binders. Map and reduction fragment callers seed their
+complete source region; generated coordinate names are reserved when the fragment arrives.
+Reduction fragments pass only their typed child environment instead of all earlier SSA values,
+and seeded calls do not repeatedly scan growing environments. Names remain deterministic, and
+KernelBody's duplicate-identity validator remains intact. This closes the demonstrated scalar
+capture cases; it is not a claim about every other schedule's allocator or target identifier mangling.
 
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved

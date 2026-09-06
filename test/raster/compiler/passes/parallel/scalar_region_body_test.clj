@@ -25,6 +25,58 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest scalar-ssa-identities-do-not-capture-source-values
+  (let [result (segred/lower-element-operations
+                (with-meta '(+ (aget x i) element-load-1) {:raster.type/tag 'float})
+                {:dtype :float :index 'i :coordinate 'i :arrays #{'x}
+                 :array-types {'x :float} :scalars #{'element-load-1}
+                 :scalar-types {'element-load-1 :float}})
+        [load add] (:operations result)]
+    (is (not= 'element-load-1 (get-in load [:result :id])))
+    (is (= [(get-in load [:result :id]) 'element-load-1]
+           (get-in add [:expression :arguments]))))
+  (let [result ((:lower (lowerer)) '(+ scalar-load-1 (aget x i)) :float
+                {'scalar-load-1 :float})
+        [load add] (:operations result)]
+    (is (not= 'scalar-load-1 (get-in load [:result :id])))
+    (is (= ['scalar-load-1 (get-in load [:result :id])]
+           (get-in add [:expression :arguments]))))
+  (let [result ((:cast (lowerer)) {:operations [] :result 'scalar-cast-1 :type :float}
+                :double nil)]
+    (is (not= 'scalar-cast-1 (:result result)))
+    (is (= ['scalar-cast-1] (get-in result [:operations 0 :expression :arguments])))))
+
+(deftest scalar-region-reserves-later-binders-before-emission
+  (let [region '{:bindings [first-value (+ a b) scalar-value-1 (+ first-value c)]
+                 :results [(+ first-value scalar-value-1)]}
+        lower-region #((:lower-region (lowerer)) region [:float]
+                        {'first-value :float 'scalar-value-1 :float}
+                        {'a :float 'b :float 'c :float})
+        result (lower-region)
+        ids (mapv #(get-in % [:result :id]) (:operations result))]
+    (is (not-any? #{'scalar-value-1} ids))
+    (is (= (count ids) (count (set ids))))
+    (is (= [(first ids) (second ids)]
+           (get-in result [:operations 2 :expression :arguments])))
+    (is (= result (lower-region)) "fresh IDs remain deterministic for the same input")))
+
+(deftest seeded-fragments-do-not-rescan-a-growing-environment
+  (let [builder (scalar/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {'a :float}
+                  :source-region '(+ a a) :lower-index (fn [x _] x)
+                  :decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))})
+        scans (atom 0)
+        original-keys keys]
+    (with-redefs [clojure.core/keys
+                  (fn [m]
+                    (when (:tracked-environment (meta m)) (swap! scans inc))
+                    (original-keys m))]
+      (loop [n 32 env (with-meta {'a :float} {:tracked-environment true}) previous 'a]
+        (when (pos? n)
+          (let [result ((:lower builder) (list '+ previous 'a) :float env)]
+            (recur (dec n) (assoc env (:result result) :float) (:result result))))))
+    (is (zero? @scans))))
+
 (deftest nested-arithmetic-retains-precision-before-consumer-promotion
   (doseq [tag-key [:raster.type/tag :tag]
           expression ['(+ a b) '(inc a) '(dec a) '(- a) '(+ a b a)]]
