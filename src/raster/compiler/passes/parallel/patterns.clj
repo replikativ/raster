@@ -776,6 +776,15 @@
   [loop-form]
   (match-reduce-loop* loop-form normalize-loop))
 
+(defn ordered-unit-step?
+  "A long induction step may widen explicitly, but must not erase a narrowing conversion."
+  [expression index]
+  (and (= 1 (descriptor/affine-step expression index))
+       (not-any? #(and (seq? %)
+                       (contains? '#{int clojure.core/int}
+                                  (descriptor/semantic-op %)))
+                 (tree-seq coll? seq expression))))
+
 (defn match-ordered-reduce-loop
   "Match an ordered scalar reduction and retain its literal induction origin."
   [loop-form]
@@ -784,8 +793,8 @@
           recur-args (vec (rest (:recur-form matched)))]
       (when (and (:scoped-update-expr matched)
                  (= 2 (count recur-args))
-                 (= 1 (descriptor/affine-step
-                       (nth recur-args (:index-slot normalized)) (:index-sym matched))))
+                 (ordered-unit-step? (nth recur-args (:index-slot normalized))
+                                     (:index-sym matched)))
         matched))))
 
 (defn match-binary-reduce-loop

@@ -59,7 +59,7 @@
                :else [nil nil])]
          (when (and update-expr index-update
                     (= 'recur (first then-branch))
-                    (= 1 (descriptor/affine-step (nth recur-args index-slot) index-sym)))
+                    (patterns/ordered-unit-step? (nth recur-args index-slot) index-sym))
            {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym :index-init index-init
             :bound-expr bound :else-expr else-expr :update-expr update-expr
             :inclusive? true}))))))

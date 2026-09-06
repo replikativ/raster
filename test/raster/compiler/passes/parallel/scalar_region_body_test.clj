@@ -85,6 +85,8 @@
                    (if (< r n) (do (aset out 0 7.0) (recur (inc r) (+ acc 1.0))) acc))
                 '(loop [r 2147483648 acc 0.0]
                    (if (< (int r) n) (recur (inc r) (+ acc 1.0)) acc))
+                '(loop [r 2147483648 acc 0.0]
+                   (if (< r n) (recur (inc (int r)) (+ acc 1.0)) acc))
                 '(loop [r 1 r 0.0] (if (< r n) (recur (inc r) r) r))]]
     (is (nil? (patterns/match-ordered-reduce-loop form))))
   (is (= 1 (:index-init
