@@ -384,6 +384,21 @@
        ;; validator that needs them must receive and revalidate that exact program slice.
        :attributes attributes}))))
 
+(defn validate-projection!
+  "Require the exact graph projection of an independently retained algorithm and scheduled body.
+   Descriptive graph context is preserved, but cannot supply storage or scalar definitions."
+  [kernel-graph algorithm scheduled-body]
+  (when-not (and algorithm scheduled-body)
+    (fail! :scheduled-equation-projection-context
+           "graph projection requires both retained algorithm and scheduled body" {}))
+  (let [expected (make algorithm scheduled-body
+                       (select-keys kernel-graph [:effects :provenance :attributes]))]
+    (when-not (= expected kernel-graph)
+      (fail! :scheduled-equation-projection
+             "graph differs from its retained algorithm and scheduled body"
+             {:expected expected :actual kernel-graph})))
+  kernel-graph)
+
 (defn make-for-equation
   "Derive the exact scheduled KernelGraph for one TypedSOAC numerical equation.
 

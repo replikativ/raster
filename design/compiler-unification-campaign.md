@@ -14,6 +14,10 @@ vertical. The north star remains the architectural specification.
 - Source closure follow-up: align the retained product KernelGrid with the segment-count launch,
   validate scratch/workgroup agreement, and replay the body refinement against the retained source.
 - Certify the exact semantic source, storage boundaries and public bindings against the graph.
+- Graph correspondence follow-up derives product pointer contracts from the exact retained
+  scheduled-equation projection, shared with fold-map. Unknown capacities and unlowered storage
+  representations decline. This does not prove arbitrary indexed accesses in bounds or enable
+  production selection; those obligations remain explicit.
 - Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
 - Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
 - Select the certified body and delete the old product algorithm emitter once its coverage is

@@ -416,20 +416,8 @@
     {}
     (let [host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
                                        (:equations closed-body)))]
-      (let [;; `make` revalidates the complete SegOp program, the retained TypedSOAC boundary,
-            ;; every buffer extent, and graph dataflow. Preserve only descriptive graph context
-            ;; while reconstructing; it cannot contribute a scalar definition.
-            expected-graph
-            (equation-graph/make
-             closed-algorithm closed-body
-             {:effects (:effects kernel-graph)
-              :provenance (:provenance kernel-graph)
-              :attributes (:attributes kernel-graph)})]
-        (when-not (= expected-graph kernel-graph)
-          (throw (ex-info "fold-map graph is not the exact projection of its retained equation body"
-                          {:reason :segfoldmap-storage-proof
-                           :expected expected-graph :actual kernel-graph})))
-        (equation-graph/derived-scalar-expressions (:values closed-body) host-prefix)))))
+      (equation-graph/validate-projection! kernel-graph closed-algorithm closed-body)
+      (equation-graph/derived-scalar-expressions (:values closed-body) host-prefix))))
 
 (defn validate-against-node!
   "Close a fold-map refinement over its exact source grid and graph storage descriptions.
