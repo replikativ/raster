@@ -8,40 +8,23 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as constant]
-            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.index-expression :as index]
-            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
-            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
+            [raster.compiler.passes.parallel.product-reduction-regions :as regions]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defn- decline! [rule message data]
   (throw (ex-info message (assoc data :reason :product-kernel-body-declined
                                  :missing-rule rule :fallback :none))))
 
-(defn- region-binding-types
-  "Read retained TypedSOAC local tags. Explicit candidate facts may fill omissions, not override."
-  [region supplied]
-  (reduce (fn [facts id]
-            (if-let [retained (some-> (types/sym-type-tag id) dtype/dtype-for-scalar-tag)]
-              (do
-                (when (and (get supplied id) (not= retained (get supplied id)))
-                  (decline! :binding-dtype-conflict
-                            "candidate binding dtype disagrees with its retained source type"
-                            {:binding id :retained retained :supplied (get supplied id)}))
-                (assoc facts id retained))
-              facts))
-          (or supplied {}) (take-nth 2 (:bindings region))))
-
 (defn lower
   "Lower one row-segmented SegRed with retained input shapes and scalar/region binding dtypes.
    Address arithmetic must already carry the long-width facts required by lower-typed."
-  [segred {:keys [array-types array-shapes scalar-types
-                 element-binding-types combine-binding-types]}]
+  [segred {:keys [array-types array-shapes scalar-types] :as options}]
   (when-not (instance? raster.compiler.ir.segop.SegRed segred)
     (decline! :source "product body requires a retained SegRed" {:source segred}))
   (let [operator (reduction/validate! (:reduction segred))
@@ -53,10 +36,6 @@
         {row :name rows :bound} (first segments)
         {column :name width :bound} (segop/seg-space-reduced-dim (:space segred))
         components (:components operator)
-        element-binding-types (region-binding-types (reduction/element-region operator)
-                                                     element-binding-types)
-        combine-binding-types (region-binding-types (reduction/combine-region operator)
-                                                     combine-binding-types)
         types (mapv :dtype components)
         wg (:workgroup-size source-schedule)
         scratch-bytes (* wg (reduce + (map dtype/bytes-of types)))
@@ -102,13 +81,7 @@
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar rows-type [] nil nil :bound)]))
-        index-types (assoc scalar-types row :int column :long)
-        lower-index (fn [expression locals]
-                      (index/lower-typed expression (set/union (set (keys index-types)) locals)
-                                         index-types :long decline!))
-        lowerer (scalar/make-lowerer
-                 {:arrays (set inputs) :array-types array-types :scalar-types scalar-types
-                  :lower-index lower-index :id-prefix "product" :decline! decline!})
+        {:keys [element combine lower-index]} (regions/lower segred options decline!)
         neutrals (mapv (fn [{:keys [neutral dtype]}]
                          (if-let [evidence (constant/value neutral)]
                            (body/literal (:value evidence) dtype)
@@ -118,18 +91,6 @@
         carries (ids "product-carry")
         lane-results (ids "product-lane-result")
         scratches (ids "product-scratch")
-        combine-region (reduction/combine-region operator)
-        combine
-        (fn [left right]
-          (let [replacements (into {} (mapcat (fn [[l r] lv rv] [[l lv] [r rv]])
-                                              (:parameters combine-region) left right))
-                region (-> combine-region
-                           (update :bindings #(util/subst-syms replacements %))
-                           (update :results #(util/subst-syms replacements %)))
-                env (into {} (concat (map vector left types) (map vector right types)))]
-            ((:lower-region lowerer) region types combine-binding-types env)))
-        element ((:lower-region lowerer) (reduction/element-region operator) types
-                 element-binding-types index-types)
         lane-update (combine carries (:results element))
         barrier #(body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
                                           (body/full-participation))
@@ -247,9 +208,9 @@
 (defn graph-options
   "Derive candidate storage/type facts from an exact retained graph projection.
 
-   Unknown input capacities are not dense-access evidence. This deliberately declines them,
-   rather than inventing rows*width for arbitrary indexed reads. Shapes describe flat physical
-   storage; this is not an index-bounds proof."
+   Unknown input capacities are not dense-access evidence. The graph may refine them from
+   actual typed loads; otherwise this declines rather than inventing rows*width. Shapes describe
+   minimum flat physical storage; this is not an independent index-bounds proof."
   [node kernel-graph algorithm scheduled-body]
   (equation-graph/validate-projection! kernel-graph algorithm scheduled-body)
   (when-not (some #(= node %) (:nodes kernel-graph))

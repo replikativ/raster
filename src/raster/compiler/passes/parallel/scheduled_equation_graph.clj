@@ -10,9 +10,11 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]))
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]))
 
 (defn- fail!
   [reason message data]
@@ -238,6 +240,37 @@
      :elements (value-elements values derived-scalars value)
      :memory-space (or (:memory-space value) :device)}))
 
+(defn- product-read-requirements
+  "Optional minimum capacities from typed product loads, never guessed from loop size alone."
+  [values operations derived-scalars]
+  (reduce
+   (fn [requirements operation]
+     (if (and (reduction/product-reduction? (:reduction operation))
+              (:element (:reduction operation))
+              (every? (fn [id]
+                        (let [value (get values id)]
+                          (and (= {:kind :plain} (:representation value))
+                               (nil? (:logical-layout value)))))
+                      (:inputs operation)))
+       (let [derived
+             (try
+               (product-regions/dense-read-requirements
+                operation
+                {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
+                 :scalar-types (into {} (keep (fn [[id v]]
+                                               (when (integral-scalar-value? v)
+                                                 [id (:dtype v)]))) values)}
+                (fn [rule message data] (fail! rule message data)))
+               ;; This is an optional refinement. Unsupported source access stays unknown;
+               ;; production admission must independently require a successful access proof.
+               (catch clojure.lang.ExceptionInfo _ nil))]
+         (reduce-kv (fn [result id extent]
+                      (update result id (fnil conj [])
+                              (launch/rebind-expression extent derived-scalars)))
+                    requirements derived))
+       requirements))
+   {} operations))
+
 (defn- algorithm-boundary?
   [equation algorithm]
   (and (= algorithm (soac/validate! algorithm))
@@ -354,6 +387,17 @@
          buffer-specs (into {}
                             (map (fn [id] [id (storage-spec values derived-scalars id)]))
                             (set/union inputs outputs temporary-ids))
+         read-requirements (product-read-requirements values operations derived-scalars)
+         buffer-specs (reduce-kv
+                       (fn [specs id requirements]
+                         (let [extents (vec (distinct
+                                             (cond-> requirements
+                                               (not (unknown-shape? (get values id)))
+                                               (conj (get-in specs [id :elements])))))
+                               required (if (= 1 (count extents)) (first extents)
+                                            (apply launch/maximum extents))]
+                           (assoc-in specs [id :elements] required)))
+                       buffer-specs read-requirements)
          ;; An aliased destination can have unknown capacity while the typed result has a
          ;; precise written extent (e.g. an exclusive scan writes n+1 elements). That semantic
          ;; extent is the required capacity, not a claim about the allocation's full size.
@@ -362,7 +406,12 @@
                          (if-let [extent (and (contains? specs id)
                                               (unknown-shape? (get values id))
                                               (required-write-extent values derived-scalars result-values))]
-                           (assoc-in specs [id :elements] extent)
+                           (assoc-in specs [id :elements]
+                                     (if (contains? read-requirements id)
+                                       (let [read-extent (get-in specs [id :elements])]
+                                         (if (= read-extent extent) extent
+                                             (launch/maximum read-extent extent)))
+                                       extent))
                            specs))
                        buffer-specs result-storage-values)
          scalars (public-scalars scheduled operations buffer-specs)]
