@@ -27,6 +27,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -34,6 +35,12 @@
             [raster.compiler.backend.gpu.par-opencl :as legacy]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
+
+(defn- unlowered-soa-effect?
+  "A logical SoA must retain its grouped pointer ABI until shared scalar replacement expands it."
+  [form]
+  (and (par/par-map-void-form? form)
+       (seq (soa-lower/collect-soa-env (:body (par/extract-par-map-void-info form))))))
 
 (defn- host-scalar-result?
   [program equation]
@@ -453,7 +460,8 @@
         direct-mini-program?
         (and (nil? supplied-program)
              (or (par/par-rng-fill-form? form)
-                 (par/par-map-void-form? form)
+                 ;; Plain-array scheduling cannot interpret a logical SoA as one tensor pointer.
+                 (and (par/par-map-void-form? form) (not (unlowered-soa-effect? form)))
                  (and (par/par-gather-form? form)
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
@@ -897,7 +905,8 @@
                                 :array-types top-array-types)
                       k (register-kernel! kernel :ze-maps)]
                     (emit-map-void-invocation k device-id))
-                  (if (and direct-mini-program? (not supplied-program))
+                  (if (and (not supplied-program)
+                           (or direct-mini-program? (unlowered-soa-effect? form)))
                     (let [kernel (legacy/generate-par-map-void-kernel
                                   form :dtype dtype :device-id device-id
                                   :array-types top-array-types :scalar-types top-scalar-types)

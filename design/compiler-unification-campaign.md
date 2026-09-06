@@ -179,6 +179,9 @@ Unscheduled raw bodies retain the existing adapter with an explicit `:compatibil
 emission route and `:effect-compatibility` count, including through nested host control. This is
 not full effect-emitter retirement: logical SoA expansion and other unsupported effect bodies still
 need their own typed closure. The independent source-emitter tests remain unchanged.
+An explicit logical-SoA guard precedes plain-array scheduling: the typed frontend can otherwise
+accept the container as one float pointer rather than decline. Bare and nested regression probes
+retain the existing per-field dtypes, names and grouped logical binding through the source adapter.
 
 ## 3. General fusion and bounded specialization — price admission active; broader work queued
 

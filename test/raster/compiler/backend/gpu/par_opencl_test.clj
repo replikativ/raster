@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.core.types :as types]
             [raster.compiler.reference.indexed-transfer-opencl :as indexed-reference]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -405,6 +406,28 @@
         (is (= 1 (get-in emitted [:stats :effect-compatibility])))
         (is (= [:compatibility-effect-opencl]
                (mapv kart/emission-route (:kernels emitted))))))))
+
+(deftest unexpanded-soa-effects-retain-their-logical-abi-group
+  (with-redefs [types/soa-registry
+                (atom {'Particle {:fields [{:name "x" :element-tag 'float :array-tag 'floats}
+                                           {:name "id" :element-tag 'int :array-tag 'ints}]}})
+                types/soa-reverse-registry (atom {'ParticleSoA 'Particle})
+                segop-lower/schedule-single-program
+                (fn [& _] (throw (ex-info "unexpanded SoA entered plain-array scheduling" {})))]
+    (doseq [wrap [identity #(list 'if 'enabled % nil)]]
+      (let [emitted (opencl-pass/opencl-pass
+                     (wrap '(raster.par/map-void! i n
+                              (aset out i (.x (aget ^ParticleSoA particles i)))))
+                     :dtype :float :min-elements 0 :array-types {'out :float}
+                     :scalar-types {'n :int 'enabled :boolean})
+            kernel (first (:kernels emitted))
+            fields (filterv #(= 'particles (:binding %)) (:abi kernel))]
+        (is (= 1 (get-in emitted [:stats :effect-compatibility])))
+        (is (= :compatibility-effect-opencl (kart/emission-route kernel)))
+        (is (= '[particles_x particles_id] (mapv :name fields)))
+        (is (= [:float :int] (mapv :dtype fields)))
+        (is (= ["x" "id"] (mapv :field fields)))
+        (is (= '[out particles] (kabi/pointer-binding-names (:abi kernel))))))))
 
 (deftest opencl-pass-fallback-test
   (testing "Small arrays fall back to scalar expansion"
