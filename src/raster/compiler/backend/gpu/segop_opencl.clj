@@ -1322,6 +1322,7 @@
      :workgroup (get-in kernel-body [:launch :workgroup-size])
      :dims dims
      :kernel-body kernel-body
+     :emission-route :kernel-body
      :epilogue-operands (mapv :name (filter #(= :input (:kind %)) epilogue-slots))
      :epilogue-scalars (mapv :name (filter #(= :scalar (:kind %)) epilogue-slots))}))
 

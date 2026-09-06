@@ -189,7 +189,7 @@ alongside retained checked-count rejection. Kernel ABI, launch count and fusion 
 Exit: representative scientific and model expressions compile with explained fusion/placement
 choices, differential correctness, and measured kernel/allocation/compile-cost changes.
 
-## 4. Measure generated production kernels and selection — queued
+## 4. Measure generated production kernels and selection — GEMM evidence active; broader ladder queued
 
 Begin with existing production canaries, not independent handwritten builders:
 
@@ -208,6 +208,14 @@ CPU results. No SOTA claim follows from successful vendor compilation alone.
 Use the measurements to shortlist legal schedules and validate selective autotuning/cache replay.
 If comparable accelerator hardware is unavailable, complete harnesses and correctness gates but
 leave accelerator competitiveness explicitly unmeasured.
+
+The GEMM canary records candidate strategy, source/ABI signature, emission routes and entry-point
+counts from its exact Prepared value, with no second compilation. These replace the parallel
+strategy/signature arrays in the opt-in report. Candidate counts are not executed launches;
+descriptor scratch counts exclude graph-owned temporaries and do not claim peak memory. The
+register-tiled emitter now reports its actual KernelBody route through the artifact adapter,
+separate from semantic contraction provenance. Host-synchronized timing remains labeled as such;
+no device-event timing or accelerator comparison is inferred from this evidence.
 
 Exit: reproducible production measurements identify wins/regressions and explain schedule choices;
 claims are limited to tested hardware and workloads. Discuss the results before stages 5–6.
