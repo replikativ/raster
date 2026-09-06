@@ -172,6 +172,20 @@ is unchanged. Exhaustive primitive conversion pairs and owner-admission checks p
 This does not unify the full scalar lowerers, change epilogue conversion labeling, or admit new
 indirect accesses; those remaining differences must be closed separately.
 
+Retained scalar precision is a prerequisite for further sharing: a nested expression's declared
+floating type must govern its arithmetic before a wider consumer converts its result. A direct
+map/fold lowerer regression exposed early promotion of a Float-tagged addition inside a Double
+addition. Lowering now respects retained expression metadata, including unary/variadic
+normalization and branch results; missing metadata still uses the owner's contextual type.
+The lowerer explicitly converts the completed floating result back to the owner's declared
+dtype, including narrowing before stores and loop yields; preserving inner precision must not
+violate those boundaries. Public softmax and heat-equation corpus checks exposed this obligation.
+Integral contexts retain their existing behavior: the public Q4 projection has widened loop carries
+around narrower dp4a result metadata. Reconciling that boundary is a separate prerequisite, not
+permission to silently change accumulator widths in this floating-precision increment.
+This is lowerer-level correctness coverage, not a demonstrated public-model miscompile or a
+new inference rule. Full source reachability and remaining owner-policy differences remain open.
+
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved
 int range. It also inherited unconditional cast erasure on seed/population captures. Passing

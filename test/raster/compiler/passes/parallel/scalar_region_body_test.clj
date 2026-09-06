@@ -25,6 +25,72 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest nested-arithmetic-retains-precision-before-consumer-promotion
+  (doseq [tag-key [:raster.type/tag :tag]
+          expression ['(+ a b) '(inc a) '(dec a) '(- a) '(+ a b a)]]
+    (let [inner (with-meta expression {tag-key 'float})
+          result ((:lower (lowerer)) (list '+ inner 'wide) :double
+                  {'a :float 'b :float 'wide :double})
+          operations (:operations result)
+          arithmetic (remove #(= :cast (get-in % [:expression :op])) operations)
+          casts (filter #(= :cast (get-in % [:expression :op])) operations)]
+      (is (= :double (:type result)))
+      (is (every? #(= :float (get-in % [:result :type])) (butlast arithmetic))
+          (str "retained inner arithmetic: " expression))
+      (is (= :double (get-in (last arithmetic) [:result :type])))
+      (is (= 1 (count casts)))
+      (is (= [(get-in (last (butlast arithmetic)) [:result :id])]
+             (get-in (first casts) [:expression :arguments])))
+      (is (= {:rounding :exact :overflow :exact}
+             (get-in (first casts) [:expression :options])))))
+  ;; Region consumers also receive an explicit conversion, not a mismatched store/yield.
+  (let [expression (with-meta '(+ a b) {:raster.type/tag 'float})
+        result ((:lower-region (lowerer)) {:bindings [] :results [expression]}
+                [:double] {} {'a :float 'b :float})]
+    (is (= [:float :double] (mapv #(get-in % [:result :type]) (:operations result))))
+    (is (= :cast (get-in result [:operations 1 :expression :op])))))
+
+(deftest retained-precision-composes-with-branches-and-predicates
+  (let [inner (with-meta '(if (> a b) (+ a b) (- a b))
+                {:raster.type/tag 'float :tag 'double})
+        result ((:lower (lowerer)) (list '+ inner 'wide) :double
+                {'a :float 'b :float 'wide :double})
+        [comparison branch conversion outer] (:operations result)]
+    (is (= :predicate (get-in comparison [:result :type])))
+    (is (= :float (get-in branch [:results 0 :type])))
+    (is (= :cast (get-in conversion [:expression :op])))
+    (is (= :double (get-in conversion [:result :type])))
+    (is (= :double (get-in outer [:result :type]))))
+  (let [result ((:lower (lowerer)) '(+ (+ a b) wide) :double
+                {'a :float 'b :float 'wide :double})]
+    (is (every? #(= :double (get-in % [:result :type])) (:operations result))
+        "Absent retained metadata still uses the owner's contextual dtype")))
+
+(deftest floating-precision-change-does-not-retarget-integral-loop-carries
+  ;; Reduced from the public Q4 projection fixture. This freezes existing behavior, not a
+  ;; proof that widened source carries and the narrower target intrinsic are equivalent.
+  (let [update (with-meta '(raster.par/dp4a a b acc) {:raster.type/tag 'int})
+        expression (list 'loop '[j 0 acc 0]
+                         (list 'if '(< j n) (list 'recur '(inc j) update) 'acc))
+        result ((:lower (lowerer)) expression :long {'a :long 'b :long 'n :long})
+        loop (last (:operations result))]
+    (is (= :long (:type result)))
+    (is (= :long (get-in loop [:results 0 :type])))
+    (is (= :long (get-in loop [:operations 0 :result :type])))))
+
+(deftest retained-wide-arithmetic-converts-before-a-narrow-loop-yield
+  (let [update (with-meta '(+ acc x) {:raster.type/tag 'double})
+        expression (list 'loop '[j 0 acc 0.0]
+                         (list 'if '(< j n) (list 'recur '(inc j) update) 'acc))
+        result ((:lower (lowerer)) expression :float {'x :float 'n :long})
+        loop (last (:operations result))
+        operations (butlast (:operations loop))]
+    (is (= :float (:type result)))
+    (is (= [:double :double :double :float]
+           (mapv #(get-in % [:result :type]) operations)))
+    (is (= {:rounding :nearest-even :overflow :ieee}
+           (get-in (last operations) [:expression :options])))))
+
 (deftest shared-conversion-policy-keeps-narrowing-an-explicit-owner-decision
   (let [types [:byte :int :long :half :float :double]
         exact [:exact :exact]

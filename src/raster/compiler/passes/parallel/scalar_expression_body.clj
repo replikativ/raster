@@ -81,12 +81,15 @@
                           range)
         known-range (fn [value type]
                       (or (get @value-ranges value) (scalar-range/for-dtype type)))
+        retained-type (fn [expression]
+                        (some-> (or (:raster.type/tag (meta expression))
+                                    (:tag (meta expression)))
+                                dtype/dtype-for-scalar-tag))
         source-type
         (fn source-type [expression expected env]
           (let [expression (inline-lets expression)]
             (or
-             (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                     dtype/dtype-for-scalar-tag)
+             (retained-type expression)
              (cond
                (instance? raster.compiler.ir.kernel_body.Literal expression) (:type expression)
                (symbol? expression) (or (get env expression) (get scalar-types expression) expected)
@@ -129,7 +132,20 @@
 
             (lower [expression expected env]
               (let [expression (inline-lets expression)
-                    expected (canon-type expected)]
+                    ;; Preserve floating rounding before consumer promotion. Integral contexts
+                    ;; retain their existing owner policy: quantized loops still carry widened
+                    ;; integers around narrower intrinsic results and need separate reconciliation.
+                    expected (canon-type expected)
+                    retained (when (seq? expression) (retained-type expression))
+                    operation-type (if (and (dtype/fp-dtype? expected)
+                                            retained (dtype/fp-dtype? retained))
+                                     retained expected)
+                    lowered (lower-value expression operation-type env)]
+                (if (not= operation-type expected)
+                  (cast-lowered lowered expected expression)
+                  lowered)))
+
+            (lower-value [expression expected env]
                 (cond
                   (instance? raster.compiler.ir.kernel_body.Literal expression)
                   {:operations [] :result expression
@@ -390,7 +406,7 @@
                   :else
                   (decline! :scalar-expression
                             "scalar expression has an unsupported value"
-                            {:expression expression :type (type expression)}))))]
+                            {:expression expression :type (type expression)})))]
       {:lower lower
        :lower-region
        (fn [{:keys [bindings results]} result-types binding-types env]
