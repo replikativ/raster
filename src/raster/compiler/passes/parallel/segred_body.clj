@@ -23,6 +23,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (defn- decline!
@@ -351,27 +352,39 @@
    result dtype retained on that expression. The lowered element must already match the certified
    accumulator dtype; this pass never invents a final narrowing conversion. A typed region owner
    may provide `declared-result-dtype` for the outer expression only; nested calls still require
-   their own retained facts."
+   their own retained facts. Admission remains here; accepted loads, conversions and arithmetic
+   over typed child values use the same SSA builder as maps and ordered fold-maps."
   [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
                       load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         operations (atom [])
-        counter (atom 0)
-        fresh (fn [prefix] (symbol (str prefix "-" (swap! counter inc))))
-        emit! (fn [operation value value-dtype]
-                (swap! operations conj operation)
-                {:value value :dtype (dtype/canon value-dtype)})]
+        environment (atom (into {} (map (fn [id] [id (dtype/canon (get scalar-types id dtype))]))
+                                scalars))
+        lowerer (scalar-expression/make-lowerer
+                 {:arrays (set arrays)
+                  :array-types (into {} (map (fn [id] [id (dtype/canon (get array-types id dtype))]))
+                                     arrays)
+                  :scalar-types @environment
+                  ;; Only this adapter's already-approved coordinates reach the SSA builder.
+                  :lower-index (fn [coordinate _] coordinate)
+                  :predicate load-predicate
+                  :load-other (fn [storage-dtype]
+                                (if load-other
+                                  (body/literal (:value load-other) storage-dtype)
+                                  (body/literal 0 storage-dtype)))
+                  :conversion-policy cast-policy :decline! decline! :id-prefix "element"})
+        append! (fn [lowered]
+                  (let [{:keys [result type]} lowered]
+                    (when (symbol? result) (swap! environment assoc result type))
+                    (swap! operations into (:operations lowered))
+                    {:value result :dtype type}))]
     (letfn [(cast! [{:keys [value dtype] :as typed} target]
               (let [source (dtype/canon dtype)
                     target (dtype/canon target)]
                 (if (= source target)
                   typed
-                  (let [[rounding overflow] (cast-policy source target)
-                        result (fresh "element-cast")]
-                    (emit! (body/->ScalarCompute
-                            (body/value result target)
-                            (body/cast-expression value target rounding overflow))
-                           result target)))))
+                  (append! ((:cast lowerer) {:operations [] :result value :type source}
+                            target nil)))))
 
             (lower [expression declared-dtype]
               (let [expression (inline-scalar-bindings expression)]
@@ -406,17 +419,8 @@
                                 "KernelBody reduction cannot prove this array load coordinate"
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
-                    (let [result (fresh "element-load")
-                          load-dtype (dtype/canon (get array-types array dtype))
-                          other (or load-other (body/literal 0 load-dtype))]
-                      (emit! (body/->ScalarLoad
-                              (body/value result load-dtype) array [lowered-coordinate]
-                              load-predicate
-                              (when load-predicate
-                                (if (= load-dtype (:type other)) other
-                                    (body/literal (:value other) load-dtype)))
-                              :cached)
-                             result load-dtype)))
+                    (append! ((:lower lowerer) (list 'aget array lowered-coordinate)
+                              (dtype/canon (get array-types array dtype)) @environment)))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
@@ -457,12 +461,10 @@
                                 "KernelBody element expression contains an unsupported scalar operation"
                                 {:expression expression :operator operator
                                  :result-dtype result-dtype}))
-                    (let [inputs (mapv (comp :value #(cast! % result-dtype)) typed-inputs)
-                          result (fresh "element-value")]
-                      (emit! (body/->ScalarCompute
-                              (body/value result result-dtype)
-                              (body/scalar-expression operator result-dtype inputs))
-                             result result-dtype)))
+                    (append! ((:lower lowerer)
+                              (apply list (descriptor/semantic-op expression)
+                                     (map :value typed-inputs))
+                              result-dtype @environment)))
 
                   :else
                   (decline! :scalar-expression

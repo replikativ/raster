@@ -132,6 +132,52 @@
              (try (segred/lower-element-operations expression options) nil
                   (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e)))))))))
 
+(deftest reduction-admission-delegates-masked-mixed-storage-ssa
+  (let [factory scalar/make-lowerer
+        calls (atom [])
+        coordinates (atom [])
+        expression (list 'float (with-meta '(+ (aget x (+ i 1)) scale)
+                                  {:raster.type/tag 'double}))
+        options {:index 'i :coordinate 'i :dtype :float
+                 :arrays #{'x} :array-types {'x :int}
+                 :scalars #{'scale} :scalar-types {'scale :double}
+                 :coordinate-lower (fn [source]
+                                     (swap! coordinates conj source)
+                                     (body/expression :add 'i 1))
+                 :load-predicate 'active :load-other (body/literal -7 :double)}
+        result (with-redefs [scalar/make-lowerer
+                            (fn [options]
+                              (let [lowerer (factory options)]
+                                (reduce (fn [lowerer entry]
+                                          (assoc lowerer entry
+                                                 (fn [& args]
+                                                   (swap! calls conj entry)
+                                                   (apply (get lowerer entry) args))))
+                                        lowerer [:lower :cast])))]
+                 (segred/lower-element-operations expression options))
+        [load promote add narrow] (:operations result)]
+    (is (= [:lower :lower :cast] @calls))
+    (is (= ['(+ i 1)] @coordinates))
+    (is (= :int (get-in load [:result :type])))
+    (is (= 'active (:predicate load)))
+    (is (= (body/literal -7 :int) (:other load)))
+    (is (= [(body/expression :add 'i 1)] (:coordinates load)))
+    (is (= [:double :double :float]
+           (mapv #(get-in % [:result :type]) [promote add narrow])))
+    (is (= {:rounding :exact :overflow :exact} (get-in promote [:expression :options])))
+    (is (= {:rounding :nearest-even :overflow :ieee}
+           (get-in narrow [:expression :options])))))
+
+(deftest reduction-literal-conversion-is-not-contextual-literal-typing
+  (let [expression (with-meta '(+ scale 0.1) {:raster.type/tag 'float})
+        result (segred/lower-element-operations
+                expression {:dtype :float :scalars #{'scale} :scalar-types {'scale :float}})
+        [cast add] (:operations result)]
+    (is (= :cast (get-in cast [:expression :op])))
+    (is (= [(body/literal 0.1 :double)] (get-in cast [:expression :arguments])))
+    (is (= {:rounding :nearest-even :overflow :ieee} (get-in cast [:expression :options])))
+    (is (= :float (get-in add [:result :type])))))
+
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]
           [['byte :byte :long :wrap] ['int :int :long :wrap]
