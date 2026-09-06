@@ -83,6 +83,9 @@
                        :route (get-in report [:route :source-dialect])
                        :typed-validated (boolean (get-in report [:route :typed-validated]))
                        :declines (decline-facts (get-in report [:route :declines]))
+                       ;; TypedSOAC frontend coverage does not imply KernelBody emission.
+                       ;; Retain the existing normalized emitter evidence from this SAME compile.
+                       :emission (:emission report)
                        :emission-declines (count (get-in report [:emission :declines])))
           (seq orders) (assoc :effect-orders orders)))
       (catch Throwable t
@@ -97,6 +100,10 @@
       :dtype (:dtype opts :float)
       :summary (merge {:total (count rows)}
                       (frequencies (map :route rows)))
+      ;; Counts artifacts, including dispatch alternatives, not runtime launches or latency.
+      :emission-summary
+      {:artifact-routes (reduce #(merge-with + %1 (get-in %2 [:emission :routes] {})) {} rows)
+       :programs-with-declines (count (filter #(seq (get-in % [:emission :declines])) rows))}
       :vars (vec (sort-by (comp str :var) rows))})))
 
 (def route-rank
@@ -139,6 +146,13 @@
   (with-open [reader (java.io.PushbackReader. (io/reader path))]
     (edn/read reader)))
 
+(defn baseline-facts
+  "The existing device-independent ratchet excludes target-specific emission diagnostics."
+  [report]
+  (-> report
+      (dissoc :emission-summary)
+      (update :vars #(mapv (fn [row] (dissoc row :emission :emission-declines)) %))))
+
 (defn write-baseline!
   "Write `report` as the committed baseline. Emission facts are excluded: they depend on the
    device's tuned leaves, while route and error facts are device-independent."
@@ -146,9 +160,7 @@
   (io/make-parents path)
   (with-open [writer (io/writer path)]
     (binding [*print-length* nil *print-level* nil]
-      (pp/pprint (update report :vars
-                         (fn [rows] (mapv #(dissoc % :emission-declines) rows)))
-                 writer)))
+      (pp/pprint (baseline-facts report) writer)))
   path)
 
 (defn -main
@@ -157,6 +169,7 @@
   [& [command]]
   (let [report (corpus-report {:target-device :ocl:0 :dtype :float})]
     (println "coverage summary:" (pr-str (:summary report)))
+    (println "emitted artifacts (not executed launches):" (pr-str (:emission-summary report)))
     (if (= "update" command)
       (println "baseline written:" (write-baseline! default-baseline-path report))
       (let [violations (ratchet-violations (read-baseline default-baseline-path) report)]

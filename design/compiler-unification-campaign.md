@@ -4,11 +4,11 @@ Authorized scope: complete the four stages below in order. Each production migra
 its numerical, ABI, ownership and resource contracts; isolated emitter coverage is not a completed
 vertical. The north star remains the architectural specification.
 
-## 1. Close product reduction production lowering — active
+## 1. Close product reduction production lowering — landed for the dense row subset
 
 - Landed #382: shared typed multi-result scalar-region lowering.
 - Landed #383: candidate row-product KernelBody, CPU OpenCL differential execution, CUDA/HIP
-  compilation. Production still uses the retained source emitter.
+  compilation. At that stage production still used the retained source emitter.
 - Landed #384: preserve TypedSOAC local dtypes through SegRed and subsequent
   scalar/index lowering; compare both direct and local-address candidates on CPU OpenCL.
 - Landed #385: align the retained product KernelGrid with the segment-count launch,
@@ -58,7 +58,7 @@ vertical. The north star remains the architectural specification.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 
-## 2. Retire the remaining compatibility paths — queued
+## 2. Retire the remaining compatibility paths — active
 
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
@@ -95,6 +95,12 @@ zero-origin SOAC recognition is unchanged. New nonzero coverage requires direct 
 binding-slot updates, one loop body and no narrowing induction test. Public GQA fan-in, group-one
 signed-zero preservation and cancellation-sensitive accumulation are checked on CPU OpenCL.
 This does not authorize reassociation or arbitrary symbolic/negative loop origins.
+
+Coverage reporting now retains the normalized emission routes and decline details from each
+existing corpus compilation. TypedSOAC frontend coverage alone cannot distinguish generated
+KernelBody from a compatibility emitter. Aggregate counts explicitly describe emitted artifacts,
+including dispatch alternatives, not executed launches. The portable baseline remains unchanged;
+target-specific route evidence stays in the report and CI output. No extra compile is required.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
