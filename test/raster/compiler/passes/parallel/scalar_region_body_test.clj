@@ -25,6 +25,48 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest nested-arithmetic-retains-precision-before-consumer-promotion
+  (doseq [tag-key [:raster.type/tag :tag]
+          expression ['(+ a b) '(inc a) '(dec a) '(- a) '(+ a b a)]]
+    (let [inner (with-meta expression {tag-key 'float})
+          result ((:lower (lowerer)) (list '+ inner 'wide) :double
+                  {'a :float 'b :float 'wide :double})
+          operations (:operations result)
+          arithmetic (remove #(= :cast (get-in % [:expression :op])) operations)
+          casts (filter #(= :cast (get-in % [:expression :op])) operations)]
+      (is (= :double (:type result)))
+      (is (every? #(= :float (get-in % [:result :type])) (butlast arithmetic))
+          (str "retained inner arithmetic: " expression))
+      (is (= :double (get-in (last arithmetic) [:result :type])))
+      (is (= 1 (count casts)))
+      (is (= [(get-in (last (butlast arithmetic)) [:result :id])]
+             (get-in (first casts) [:expression :arguments])))
+      (is (= {:rounding :exact :overflow :exact}
+             (get-in (first casts) [:expression :options])))))
+  ;; A retained region result cannot silently change its declared binding type either.
+  (let [expression (with-meta '(+ a b) {:raster.type/tag 'float})]
+    (is (= :scalar-region-dtype
+           (try ((:lower-region (lowerer)) {:bindings [] :results [expression]}
+                 [:double] {} {'a :float 'b :float})
+                nil
+                (catch clojure.lang.ExceptionInfo e (:rule (ex-data e))))))))
+
+(deftest retained-precision-composes-with-branches-and-predicates
+  (let [inner (with-meta '(if (> a b) (+ a b) (- a b))
+                {:raster.type/tag 'float :tag 'double})
+        result ((:lower (lowerer)) (list '+ inner 'wide) :double
+                {'a :float 'b :float 'wide :double})
+        [comparison branch conversion outer] (:operations result)]
+    (is (= :predicate (get-in comparison [:result :type])))
+    (is (= :float (get-in branch [:results 0 :type])))
+    (is (= :cast (get-in conversion [:expression :op])))
+    (is (= :double (get-in conversion [:result :type])))
+    (is (= :double (get-in outer [:result :type]))))
+  (let [result ((:lower (lowerer)) '(+ (+ a b) wide) :double
+                {'a :float 'b :float 'wide :double})]
+    (is (every? #(= :double (get-in % [:result :type])) (:operations result))
+        "Absent retained metadata still uses the owner's contextual dtype")))
+
 (deftest shared-conversion-policy-keeps-narrowing-an-explicit-owner-decision
   (let [types [:byte :int :long :half :float :double]
         exact [:exact :exact]

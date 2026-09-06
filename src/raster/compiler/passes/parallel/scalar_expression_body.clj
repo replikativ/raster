@@ -81,12 +81,15 @@
                           range)
         known-range (fn [value type]
                       (or (get @value-ranges value) (scalar-range/for-dtype type)))
+        retained-type (fn [expression]
+                        (some-> (or (:raster.type/tag (meta expression))
+                                    (:tag (meta expression)))
+                                dtype/dtype-for-scalar-tag))
         source-type
         (fn source-type [expression expected env]
           (let [expression (inline-lets expression)]
             (or
-             (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                     dtype/dtype-for-scalar-tag)
+             (retained-type expression)
              (cond
                (instance? raster.compiler.ir.kernel_body.Literal expression) (:type expression)
                (symbol? expression) (or (get env expression) (get scalar-types expression) expected)
@@ -129,7 +132,12 @@
 
             (lower [expression expected env]
               (let [expression (inline-lets expression)
-                    expected (canon-type expected)]
+                    ;; A consumer's conversion happens after the child's arithmetic. Promoting
+                    ;; that arithmetic early discards its retained rounding/overflow semantics.
+                    ;; Untagged regions continue to use the owner's declared contextual dtype.
+                    expected (canon-type (or (when (seq? expression)
+                                               (retained-type expression))
+                                             expected))]
                 (cond
                   (instance? raster.compiler.ir.kernel_body.Literal expression)
                   {:operations [] :result expression
