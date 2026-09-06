@@ -113,7 +113,7 @@ The next caller audit distinguishes a remaining source edge from demonstrated ru
 | Boundary | Retained owner / consumer | Current evidence |
 |---|---|---|
 | General contractions | `generate-segmented-reduce-kernel` → `contract_route` | Nested gather selects the source fallback after `:operand-layout` decline. |
-| Unscheduled effects | `generate-par-map-void-kernel` → `opencl_pass` | Raw/unbound effect fallback still present. |
+| Unscheduled effects | Typed mini-program first; `generate-par-map-void-kernel` on decline | Raw/nested plain-array effects schedule once; unsupported bodies retain a reported compatibility route. |
 | Strided transfers | Typed mini-program → KernelBody | Bare and host-wrapped leaves share typed scheduling; source generators moved to test-only oracles. |
 | Active IDs | `generate-par-active-ids-kernel` → `opencl_pass` | ABM firms uses seeded agent indices, not arbitrary visibility compaction. |
 | Compound local | `generate-compound-local-kernel` → `opencl_pass` | Compatibility markers remain; structured typed programs bypass detection. |
@@ -179,6 +179,22 @@ cast. Typed scalar materialization reapplies its retained result conversion, pre
 checks local; missing certified leaves fail once instead of recursively rescheduling. Public
 descriptor preflight, CPU differential execution and vendor compile fixtures cover this boundary.
 This does not admit the active-ID population domain or retire its production source kernel.
+
+Raw effect-map follow-up uses the same one-attempt typed mini-program boundary as RNG and strided
+transfers. Conditional leaves keep checked extents beside their invocation. Plain mixed-storage
+maps and pre-store lexical snapshots have CPU OpenCL differential checks; tiny host-only bodies
+still use the existing scalar fallback. A supplied typed program cannot re-enter source lowering.
+Unscheduled raw bodies retain the existing adapter with an explicit `:compatibility-effect-opencl`
+emission route and `:effect-compatibility` count, including through nested host control. This is
+not full effect-emitter retirement: logical SoA expansion and other unsupported effect bodies still
+need their own typed closure. The independent source-emitter tests remain unchanged.
+An explicit logical-SoA guard precedes plain-array scheduling: the typed frontend can otherwise
+accept the container as one float pointer rather than decline. Bare, conditional and let-bound probes
+retain the existing per-field dtypes, names and grouped logical binding through the source adapter.
+Unscheduled effects within partially scheduled source programs also retain that reported adapter:
+introducing leaf-local lets after emission breaks flat resident extraction, and alpha-renaming
+only the host form would disconnect its artifact argument plan. Semantic-stage composition tests
+exercise this boundary. Complete host-region normalization must precede emission before retiring it.
 
 ## 3. General fusion and bounded specialization — price admission active; broader work queued
 

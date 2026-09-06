@@ -27,6 +27,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -34,6 +35,16 @@
             [raster.compiler.backend.gpu.par-opencl :as legacy]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
+
+(defn- unlowered-soa-effect?
+  "A logical SoA must retain its grouped pointer ABI until shared scalar replacement expands it."
+  [form]
+  (and (par/par-map-void-form? form)
+       (seq (soa-lower/collect-soa-env (:body (par/extract-par-map-void-info form))))))
+
+(defn- contains-unlowered-soa-effect?
+  [source]
+  (boolean (some unlowered-soa-effect? (tree-seq coll? seq source))))
 
 (defn- host-scalar-result?
   [program equation]
@@ -378,9 +389,9 @@
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
    Uses full SegOp conversion for par/map! and par/reduce.
-   Certified effect-only map-void forms consume their scheduled TypedSOAC SegMap; unsupported
-   bodies and the remaining active-id and key-reduction forms retain
-   explicit compatibility generators.
+   Effect-only map-void forms consume their scheduled TypedSOAC SegMap, including raw nested
+   leaves. Effect bodies without a typed schedule retain a reported compatibility route;
+   the remaining active-id and key-reduction forms also retain compatibility generators.
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
             :kernels [{:kernel-name :source ...} ...]}
@@ -453,6 +464,8 @@
         direct-mini-program?
         (and (nil? supplied-program)
              (or (par/par-rng-fill-form? form)
+                 ;; Plain-array scheduling cannot interpret a logical SoA as one tensor pointer.
+                 (and (par/par-map-void-form? form) (not (unlowered-soa-effect? form)))
                  (and (par/par-gather-form? form)
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
@@ -477,7 +490,8 @@
             :scalar-types (merge scalar-types retained-scalar-types)
             :array-types (merge array-types retained-array-types)})
 
-          (and (nil? supplied-program) (form/binding-form? form))
+          (and (nil? supplied-program) (form/binding-form? form)
+               (not (contains-unlowered-soa-effect? form)))
           (segop-lower-pass/schedule-source-program
            form {:target-device device-id :dtype dtype
                  :scalar-types scalar-types :array-types array-types})
@@ -549,7 +563,7 @@
 
         emit-nested-map!
         (fn [form]
-          ;; Raw host control flow can contain an indexed/RNG map without a surrounding
+          ;; Raw host control flow can contain an indexed, RNG or effect map without a surrounding
           ;; ParallelProgram. Schedule that leaf at its original control-flow position: its
           ;; hoisted extent belongs beside the invocation, never outside the host branch.
           ;; A supplied typed program must already account for every scheduled operation; do
@@ -885,22 +899,32 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map-void! form))
-                (let [scheduled (take-bound-segop
+                (if-let [scheduled (take-bound-segop
                                  stats :segmap
                                  #(and (instance? raster.compiler.ir.segop.SegMap %)
-                                       (= :typed-soac (:algorithm-dialect %))))
-                      kernel (if scheduled
-                               (segop-cl/generate-scheduled-segmap-kernel
+                                       (= :typed-soac (:algorithm-dialect %))))]
+                  (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                                 scheduled
                                 :dtype (:dtype scheduled)
                                 :scalar-types top-scalar-types
                                 :array-types top-array-types)
-                               (legacy/generate-par-map-void-kernel
-                                form :dtype dtype :device-id device-id
-                                :array-types top-array-types
-                                :scalar-types top-scalar-types))
                       k (register-kernel! kernel :ze-maps)]
-                  (emit-map-void-invocation k device-id))))
+                    (emit-map-void-invocation k device-id))
+                  ;; A partially scheduled source program still needs a flat resident marker.
+                  ;; Re-scheduling just this binding would introduce private scalar lets after
+                  ;; graph/ABI formation. Keep that explicit compatibility boundary until the
+                  ;; whole host region can be normalized before emission.
+                  (if (and (not supplied-program)
+                           (or direct-mini-program? parallel-program (unlowered-soa-effect? form)))
+                    (let [kernel (legacy/generate-par-map-void-kernel
+                                  form :dtype dtype :device-id device-id
+                                  :array-types top-array-types :scalar-types top-scalar-types)
+                          kernel (assoc-in kernel [:attributes :emission-route]
+                                           :compatibility-effect-opencl)
+                          k (register-kernel! kernel :ze-maps)]
+                      (swap! stats update :effect-compatibility (fnil inc 0))
+                      (emit-map-void-invocation k device-id))
+                    (emit-nested-map! form)))))
 
             ;; par/scan-exclusive
             (par/par-scan-exclusive-form? form)

@@ -8,6 +8,7 @@
   buffers (uninitialized device memory — Intel's driver zeroes allocations,
   POCL's malloc does not)."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pl]
@@ -282,6 +283,52 @@
       (register! (:kernel-name kernel) kernel)
       (invoke! (:kernel-name kernel) [out q] [{:type :int :value 7}] n)
       (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out))))))
+
+(deftest ocl-nested-effect-map-mixed-storage-roundtrip
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "nested typed effect map")
+    (let [emitted (opencl-pass/opencl-pass
+                   '(if enabled
+                      (raster.par/map-void! i (int n)
+                        (aset out i (+ (int (aget q i)) limit))) nil)
+                   :device-id :ocl:0 :min-elements 0 :dtype :float
+                   :array-types {'out :int 'q :byte}
+                   :scalar-types {'enabled :boolean 'n :long 'limit :int})
+          register! (resolve 'raster.gpu.ocl-runtime/register-kernel!)
+          execute (eval (list 'fn '[enabled n q out limit]
+                              (walk/postwalk #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                                             (:form emitted))))
+          q (byte-array [-128 -3 0 127])
+          out (int-array [99 99 99 99])]
+      (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route]) (:kernels emitted))))
+      (doseq [kernel (:kernels emitted)] (register! (:kernel-name kernel) kernel))
+      (is (nil? (execute false nil nil nil nil)))
+      (is (nil? (execute true 4 q out 7)))
+      (is (= [-121 4 7 134] (vec out))))))
+
+(deftest ocl-raw-effect-map-retains-pre-store-snapshots
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "typed effect lexical snapshots")
+    (let [emitted (opencl-pass/opencl-pass
+                   '(raster.par/map-void! i n
+                      (let* [^float next-state (+ (aget state i) (aget grad i))]
+                        (aset state i (float next-state))
+                        (aset param i (float (- (aget param i) next-state)))))
+                   :device-id :ocl:0 :min-elements 0 :dtype :float
+                   :array-types {'state :float 'grad :float 'param :float}
+                   :scalar-types {'n :int})
+          register! (resolve 'raster.gpu.ocl-runtime/register-kernel!)
+          execute (eval (list 'fn '[state grad param n]
+                              (walk/postwalk #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                                             (:form emitted))))
+          state (float-array [1 2 3])
+          grad (float-array [4 5 6])
+          param (float-array [20 30 40])]
+      (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route]) (:kernels emitted))))
+      (doseq [kernel (:kernels emitted)] (register! (:kernel-name kernel) kernel))
+      (is (nil? (execute state grad param 3)))
+      (is (= [5.0 7.0 9.0] (vec state)))
+      (is (= [15.0 23.0 31.0] (vec param))))))
 
 (deftest ocl-resident-session-roundtrip
   (if-not @device-probe/opencl-available?
