@@ -626,9 +626,37 @@
       :scalars (mapv #(-> % (assoc :value (:sym %)) (dissoc :sym)) (:scalars epilogue))
       :result-dtype (or (:dtype epilogue) :float)})))
 
-(defn- strip-index-casts
-  [expression]
-  (util/postwalk-preserving-meta strip-index-cast expression))
+(defn- retained-scalar-dtype
+  [expression scalar-types]
+  (or (get scalar-types expression)
+      (some-> (when (instance? clojure.lang.IObj expression)
+                (types/sym-type-tag expression))
+              dtype/dtype-for-scalar-tag)
+      (when (and (seq? expression)
+                 (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression))))
+        (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
+                dtype/dtype-for-scalar-tag))))
+
+(defn- normalize-scalar-casts
+  "Erase only integral identity/widening casts proved by retained types. A narrowing cast
+   performs a check (or a conversion), even when its argument also names a shape dimension."
+  [expression scalar-types]
+  (util/postwalk-preserving-meta
+   (fn [form]
+     (if (and (seq? form) (descriptor/cast-op? (descriptor/semantic-op form))
+              (not (contains? util/*shadowing-locals* (descriptor/semantic-op form)))
+              (= 1 (count (descriptor/call-args form))))
+       (let [argument (first (descriptor/call-args form))
+             source (retained-scalar-dtype argument scalar-types)
+             target (some-> (descriptor/semantic-op form) descriptor/cast-result-tag
+                            dtype/dtype-for-scalar-tag)
+             integral? #{:byte :short :int :long}]
+         (if (and (integral? source) (integral? target)
+                  (<= (dtype/bytes-of source) (dtype/bytes-of target)))
+           argument
+           form))
+       form))
+   expression))
 
 (def ^:dynamic ^:private *scalar-definitions*
   "Host scalar bindings preceding the operation being described, as `{id expression}` for the
@@ -1352,6 +1380,8 @@
 (defn- parallel-extent
   [expression]
   (cond
+    (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
+        (par/par-reduce-by-key-form? expression)) (nth expression 4)
     (par/par-rng-fill-form? expression) (:n (par/extract-par-rng-fill-info expression))
     (par/par-map-pure-form? expression) (nth expression 2)
     (par/par-map-form? expression) (nth expression 3)
@@ -1368,6 +1398,8 @@
 (defn- replace-parallel-extent
   [expression extent]
   (let [position (cond
+                   (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
+                       (par/par-reduce-by-key-form? expression)) 4
                    (par/par-rng-fill-form? expression) 2
                    (par/par-map-pure-form? expression) 2
                    (par/par-map-form? expression) 3
@@ -1570,7 +1602,7 @@
         :else nil))))
 
 (defn- normalize-source*
-  [source]
+  [source scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
@@ -1582,7 +1614,8 @@
             pairs (vec (partition 2 bindings))
             {:keys [normalized]}
             (reduce
-             (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids]
+             (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
+                         local-scalar-types]
                    :as state}
                   [ordinal [symbol expression]]]
                (let [expression (->> expression
@@ -1593,7 +1626,8 @@
                      ;; that earlier value. Extents are compared in these canonical names so
                      ;; `(* seq dff)` and `(* n1 n2)` with `n1 = seq`, `n2 = dff` are one size.
                      canonical-scalar (fn [form]
-                                        (util/subst-syms scalar-aliases (strip-index-casts form)))
+                                        (normalize-scalar-casts
+                                         (util/subst-syms scalar-aliases form) local-scalar-types))
                      ;; `(long x)` of a floating scalar is a conversion, not a renaming.
                      floating-cast? (and (seq? expression) (= 2 (count expression))
                                          (contains? '#{long int clojure.core/long clojure.core/int}
@@ -1631,6 +1665,10 @@
                                (assoc-in state [:pure-scalar-ids scalar-form] symbol))
 
                              :else state)
+                     state (if-let [scalar-dtype (or (retained-scalar-dtype symbol local-scalar-types)
+                                                    (retained-scalar-dtype expression local-scalar-types))]
+                             (assoc-in state [:local-scalar-types symbol] scalar-dtype)
+                             state)
                      scalar-aliases (:scalar-aliases state)
                      extent (parallel-extent expression)
                      ;; `(alength y)` over a local allocation is the allocation's declared
@@ -1645,12 +1683,12 @@
                      canonical-extent (some-> extent
                                               (resolve-length #{})
                                               (->> (util/subst-syms scalar-aliases))
-                                              descriptor/unwrap-int-cast)
+                                              (normalize-scalar-casts local-scalar-types))
                      state (if-let [length (allocation-length expression)]
                              (assoc-in state [:allocation-lengths symbol]
                                        (->> (resolve-length length #{})
                                             (util/subst-syms scalar-aliases)
-                                            descriptor/unwrap-int-cast))
+                                            (#(normalize-scalar-casts % local-scalar-types))))
                              (if (and (symbol? expression)
                                       (contains? allocation-lengths expression))
                                (assoc-in state [:allocation-lengths symbol]
@@ -1660,9 +1698,8 @@
                    (nil? extent)
                    (update state :normalized conj [symbol expression])
 
-                   ;; Integral casts are representation noise, not new semantic dimensions.
-                   ;; Keeping their underlying value identity also prevents one array from
-                   ;; acquiring incompatible [n] and [(long n)] shapes across operations.
+                   ;; Only proved identity/widening casts are representation noise. A narrowing
+                   ;; count remains an executable scalar equation with a distinct dimension id.
                    (dialect/extent? canonical-extent)
                    (update state :normalized conj
                            [symbol (replace-parallel-extent expression canonical-extent)])
@@ -1674,9 +1711,12 @@
                      ;; general horizontal-fusion rule (for example two same-shaped views).
                      (update state :normalized conj
                              [symbol (replace-parallel-extent expression extent-id)])
-                     (let [extent-id (with-meta
+                     (let [extent-dtype (or (retained-scalar-dtype canonical-extent local-scalar-types)
+                                            :long)
+                           extent-tag (dtype/scalar-tag-for-dtype extent-dtype)
+                           extent-id (with-meta
                                        (clojure.core/symbol (str "rstr_extent_" ordinal))
-                                       {:tag 'long :raster.type/tag 'long
+                                       {:tag extent-tag :raster.type/tag extent-tag
                                         ;; This SSA value is introduced by the frontend as the
                                         ;; canonical identity of compound launch/storage algebra.
                                         ;; Preserve that provenance without relying on its name.
@@ -1690,7 +1730,7 @@
                    :else
                    (update state :normalized conj [symbol expression]))))
              {:normalized [] :compound-extents {} :allocation-lengths {}
-              :scalar-aliases {} :pure-scalar-ids {}}
+              :scalar-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
       source)))
@@ -1746,7 +1786,12 @@
   (loop [extent extent seen #{}]
     (let [wrapped? (and (seq? extent) (= 'value (first extent)) (= 2 (count extent)))
           inner (if wrapped? (second extent) extent)
-          normalized (descriptor/unwrap-int-cast inner)
+          ;; Consult only this expression's free values, not every program value on each
+          ;; relational shape comparison.
+          scalar-types (into {} (keep (fn [id]
+                                        (when-let [value (get values id)] [id (:dtype value)])))
+                             (util/free-syms inner))
+          normalized (normalize-scalar-casts inner scalar-types)
           array (alength-array normalized)
           proved-shape (when array (:shape (get values array)))
           proved-extent (when (= 1 (count proved-shape)) (first proved-shape))
@@ -1787,7 +1832,7 @@
               (assoc-in [:scalar-representatives (:sym description)] representative)))
 
         (:map :scatter :effect-map :stencil :reduce :scan)
-        (let [extent (descriptor/unwrap-int-cast (:extent description))
+        (let [extent (:extent description)
               array (alength-array extent)
               proved-extent (canonical-extent shape-equalities values extent)
               extent' (cond
@@ -1907,7 +1952,7 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* source)))))
+       (normalize-source* source scalar-types)))))
 
 (declare coverage-decline*)
 

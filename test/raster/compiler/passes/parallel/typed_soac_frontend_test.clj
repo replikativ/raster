@@ -883,6 +883,60 @@
       (let [source (list 'let* ['r (accumulating-gemm-call '(clojure.core/aget S 0))] 'r)]
         (is (= source (frontend/normalize-source source types)))))))
 
+(deftest scalar-cast-aliases-require-a-retained-widening-proof
+  (doseq [[source-type cast eliminated?] [[:int 'long true] [:long 'long true]
+                                         [:int 'int true] [:long 'int false]
+                                         [:float 'long false] [nil 'int false]]]
+    (let [source (list 'let* ['count (list cast 'n)
+                             'result '(raster.par/map! out i count float (aget x i))]
+                       'result)
+          normalized (frontend/normalize-source
+                      source {:scalar-types (if source-type {'n source-type} {})
+                              :array-types {'x :float 'out :float}})
+          map-source (nth (second normalized) 3)]
+      (is (= (if eliminated? 'n 'count) (nth map-source 3))
+          (str source-type " → " cast)))))
+
+(deftest a-shadowed-cast-name-is-not-a-conversion-proof
+  (let [source '(let* [int convert count (int n)
+                       result (raster.par/map! out i count float (aget x i))]
+                      result)]
+    (is (= source (frontend/normalize-source
+                   source {:scalar-types {'n :int} :array-types {'x :float 'out :float}})))))
+
+(deftest narrowing-extents-remain-typed-scalar-equations
+  (let [options {:dtype :float :array-types {'x :float 'out :float}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source
+                    '(let* [result (raster.par/map! out i (int n) float (aget x i))] result)
+                    options)
+        extent (first (second normalized))
+        program (frontend/form->program normalized options)
+        equations (dialect/equations program)]
+    (is (= '(int n) (second (second normalized))))
+    (is (= 'int (:tag (meta extent))))
+    (is (= '[scalar map] (mapv dialect/operation-kind equations)))))
+
+(deftest indexed-operation-counts-use-the-shared-scalar-normalizer
+  (doseq [operation ['(raster.par/gather out x indices count)
+                     '(raster.par/scatter! out x indices count)
+                     '(raster.par/reduce-by-key out indices x count +)]
+          cast ['long 'int]]
+    (let [expression (apply list (assoc (vec operation) 4 (list cast 'n)))
+          options {:dtype :float :array-types {'x :float 'out :float 'indices :int}
+                   :scalar-types {'n :long}}
+          normalized (frontend/normalize-source (list 'let* ['result expression] 'result)
+                                                options)
+          bindings (second normalized)
+          program (frontend/form->program normalized options)
+          equations (dialect/equations program)]
+      (if (= cast 'int)
+        (do (is (= '(int n) (second bindings)))
+            (is (= 'int (:tag (meta (first bindings)))))
+            (is (= 'scalar (dialect/operation-kind (first equations)))))
+        (is (= 'n (nth (second bindings) 4))))
+      (is (some? program) (str (first operation) " / " cast)))))
+
 (deftest equal-sizes-spelled-through-host-bindings-are-one-extent
   ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`
   ;; over `y = (float-array n)` is `n`. Without those identities the buffer `y` would receive

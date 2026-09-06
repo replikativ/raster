@@ -46,6 +46,31 @@
   [out :- (Array long) state :- Long n :- Long] :- (Array long)
   (raster.par/map! out i n long (unchecked-add state (long i))))
 
+(deftm ocl-session-checked-count
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/map! out i (int n) float (ra/aget x i)))
+
+(deftest public-checked-count-refuses-overflow-before-allocation
+  (let [descriptor (pl/compile-gpu-program #'ocl-session-checked-count :ocl:0 :dtype :float)
+        bound (last (:argument-specs (first (:steps descriptor))))]
+    (is (= :int (:type bound)))
+    (is (= 3 ((:value-fn bound) [nil nil 3])))
+    (doseq [n [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]]
+      (is (thrown? ArithmeticException ((:value-fn bound) [nil nil n]))))))
+
+(deftest ocl-public-checked-count-roundtrip
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "public checked-count map")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-checked-count :ocl:0 :dtype :float)
+          s (gpu/make-session :ocl:0)
+          arguments [(float-array [3 5 7]) (float-array 3) (long 3)]]
+      (try
+        (let [program (fixture/instantiate! s descriptor arguments)]
+          (try
+            (is (= [3.0 5.0 7.0] (vec (get (fixture/run! program arguments) 'out))))
+            (finally (fixture/close! program))))
+        (finally (gpu/close-session! s))))))
+
 (deftest public-compiler-entry-points-preserve-declared-long-scalars
   (let [emitted (equation-first/compile #'ocl-session-long-state
                                        {:target :ocl:0 :dtype :float})
