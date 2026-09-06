@@ -142,6 +142,15 @@ checked narrowing. Public equation-first, resident and session paths are tested 
 and wrapping arithmetic. The active-ID prototype remains unshipped until its checked int count
 conversion is also retained; this prerequisite alone does not retire that kernel.
 
+The next prerequisite distinguishes shape-value equality from unchecked cast erasure. Source
+normalization removes integral identity/widening casts only when retained types prove them safe;
+narrowing and unknown conversions remain scalar equations. Relational extent canonicalization
+must not subsequently erase the same check. A public checked count is evaluated by the resident
+descriptor before driver contact; horizontal fusion retains the scalar equation ahead of its
+combined launch, and inactive host branches do not evaluate their local count. This does not yet
+repair convenience operations that unconditionally unwrap counts or prove every compiler pass
+preserves checked conversions.
+
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.

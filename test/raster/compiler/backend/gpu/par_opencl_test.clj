@@ -1,5 +1,6 @@
 (ns raster.compiler.backend.gpu.par-opencl-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.reference.indexed-transfer-opencl :as indexed-reference]
@@ -180,6 +181,56 @@
         (when (= 'raster.par/scatter! op)
           (is (= :reducing-scatter (get-in artifact [:effects :kind])))
           (is (= :inout (:kind (first (filter #(= 'out (:name %)) (:abi artifact)))))))))))
+
+(deftest checked-extent-survives-horizontal-fusion-before-submission
+  (let [source '(let* [a (raster.par/map! left i (int n) float (+ (aget x i) 1.0))
+                       b (raster.par/map! right j (int n) float (* (aget x j) 2.0))]
+                      [a b])
+        emitted (opencl-pass/opencl-pass
+                 source :min-elements 0 :dtype :float
+                 :array-types {'x :float 'left :float 'right :float}
+                 :scalar-types {'n :long})
+        ;; Clojure's evaluator rejects an int hint on an already primitive initializer;
+        ;; Raster's bytecode emitter accepts it. Remove only that evaluator hint, retaining
+        ;; every executable cast and the compiler's own type facts.
+        host-form (walk/postwalk
+                   #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                   (walk/postwalk-replace
+                    {'raster.gpu.ze-runtime/invoke-registered-map-void-kernel 'submit!}
+                    (:form emitted)))
+        execute (eval (list 'fn '[submit! n x left right] host-form))
+        submissions (atom 0)
+        submit! (fn [& _] (swap! submissions inc))]
+    (is (= 1 (get-in emitted [:stats :direct-scheduling :horizontal])))
+    (is (= 1 (get-in emitted [:stats :direct-scheduling :typed-scalar-equations])))
+    (is (= 1 (count (:kernels emitted))))
+    (execute submit! 3 nil nil nil)
+    (is (= 1 @submissions))
+    (reset! submissions 0)
+    (doseq [n [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]]
+      (is (thrown? ArithmeticException (execute submit! n nil nil nil))))
+    (is (zero? @submissions) "the retained checked conversion runs before any kernel call")))
+
+(deftest inactive-host-branch-does-not-evaluate-its-checked-count
+  (let [emitted (opencl-pass/opencl-pass
+                 '(if enabled
+                    (let* [^int count (int n)
+                           result (raster.par/map! out i count float (aget x i))]
+                          result)
+                    nil)
+                 :min-elements 0 :dtype :float
+                 :array-types {'x :float 'out :float}
+                 :scalar-types {'n :long 'enabled :boolean})
+        host-form (walk/postwalk
+                   #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                   (walk/postwalk-replace
+                    {'raster.gpu.ze-runtime/invoke-registered-kernel 'submit!}
+                    (:form emitted)))
+        execute (eval (list 'fn '[submit! enabled n x out] host-form))
+        submit! (fn [& _] (throw (AssertionError. "unexpected submission")))]
+    (is (nil? (execute submit! false nil nil nil)))
+    (is (thrown? ArithmeticException
+                 (execute submit! true (inc (long Integer/MAX_VALUE)) nil nil)))))
 
 (deftest strided-transfer-retained-programs-do-not-reenter-source-lowering
   (doseq [op '[raster.par/gather raster.par/scatter!]]
