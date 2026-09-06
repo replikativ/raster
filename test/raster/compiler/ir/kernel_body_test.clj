@@ -11,6 +11,33 @@
 (def ^:private lhs-layout (layout/dot-operand 0 acc-layout 2 :half))
 (def ^:private rhs-layout (layout/dot-operand 1 acc-layout 2 :half))
 
+(deftest concrete-launches-must-fit-the-declared-hardware-index-width
+  (doseq [[source dimension accepted rejected]
+          [[:group :group-count (inc (long Integer/MAX_VALUE)) (+ 2 (long Integer/MAX_VALUE))]
+           [:group-count :group-count (long Integer/MAX_VALUE) (inc (long Integer/MAX_VALUE))]
+           [:local :workgroup-size (inc (long Integer/MAX_VALUE)) (+ 2 (long Integer/MAX_VALUE))]
+           [:subgroup :workgroup-size (inc (long Integer/MAX_VALUE)) (+ 2 (long Integer/MAX_VALUE))]
+           [:lane :workgroup-size (inc (long Integer/MAX_VALUE)) (+ 2 (long Integer/MAX_VALUE))]]]
+    (let [index (body/->IndexBinding 'hardware-index source 0)
+          kernel (body/make {:id :index-range :indices [index]
+                             :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+          geometry #(launch/geometry (assoc {:workgroup-size [1] :group-count [1]}
+                                            dimension [%]))]
+      (is (= (geometry accepted)
+             (body/validate-launch-index-ranges! kernel (geometry accepted))))
+      (try
+        (body/validate-launch-index-ranges! kernel (geometry rejected))
+        (is false (str source " must not overflow int hardware indices"))
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :kernel-launch-index-range (:reason (ex-data e))))))))
+  (let [kernel (body/make {:id :lane-range :indices [(body/->IndexBinding 'lane :lane 0)]
+                           :launch (launch/spec {:workgroup-size [1 1 1] :group-count [1 1 1]})})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hardware index representation"
+                         (body/validate-launch-index-ranges!
+                          kernel (launch/geometry {:workgroup-size [2147483648 2147483648 4]
+                                                   :group-count [1 1 1]})))
+        "the proof product must not overflow host arithmetic")))
+
 (defn- minimal-body []
   (body/make
    {:id :matrix

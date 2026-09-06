@@ -20,6 +20,10 @@ vertical. The north star remains the architectural specification.
   production selection; those obligations remain explicit.
 - Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
 - Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
+- Before widening public dimension support, bind concrete launch geometry to KernelBody's int
+  hardware-index representation, including scheduler overrides and compatibility staging. Logical
+  Long dimensions must not silently overflow group/local indices; target resource limits remain
+  a separate, potentially stricter contract.
 - Select the certified body and delete the old product algorithm emitter once its coverage is
   replaced. Keep necessary target instruction lowering.
 
