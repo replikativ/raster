@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as reference]
+            [raster.compiler.reference.product-opencl :as product-oracle]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
@@ -109,7 +110,7 @@
 (deftest row-product-emits-through-shared-target-pipeline
   (let [segred (argmax-segred)
         scheduled (product/schedule segred options)
-        old (reference/generate-product-reduction-kernel segred
+        old (product-oracle/generate-product-reduction-kernel segred
               :scalar-types (:scalar-types options) :array-types (:array-types options))]
     (is (= segred (:source scheduled)))
     (is (= [:float :int] (get-in scheduled [:body :attributes :component-dtypes])))
@@ -241,7 +242,7 @@
   (doseq [materialize-value? [false true]
           dialect [:opencl-portable :cuda :hip]]
     (let [{:keys [graph algorithm body]} (graph-context false nil nil nil materialize-value?)
-          emitted (with-redefs [reference/generate-product-reduction-kernel
+          emitted (with-redefs [product-oracle/generate-product-reduction-kernel
                                 (fn [& _] (throw (ex-info "legacy product emitter reached" {})))]
                     (reference/generate-kernel-graph
                      graph :target-dialect dialect

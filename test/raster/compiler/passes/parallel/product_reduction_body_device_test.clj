@@ -2,7 +2,7 @@
   "Differential execution of the candidate and retained product schedule on OpenCL."
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
-            [raster.compiler.backend.gpu.segop-opencl :as reference]
+            [raster.compiler.reference.product-opencl :as product-oracle]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
             [raster.compiler.passes.parallel.product-reduction-body-test :as fixtures]
@@ -29,7 +29,7 @@
           read! (ns-resolve runtime 'buffer->array)
           free! (ns-resolve runtime 'free-buffer!)
           segred (fixtures/argmax-segred)
-          old (reference/generate-product-reduction-kernel segred
+          old (product-oracle/generate-product-reduction-kernel segred
                 :scalar-types (:scalar-types fixtures/options)
                 :array-types (:array-types fixtures/options))
           retained-options (dissoc fixtures/options :element-binding-types :combine-binding-types)

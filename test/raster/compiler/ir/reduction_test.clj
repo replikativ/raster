@@ -1,7 +1,7 @@
 (ns raster.compiler.ir.reduction-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
-            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.reference.product-opencl :as product-oracle]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.par :as par-ir]
             [raster.compiler.ir.reduction :as reduction]
@@ -40,7 +40,7 @@
   (let [form (apply list (assoc-in (vec argmax-product-form) [2 1 1] neutral))
         node (soac/par-form->soac '_ form 7 :dtype :float)
         scheduled (first (soac-lower/lower-soac node :cpu:0 :dtype :float))]
-    (:source (segop-opencl/generate-product-reduction-kernel
+    (:source (product-oracle/generate-product-reduction-kernel
                scheduled :scalar-types {'nrows :int 'width :int}
                :array-types {'values :float}))))
 
@@ -81,7 +81,7 @@
         ;; Both initial schedule construction and emission of a changed retained operator must
         ;; check the same contract; callers cannot bypass it with an already-built schedule.
         (doseq [attempt [#(soac-lower/lower-soac (assoc node :reduction operator) :cpu:0 :dtype :float)
-                         #(segop-opencl/generate-product-reduction-kernel
+                         #(product-oracle/generate-product-reduction-kernel
                            (assoc scheduled :reduction operator)
                            :scalar-types {'nrows :int 'width :int}
                            :array-types {'values :float})]]
@@ -122,7 +122,7 @@
         (is (= (* 8 (get-in scheduled [:grid :block-size]))
                (get-in scheduled [:grid :shared-mem-bytes])))
         (testing "the portable target leaf emits a mixed-dtype workgroup tree"
-          (let [artifact (segop-opencl/generate-product-reduction-kernel
+          (let [artifact (product-oracle/generate-product-reduction-kernel
                           scheduled
                           :scalar-types {'nrows :int 'width :int}
                           :array-types {'values :float})
@@ -146,7 +146,7 @@
     (testing "a computed reduction bound survives into target source"
       (let [scheduled (-> (first (soac-lower/lower-soac node :cpu:0 :dtype :float))
                           (assoc-in [:space :dims 1 :bound] '(- width 1)))
-            source (:source (segop-opencl/generate-product-reduction-kernel
+            source (:source (product-oracle/generate-product-reduction-kernel
                              scheduled
                              :scalar-types {'nrows :int 'width :int}
                              :array-types {'values :float}))]
