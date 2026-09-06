@@ -178,6 +178,14 @@ fan-out producer. Sole-consumer elimination still needs no cost estimate. The wi
 versioned; production typed-route tests retain both materialized consumers with an explicit reason.
 This is price admission, not a new fusion legality proof or a bounded specialization cache.
 
+An observable-result audit found a separate compatibility-boundary bug: horizontally fused stored
+maps submit through an effect-only kernel convention, but their source bindings still return
+buffers. Returning the submission's nil value lost the first host alias despite correct device
+writes. Typed materialization now emits one effect binding followed by every source buffer alias
+as a flat binding; resident extraction needs no new nested-call convention. Effect-only source
+maps remain nil. Tests check the public resident descriptor, buffer identity and CPU OpenCL values,
+alongside retained checked-count rejection. Kernel ABI, launch count and fusion legality are unchanged.
+
 Exit: representative scientific and model expressions compile with explained fusion/placement
 choices, differential correctness, and measured kernel/allocation/compile-cost changes.
 
