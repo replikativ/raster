@@ -7,6 +7,7 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
@@ -23,10 +24,15 @@
                                  #(if (seq? %) (with-meta % {:tag 'long}) %) coordinate))))]
     (apply list form)))
 
+(defn- small-workgroup [segred]
+  (-> segred
+      (assoc-in [:schedule :workgroup-size] 32)
+      (assoc-in [:grid :block-size] 32)
+      (assoc-in [:grid :shared-mem-bytes] 256)))
+
 (defn argmax-segred []
   (let [node (soac/par-form->soac '_ (argmax-form) 7 :dtype :float)]
-    (assoc-in (first (soac-lower/lower-soac node :cpu:0 :dtype :float))
-              [:schedule :workgroup-size] 32)))
+    (small-workgroup (first (soac-lower/lower-soac node :cpu:0 :dtype :float)))))
 
 (def options
   {:array-types {'values :float}
@@ -52,8 +58,7 @@
                  (list 'let* ['effect (apply list form)] 'effect)
                  {:dtype :float :array-types {'values :float 'indices :int}
                   :scalar-types (:scalar-types options)})]
-    (assoc-in (first (soac-lower/lower-typed-product-reduce program :cpu:0 :dtype :float))
-              [:schedule :workgroup-size] 32)))
+    (small-workgroup (first (soac-lower/lower-typed-product-reduce program :cpu:0 :dtype :float)))))
 
 (defn typed-local-address-segred []
   (let [segred (typed-argmax-segred)
@@ -140,3 +145,41 @@
       (is false "unretained compound address widths must not be guessed")
       (catch clojure.lang.ExceptionInfo e
         (is (= :index-expression (:missing-rule (ex-data e))))))))
+
+(deftest source-product-grid-is-the-actual-segment-schedule
+  (doseq [source [(argmax-segred) (typed-argmax-segred)]]
+    (is (= 'nrows (get-in source [:grid :num-blocks])))
+    (doseq [[field bad] [[:num-blocks 'width] [:block-size 64] [:shared-mem-bytes 128]]]
+      (try
+        (product/schedule (assoc-in source [:grid field] bad) options)
+        (is false (str "contradictory grid " field " must decline"))
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :source-grid (:missing-rule (ex-data e)))))))))
+
+(deftest source-refinement-is-replayed-not-asserted-by-a-candidate-label
+  (let [source (typed-argmax-segred)
+        options (dissoc options :element-binding-types :combine-binding-types)
+        candidate (product/schedule source options)]
+    (is (= candidate (product/validate-source! candidate source options)))
+    (doseq [forged [(assoc-in candidate [:numerics :policy] :different-tree)
+                    (assoc-in candidate [:body :operations 0 :upper]
+                              (body/index-cast 0 :long :exact))
+                    (assoc-in candidate [:body :operations 0 :iter-args 1 :initial]
+                              (body/literal 0 :int))]]
+      (try
+        (product/validate-source! forged source options)
+        (is false "a well-typed but different computation must not retain the source witness")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :source-refinement (:missing-rule (ex-data e)))))))
+    (try
+      (product/validate-source! candidate (assoc source :id :other-equation) options)
+      (is false "a caller-supplied source, not the candidate's own label, closes identity")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :source-identity (:missing-rule (ex-data e))))))
+    (try
+      (product/validate-source!
+       candidate source
+       (assoc-in options [:array-shapes 'values] [(launch/sum (launch/product 'nrows 'width) 1)]))
+      (is false "changed independent storage facts require a different refinement")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :source-refinement (:missing-rule (ex-data e))))))))

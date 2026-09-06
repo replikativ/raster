@@ -462,6 +462,11 @@ certificate (`:source-storage-certified? false`); exact graph/source/body storag
 added before selection. Zero-row calls retain the existing zero-group rejection and need planner
 elision; zero-width rows produce the neutral tuple. Next: close those obligations over the public
 TypedSOAC route, switch only certified candidates, then delete the retained source emitter.
+The retained product `KernelGrid` now describes its actual segment-count launch and tuple scratch,
+not the scalar width-reduction grid formerly used only to seed workgroup sizing. The candidate
+checks that grid against the selected tree. `validate-source!` additionally replays the body and
+ABI refinement against an independently supplied SegRed; neither check substitutes for the pending
+graph/storage proof.
 
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable

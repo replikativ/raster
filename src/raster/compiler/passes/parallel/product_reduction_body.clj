@@ -58,6 +58,12 @@
                                                      combine-binding-types)
         types (mapv :dtype components)
         wg (:workgroup-size source-schedule)
+        scratch-bytes (* wg (reduce + (map dtype/bytes-of types)))
+        expected-grid {:num-blocks rows :block-size wg :shared-mem-bytes scratch-bytes}
+        _ (when-not (= expected-grid (select-keys (:grid segred) (keys expected-grid)))
+            (decline! :source-grid
+                      "product source grid must agree with its segment launch and tuple scratch"
+                      {:expected expected-grid :actual (:grid segred)}))
         inputs (vec (sort-by name (:inputs segred)))
         outputs (vec (keep :result components))
         scalars (vec (sort-by name (set/union (set (:scalars segred))
@@ -185,7 +191,7 @@
                   [(body/->Yield [])] [])]))
           :schedule {:strategy :product-workgroup-tree :workgroup-size wg}
           :launch (launch/spec {:workgroup-size [wg] :group-count [(launch/runtime-value '_n_bound)]
-                                :shared-memory-bytes (* wg (reduce + (map dtype/bytes-of types)))})
+                                :shared-memory-bytes scratch-bytes})
           :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
           :attributes {:kind :product-reduction :component-dtypes types}})]
     {:kernel-body kernel-body :rows rows :inputs inputs :outputs outputs :scalars scalars}))
@@ -207,3 +213,20 @@
                                      (:components (:reduction segred)))}
       :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
       :attributes {:candidate-only true :source-storage-certified? false}})))
+
+(defn validate-source!
+  "Replay the deterministic body refinement against an independently retained SegRed.
+
+   This closes source, schedule, scalar/effect ABI and tuple evaluation correspondence. It is
+   deliberately not a storage-capacity proof: options still carry the caller's storage extents.
+   Production selection additionally needs the exact enclosing graph/storage certificate."
+  [candidate source options]
+  (scheduled/validate! candidate)
+  (when-not (= source (:source candidate))
+    (decline! :source-identity "product candidate does not retain the supplied source" {}))
+  (let [expected (schedule source options)]
+    (when-not (= expected candidate)
+      (decline! :source-refinement
+                "product body or contracts differ from the retained source refinement"
+                {:source (:id source)})))
+  candidate)
