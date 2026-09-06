@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.ocl-runtime :as ocl]
@@ -24,6 +25,32 @@
 
 (def ^:private args
   [:resident-x :resident-out {:type :float :value 2.0} {:type :int :value 513}])
+
+(deftest scheduled-call-overrides-cannot-overflow-hardware-indices
+  (let [kernel (body/make
+                {:id :range-check
+                 :parameters [(body/->KernelParameter 'n :scalar :int [] nil nil :bound)]
+                 :indices [(body/->IndexBinding 'group :group 0)]
+                 :launch (:launch artifact)})
+        scheduled-artifact (assoc-in artifact [:attributes :kernel-body] kernel)]
+    (is (kcall/kernel-call? (kcall/make scheduled-artifact args)))
+    (is (kcall/kernel-call?
+         (kcall/make scheduled-artifact args {:group-count [(inc (long Integer/MAX_VALUE))]})))
+    (try
+      (kcall/make scheduled-artifact args {:group-count [(+ 2 (long Integer/MAX_VALUE))]})
+      (is false "a scheduling override must not bypass the body's physical index width")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :kernel-launch-index-range (:reason (ex-data e))))))
+    (let [large-launch (klaunch/spec {:workgroup-size [256]
+                                      :group-count [(klaunch/product 'n 10000000)]})
+          large-artifact (-> scheduled-artifact
+                             (assoc :launch large-launch)
+                             (assoc-in [:attributes :kernel-body :launch] large-launch))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hardware index representation"
+                           (kcall/realize-launch large-artifact args))
+          "compatibility staging checks before allocating partial storage")
+      (is (kcall/kernel-call? (kcall/make large-artifact args {:group-count [1]}))
+          "a legal explicit override is checked instead of the unused default geometry"))))
 
 (def ^:private stable-artifact
   (kart/make (assoc-in artifact [:abi 0 :aliasing] :no-write-alias)))

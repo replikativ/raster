@@ -2413,3 +2413,26 @@
          operations [] schedule {} launch {} provenance {} attributes {}}}]
   (validate! (->KernelBody id parameters views stable-reads allocations indices masks fragments
                            operations schedule launch provenance attributes)))
+
+(defn validate-launch-index-ranges!
+  "Check the physical ranges of a verified body's hardware bindings at concrete launch time.
+
+   IndexBinding currently has canonical dtype int. A long logical extent does not widen the
+   hardware index representation. This cheap binding check does not rerun body verification and
+   is independent of target limits, which may impose stricter resource constraints."
+  [kernel-body geometry]
+  (let [{:keys [workgroup-size group-count]} (launch/validate-geometry! geometry)
+        workgroup-items (reduce *' 1 workgroup-size)]
+    (doseq [index (:indices kernel-body)
+            :when (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" index)]
+      (let [upper (case (:source index)
+                    :group (dec (nth group-count (:axis index)))
+                    :group-count (nth group-count (:axis index))
+                    :local (dec (nth workgroup-size (:axis index)))
+                    ;; Without a target subgroup width, the workgroup bounds both values.
+                    (:subgroup :lane) (dec workgroup-items))]
+        (when-not (scalar-range/contained-in-dtype? {:lower 0 :upper upper} :int)
+          (throw (ex-info "kernel launch exceeds its hardware index representation"
+                          {:reason :kernel-launch-index-range :index index :dtype :int
+                           :upper upper :geometry geometry}))))))
+  geometry)

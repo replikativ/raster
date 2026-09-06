@@ -12,6 +12,16 @@
 
 (defrecord KernelCall [artifact arguments geometry])
 
+;; Artifact-only runtime clients need not load the compiler's full body vocabulary. Cache the Var,
+;; not its root function, so a REPL reload still updates the validator used by subsequent calls.
+(def ^:private body-launch-validator
+  (delay (requiring-resolve 'raster.compiler.ir.kernel-body/validate-launch-index-ranges!)))
+
+(defn- validate-body-launch! [artifact geometry]
+  (when-let [kernel-body (get-in artifact [:attributes :kernel-body])]
+    (@body-launch-validator kernel-body geometry))
+  geometry)
+
 (defn kernel-call?
   "Recognize executable calls across Typed Clojure's child DynamicClassLoaders."
   [x]
@@ -199,6 +209,7 @@
                       {:kernel-name (:kernel-name artifact)
                        :expected (:shared-memory-bytes spec)
                        :actual (:shared-memory-bytes geometry)})))
+    (validate-body-launch! artifact geometry)
     (doseq [[slot value] (map vector abi arguments)]
       (if (= :scalar (:kind slot))
         (scalar-value! slot value)
@@ -244,8 +255,9 @@
    the caller's responsibility and KernelCall performs them for resident execution."
   [artifact arguments]
   (let [artifact (kart/validate! artifact)
-        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
-    (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))))
+        arguments (kabi/validate-arguments! (:abi artifact) arguments)
+        geometry (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))]
+    (validate-body-launch! artifact geometry)))
 
 (defn resolve-value
   "Resolve one compiler value through a checked call's artifact/runtime argument relation. This
@@ -272,9 +284,9 @@
                    :when (= :scalar (:kind slot))]
              (scalar-value! slot value))
          resolver (or resolve-value (argument-resolver artifact arguments))
-         realized (if resolve-value
-                    (klaunch/realize (:launch artifact) resolver)
-                    (realize-launch artifact arguments))
+         ;; An override replaces the group vector; check its final geometry below, not the
+         ;; unused default grid. Staging callers of realize-launch have no such override.
+         realized (klaunch/realize (:launch artifact) resolver)
          geometry (if group-count
                     (klaunch/geometry
                      {:workgroup-size (:workgroup-size realized)
