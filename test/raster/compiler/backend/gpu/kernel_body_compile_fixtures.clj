@@ -32,6 +32,10 @@
             [raster.quant.kernels-k :as qk]
             [raster.runtime.hardware :as hardware]))
 
+(deftm public-c-family-long-state
+  [out :- (Array long) state :- Long n :- Long] :- (Array long)
+  (raster.par/map! out i n long (unchecked-add state (long i))))
+
 (deftm public-c-family-dot
   "Public equation-first workload compiled by nvcc/hipcc without a physical device."
   (All [T] [left :- (Array T) right :- (Array T) n :- Long] :- Double
@@ -253,6 +257,8 @@
      (concat
       (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-long-state {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-arrays/argmax-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
