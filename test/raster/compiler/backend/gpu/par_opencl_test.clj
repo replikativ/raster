@@ -351,13 +351,60 @@
             result (opencl-pass/opencl-pass
                     form :device-id device :dtype :float
                     :array-types {'state :int 'x :float 'y :float}
-                    :scalar-types {'limit :int 'scale :float})
-            marker (:form result)
+                    :scalar-types {'limit :int 'scale :float 'n :int})
+            marker (some #(when (and (seq? %) (= expected-head (first %))) %)
+                         (tree-seq coll? seq (:form result)))
             abi (:abi (first (:kernels result)))]
         (is (= expected-head (first marker)))
         (is (= (kabi/pointer-binding-names abi) (nth marker 2)))
         (is (= '[limit scale] (nth marker 3)))
         (is (= 'n (nth marker 4)))))))
+
+(deftest nested-effect-maps-use-typed-scheduling-at-their-host-position
+  (with-redefs [par-opencl/generate-par-map-void-kernel
+                (fn [& _] (throw (ex-info "legacy effect emitter reached" {})))]
+    (let [emitted (opencl-pass/opencl-pass
+                   '(if enabled (raster.par/map-void! i (int n) (aset out i (aget x i))) nil)
+                   :dtype :float :min-elements 0
+                   :array-types {'out :float 'x :float}
+                   :scalar-types {'n :long 'enabled :boolean})
+          host (walk/postwalk
+                 #(if (symbol? %) (vary-meta % dissoc :tag) %)
+                 (walk/postwalk-replace
+                  {'raster.gpu.ze-runtime/invoke-registered-map-void-kernel 'submit!}
+                  (:form emitted)))
+          execute (eval (list 'fn '[submit! enabled n x out] host))
+          calls (atom 0)
+          submit! (fn [& _] (swap! calls inc) nil)]
+      (is (= [:kernel-body] (mapv kart/emission-route (:kernels emitted))))
+      (is (nil? (execute submit! false nil nil nil)))
+      (is (thrown? ArithmeticException
+                   (execute submit! true (inc (long Integer/MAX_VALUE)) nil nil)))
+      (is (zero? @calls))
+      (is (nil? (execute submit! true 3 (float-array 3) (float-array 3))))
+      (is (= 1 @calls)))))
+
+(deftest literal-small-effect-maps-preserve-the-host-fallback
+  (with-redefs [par-opencl/generate-par-map-void-kernel
+                (fn [& _] (throw (ex-info "unexpected GPU source emission" {})))]
+    (let [emitted (opencl-pass/opencl-pass '(raster.par/map-void! i 2 (println i))
+                                         :dtype :float :min-elements 4096)]
+      (is (empty? (:kernels emitted)))
+      (is (= 1 (get-in emitted [:stats :fallback])))
+      (is (= "0\n1\n" (with-out-str (is (nil? (eval (:form emitted))))))))))
+
+(deftest declined-raw-effect-scheduling-is-reported-once
+  (let [attempts (atom 0)]
+    (with-redefs [segop-lower/schedule-single-program (fn [& _] (swap! attempts inc) {})]
+      (let [emitted (opencl-pass/opencl-pass
+                     '(if enabled (raster.par/map-void! i n (aset out i (aget x i))) nil)
+                     :dtype :float :min-elements 0
+                     :array-types {'out :float 'x :float}
+                     :scalar-types {'n :int 'enabled :boolean})]
+        (is (= 1 @attempts))
+        (is (= 1 (get-in emitted [:stats :effect-compatibility])))
+        (is (= [:compatibility-effect-opencl]
+               (mapv kart/emission-route (:kernels emitted))))))))
 
 (deftest opencl-pass-fallback-test
   (testing "Small arrays fall back to scalar expansion"
