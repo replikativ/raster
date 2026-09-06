@@ -512,11 +512,15 @@
                                       (if (== 1 (aget alive i))
                                         (aset output i (float 1.0))
                                         (aset output i (float 0.0))))
-          result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)]
+          result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false
+                                          :array-types {'alive :int 'output :float}
+                                          :scalar-types {'n :int})]
       (is (seq (:kernels result))
           "Should generate at least one kernel")
       (when (seq (:kernels result))
         (let [src (:source (first (:kernels result)))]
           (is (string? src) "Kernel source should be a string")
           (is (.contains ^String src "__kernel") "Should contain __kernel")
-          (is (.contains ^String src "if") "Should contain if statement"))))))
+          (is (= :kernel-body (get-in result [:kernels 0 :attributes :emission-route])))
+          (is (.contains ^String src "?")
+              "the typed value conditional lowers to a scalar selection"))))))

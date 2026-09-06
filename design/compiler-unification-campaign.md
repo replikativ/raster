@@ -182,6 +182,10 @@ need their own typed closure. The independent source-emitter tests remain unchan
 An explicit logical-SoA guard precedes plain-array scheduling: the typed frontend can otherwise
 accept the container as one float pointer rather than decline. Bare, conditional and let-bound probes
 retain the existing per-field dtypes, names and grouped logical binding through the source adapter.
+Unscheduled effects within partially scheduled source programs also retain that reported adapter:
+introducing leaf-local lets after emission breaks flat resident extraction, and alpha-renaming
+only the host form would disconnect its artifact argument plan. Semantic-stage composition tests
+exercise this boundary. Complete host-region normalization must precede emission before retiring it.
 
 ## 3. General fusion and bounded specialization — price admission active; broader work queued
 

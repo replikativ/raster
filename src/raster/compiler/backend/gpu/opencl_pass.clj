@@ -910,8 +910,12 @@
                                 :array-types top-array-types)
                       k (register-kernel! kernel :ze-maps)]
                     (emit-map-void-invocation k device-id))
+                  ;; A partially scheduled source program still needs a flat resident marker.
+                  ;; Re-scheduling just this binding would introduce private scalar lets after
+                  ;; graph/ABI formation. Keep that explicit compatibility boundary until the
+                  ;; whole host region can be normalized before emission.
                   (if (and (not supplied-program)
-                           (or direct-mini-program? (unlowered-soa-effect? form)))
+                           (or direct-mini-program? parallel-program (unlowered-soa-effect? form)))
                     (let [kernel (legacy/generate-par-map-void-kernel
                                   form :dtype dtype :device-id device-id
                                   :array-types top-array-types :scalar-types top-scalar-types)
