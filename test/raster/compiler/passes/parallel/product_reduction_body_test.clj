@@ -9,6 +9,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
@@ -45,7 +46,7 @@
    :element-binding-types {'candidate :float}
    :combine-binding-types {'left-nan :int 'right-nan :int 'better :int}})
 
-(defn- typed-argmax-program [values]
+(defn- typed-argmax-program [values & [scalar-types]]
   (let [tag-bindings (fn [bindings dtypes]
                        (vec (mapcat (fn [[id init]]
                                       [(with-meta id {:raster.type/tag
@@ -61,22 +62,27 @@
         program (frontend/form->program
                  (list 'let* ['effect (apply list form)] 'effect)
                  {:dtype :float :array-types {'values :float 'indices :int}
-                  :values values :scalar-types (:scalar-types options)})]
+                  :values values :scalar-types (or scalar-types (:scalar-types options))})]
     program))
 
-(defn typed-argmax-segred []
-  (small-workgroup
-   (first (soac-lower/lower-typed-product-reduce (typed-argmax-program {}) :cpu:0 :dtype :float))))
+(defn typed-argmax-segred
+  ([] (typed-argmax-segred (:scalar-types options)))
+  ([scalar-types]
+   (small-workgroup
+    (first (soac-lower/lower-typed-product-reduce
+            (typed-argmax-program {} scalar-types) :cpu:0 :dtype :float)))))
 
-(defn typed-local-address-segred []
-  (let [segred (typed-argmax-segred)
+(defn typed-local-address-segred
+  ([] (typed-local-address-segred (:scalar-types options)))
+  ([scalar-types]
+  (let [segred (typed-argmax-segred scalar-types)
         ;; Use the semantic reduction index, not a spelling inferred from generated code.
         index (get-in segred [:reduction :index])]
     (update-in segred [:reduction :element :bindings]
                (fn [bindings]
                  (into [(with-meta 'offset {:raster.type/tag 'long}) (list 'long index)]
                        (mapcat (fn [[id init]] [id (util/subst-syms {index 'offset} init)])
-                               (partition 2 bindings)))))))
+                               (partition 2 bindings))))))))
 
 (deftest typed-product-projection-retains-local-types-without-caller-reconstruction
   (let [segred (typed-argmax-segred)
@@ -192,11 +198,12 @@
       (catch clojure.lang.ExceptionInfo e
         (is (= :source-refinement (:missing-rule (ex-data e))))))))
 
-(defn- graph-context [known-input? & [input-options output-options]]
-  (let [algorithm (typed-argmax-program
+(defn- graph-context [known-input? & [input-options output-options scalar-types]]
+  (let [scalar-types (or scalar-types (:scalar-types options))
+        algorithm (typed-argmax-program
                    (if known-input?
                      {'values (av/tensor {:dtype :float :shape ['nrows 'width]})}
-                     {}))
+                     {}) scalar-types)
         ;; Model a compiler-generated typed program as well as the analyzed-source frontend,
         ;; which already declines non-plain aget storage before this boundary.
         algorithm (if input-options
@@ -214,7 +221,7 @@
                           (route/program-envelope algorithm)
                           {:dtype :float :target-device :cpu:0
                            :array-types (:array-types options)
-                           :scalar-types (:scalar-types options)}))
+                           :scalar-types scalar-types}))
         equation (first (:equations scheduled))
         {:keys [graph body]} (equation-graph/make-for-equation scheduled equation)]
     {:algorithm (:algorithm equation) :body body :graph graph :node (first (:nodes graph))}))
@@ -280,3 +287,39 @@
       (is false "a retained but unrelated output capacity does not establish the row write contract")
       (catch clojure.lang.ExceptionInfo e
         (is (= :graph-output-storage (:missing-rule (ex-data e))))))))
+
+(deftest long-logical-dimensions-retain-their-abi-width
+  (let [{:keys [algorithm body graph node]}
+        (graph-context true nil nil {'nrows :long 'width :long})
+        derived (product/graph-options node graph algorithm body)
+        candidate (product/schedule (:operation node) derived)]
+    (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
+    (is (= #{:long} (set (map :dtype (:scalar-bindings candidate)))))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [artifact (target/emit-artifact "long_product" candidate dialect)]
+        (is (= [:long :long :long]
+               (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi artifact)))))))
+    (is (= :long (get-in candidate [:body :operations 0 :index :type])))
+    (is (= :int (get-in candidate [:body :parameters 1 :dtype]))
+        "dimension width does not change the winning-index component representation")
+    (let [artifact (target/emit-artifact "long_product_range" candidate :opencl-portable)
+          bindings {'values :input 'indices :output
+                    'nrows {:type :long :value (+ 2 (long Integer/MAX_VALUE))}
+                    'width {:type :long :value 1}}]
+      (try
+        (call/make artifact (mapv bindings (:arguments artifact)))
+        (is false "a long logical row count still needs representable physical group indices")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :kernel-launch-index-range (:reason (ex-data e)))))))))
+
+(deftest dimension-widths-are-independent
+  (doseq [[row-type width-type] [[:int :long] [:long :int]]]
+    (let [{:keys [algorithm body graph node]}
+          (graph-context true nil nil {'nrows row-type 'width width-type})
+          candidate (product/schedule (:operation node)
+                                      (product/graph-options node graph algorithm body))
+          artifact (target/emit-artifact "mixed_dimension_product" candidate :opencl-portable)]
+      (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
+      (is (= {'nrows row-type 'width width-type '_n_bound row-type}
+             (into {} (map (juxt :name :kernel-dtype))
+                   (filter #(= :scalar (:kind %)) (:abi artifact))))))))

@@ -38,8 +38,13 @@
                                    :opencl-portable)
           local (target/emit-artifact "candidate_product_local_address"
                                      (product/schedule (fixtures/typed-local-address-segred)
-                                                       retained-options) :opencl-portable)]
-      (doseq [artifact [old new local]] (register! (:kernel-name artifact) artifact))
+                                                       retained-options) :opencl-portable)
+          long-types {'nrows :long 'width :long}
+          wide (target/emit-artifact "candidate_product_long_dimensions"
+                                    (product/schedule (fixtures/typed-local-address-segred long-types)
+                                                      (assoc retained-options :scalar-types long-types))
+                                    :opencl-portable)]
+      (doseq [artifact [old new local wide]] (register! (:kernel-name artifact) artifact))
       (doseq [[nrows width] (cons [0 1] (map #(vector 5 %) [0 1 7 32 33 65]))]
         (let [rows (vec (take nrows [(vec (repeat width (float 2)))
                     (mapv #(float (mod % 7)) (range width))
@@ -53,9 +58,11 @@
                   (mapv (fn [artifact]
                           (let [output (buffer-of-array
                                         (int-array (repeat (max 1 nrows) -77)) :int)
+                                scalar-types (into {} (map (juxt :name :kernel-dtype))
+                                                   (filter #(= :scalar (:kind %)) (:abi artifact)))
                                 bindings {'values input 'indices output
-                                          'nrows {:type :int :value (count rows)}
-                                          'width {:type :int :value width}}]
+                                          'nrows {:type (get scalar-types 'nrows) :value (count rows)}
+                                          'width {:type (get scalar-types 'width) :value width}}]
                             (try
                               (if (zero? nrows)
                                 ;; Both routes reject zero-group launches. The planner must elide
@@ -67,7 +74,7 @@
                                 (execute! (bind-call (call/make artifact
                                                                (mapv bindings (:arguments artifact))))))
                               (vec (read! output))
-                              (finally (free! output))))) [old new local])]
+                              (finally (free! output))))) [old new local wide])]
               (is (apply = (cons (if (zero? nrows) [-77] (mapv argmax rows)) results))
                   (str "rows " nrows ", width " width)))
             (finally (free! input))))))))

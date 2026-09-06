@@ -9,17 +9,21 @@ vertical. The north star remains the architectural specification.
 - Landed #382: shared typed multi-result scalar-region lowering.
 - Landed #383: candidate row-product KernelBody, CPU OpenCL differential execution, CUDA/HIP
   compilation. Production still uses the retained source emitter.
-- Implemented in this slice: preserve TypedSOAC local dtypes through SegRed and subsequent
+- Landed #384: preserve TypedSOAC local dtypes through SegRed and subsequent
   scalar/index lowering; compare both direct and local-address candidates on CPU OpenCL.
-- Source closure follow-up: align the retained product KernelGrid with the segment-count launch,
+- Landed #385: align the retained product KernelGrid with the segment-count launch,
   validate scratch/workgroup agreement, and replay the body refinement against the retained source.
 - Certify the exact semantic source, storage boundaries and public bindings against the graph.
-- Graph correspondence follow-up derives product pointer contracts from the exact retained
+- Landed #386: derive product pointer contracts from the exact retained
   scheduled-equation projection, shared with fold-map. Unknown capacities and unlowered storage
   representations decline. This does not prove arbitrary indexed accesses in bounds or enable
   production selection; those obligations remain explicit.
 - Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
 - Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
+- Long-bound follow-up preserves independent row/column int or long facts through the public
+  scalar ABI and widened induction. CPU differential execution includes Long dimensions and
+  retained local addresses; CUDA/HIP fixtures compile the same candidate. This is still not the
+  production route, and zero-row elision and source access requirements remain open.
 - Before widening public dimension support, bind concrete launch geometry to KernelBody's int
   hardware-index representation, including scheduler overrides and compatibility staging. Logical
   Long dimensions must not silently overflow group/local indices; target resource limits remain
