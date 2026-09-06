@@ -186,6 +186,13 @@ as a flat binding; resident extraction needs no new nested-call convention. Effe
 maps remain nil. Tests check the public resident descriptor, buffer identity and CPU OpenCL values,
 alongside retained checked-count rejection. Kernel ABI, launch count and fusion legality are unchanged.
 
+Automatic Object-array element-class specialization now has a separate, explicit admission bound
+(default 32 attempts per generic function, configurable down to zero), with generic dispatch at
+capacity. One atomic claim owns each pending compilation, and clearing the cache revokes its old
+completion token. Failed/pending entries consume the budget too. This bounds this existing host
+specialization cache, not the number of functions, manually generated JVM classes, GPU shape
+variants or global compilation memory. It is not yet the shared cluster/resource admission policy.
+
 Exit: representative scientific and model expressions compile with explained fusion/placement
 choices, differential correctness, and measured kernel/allocation/compile-cost changes.
 

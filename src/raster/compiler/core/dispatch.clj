@@ -243,6 +243,39 @@
   "When true (default), deftm dispatch auto-specializes methods with Object[]."
   true)
 
+(def ^:dynamic *auto-specialization-limit*
+  "Maximum automatic element-class specializations retained per generic function (default 32).
+   Pending and failed attempts count toward the limit. At capacity dispatch uses its existing
+   generic method; zero disables new attempts. This does not bound manually compiled methods,
+   the number of generic functions, or total JVM classloader memory."
+  32)
+
+(defn- claim-specialization!
+  [cache-atom elem-class]
+  (let [limit *auto-specialization-limit*]
+    (when-not (and (integer? limit) (<= 0 limit))
+      (throw (ex-info "automatic specialization limit must be a nonnegative integer"
+                      {:reason :auto-specialization-limit :limit limit})))
+    (loop []
+      (let [entries @cache-atom
+            claim (Object.)]
+        (cond
+          (contains? entries elem-class) nil
+          (<= limit (count entries)) nil
+          (compare-and-set! cache-atom entries
+                            (assoc entries elem-class {:fn nil :pending? true :claim claim})) claim
+          :else (recur))))))
+
+(defn- complete-specialization!
+  [cache-atom elem-class claim compiled]
+  (swap! cache-atom
+         (fn [entries]
+           ;; Clearing/redefining a function revokes its old claims. An old compiler task must
+           ;; not repopulate the cleared cache or overwrite a newly admitted specialization.
+           (if (identical? claim (get-in entries [elem-class :claim]))
+             (assoc entries elem-class {:fn compiled :pending? false})
+             entries))))
+
 (defn- get-specialization-cache [fn-key]
   (or (get @specialization-cache fn-key)
       (do (swap! specialization-cache
@@ -286,12 +319,8 @@
       (and cached (:fn cached)) (:fn cached)
       (and cached (:pending? cached)) nil
       :else
-      (let [prev (get (swap! cache-atom
-                             (fn [m]
-                               (if (contains? m elem-class) m
-                                   (assoc m elem-class {:fn nil :pending? true}))))
-                      elem-class)]
-        (when (and (:pending? prev) (nil? (:fn prev)))
+      (let [claim (claim-specialization! cache-atom elem-class)]
+        (when claim
           (let [elem-sym (symbol (.getName ^Class elem-class))
                 var-ns (the-ns (:ns (meta dispatch-var)))
                 var-name (:name (meta dispatch-var))
@@ -305,9 +334,9 @@
                       (let [spec-sym (specialize! dispatch-var {:element-type elem-short :ns-obj var-ns})
                             spec-var (ns-resolve var-ns spec-sym)
                             spec-fn (when spec-var (deref spec-var))]
-                        (swap! cache-atom assoc elem-class {:fn spec-fn :pending? false})))))
+                        (complete-specialization! cache-atom elem-class claim spec-fn)))))
                 (catch Exception e
-                  (swap! cache-atom assoc elem-class {:fn nil :pending? false})
+                  (complete-specialization! cache-atom elem-class claim nil)
                   (binding [*out* *err*]
                     (println (str "Auto-specialization failed for " var-name
                                   " [" elem-sym "]: " (.getMessage e)))))))))
