@@ -226,7 +226,12 @@
 
 (deftest compile-gpu-program-extracts-a-real-contraction-as-an-ordered-resident-executable
   (let [descriptor (pipeline/compile-gpu-program #'resident-contract-descriptor-probe
-                                                 :ze:0 :dtype :float)
+                                                 :ze:0 :dtype :float
+                                                 ;; This test checks the direct contraction ABI,
+                                                 ;; not a mixed-precision graph's leading casts.
+                                                 ;; Other tests may register a matrix-capable
+                                                 ;; synthetic target in the shared registry.
+                                                 :schedule {:precision :f32-scalar})
         step (first (:steps descriptor))
         executable (:artifact step)
         args [(float-array 64) (float-array 64)]
@@ -237,7 +242,7 @@
                              (:argument-specs step))
         {:keys [buffers scalar-values]} (kexec/graph-bindings executable call-arguments)
         ;; `graph-bindings` exposes only the public interface.  The graph runner owns the
-        ;; XMX staging allocations; a direct KernelGraphCall test supplies equivalent mock
+        ;; private allocations; a direct KernelGraphCall test supplies equivalent mock
         ;; values for each declared private temporary.
         temporary-buffers (into {}
                                 (map (fn [id] [id [:temporary-buffer id]]))
