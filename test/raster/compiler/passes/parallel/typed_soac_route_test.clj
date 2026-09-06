@@ -107,7 +107,8 @@
           (route/attempt
            '(let* [result (raster.par/rng-fill! seeds (int n) (long base-seed))]
                   result)
-           :long {'seeds :long})
+           :long {'seeds :long}
+           {:scalar-types {'n :int 'base-seed :long}})
           algorithm (get-in program [:equations 0 :algorithm])
           operation (dialect/operation-parts (first (dialect/equations algorithm)))]
       (is (= ['base-seed] (:captures operation)))
@@ -1706,7 +1707,8 @@
         {:keys [program stats]} (route/attempt
                                  source :float
                                  {'a :float 'out :float}
-                                 {:resident-reductions? true})
+                                 {:resident-reductions? true
+                                  :scalar-types {'n :long 'scale :double 'gain :float}})
         scheduled (:form (segop-lower/segop-lower-pass
                           program {:dtype :float :target-device :ze:0}))
         reductions (->> (:equations scheduled)

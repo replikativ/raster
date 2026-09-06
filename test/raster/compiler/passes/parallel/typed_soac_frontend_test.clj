@@ -917,6 +917,26 @@
     (is (= 'int (:tag (meta extent))))
     (is (= '[scalar map] (mapv dialect/operation-kind equations)))))
 
+(deftest indexed-operation-counts-use-the-shared-scalar-normalizer
+  (doseq [operation ['(raster.par/gather out x indices count)
+                     '(raster.par/scatter! out x indices count)
+                     '(raster.par/reduce-by-key out indices x count +)]
+          cast ['long 'int]]
+    (let [expression (apply list (assoc (vec operation) 4 (list cast 'n)))
+          options {:dtype :float :array-types {'x :float 'out :float 'indices :int}
+                   :scalar-types {'n :long}}
+          normalized (frontend/normalize-source (list 'let* ['result expression] 'result)
+                                                options)
+          bindings (second normalized)
+          program (frontend/form->program normalized options)
+          equations (dialect/equations program)]
+      (if (= cast 'int)
+        (do (is (= '(int n) (second bindings)))
+            (is (= 'int (:tag (meta (first bindings)))))
+            (is (= 'scalar (dialect/operation-kind (first equations)))))
+        (is (= 'n (nth (second bindings) 4))))
+      (is (some? program) (str (first operation) " / " cast)))))
+
 (deftest equal-sizes-spelled-through-host-bindings-are-one-extent
   ;; `n1 = seq`, `n2 = dff`, `(* n1 n2)` and `(* seq dff)` denote one size, and `(alength y)`
   ;; over `y = (float-array n)` is `n`. Without those identities the buffer `y` would receive

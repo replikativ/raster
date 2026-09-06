@@ -1380,6 +1380,8 @@
 (defn- parallel-extent
   [expression]
   (cond
+    (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
+        (par/par-reduce-by-key-form? expression)) (nth expression 4)
     (par/par-rng-fill-form? expression) (:n (par/extract-par-rng-fill-info expression))
     (par/par-map-pure-form? expression) (nth expression 2)
     (par/par-map-form? expression) (nth expression 3)
@@ -1396,6 +1398,8 @@
 (defn- replace-parallel-extent
   [expression extent]
   (let [position (cond
+                   (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
+                       (par/par-reduce-by-key-form? expression)) 4
                    (par/par-rng-fill-form? expression) 2
                    (par/par-map-pure-form? expression) 2
                    (par/par-map-form? expression) 3
