@@ -318,15 +318,17 @@
         swizzled-pipelined (attention-emit/emit-fp16-pipelined
                             plan swizzled-pipelined-schedule dialect descriptor)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
-        public-artifacts (equation-first-artifacts target descriptor)]
+        public-artifacts (equation-first-artifacts target descriptor)
+        product-scalar-types {'nrows :long 'width :long}]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "candidate-product-reduction"
                             (body-target/emit-artifact
                              "candidate_product_argmax"
-                             (product-body/schedule (product-fixtures/typed-local-address-segred)
-                                                    (dissoc product-fixtures/options
-                                                            :element-binding-types
-                                                            :combine-binding-types))
+                             (product-body/schedule
+                              (product-fixtures/typed-local-address-segred product-scalar-types)
+                              (-> product-fixtures/options
+                                  (dissoc :element-binding-types :combine-binding-types)
+                                  (assoc :scalar-types product-scalar-types)))
                              dialect))
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"

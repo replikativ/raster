@@ -74,11 +74,13 @@
               (decline! :scalar-dtype "product scalar requires retained dtype" {:scalar id})))
         _ (doseq [bound [rows width]]
             (when-not (and (or (integer? bound) (symbol? bound))
-                           (= :int (launch/typed-expression-dtype bound scalar-types))
+                           (contains? #{:int :long}
+                                      (launch/typed-expression-dtype bound scalar-types))
                            (or (symbol? bound) (not (neg? bound))))
               (decline! :bound-dtype
-                        "initial product body requires nonnegative int32 row/column bounds"
+                        "product body requires nonnegative integral row/column bounds"
                         {:bound bound})))
+        rows-type (launch/typed-expression-dtype rows scalar-types)
         _ (doseq [id inputs]
             (when-not (and (get array-types id) (seq (get array-shapes id)))
               (decline! :input-storage "product input requires retained dtype and extent"
@@ -98,7 +100,7 @@
                     components)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
-              [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
+              [(body/->KernelParameter '_n_bound :scalar rows-type [] nil nil :bound)]))
         index-types (assoc scalar-types row :int column :long)
         lower-index (fn [expression locals]
                       (index/lower-typed expression (set/union (set (keys index-types)) locals)
