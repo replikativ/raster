@@ -418,8 +418,7 @@
                                 "KernelBody reduction cannot prove this array load coordinate"
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
-                    (append! ((:lower lowerer) (list 'aget array lowered-coordinate)
-                              (dtype/canon (get array-types array dtype)) {})))
+                    (append! ((:load lowerer) array [lowered-coordinate])))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
@@ -460,13 +459,8 @@
                                 "KernelBody element expression contains an unsupported scalar operation"
                                 {:expression expression :operator operator
                                  :result-dtype result-dtype}))
-                    (append! ((:lower lowerer)
-                              (apply list (descriptor/semantic-op expression)
-                                     (map :value typed-inputs))
-                              result-dtype
-                              (into {} (keep (fn [{:keys [value dtype]}]
-                                               (when (symbol? value) [value dtype])))
-                                    typed-inputs))))
+                    (append! ((:compute lowerer) operator result-dtype
+                              (mapv (comp :value #(cast! % result-dtype)) typed-inputs) {})))
 
                   :else
                   (decline! :scalar-expression
