@@ -22,6 +22,23 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest scalar-casts-use-the-shared-descriptor-vocabulary
+  (doseq [[head target source overflow]
+          [['byte :byte :long :wrap] ['int :int :long :wrap]
+           ['long :long :int :exact] ['float :float :double :ieee]
+           ['double :double :float :exact]]
+          qualified? [false true]]
+    (let [head (if qualified? (symbol "clojure.core" (name head)) head)
+          result ((:lower (lowerer)) (list head 'value) target {'value source})
+          expression (:expression (last (:operations result)))]
+      (is (= target (:type result)))
+      (is (= :cast (:op expression)))
+      (is (= overflow (get-in expression [:options :overflow])))))
+  (let [result ((:lower (lowerer)) '(double (int value)) :double {'value :long})]
+    (is (= [:int :double] (mapv #(get-in % [:result :type]) (:operations result))))
+    (is (= [:wrap :exact] (mapv #(get-in % [:expression :options :overflow])
+                              (:operations result))))))
+
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]
     (let [lower (:lower-region (lowerer))

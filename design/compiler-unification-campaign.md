@@ -155,6 +155,15 @@ Exit: classify all remaining routes; retire duplicated paths for covered workloa
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.
 
+Scalar-emission audit removes the map/fold lowerer's private copy of primitive cast spellings in
+favor of the shared operation descriptor and dtype vocabulary. This does not change narrowing or
+rounding policies. Before sharing that lowerer with contraction elements, reconcile its explicit
+device-wrap narrowing policy with reduction lowering's checked-cast rejection; do not widen
+reduction admission accidentally. Indirect contraction loads also need independent storage
+capacities and a data-dependent index-range contract. A dense AxisMap or an index array's integral
+dtype does not prove its contents are in bounds. Keep the production operand-layout gate until
+those obligations are represented and enforced, reusing existing typed loads and graph capacities.
+
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved
 int range. It also inherited unconditional cast erasure on seed/population captures. Passing
