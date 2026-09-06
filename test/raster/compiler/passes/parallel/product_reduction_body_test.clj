@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
@@ -47,7 +48,7 @@
    :element-binding-types {'candidate :float}
    :combine-binding-types {'left-nan :int 'right-nan :int 'better :int}})
 
-(defn- typed-argmax-program [values & [scalar-types]]
+(defn- typed-argmax-program [values & [scalar-types materialize-value? scale?]]
   (let [tag-bindings (fn [bindings dtypes]
                        (vec (mapcat (fn [[id init]]
                                       [(with-meta id {:raster.type/tag
@@ -56,13 +57,16 @@
         ;; Supply the facts normally attached by the walker; the frontend deliberately does not
         ;; infer types from these raw test S-expressions.
         form (-> (vec (argmax-form))
+                 (cond-> materialize-value? (assoc-in [1 0] 'maxima))
+                 (cond-> scale? (update-in [6 1]
+                                          #(with-meta (list '* 'alpha %) {:raster.type/tag 'float})))
                  (update 6 tag-bindings (:element-binding-types options))
                  (update 9 tag-bindings (:combine-binding-types options))
                  (update 2 #(mapv (fn [[id neutral type]]
                                     [id (constant/literal-or-original neutral) type]) %)))
         program (frontend/form->program
                  (list 'let* ['effect (apply list form)] 'effect)
-                 {:dtype :float :array-types {'values :float 'indices :int}
+                 {:dtype :float :array-types {'values :float 'indices :int 'maxima :float}
                   :values values :scalar-types (or scalar-types (:scalar-types options))})]
     program))
 
@@ -205,12 +209,12 @@
       (catch clojure.lang.ExceptionInfo e
         (is (= :source-refinement (:missing-rule (ex-data e))))))))
 
-(defn- graph-context [known-input? & [input-options output-options scalar-types]]
+(defn- graph-context [known-input? & [input-options output-options scalar-types materialize-value? scale?]]
   (let [scalar-types (or scalar-types (:scalar-types options))
         algorithm (typed-argmax-program
                    (if known-input?
                      {'values (av/tensor {:dtype :float :shape ['nrows 'width]})}
-                     {}) scalar-types)
+                     {}) scalar-types materialize-value? scale?)
         ;; Model a compiler-generated typed program as well as the analyzed-source frontend,
         ;; which already declines non-plain aget storage before this boundary.
         algorithm (if input-options
@@ -232,6 +236,26 @@
         equation (first (:equations scheduled))
         {:keys [graph body]} (equation-graph/make-for-equation scheduled equation)]
     {:algorithm (:algorithm equation) :body body :graph graph :node (first (:nodes graph))}))
+
+(deftest production-product-emission-is-graph-bound-and-target-neutral
+  (doseq [materialize-value? [false true]
+          dialect [:opencl-portable :cuda :hip]]
+    (let [{:keys [graph algorithm body]} (graph-context false nil nil nil materialize-value?)
+          emitted (with-redefs [reference/generate-product-reduction-kernel
+                                (fn [& _] (throw (ex-info "legacy product emitter reached" {})))]
+                    (reference/generate-kernel-graph
+                     graph :target-dialect dialect
+                     :scheduled-equation-algorithm algorithm :scheduled-equation-body body))
+          artifacts (executable/artifacts emitted)
+          artifact (first artifacts)]
+      (is (= emitted (executable/validate! emitted)))
+      (is (= 1 (count artifacts)))
+      (is (= (if materialize-value? 2 1) (count (:outputs emitted))))
+      (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+      (is (false? (get-in artifact [:attributes :candidate-only])))
+      (is (true? (get-in artifact [:attributes :source-storage-certified?])))))
+  (let [{:keys [graph]} (graph-context false)]
+    (is (thrown? clojure.lang.ExceptionInfo (reference/generate-kernel-graph graph)))))
 
 (deftest graph-storage-facts-are-derived-from-the-retained-program
   (let [{:keys [algorithm body graph node]} (graph-context true)
@@ -261,6 +285,33 @@
     (is (= [(launch/product 'nrows 'width)] (get-in options [:array-shapes 'values])))
     (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
     (is (true? (get-in candidate [:attributes :candidate-only])))))
+
+(deftest runtime-allocation-extents-are-not-independent-minimum-shapes
+  (let [{:keys [algorithm body graph node]}
+        (graph-context true {:shape ['(extent values)]} {:shape ['(extent indices)]})
+        admitted (product/schedule-for-node node graph algorithm body)]
+    (is (= (launch/product 'nrows 'width) (get-in graph [:inputs 0 :elements])))
+    (is (= 'nrows (get-in graph [:outputs 0 :elements])))
+    (is (false? (get-in admitted [:attributes :candidate-only])))))
+
+(deftest floating-captures-and-optional-refinement-cannot-bypass-read-capacity
+  (let [context #(graph-context true {:shape [1]} nil
+                                (assoc (:scalar-types options) 'alpha :float) false true)
+        {:keys [algorithm body graph node]} (context)]
+    (is (= (launch/maximum (launch/product 'nrows 'width) 1)
+           (get-in graph [:inputs 0 :elements])))
+    (is (false? (get-in (product/schedule-for-node node graph algorithm body)
+                        [:attributes :candidate-only])))
+    (with-redefs-fn
+      {(ns-resolve 'raster.compiler.passes.parallel.scheduled-equation-graph
+                    'product-read-requirements) (constantly {})}
+      (fn []
+        (let [{:keys [algorithm body graph node]} (context)]
+          (try
+            (product/schedule-for-node node graph algorithm body)
+            (is false "a known capacity cannot substitute for the omitted access requirement")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :graph-read-capacity (:missing-rule (ex-data e)))))))))))
 
 (deftest graph-capacity-is-not-an-index-safety-certificate
   (let [{:keys [algorithm body graph node]} (graph-context true {:shape [1]})

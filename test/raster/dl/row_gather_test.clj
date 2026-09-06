@@ -1,5 +1,6 @@
 (ns raster.dl.row-gather-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
@@ -191,10 +192,14 @@
       (is (= [7 400] (vec token-indices)))
       (is (= [21.0 22.0 23.0 1200.0 1201.0 1202.0] (vec rows))))
     (testing "the compiled graph retains one scheduled reduction and one independent row gather"
-      (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
+      (is (= [:executable :map-void] (mapv :convention (:steps descriptor))))
       (is (empty? (:allocs descriptor)))
-      (is (= :segmented-workgroup-tree
-             (get-in descriptor [:steps 0 :artifact :attributes :schedule :strategy]))))
+      (let [artifacts (vec (executable/artifacts (get-in descriptor [:steps 0 :artifact])))]
+        (is (= 1 (count artifacts)))
+        (is (= :product-workgroup-tree
+               (get-in artifacts [0 :attributes :kernel-body :schedule :strategy])))
+        (is (true? (get-in artifacts [0 :attributes :source-storage-certified?])))
+        (is (= :none (get-in descriptor [:steps 0 :result-policy])))))
     (testing "the ordinary multi-output descriptor certifies before allocation"
       (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))
 

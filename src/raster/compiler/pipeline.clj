@@ -1364,9 +1364,11 @@
 
    The indirection avoids a static pipeline -> gpu.core dependency cycle; resident extraction
    recognizes the same marker and binds its registered dispatch without staging."
-  [device-id dispatch-id arguments]
+  ([device-id dispatch-id arguments]
+   (invoke-scheduled-executable! device-id dispatch-id arguments :single))
+  ([device-id dispatch-id arguments result-policy]
   ((requiring-resolve 'raster.gpu.core/invoke-staged-executable!)
-   device-id dispatch-id arguments))
+   device-id dispatch-id arguments result-policy)))
 
 (def ^:private gpu-alloc-ops
   "Array-allocating ops that appear as devirtualized .invk (not a bare `float-array` head): a
@@ -1448,11 +1450,12 @@
       (= head 'raster.compiler.pipeline/invoke-scheduled-executable!)
       ;; Generic scheduled-executable marker. Resident extraction consumes the same dispatch and
       ;; ordered arguments as staging; the target device is carried for the staged runtime only.
-      (when (= 4 argc)
-        (let [[_ _device-id dispatch-id arguments] expr]
-          (when (vector? arguments)
+      (when (contains? #{4 5} argc)
+        (let [[_ _device-id dispatch-id arguments policy] expr
+              policy (if (= 4 argc) :single policy)]
+          (when (and (vector? arguments) (contains? #{:single :none} policy))
             {:dispatch-id dispatch-id :arguments arguments
-             :convention :executable :returns sym})))
+             :convention :executable :returns sym :result-policy policy})))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
       ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
@@ -1579,7 +1582,7 @@
              (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
              (if-let [s (parse-gpu-step sym expr)]
                (let [ordered-result
-                     (when (:arguments s)
+                     (when (and (:arguments s) (not= :none (:result-policy s)))
                        (let [abi (if (and (:dispatch-id s) dispatch-info-fn)
                                    ;; Graph schedules have no single kernel name. Their validated
                                    ;; common ABI owns the return value just as it owns binding.
@@ -1599,7 +1602,10 @@
                   ;; recorded into a resident graph, but must remain a clean non-resident fallback
                   ;; (rather than reaching descriptor construction and throwing there).
                    (reject! :host-scalar-reduction sym expr)
-                   (do (vswap! steps conj s) (vswap! device-buffers conj sym)
+                   (do (vswap! steps conj s)
+                       (if (= :none (:result-policy s))
+                         (vswap! aliases assoc sym nil)
+                         (vswap! device-buffers conj sym))
                   ;; A :map step's runtime VALUE is its out buffer (invoke-registered-kernel
                   ;; returns output-array), so the binding sym is a pure alias of the out
                   ;; array. Copy-propagate it like any other array alias — a later step
@@ -1996,7 +2002,7 @@
                            :phase (keyword (str "gpu-step-" i))})
 
                         (= :executable (:convention step))
-                        (let [{:keys [dispatch-id arguments]} step
+                        (let [{:keys [dispatch-id arguments result-policy]} step
                               dispatch (or (dispatch-entry dispatch-id)
                                            (throw (ex-info "resident executable dispatch is not registered"
                                                            {:dispatch-id dispatch-id})))
@@ -2010,9 +2016,11 @@
                               ;; A generic graph may be effect-only or multi-output. `:output` is
                               ;; retained solely as compatibility sugar for the one-result case;
                               ;; LinkPlan derives every write from the complete executable ABI.
-                              output (when (= 1 (count result-pairs))
+                              output (when (and (not= :none result-policy)
+                                                (= 1 (count result-pairs)))
                                        (second (first result-pairs)))]
                           {:convention :executable
+                           :result-policy (or result-policy :single)
                            :dispatch-id dispatch-id
                            :dispatch dispatch
                            :artifact executable

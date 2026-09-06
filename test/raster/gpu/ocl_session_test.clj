@@ -313,6 +313,13 @@
         (let [program (fixture/instantiate! s descriptor [values indices nrows width])
               result (get (fixture/run! program [values indices nrows width]) 'indices)]
           (is (= [3 255 411] (vec result))))
+        (let [execute (pl/compile-aot #'ops/argmax-rows! :target-device :ocl:0 :dtype :float)
+              staged-indices (int-array nrows)]
+          (is (nil? (execute values staged-indices nrows width))
+              "the effect-only product returns nil, not its output buffer")
+          (is (nil? (apply execute [values staged-indices nrows width]))
+              "the hoisted IFn applyTo bridge also boxes void as nil")
+          (is (= [3 255 411] (vec staged-indices))))
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-row-gather-roundtrip

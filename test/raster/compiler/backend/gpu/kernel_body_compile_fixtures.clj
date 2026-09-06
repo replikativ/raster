@@ -6,7 +6,6 @@
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
-            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
@@ -20,14 +19,13 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
-            [raster.compiler.passes.parallel.product-reduction-body :as product-body]
-            [raster.compiler.passes.parallel.product-reduction-body-test :as product-fixtures]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as dl-attention]
+            [raster.dl.array-ops :as dl-arrays]
             [raster.linalg.contract :as contract]
             [raster.numeric]
             [raster.par]
@@ -256,6 +254,8 @@
       (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-arrays/argmax-rows! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-scan {:target device-id :dtype :float}))
@@ -318,18 +318,8 @@
         swizzled-pipelined (attention-emit/emit-fp16-pipelined
                             plan swizzled-pipelined-schedule dialect descriptor)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
-        public-artifacts (equation-first-artifacts target descriptor)
-        product-scalar-types {'nrows :long 'width :long}]
+        public-artifacts (equation-first-artifacts target descriptor)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
-           (write-artifact! directory suffix "candidate-product-reduction"
-                            (body-target/emit-artifact
-                             "candidate_product_argmax"
-                             (product-body/schedule
-                              (product-fixtures/typed-local-address-segred product-scalar-types)
-                              (-> product-fixtures/options
-                                  (dissoc :element-binding-types :combine-binding-types)
-                                  (assoc :scalar-types product-scalar-types)))
-                             dialect))
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
                             swizzled-pipelined)

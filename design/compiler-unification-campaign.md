@@ -44,6 +44,13 @@ vertical. The north star remains the architectural specification.
   checked resident/staged binding enforces graph capacities. Gathers, broadcasts and combine
   reads remain unsupported by this initial access proof. Production selection still requires
   successful access admission in addition to exact source/body/graph correspondence.
+- Production follow-up admits dense row products through that combined check and the common
+  C-family graph emitter. Public resident extraction uses the existing executable convention;
+  effect-only staging has an explicit nil result policy, including multiple written outputs.
+  Direct descriptor graph binding now enforces the same capacity premise as session/LinkPlan
+  binding. Hidden/multiple outputs are checked across all three target dialects; public argmax
+  has resident and staged CPU OpenCL numerical coverage. The handwritten emitter remains only
+  as the differential/test oracle pending its final retirement and coverage transfer.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 

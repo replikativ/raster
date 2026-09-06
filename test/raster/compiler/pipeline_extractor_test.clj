@@ -20,6 +20,21 @@
 
 (defn- why [form] (get-in (pipeline/extract-gpu-program form) [nr-key :why]))
 
+(deftest effect-only-executable-results-never-alias-an-output-buffer
+  (doseq [arguments ['[A C] '[A C D]]]
+    (let [call (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                     :ocl:0 "effect-dispatch" arguments :none)
+          extracted (pipeline/extract-gpu-program
+                     (list 'let* ['returned call 'again 'returned] 'again)
+                     (fn [& _] (throw (ex-info "effect result needs no kernel lookup" {})))
+                     (fn [& _] (throw (ex-info "effect result needs no primary result lookup" {}))))]
+      (is (not (contains? extracted nr-key)))
+      (is (= '[again nil] (:scalar-lets extracted)))
+      (is (= :none (get-in extracted [:steps 0 :result-policy])))))
+  (is (= :unparseable-kernel-invoke
+         (why '(let* [r (raster.compiler.pipeline/invoke-scheduled-executable!
+                         :ocl:0 "x" [A C] :unknown)] r)))))
+
 (deftest scheduled-results-use-the-dispatch-common-abi
   (let [artifact (kart/make
                   {:kernel-name "alias_fixture"

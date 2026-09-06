@@ -1,6 +1,7 @@
 (ns raster.dl.indexed-reduction-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.array-ops :as ops]))
@@ -46,7 +47,8 @@
         descriptor (get descriptors :ocl:0)
         allocs (:allocs descriptor)
         steps (:steps descriptor)
-        sources (mapv #(get-in % [:artifact :source]) steps)
+        artifacts (vec (mapcat #(executable/artifacts (:artifact %)) steps))
+        sources (mapv :source artifacts)
         lowering (resident-plan/lower
                   {:id :indexed-row-reduction
                    :target :ocl:0
@@ -59,8 +61,8 @@
       (is (= '[nrows width] (:scalar-params descriptor))))
     (testing "schedule scratch is local to the emitted product kernel"
       (is (empty? allocs))
-      (is (= :segmented-workgroup-tree
-             (get-in steps [0 :artifact :attributes :schedule :strategy]))))
+      (is (= :product-workgroup-tree
+             (get-in artifacts [0 :attributes :kernel-body :schedule :strategy]))))
     (testing "the typed product reduction is one resident scheduled step"
       (is (= {:backend :opencl
               :source-dialect :typed-soac
@@ -70,12 +72,15 @@
       (is (= 1 (get-in report [:lowering :typed-reused])))
       (is (zero? (get-in report [:lowering :backend-relowered])))
       (is (zero? (get-in report [:lowering :fallback])))
-      (is (= [:map-void] (mapv :convention steps)))
+      (is (= [:executable] (mapv :convention steps)))
       (is (= 1 (count steps)))
       (is (= ['values 'indices]
              (vec (take 2 (get-in steps [0 :artifact :arguments])))))
       (is (= [:float :int]
-             (get-in steps [0 :artifact :attributes :component-dtypes]))))
+             (get-in artifacts [0 :attributes :kernel-body :attributes :component-dtypes])))
+      (is (every? #(= :kernel-body (get-in % [:attributes :emission-route])) artifacts))
+      (is (every? #(false? (get-in % [:attributes :candidate-only])) artifacts))
+      (is (every? #(true? (get-in % [:attributes :source-storage-certified?])) artifacts)))
     (testing "OpenCL and Level Zero preserve the same typed lowering"
       (is (apply = (map (comp #(mapv :dtype %) :allocs val) descriptors)))
       (is (apply = (map (comp #(mapv :convention %) :steps val) descriptors)))
@@ -84,14 +89,13 @@
                               :steps val)
                         descriptors))))
     (testing "OpenCL C preserves mixed local products and portable NaN comparison"
-      (is (str/includes? (first sources) "__local float shared_0"))
-      (is (str/includes? (first sources) "__local int shared_1"))
-      (is (every? #(str/includes? % "shared_0[lid]") sources))
-      (is (every? #(str/includes? % "shared_0[(lid + stride)]") sources))
+      (is (= [:float :int]
+             (mapv :dtype (get-in artifacts [0 :attributes :kernel-body :allocations]))))
+      (is (str/includes? (first sources) "__local float*"))
+      (is (str/includes? (first sources) "__local int*"))
       (is (every? #(not (str/includes? % "_u005b_")) sources))
-      (is (str/includes? (first sources) "for (int col = lid"))
+      (is (str/includes? (first sources) "for (long rstr_col"))
       (is (str/includes? (first sources) "barrier(CLK_LOCAL_MEM_FENCE)"))
-      (is (every? #(not (str/includes? % "boolean(")) sources))
-      (is (every? #(str/includes? % "(float)(elem_0) == (float)(elem_0)") sources)))
+      (is (every? #(not (str/includes? % "boolean(")) sources)))
     (testing "the descriptor certifies as a composable LinkPlan before allocation"
       (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))

@@ -1193,22 +1193,31 @@
                       {:expression expression :resolved value})))
     (long value)))
 
-(defn- validate-external-view!
-  [graph-buffer view scalar-values]
-  (let [view (bview/validate-view! view)
-        expected-dtype (dtype/canon (:dtype graph-buffer))
-        actual-dtype (dtype/canon (:dtype view))
+(defn- validate-external-capacity!
+  "The same external graph-storage precondition for session views and descriptor-step buffers."
+  [graph-buffer actual-dtype capacity scalar-values]
+  (when-not (and (integer? capacity) (not (neg? capacity)))
+    (throw (ex-info "kernel graph binding lacks a nonnegative buffer capacity"
+                    {:graph-buffer (:id graph-buffer) :capacity capacity})))
+  (let [expected-dtype (dtype/canon (:dtype graph-buffer))
+        actual-dtype (dtype/canon actual-dtype)
         expected-elements (when (some? (:elements graph-buffer))
-                            (resolve-graph-elements scalar-values (:elements graph-buffer)))
-        capacity (quot (:byte-length view) (dtype/bytes-of actual-dtype))]
+                            (resolve-graph-elements scalar-values (:elements graph-buffer)))]
     (when-not (= expected-dtype actual-dtype)
       (throw (ex-info "kernel graph buffer dtype differs from its resident view"
                       {:graph-buffer (:id graph-buffer) :expected expected-dtype
-                       :actual actual-dtype :view (:id view)})))
+                       :actual actual-dtype})))
     (when (and expected-elements (> expected-elements capacity))
       (throw (ex-info "kernel graph buffer extent exceeds its resident view"
                       {:graph-buffer (:id graph-buffer) :elements expected-elements
-                       :view-elements capacity :view (:id view)})))
+                       :view-elements capacity})))))
+
+(defn- validate-external-view!
+  [graph-buffer view scalar-values]
+  (let [view (bview/validate-view! view)]
+    (validate-external-capacity! graph-buffer (:dtype view)
+                                 (quot (:byte-length view) (dtype/bytes-of (:dtype view)))
+                                 scalar-values)
     (when-not (bview/contiguous? view)
       (throw (ex-info "kernel ABI binding currently requires a contiguous resident view"
                       {:graph-buffer (:id graph-buffer) :view (:id view)
@@ -1699,8 +1708,13 @@
    This is the ordinary compiled-function staging contract: JVM primitive arrays are copied in
    and ABI-declared writes are copied back; backend DeviceBuffers are borrowed without copying.
    Every call owns and closes its graph recording and temporary buffers. Long-lived/replayable
-   execution belongs to compile-gpu-program plus LinkPlan, which uses the same executable binder."
-  [device-id dispatch-id runtime-arguments]
+   execution belongs to compile-gpu-program plus LinkPlan, which uses the same executable binder.
+   Optional :none result policy copies every write back but returns nil for effect-only calls."
+  ([device-id dispatch-id runtime-arguments]
+   (invoke-staged-executable! device-id dispatch-id runtime-arguments :single))
+  ([device-id dispatch-id runtime-arguments result-policy]
+  (when-not (contains? #{:single :none} result-policy)
+    (throw (ex-info "unsupported staged executable result policy" {:result-policy result-policy})))
   (let [dispatch-entry (rt-resolve device-id "kernel-dispatch-registry-entry")
         dispatch (or (dispatch-entry dispatch-id)
                      (throw (ex-info "staged kernel executable dispatch is not registered"
@@ -1712,7 +1726,7 @@
         {:keys [groups arguments]} (staged-pointer-plan device-id executable typed-arguments)
         result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
                               (map vector (kexec/abi executable) typed-arguments))]
-    (when (> (count result-pairs) 1)
+    (when (and (= :single result-policy) (> (count result-pairs) 1))
       (throw (ex-info "staged kernel executable has more than one primary result"
                       {:dispatch-id dispatch-id :result-slots (mapv first result-pairs)})))
     (with-gpu-session* device-id
@@ -1731,7 +1745,7 @@
           (doseq [{:keys [key value elements resident? write?]} groups
                   :when (and write? (not resident?))]
             (download-range! session key value {:elements elements})))
-        (some-> (first result-pairs) second)))))
+        (when (= :single result-policy) (some-> (first result-pairs) second)))))))
 
 (defn kernel-graph-execution-plan
   "Return the pure backend-neutral queue/event plan for a bound KernelGraph."
@@ -1845,6 +1859,12 @@
       :kernel-graph
       (let [{:keys [buffers scalar-values]}
             (kexec/graph-bindings executable runtime-arguments)
+            extent-values (into {} (map (fn [[id buffer]]
+                                          [(list 'extent id) (:n-elements buffer)])) buffers)
+            _ (doseq [buffer-spec (concat (:inputs executable) (:outputs executable))
+                      :let [buffer (get buffers (:id buffer-spec))]]
+                (validate-external-capacity! buffer-spec (:dtype buffer) (:n-elements buffer)
+                                             (merge scalar-values extent-values)))
             temporary-buffers
             (allocate-executable-temporaries
              device-id (kgcall/temporary-specs executable scalar-values))

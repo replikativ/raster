@@ -34,6 +34,7 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
+            [raster.compiler.passes.parallel.product-reduction-body :as product-body]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
@@ -1006,7 +1007,8 @@
 (declare generate-contraction-kernel-artifact)
 
 (defn- generate-reduction-kernel-graph
-  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts]
+  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts
+                 scheduled-equation-algorithm scheduled-equation-body]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel
                contraction-facts {}}}]
   (let [array-types (graph-array-types graph array-types)
@@ -1014,7 +1016,13 @@
         (kgraph/map-operations
          graph
          (fn [{:keys [id operation] :as node}]
-           (let [outputs (vec (:outputs operation))]
+           (if (= :product (:phase operation))
+             (kernel-body-target/emit-artifact
+              (str "graph_product_" (gensym ""))
+              (product-body/schedule-for-node node graph scheduled-equation-algorithm
+                                               scheduled-equation-body)
+              target-dialect)
+             (let [outputs (vec (:outputs operation))]
              (when-not (= 1 (count outputs))
                (throw (ex-info "scalar SegRed graph node requires exactly one scheduled output"
                                {:reason :kernel-graph-reduction-output
@@ -1047,7 +1055,7 @@
                 :dtype (:dtype operation)
                 :scalar-types scalar-types :array-types array-types
                 :target-dialect target-dialect
-                :graph-node node :kernel-graph graph)))))]
+                :graph-node node :kernel-graph graph))))))]
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
