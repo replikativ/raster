@@ -38,6 +38,12 @@ vertical. The north star remains the architectural specification.
   overflow; every add/multiply subtree is checked before affine normalization. The proof assumes
   active positive axis domains and checked resident capacity; deriving those access requirements
   from scalar lowering and enforcing them in graph binding remain production obligations.
+- Read-requirement follow-up shares product scalar-region lowering with scheduling and derives
+  flat minimum capacities from actual typed dense loads, without invented input shapes. The
+  graph preserves larger declared capacities and combines shared-storage requirements; existing
+  checked resident/staged binding enforces graph capacities. Gathers, broadcasts and combine
+  reads remain unsupported by this initial access proof. Production selection still requires
+  successful access admission in addition to exact source/body/graph correspondence.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 

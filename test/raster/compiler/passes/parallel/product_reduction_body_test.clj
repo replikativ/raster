@@ -13,6 +13,7 @@
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
+            [raster.compiler.passes.parallel.product-reduction-regions :as regions]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -253,23 +254,73 @@
       (catch clojure.lang.ExceptionInfo e
         (is (= :graph-node (:missing-rule (ex-data e))))))))
 
-(deftest unknown-product-input-storage-is-not-assumed-dense
-  (let [{:keys [algorithm body graph node]} (graph-context false)]
-    (try
-      (product/graph-options node graph algorithm body)
-      (is false "unknown capacity cannot be replaced by rows*width for an indexed read")
-      (catch clojure.lang.ExceptionInfo e
-        (is (= :graph-input-extent (:missing-rule (ex-data e))))))))
+(deftest unknown-product-input-storage-is-refined-from-typed-loads
+  (let [{:keys [algorithm body graph node]} (graph-context false)
+        options (product/graph-options node graph algorithm body)
+        candidate (product/schedule (:operation node) options)]
+    (is (= [(launch/product 'nrows 'width)] (get-in options [:array-shapes 'values])))
+    (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
+    (is (true? (get-in candidate [:attributes :candidate-only])))))
 
 (deftest graph-capacity-is-not-an-index-safety-certificate
   (let [{:keys [algorithm body graph node]} (graph-context true {:shape [1]})
         candidate (product/schedule (:operation node)
                                     (product/graph-options node graph algorithm body))]
-    ;; The source's row-major read may exceed this capacity for runtime rows/width > 1.
-    ;; Do not execute it: correspondence preserves that source, it does not prove it safe.
+    ;; Required storage is now the maximum of the AV contract and the proven dense read.
+    ;; This still does not authorize production or bypass the runtime buffer-capacity check.
+    (is (= (launch/maximum (launch/product 'nrows 'width) 1)
+           (get-in graph [:inputs 0 :elements])))
     (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
     (is (true? (get-in candidate [:attributes :candidate-only])))
     (is (false? (get-in candidate [:attributes :source-storage-certified?])))))
+
+(deftest derived-read-capacity-is-a-checked-minimum
+  (doseq [shape [[1] [4096]]]
+    (let [{:keys [graph]} (graph-context true {:shape shape})
+          required (get-in graph [:inputs 0 :elements])]
+      (is (= (max (first shape) 12)
+             (launch/resolve-expression {'nrows 3 'width 4} required)))
+      (is (= (first shape)
+             (launch/resolve-expression {'nrows 0 'width 4} required)))
+      (is (thrown? ArithmeticException
+                   (launch/resolve-expression {'nrows Long/MAX_VALUE 'width 2} required))))))
+
+(deftest shared-product-input-keeps-every-derived-read-requirement
+  (let [{:keys [body node]} (graph-context false)
+        source (:operation node)
+        second-source (assoc-in source [:space :dims 0 :bound] 'more-rows)
+        values (assoc (:values body) 'more-rows (get-in body [:values 'nrows]))
+        derive (ns-resolve 'raster.compiler.passes.parallel.scheduled-equation-graph
+                           'product-read-requirements)
+        requirements (derive values [source second-source]
+                             {'more-rows (launch/sum 'nrows 1)})]
+    (is (= [(launch/product 'nrows 'width)
+            (launch/product (launch/sum 'nrows 1) 'width)]
+           (get requirements 'values)))
+    (is (= 16 (launch/resolve-expression {'nrows 3 'width 4}
+                                         (apply launch/maximum (get requirements 'values)))))))
+
+(deftest typed-read-requirements-do-not-assume-every-access-is-dense
+  (let [source (typed-local-address-segred)
+        decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        derive #(regions/dense-read-requirements % options decline!)
+        change-load (fn [coordinate]
+                      (assoc-in source [:reduction :element :bindings 3]
+                                (list 'clojure.core/aget 'values coordinate)))]
+    (is (= {'values (launch/product 'nrows 'width)} (derive source)))
+    (is (= (derive source) (regions/dense-read-requirements source
+                                                          (dissoc options :array-shapes) decline!))
+        "lowering does not need a fabricated shape")
+    (doseq [coordinate ['offset 0
+                        '(clojure.core/aget indices col)]]
+      (is (thrown? clojure.lang.ExceptionInfo (derive (change-load coordinate)))))
+    (let [with-combine-read
+          (assoc-in source [:reduction :combine :results 0]
+                    '(clojure.core/aget values 0))]
+      (try (derive with-combine-read)
+           (is false "combine reads execute outside the positive element domain")
+           (catch clojure.lang.ExceptionInfo e
+             (is (= :combine-read (:rule (ex-data e)))))))))
 
 (deftest logical-representations-must-be-lowered-before-raw-product-storage
   (doseq [storage-options [{:representation {:kind :quantized :scheme :q4-k}}
