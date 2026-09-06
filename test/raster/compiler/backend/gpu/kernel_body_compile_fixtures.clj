@@ -1,11 +1,12 @@
 (ns raster.compiler.backend.gpu.kernel-body-compile-fixtures
-  "Generate production scheduled KernelBody sources for hardware-free CUDA/HIP CI gates."
+  "Generate production and explicitly labeled candidate KernelBody sources for CUDA/HIP CI gates."
   (:require [clojure.java.io :as io]
             [raster.arrays]
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
@@ -19,6 +20,8 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
+            [raster.compiler.passes.parallel.product-reduction-body :as product-body]
+            [raster.compiler.passes.parallel.product-reduction-body-test :as product-fixtures]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -317,6 +320,12 @@
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
         public-artifacts (equation-first-artifacts target descriptor)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
+           (write-artifact! directory suffix "candidate-product-reduction"
+                            (body-target/emit-artifact
+                             "candidate_product_argmax"
+                             (product-body/schedule (product-fixtures/argmax-segred)
+                                                    product-fixtures/options)
+                             dialect))
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
                             swizzled-pipelined)
