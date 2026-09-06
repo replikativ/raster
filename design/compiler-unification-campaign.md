@@ -49,8 +49,12 @@ vertical. The north star remains the architectural specification.
   effect-only staging has an explicit nil result policy, including multiple written outputs.
   Direct descriptor graph binding now enforces the same capacity premise as session/LinkPlan
   binding. Hidden/multiple outputs are checked across all three target dialects; public argmax
-  has resident and staged CPU OpenCL numerical coverage. The handwritten emitter remains only
-  as the differential/test oracle pending its final retirement and coverage transfer.
+  has resident and staged CPU OpenCL numerical coverage.
+- Retirement follow-up removes the handwritten product emitter from production sources and
+  preserves its algorithm in `test/raster/compiler/reference/product_opencl.clj`. Existing source
+  contract tests and CPU OpenCL differential execution retain that independent oracle. This does
+  not promote its broader source-only cases (computed reduction bounds or multiple segment axes)
+  into supported production coverage; the initial certified route remains dense and rank-one.
 
 Exit: public product workloads use the typed route without reconstructed facts or source assembly.
 

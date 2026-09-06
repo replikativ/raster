@@ -467,8 +467,10 @@ Zero-row kernels use one physical group with a uniform guard around all computat
 stores; zero-width rows produce the neutral tuple. This is a no-op over existing resident storage,
 not graph-node elision or support for allocating zero-byte device buffers. Public argmax uses the
 common executable binder; effect-only staging copies all writes and returns nil explicitly. The
-public equation-first workload joins CUDA/HIP compilation gates. Next: finish the coverage audit
-and retire the retained source emitter, which is now only a differential/test oracle.
+public equation-first workload joins CUDA/HIP compilation gates. The handwritten product emitter
+has been removed from production sources; its frozen test-only algorithm remains an independent
+differential oracle. Its broader source-only fixtures are not evidence of production support for
+computed bounds or multiple segment axes. Next: audit remaining public workload coverage.
 The retained product `KernelGrid` now describes its actual guarded segment-count launch and tuple scratch,
 not the scalar width-reduction grid formerly used only to seed workgroup sizing. The candidate
 checks that grid against the selected tree. `validate-source!` additionally replays the body and
