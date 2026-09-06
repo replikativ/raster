@@ -11,6 +11,8 @@ vertical. The north star remains the architectural specification.
   compilation. Production still uses the retained source emitter.
 - Implemented in this slice: preserve TypedSOAC local dtypes through SegRed and subsequent
   scalar/index lowering; compare both direct and local-address candidates on CPU OpenCL.
+- Source closure follow-up: align the retained product KernelGrid with the segment-count launch,
+  validate scratch/workgroup agreement, and replay the body refinement against the retained source.
 - Certify the exact semantic source, storage boundaries and public bindings against the graph.
 - Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
 - Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
@@ -36,6 +38,9 @@ before treating a definition as live or dead:
 Audit apparent unused wrappers separately. A source oracle is not a production fallback; removing
 one must not erase its independent numerical evidence. Track JVM and C/SIMD compatibility as well
 as GPU paths, using the same production corpus and retained TypedSOAC facts.
+CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
+change another test's automatic precision route. The direct contraction ABI test now requests its
+FP32 policy explicitly; broader fixture isolation remains a cleanup item.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
