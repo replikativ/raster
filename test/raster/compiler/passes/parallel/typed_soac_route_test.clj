@@ -129,6 +129,18 @@
     (is (= 2 (count (get-in rich [:program :equations]))))
     (is (= :typed-soac (get-in rich [:stats :route])))))
 
+(deftest invalid-machine-prices-preserve-the-production-fanout
+  (doseq [[price reason] [[Double/POSITIVE_INFINITY :invalid-roofline-ridge]
+                         ["100" :invalid-roofline-ridge]
+                         [Double/MAX_VALUE :invalid-recompute-threshold]]]
+    (let [result (route/attempt expensive-fanout :float {'x :float}
+                                {:abstract-machine {:ridge {:float price}}})
+          witness (-> result :stats :placements first)]
+      (is (= :typed-soac (get-in result [:stats :route])))
+      (is (= :materialize (:decision witness)))
+      (is (= reason (:reason witness)))
+      (is (= 3 (count (get-in result [:program :equations])))))))
+
 (def ^:private inclusive-scan
   '(let* [result (raster.par/scan out acc 0.0 i n float
                                   (+ acc (clojure.core/aget x i)))]
