@@ -42,6 +42,10 @@
   (and (par/par-map-void-form? form)
        (seq (soa-lower/collect-soa-env (:body (par/extract-par-map-void-info form))))))
 
+(defn- contains-unlowered-soa-effect?
+  [source]
+  (boolean (some unlowered-soa-effect? (tree-seq coll? seq source))))
+
 (defn- host-scalar-result?
   [program equation]
   (let [value (get-in program [:values (first (:results equation))])
@@ -486,7 +490,8 @@
             :scalar-types (merge scalar-types retained-scalar-types)
             :array-types (merge array-types retained-array-types)})
 
-          (and (nil? supplied-program) (form/binding-form? form))
+          (and (nil? supplied-program) (form/binding-form? form)
+               (not (contains-unlowered-soa-effect? form)))
           (segop-lower-pass/schedule-source-program
            form {:target-device device-id :dtype dtype
                  :scalar-types scalar-types :array-types array-types})

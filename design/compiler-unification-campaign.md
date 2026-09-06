@@ -180,7 +180,7 @@ emission route and `:effect-compatibility` count, including through nested host 
 not full effect-emitter retirement: logical SoA expansion and other unsupported effect bodies still
 need their own typed closure. The independent source-emitter tests remain unchanged.
 An explicit logical-SoA guard precedes plain-array scheduling: the typed frontend can otherwise
-accept the container as one float pointer rather than decline. Bare and nested regression probes
+accept the container as one float pointer rather than decline. Bare, conditional and let-bound probes
 retain the existing per-field dtypes, names and grouped logical binding through the source adapter.
 
 ## 3. General fusion and bounded specialization — price admission active; broader work queued

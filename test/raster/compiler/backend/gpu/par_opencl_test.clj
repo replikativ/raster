@@ -413,8 +413,11 @@
                                            {:name "id" :element-tag 'int :array-tag 'ints}]}})
                 types/soa-reverse-registry (atom {'ParticleSoA 'Particle})
                 segop-lower/schedule-single-program
-                (fn [& _] (throw (ex-info "unexpanded SoA entered plain-array scheduling" {})))]
-    (doseq [wrap [identity #(list 'if 'enabled % nil)]]
+                (fn [& _] (throw (ex-info "unexpanded SoA entered plain-array scheduling" {})))
+                segop-lower/schedule-source-program
+                (fn [& _] (throw (ex-info "unexpanded SoA entered source scheduling" {})))]
+    (doseq [wrap [identity #(list 'if 'enabled % nil)
+                 #(list 'let* ['effect %] 'effect)]]
       (let [emitted (opencl-pass/opencl-pass
                      (wrap '(raster.par/map-void! i n
                               (aset out i (.x (aget ^ParticleSoA particles i)))))
