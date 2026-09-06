@@ -32,9 +32,14 @@
           old (reference/generate-product-reduction-kernel segred
                 :scalar-types (:scalar-types fixtures/options)
                 :array-types (:array-types fixtures/options))
+          retained-options (dissoc fixtures/options :element-binding-types :combine-binding-types)
           new (target/emit-artifact "candidate_product_argmax"
-                                   (product/schedule segred fixtures/options) :opencl-portable)]
-      (doseq [artifact [old new]] (register! (:kernel-name artifact) artifact))
+                                   (product/schedule (fixtures/typed-argmax-segred) retained-options)
+                                   :opencl-portable)
+          local (target/emit-artifact "candidate_product_local_address"
+                                     (product/schedule (fixtures/typed-local-address-segred)
+                                                       retained-options) :opencl-portable)]
+      (doseq [artifact [old new local]] (register! (:kernel-name artifact) artifact))
       (doseq [[nrows width] (cons [0 1] (map #(vector 5 %) [0 1 7 32 33 65]))]
         (let [rows (vec (take nrows [(vec (repeat width (float 2)))
                     (mapv #(float (mod % 7)) (range width))
@@ -62,8 +67,7 @@
                                 (execute! (bind-call (call/make artifact
                                                                (mapv bindings (:arguments artifact))))))
                               (vec (read! output))
-                              (finally (free! output))))) [old new])]
-              (is (= (if (zero? nrows) [-77] (mapv argmax rows))
-                     (first results) (second results))
+                              (finally (free! output))))) [old new local])]
+              (is (apply = (cons (if (zero? nrows) [-77] (mapv argmax rows)) results))
                   (str "rows " nrows ", width " width)))
             (finally (free! input))))))))

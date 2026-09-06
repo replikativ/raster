@@ -454,8 +454,10 @@ retained emitter and a host oracle on CPU OpenCL (empty/short/tail rows, ties, N
 and joins the hardware-free CUDA/HIP compile gates. This is not a throughput benchmark.
 
 It is deliberately not yet a production route: it accepts one segment axis, int32 row/column
-bounds, explicitly retained region-binding types and long-width address expressions. Computed
-local address bindings still decline. Caller-supplied storage shapes are not a source/storage
+bounds, retained region-binding types and long-width address expressions. TypedSOAC local dtypes
+now survive SegRed projection and scalar SSA substitution, so computed local address bindings and
+typed integral constants use those same facts rather than a reconstructed type map. Contradictory
+candidate overrides decline. Caller-supplied storage shapes are not a source/storage
 certificate (`:source-storage-certified? false`); exact graph/source/body storage closure must be
 added before selection. Zero-row calls retain the existing zero-group rejection and need planner
 elision; zero-width rows produce the neutral tuple. Next: close those obligations over the public

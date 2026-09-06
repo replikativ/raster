@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -20,6 +21,20 @@
 (defn- decline! [rule message data]
   (throw (ex-info message (assoc data :reason :product-kernel-body-declined
                                  :missing-rule rule :fallback :none))))
+
+(defn- region-binding-types
+  "Read retained TypedSOAC local tags. Explicit candidate facts may fill omissions, not override."
+  [region supplied]
+  (reduce (fn [facts id]
+            (if-let [retained (some-> (types/sym-type-tag id) dtype/dtype-for-scalar-tag)]
+              (do
+                (when (and (get supplied id) (not= retained (get supplied id)))
+                  (decline! :binding-dtype-conflict
+                            "candidate binding dtype disagrees with its retained source type"
+                            {:binding id :retained retained :supplied (get supplied id)}))
+                (assoc facts id retained))
+              facts))
+          (or supplied {}) (take-nth 2 (:bindings region))))
 
 (defn lower
   "Lower one row-segmented SegRed with retained input shapes and scalar/region binding dtypes.
@@ -37,6 +52,10 @@
         {row :name rows :bound} (first segments)
         {column :name width :bound} (segop/seg-space-reduced-dim (:space segred))
         components (:components operator)
+        element-binding-types (region-binding-types (reduction/element-region operator)
+                                                     element-binding-types)
+        combine-binding-types (region-binding-types (reduction/combine-region operator)
+                                                     combine-binding-types)
         types (mapv :dtype components)
         wg (:workgroup-size source-schedule)
         inputs (vec (sort-by name (:inputs segred)))

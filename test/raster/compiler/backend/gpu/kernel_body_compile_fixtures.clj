@@ -323,8 +323,10 @@
            (write-artifact! directory suffix "candidate-product-reduction"
                             (body-target/emit-artifact
                              "candidate_product_argmax"
-                             (product-body/schedule (product-fixtures/argmax-segred)
-                                                    product-fixtures/options)
+                             (product-body/schedule (product-fixtures/typed-local-address-segred)
+                                                    (dissoc product-fixtures/options
+                                                            :element-binding-types
+                                                            :combine-binding-types))
                              dialect))
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"

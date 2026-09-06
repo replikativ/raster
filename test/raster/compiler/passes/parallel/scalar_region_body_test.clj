@@ -105,3 +105,47 @@
                         :results [(let* [a 9] a) a]}
                       [:int :int] {'a :int} {})]
     (is (= [(body/literal 9 :int) (body/literal 3 :int)] (:results result)))))
+
+(deftest typed-index-lowering-consumes-local-ssa-facts
+  (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        lower (:lower-region
+               (scalar/make-lowerer
+                {:arrays #{'x} :array-types {'x :float} :scalar-types {'i :int}
+                 :lower-index (fn [expression scope]
+                                (index/lower-typed expression scope {'i :int} :long decline!))
+                 :decline! decline!}))]
+    (doseq [[init expected-kind] [['(long i) "ScalarCompute"] [0 nil]]]
+      (let [result (lower {:bindings ['offset init] :results '[(aget x offset)]}
+                          [:float] {'offset :long} {})
+            load (peek (:operations result))
+            coordinate (first (:coordinates load))]
+        (is (= :float (get-in load [:result :type])))
+        (if expected-kind
+          (do
+            (is (= expected-kind (.getSimpleName (class (first (:operations result))))))
+            (is (= 'long (:raster.type/tag (meta coordinate)))))
+          (is (= (body/index-cast 0 :long :exact) coordinate)))))
+    (let [result (lower '{:bindings [offset 0] :results [(aget x (long offset))]}
+                        [:float] {'offset :int} {})]
+      (is (= (body/index-cast (body/index-cast 0 :int :exact) :long :exact)
+             (first (:coordinates (peek (:operations result)))))))
+    (doseq [[value type] [[2147483648 :int] [0.5 :float]]]
+      (try
+        (lower {:bindings ['offset value] :results '[(aget x offset)]}
+               [:float] {'offset type} {})
+        (is false "malformed typed index constants must decline")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :index-literal (:rule (ex-data e)))))))))
+
+(deftest kernel-only-dtypes-do-not-require-a-jvm-tag
+  (let [lower (:lower-region
+               (scalar/make-lowerer
+                {:arrays #{'x} :array-types {'x :half} :scalar-types {}
+                 :lower-index (fn [coordinate _] coordinate)
+                 :decline! (fn [rule message data]
+                             (throw (ex-info message (assoc data :rule rule))))}))
+        result (lower '{:bindings [h (aget x 0)] :results [h h]} [:half :half] {'h :half} {})]
+    (is (= [:half :half] (:types result)))
+    (is (= 1 (count (:operations result))))
+    (is (apply = (:results result)))
+    (is (= :half (get-in result [:operations 0 :result :type])))))
