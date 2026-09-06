@@ -20,7 +20,8 @@
    Extents may be numbers or symbols; index expressions fold to constants when everything is
    literal and stay symbolic otherwise."
   (:refer-clojure :exclude [shape])
-  (:require [raster.compiler.core.op-descriptor :as od]))
+  (:require [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 ;; ── construction ────────────────────────────────────────────────────────────────────
 (defn of-axes
@@ -151,13 +152,22 @@
 ;;
 ;; `axes` is required because `(* i k)` is ambiguous without it — axis × extent, or axis × axis.
 ;; Symbols in `axes` are atoms; every other symbol is a coefficient factor.
+(def ^:private ^:dynamic *polynomial-term-limit* nil)
+
+(defn- bounded-polynomial [p]
+  (when (and *polynomial-term-limit* (> (count p) *polynomial-term-limit*))
+    (throw (ex-info "axis-map proof budget exhausted" {:reason ::proof-budget})))
+  p)
+
 (defn- p* [a b]
   (reduce (fn [acc [sa ca]]
             (reduce (fn [acc [sb cb]]
-                      (update acc (vec (sort-by str (concat sa sb))) (fnil + 0) (* ca cb)))
+                      (bounded-polynomial
+                       (update acc (vec (sort-by str (concat sa sb))) (fnil +' 0) (*' ca cb))))
                     acc b))
           {} a))
-(defn- p+ [a b] (into {} (remove (comp zero? val)) (merge-with + a b)))
+(defn- p+ [a b]
+  (bounded-polynomial (into {} (remove (comp zero? val)) (merge-with +' a b))))
 (def ^:private p-one {[] 1})
 
 (defn affine
@@ -199,7 +209,9 @@
                                      {::one p-one} args)
                     :else {(opaque e) p-one}))
                 :else {(opaque e) p-one}))]
-    (some->> (aff e) (into {} (remove (comp empty? val))))))
+    (some->> (aff e)
+             (map (fn [[atom coefficients]] [atom (p+ coefficients {})]))
+             (into {} (remove (comp empty? second))))))
 
 (defn index=
   "Do two index expressions denote the same element for all values of `axes`? The single index
@@ -213,6 +225,88 @@
    an operand's layout if the operand's actual index provably IS that layout."
   [amap idx-expr]
   (index= idx-expr (index-expr amap) (axes amap)))
+
+(defn bounded-typed-index-matches?
+  "Conservatively prove a typed index implements this AxisMap without intermediate overflow.
+
+  CONDITIONAL proof: at the access, each axis must be in [0, extent), all extents must be
+  positive, and the checked mathematical product of extents must fit signed long and the
+  resident buffer. Callers must establish those execution/binding premises separately. This
+  function does not certify a graph, pointer, guard, or arbitrary source expression.
+
+  Accepts exact integral widenings and long add/multiply only; `leaf-dtype` supplies retained
+  types. The existing affine relation establishes layout equality. Before normalization can
+  erase arithmetic, every subtree is bounded by capacity. Bounds use the same polynomial
+  algebra with extent = 1 + nonnegative slack; nonnegative difference coefficients suffice.
+  A fixed structural/polynomial budget or an unsupported case returns false."
+  [amap expression leaf-dtype]
+  (binding [*polynomial-term-limit* 64]
+    (try
+      (let [pairs (vec (take 17 (mapcat identity (take 17 (:groups amap)))))
+            axis-extents (into {} pairs)
+            extents (mapv second pairs)
+            extent-symbols (set (filter symbol? extents))
+            decline! (fn [] (throw (ex-info "unsupported typed axis-map proof"
+                                          {:reason ::proof-decline})))
+            visited (volatile! 0)]
+        (when-not (and (<= 1 (bounded-count 17 (:groups amap)) 16)
+                       (every? seq (:groups amap))
+                       (<= 1 (count pairs) 16)
+                       (every? #(and (vector? %) (= 2 (count %)) (symbol? (first %))) pairs)
+                       (= (count pairs) (count axis-extents))
+                       (not-any? extent-symbols (keys axis-extents))
+                       (every? #(or (symbol? %)
+                                    (and (integer? %) (<= 1 % Long/MAX_VALUE))) extents))
+          (decline!))
+        ;; Bound the tree BEFORE the recursive type validator or affine normalization sees it.
+        (letfn [(check-tree! [x]
+                  (when (> (vswap! visited inc) 128) (decline!))
+                  (cond
+                    (launch/index-expr? x)
+                    (do (when-not (contains? #{:add :mul} (:op x)) (decline!))
+                        (doseq [a (:arguments x)] (check-tree! a)))
+                    (launch/index-cast? x) (check-tree! (:argument x))
+                    (symbol? x) (when-not (or (contains? axis-extents x)
+                                              (extent-symbols x)) (decline!))
+                    (integer? x) (when-not (<= 0 x Long/MAX_VALUE) (decline!))
+                    :else (decline!)))
+                (extent-poly [e]
+                  (if (symbol? e) {[] 1 [e] 1} {[] e}))
+                (nonnegative-difference? [a b]
+                  (every? (comp (complement neg?) val)
+                          (p+ a (into {} (map (fn [[k v]] [k (-' v)])) b))))]
+          (check-tree! expression)
+          (launch/validate-typed-expression! expression leaf-dtype)
+          ;; Extents omitted from the index (e.g. outermost rows) still require retained types.
+          (doseq [e extent-symbols] (launch/validate-typed-expression! e leaf-dtype))
+          (let [capacity (reduce p* p-one (map extent-poly extents))]
+            ;; The constant coefficient is capacity's minimum in the positive domain.
+            ;; If it cannot fit, no runtime binding can satisfy the proof's premise.
+            (when (> (get capacity [] 0) Long/MAX_VALUE) (decline!))
+            (letfn [(visit [x]
+                      (let [[source upper]
+                            (cond
+                              (integer? x) [x {[] x}]
+                              (symbol? x)
+                              [x (if-let [e (get axis-extents x)]
+                                   (p+ (extent-poly e) {[] -1})
+                                   (extent-poly x))]
+                              (launch/index-cast? x) (visit (:argument x))
+                              :else
+                              (do
+                                (when-not (= :long (launch/typed-expression-dtype x leaf-dtype))
+                                  (decline!))
+                                (let [args (mapv visit (:arguments x))
+                                      multiply? (= :mul (:op x))]
+                                  [(cons (if multiply? '* '+) (map first args))
+                                   (reduce (if multiply? p* p+)
+                                           (if multiply? p-one {}) (map second args))])))]
+                        (when-not (nonnegative-difference? capacity upper) (decline!))
+                        [source upper]))]
+              (let [[source upper] (visit expression)]
+                (and (nonnegative-difference? (p+ capacity {[] -1}) upper)
+                     (index-matches? amap source)))))))
+      (catch clojure.lang.ExceptionInfo _ false))))
 
 (defn transposed-2d?
   "True when `to` is `from` with its two groups swapped (the 2-D transpose case a physical
