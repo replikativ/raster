@@ -280,7 +280,7 @@
         ;; mixed byte/int/float storage lowers through the verified KernelBody: the int8 store
         ;; is a stated narrowing cast, not a source spelling the SegMap generator reparses
         (is (= :kernel-body (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
-        (is (= [:byte :float :int :float :int]
+        (is (= [:byte :float :int :float :long]
                (mapv :dtype (get-in descriptor [:steps 0 :abi]))))
         (let [program (fixture/instantiate! session descriptor [x q y labels n]
                                             {'x :input 'q :input
