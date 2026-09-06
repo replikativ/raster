@@ -36,11 +36,11 @@
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
   (or
-   (when-let [matched (patterns/match-reduce-loop expression)]
+   (when-let [matched (patterns/match-ordered-reduce-loop expression)]
      (assoc matched :inclusive? false
-            :update-expr (or (:scoped-update-expr matched) (:update-expr matched))))
-   (when-let [{:keys [kind index-sym acc-sym acc-init body-form bound]}
-              (patterns/normalize-loop expression)]
+            :update-expr (:scoped-update-expr matched)))
+   (when-let [{:keys [kind index-sym index-init index-slot acc-sym acc-init body-form bound]}
+              (patterns/normalize-ordered-loop expression)]
      (when (and (= :reduce-loop kind)
                 (= :le (descriptor/comparison-kind
                         (descriptor/semantic-op (second body-form)))))
@@ -57,8 +57,10 @@
                [(second recur-args) (first recur-args)]
 
                :else [nil nil])]
-         (when (and update-expr index-update)
-           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym
+         (when (and update-expr index-update
+                    (= 'recur (first then-branch))
+                    (= 1 (descriptor/affine-step (nth recur-args index-slot) index-sym)))
+           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym :index-init index-init
             :bound-expr bound :else-expr else-expr :update-expr update-expr
             :inclusive? true}))))))
 
@@ -249,7 +251,7 @@
 
                   (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                   (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
-                                   inclusive?]}
+                                   inclusive? index-init]}
                            (match-ordered-loop expression)]
                     (do
                       (when (or (patterns/contains-sym? bound-expr index-sym)
@@ -288,7 +290,7 @@
                                     upper)
                             loop (body/->ForLoop
                                   (body/value loop-index :long)
-                                  (body/index-cast 0 :long :exact)
+                                  (body/index-cast index-init :long :exact)
                                   upper 1
                                   [(body/->LoopArg (body/value carry loop-type)
                                                    (:result initial))]

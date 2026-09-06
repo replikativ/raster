@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -57,6 +58,38 @@
                                                       (body/scalar-expression :neg type ['a]))]
                    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
                    :provenance {:dialect :test} :attributes {}})))))
+
+(deftest ordered-loop-origin-is-retained-without-widening-soac-recognition
+  (doseq [origin [0 1 3 Long/MAX_VALUE]]
+    (let [form (list 'loop ['r origin 'acc (body/literal 7.0 :float)]
+                     '(if (< r n) (recur (inc r) (+ acc (float r))) acc))
+          result ((:lower-region (lowerer)) {:bindings [] :results [form]}
+                  [:float] {} {'n :long})
+          loop (last (:operations result))]
+      (is (= origin (:index-init (patterns/match-ordered-reduce-loop form))))
+      (is (= (zero? origin) (some? (patterns/match-reduce-loop form))))
+      (is (= (body/index-cast origin :long :exact) (:lower loop)))
+      (is (= :ordered (get-in loop [:attributes :association])))))
+  (doseq [origin [-1 0.5 'start 9223372036854775808N]]
+    (let [form (list 'loop ['r origin 'acc 0.0]
+                     '(if (< r n) (recur (inc r) (+ acc r)) acc))]
+      (is (nil? (patterns/match-ordered-reduce-loop form))))))
+
+(deftest ordered-loop-admission-does-not-drop-effects-or-swap-recur-slots
+  (doseq [form ['(loop [r 1 acc 0.0]
+                  (aset out 0 7.0)
+                  (if (< r n) (recur (inc r) (+ acc 1.0)) acc))
+                '(loop [r 1 acc 0]
+                   (if (< r n) (recur (+ acc 1) (inc r)) acc))
+                '(loop [r 1 acc 0.0]
+                   (if (< r n) (do (aset out 0 7.0) (recur (inc r) (+ acc 1.0))) acc))
+                '(loop [r 2147483648 acc 0.0]
+                   (if (< (int r) n) (recur (inc r) (+ acc 1.0)) acc))
+                '(loop [r 1 r 0.0] (if (< r n) (recur (inc r) r) r))]]
+    (is (nil? (patterns/match-ordered-reduce-loop form))))
+  (is (= 1 (:index-init
+            (patterns/match-ordered-reduce-loop
+             '(loop [acc 0.0 r 1] (if (< (long r) n) (recur (+ acc 1.0) (inc r)) acc)))))))
 
 (deftest coupled-results-share-bindings-without-sharing-component-types
   (let [{:keys [operations results types] :as lowered} (mixed-region (lowerer))

@@ -89,6 +89,13 @@ floating operands (preserving signed zero); integral operands retain checked sub
 its explicit portable-OpenCL trap limitation. Public route, CPU OpenCL IEEE cases and vendor
 compile fixtures cover this increment. It does not retire the remaining ordered-loop fallback.
 
+The next measured gap is `sum-kv-heads`: its ordered carry starts at one after loading the first
+element. The origin follow-up retains nonnegative literal starts in the existing scalar ForLoop;
+zero-origin SOAC recognition is unchanged. New nonzero coverage requires direct recursion, exact
+binding-slot updates, one loop body and no narrowing induction test. Public GQA fan-in, group-one
+signed-zero preservation and cancellation-sensitive accumulation are checked on CPU OpenCL.
+This does not authorize reassociation or arbitrary symbolic/negative loop origins.
+
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.
