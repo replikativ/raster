@@ -1,0 +1,83 @@
+# Compiler unification campaign
+
+Authorized scope: complete the four stages below in order. Each production migration must retain
+its numerical, ABI, ownership and resource contracts; isolated emitter coverage is not a completed
+vertical. The north star remains the architectural specification.
+
+## 1. Close product reduction production lowering — active
+
+- Landed #382: shared typed multi-result scalar-region lowering.
+- Landed #383: candidate row-product KernelBody, CPU OpenCL differential execution, CUDA/HIP
+  compilation. Production still uses the retained source emitter.
+- Implemented in this slice: preserve TypedSOAC local dtypes through SegRed and subsequent
+  scalar/index lowering; compare both direct and local-address candidates on CPU OpenCL.
+- Certify the exact semantic source, storage boundaries and public bindings against the graph.
+- Exercise ordinary public compilation, resident execution and hidden/multiple tuple results.
+- Cover required axis/bound variants and zero-row planning; reject unsupported cases explicitly.
+- Select the certified body and delete the old product algorithm emitter once its coverage is
+  replaced. Keep necessary target instruction lowering.
+
+Exit: public product workloads use the typed route without reconstructed facts or source assembly.
+
+## 2. Retire the remaining compatibility paths — queued
+
+Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
+before treating a definition as live or dead:
+
+| Priority | Boundary | Representative acceptance |
+|---|---|---|
+| 1 | General contraction fallback in `contract_route` / `segop_opencl` | General/scientific contractions, exact decline inventory |
+| 2 | Unscheduled effect maps in `opencl_pass` / `par_opencl` | Resident mutation, aliasing, nil/buffer returns |
+| 3 | Strided scatter/gather source emission | Block transfers, collision and view contracts |
+| 4 | Active-ID compaction | ABM firms, stable output order and count/capacity |
+| 5 | Compound-local algorithm emission | Structured loop dependencies, storage and barriers |
+| 6 | Staged/quantized contractions | Decode/lift algebra, typed accumulators and overflow |
+
+Audit apparent unused wrappers separately. A source oracle is not a production fallback; removing
+one must not erase its independent numerical evidence. Track JVM and C/SIMD compatibility as well
+as GPU paths, using the same production corpus and retained TypedSOAC facts.
+
+Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
+production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
+the entire compiler unified from one successful vertical.
+
+## 3. General fusion and bounded specialization — queued
+
+- Validate shared scalar-region composition, coupled reductions and post-reduction transforms.
+- Audit recompute/materialize choices on fan-out, effects, aliases and observable results.
+- Apply retained static structural facts before fusion, shape/layout/target facts before scheduling,
+  and typed constant/range simplification afterward.
+- Preserve ordered arithmetic and AD/effect boundaries. Use guards and bounded specialization
+  caches; do not unroll large numerical iteration spaces merely because their sizes are known.
+
+Exit: representative scientific and model expressions compile with explained fusion/placement
+choices, differential correctness, and measured kernel/allocation/compile-cost changes.
+
+## 4. Measure generated production kernels and selection — queued
+
+Begin with existing production canaries, not independent handwritten builders:
+
+- `test/raster/perf/production_canary.clj`: public AOT sumsq and resident generated GEMM;
+  GPU replay currently measures host-synchronized latency, not pure device throughput.
+- `bench/soac_contract_bench.clj`: contraction ladder; verify its entry point before reuse.
+- `bench/resident_gemm_cold_bench.clj`: useful cold/warm methodology, but its source-oracle builder
+  must be replaced before it counts as generated-production evidence.
+
+Measure GEMM, quantized projections, reductions and attention with matched shape, dtype, numerical
+policy, warmup and transfer boundaries. Record compiler/tuning time, kernel count, allocations,
+peak storage, transferred bytes and execution time. External comparisons and heavier experiments
+stay outside the local hot loop. Use device events where available and label CPU OpenCL results as
+CPU results. No SOTA claim follows from successful vendor compilation alone.
+
+Use the measurements to shortlist legal schedules and validate selective autotuning/cache replay.
+If comparable accelerator hardware is unavailable, complete harnesses and correctness gates but
+leave accelerator competitiveness explicitly unmeasured.
+
+Exit: reproducible production measurements identify wins/regressions and explain schedule choices;
+claims are limited to tested hardware and workloads. Discuss the results before stages 5–6.
+
+## Working loop
+
+One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
+compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
+with all required checks green. Never alter the concurrently edited main-checkout north-star file.

@@ -628,13 +628,18 @@
                        [parameter (list 'clojure.core/aget array coordinate)])
                      array-parameters arrays))
           element-bindings
-          (vec (mapcat (fn [{:keys [id init]}]
-                         [id (util/subst-syms substitutions init)])
+          (vec (mapcat (fn [{:keys [id dtype init]}]
+                         [(with-meta id (assoc (meta id) :raster.type/tag
+                                               (dtype/scalar-tag-for-dtype dtype)))
+                          (util/subst-syms substitutions init)])
                        (:locals element)))
           element-results (mapv #(util/subst-syms substitutions %)
                                 (:body-results element))
           combine-bindings
-          (vec (mapcat (fn [{:keys [id init]}] [id init]) (:locals combine)))
+          (vec (mapcat (fn [{:keys [id dtype init]}]
+                         [(with-meta id (assoc (meta id) :raster.type/tag
+                                               (dtype/scalar-tag-for-dtype dtype))) init])
+                       (:locals combine)))
           facts (soac-dialect/facts program)
           physical-results (soac-dialect/physical-results facts equation)
           result-by-component (zipmap (:result-components attributes) physical-results)

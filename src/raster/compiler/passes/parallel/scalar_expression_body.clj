@@ -429,7 +429,18 @@
                               {:binding id :expression expression}))
                   (let [lowered (checked-lower (util/subst-syms substitutions expression)
                                                (get binding-types id) environment)
-                        result (:result lowered)]
+                        result (:result lowered)
+                        ;; References to fresh SSA locals must carry the same retained type as
+                        ;; their definition, including when they become storage coordinates.
+                        ;; Index lowering must not rediscover this from an enclosing result.
+                        ;; Half and internal predicate values have no JVM scalar tag. Their
+                        ;; dtype stays in the existing typed SSA environment, not a guessed tag.
+                        tag (when-not (= :predicate (:type lowered))
+                              (:scalar-tag (dtype/info (:type lowered))))
+                        result (if (and (symbol? result) tag)
+                                 (with-meta result
+                                   (assoc (meta result) :raster.type/tag tag))
+                                 result)]
                     {:operations (into operations (:operations lowered))
                      :substitutions (assoc substitutions id result)
                      :environment (cond-> environment

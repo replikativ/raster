@@ -3,21 +3,28 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as reference]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
-(defn argmax-segred []
+(defn- argmax-form []
   (let [form (vec fixtures/argmax-product-form)
         ;; This fixture supplies retained address widths explicitly, like analyzed source.
         form (update-in form [6 1]
                         (fn [[op array coordinate]]
                           (list op array
                                 (walk/postwalk
-                                 #(if (seq? %) (with-meta % {:tag 'long}) %) coordinate))))
-        node (soac/par-form->soac '_ (apply list form) 7 :dtype :float)]
+                                 #(if (seq? %) (with-meta % {:tag 'long}) %) coordinate))))]
+    (apply list form)))
+
+(defn argmax-segred []
+  (let [node (soac/par-form->soac '_ (argmax-form) 7 :dtype :float)]
     (assoc-in (first (soac-lower/lower-soac node :cpu:0 :dtype :float))
               [:schedule :workgroup-size] 32)))
 
@@ -27,6 +34,53 @@
    :scalar-types {'nrows :int 'width :int}
    :element-binding-types {'candidate :float}
    :combine-binding-types {'left-nan :int 'right-nan :int 'better :int}})
+
+(defn typed-argmax-segred []
+  (let [tag-bindings (fn [bindings dtypes]
+                       (vec (mapcat (fn [[id init]]
+                                      [(with-meta id {:raster.type/tag
+                                                      (dtype/scalar-tag-for-dtype (get dtypes id))})
+                                       init]) (partition 2 bindings))))
+        ;; Supply the facts normally attached by the walker; the frontend deliberately does not
+        ;; infer types from these raw test S-expressions.
+        form (-> (vec (argmax-form))
+                 (update 6 tag-bindings (:element-binding-types options))
+                 (update 9 tag-bindings (:combine-binding-types options))
+                 (update 2 #(mapv (fn [[id neutral type]]
+                                    [id (constant/literal-or-original neutral) type]) %)))
+        program (frontend/form->program
+                 (list 'let* ['effect (apply list form)] 'effect)
+                 {:dtype :float :array-types {'values :float 'indices :int}
+                  :scalar-types (:scalar-types options)})]
+    (assoc-in (first (soac-lower/lower-typed-product-reduce program :cpu:0 :dtype :float))
+              [:schedule :workgroup-size] 32)))
+
+(defn typed-local-address-segred []
+  (let [segred (typed-argmax-segred)
+        ;; Use the semantic reduction index, not a spelling inferred from generated code.
+        index (get-in segred [:reduction :index])]
+    (update-in segred [:reduction :element :bindings]
+               (fn [bindings]
+                 (into [(with-meta 'offset {:raster.type/tag 'long}) (list 'long index)]
+                       (mapcat (fn [[id init]] [id (util/subst-syms {index 'offset} init)])
+                               (partition 2 bindings)))))))
+
+(deftest typed-product-projection-retains-local-types-without-caller-reconstruction
+  (let [segred (typed-argmax-segred)
+        tags (fn [region]
+               (into {} (map #(vector % (:raster.type/tag (meta %))))
+                     (take-nth 2 (get-in segred [:reduction region :bindings]))))
+        inferred-options (dissoc options :element-binding-types :combine-binding-types)]
+    (is (= {'candidate 'float} (tags :element)))
+    (is (= {'left-nan 'int 'right-nan 'int 'better 'int} (tags :combine)))
+    (is (string? (:source (target/emit-artifact "typed_product_argmax"
+                                              (product/schedule segred inferred-options)
+                                              :opencl-portable))))
+    (try
+      (product/schedule segred (assoc-in options [:combine-binding-types 'better] :float))
+      (is false "retained source types cannot be overridden by candidate options")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :binding-dtype-conflict (:missing-rule (ex-data e))))))))
 
 (deftest row-product-emits-through-shared-target-pipeline
   (let [segred (argmax-segred)

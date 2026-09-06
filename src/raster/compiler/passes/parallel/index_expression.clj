@@ -154,7 +154,8 @@
    This is the graph-launch counterpart of scalar KernelBody lowering, not source type inference."
   [expression scope leaf-dtype expected-dtype decline!]
   (letfn [(source-dtype [form]
-            (or (some-> (or (:raster.type/tag (meta form)) (:tag (meta form)))
+            (or (when (instance? raster.compiler.ir.kernel_body.Literal form) (:type form))
+                (some-> (or (:raster.type/tag (meta form)) (:tag (meta form)))
                         dtype/dtype-for-scalar-tag dtype/canon)
                 (when (symbol? form) (some-> (leaf-dtype form) dtype/canon))
                 (when (integer? form)
@@ -175,6 +176,15 @@
               (cond
                 (integer? form)
                 (coerce form (source-dtype form) expected form)
+
+                (instance? raster.compiler.ir.kernel_body.Literal form)
+                (let [{:keys [value type]} form]
+                  (when-not (and (contains? #{:int :long} type) (integer? value)
+                                 (scalar-range/literal value type))
+                    (decline! :index-literal
+                              "typed index literal requires a representable int or long"
+                              {:expression form}))
+                  (coerce (body/index-cast value type :exact) type expected form))
 
                 (symbol? form)
                 (if (contains? scope form)
