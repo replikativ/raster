@@ -12,13 +12,6 @@
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
-(def ^:private cast-heads
-  {'byte :byte, 'clojure.core/byte :byte
-   'int :int, 'clojure.core/int :int
-   'long :long, 'clojure.core/long :long
-   'float :float, 'clojure.core/float :float
-   'double :double, 'clojure.core/double :double})
-
 (defn- contains-indexed-load?
   [expression]
   (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
@@ -99,8 +92,8 @@
                (number? expression) expected
                (descriptor/aget-call? expression)
                (or (get array-types (descriptor/aget-array-sym expression)) expected)
-               (and (seq? expression) (contains? cast-heads (first expression)))
-               (get cast-heads (first expression))
+               (and (seq? expression) (descriptor/cast-op? (first expression)))
+               (dtype/dtype-for-scalar-tag (descriptor/cast-result-tag (first expression)))
                (and (seq? expression)
                     (= :cmp (:kind (intrinsics/descriptor
                                     (intrinsics/canonical
@@ -211,9 +204,10 @@
                                           (when predicate (body/literal 0 array-type)) :cached))
                          :result id :type array-type :range range})))
 
-                  (and (seq? expression) (contains? cast-heads (first expression))
+                  (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
-                  (let [target (dtype/canon (get cast-heads (first expression)))
+                  (let [target (dtype/dtype-for-scalar-tag
+                                (descriptor/cast-result-tag (first expression)))
                         source-expected (dtype/canon (source-type (second expression) target env))
                         lowered (lower (second expression) source-expected env)]
                     (cast-lowered lowered target expression))
