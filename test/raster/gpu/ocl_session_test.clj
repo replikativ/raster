@@ -35,6 +35,67 @@
   [state :- (Array float) a :- Float n :- Long] :- (Array float)
   (raster.par/map! state i n float (* a (ra/aget state i))))
 
+(deftm ocl-session-negate!
+  [x :- (Array float) out :- (Array float) n :- Long] :- Void
+  (raster.par/map-void! i n (ra/aset out i (- (ra/aget x i)))))
+
+(deftest scale-clamp-exp-uses-the-common-scalar-body
+  (let [report (pl/compile-report #'ops/scale-clamp-exp
+                                  :target-device :ocl:0 :dtype :double)]
+    (is (= :typed-soac (get-in report [:route :source-dialect])))
+    (is (= {:kernel-body 1} (get-in report [:emission :routes])))
+    (is (empty? (get-in report [:emission :declines])))))
+
+(deftest sum-kv-heads-keeps-an-ordered-nonzero-origin-body
+  (let [report (pl/compile-report #'ops/sum-kv-heads :target-device :ocl:0 :dtype :float)]
+    (is (= {:kernel-body 1} (get-in report [:emission :routes])))
+    (is (empty? (get-in report [:emission :declines])))))
+
+(deftest ocl-ordered-head-fan-in-preserves-initial-load-and-association
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "ordered head fan-in")
+    (let [descriptor (pl/compile-gpu-program #'ops/sum-kv-heads :ocl:0 :dtype :float)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (doseq [group [1 3 5]]
+          (let [n-kv 2 slab 3
+                input (float-array
+                       (for [head (range n-kv) r (range group) col (range slab)]
+                         (if (= group 1) -0.0
+                             (case r 0 1.0e20 1 -1.0e20 (+ 3.0 head col)))))
+                expected (float-array
+                          (for [head (range n-kv) col (range slab)]
+                            (reduce (fn [acc r]
+                                      (float (+ acc (aget input (+ (* (+ (* head group) r) slab) col)))))
+                                    (aget input (+ (* head group slab) col))
+                                    (range 1 group))))
+                arguments [input (long n-kv) (long group) (long slab)]
+                program (fixture/instantiate! session descriptor arguments)]
+            (try
+              (let [result (get (fixture/run! program arguments) (:result-sym descriptor))]
+                (is (= (mapv #(Float/floatToRawIntBits %) expected)
+                       (mapv #(Float/floatToRawIntBits %) result))))
+              (finally (fixture/close! program)))))
+        (finally (gpu/close-session! session))))))
+
+(deftest ocl-unary-negation-preserves-ieee-signs
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "generated scalar negation")
+    (let [x (float-array [0.0 -0.0 3.5 -3.5 Float/POSITIVE_INFINITY
+                          Float/NEGATIVE_INFINITY Float/NaN])
+          out (float-array (alength x))
+          descriptor (pl/compile-gpu-program #'ocl-session-negate! :ocl:0 :dtype :float)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (let [program (fixture/instantiate! session descriptor [x out (long (alength x))])
+              result (get (fixture/run! program [x out (long (alength x))]) 'out)]
+          (is (every? #(= :kernel-body (get-in % [:artifact :attributes :emission-route]))
+                      (:steps descriptor)))
+          (is (= (mapv #(bit-xor Integer/MIN_VALUE (Float/floatToRawIntBits %)) (take 6 x))
+                 (mapv #(Float/floatToRawIntBits %) (take 6 result))))
+          (is (Float/isNaN (aget ^floats result 6))))
+        (finally (gpu/close-session! session))))))
+
 (deftm ocl-session-map2
   [x :- (Array float) y :- (Array float)
    a :- (Array float) b :- (Array float) n :- Long] :- Void

@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -20,6 +21,77 @@
      :results [(if better candidate old-value) (if better i old-index)]}
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
+
+(deftest unary-subtraction-retains-floating-sign-and-integral-overflow
+  (doseq [type [:float :double :int :long]]
+    (let [lower (:lower-region (lowerer))
+          lowered (lower '{:bindings [] :results [(- a)]} [type] {} {'a type})
+          expression (get-in lowered [:operations 0 :expression])
+          floating? (contains? #{:float :double} type)]
+      (is (= (if floating? :neg :-) (:op expression)))
+      (is (= (if floating? 1 2) (count (:arguments expression))))
+      (is (= (when-not floating? :trap) (get-in expression [:options :overflow])))
+      (let [kernel (body/make
+                    {:id :unary-minus
+                     :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :parameter)
+                                  (body/->KernelParameter 'out :output type [1] :global
+                                                         (layout/row-major [1] type) :result)]
+                     :operations (conj (:operations lowered)
+                                       (body/->ScalarStore 'out [0] (first (:results lowered)) nil))
+                     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                     :provenance {:dialect :test} :attributes {}})]
+        (doseq [target [:opencl-portable :cuda :hip]]
+          (if (and (not floating?) (= :opencl-portable target))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no portable trapping"
+                                 (emit/emit-scalar-kernel "unary_minus" kernel
+                                                          {:target-dialect target})))
+            (is (string? (emit/emit-scalar-kernel "unary_minus" kernel
+                                                {:target-dialect target})))))))))
+
+(deftest integer-prefix-negation-cannot-bypass-the-overflow-contract
+  (doseq [type [:byte :int :long]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (body/make
+                  {:id :invalid-integer-prefix
+                   :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :parameter)]
+                   :operations [(body/->ScalarCompute (body/value 'negative type)
+                                                      (body/scalar-expression :neg type ['a]))]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                   :provenance {:dialect :test} :attributes {}})))))
+
+(deftest ordered-loop-origin-is-retained-without-widening-soac-recognition
+  (doseq [origin [0 1 3 Long/MAX_VALUE]]
+    (let [form (list 'loop ['r origin 'acc (body/literal 7.0 :float)]
+                     '(if (< r n) (recur (inc r) (+ acc (float r))) acc))
+          result ((:lower-region (lowerer)) {:bindings [] :results [form]}
+                  [:float] {} {'n :long})
+          loop (last (:operations result))]
+      (is (= origin (:index-init (patterns/match-ordered-reduce-loop form))))
+      (is (= (zero? origin) (some? (patterns/match-reduce-loop form))))
+      (is (= (body/index-cast origin :long :exact) (:lower loop)))
+      (is (= :ordered (get-in loop [:attributes :association])))))
+  (doseq [origin [-1 0.5 'start 9223372036854775808N]]
+    (let [form (list 'loop ['r origin 'acc 0.0]
+                     '(if (< r n) (recur (inc r) (+ acc r)) acc))]
+      (is (nil? (patterns/match-ordered-reduce-loop form))))))
+
+(deftest ordered-loop-admission-does-not-drop-effects-or-swap-recur-slots
+  (doseq [form ['(loop [r 1 acc 0.0]
+                  (aset out 0 7.0)
+                  (if (< r n) (recur (inc r) (+ acc 1.0)) acc))
+                '(loop [r 1 acc 0]
+                   (if (< r n) (recur (+ acc 1) (inc r)) acc))
+                '(loop [r 1 acc 0.0]
+                   (if (< r n) (do (aset out 0 7.0) (recur (inc r) (+ acc 1.0))) acc))
+                '(loop [r 2147483648 acc 0.0]
+                   (if (< (int r) n) (recur (inc r) (+ acc 1.0)) acc))
+                '(loop [r 2147483648 acc 0.0]
+                   (if (< r n) (recur (inc (int r)) (+ acc 1.0)) acc))
+                '(loop [r 1 r 0.0] (if (< r n) (recur (inc r) r) r))]]
+    (is (nil? (patterns/match-ordered-reduce-loop form))))
+  (is (= 1 (:index-init
+            (patterns/match-ordered-reduce-loop
+             '(loop [acc 0.0 r 1] (if (< (long r) n) (recur (+ acc 1.0) (inc r)) acc)))))))
 
 (deftest coupled-results-share-bindings-without-sharing-component-types
   (let [{:keys [operations results types] :as lowered} (mixed-region (lowerer))

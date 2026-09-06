@@ -234,7 +234,8 @@
   #{:bit-and :bit-or :bit-xor :shl :shr :ushr :rem :mod :quot :wi8-dot :dp4a})
 
 (def ^:private floating-ops
-  #{:sqrt :floor :ceil :trunc :round :sin :cos :tan :exp :log :pow :fma
+  ;; Integral negation is 0-x with an explicit overflow contract, never a bare C prefix.
+  #{:neg :sqrt :floor :ceil :trunc :round :sin :cos :tan :exp :log :pow :fma
     :asin :acos :atan :atan2 :sinh :cosh :tanh :asinh :acosh :atanh :cbrt
     :log2 :log10 :exp2 :exp10 :expm1 :log1p :hypot :deg2rad :rad2deg
     :copysign :flipsign})
@@ -287,6 +288,9 @@
         (= :floored-mod c) {:kind :floored-mod}
         (string? c)        {:kind :infix :op c}
         (and (map? c) (:fn c)) {:kind :fn :op (if (and glsl? (:glsl c)) (:glsl c) (:fn c))}
+        ;; A unary prefix uses the same parenthesized shape as a function: -(operand).
+        ;; Keep spelling in the descriptor, shared by the source and KernelBody emitters.
+        (and (map? c) (:prefix c)) {:kind :fn :op (:prefix c)}
         :else nil))))
 
 (defn op->c-lowering

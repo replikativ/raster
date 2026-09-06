@@ -19,7 +19,8 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
-            [raster.runtime.hardware :as hw]))
+            [raster.runtime.hardware :as hw]
+            [raster.hardware-fixture :as hardware-fixture]))
 
 ;; ================================================================
 ;; Test infrastructure
@@ -27,8 +28,8 @@
 
 ;; Mock hardware for codegen tests (no GPU needed)
 (use-fixtures :each
+  hardware-fixture/isolated
   (fn [f]
-    (hw/reset-hardware!)
     (hw/init!)
     (hw/register-target-device! :ze:0
                                 {:name "Test GPU"

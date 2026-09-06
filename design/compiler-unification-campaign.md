@@ -77,7 +77,24 @@ one must not erase its independent numerical evidence. Track JVM and C/SIMD comp
 as GPU paths, using the same production corpus and retained TypedSOAC facts.
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
-FP32 policy explicitly; broader fixture isolation remains a cleanup item.
+FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three
+resetting cross-compilation fixtures fresh device, initialization and calibration atoms, restoring
+the original identities even on exceptions. This is a serial-JVM fixture; parallelism remains
+across CI processes. Other registration sites still need an ownership audit.
+
+The first measured elementwise gap is unary subtraction in `scale-clamp-exp`: its typed source
+reached the verified SegMap source fallback solely because the scalar lowerer required binary
+subtraction. The follow-up uses the existing negation intrinsic and shared prefix spelling for
+floating operands (preserving signed zero); integral operands retain checked subtraction and
+its explicit portable-OpenCL trap limitation. Public route, CPU OpenCL IEEE cases and vendor
+compile fixtures cover this increment. It does not retire the remaining ordered-loop fallback.
+
+The next measured gap is `sum-kv-heads`: its ordered carry starts at one after loading the first
+element. The origin follow-up retains nonnegative literal starts in the existing scalar ForLoop;
+zero-origin SOAC recognition is unchanged. New nonzero coverage requires direct recursion, exact
+binding-slot updates, one loop body and no narrowing induction test. Public GQA fan-in, group-one
+signed-zero preservation and cancellation-sensitive accumulation are checked on CPU OpenCL.
+This does not authorize reassociation or arbitrary symbolic/negative loop origins.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring

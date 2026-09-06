@@ -36,11 +36,11 @@
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
   (or
-   (when-let [matched (patterns/match-reduce-loop expression)]
+   (when-let [matched (patterns/match-ordered-reduce-loop expression)]
      (assoc matched :inclusive? false
-            :update-expr (or (:scoped-update-expr matched) (:update-expr matched))))
-   (when-let [{:keys [kind index-sym acc-sym acc-init body-form bound]}
-              (patterns/normalize-loop expression)]
+            :update-expr (:scoped-update-expr matched)))
+   (when-let [{:keys [kind index-sym index-init index-slot acc-sym acc-init body-form bound]}
+              (patterns/normalize-ordered-loop expression)]
      (when (and (= :reduce-loop kind)
                 (= :le (descriptor/comparison-kind
                         (descriptor/semantic-op (second body-form)))))
@@ -57,8 +57,10 @@
                [(second recur-args) (first recur-args)]
 
                :else [nil nil])]
-         (when (and update-expr index-update)
-           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym
+         (when (and update-expr index-update
+                    (= 'recur (first then-branch))
+                    (patterns/ordered-unit-step? (nth recur-args index-slot) index-sym))
+           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym :index-init index-init
             :bound-expr bound :else-expr else-expr :update-expr update-expr
             :inclusive? true}))))))
 
@@ -249,7 +251,7 @@
 
                   (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                   (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
-                                   inclusive?]}
+                                   inclusive? index-init]}
                            (match-ordered-loop expression)]
                     (do
                       (when (or (patterns/contains-sym? bound-expr index-sym)
@@ -288,7 +290,7 @@
                                     upper)
                             loop (body/->ForLoop
                                   (body/value loop-index :long)
-                                  (body/index-cast 0 :long :exact)
+                                  (body/index-cast index-init :long :exact)
                                   upper 1
                                   [(body/->LoopArg (body/value carry loop-type)
                                                    (:result initial))]
@@ -319,6 +321,19 @@
                   (and (seq? expression) (= 2 (count expression))
                        (contains? '#{dec clojure.core/dec} (first expression)))
                   (lower (list 'clojure.core/- (second expression) 1) expected env)
+
+                  ;; Unary subtraction is the existing negation intrinsic for floating values:
+                  ;; spelling it as 0-x would lose the sign of zero. Integral negation instead
+                  ;; uses the checked/wrapping subtraction machinery, including MIN_VALUE.
+                  (and (seq? expression)
+                       (= :- (intrinsics/canonical (descriptor/semantic-op expression)))
+                       (= 1 (count (descriptor/call-args expression))))
+                  (lower (if (dtype/fp-dtype? expected)
+                           (list :neg (first (descriptor/call-args expression)))
+                           (list (descriptor/semantic-op expression)
+                                 (body/literal 0 expected)
+                                 (first (descriptor/call-args expression))))
+                         expected env)
 
                   (seq? expression)
                   (let [semantic-operation (descriptor/semantic-op expression)

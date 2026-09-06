@@ -490,7 +490,7 @@
         [idx (second args)])
       [nil nil])))
 
-(defn normalize-loop
+(defn- normalize-loop*
   "Normalize loop*, loop, and dotimes into a unified representation.
 	Returns {:kind :map-loop|:reduce-loop, :index-sym sym, :bound bound,
 					 :body-forms [...], :acc-sym sym, :acc-init expr} or nil.
@@ -498,7 +498,7 @@
 	dotimes: (let [n (long bound)] (loop [i 0] (when (< i n) body (recur (unchecked-inc i)))))
 	loop (1-var): (loop [i 0] (if (< i n) (do body (recur (inc i))) nil))
 	loop (2-var): (loop [acc init i 0] (if (< i n) (recur new-acc (inc i)) acc))"
-  [form]
+  [form allow-nonzero-origin?]
   (cond
     (and (seq? form)
          (= 'dotimes (first form)))
@@ -564,18 +564,57 @@
                     (= test-var sym1) [sym1 init1 sym2 init2]
                     (= test-var sym2) [sym2 init2 sym1 init1]
                     :else nil)]
-              ;; index must start at 0 to map onto a [0,bound) SOAC
-              (when (and idx-sym (int-zero? idx-init))
-                {:kind :reduce-loop
+              ;; SOAC recognition remains zero-origin. Ordered scalar loops may instead keep
+              ;; an explicit nonnegative literal origin; do not translate it into an extent.
+              (when (and idx-sym
+                         (or (int-zero? idx-init)
+                             (and allow-nonzero-origin? (integer? idx-init)
+                                  (<= 0 idx-init Long/MAX_VALUE))))
+                (cond-> {:kind :reduce-loop
                  :index-sym idx-sym
                  :acc-sym acc-sym
                  :acc-init acc-init
                  :bound bound-expr
-                 :body-form body-form}))))
+                 :body-form body-form}
+                  allow-nonzero-origin? (assoc :index-init idx-init))))))
 
         :else nil))
 
     :else nil))
+
+(defn normalize-loop
+  "Normalize only zero-origin map/reduction loops for SOAC recognition."
+  [form]
+  (normalize-loop* form false))
+
+(defn normalize-ordered-loop
+  "Normalize a scalar counted loop, retaining a nonnegative literal :index-init.
+   Unlike SOAC recognition, this boundary does not assume a [0,bound) iteration domain."
+  [form]
+  (when (and (seq? form) (= 3 (count form))
+             (vector? (second form)) (= 4 (count (second form))))
+    (let [bindings (second form)
+          ids (vec (take-nth 2 bindings))
+          normalized (normalize-loop* form true)
+          {:keys [index-sym index-init body-form]} normalized
+          test (second body-form)
+          then-branch (nth body-form 2 nil)
+          lhs (first (descriptor/call-args test))
+          ;; A long loop cannot inherit a narrowing int comparison just because a generic
+          ;; SOAC recognizer can strip cast syntax. Only the explicit widening spelling is safe.
+          lhs (if (and (seq? lhs) (= 2 (count lhs))
+                       (contains? '#{long clojure.core/long} (first lhs)))
+                (second lhs) lhs)]
+      (when (and (= :reduce-loop (:kind normalized))
+                 (every? symbol? ids) (= 2 (count (set ids)))
+                 (= 4 (count body-form))
+                 (= 2 (count (descriptor/call-args test)))
+                 (= index-sym lhs)
+                 ;; New nonzero-origin coverage is deliberately direct-recursive. Lexical
+                 ;; wrappers keep their existing zero-origin coverage, not a broader promise.
+                 (or (zero? index-init)
+                     (and (seq? then-branch) (= 'recur (first then-branch)))))
+        (assoc normalized :index-slot (.indexOf ids index-sym))))))
 
 ;; ================================================================
 ;; Stencil pattern detection — shifted array loads
@@ -690,11 +729,11 @@
 
     :else nil))
 
-(defn match-reduce-loop
+(defn- match-reduce-loop*
   "Generic matcher for reduction loops.
 	Returns a structural descriptor of the loop/update shape or nil."
-  [loop-form]
-  (when-let [normalized (normalize-loop loop-form)]
+  [loop-form normalize]
+  (when-let [normalized (normalize loop-form)]
     (when (= :reduce-loop (:kind normalized))
       (let [{:keys [acc-sym acc-init index-sym body-form]} normalized
             [_ test then-branch else-branch] body-form
@@ -718,7 +757,7 @@
             (when (and update-expr
                        ;; only (< i n) → contiguous [0,bound) iteration
                        (descriptor/less-than-op? (descriptor/semantic-op test)))
-              {:acc-sym acc-sym
+              (cond-> {:acc-sym acc-sym
                :acc-init acc-init
                :index-sym index-sym
                :bound-expr (second (test-index+bound test))
@@ -728,7 +767,35 @@
                :recur-form recur-form
                :idx-update-expr idx-update-expr
                :update-expr update-expr
-               :scoped-update-expr (scoped-recur-value then-branch update-expr)})))))))
+               :scoped-update-expr (scoped-recur-value then-branch update-expr)}
+                (contains? normalized :index-init)
+                (assoc :index-init (:index-init normalized))))))))))
+
+(defn match-reduce-loop
+  "Match a zero-origin reduction for SOAC recognition."
+  [loop-form]
+  (match-reduce-loop* loop-form normalize-loop))
+
+(defn ordered-unit-step?
+  "A long induction step may widen explicitly, but must not erase a narrowing conversion."
+  [expression index]
+  (and (= 1 (descriptor/affine-step expression index))
+       (not-any? #(and (seq? %)
+                       (contains? '#{int clojure.core/int}
+                                  (descriptor/semantic-op %)))
+                 (tree-seq coll? seq expression))))
+
+(defn match-ordered-reduce-loop
+  "Match an ordered scalar reduction and retain its literal induction origin."
+  [loop-form]
+  (when-let [matched (match-reduce-loop* loop-form normalize-ordered-loop)]
+    (let [normalized (normalize-ordered-loop loop-form)
+          recur-args (vec (rest (:recur-form matched)))]
+      (when (and (:scoped-update-expr matched)
+                 (= 2 (count recur-args))
+                 (ordered-unit-step? (nth recur-args (:index-slot normalized))
+                                     (:index-sym matched)))
+        matched))))
 
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.

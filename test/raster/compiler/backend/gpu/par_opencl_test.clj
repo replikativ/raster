@@ -8,12 +8,13 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]
+            [raster.hardware-fixture :as hardware-fixture]
             [clojure.string :as str]))
 
 ;; Set up target device for tests (no actual GPU required)
 (use-fixtures :each
+  hardware-fixture/isolated
   (fn [f]
-    (hw/reset-hardware!)
     (hw/init!)
     (hw/register-target-device! :ze:0
                                 {:name "Intel(R) Arc(TM) Graphics"
