@@ -287,6 +287,9 @@
         (= :floored-mod c) {:kind :floored-mod}
         (string? c)        {:kind :infix :op c}
         (and (map? c) (:fn c)) {:kind :fn :op (if (and glsl? (:glsl c)) (:glsl c) (:fn c))}
+        ;; A unary prefix uses the same parenthesized shape as a function: -(operand).
+        ;; Keep spelling in the descriptor, shared by the source and KernelBody emitters.
+        (and (map? c) (:prefix c)) {:kind :fn :op (:prefix c)}
         :else nil))))
 
 (defn op->c-lowering

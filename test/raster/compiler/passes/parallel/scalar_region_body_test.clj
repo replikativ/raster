@@ -21,6 +21,32 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest unary-subtraction-retains-floating-sign-and-integral-overflow
+  (doseq [type [:float :double :int :long]]
+    (let [lower (:lower-region (lowerer))
+          lowered (lower '{:bindings [] :results [(- a)]} [type] {} {'a type})
+          expression (get-in lowered [:operations 0 :expression])
+          floating? (contains? #{:float :double} type)]
+      (is (= (if floating? :neg :-) (:op expression)))
+      (is (= (if floating? 1 2) (count (:arguments expression))))
+      (is (= (when-not floating? :trap) (get-in expression [:options :overflow])))
+      (let [kernel (body/make
+                    {:id :unary-minus
+                     :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :parameter)
+                                  (body/->KernelParameter 'out :output type [1] :global
+                                                         (layout/row-major [1] type) :result)]
+                     :operations (conj (:operations lowered)
+                                       (body/->ScalarStore 'out [0] (first (:results lowered)) nil))
+                     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                     :provenance {:dialect :test} :attributes {}})]
+        (doseq [target [:opencl-portable :cuda :hip]]
+          (if (and (not floating?) (= :opencl-portable target))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no portable trapping"
+                                 (emit/emit-scalar-kernel "unary_minus" kernel
+                                                          {:target-dialect target})))
+            (is (string? (emit/emit-scalar-kernel "unary_minus" kernel
+                                                {:target-dialect target})))))))))
+
 (deftest coupled-results-share-bindings-without-sharing-component-types
   (let [{:keys [operations results types] :as lowered} (mixed-region (lowerer))
         kernel

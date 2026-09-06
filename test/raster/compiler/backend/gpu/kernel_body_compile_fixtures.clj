@@ -256,6 +256,8 @@
       (:kernels (equation-first/compile
                  #'dl-arrays/argmax-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-arrays/scale-clamp-exp {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
                  #'public-c-family-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-scan {:target device-id :dtype :float}))

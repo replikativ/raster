@@ -320,6 +320,19 @@
                        (contains? '#{dec clojure.core/dec} (first expression)))
                   (lower (list 'clojure.core/- (second expression) 1) expected env)
 
+                  ;; Unary subtraction is the existing negation intrinsic for floating values:
+                  ;; spelling it as 0-x would lose the sign of zero. Integral negation instead
+                  ;; uses the checked/wrapping subtraction machinery, including MIN_VALUE.
+                  (and (seq? expression)
+                       (= :- (intrinsics/canonical (descriptor/semantic-op expression)))
+                       (= 1 (count (descriptor/call-args expression))))
+                  (lower (if (dtype/fp-dtype? expected)
+                           (list :neg (first (descriptor/call-args expression)))
+                           (list (descriptor/semantic-op expression)
+                                 (body/literal 0 expected)
+                                 (first (descriptor/call-args expression))))
+                         expected env)
+
                   (seq? expression)
                   (let [semantic-operation (descriptor/semantic-op expression)
                         operator (intrinsics/canonical semantic-operation)

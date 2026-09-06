@@ -82,6 +82,13 @@ resetting cross-compilation fixtures fresh device, initialization and calibratio
 the original identities even on exceptions. This is a serial-JVM fixture; parallelism remains
 across CI processes. Other registration sites still need an ownership audit.
 
+The first measured elementwise gap is unary subtraction in `scale-clamp-exp`: its typed source
+reached the verified SegMap source fallback solely because the scalar lowerer required binary
+subtraction. The follow-up uses the existing negation intrinsic and shared prefix spelling for
+floating operands (preserving signed zero); integral operands retain checked subtraction and
+its explicit portable-OpenCL trap limitation. Public route, CPU OpenCL IEEE cases and vendor
+compile fixtures cover this increment. It does not retire the remaining ordered-loop fallback.
+
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.
