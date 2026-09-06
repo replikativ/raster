@@ -6,6 +6,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.kernel-launch :as launch]))
 
 (def ^:private operators
@@ -78,6 +79,17 @@
   (let [expression (descriptor/unwrap-int-cast expression)]
     (cond
       (integer? expression) expression
+
+      (instance? raster.compiler.ir.kernel_body.Literal expression)
+      (let [{:keys [value type]} expression]
+        (if (and (contains? #{:byte :int :long} type)
+                 (integer? value) (scalar-range/literal value type))
+          ;; Typed region substitution retains constants as Literal values. Preserve long
+          ;; index arithmetic even when the constant itself happens to fit in an int.
+          (body/index-cast value (if (= :long type) :long :int) :exact)
+          (decline! :index-literal
+                    "index literal must be a representable integral value"
+                    {:expression expression})))
 
       (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
       (apply body/expression (:op expression)

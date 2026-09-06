@@ -443,6 +443,14 @@ now proves direct analyzed-source-to-TypedSOAC routing, typed schedule reuse and
 fallback. Subgroup/shuffle and multi-workgroup alternatives remain schedule candidates, not new
 semantic primitives.
 
+The product workgroup schedule still uses its source emitter; migrating it to KernelBody must
+preserve the simultaneous tuple update, hidden components, independent dtypes and logical ABI.
+The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
+types: each local is lowered once to SSA and shared across results, without inferring its type from
+a consuming component. This is a prerequisite, not yet a production product KernelBody route.
+Next: express the lane folds and workgroup tree with typed carries and per-component scratch,
+compare numerically with the retained implementation, then switch the route and delete that oracle.
+
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
 arbitrarily indexed tensor captures. Its extents participate in the typed program boundary and
