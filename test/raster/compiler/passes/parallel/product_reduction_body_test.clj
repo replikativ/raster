@@ -132,9 +132,11 @@
   (let [scheduled (product/schedule (argmax-segred) options)
         kernel (:body scheduled)
         kind #(.getSimpleName (class %))
-        loop-op (first (:operations kernel))
+        reduction-operations (get-in kernel [:operations 1 :then-operations])
+        loop-op (first reduction-operations)
         tree-branches (filter #(and (= "IfRegion" (kind %))
-                                    (not= :product-writer (:condition %))) (:operations kernel))]
+                                    (not= :product-writer (:condition %))) reduction-operations)]
+    (is (= :product-active (get-in kernel [:operations 1 :condition])))
     (is (= [:float :int] (mapv (comp :type :binding) (:iter-args loop-op))))
     (is (= [:float :int] (mapv :dtype (:allocations kernel))))
     (is (= ['indices] (mapv :id (filter #(= :output (:kind %)) (:parameters kernel))))
@@ -144,7 +146,7 @@
       (is (= ["ScalarStore" "ScalarStore" "Yield"]
              (mapv kind (take-last 3 (:then-operations branch)))))
       (is (not-any? #(= "WorkgroupBarrier" (kind %)) (:then-operations branch))))
-    (is (= 6 (count (filter #(= "WorkgroupBarrier" (kind %)) (:operations kernel)))))
+    (is (= 6 (count (filter #(= "WorkgroupBarrier" (kind %)) reduction-operations))))
     (is (false? (get-in scheduled [:attributes :source-storage-certified?])))))
 
 (deftest invalid-neutral-or-unretained-address-width-is-rejected
@@ -162,7 +164,7 @@
 
 (deftest source-product-grid-is-the-actual-segment-schedule
   (doseq [source [(argmax-segred) (typed-argmax-segred)]]
-    (is (= 'nrows (get-in source [:grid :num-blocks])))
+    (is (= '(max 1 nrows) (get-in source [:grid :num-blocks])))
     (doseq [[field bad] [[:num-blocks 'width] [:block-size 64] [:shared-mem-bytes 128]]]
       (try
         (product/schedule (assoc-in source [:grid field] bad) options)
@@ -176,10 +178,14 @@
         candidate (product/schedule source options)]
     (is (= candidate (product/validate-source! candidate source options)))
     (doseq [forged [(assoc-in candidate [:numerics :policy] :different-tree)
-                    (assoc-in candidate [:body :operations 0 :upper]
+                    (assoc-in candidate [:body :operations 1 :then-operations 0 :upper]
                               (body/index-cast 0 :long :exact))
-                    (assoc-in candidate [:body :operations 0 :iter-args 1 :initial]
-                              (body/literal 0 :int))]]
+                    (assoc-in candidate [:body :operations 1 :then-operations 0 :iter-args 1 :initial]
+                              (body/literal 0 :int))
+                    (assoc-in candidate [:body :operations 0 :expression :arguments 1]
+                              (body/literal 0 :long))
+                    (assoc-in candidate [:body :launch :group-count]
+                              [(launch/runtime-value '_n_bound)])]]
       (try
         (product/validate-source! forged source options)
         (is false "a well-typed but different computation must not retain the source witness")
@@ -299,7 +305,7 @@
       (let [artifact (target/emit-artifact "long_product" candidate dialect)]
         (is (= [:long :long :long]
                (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi artifact)))))))
-    (is (= :long (get-in candidate [:body :operations 0 :index :type])))
+    (is (= :long (get-in candidate [:body :operations 1 :then-operations 0 :index :type])))
     (is (= :int (get-in candidate [:body :parameters 1 :dtype]))
         "dimension width does not change the winning-index component representation")
     (let [artifact (target/emit-artifact "long_product_range" candidate :opencl-portable)

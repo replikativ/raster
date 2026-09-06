@@ -443,11 +443,12 @@
             (throw (ex-info "product reduction workgroup size must be a positive power of two"
                             {:reason :product-reduction-workgroup :block-size block-size})))
         num-segments (segop/seg-space-num-segments-expr space)
-        launch-segments (let [bounds (mapv :bound segment-dims)]
-                          (case (count bounds)
-                            0 1
-                            1 (klaunch/runtime-value (first bounds))
-                            (apply klaunch/product bounds)))
+        launch-segments (klaunch/maximum
+                         1 (let [bounds (mapv :bound segment-dims)]
+                             (case (count bounds)
+                               0 1
+                               1 (klaunch/runtime-value (first bounds))
+                               (apply klaunch/product bounds))))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         input-params (vec (sort-by name (:inputs segred)))
         output-params (vec (keep :result components))

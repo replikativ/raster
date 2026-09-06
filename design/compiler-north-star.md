@@ -453,20 +453,23 @@ scalar/control target emission. Its mixed float/int argmax fixture is compared a
 retained emitter and a host oracle on CPU OpenCL (empty/short/tail rows, ties, NaNs and infinities),
 and joins the hardware-free CUDA/HIP compile gates. This is not a throughput benchmark.
 
-It is deliberately not yet a production route: it accepts one segment axis, int32 row/column
+It is deliberately not yet a production route: it accepts one segment axis, integral int/long row/column
 bounds, retained region-binding types and long-width address expressions. TypedSOAC local dtypes
 now survive SegRed projection and scalar SSA substitution, so computed local address bindings and
 typed integral constants use those same facts rather than a reconstructed type map. Contradictory
 candidate overrides decline. Caller-supplied storage shapes are not a source/storage
-certificate (`:source-storage-certified? false`); exact graph/source/body storage closure must be
-added before selection. Zero-row calls retain the existing zero-group rejection and need planner
-elision; zero-width rows produce the neutral tuple. Next: close those obligations over the public
+certificate (`:source-storage-certified? false`). Exact graph/source/body storage correspondence is
+available for retained plain capacities; unknown indexed input requirements still need derivation.
+Zero-row kernels use one physical group with a uniform guard around all computation, barriers and
+stores; zero-width rows produce the neutral tuple. This is a no-op over existing resident storage,
+not graph-node elision or support for allocating zero-byte device buffers. Next: close the remaining
+storage and public-binding obligations over the public
 TypedSOAC route, switch only certified candidates, then delete the retained source emitter.
-The retained product `KernelGrid` now describes its actual segment-count launch and tuple scratch,
+The retained product `KernelGrid` now describes its actual guarded segment-count launch and tuple scratch,
 not the scalar width-reduction grid formerly used only to seed workgroup sizing. The candidate
 checks that grid against the selected tree. `validate-source!` additionally replays the body and
-ABI refinement against an independently supplied SegRed; neither check substitutes for the pending
-graph/storage proof.
+ABI refinement against an independently supplied SegRed. Graph reconstruction and source replay
+preserve storage contracts; they do not certify arbitrary source indices as in bounds.
 
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable

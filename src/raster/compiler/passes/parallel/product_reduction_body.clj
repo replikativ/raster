@@ -60,7 +60,8 @@
         types (mapv :dtype components)
         wg (:workgroup-size source-schedule)
         scratch-bytes (* wg (reduce + (map dtype/bytes-of types)))
-        expected-grid {:num-blocks rows :block-size wg :shared-mem-bytes scratch-bytes}
+        expected-grid {:num-blocks (list 'max 1 rows) :block-size wg
+                       :shared-mem-bytes scratch-bytes}
         _ (when-not (= expected-grid (select-keys (:grid segred) (keys expected-grid)))
             (decline! :source-grid
                       "product source grid must agree with its segment launch and tuple scratch"
@@ -170,7 +171,14 @@
           :indices [(body/->IndexBinding row :group 0)
                     (body/->IndexBinding 'product-lane :local 0)]
           :operations
-          (vec (concat
+          [(body/->ScalarCompute
+            (body/value :product-active :predicate)
+            (body/scalar-expression :lt :predicate
+                                    [(body/cast-expression row :long :exact :exact)
+                                     (body/cast-expression '_n_bound :long :exact :exact)]))
+           (body/->IfRegion
+            :product-active
+            (conj (vec (concat
                 [(body/->ForLoop
                   (body/value column :long) (body/index-cast 'product-lane :long :exact)
                   (lower-index width #{}) wg
@@ -191,9 +199,11 @@
                             [(body/->ScalarLoad (body/value value dtype) scratch [0] nil nil :cached)
                              (body/->ScalarStore result [row] value nil)]))
                         components scratches (ids "product-final"))) (body/->Yield []))
-                  [(body/->Yield [])] [])]))
+                  [(body/->Yield [])] [])])) (body/->Yield []))
+            [(body/->Yield [])] [])]
           :schedule {:strategy :product-workgroup-tree :workgroup-size wg}
-          :launch (launch/spec {:workgroup-size [wg] :group-count [(launch/runtime-value '_n_bound)]
+          :launch (launch/spec {:workgroup-size [wg]
+                                :group-count [(launch/maximum 1 (launch/runtime-value '_n_bound))]
                                 :shared-memory-bytes scratch-bytes})
           :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
           :attributes {:kind :product-reduction :component-dtypes types}})]

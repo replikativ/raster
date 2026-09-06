@@ -64,15 +64,11 @@
                                           'nrows {:type (get scalar-types 'nrows) :value (count rows)}
                                           'width {:type (get scalar-types 'width) :value width}}]
                             (try
-                              (if (zero? nrows)
-                                ;; Both routes reject zero-group launches. The planner must elide
-                                ;; a zero-row operation rather than submit an invalid device call.
-                                (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                                                     #"group-count dimension must be a positive integer"
-                                                     (call/make artifact
-                                                                (mapv bindings (:arguments artifact)))))
-                                (execute! (bind-call (call/make artifact
-                                                               (mapv bindings (:arguments artifact))))))
+                              (let [kernel-call (call/make artifact
+                                                          (mapv bindings (:arguments artifact)))]
+                                (when (zero? nrows)
+                                  (is (= [1] (get-in kernel-call [:geometry :group-count]))))
+                                (execute! (bind-call kernel-call)))
                               (vec (read! output))
                               (finally (free! output))))) [old new local wide])]
               (is (apply = (cons (if (zero? nrows) [-77] (mapv argmax rows)) results))
