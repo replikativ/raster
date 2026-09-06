@@ -67,6 +67,18 @@
     (is (every? #(= :double (get-in % [:result :type])) (:operations result))
         "Absent retained metadata still uses the owner's contextual dtype")))
 
+(deftest floating-precision-change-does-not-retarget-integral-loop-carries
+  ;; Reduced from the public Q4 projection fixture. This freezes existing behavior, not a
+  ;; proof that widened source carries and the narrower target intrinsic are equivalent.
+  (let [update (with-meta '(raster.par/dp4a a b acc) {:raster.type/tag 'int})
+        expression (list 'loop '[j 0 acc 0]
+                         (list 'if '(< j n) (list 'recur '(inc j) update) 'acc))
+        result ((:lower (lowerer)) expression :long {'a :long 'b :long 'n :long})
+        loop (last (:operations result))]
+    (is (= :long (:type result)))
+    (is (= :long (get-in loop [:results 0 :type])))
+    (is (= :long (get-in loop [:operations 0 :result :type])))))
+
 (deftest shared-conversion-policy-keeps-narrowing-an-explicit-owner-decision
   (let [types [:byte :int :long :half :float :double]
         exact [:exact :exact]

@@ -132,12 +132,14 @@
 
             (lower [expression expected env]
               (let [expression (inline-lets expression)
-                    ;; A consumer's conversion happens after the child's arithmetic. Promoting
-                    ;; that arithmetic early discards its retained rounding/overflow semantics.
-                    ;; Untagged regions continue to use the owner's declared contextual dtype.
-                    expected (canon-type (or (when (seq? expression)
-                                               (retained-type expression))
-                                             expected))]
+                    ;; Preserve floating rounding before consumer promotion. Integral contexts
+                    ;; retain their existing owner policy: quantized loops still carry widened
+                    ;; integers around narrower intrinsic results and need separate reconciliation.
+                    expected (canon-type expected)
+                    retained (when (seq? expression) (retained-type expression))
+                    expected (if (and (dtype/fp-dtype? expected)
+                                      retained (dtype/fp-dtype? retained))
+                               retained expected)]
                 (cond
                   (instance? raster.compiler.ir.kernel_body.Literal expression)
                   {:operations [] :result expression

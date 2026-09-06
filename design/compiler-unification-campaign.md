@@ -173,10 +173,13 @@ This does not unify the full scalar lowerers, change epilogue conversion labelin
 indirect accesses; those remaining differences must be closed separately.
 
 Retained scalar precision is a prerequisite for further sharing: a nested expression's declared
-numeric type must govern its arithmetic before a wider consumer converts its result. A direct
+floating type must govern its arithmetic before a wider consumer converts its result. A direct
 map/fold lowerer regression exposed early promotion of a Float-tagged addition inside a Double
 addition. Lowering now respects retained expression metadata, including unary/variadic
 normalization and branch results; missing metadata still uses the owner's contextual type.
+Integral contexts retain their existing behavior: the public Q4 projection has widened loop carries
+around narrower dp4a result metadata. Reconciling that boundary is a separate prerequisite, not
+permission to silently change accumulator widths in this floating-precision increment.
 This is lowerer-level correctness coverage, not a demonstrated public-model miscompile or a
 new inference rule. Full source reachability and remaining owner-policy differences remain open.
 
