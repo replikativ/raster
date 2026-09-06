@@ -65,9 +65,12 @@
 (defn make-lowerer
   "Build a scalar-expression lowerer.
 
-   Returns `{:lower f}` where `f` accepts expression, expected dtype, and a map of typed local
-   values. `decline!` is called as `(decline! rule message data)` so each owning schedule retains
-   an honest, local coverage contract."
+   Returns `{:lower f :lower-region g}`. `f` accepts expression, expected dtype, and a map of typed
+   local values. `g` accepts an ordered {:bindings [...] :results [...]} region, result dtypes,
+   retained binding dtypes, and typed locals; it returns shared SSA operations and ordered results.
+   Neither entry point stores tuple results: the schedule must commit all components together.
+   `decline!` is called as `(decline! rule message data)` so each owning schedule retains an honest,
+   local coverage contract."
   [{:keys [array-types scalar-types arrays index-scope lower-index predicate id-prefix decline!]
     :or {id-prefix "scalar"}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
@@ -89,6 +92,7 @@
              (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
                      dtype/dtype-for-scalar-tag)
              (cond
+               (instance? raster.compiler.ir.kernel_body.Literal expression) (:type expression)
                (symbol? expression) (or (get env expression) (get scalar-types expression) expected)
                (number? expression) expected
                (descriptor/aget-call? expression)
@@ -392,4 +396,51 @@
                   (decline! :scalar-expression
                             "scalar expression has an unsupported value"
                             {:expression expression :type (type expression)}))))]
-      {:lower lower})))
+      {:lower lower
+       :lower-region
+       (fn [{:keys [bindings results]} result-types binding-types env]
+         ;; Region locals are evaluated once, in source order. In particular, a product's
+         ;; shared combine bindings must not be beta-expanded separately into every result.
+         ;; Types are retained facts supplied by the caller, never guessed from a consumer.
+         (when-not (and (vector? bindings) (even? (count bindings))
+                        (every? symbol? (take-nth 2 bindings))
+                        (= (count (take-nth 2 bindings))
+                           (count (set (take-nth 2 bindings))))
+                        (vector? results) (= (count results) (count result-types)))
+           (decline! :scalar-region-shape
+                     "scalar region requires distinct ordered bindings and typed results"
+                     {:bindings bindings :results results :result-types result-types}))
+         (let [checked-lower
+               (fn [expression expected local-env]
+                 (let [expected (canon-type expected)
+                       lowered (lower expression expected local-env)]
+                   (when-not (= expected (:type lowered))
+                     (decline! :scalar-region-dtype
+                               "scalar region value disagrees with its retained dtype"
+                               {:expression expression :expected expected
+                                :actual (:type lowered)}))
+                   lowered))
+               {:keys [operations substitutions environment]}
+               (reduce
+                (fn [{:keys [operations substitutions environment]} [id expression]]
+                  (when-not (get binding-types id)
+                    (decline! :scalar-region-binding-dtype
+                              "scalar region binding lacks a retained dtype"
+                              {:binding id :expression expression}))
+                  (let [lowered (checked-lower (util/subst-syms substitutions expression)
+                                               (get binding-types id) environment)
+                        result (:result lowered)]
+                    {:operations (into operations (:operations lowered))
+                     :substitutions (assoc substitutions id result)
+                     :environment (cond-> environment
+                                    (symbol? result) (assoc result (:type lowered)))}))
+                {:operations [] :substitutions {} :environment env}
+                (partition 2 bindings))
+               lowered-results
+               (mapv (fn [expression expected]
+                       (checked-lower (util/subst-syms substitutions expression)
+                                      expected environment))
+                     results result-types)]
+           {:operations (into operations (mapcat :operations lowered-results))
+            :results (mapv :result lowered-results)
+            :types (mapv :type lowered-results)}))})))
