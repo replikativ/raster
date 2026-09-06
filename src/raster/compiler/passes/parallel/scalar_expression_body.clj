@@ -61,13 +61,16 @@
 (defn make-lowerer
   "Build a scalar-expression lowerer.
 
-   Returns `{:lower f :lower-region g}`. `f` accepts expression, expected dtype, and a map of typed
+   Returns `{:lower f :lower-region g :cast h}`. `f` accepts expression, expected dtype, and a map of typed
    local values. `g` accepts an ordered {:bindings [...] :results [...]} region, result dtypes,
    retained binding dtypes, and typed locals; it returns shared SSA operations and ordered results.
    Neither entry point stores tuple results: the schedule must commit all components together.
    `decline!` is called as `(decline! rule message data)` so each owning schedule retains an honest,
-   local coverage contract."
-  [{:keys [array-types scalar-types arrays index-scope lower-index predicate id-prefix decline!]
+   local coverage contract. `h` converts an already-lowered value to a target dtype, with source
+   context as its third argument. Owners may supply `conversion-policy` (source/target dtypes)
+   and `load-other` (storage dtype); these do not change source-language admission."
+  [{:keys [array-types scalar-types arrays index-scope lower-index predicate id-prefix decline!
+           conversion-policy load-other]
     :or {id-prefix "scalar"}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         counter (atom 0)
@@ -113,9 +116,11 @@
                   lowered
                   (let [source (dtype/canon (:type lowered))
                         [rounding overflow]
-                        ;; Keep this owner's existing device-wrap policy explicit. Reduction
-                        ;; lowering must not inherit it merely by sharing conversion machinery.
-                        (or (scalar-conversion/policy source target :wrap)
+                        ;; Map/fold retain their existing device-wrap default. A stricter owner
+                        ;; supplies its conversion contract rather than inheriting that policy.
+                        (or (if conversion-policy
+                              (conversion-policy source target)
+                              (scalar-conversion/policy source target :wrap))
                             (decline! :cast-policy
                                       "scalar cast has no portable rounding and overflow policy"
                                       {:expression expression :source source :target target}))
@@ -203,7 +208,9 @@
                                          (body/->ScalarLoad
                                           (body/value id array-type) array
                                           [coordinate-expression] predicate
-                                          (when predicate (body/literal 0 array-type)) :cached))
+                                          (when predicate
+                                            (if load-other (load-other array-type)
+                                                (body/literal 0 array-type))) :cached))
                          :result id :type array-type :range range})))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
@@ -408,6 +415,7 @@
                             "scalar expression has an unsupported value"
                             {:expression expression :type (type expression)})))]
       {:lower lower
+       :cast cast-lowered
        :lower-region
        (fn [{:keys [bindings results]} result-types binding-types env]
          ;; Region locals are evaluated once, in source order. In particular, a product's

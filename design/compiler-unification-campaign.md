@@ -186,6 +186,15 @@ permission to silently change accumulator widths in this floating-precision incr
 This is lowerer-level correctness coverage, not a demonstrated public-model miscompile or a
 new inference rule. Full source reachability and remaining owner-policy differences remain open.
 
+Reduction element lowering now delegates accepted loads, casts and arithmetic over typed child
+values to the shared scalar-expression SSA builder. Its admission adapter still requires retained
+nested arithmetic types, preserves literal dtypes, rejects checked integral casts/arithmetic and
+comparisons, proves load coordinates through the existing owner callback, and checks the final
+accumulator dtype. The shared builder accepts explicit owner conversion and masked-load policies;
+map/fold defaults are unchanged. This serves existing scalar reductions and portable contractions,
+without adding indirect-access admission or retiring their remaining source fallbacks. Result
+transform lowering and deterministic SSA-name hygiene remain separate consolidation work.
+
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved
 int range. It also inherited unconditional cast erasure on seed/population captures. Passing
