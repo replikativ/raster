@@ -120,8 +120,15 @@
                                     result (raster.par/map! out i n long value)] result)
                            :long {'out :long} {:scalar-types {'seed :long 'n :int}}))
         source (get-in program [:equations 0 :source])
-        execute (eval (list 'fn '[seed long] source))]
+        execute (eval (list 'fn '[seed long] source))
+        scalar-bindings (vec (take 2 (second (:source program))))
+        execute-binding (eval (list 'fn '[seed] (list 'let* scalar-bindings 'value)))]
     (is (= '(clojure.core/long (int seed)) source))
+    (is (= :long (get-in program [:values 'value :dtype])))
+    (is (nil? (:tag (meta (first scalar-bindings))))
+        "the primitive initializer, not a redundant binding hint, types the JVM local")
+    (is (instance? Long (execute-binding -1)))
+    (is (thrown? ArithmeticException (execute-binding (inc (long Integer/MAX_VALUE)))))
     (is (= (long -1) (execute -1 (fn [& _] (throw (ex-info "shadowed long" {}))))))
     (is (instance? Long (execute Integer/MAX_VALUE nil)))
     (is (thrown? ArithmeticException (execute (inc (long Integer/MAX_VALUE)) nil))))

@@ -146,7 +146,9 @@
                     (typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))]
         {:equation-id equation-id
          :placement placement
-         :pairs [[result source]]
+         ;; The explicit conversion carries the JVM initializer type. Clojure rejects an
+         ;; additional primitive :tag on that binding; retain Raster's independent type facts.
+         :pairs [[(vary-meta result dissoc :tag) source]]
          :site [:binding result]
          :source source})
 
