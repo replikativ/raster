@@ -11,7 +11,8 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.soac-dialect :as dialect]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn from-typed-result-transform
   "Project a validated TypedSOAC result transform to the shared scheduled ScalarRegion.
@@ -92,24 +93,28 @@
         operand-by-id (into {} (map (juxt :sym identity)) (:operands region))
         scalar-ids (vec (drop (inc (count operand-by-id)) (:parameters region)))
         operations (atom [])
-        counter (atom 0)
-        fresh (fn [prefix]
-                (symbol (str (when id-prefix (str id-prefix "-"))
-                             prefix "-" (swap! counter inc))))
-        emit! (fn [operation value value-dtype]
-                (swap! operations conj operation)
-                {:value value :dtype value-dtype})]
+        builder (scalar-expression/make-lowerer
+                 {:arrays (set (keys operand-by-id))
+                  :array-types (into {} (map (fn [[id operand]] [id (get operand :dtype :float)]))
+                                     operand-by-id)
+                  :scalar-types (into {} (keep (fn [[id parameter]]
+                                                (when (= :scalar (:kind parameter))
+                                                  [id (:dtype parameter)])))
+                                      parameters)
+                  :source-region [(:expression region) accumulator (keys parameters)]
+                  :lower-index (fn [x _] x) :predicate predicate
+                  :conversion-policy cast-policy :decline! decline!
+                  :id-prefix (str (when id-prefix (str id-prefix "-")) "result-transform")})
+        emit! (fn [{:keys [result type] :as lowered}]
+                (swap! operations into (:operations lowered))
+                {:value result :dtype type})]
     (letfn [(cast [{:keys [value dtype] :as typed} target]
               (let [dtype (dtype/canon dtype)
                     target (dtype/canon target)]
                 (if (= dtype target)
                   typed
-                  (let [[rounding overflow] (cast-policy dtype target)
-                        result (fresh "result-transform-cast")]
-                    (emit! (body/->ScalarCompute
-                            (body/value result target)
-                            (body/cast-expression value target rounding overflow))
-                           result target)))))
+                  (emit! ((:cast builder) {:operations [] :result value :type dtype}
+                          target nil)))))
 
             (load-operand [id]
               (let [{:keys [map] :as operand} (get operand-by-id id)
@@ -127,16 +132,10 @@
                   (decline! :result-transform-operand
                             "result-transform operand lacks its typed KernelBody parameter"
                             {:operand operand :parameter parameter}))
-                (let [result (fresh "result-transform-load")
-                      coordinates (coordinate-lower map)
+                (let [coordinates (coordinate-lower map)
                       coordinates (if (vector? coordinates) coordinates [coordinates])]
                   (cast
-                   (emit! (body/->ScalarLoad
-                           (body/value result operand-dtype) id coordinates
-                           predicate
-                           (when predicate (body/literal 0 operand-dtype))
-                           :cached)
-                          result operand-dtype)
+                   (emit! ((:load builder) id coordinates))
                    result-dtype))))
 
             (lower-let [expression env]
@@ -218,14 +217,9 @@
                         overflow (when (and (contains? #{:byte :int :long} result-dtype)
                                             (contains? #{:+ :- :*} operator))
                                    (or (intrinsics/source-overflow-policy semantic-operation)
-                                       :trap))
-                        result (fresh "result-transform-value")]
-                    (emit! (body/->ScalarCompute
-                            (body/value result result-dtype)
-                            (body/scalar-expression
-                             operator result-dtype inputs
-                             (cond-> {} overflow (assoc :overflow overflow))))
-                           result result-dtype)))
+                                       :trap))]
+                    (emit! ((:compute builder) operator result-dtype inputs
+                            (cond-> {} overflow (assoc :overflow overflow))))))
 
                 :else
                 (decline! :result-transform-expression

@@ -9,6 +9,7 @@
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segred-body :as segred]
+            [raster.compiler.passes.parallel.scalar-region-lower :as result-region]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- lowerer []
@@ -205,10 +206,10 @@
                                                  (fn [& args]
                                                    (swap! calls conj entry)
                                                    (apply (get lowerer entry) args))))
-                                        lowerer [:lower :cast])))]
+                                        lowerer [:lower :cast :load :compute])))]
                  (segred/lower-element-operations expression options))
         [load promote add narrow] (:operations result)]
-    (is (= [:lower :lower :cast] @calls))
+    (is (= [:load :cast :compute :cast] @calls))
     (is (= ['(+ i 1)] @coordinates))
     (is (= :int (get-in load [:result :type])))
     (is (= 'active (:predicate load)))
@@ -229,6 +230,47 @@
     (is (= [(body/literal 0.1 :double)] (get-in cast [:expression :arguments])))
     (is (= {:rounding :nearest-even :overflow :ieee} (get-in cast [:expression :options])))
     (is (= :float (get-in add [:result :type])))))
+
+(deftest result-transforms-share-typed-ssa-without-changing-owner-policy
+  (doseq [[kind role] [[:input :operand] [:inout :result]]]
+    (let [factory scalar/make-lowerer calls (atom [])
+          region (body/->ScalarRegion
+                   ['acc 'x 'scale] '(+ (+ acc (aget x 0)) scale)
+                   [{:sym 'x :dtype :float :map :approved-map}] :double)
+          options {:accumulator 'carry :accumulator-dtype :double :store-dtype :float
+                   :predicate 'active
+                   :coordinate-lower (fn [m] (is (= :approved-map m)) [0 1])
+                   :parameters {'x (body/->KernelParameter 'x kind :float [2 3] :global
+                                                          (layout/row-major [2 3] :float) role)
+                                'scale (body/->KernelParameter 'scale :scalar :int [] nil nil
+                                                              :epilogue)}}
+          result (with-redefs [scalar/make-lowerer
+                              (fn [options]
+                                (let [builder (factory options)]
+                                  (reduce (fn [builder entry]
+                                            (assoc builder entry
+                                                   (fn [& args]
+                                                     (swap! calls conj entry)
+                                                     (apply (get builder entry) args))))
+                                          builder [:load :cast :compute])))]
+                   (result-region/lower region options))
+          [load widen add scale-cast outer narrow] (:operations result)]
+      (is (= [:load :cast :compute :cast :compute :cast] @calls))
+      (is (= [0 1] (:coordinates load)))
+      (is (= 'active (:predicate load)))
+      (is (= (body/literal 0 :float) (:other load)))
+      (is (= :float (:result-dtype result)))
+      (is (= {:rounding :exact :overflow :exact} (get-in widen [:expression :options])))
+      ;; This owner's pre-existing Int->Double rounding label is deliberately retained.
+      (is (= {:rounding :nearest-even :overflow :exact}
+             (get-in scale-cast [:expression :options])))
+      (is (= {:rounding :nearest-even :overflow :ieee}
+             (get-in narrow [:expression :options])))))
+  (let [result (result-region/lower
+                (body/->ScalarRegion ['acc] '(+ 1 2) [] :int)
+                {:accumulator 'carry :accumulator-dtype :int :store-dtype :int :parameters {}})]
+    (is (= {:overflow :trap} (get-in result [:operations 0 :expression :options]))
+        "typed emission does not invent a no-overflow proof for this owner")))
 
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]

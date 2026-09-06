@@ -193,7 +193,7 @@ comparisons, proves load coordinates through the existing owner callback, and ch
 accumulator dtype. The shared builder accepts explicit owner conversion and masked-load policies;
 map/fold defaults are unchanged. This serves existing scalar reductions and portable contractions,
 without adding indirect-access admission or retiring their remaining source fallbacks. Result
-transform lowering remains separate consolidation work.
+transform admission still has its own explicit precision and overflow policy.
 
 The shared scalar builder now reserves source, parameter and owner-scope identities before fresh
 SSA allocation, including future local binders. Map and reduction fragment callers seed their
@@ -202,6 +202,14 @@ Reduction fragments pass only their typed child environment instead of all earli
 and seeded calls do not repeatedly scan growing environments. Names remain deterministic, and
 KernelBody's duplicate-identity validator remains intact. This closes the demonstrated scalar
 capture cases; it is not a claim about every other schedule's allocator or target identifier mangling.
+
+Result transforms now use the same typed load, conversion and scalar-compute builder as reduction
+elements and map/fold source lowering. Reduction and result-transform adapters no longer rebuild
+source fragments to emit accepted operations. The typed entries take approved coordinate vectors,
+converted operands and explicit options; they do not infer source semantics or new range proofs.
+Result-transform operand roles (including destination reads), multidimensional coordinates,
+conversion labels and trapping integer arithmetic remain unchanged. Their separate admission
+rules are not duplicate kernel emitters, and harmonizing those rules remains a semantic decision.
 
 The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
 body matches source `mod` only over positive populations, and its output conversion needs a proved
