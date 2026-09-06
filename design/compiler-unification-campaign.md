@@ -155,7 +155,15 @@ Exit: classify all remaining routes; retire duplicated paths for covered workloa
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.
 
-## 3. General fusion and bounded specialization — queued
+The active-ID prototype is deliberately **not shipped**. Review found that its remainder-based
+body matches source `mod` only over positive populations, and its output conversion needs a proved
+int range. It also inherited unconditional cast erasure on seed/population captures. Passing
+ordinary ABM differential tests does not establish those preconditions. Keep the production route
+until shared capture normalization and enforced scalar-domain admission preserve empty/inactive
+execution as well as overflow. The local `compiler/active-indices-typed-map` branch retains the
+prototype and count-check tests for that follow-up; no retirement is claimed.
+
+## 3. General fusion and bounded specialization — price admission active; broader work queued
 
 - Validate shared scalar-region composition, coupled reductions and post-reduction transforms.
 - Audit recompute/materialize choices on fan-out, effects, aliases and observable results.
@@ -163,6 +171,12 @@ the entire compiler unified from one successful vertical.
   and typed constant/range simplification afterward.
 - Preserve ordered arithmetic and AD/effect boundaries. Use guards and bounded specialization
   caches; do not unroll large numerical iteration spaces merely because their sizes are known.
+
+The first generic hardening rejects nonnumeric, nonpositive and nonfinite machine ridge prices,
+and overflow of their derived recompute threshold. These prices cannot authorize duplicating a
+fan-out producer. Sole-consumer elimination still needs no cost estimate. The witness policy is
+versioned; production typed-route tests retain both materialized consumers with an explicit reason.
+This is price admission, not a new fusion legality proof or a bounded specialization cache.
 
 Exit: representative scientific and model expressions compile with explained fusion/placement
 choices, differential correctness, and measured kernel/allocation/compile-cost changes.

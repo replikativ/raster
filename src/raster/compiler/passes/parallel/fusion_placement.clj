@@ -10,7 +10,11 @@
 
 (def policy-version
   "Stable identifier recorded with every placement witness."
-  :roofline-v1)
+  :roofline-v2)
+
+(defn- positive-finite-price?
+  [price]
+  (and (number? price) (Double/isFinite (double price)) (pos? (double price))))
 
 (defn expression-cost
   "Return registered flop-equivalent cost and its completeness for `expressions`.
@@ -61,7 +65,7 @@
         {:keys [flops complete? unknown-ops]} (expression-cost expressions)
         element-bytes (when (dtype/known? dtype) (dtype/bytes-of dtype))
         ridge (get-in abstract-machine [:ridge dtype])
-        threshold (when (and element-bytes ridge)
+        threshold (when (and element-bytes (positive-finite-price? ridge))
                     (* (long element-bytes) (double ridge)))
         base {:policy policy-version
               :consumer-count consumer-count
@@ -96,6 +100,16 @@
       (nil? ridge)
       (assoc base :decision :materialize
              :reason :unknown-roofline-ridge
+             :fuse? false)
+
+      (not (positive-finite-price? ridge))
+      (assoc base :decision :materialize
+             :reason :invalid-roofline-ridge
+             :fuse? false)
+
+      (not (positive-finite-price? threshold))
+      (assoc base :decision :materialize
+             :reason :invalid-recompute-threshold
              :fuse? false)
 
       (<= flops threshold)

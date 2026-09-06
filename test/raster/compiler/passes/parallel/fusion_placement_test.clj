@@ -39,6 +39,28 @@
                          (assoc arguments :consumer-count 1))
                         [:decision :reason])))))
 
+(deftest invalid-machine-prices-cannot-authorize-recomputation
+  (doseq [price [0 -1 Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY
+                 "100" :unknown true {}]]
+    (let [arguments {:abstract-machine {:ridge {:float price}}
+                     :dtype :float :expressions '[(exp x)] :consumer-count 2}
+          witness (placement/placement-decision arguments)]
+      (is (= :roofline-v2 (:policy witness)))
+      (is (= {:decision :materialize :reason :invalid-roofline-ridge :fuse? false}
+             (select-keys witness [:decision :reason :fuse?])) (str price))
+      (is (nil? (:recompute-threshold-flops witness)))
+      (is (= {:decision :eliminate :reason :sole-consumer :fuse? true}
+             (select-keys (placement/placement-decision (assoc arguments :consumer-count 1))
+                          [:decision :reason :fuse?]))
+          "moving one computation needs no speculative hardware price"))))
+
+(deftest finite-ridge-can-still-overflow-its-derived-price
+  (let [witness (placement/placement-decision
+                 {:abstract-machine {:ridge {:double Double/MAX_VALUE}}
+                  :dtype :double :expressions '[(+ x 1)] :consumer-count 2})]
+    (is (= {:decision :materialize :reason :invalid-recompute-threshold :fuse? false}
+           (select-keys witness [:decision :reason :fuse?])))))
+
 (deftest incomplete-placement-prices-never-enable-duplicated-work
   (let [machine {:ridge {:float 100.0}}
         unknown-op (placement/placement-decision
