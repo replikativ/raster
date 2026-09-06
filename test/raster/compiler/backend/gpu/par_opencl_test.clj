@@ -204,7 +204,10 @@
     (is (= 1 (get-in emitted [:stats :direct-scheduling :horizontal])))
     (is (= 1 (get-in emitted [:stats :direct-scheduling :typed-scalar-equations])))
     (is (= 1 (count (:kernels emitted))))
-    (execute submit! 3 nil nil nil)
+    (let [left (float-array 3) right (float-array 3)
+          result (execute submit! 3 nil left right)]
+      (is (identical? left (first result)))
+      (is (identical? right (second result))))
     (is (= 1 @submissions))
     (reset! submissions 0)
     (doseq [n [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]]

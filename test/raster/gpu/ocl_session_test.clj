@@ -50,6 +50,17 @@
   [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
   (raster.par/map! out i (int n) float (ra/aget x i)))
 
+(deftm ocl-session-fused-buffer-maps
+  [x :- (Array float) left :- (Array float) right :- (Array float) n :- Long] :- Object
+  (let [a (raster.par/map! left i n float (+ (ra/aget x i) 1.0))
+        b (raster.par/map! right j n float (* (ra/aget x j) 2.0))]
+    [a b]))
+
+(deftest public-fused-buffer-maps-remain-a-flat-resident-program
+  (let [descriptor (pl/compile-gpu-program #'ocl-session-fused-buffer-maps :ocl:0 :dtype :float)]
+    (is (= [:map-void] (mapv :convention (:steps descriptor))))
+    (is (= '[left right] (:result-sym descriptor)))))
+
 (deftest public-checked-count-refuses-overflow-before-allocation
   (let [descriptor (pl/compile-gpu-program #'ocl-session-checked-count :ocl:0 :dtype :float)
         bound (last (:argument-specs (first (:steps descriptor))))]
@@ -448,6 +459,43 @@
           (is (nil? (apply execute [values staged-indices nrows width]))
               "the hoisted IFn applyTo bridge also boxes void as nil")
           (is (= [3 255 411] (vec staged-indices))))
+        (finally (gpu/close-session! s))))))
+
+(deftest ocl-fused-maps-retain-each-observable-buffer-alias
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "fused map buffer identities")
+    (let [emitted (opencl-pass/opencl-pass
+                   '(let* [a (raster.par/map! left i n float (+ (aget x i) 1.0))
+                            b (raster.par/map! right j n float (* (aget x j) 2.0))]
+                           [a b])
+                   :device-id :ocl:0 :min-elements 0 :dtype :float
+                   :array-types {'x :float 'left :float 'right :float}
+                   :scalar-types {'n :long})
+          execute (eval (list 'fn '[x left right n] (:form emitted)))
+          register! (requiring-resolve 'raster.gpu.ocl-runtime/register-kernel!)
+          x (float-array [-1 0 2])
+          left (float-array 3) right (float-array 3)]
+      (is (= 1 (count (:kernels emitted))))
+      (doseq [artifact (:kernels emitted)] (register! (:kernel-name artifact) artifact))
+      (let [result (execute x left right 3)]
+        (is (identical? left (first result)))
+        (is (identical? right (second result))))
+      (is (= [0.0 1.0 3.0] (vec left)))
+      (is (= [-2.0 0.0 4.0] (vec right))))))
+
+(deftest ocl-public-fused-buffer-maps-replay-both-results
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident fused buffer maps")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-fused-buffer-maps :ocl:0 :dtype :float)
+          s (gpu/make-session :ocl:0)
+          args [(float-array [-1 0 2]) (float-array 3) (float-array 3) 3]]
+      (try
+        (let [program (fixture/instantiate! s descriptor args)]
+          (try
+            (let [result (fixture/run! program args)]
+              (is (= [0.0 1.0 3.0] (vec (get result 'left))))
+              (is (= [-2.0 0.0 4.0] (vec (get result 'right)))))
+            (finally (fixture/close! program))))
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-strided-transfers-retain-host-control-and-accumulation

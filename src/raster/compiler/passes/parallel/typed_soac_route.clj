@@ -168,6 +168,8 @@
               host-bindings (or (get-in placement-facts [:attributes :host-bindings])
                                 {result host-binding})
               host-returns (set (map :host-return storage))
+              multiple-buffer-results? (and (= #{:buffer} host-returns)
+                                             (< 1 (count physical-results)))
               _ (when (and storage
                            (not (or (= #{:effect} host-returns)
                                     (= #{:buffer} host-returns))))
@@ -187,7 +189,7 @@
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
                        (cond
-                         (= #{:effect} host-returns)
+                         (or (= #{:effect} host-returns) multiple-buffer-results?)
                          (list 'raster.par/map-void! (:index attributes) (:extent attributes)
                                (materialize-region
                                 region-locals
@@ -209,16 +211,28 @@
                        {:raster.type/elem-type (first result-dtypes)})]
           {:equation-id equation-id
            :placement placement
-           :pairs (if storage
+           :pairs (cond
+                    multiple-buffer-results?
+                    ;; A fused submission has no single host return. Keep every source buffer
+                    ;; alias as its own flat binding; both staging and resident extraction then
+                    ;; consume the same effect call without treating nil as the primary buffer.
+                    (into [[effect source]]
+                          (keep (fn [[logical destination]]
+                                  (when-let [binding (get host-bindings logical)]
+                                    [binding destination])))
+                          (map vector results physical-results))
+
+                    storage
                     (into [[host-binding source]]
                           (keep (fn [[logical destination]]
                                   (let [binding (get host-bindings logical)]
                                     (when (and binding (not= binding host-binding))
                                       [binding destination])))
                                 (map vector results physical-results)))
+                    :else
                     (conj (mapv #(allocation-pair values % (:extent attributes)) results)
                           [effect source]))
-           :site [:binding (if storage host-binding effect)]
+           :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
            :source source}))
 
       scatter
