@@ -102,6 +102,12 @@ KernelBody from a compatibility emitter. Aggregate counts explicitly describe em
 including dispatch alternatives, not executed launches. The portable baseline remains unchanged;
 target-specific route evidence stays in the report and CI output. No extra compile is required.
 
+Static caller audit found the old `par-hip` elementwise source emitter referenced only by its
+historical compile-gate test, not by any production routing path. It is moved to the test-only
+`reference.elementwise-cuda` namespace with the algorithm unchanged. Historical ABI/math compile
+checks remain; mandatory CUDA/HIP CI continues to compile public equation-first KernelBody
+fixtures. This removes a misleading second production emitter, not a supported runtime target.
+
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring
 the entire compiler unified from one successful vertical.

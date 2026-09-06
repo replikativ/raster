@@ -5,9 +5,9 @@
   Backend differences (cast syntax, struct constructors, atomics) are
   parameterized via a config map bound to *emit-config*.
 
-  All kernel backends (par_opencl, par_vulkan, par_hip) delegate
-  expression/statement emission to this module and only implement
-  their own kernel scaffold (declarations, index computation, barriers).
+  Retained source-shaped backends (par_opencl, par_vulkan) and test-only source oracles
+  delegate expression/statement emission here. Production KernelBody emission has its own
+  typed boundary and shares semantic intrinsic descriptors, not these source scaffolds.
 
   Usage:
     (binding [*emit-config* opencl-config

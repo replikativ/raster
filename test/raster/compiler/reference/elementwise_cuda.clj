@@ -1,5 +1,9 @@
-(ns raster.compiler.backend.gpu.par-hip
-  "HIP/CUDA kernel emission for raster.par elementwise forms — the forcing-function backend
+(ns raster.compiler.reference.elementwise-cuda
+  "TEST-ONLY historical CUDA-C elementwise emitter. Production CUDA/HIP emission uses
+   typed KernelBody and its target dialects. Keep this independent source oracle for the old
+   expression/ABI compile checks; it is not a selectable compiler backend or fallback.
+
+   Historical design: HIP/CUDA kernel emission for raster.par elementwise forms — the forcing-function backend
    that proves 'CUDA/HIP is a descriptor + emitter, not a pipeline fork' (.internal/cuda_hip_plan.md).
 
    The EXPRESSION layer is vendor-neutral: the kernel body is emitted by the shared `c-emit`
