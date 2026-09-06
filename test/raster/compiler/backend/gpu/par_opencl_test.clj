@@ -2,10 +2,12 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.reference.indexed-transfer-opencl :as indexed-reference]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.passes.parallel.device :as device]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]
             [raster.hardware-fixture :as hardware-fixture]
@@ -138,7 +140,7 @@
            (str/index-of source "state[idx] =")))))
 
 (deftest generate-gather-kernel-is-a-side-effect-artifact
-  (let [k (par-opencl/generate-par-gather-kernel
+  (let [k (indexed-reference/generate-par-gather-kernel
            '(raster.par/gather out src index n stride) :dtype :float)]
     (is (kart/kernel-artifact? k))
     (is (= '[out src index stride _n_bound] (mapv :name (:abi k))))
@@ -146,6 +148,63 @@
     (is (= '[out src index stride n] (kcall/logical-arguments k)))
     (is (= :side-effect-map (get-in k [:effects :kind])))
     (is (= [256] (get-in k [:launch :workgroup-size])))))
+
+(deftest strided-transfers-use-typed-lowering-inside-host-control
+  (with-redefs [indexed-reference/generate-par-gather-kernel
+                (fn [& _] (throw (ex-info "source oracle reached" {})))
+                indexed-reference/generate-par-scatter-kernel
+                (fn [& _] (throw (ex-info "source oracle reached" {})))]
+    (doseq [op '[raster.par/gather raster.par/scatter!]
+            dtype [:int :long]
+            wrap [identity #(list 'let* ['result %] 'result)
+                  #(list 'let* [] %)
+                  #(list 'do %)
+                  #(list 'if 'enabled % nil)]]
+      (let [source (wrap (list op 'out 'src 'indices 'n 'stride))
+            emitted (opencl-pass/opencl-pass
+                     source :min-elements 0 :dtype :float
+                     :array-types {'out :float 'src :float 'indices :int}
+                     :scalar-types {'n dtype 'stride dtype 'enabled :boolean})
+            artifact (first (:kernels emitted))]
+        (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route])
+                                   (:kernels emitted))) (pr-str source))
+        (is (zero? (get-in emitted [:stats :fallback])))
+        (is (= dtype (:dtype (first (filter #(= 'stride (:name %)) (:abi artifact))))))
+        (is (= :long (:dtype (first (filter #(= :bound (:role %)) (:abi artifact)))))
+            "the hoisted product retains its analyzed Long dtype")
+        (when (= 'if (first source))
+          (is (= '(if enabled) (take 2 (:form emitted))))
+          (is (nil? (last (:form emitted))))
+          (is (= 'let* (first (nth (:form emitted) 2)))
+              "the extent binding stays inside the chosen host branch"))
+        (when (= 'raster.par/scatter! op)
+          (is (= :reducing-scatter (get-in artifact [:effects :kind])))
+          (is (= :inout (:kind (first (filter #(= 'out (:name %)) (:abi artifact)))))))))))
+
+(deftest strided-transfer-retained-programs-do-not-reenter-source-lowering
+  (doseq [op '[raster.par/gather raster.par/scatter!]]
+    (let [source (list op 'out 'src 'indices 'n 'stride)
+          program (:program (segop-lower/schedule-single-program
+                             'result source
+                             {:target-device :ze:0 :dtype :float
+                              :array-types {'out :float 'src :float 'indices :int}
+                              :scalar-types {'n :long 'stride :long}}))
+          emit #(opencl-pass/opencl-pass % :min-elements 0 :dtype :float)]
+      (with-redefs [segop-lower/schedule-single-program
+                    (fn [& _] (throw (ex-info "typed program reparsed" {})))
+                    segop-lower/schedule-source-program
+                    (fn [& _] (throw (ex-info "typed program reparsed" {})))]
+        (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route])
+                                   (:kernels (emit program)))))
+        (is (= :unscheduled-indexed-transfer
+               (try (emit (assoc program :source (list 'do source))) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (let [emitted (emit (assoc-in program [:provenance :source-dialect] :soac))]
+        (is (= [:kernel-body] (mapv #(get-in % [:attributes :emission-route])
+                                   (:kernels emitted))))
+        (is (= [:long :long]
+               (mapv :dtype (filter #(= :scalar (:kind %))
+                                   (:abi (first (:kernels emitted)))))))))))
 
 ;; ================================================================
 ;; Kernel generation: par/reduce

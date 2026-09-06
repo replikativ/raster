@@ -376,7 +376,7 @@
 
    Uses full SegOp conversion for par/map! and par/reduce.
    Certified effect-only map-void forms consume their scheduled TypedSOAC SegMap; unsupported
-   bodies and the remaining stencil, scatter, active-id and key-reduction forms retain
+   bodies and the remaining active-id and key-reduction forms retain
    explicit compatibility generators.
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
@@ -543,6 +543,30 @@
             (swap! stats update stat-key inc)
             (swap! kernels conj k)
             k))
+
+        emit-nested-indexed!
+        (fn [form]
+          ;; Raw host control flow can contain a strided transfer without a surrounding
+          ;; ParallelProgram. Schedule that leaf at its original control-flow position: its
+          ;; hoisted extent belongs beside the invocation, never outside the host branch.
+          ;; A supplied typed program must already account for every scheduled operation; do
+          ;; not re-analyze a missing equation at that verified boundary. Source scheduling may
+          ;; still leave a body-position operation outside its binding equations.
+          (when supplied-program
+            (throw (ex-info "Strided transfer is missing its retained typed equation"
+                            {:reason :unscheduled-indexed-transfer :form form})))
+          (let [emitted (binding [*bound-segops* nil *bound-algorithm* nil]
+                          (opencl-pass form :device-id device-id :dtype dtype
+                                       :min-elements min-elements :compile-spirv? compile-spirv?
+                                       :scalar-types top-scalar-types :array-types top-array-types
+                                       :schedule schedule))]
+            (swap! kernels into (:kernels emitted))
+            (swap! dispatches into (:dispatches emitted))
+            (doseq [[k v] (:stats emitted) :when (number? v)]
+              (swap! stats update k (fnil + 0) v))
+            (swap! stats update :nested-scheduling (fnil conj [])
+                   (get-in emitted [:stats :direct-scheduling]))
+            (:form emitted)))
 
         emit-scheduled-graph!
         (fn emit-scheduled-graph!
@@ -930,16 +954,7 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-scatter! form))
                 (if stride
-                  ;; The typed route hoists n*stride into a scalar equation. Direct source callers
-                  ;; cannot yet carry that equation beside one returned operation, so retain the
-                  ;; explicit compatibility generator rather than emitting an unbound extent.
-                  (let [k (register-kernel!
-                           (legacy/generate-par-scatter-kernel
-                            form :dtype dtype :device-id device-id)
-                           :ze-maps)]
-                    (list 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel
-                          (:kernel-name k) out (:src (par/extract-par-scatter-info form))
-                          index n stride))
+                  (emit-nested-indexed! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "scatter_result_") form
                                               dtype device-id top-scalar-types array-types)
@@ -958,11 +973,7 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-gather! form))
                 (if stride
-                  (let [k (register-kernel!
-                           (legacy/generate-par-gather-kernel
-                            form :dtype dtype :device-id device-id)
-                           :ze-maps)]
-                    (emit-map-void-invocation k device-id))
+                  (emit-nested-indexed! form)
                   (let [array-types (assoc top-array-types index :int)
                         segmap (source->segmap stats (gensym "gather_result_") form
                                               dtype device-id top-scalar-types array-types)

@@ -426,8 +426,8 @@
 
 (deftest scatter-kernel-source-generation
   (testing "Scatter kernel generates valid OpenCL C source"
-    (require '[raster.compiler.backend.gpu.par-opencl :as pocl])
-    (let [gen (resolve 'raster.compiler.backend.gpu.par-opencl/generate-par-scatter-kernel)
+    (require 'raster.compiler.reference.indexed-transfer-opencl)
+    (let [gen (resolve 'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)
           form '(raster.par/scatter! out src index 100)
           kernel (gen form :dtype :float)]
       (is (string? (:source kernel)))
@@ -437,8 +437,8 @@
 
 (deftest scatter-strided-kernel-source-generation
   (testing "Strided scatter kernel generates valid OpenCL C source"
-    (require '[raster.compiler.backend.gpu.par-opencl :as pocl])
-    (let [gen (resolve 'raster.compiler.backend.gpu.par-opencl/generate-par-scatter-kernel)
+    (require 'raster.compiler.reference.indexed-transfer-opencl)
+    (let [gen (resolve 'raster.compiler.reference.indexed-transfer-opencl/generate-par-scatter-kernel)
           form '(raster.par/scatter! out src index 100 4)
           kernel (gen form :dtype :float)]
       (is (clojure.string/includes? (:source kernel) "stride"))
