@@ -109,7 +109,7 @@
     (is (= ['scalar 'map] (mapv dialect/operation-kind (dialect/equations direct))))
     (is (= :analyzed-source
            (get-in routed [:stats :front-end])))
-    (is (= ['size '(clojure.core/* m n)]
+    (is (= ['size '(clojure.core/long (clojure.core/* m n))]
            (vec (take 2 (second (get-in routed [:program :source])))))
         "host allocation retains the transitive scalar binding that computes its extent")))
 
@@ -916,6 +916,20 @@
     (is (= '(int n) (second (second normalized))))
     (is (= 'int (:tag (meta extent))))
     (is (= '[scalar map] (mapv dialect/operation-kind equations)))))
+
+(deftest fixed-rng-inputs-keep-their-ordered-checked-conversions
+  (let [options {:dtype :long :array-types {'seeds :long}
+                 :scalar-types {'n :long 'seed :long}}
+        normalized (frontend/normalize-source
+                    '(let* [result (raster.par/rng-fill! seeds n (int seed))] result) options)
+        bindings (second normalized)
+        program (frontend/form->program normalized options)]
+    (is (= '(clojure.core/int n) (nth bindings 1)))
+    (is (= '(clojure.core/long (int seed)) (nth bindings 3)))
+    (is (= '[int long] (mapv #(-> % meta :raster.type/tag) [(nth bindings 0) (nth bindings 2)])))
+    (is (= '[scalar scalar map] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= normalized (frontend/normalize-source normalized options))
+        "normalization re-entry does not introduce another set of guards")))
 
 (deftest indexed-operation-counts-use-the-shared-scalar-normalizer
   (doseq [operation ['(raster.par/gather out x indices count)

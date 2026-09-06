@@ -163,6 +163,14 @@ until shared capture normalization and enforced scalar-domain admission preserve
 execution as well as overflow. The local `compiler/active-indices-typed-map` branch retains the
 prototype and count-check tests for that follow-up; no retirement is claimed.
 
+The next prerequisite closes the existing RNG route's scalar inputs: source-signature count and
+seed conversions become ordered host scalar equations, rather than unwrapping a captured checked
+cast. Typed scalar materialization reapplies its retained result conversion, preserving
+`long(int(seed))` even after value-equality simplification. Raw inactive host branches keep these
+checks local; missing certified leaves fail once instead of recursively rescheduling. Public
+descriptor preflight, CPU differential execution and vendor compile fixtures cover this boundary.
+This does not admit the active-ID population domain or retire its production source kernel.
+
 ## 3. General fusion and bounded specialization — price admission active; broader work queued
 
 - Validate shared scalar-region composition, coupled reductions and post-reduction transforms.

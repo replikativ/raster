@@ -50,6 +50,40 @@
   [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
   (raster.par/map! out i (int n) float (ra/aget x i)))
 
+(deftm ocl-session-checked-rng
+  [seeds :- (Array long) n :- Long seed :- Long] :- (Array long)
+  (raster.par/rng-fill! seeds n (int seed)))
+
+(deftest public-rng-capture-checks-precede-allocation
+  (let [descriptor (pl/compile-gpu-program #'ocl-session-checked-rng :ocl:0 :dtype :float)
+        step (first (:steps descriptor))
+        scalars (filterv #(= :scalar (:kind %)) (:argument-specs step))]
+    (is (= [:long :long :int] (mapv :dtype (:abi (:artifact step)))))
+    (is (= [-1 3] (mapv #((:value-fn %) [nil 3 -1]) scalars)))
+    (doseq [value [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]
+            position [1 2]]
+      (is (thrown? ArithmeticException
+                   ((:value-fn (first scalars)) (assoc [nil 3 0] position value)))))
+    (is (thrown? NullPointerException
+                 ((:value-fn (first scalars)) [nil nil (inc (long Integer/MAX_VALUE))]))
+        "the count conversion still precedes the seed conversion")))
+
+(deftest ocl-checked-rng-captures-match-source-values
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "checked RNG captures")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-checked-rng :ocl:0 :dtype :float)
+          s (gpu/make-session :ocl:0)]
+      (try
+        (doseq [seed [Integer/MIN_VALUE Integer/MAX_VALUE]]
+          (let [expected (long-array 17)
+                arguments [(long-array 17) 17 seed]
+                program (fixture/instantiate! s descriptor arguments)]
+            (try
+              (raster.par/rng-fill! expected 17 (int seed))
+              (is (= (vec expected) (vec (get (fixture/run! program arguments) 'seeds))))
+              (finally (fixture/close! program)))))
+        (finally (gpu/close-session! s))))))
+
 (deftm ocl-session-fused-buffer-maps
   [x :- (Array float) left :- (Array float) right :- (Array float) n :- Long] :- Object
   (let [a (raster.par/map! left i n float (+ (ra/aget x i) 1.0))
