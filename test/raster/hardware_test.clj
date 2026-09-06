@@ -1,11 +1,12 @@
 (ns raster.hardware-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.runtime.hardware :as hw]
+            [raster.hardware-fixture :as hardware-fixture]
             [raster.compiler.core.hardware :as chw]
             [raster.runtime.hardware-catalogue :as catalogue]))
 
 ;; Reset hardware state between tests
-(use-fixtures :each (fn [f] (hw/reset-hardware!) (f)))
+(use-fixtures :each hardware-fixture/isolated)
 
 ;; ================================================================
 ;; CPU detection

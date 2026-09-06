@@ -77,7 +77,10 @@ one must not erase its independent numerical evidence. Track JVM and C/SIMD comp
 as GPU paths, using the same production corpus and retained TypedSOAC facts.
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
-FP32 policy explicitly; broader fixture isolation remains a cleanup item.
+FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three
+resetting cross-compilation fixtures fresh device, initialization and calibration atoms, restoring
+the original identities even on exceptions. This is a serial-JVM fixture; parallelism remains
+across CI processes. Other registration sites still need an ownership audit.
 
 Exit: classify all remaining routes; retire duplicated paths for covered workloads with explicit
 production coverage and no silent legacy re-entry. Report any remaining gaps rather than declaring

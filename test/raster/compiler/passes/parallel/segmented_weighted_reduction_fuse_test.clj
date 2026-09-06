@@ -11,6 +11,7 @@
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
+            [raster.hardware-fixture :as hardware-fixture]
             [raster.numeric]
             [raster.runtime.hardware :as hardware]))
 
@@ -19,8 +20,8 @@
 ;; test JVM.  No device or driver is required to derive and emit these schedules.
 (use-fixtures
   :once
+  hardware-fixture/isolated
   (fn [f]
-    (hardware/reset-hardware!)
     (hardware/init!)
     (hardware/register-target-device!
      :ze:0
