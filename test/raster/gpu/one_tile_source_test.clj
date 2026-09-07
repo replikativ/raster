@@ -12,7 +12,8 @@
    the tile must not cost peak. `gemm-tile-for` on the default descriptor must reproduce
    `emit-gemm-tiled`'s literals exactly, and the split-k policy must produce the same schedule it
    produced from its own constants."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hw]
@@ -69,7 +70,7 @@
 
 (deftest direct-and-autotune-sources-use-the-scheduled-body
   (let [tile (hw/gemm-tile-for nil)]
-    (with-redefs [opencl-codegen/emit-gemm-tiled
+    (with-redefs [gemm-oracle/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
       (let [emitted (gemm/emit-scheduled-matrix-kernel
@@ -91,7 +92,7 @@
                  :operands [{:sym 'bias
                              :map (axis-map/of-axes [['j 'N]])
                              :dtype :half}]}]
-    (with-redefs [opencl-codegen/emit-gemm-tiled
+    (with-redefs [gemm-oracle/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
       (let [emitted (gemm/emit-scheduled-matrix-kernel
@@ -108,7 +109,7 @@
 
 (deftest grid-z-sources-use-the-scheduled-body
   (let [tile (hw/gemm-tile-for nil)]
-    (with-redefs [opencl-codegen/emit-gemm-tiled
+    (with-redefs [gemm-oracle/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
       (let [split (gemm/emit-scheduled-split-k-kernel

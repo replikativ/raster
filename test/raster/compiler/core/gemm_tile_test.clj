@@ -1,7 +1,8 @@
 (ns raster.compiler.core.gemm-tile-test
   "T2: the GEMM tile is DERIVED from the hardware descriptor's matrix unit + GRF budget, not
    hardcoded. Device-free — synthetic descriptors in, tile maps out."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.backend.gpu.opencl-codegen :as cg]))
 
@@ -53,7 +54,7 @@
 (deftest derived-tile-feeds-the-generator
   (testing "the derived tile is a valid emit-gemm-tiled argument map (round-trips to a kernel)"
     (let [tile (hw/derive-gemm-tile arc-desc)
-          src (apply cg/emit-gemm-tiled "gemm_derived" :prefetch (:num-stages tile)
+          src (apply gemm-oracle/emit-gemm-tiled "gemm_derived" :prefetch (:num-stages tile)
                      (mapcat identity (dissoc tile :num-stages)))]
       (is (string? src))
       (is (.contains src "intel_sub_group_f16_f16_matrix_mad_k16"))

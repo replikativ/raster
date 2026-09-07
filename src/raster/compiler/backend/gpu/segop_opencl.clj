@@ -1498,127 +1498,58 @@
      :epilogue-params params}))
 
 (defn- emit-dpas-plan
-  "Lower one already-checked DPAS plan. A KernelBody takes the direct operation lowerer; nil is
-  reserved for the independent source oracle."
-  [kernel-name row-arr col-arr out-sym [M N L] [i-sym j-sym] tile epilogue kernel-body]
-  (let [effective-tile (if kernel-body (:schedule kernel-body) tile)
-        result-dtype (if kernel-body
-                       (:dtype (first (filter #(= :result (:role %))
-                                              (:parameters kernel-body))))
-                       :half)
-        sg (long (get-in effective-tile [:matrix :subgroup] 16))
-        ep (if kernel-body
-             (kernel-body-opencl/lower-store-region kernel-body)
-             (when epilogue
-               (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float))))
-        effective-epilogue (or epilogue (get-in kernel-body [:attributes :epilogue]))
-        matrix-abi
-        (when kernel-body
-          (let [dimensions (filterv #(= :dimension (:role %)) (:parameters kernel-body))
-                dimension-names (zipmap (map :id dimensions) ["M" "N" "K"])
-                c-name (fn [{:keys [id role]}]
-                         (case role
-                           :lhs "A"
-                           :rhs "B"
-                           :result "C"
-                           (or (get dimension-names id) (ce/c-symbol id))))]
-            (body-abi/project-contracts
-             (mapv (fn [{:keys [id kind dtype role] :as parameter}]
-                     (kabi/slot id kind dtype
-                                :c-name (c-name parameter)
-                                :role (if (contains? #{:lhs :rhs} role) :operand role)))
-                   (:parameters kernel-body))
-             kernel-body)))
-        source (if kernel-body
-                 (:source (matrix-target/emit-matrix-kernel
-                           kernel-name kernel-body :opencl-intel))
-                 (apply codegen/emit-gemm-tiled kernel-name
-                        (concat [:c-dtype :half
-                                 :block-m (:block-m effective-tile)
-                                 :block-n (:block-n effective-tile)
-                                 :sg-m (:sg-m effective-tile) :sg-n (:sg-n effective-tile)
-                                 :block-k (:block-k effective-tile) :matrix (:matrix effective-tile)
-                                 :prefetch (:num-stages effective-tile 3)]
-                                (when ep [:epilogue (:epilogue ep)
-                                          :epilogue-params (:epilogue-params ep)]))))]
-    (cond->
-     {:kernel-name kernel-name
-      :source source
-      :array-params [row-arr col-arr]
-      :abi (or matrix-abi
-               (kabi/validate!
-                (vec (concat
-                      [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
-                       (kabi/slot col-arr :input :half :c-name "B" :role :operand)
-                       (kabi/slot out-sym :output result-dtype :c-name "C" :role :result)
-                       (kabi/slot 'M :scalar :int :role :dimension)
-                       (kabi/slot 'N :scalar :int :role :dimension)
-                       (kabi/slot 'K :scalar :int :role :dimension)]
-                      (for [{:keys [sym dtype] :or {dtype :float}} (:operands effective-epilogue)]
-                        (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
-                      (for [{:keys [sym dtype] :or {dtype :float}} (:scalars effective-epilogue)]
-                        (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue))))))
-      :dims [M N L]
-      :dtype result-dtype
-      :tile effective-tile
-      :epilogue-params (when ep (:epilogue-params ep))
-      :epilogue-operands (when ep (mapv :sym (:operands effective-epilogue)))
-      :epilogue-scalars (when ep (mapv :sym (:scalars effective-epilogue)))
-      :workgroup (if kernel-body
-                   (get-in kernel-body [:launch :workgroup-size])
-                   [(* (quot (:block-m effective-tile) (:sg-m effective-tile))
-                       (quot (:block-n effective-tile) (:sg-n effective-tile))
-                       sg) 1])
-      :tensorized true}
-      kernel-body (assoc :kernel-body kernel-body))))
+  "Emit a verified DPAS body and project its public artifact interface."
+  [kernel-name row-arr col-arr out-sym [M N L] kernel-body]
+  (let [effective-tile (:schedule kernel-body)
+        result-dtype (:dtype (first (filter #(= :result (:role %))
+                                           (:parameters kernel-body))))
+        ep (kernel-body-opencl/lower-store-region kernel-body)
+        effective-epilogue (get-in kernel-body [:attributes :epilogue])
+        dimensions (filterv #(= :dimension (:role %)) (:parameters kernel-body))
+        dimension-names (zipmap (map :id dimensions) ["M" "N" "K"])
+        c-name (fn [{:keys [id role]}]
+                 (case role
+                   :lhs "A"
+                   :rhs "B"
+                   :result "C"
+                   (or (get dimension-names id) (ce/c-symbol id))))
+        matrix-abi (body-abi/project-contracts
+                    (mapv (fn [{:keys [id kind dtype role] :as parameter}]
+                            (kabi/slot id kind dtype
+                                       :c-name (c-name parameter)
+                                       :role (if (contains? #{:lhs :rhs} role) :operand role)))
+                          (:parameters kernel-body))
+                    kernel-body)]
+    {:kernel-name kernel-name
+     :source (:source (matrix-target/emit-matrix-kernel
+                       kernel-name kernel-body :opencl-intel))
+     :array-params [row-arr col-arr]
+     :abi matrix-abi
+     :dims [M N L]
+     :dtype result-dtype
+     :tile effective-tile
+     :epilogue-params (when ep (:epilogue-params ep))
+     :epilogue-operands (when ep (mapv :sym (:operands effective-epilogue)))
+     :epilogue-scalars (when ep (mapv :sym (:scalars effective-epilogue)))
+     :workgroup (get-in kernel-body [:launch :workgroup-size])
+     :tensorized true
+     :kernel-body kernel-body}))
 
 (defn generate-dpas-kernel-body
   "Lower a verified, scheduled matrix KernelBody to the Intel OpenCL target.
 
    This is deliberately a separate boundary from contraction scheduling.  The production path
-   walks explicit body operations and layouts directly.  The legacy source generator remains only
-   behind `generate-dpas-contraction-kernel` as an independent equivalence oracle."
+   walks explicit body operations and layouts directly. Independent source oracles live only in tests."
   [kernel-body out-sym]
   (let [kernel-body (kbody/validate! kernel-body)
-        {:keys [kind instruction-family dims bindings epilogue axis-symbols]}
+        {:keys [kind instruction-family dims bindings]}
         (:attributes kernel-body)]
     (when-not (and (= :matrix-contraction kind) (= :dpas instruction-family))
       (throw (ex-info "OpenCL DPAS lowering requires a DPAS matrix KernelBody"
                       {:kind kind :instruction-family instruction-family})))
     (emit-dpas-plan (str "dpas_contract_" (gensym ""))
                     (:row bindings) (:col bindings) out-sym dims
-                    (subvec (vec axis-symbols) 0 2)
-                    (:schedule kernel-body) epilogue kernel-body)))
-
-(defn generate-dpas-contraction-kernel
-  "Legacy direct entry to the proven DPAS/XMX OpenCL emitter.
-
-   Production canonical f16 contractions now travel through ContractionFacts and a scheduled
-   KernelBody before reaching `generate-dpas-kernel-body`. This entry remains only as the
-   independent source oracle for the direct operation lowerer.
-   Its legality analysis determines operand orientation and launch dimensions; the emitted body is
-   f16 input, f32 accumulation and f16 output with a tile-parametric K16 matrix instruction.
-
-   Returns {:kernel-name :source :array-params [row-arr col-arr] :dims [M N L] :dtype :half
-            :tensorized true}  — NB: :array-params is in [row col] BINDING order (row's
-   buffer → A slot, col's → B slot, out → C), NOT sorted-by-name. Returns
-   {:tensorized false :reason …} when the gate rejects (caller falls back to regtiled)."
-  [segred out-sym & {:keys [dtype desc tile epilogue] :or {dtype :half}}]
-  (let [gate (dpas-contraction-legal? segred dtype)]
-    (if-not (:ok gate)
-      {:tensorized false :reason (:reason gate) :detail gate}
-      (let [{:keys [M N L row-arr col-arr]} gate
-            kernel-name (str "dpas_contract_" (gensym ""))
-            ;; TILE GEOMETRY IS DERIVED FROM THE HARDWARE DESCRIPTOR, never hardcoded: the
-            ;; per-subgroup accumulator tile is GRF-bound and rounded to the matrix (DPAS)
-            ;; fragment granularity, so a part with a different GRF budget / subgroup size /
-            ;; matrix shape gets a correctly rescaled tile from the same rule. An explicit
-            ;; `tile` (e.g. an autotune result via hw/gemm-tile-candidates) overrides.
-            ;; hw/derive-gemm-tile's own defaults reproduce the Arc 140V config, so passing no
-            ;; descriptor is equivalent to the previous literal — with zero magic numbers here.
-            tile (or tile (hw/derive-gemm-tile (or desc {})))]
-        (emit-dpas-plan kernel-name row-arr col-arr out-sym [M N L]
-                        [(:i-sym gate) (:j-sym gate)] tile epilogue nil)))))
+                    kernel-body)))
 
 ;; ================================================================
 ;; QUANT (int8) contraction — the SAME skeleton, WIDENING facet

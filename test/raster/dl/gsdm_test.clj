@@ -1,5 +1,6 @@
 (ns raster.dl.gsdm-test
-  (:require [clojure.test :refer [deftest testing is use-fixtures]]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [raster.dl.gsdm :as gsdm]
             [raster.dl.nn :as nn]
             [raster.dl.diffusion :as diff]
@@ -421,7 +422,7 @@
 (deftest gemm-epilogue-store-splice
   (testing "emit-gemm-tiled :epilogue splices into the store slot; byte-identical when absent"
     (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
+    (let [emit gemm-oracle/emit-gemm-tiled
           plain (emit "g" :c-dtype :float)
           biased (emit "gb" :c-dtype :float
                        :epilogue-params ", __global const half* restrict bias"
@@ -450,7 +451,7 @@
 (deftest gemm-tiled-kernel-test
   (testing "tile-parametric GEMM kernel generates valid OpenCL"
     (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
+    (let [emit gemm-oracle/emit-gemm-tiled
           src (emit "gemm_test")]
       (is (string? src))
       (is (.contains src "gemm_test"))

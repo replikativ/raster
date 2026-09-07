@@ -4,7 +4,8 @@
    → emit-gemm-nonsquare-kernel body) produces a NUMERICALLY CORRECT peak kernel: its f16
    output matches a CPU matmul on the SAME f16-rounded inputs (f32 accumulate) within f16
    tolerance. Gated on a real GPU."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.contract-lower :as cl]
@@ -60,7 +61,7 @@
         Bf (float-array (map float Bd))
         sr (cl/contract-form->segred (matmul-form m n k) :dtype :half)
         {:keys [kernel-name source array-params tensorized]}
-        (sco/generate-dpas-contraction-kernel sr 'C)
+        (gemm-oracle/generate-dpas-contraction-kernel sr 'C)
         _ (assert tensorized "DPAS gate should accept the canonical matmul")
         _ (assert (= '[A B] array-params) (str "row/col binding order, got " array-params))
         _ (register! kernel-name {:source source :dtype :half})
@@ -109,21 +110,21 @@
                           (list 'aget 'B (list '+ (list '* 'j 64) 'l)))) ; B transposed
               :dtype :half)
           f64 (cl/contract-form->segred (matmul-form 64 64 64) :dtype :double)]
-      (is (:tensorized (sco/generate-dpas-contraction-kernel nn 'C)))
+      (is (:tensorized (gemm-oracle/generate-dpas-contraction-kernel nn 'C)))
       (is (= :non-canonical-orientation
-             (:reason (sco/generate-dpas-contraction-kernel tn 'C))))
+             (:reason (gemm-oracle/generate-dpas-contraction-kernel tn 'C))))
       (is (= :dtype-not-dpas
-             (:reason (sco/generate-dpas-contraction-kernel f64 'C :dtype :double))))
-      (is (str/includes? (:source (sco/generate-dpas-contraction-kernel nn 'C))
+             (:reason (gemm-oracle/generate-dpas-contraction-kernel f64 'C :dtype :double))))
+      (is (str/includes? (:source (gemm-oracle/generate-dpas-contraction-kernel nn 'C))
                          "matrix_mad_k16"))))
   (testing "pitch-unaligned dims are REJECTED (would silently miscompile → fall back)"
     ;; N%8≠0 (B pitch = N·2 not 16-byte aligned) and K%8≠0 (A pitch) are device-verified to
     ;; corrupt ~80% of outputs; the gate must reject so the caller uses the register-tiled path.
     (let [n-bad (cl/contract-form->segred (matmul-form 128 70 128) :dtype :half)  ; N=70
           k-bad (cl/contract-form->segred (matmul-form 128 128 124) :dtype :half)] ; K=124
-      (is (= :n-pitch-unaligned (:reason (sco/generate-dpas-contraction-kernel n-bad 'C))))
-      (is (= :k-pitch-unaligned (:reason (sco/generate-dpas-contraction-kernel k-bad 'C))))
-      (is (false? (:tensorized (sco/generate-dpas-contraction-kernel n-bad 'C)))))))
+      (is (= :n-pitch-unaligned (:reason (gemm-oracle/generate-dpas-contraction-kernel n-bad 'C))))
+      (is (= :k-pitch-unaligned (:reason (gemm-oracle/generate-dpas-contraction-kernel k-bad 'C))))
+      (is (false? (:tensorized (gemm-oracle/generate-dpas-contraction-kernel n-bad 'C)))))))
 
 ;; ── Q2: EPILOGUE FUSION — fold bias+activation into the peak kernel's store slot ───────
 ;; emit-gemm-tiled exposes a store-splice hook; the contraction path now drives it from a

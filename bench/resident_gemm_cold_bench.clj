@@ -50,7 +50,8 @@
        {:name \"proj\" :m 1024 :k 640 :n 2048}
        [{:label \"baseline\"}
         {:label \"large-grf\" :large-grf? true}])"
-  (:require [raster.gpu.ze-runtime :as ze]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [raster.gpu.ze-runtime :as ze]
             [raster.compiler.backend.gpu.opencl-codegen :as cg]
             [raster.compiler.support.spirv-cache :as spv]
             [raster.runtime.hardware :as hw]))
@@ -84,23 +85,23 @@
 (defn- tile-tag [{:keys [block-m block-n block-k]}]
   (str "b" block-m "x" block-n "k" block-k))
 (defn build-kernel!
-  "Compile+cache the resident GEMM kernel for `config`.
+  "Compile+cache the historical GEMM source oracle for `config`, not the production compiler.
    Returns {:module :kname :tile}. config keys:
      :tile        a derive-gemm-tile map {:block-m :block-n :sg-m :sg-n :block-k :matrix}
                   → builds the TILE-PARAMETRIC emit-gemm-tiled kernel (B1 tile comparison).
-                  Absent → the plain hand emit-gemm-nonsquare-kernel baseline (block 128).
+                  Absent → the historical default tile (block 128).
      :large-grf?  EXPERIMENTAL build-flag comparand (default false, gated nowhere)."
   [{:keys [large-grf? tile] :as _config}]
   (let [ck [large-grf? tile]]
     (or (get @kern-cache ck)
         (let [kname (str "gemm_cold_" (if tile (tile-tag tile) (if large-grf? "grf256" "grf128")))
               src   (if tile
-                      (apply cg/emit-gemm-tiled kname :c-dtype :half :prefetch (:num-stages tile 3)
+                      (apply gemm-oracle/emit-gemm-tiled kname :c-dtype :half :prefetch (:num-stages tile 3)
                              (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
                       ;; no tile → emit-gemm-tiled at its DEFAULT geometry (block 128, wg 256 —
                       ;; matches the historical baseline; the old hand emit-gemm-nonsquare-kernel
                       ;; was removed when the tile-parametric generator replaced it in T1).
-                      (cg/emit-gemm-tiled kname :c-dtype :half))
+                      (gemm-oracle/emit-gemm-tiled kname :c-dtype :half))
               spirv (spv/compile-opencl-to-spirv src :device @device-hex)
               _ (when large-grf?
                   (throw (ex-info ":large-grf? unsupported — the -ze-opt-large-register-file build-flag path was removed from load-module!; re-add flag plumbing to compile/load to use it" {})))
