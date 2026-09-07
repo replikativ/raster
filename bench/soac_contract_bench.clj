@@ -2,7 +2,8 @@
   "Cadence-controlled COLD/WARM benchmark for the SOAC contraction ladder
    (par/contract → segmented SegRed → naive / block-tiled / register-tiled OpenCL),
    measured on the SAME rigorous method as `resident-gemm-cold-bench` and against the
-   golden `emit-gemm-tiled` (the resident XMX GEMM) as the reference line.
+   historical `emit-gemm-tiled` source oracle as the reference line. The golden and DPAS-oracle
+   rows are not measurements of the current public compiler; use the routed row for that.
 
    WHY THIS EXISTS
    ---------------
@@ -46,7 +47,8 @@
      (soac-contract-bench/compare-ladder {:name \"proj\" :m 1024 :k 640 :n 2048})
      ;; include the golden GEMM reference line (f16), dtype-labeled:
      (soac-contract-bench/compare-ladder {:name \"proj\" :m 1024 :k 640 :n 2048} :golden? true)"
-  (:require [raster.gpu.ze-runtime :as ze]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [raster.gpu.ze-runtime :as ze]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
@@ -198,7 +200,7 @@
    :bind
    (fn [m n k triple]
      (let [kname "gemm_nonsquare_bench"
-           src (cg/emit-gemm-tiled kname :c-dtype :half)
+           src (gemm-oracle/emit-gemm-tiled kname :c-dtype :half)
            {:keys [module kname]} (compile-src! [:golden] kname src)
            args [(:segment (:a triple)) (:segment (:b triple)) (:segment (:c triple))
                  {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]]
@@ -206,17 +208,17 @@
               (long (Math/ceil (/ (double n) 128.0))) (long (Math/ceil (/ (double m) 128.0))) 1)))})
 
 (def ^:private dpas-spec
-  "The DPAS/XMX-tensorized SOAC contraction — sourced from the segred via the legality gate,
+  "Historical DPAS/XMX source-oracle contraction — sourced from the segred via the legality gate,
    f16. This is the apples-to-apples proof that the SOAC path reproduces the golden GEMM:
    for a canonical matmul the gate accepts and emits the golden body, so a near-tie with
-   golden-gemm-f16 is the 'general emitter, no lost performance' result. Requires N%8==0 and
+   golden-gemm-f16 checks only the historical oracle, not production competitiveness. Requires N%8==0 and
    K%8==0 (the DPAS block-read pitch alignment the gate enforces)."
   {:label "dpas-soac-f16" :dtype :half
    :bind
    (fn [m n k triple]
      (let [sr (cl/contract-form->segred (matmul-form m n k) :dtype :half)
            {:keys [kernel-name source array-params tensorized reason]}
-           (sco/generate-dpas-contraction-kernel sr 'C)
+           (gemm-oracle/generate-dpas-contraction-kernel sr 'C)
            _ (when-not tensorized
                (throw (ex-info (str "dpas-spec: gate rejected this shape (" reason
                                     ") — DPAS needs N%8==0 & K%8==0, canonical orientation")

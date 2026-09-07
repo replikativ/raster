@@ -84,6 +84,14 @@ remain, with scalar-scatter coverage added; these are source-shape oracles, not 
 accelerator performance evidence. Shared dtype/extension helpers remain production infrastructure.
 This removes dead algorithms from production, not a live workload's fallback or an optimization.
 
+The handwritten tiled GEMM generator and legacy direct DPAS source entry are now test-only
+oracles. Production DPAS artifact construction has only the verified KernelBody branch, preserving
+its source, ABI, epilogue metadata and launch geometry. Independent source comparisons and
+historical benchmark rows still use the relocated generator; those rows are explicitly not public
+compiler performance evidence. The legacy orientation gate remains shared with oracle tests for
+now; live staged quantized contractions still require the epilogue-splice helper. This retirement
+does not remove their source emission or the general gathered-contraction fallback.
+
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
 FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three

@@ -1,5 +1,6 @@
 (ns raster.compiler.backend.gpu.gemm-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hardware]
@@ -13,6 +14,11 @@
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
+
+(deftest handwritten-gemm-entry-points-are-test-only
+  (is (nil? (ns-resolve 'raster.compiler.backend.gpu.opencl-codegen 'emit-gemm-tiled)))
+  (is (nil? (ns-resolve 'raster.compiler.backend.gpu.segop-opencl
+                        'generate-dpas-contraction-kernel))))
 
 (defn- matrix-contract
   [graph]
@@ -147,7 +153,7 @@
         stage (:source scheduled)
         dimensions (filter #(= :dimension (:role %)) (:parameters kernel-body))
         result (first (filter #(= :result (:role %)) (:parameters kernel-body)))
-        oracle (apply opencl-codegen/emit-gemm-tiled (:kernel-name contract)
+        oracle (apply gemm-oracle/emit-gemm-tiled (:kernel-name contract)
                       :c-dtype :float :prefetch (:num-stages tile)
                       (mapcat identity
                               (select-keys tile
@@ -208,7 +214,7 @@
     (is (graph-call/kernel-graph-call? call))))
 
 (deftest shared-direct-emission-does-not-call-the-legacy-template
-  (with-redefs [opencl-codegen/emit-gemm-tiled
+  (with-redefs [gemm-oracle/emit-gemm-tiled
                 (fn [& _]
                   (throw (ex-info "legacy template was called" {:reason :test/failure})))]
     (let [emitted (gemm/emit-scheduled-matrix-kernel
@@ -222,7 +228,7 @@
              (:workgroup-size emitted))))))
 
 (deftest typed-epilogue-is-lowered-from-the-shared-body
-  (with-redefs [opencl-codegen/emit-gemm-tiled
+  (with-redefs [gemm-oracle/emit-gemm-tiled
                 (fn [& _]
                   (throw (ex-info "legacy template was called" {:reason :test/failure})))]
     (let [emitted (gemm/emit-scheduled-matrix-kernel
@@ -260,7 +266,7 @@
 
 (deftest grid-z-matrix-emission-does-not-call-the-legacy-template
   (let [tile (hardware/derive-gemm-tile {})]
-    (with-redefs [opencl-codegen/emit-gemm-tiled
+    (with-redefs [gemm-oracle/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
       (let [split (gemm/emit-scheduled-split-k-kernel

@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.contraction-schedule-test
-  (:require [clojure.string :as str]
+  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
@@ -120,7 +121,7 @@
 (deftest kernel-body-lowering-shadows-the-proven-dpas-oracle
   (let [form (matrix-form 128 128 128)
         routed (route/route-contraction form :dtype :half)
-        oracle (segop-opencl/generate-dpas-contraction-kernel
+        oracle (gemm-oracle/generate-dpas-contraction-kernel
                 (contract-lower/contract-form->segred form :dtype :half) 'C)
         normalize #(str/replace % #"dpas_contract_[0-9]+" "dpas_contract_N")]
     (is (= (normalize (:source oracle)) (normalize (:source routed))))
@@ -166,7 +167,7 @@
     (is (= 1 (count (re-seq #"__global const half\* restrict A" (:source routed)))))))
 
 (deftest production-kernel-body-lowering-does-not-call-the-legacy-template
-  (with-redefs [opencl-codegen/emit-gemm-tiled
+  (with-redefs [gemm-oracle/emit-gemm-tiled
                 (fn [& _]
                   (throw (ex-info "legacy template was called" {:reason :test/failure})))]
     (let [routed (route/route-contraction (matrix-form 128 128 128) :dtype :half)]
@@ -182,7 +183,7 @@
         scheduled (schedule/plan-matrix-body
                    (facts/contraction-facts form :dtype :half) nil nil)]
     (is (= {:ok false :reason :opaque-epilogue-helper} scheduled))
-    (with-redefs [opencl-codegen/emit-gemm-tiled
+    (with-redefs [gemm-oracle/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no store splice"
