@@ -499,16 +499,33 @@
            :scalar-args [] :dims [1]})
 
         (zero? n-contract)
-        (let [sm (cl/contract-form->segmap
-                  (compatibility-form! contract-form :segmap) :dtype dtype)
+        (let [sm (cl/contraction-facts->segmap contract-facts)
+              portable (contraction-schedule/plan-portable-body
+                        contract-facts sm desc
+                        {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
+              emitted (when (:ok portable)
+                        (sco/generate-contraction-kernel-body (:body portable)))
               {:keys [kernel-name source array-params scalar-params abi]}
-              (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
-          {:strategy :segmap
-           :kernel-name kernel-name :source source :array-params array-params :abi abi
-           :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-           :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
-                              {:type :int :value nseg})
-           :out-elems nseg :dims [nseg]})
+              (or emitted
+                  (sco/generate-segmap-nd-kernel
+                   (cl/contract-form->segmap
+                    (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :segmap)
+                    :dtype dtype)
+                   out-sym :dtype dtype))
+              workgroup-size (or (:workgroup-size portable) 256)
+              scalar-dtypes (into {} (map (juxt :name :dtype)) abi)]
+          (cond->
+           {:strategy :segmap
+            :emission-route (if emitted :kernel-body :verified-segmap-opencl)
+            :kernel-body (:body portable)
+            :kernel-name kernel-name :source source :array-params array-params :abi abi
+            :dtype dtype :out-dtype dtype :wg [workgroup-size] :grid [(ceil-div nseg workgroup-size)]
+            :scalar-args (conj (mapv (fn [p] {:type (get scalar-dtypes p :int) :value p}) scalar-params)
+                               {:type :int :value nseg})
+            :out-elems nseg :dims [nseg]}
+            (not emitted) (assoc :fallback-reason (:reason portable)
+                                 :declines [{:leaf :portable-kernel-body
+                                             :reason (:reason portable) :data (:detail portable)}])))
 
       ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled).
       ;; A `{::declines …}` result means BOTH tensorize leaves refused for a documented reason —

@@ -17,6 +17,7 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
+            [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
@@ -137,6 +138,16 @@
     (segop-emit/generate-contraction-kernel-body
      (:body planned) :target-dialect dialect
      :kernel-name-prefix "portable_contraction")))
+
+(defn- outer-product-artifact
+  [dialect]
+  (let [routed (contract-route/route-contraction
+                '(raster.par/contract C [[i 17] [j 19]] [] (* (aget a i) (aget b j)))
+                :dtype :float)]
+    (when-not (= :kernel-body (:emission-route routed))
+      (throw (ex-info "outer-product fixture did not select KernelBody" routed)))
+    (segop-emit/generate-contraction-kernel-body
+     (:kernel-body routed) :target-dialect dialect :kernel-name-prefix "outer_product")))
 
 (defn- mixed-contraction-artifact
   [dialect descriptor]
@@ -343,6 +354,8 @@
                             (reduction-artifact dialect))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
+           (write-artifact! directory suffix "outer-product"
+                            (outer-product-artifact dialect))
            (write-artifact! directory suffix "mixed-contraction"
                             (mixed-contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "segmented-fold-map"
