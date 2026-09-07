@@ -21,11 +21,51 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
+            [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
+
+(deftest typed-map-preserves-independent-static-graph-capacities
+  (doseq [a-capacity [4 8]
+          dialect [:opencl-intel :cuda :hip]]
+    (let [graph (capacity-fixture/graph a-capacity)
+          emitted (sg/generate-kernel-graph graph :target-dialect dialect)
+          artifact (get-in emitted [:nodes 0 :operation])
+          body (get-in artifact [:attributes :kernel-body])
+          shapes (into {} (map (juxt :id :shape)) (:parameters body))
+          certificate (get-in artifact [:attributes :scheduled-kernel-body])]
+      (is (= :kernel-body (kart/emission-route artifact)))
+      (is (= [a-capacity] (shapes 'a)))
+      (is (= [3] (shapes 'b)))
+      (is (= [12] (shapes 'C)))
+      (is (= [a-capacity 3] (mapv :elements (:inputs emitted))))
+      (is (= 12 (get-in body [:attributes :extent])))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact))))))
+
+(deftest map-capacity-projection-rejects-drift-without-changing-the-algorithm
+  (let [graph (capacity-fixture/graph)
+        emit #(get-in (sg/generate-kernel-graph %) [:nodes 0 :operation])
+        small (emit graph)
+        larger (emit (capacity-fixture/graph 8))
+        source #(str/replace (:source %) (:kernel-name %) "map_capacity")
+        candidate (get-in small [:attributes :scheduled-kernel-body])
+        corrupted (assoc-in candidate [:body :parameters 0 :shape] [12])]
+    (is (= (source small) (source larger)))
+    (is (= (:arguments small) (:arguments larger)))
+    (is (= (:launch small) (:launch larger)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
+                         (segmap-body/validate-static-graph-capacities!
+                          corrupted (first (:nodes graph)) graph)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
+                         (segmap-body/validate-static-graph-capacities!
+                          (assoc-in candidate [:body :parameters 0 :layout] nil)
+                          (first (:nodes graph)) graph)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact graph node"
+                         (segmap-body/validate-static-graph-capacities!
+                          candidate (assoc (first (:nodes graph)) :id :foreign-node) graph)))))
 
 (deftest emitted-graph-interface-preserves-in-place-buffer-direction
   (let [operation (segop/->SegMap
@@ -38,6 +78,10 @@
                  scheduled :array-types {'output :float} :scalar-types {'n :int})]
     (is (= ['output 'n] (:arguments emitted)))
     (is (= [:inout :scalar] (mapv :kind (:abi emitted))))
+    (let [parameters (get-in emitted [:nodes 0 :operation :attributes :kernel-body :parameters])]
+      (is (= 1 (count (filter #(= :inout (:kind %)) parameters))))
+      (is (= ['_n_bound] (:shape (first parameters)))
+          "unknown graph capacities retain the compatibility shape without new scalar arguments"))
     (is (= :inout (get-in emitted [:inputs 0 :role])))))
 
 (deftest two-phase-reduction-graph-emits-its-explicit-scheduled-dataflow

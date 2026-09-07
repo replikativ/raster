@@ -18,6 +18,7 @@
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
@@ -356,6 +357,10 @@
                             (contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "outer-product"
                             (outer-product-artifact dialect))
+           (write-artifact! directory suffix "map-independent-capacities"
+                            (get-in (segop-emit/generate-kernel-graph
+                                     (capacity-fixture/graph) :target-dialect dialect)
+                                    [:nodes 0 :operation]))
            (write-artifact! directory suffix "mixed-contraction"
                             (mixed-contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "segmented-fold-map"

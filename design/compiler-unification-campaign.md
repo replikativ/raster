@@ -104,6 +104,17 @@ yet the public equation-first frontend: that frontend still excludes zero-reduct
 Admitting them through retained map equations requires preserving independent input capacities;
 the generic map lowerer's output-sized input shapes must not be reused as an outer-product proof.
 
+The first generic map-capacity step preserves known positive static GraphBuffer capacities in
+each KernelBody pointer shape/layout, including larger retained input capacities. An independent
+check compares those static pointer contracts to the exact source graph node before target
+emission. The typed-map fixture carries AbstractValues a[4], b[3], C[12] through ordinary typed
+scheduling and graph construction; CPU execution uses exact buffers and rejects undersized inputs
+and outputs. Source, launch and arguments are unchanged by enlarging a retained capacity. This is
+storage-contract correspondence, not proof of arbitrary indexed access safety. Symbolic, unknown
+and zero capacities still retain the compatibility behavior; no shape-only scalar ABI is added.
+Public zero-reduction contraction admission remains a follow-up, as does access-derived capacity
+refinement where the frontend has no declared shape.
+
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
 FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three
