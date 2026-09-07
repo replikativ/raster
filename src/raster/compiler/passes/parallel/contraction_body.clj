@@ -50,8 +50,34 @@
     (throw (ex-info "portable contraction lowering requires verified facts"
                     {:reason :raster/bug :facts contract-facts})))
   (let [space (:space segred)
-        segment-dims (segop/seg-space-segment-dims space)
-        reduced-dim (segop/seg-space-reduced-dim space)
+        map-only? (empty? (:contract-axes contract-facts))
+        segment-dims (if map-only? (segop/seg-space-dims space)
+                        (segop/seg-space-segment-dims space))
+        reduced-dim (when-not map-only? (segop/seg-space-reduced-dim space))
+        _ (when (and map-only?
+                     (some #(> (count (set (map :idx %))) 1)
+                           (vals (group-by :sym (:operands contract-facts)))))
+            (decline! :map-multiple-accesses
+                      "initial map capacity proof requires one index expression per input"
+                      {:operands (:operands contract-facts)}))
+        _ (when (and map-only?
+                     (not (every? #(and (integer? (:bound %)) (pos? (:bound %))) segment-dims)))
+            (decline! :map-domain
+                      "initial zero-reduction schedule requires positive static axis extents"
+                      {:dimensions segment-dims}))
+        _ (when (and map-only?
+                     (> (reduce *' 1 (map :bound segment-dims)) Integer/MAX_VALUE))
+            ;; The artifact's trailing count is int. A source fallback has the same ABI and
+            ;; cannot repair this domain, so fail instead of wrapping or declining to it.
+            (throw (ex-info "zero-reduction output count exceeds its int launch ABI"
+                            {:reason :contraction-map-count-overflow
+                             :dimensions segment-dims :limit Integer/MAX_VALUE})))
+        _ (when (and map-only?
+                     (or (seq (:opts contract-facts)) (:epilogue contract-facts)
+                         (some #(= (:out contract-facts) (:sym %)) (:operands contract-facts))))
+            (decline! :map-options
+                      "initial zero-reduction schedule requires an unadorned, non-aliasing map"
+                      {:options (:opts contract-facts)}))
         _ (when (empty? segment-dims)
             (decline! :no-segments
                       "portable contraction body requires at least one free axis"
@@ -122,7 +148,8 @@
                       {:operands (vec missing)
                        :indices (mapv (juxt :sym :idx) (:operands contract-facts))}))
         reduced-index (:name reduced-dim)
-        axis-symbols (set (concat (map :name segment-dims) [reduced-index]))
+        axis-symbols (set (cond-> (mapv :name segment-dims)
+                           reduced-index (conj reduced-index)))
         index-scope (into axis-symbols
                           (filter #(contains? #{:int :long} (dtype/canon (scalar-dtype %))) scalars))
         ;; Physical coordinates are wide. Preserve the scalar ABI's retained widths and insert
@@ -144,10 +171,13 @@
                         :else expression))
         lower-index (fn [expression scope]
                       (widen-index (lower-index expression scope)))
-        segment-count-source (segop/seg-space-num-segments-expr space)
+        segment-count-source (if map-only?
+                               (reduce (fn [a d] (list '* a (:bound d)))
+                                       (:bound (first segment-dims)) (rest segment-dims))
+                               (segop/seg-space-num-segments-expr space))
         segment-count (lower-index segment-count-source index-scope)
         launch-segment-count (index-expression/to-launch-expression segment-count decline!)
-        reduced-bound (lower-index (:bound reduced-dim) index-scope)
+        reduced-bound (when reduced-dim (lower-index (:bound reduced-dim) index-scope))
         segment-index 'segment-index
         group-index 'segment-group
         local-index 'segment-lane
@@ -164,7 +194,9 @@
              (body/->IndexCompute
               name (body/expression :mod quotient (lower-index bound index-scope)))))
          (range) segment-dims)
-        {:keys [operator identity element]} (segred-body/scalar-plan segred)
+        {:keys [operator identity element]} (if map-only?
+                                             {:identity 0.0 :element (:body contract-facts)}
+                                             (segred-body/scalar-plan segred))
         _ (when-not (number? identity)
             (decline! :literal-identity
                       "portable contraction requires a typed numeric reduction identity"
@@ -191,7 +223,7 @@
                   :load-other (body/literal identity dtype)})
         accumulator 'segment-accumulator
         next-accumulator 'next-segment-accumulator
-        reduction-result 'segment-result
+        reduction-result (if map-only? result 'segment-result)
         physical-extent
         (fn [array]
           (lower-index (axis-map/n-elements (get operand-maps array)) index-scope))
@@ -260,7 +292,9 @@
          :operations
          (vec
           (concat
-           [(body/->ForLoop
+           (if map-only?
+             operations
+             [(body/->ForLoop
              (body/value reduced-index (if wide-indices? :long :int))
              (widen-builtin 0) reduced-bound 1
              [(body/->LoopArg (body/value accumulator dtype)
@@ -272,10 +306,10 @@
                      (body/scalar-expression operator dtype [accumulator result]))
                     (body/->Yield [next-accumulator])]))
              [(body/value reduction-result dtype)]
-             {})]
+             {})])
            (:operations lowered-transform)
            [(body/->ScalarStore output [segment-index] stored-result active-mask)]))
-         :schedule {:strategy :sequential-segments
+         :schedule {:strategy (if map-only? :independent-segments :sequential-segments)
                     :workgroup-size workgroup-size
                     :reduction-operator operator}
          :launch (launch/spec
@@ -288,8 +322,8 @@
                       :segment-count segment-count
                       :launch-segment-count launch-segment-count
                       :reduced-bound reduced-bound
-                      :axis-symbols (vec (concat (map :name segment-dims)
-                                                 [reduced-index]))
+                      :axis-symbols (cond-> (mapv :name segment-dims)
+                                      reduced-index (conj reduced-index))
                       :result-transform result-transform}})
        :arrays arrays
        :scalars scalars

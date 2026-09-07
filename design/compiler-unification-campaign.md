@@ -92,6 +92,18 @@ compiler performance evidence. The legacy orientation gate remains shared with o
 now; live staged quantized contractions still require the epilogue-splice helper. This retirement
 does not remove their source emission or the general gathered-contraction fallback.
 
+The zero-reduction contraction router now attempts the shared portable contraction KernelBody
+lowerer, using a semantic SegMap projected directly from verified facts. The map branch emits
+scalar operations and one store without a synthetic reduction, and obtains each input extent from
+its own proven AxisMap (not the output count). Initial admission is deliberately limited to
+positive static free-axis extents whose product fits the int launch ABI, no options/result transforms or destination reads, and one
+index expression per input array. Unsupported maps retain an explicit compatibility decline.
+Focused CPU OpenCL execution uses exact input lengths and a partial final workgroup; the same
+routed body is included in CUDA/HIP compile fixtures. This is a contraction-router migration, not
+yet the public equation-first frontend: that frontend still excludes zero-reduction contractions.
+Admitting them through retained map equations requires preserving independent input capacities;
+the generic map lowerer's output-sized input shapes must not be reused as an outer-product proof.
+
 CI also exposed target-registry leakage from test fixtures: matrix-capable synthetic targets can
 change another test's automatic precision route. The direct contraction ABI test now requests its
 FP32 policy explicitly. The isolation follow-up gives the hardware registry tests and the three

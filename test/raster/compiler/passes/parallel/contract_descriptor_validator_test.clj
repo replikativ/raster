@@ -158,4 +158,6 @@
              '(raster.par/contract out-buffer [[row-index 4]] []
                                    (aget input-buffer row-index))
              :dtype :double)]
-      (is (= ["input_buffer" "out" "_nseg"] (mapv :c-name (:abi d)))))))
+      ;; The KernelBody route preserves the declared output's mangled name instead of the
+      ;; historical source emitter's fixed "out" placeholder; source and ABI still agree.
+      (is (= ["input_buffer" "out_buffer" "_nseg"] (mapv :c-name (:abi d)))))))

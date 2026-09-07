@@ -75,6 +75,25 @@
                     nil
                     dtype)))
 
+(defn contraction-facts->segmap
+  "Project a zero-reduction contraction's verified facts into its semantic map space.
+   No surface form is reconstructed. Physical layouts remain in the accompanying facts."
+  [facts]
+  (when-not (and (contraction-facts/facts? facts)
+                 (seq (:free-axes facts)) (empty? (:contract-axes facts)))
+    (throw (ex-info "map projection requires verified zero-reduction contraction facts"
+                    {:reason :contraction-map-facts})))
+  (let [{:keys [out free-axes body dtype]} facts
+        arrays (set (map :sym (:operands facts)))
+        bound-symbols (reduce set/union #{} (map (comp util/free-syms second) free-axes))
+        scalars (set/difference (set/union bound-symbols (util/free-syms body))
+                                arrays #{out} (set (map first free-axes)))]
+    (segop/->SegMap 0
+                    (segop/make-seg-space-nd
+                     (mapv (fn [[index bound]] {:name index :bound bound}) free-axes))
+                    (segop/->SegLevel :thread :virtual)
+                    body nil arrays #{out} scalars nil dtype out nil)))
+
 (defn contract-form->segmap
   "Parse a 0-CONTRACT `(raster.par/contract out [[i mi] …] [] body)` form → a SegMap (a pure
    N-D map = outer product / broadcast / elementwise). The free axes ARE the map/output space
