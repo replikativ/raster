@@ -3,8 +3,30 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.passes.parallel.contract-route :as route]
+            [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as device-probe]))
+
+(deftest opencl-typed-map-independent-input-capacities
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "typed map independent capacities")
+    (let [graph (emit/generate-kernel-graph (capacity-fixture/graph))]
+      (gpu/with-gpu-session [session :ocl:0]
+        (gpu/alloc! session {:a [:float 4 (float-array [1 2 3 4])]
+                             :b [:float 3 (float-array [10 20 30])]
+                             :short-a [:float 3 nil] :short-b [:float 2 nil]
+                             :short-c [:float 11 nil] :c [:float 12 nil]})
+        (doseq [bindings [{'a :short-a 'b :b 'C :c}
+                          {'a :a 'b :short-b 'C :c}
+                          {'a :a 'b :b 'C :short-c}]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (gpu/bind-kernel-graph! session :short-map graph bindings {}))))
+        (let [handle (gpu/bind-kernel-graph! session :map graph {'a :a 'b :b 'C :c} {})]
+          (try
+            (gpu/run-kernel-graph! session handle)
+            (is (= (mapv float [10 20 30 20 40 60 30 60 90 40 80 120])
+                   (vec (gpu/download session :c))))
+            (finally (gpu/release-kernel-graph! session handle))))))))
 
 (deftest opencl-outer-product-exact-input-capacities
   (if-not @device-probe/opencl-available?

@@ -11,6 +11,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
@@ -106,7 +107,7 @@
 
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
-  [segmap {:keys [workgroup-size array-types scalar-types]
+  [segmap {:keys [workgroup-size array-types scalar-types array-shapes]
            :or {workgroup-size 256 array-types {} scalar-types {}}}]
   (when-not (instance? raster.compiler.ir.segop.SegMap segmap)
     (throw (ex-info "map KernelBody lowering requires SegMap"
@@ -367,16 +368,19 @@
             []
             {:association :ordered :source-order true})]
           scalar-operations)
+        ;; These are physical capacities supplied by the enclosing graph, not a proof that
+        ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
+        pointer-shape (fn [id] (get array-shapes id ['_n_bound]))
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input (get array-types %) ['_n_bound] :global
-                     (layout/row-major ['_n_bound] (get array-types %)) :operand)
+                     % :input (get array-types %) (pointer-shape %) :global
+                     (layout/row-major (pointer-shape %) (get array-types %)) :operand)
                    read-only-inputs)
               (map #(body/->KernelParameter
                      % (if (contains? inout %) :inout :output)
-                     (get array-types %) ['_n_bound] :global
-                     (layout/row-major ['_n_bound] (get array-types %)) :result)
+                     (get array-types %) (pointer-shape %) :global
+                     (layout/row-major (pointer-shape %) (get array-types %)) :result)
                    outputs)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
@@ -415,6 +419,27 @@
        :attributes {:kind :portable-segmap :extent bound :no-write-alias true
                     :effect-iteration-order iteration-order}})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))
+
+(defn validate-static-graph-capacities!
+  "Check static graph-to-pointer correspondence, not arbitrary indexed access safety."
+  [candidate node kernel-graph]
+  (graph/validate! kernel-graph)
+  (when-not (and (= (:source candidate) (:operation node))
+                 (some #(= node %) (:nodes kernel-graph)))
+    (throw (ex-info "map capacity projection requires its exact graph node"
+                    {:reason :segmap-capacity-node})))
+  (let [buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))]
+    (doseq [{:keys [id kind shape layout dtype]} (get-in candidate [:body :parameters])
+            :let [elements (:elements (get buffers id))]
+            :when (and (not= :scalar kind) (integer? elements) (pos? elements))]
+      (when-not (and (= [elements] shape)
+                     (= (raster.compiler.core.layout/row-major [elements] dtype) layout))
+        (throw (ex-info "map pointer capacity differs from its static graph buffer"
+                        {:reason :segmap-static-capacity :buffer id
+                         :expected [elements] :actual shape})))))
+  candidate)
 
 (defn schedule
   "Refine one SegMap into a complete, target-neutral ScheduledKernelBody.
