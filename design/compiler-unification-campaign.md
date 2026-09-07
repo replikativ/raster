@@ -96,7 +96,7 @@ The zero-reduction contraction router now attempts the shared portable contracti
 lowerer, using a semantic SegMap projected directly from verified facts. The map branch emits
 scalar operations and one store without a synthetic reduction, and obtains each input extent from
 its own proven AxisMap (not the output count). Initial admission is deliberately limited to
-positive static free-axis extents, no options/result transforms or destination reads, and one
+positive static free-axis extents whose product fits the int launch ABI, no options/result transforms or destination reads, and one
 index expression per input array. Unsupported maps retain an explicit compatibility decline.
 Focused CPU OpenCL execution uses exact input lengths and a partial final workgroup; the same
 routed body is included in CUDA/HIP compile fixtures. This is a contraction-router migration, not

@@ -41,6 +41,16 @@
       (is (string? (:source (emit/generate-contraction-kernel-body
                             kernel :target-dialect dialect)))))))
 
+(deftest outer-product-rejects-unrepresentable-launch-count
+  (let [failure (try
+                  (route/route-contraction
+                   '(raster.par/contract C [[i 65536] [j 65536]] []
+                                         (* (aget a i) (aget b j))) :dtype :float)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+    (is (= :contraction-map-count-overflow (:reason failure)))
+    (is (= Integer/MAX_VALUE (:limit failure)))))
+
 (deftest outer-product-retains-explicit-migration-declines
   (doseq [[form reason]
           [['(raster.par/contract C [[i m] [j n]] [] (* (aget a i) (aget b j))) :map-domain]

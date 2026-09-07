@@ -66,6 +66,13 @@
                       "initial zero-reduction schedule requires positive static axis extents"
                       {:dimensions segment-dims}))
         _ (when (and map-only?
+                     (> (reduce *' 1 (map :bound segment-dims)) Integer/MAX_VALUE))
+            ;; The artifact's trailing count is int. A source fallback has the same ABI and
+            ;; cannot repair this domain, so fail instead of wrapping or declining to it.
+            (throw (ex-info "zero-reduction output count exceeds its int launch ABI"
+                            {:reason :contraction-map-count-overflow
+                             :dimensions segment-dims :limit Integer/MAX_VALUE})))
+        _ (when (and map-only?
                      (or (seq (:opts contract-facts)) (:epilogue contract-facts)
                          (some #(= (:out contract-facts) (:sym %)) (:operands contract-facts))))
             (decline! :map-options
