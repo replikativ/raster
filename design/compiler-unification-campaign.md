@@ -390,6 +390,8 @@ projection dimensions retain Long, while mixed-DPAS layout/matrix stages current
 extents. That candidate now declines explicitly as `:mixed-dpas-index-width-not-lowered`,
 leaving generated portable contraction schedules available. Tiny forward, input-gradient and
 weight-gradient executions match CPU references, and the full AD train-step compiles resident.
+The existing train-step gate also executes a 2×3×2 AD/SGD update on an available GPU, checking
+output extent, numerical agreement with CPU AD and a nontrivial update from the saved input.
 This is not an optimized-training result. Restore that optimization with width-preserving
 matrix/layout schedules or guarded specialization whose range proof covers dimensions, products
 and indexing; do not narrow retained types implicitly or relax ScheduledKernelBody validation.

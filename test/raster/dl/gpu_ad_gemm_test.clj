@@ -358,12 +358,16 @@
         (gp/gpu-skip! "gpu-ad-full-train-step-execution")
         (let [batch 2 in-f 3 out-f 2 lr 0.01
               weights (rnd (* in-f out-f) 31)
+              initial-weights (vec weights)
               input (rnd (* batch in-f) 32)
               target (rnd (* batch out-f) 33)
               expected (@train (aclone weights) input target batch in-f out-f lr)
               {:keys [out]} (run-resident train
                                          [weights input target batch in-f out-f lr])]
+          (is (= (* in-f out-f) (count out) (count expected)))
           (is (< (rel-err out expected) 1e-3)
               "the GPU update matches the complete CPU AD and SGD composition")
-          (is (not= (vec weights) (vec expected))
-              "the fixture performs a nontrivial weight update"))))))
+          (is (not= initial-weights (vec expected))
+              "the fixture performs a nontrivial weight update")
+          (is (not= initial-weights (vec out))
+              "the GPU cannot satisfy the check by returning unchanged weights"))))))
