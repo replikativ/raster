@@ -383,6 +383,20 @@
                            (layout-transform/emit-transpose-kernel
                             {:kernel-name "layout_transpose" :input 'in :output 'out
                              :element-dtype :half :target-dialect dialect})))
+           (write-source! directory suffix "layout-cast-long"
+                          (:source
+                           (layout-transform/emit-cast-kernel
+                            {:kernel-name "layout_cast_long" :input 'in :output 'out
+                             :extent-dtype :long
+                             :source-dtype :float :destination-dtype :half
+                             :vector-width 4 :rounding :nearest-even :overflow :ieee
+                             :target-dialect dialect})))
+           (write-source! directory suffix "layout-transpose-mixed-width"
+                          (:source
+                           (layout-transform/emit-transpose-kernel
+                            {:kernel-name "layout_transpose_mixed_width" :input 'in :output 'out
+                             :row-extent-dtype :long :column-extent-dtype :int
+                             :element-dtype :half :target-dialect dialect})))
            (write-source! directory suffix "split-k-combine"
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel

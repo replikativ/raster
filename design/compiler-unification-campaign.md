@@ -396,6 +396,15 @@ This is not an optimized-training result. Restore that optimization with width-p
 matrix/layout schedules or guarded specialization whose range proof covers dimensions, products
 and indexing; do not narrow retained types implicitly or relax ScheduledKernelBody validation.
 
+The first width-preserving prerequisite gives shared layout cast and transpose schedules explicit
+int/long extent parameters, with independent row/column widths and unchanged int defaults.
+Exact widened address arithmetic and checked hardware launch limits remain unchanged. Small
+OpenCL device tests exercise every width combination and poisoned tails; non-allocating checks
+cover a logical extent above int range and overflowing shape products. CUDA/HIP fixtures include
+long cast and mixed-width transpose. The mixed-DPAS Long admission gate remains closed until its
+matrix, split-K and batched stages also retain widths consistently; this prerequisite alone does
+not restore optimized Long-dimension GEMM.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its
