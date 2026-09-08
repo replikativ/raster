@@ -10,6 +10,7 @@
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-body :as kernel-body]))
 
 (defn- target-parameter-names
@@ -71,8 +72,10 @@
   [body target-dialect plan]
   (let [body (kernel-body/validate! body)
         dialect (c-dialect/resolve! target-dialect)
-        pointer-alignment (when (= :cuda (:id dialect)) 32)]
-    {:parameter-alignments
+        pointer-alignment (when (= :cuda (:id dialect)) 32)
+        intel? (= :opencl-intel (:id dialect))
+        requirements (when intel? (block-io/body-requirements body))]
+    (merge {:preconditions [] :parameter-alignments
      (into {}
            (keep (fn [{:keys [id kind]}]
                    (when (and pointer-alignment (not= :scalar kind))
@@ -82,7 +85,8 @@
      {:target-dialect (:id dialect)
       :instruction (:instruction plan)
       :instruction-family (get-in plan [:instruction :family])
-      :pointer-alignment pointer-alignment}}))
+      :pointer-alignment pointer-alignment}}
+           requirements)))
 
 (defn emit-matrix-kernel
   "Emit `body` for one C-family target dialect.

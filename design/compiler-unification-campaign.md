@@ -447,7 +447,17 @@ and artifact binding. The [Intel 2D block-I/O specification](https://registry.kh
 requires at least 64-byte row widths and 64-byte base alignment; the existing tiny FP16 N/K=16
 device cases do not establish legality despite passing this driver. Validate surface maxima,
 pitch and view-slice alignment as well, widen linear output arithmetic, and keep the retained-Long
-DPAS admission gate closed until the complete contract is enforced. These target fixes remain open.
+DPAS admission gate closed until the complete contract is enforced.
+
+The Intel surface-contract slice derives checked bounds and pitch/fragment divisibility once for
+static admission, runtime fallback and artifact binding. A/B bases require 64-byte alignment;
+leading input views additionally require 32-half-element slice strides, while shared operands and
+scalar C stores are not over-aligned. Projection verification rejects stripped requirements.
+Intel block-I/O now admits subgroup 16 only, and C linear stores widen before multiplication.
+Focused Arc direct, split-K, batched/shared-weight and fused-SSA-epilogue execution passes with
+legal surface widths. Non-allocating tests cover maximum surfaces and rejected odd-height/K48
+batched slices. This does not admit retained Long dimensions or prove legacy ScalarRegion source
+epilogue indexing safe at large sizes; production SSA epilogues retain typed storage addressing.
 
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads

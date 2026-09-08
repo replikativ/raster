@@ -192,7 +192,7 @@
         {mi :m ni :n ki :k subgroup :subgroup} instruction]
     (require! (and (= :dpas (:family instruction))
                    (= 8 mi) (= 16 ki)
-                   (contains? #{8 16} subgroup)
+                   (= 16 subgroup)
                    (= ni subgroup))
               "Intel OpenCL lowering has no builtin for this matrix instruction"
               {:instruction instruction})
@@ -328,9 +328,9 @@
                             (let [acc-expr (str "acc" m n ".s" i)]
                               (str "        { int col = n_base" n " + sg_lid;\n          if (col < N) "
                                    (if epilogue
-                                     (str "C[row*N+col] = " store-cast "("
+                                     (str "C[(long)row*(long)N+(long)col] = " store-cast "("
                                           (epilogue acc-expr "row" "col") ");\n")
-                                     (str "C[row*N+col] = " store-cast "(" acc-expr ");\n"))
+                                     (str "C[(long)row*(long)N+(long)col] = " store-cast "(" acc-expr ");\n"))
                                    "        }\n"))))
                    "      }\n    }\n")))
      "}\n")))

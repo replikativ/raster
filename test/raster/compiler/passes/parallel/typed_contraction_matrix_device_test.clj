@@ -172,12 +172,12 @@
     (let [scheduled (typed-dispatch :ze:0)]
       (testing "an aligned dynamic contraction selects and executes the direct matrix graph"
         (let [{:keys [strategy actual expected]}
-              (run-contraction :ze:0 scheduled 16 16 16)]
+              (run-contraction :ze:0 scheduled 16 32 32)]
           (is (= :xmx-direct strategy))
           (is (< (relative-l1 actual expected) 1.0e-3))))
       (testing "a low-output-occupancy contraction executes the graph-private split-K schedule"
         (let [{:keys [strategy actual expected]}
-              (run-contraction :ze:0 scheduled 13 16 8192)]
+              (run-contraction :ze:0 scheduled 13 32 8192)]
           (is (= :xmx-split-k strategy))
           (is (< (relative-l1 actual expected) 1.0e-3)))))))
 
@@ -187,8 +187,8 @@
     (let [device-id :ze:0
           batch 2
           m 8
-          n 16
-          k 16
+          n 32
+          k 32
           a (input-array (* batch m k) 41)
           b (input-array (* k n) 43)
           scheduled (typed-batched-dispatch device-id)
@@ -219,8 +219,8 @@
     (gpu-probe/gpu-skip! "typed matrix result transform")
     (let [device-id :ze:0
           m 8
-          n 16
-          k 16
+          n 32
+          k 32
           scale 0.5
           a (input-array (* m k) 47)
           b (input-array (* k n) 53)

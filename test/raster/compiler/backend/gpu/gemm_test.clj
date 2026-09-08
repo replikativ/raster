@@ -12,6 +12,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
@@ -173,8 +174,9 @@
     (is (= :float (:dtype result)))
     (is (= (:source contract) (-> oracle
                                   (str/replace "int k =" "long k =")
-                                  (str/replace "int pk =" "long pk =")))
-        "direct lowering preserves the oracle except for explicitly widened K arithmetic")))
+                                  (str/replace "int pk =" "long pk =")
+                                  (str/replace "C[row*N+col]" "C[(long)row*(long)N+(long)col]")))
+        "direct lowering preserves the oracle except for widened K and output arithmetic")))
 
 (deftest production-xmx-epilogue-is-part-of-the-certified-stage
   (let [tile (hardware/derive-gemm-tile {})
@@ -193,12 +195,12 @@
         scheduled (artifact/attribute contract :scheduled-kernel-body)
         stage (:source scheduled)
         runtime-arguments [:a-buffer :b-buffer :c-buffer
-                           {:type :int :value 16} {:type :int :value 16}
-                           {:type :int :value 16} :bias-buffer
+                           {:type :int :value 16} {:type :int :value 32}
+                           {:type :int :value 32} :bias-buffer
                            {:type :float :value 0.5}]
         {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)
         temporary-specs (graph-call/temporary-specs graph scalar-values)
-        temporaries (into {} (map (fn [id] [id [:temporary-buffer id]]))
+        temporaries (into {} (map (fn [id] [id {:id [:temporary-buffer id] :alignment 64}]))
                           (keys temporary-specs))
         call (graph-call/make graph (merge buffers temporaries) scalar-values)]
     (is (= 1 (count alternatives)) "a result transform intentionally disables split-K")
@@ -363,8 +365,29 @@
       (let [graph (dispatch/alternative (emitted variant) strategy)
             {:keys [buffers scalar-values]} (executable/graph-bindings graph runtime-arguments)
             temporary-specs (graph-call/temporary-specs graph scalar-values)
-            temporary-buffers (into {} (map (fn [id] [id [:temporary-buffer id]]))
+            temporary-buffers (into {} (map (fn [id] [id {:id [:temporary-buffer id] :alignment 64}]))
                                     (keys temporary-specs))
             call (graph-call/make graph (merge buffers temporary-buffers) scalar-values)]
         (is (graph-call/kernel-graph-call? call) (str (name variant) "/" (name strategy)))
         (is (= (count (:nodes graph)) (count (:nodes call))))))))
+
+(deftest batched-input-slices-preserve-block-io-alignment-before-allocation
+  (doseq [row-batched? [true false]]
+    (let [{:keys [graph selector]}
+          (gemm/emit-batched-matrix-alternative
+           {:id [:slice-alignment row-batched?]
+            :a 'a :b 'b :c 'c :batch 'batch :m 'm :n 'n :k 'k
+            :variant :nn :tile (hardware/derive-gemm-tile {})
+            :batching {:row row-batched? :col false}})
+          values {'batch {:type :int :value 2} 'm {:type :int :value 3}
+                  'n {:type :int :value 40} 'k {:type :int :value 48}}
+          scalar-values (into {} (map (fn [[id value]] [id (:value value)])) values)
+          fallback? (some (fn [{:keys [expression op value]}]
+                            (precondition/compare-value?
+                             op (launch/resolve-expression scalar-values expression) value))
+                          (:cases selector))]
+      (is (= row-batched? (boolean fallback?)))
+      (if row-batched?
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
+                              (graph-call/temporary-specs graph values)))
+        (is (map? (graph-call/temporary-specs graph values)))))))

@@ -13,6 +13,7 @@
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -930,12 +931,12 @@
      :refinement refinement
      :selector
      {:kind :runtime-expression-cases
-      :cases [{:expression n :op :< :value 8 :strategy :f32-scalar}
-              {:expression k :op :< :value 8 :strategy :f32-scalar}
-              {:expression (kbody/expression :mod n 8)
-               :op :> :value 0 :strategy :f32-scalar}
-              {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
-               :op :> :value 0 :strategy :f32-scalar}]
+      :cases (block-io/fallback-cases
+              (block-io/matrix-preconditions
+               m n k (cond-> []
+                       (get batching :row true) (conj (klaunch/product m k))
+                       (get batching :col true) (conj (klaunch/product k n))))
+              :f32-scalar)
       :default :xmx-batched}}))
 
 (defn requested-splits
@@ -970,7 +971,7 @@
         backend (:backend desc)]
     (when (and (contains? #{:ze :opencl} backend)
                (= :dpas family) (= [8 16 16] [m n k])
-               (contains? #{8 16} subgroup)
+               (= 16 subgroup)
                (contains? (hardware/supported-subgroup-sizes desc) (long subgroup)))
       (let [tile (or requested-tile (hardware/gemm-tile-for desc))
             workgroup-size (* (quot (:block-m tile) (:sg-m tile))
@@ -1023,12 +1024,7 @@
                                     :requested-splits factor)))
                 split-factors))
         alignment-cases
-        [{:expression n :op :< :value 8 :strategy :f32-scalar}
-         {:expression k :op :< :value 8 :strategy :f32-scalar}
-         {:expression (kbody/expression :mod n 8)
-          :op :> :value 0 :strategy :f32-scalar}
-         {:expression (kbody/expression :mod k (get-in tile [:matrix :k]))
-          :op :> :value 0 :strategy :f32-scalar}]
+        (block-io/fallback-cases (block-io/matrix-preconditions m n k) :f32-scalar)
         selector {:kind :runtime-expression-cases
                   :cases (cond-> alignment-cases
                            split? (conj {:expression split-expression :op :>= :value 2

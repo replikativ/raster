@@ -7,6 +7,7 @@
    they must not reconstruct any of these facts from operation names or generated source."
   (:require [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-graph :as graph]
@@ -266,6 +267,9 @@
         bindings (into {} (map (juxt :parameter identity)) (:scalar-bindings scheduled))
         target-facts (get-in emitted [:attributes :target-facts])
         pointer-alignment (:pointer-alignment target-facts)
+        intel-requirements (when (and (= :opencl-intel (:target-dialect target-facts))
+                                      (= :dpas (:instruction-family target-facts)))
+                             (block-io/body-requirements (:body scheduled)))
         expected-slots
         (body-abi/project-contracts
          (mapv (fn [index {:keys [id kind dtype role]}]
@@ -273,8 +277,9 @@
                    (abi/slot id kind (or (:dtype binding) dtype)
                              :kernel-dtype (or (:kernel-dtype binding) dtype)
                              :c-name (str "p" index) :role role
-                             :alignment (when (and pointer-alignment (not= :scalar kind))
-                                          pointer-alignment))))
+                             :alignment (or (get-in intel-requirements [:parameter-alignments id])
+                                            (when (and pointer-alignment (not= :scalar kind))
+                                              pointer-alignment)))))
                (range) parameters)
          (:body scheduled))
         fields [:kind :dtype :kernel-dtype :role :aliasing :alignment]
@@ -292,6 +297,7 @@
              [:effects (:effects scheduled) (:effects emitted)]
              [:launch (realized-launch scheduled) (:launch emitted)]
              [:body (:body scheduled) (get-in emitted [:attributes :kernel-body])]
+             [:preconditions (or (:preconditions intel-requirements) []) (:preconditions emitted)]
              [:abi expected-abi actual-abi]]]
       (when-not (= expected actual)
         (fail! :scheduled-kernel-body-artifact-projection

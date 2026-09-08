@@ -26,6 +26,39 @@
     :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
     :tile (mma-tile) :result-dtype :float}))
 
+(deftest intel-matrix-artifact-binds-surface-and-input-alignment-contracts
+  (let [body (schedule/matrix-body
+              {:id :intel-surface-test :row 'a :col 'b :out 'c
+               :dimensions ['m 'n 'k] :dimension-parameters ['m 'n 'k]
+               :tile (hardware/derive-gemm-tile {}) :result-dtype :float})
+        scheduled (scheduled-body/make
+                   {:source :intel-surface-test :body body :arguments ['a 'b 'c 'm 'n 'k]
+                    :effects {:kind :tensor-contraction-stage
+                              :uses [{:value 'a :access :read} {:value 'b :access :read}
+                                     {:value 'c :access :write}]}
+                    :legality {:kind :matrix-instruction-tiling}
+                    :numerics {:mode :reassociated :policy :tiled-contraction
+                               :rounding :nearest-even :accumulator-dtype :float}})
+        artifact (body-target/emit-artifact "intel_surface" scheduled :opencl-intel)
+        args (fn [m n k] [{:id :a :alignment 64} {:id :b :alignment 64} {:id :c}
+                          {:type :int :value m} {:type :int :value n} {:type :int :value k}])]
+    (is (= [64 64 nil] (mapv :alignment (take 3 (:abi artifact)))))
+    (is (seq (:preconditions artifact)))
+    (is (kernel-call/kernel-call? (kernel-call/make artifact (args 17 40 48))))
+    (doseq [dims [[17 16 32] [17 32 16] [16777217 32 32] [17 8388616 32]]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
+                            (kernel-call/make artifact (apply args dims)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"alignment contract"
+                          (kernel-call/make artifact (assoc (args 17 40 48) 0
+                                                           {:id :misaligned :alignment 32}))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"differs from"
+                          (scheduled-body/validate-artifact-projection!
+                           scheduled (assoc artifact :preconditions []))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"differs from"
+                          (scheduled-body/validate-artifact-projection!
+                           scheduled (update-in artifact [:abi 0] dissoc :alignment))))
+    (is (clojure.string/includes? (:source artifact) "C[(long)row*(long)N+(long)col]"))))
+
 (deftest target-lowering-forks-after-one-verified-body
   (let [body (mma-body)
         cuda (matrix-target/emit-matrix-kernel "matrix_target_cuda" body :cuda)]

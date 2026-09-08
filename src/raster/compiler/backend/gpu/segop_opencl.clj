@@ -18,6 +18,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as cstage]
             [raster.compiler.ir.contraction-facts :as cf]
@@ -1374,7 +1375,8 @@
    K=124) SILENTLY MISCOMPILES ~80% of outputs (device-verified) — production GEMM shapes
    (N∈{640,1024,2048}) are all N%8==0 so never hit it, but a general contraction can, and
    the gate must reject it so the caller falls back to the register-tiled kernel (which
-   handles arbitrary dims). M (the block-read HEIGHT) is unconstrained. Transposed operands
+   handles arbitrary dims). The shared surface contract also bounds M, N and K and requires
+   complete K16 fragments. Pointer alignment is enforced by the target artifact. Transposed operands
    (:tn/:nt) and a batch axis are legal extensions the golden body already has flags for —
    rejected here as :non-canonical-orientation / :not-a-contraction until wired."
   [segred dtype]
@@ -1394,6 +1396,9 @@
             {:ok false :reason :n-pitch-unaligned :N N}
             (not (pitch-ok? L))   ; A pitch = K·2 bytes must be 16-byte aligned
             {:ok false :reason :k-pitch-unaligned :L L}
+            (block-io/static-failure M N L)
+            {:ok false :reason :matrix-surface-contract
+             :condition (block-io/static-failure M N L)}
             :else
             ;; i-sym/j-sym are the FREE axes; an epilogue binds them to the store slot's row/col
             {:ok true :M M :N N :L L :i-sym i-sym :j-sym j-sym
