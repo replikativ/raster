@@ -11,6 +11,14 @@
 
 (def ^:private workgroup-size 256)
 
+(defn- extent-dtype!
+  [value]
+  (let [canonical (dtype/canon value)]
+    (when-not (contains? #{:int :long} canonical)
+      (throw (ex-info "layout extent requires a retained int or long representation"
+                      {:reason :layout-transform-index-dtype :dtype value})))
+    canonical))
+
 (defn- global-index
   [id]
   [(body/->IndexBinding :layout-group :group 0)
@@ -29,11 +37,14 @@
    `vector-width` is expressed as statically unrolled lane-owned elements, not a target vector
    builtin. This preserves the same coalesced access geometry on OpenCL, CUDA and HIP while
    leaving physical vector formation to target lowering. Narrowing behavior is an explicit part
-   of the body and can therefore participate in dispatch equivalence and certification."
-  [{:keys [id input output extent-id source-dtype destination-dtype vector-width rounding overflow]
-    :or {extent-id :layout-elements vector-width 1}}]
+   of the body and can therefore participate in dispatch equivalence and certification.
+   `extent-dtype` retains the caller's int/long representation; hardware launch limits remain
+   independently checked and are not widened by this option."
+  [{:keys [id input output extent-id extent-dtype source-dtype destination-dtype vector-width rounding overflow]
+    :or {extent-id :layout-elements extent-dtype :int vector-width 1}}]
   (let [source-dtype (dtype/canon source-dtype)
-        destination-dtype (dtype/canon destination-dtype)]
+        destination-dtype (dtype/canon destination-dtype)
+        extent-dtype (extent-dtype! extent-dtype)]
     (when-not (and rounding overflow)
       (throw (ex-info "layout conversion requires explicit rounding and overflow policies"
                       {:reason :layout-transform-numerical-policy
@@ -78,7 +89,7 @@
                      (body/->KernelParameter
                       output :output destination-dtype [extent] :global
                       (layout/row-major [extent] destination-dtype) :destination)
-                     (body/->KernelParameter extent :scalar :int [] nil nil :extent)]
+                     (body/->KernelParameter extent :scalar extent-dtype [] nil nil :extent)]
         :stable-reads [(body/stable-read input)]
         :indices (conj (global-index work-item)
                        (body/->IndexCompute
@@ -100,10 +111,15 @@
                      :source-dtype source-dtype :destination-dtype destination-dtype}}))))
 
 (defn transpose-body
-  "Schedule a dense row-major [rows, cols] -> [cols, rows] transpose."
-  [{:keys [id input output row-extent-id column-extent-id element-dtype]
-    :or {row-extent-id :layout-rows column-extent-id :layout-cols}}]
+  "Schedule a dense row-major [rows, cols] -> [cols, rows] transpose.
+   Row and column extent dtypes are independently retained int/long representations."
+  [{:keys [id input output row-extent-id column-extent-id element-dtype
+           row-extent-dtype column-extent-dtype]
+    :or {row-extent-id :layout-rows column-extent-id :layout-cols
+         row-extent-dtype :int column-extent-dtype :int}}]
   (let [element-dtype (dtype/canon element-dtype)
+        row-extent-dtype (extent-dtype! row-extent-dtype)
+        column-extent-dtype (extent-dtype! column-extent-dtype)
         linear :layout-linear
         row :layout-row
         column :layout-column
@@ -120,8 +136,8 @@
                    (body/->KernelParameter
                     output :output element-dtype [cols-id rows-id] :global
                     (layout/row-major [cols-id rows-id] element-dtype) :destination)
-                   (body/->KernelParameter rows-id :scalar :int [] nil nil :extent)
-                   (body/->KernelParameter cols-id :scalar :int [] nil nil :extent)]
+                   (body/->KernelParameter rows-id :scalar row-extent-dtype [] nil nil :extent)
+                   (body/->KernelParameter cols-id :scalar column-extent-dtype [] nil nil :extent)]
       :stable-reads [(body/stable-read input)]
       :indices (into (global-index linear)
                      [(body/->IndexCompute

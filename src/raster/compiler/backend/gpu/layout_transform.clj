@@ -5,31 +5,35 @@
 
 (defn cast-body
   "Build the target-neutral body for one dense representation conversion."
-  [{:keys [id kernel-name input output source-dtype destination-dtype vector-width rounding overflow]
-    :or {vector-width 1}}]
+  [{:keys [id kernel-name input output source-dtype destination-dtype vector-width rounding overflow
+           extent-dtype]
+    :or {vector-width 1 extent-dtype :int}}]
   (schedule/cast-body
    {:id (or id [:layout-transform kernel-name])
     :input input :output output
     :source-dtype source-dtype :destination-dtype destination-dtype
-    :vector-width vector-width
+    :vector-width vector-width :extent-dtype extent-dtype
     :rounding rounding :overflow overflow}))
 
 (defn transpose-body
   "Build the target-neutral body for one dense row-major matrix transpose."
-  [{:keys [id kernel-name input output element-dtype]}]
+  [{:keys [id kernel-name input output element-dtype row-extent-dtype column-extent-dtype]
+    :or {row-extent-dtype :int column-extent-dtype :int}}]
   (schedule/transpose-body
    {:id (or id [:layout-transform kernel-name])
     :input input :output output
-    :element-dtype element-dtype}))
+    :element-dtype element-dtype
+    :row-extent-dtype row-extent-dtype :column-extent-dtype column-extent-dtype}))
 
 (defn emit-cast-kernel
   [{:keys [kernel-name input output source-dtype destination-dtype vector-width rounding overflow
-           target-dialect]
-    :or {vector-width 1 target-dialect :opencl-intel}}]
+           target-dialect extent-dtype]
+    :or {vector-width 1 target-dialect :opencl-intel extent-dtype :int}}]
   (let [kernel-body (cast-body
                      {:kernel-name kernel-name :input input :output output
                       :source-dtype source-dtype :destination-dtype destination-dtype
-                      :vector-width vector-width :rounding rounding :overflow overflow})]
+                      :vector-width vector-width :rounding rounding :overflow overflow
+                      :extent-dtype extent-dtype})]
     {:source (emitter/emit-scalar-kernel
               kernel-name kernel-body
               {:target-dialect target-dialect
@@ -37,11 +41,12 @@
      :kernel-body kernel-body}))
 
 (defn emit-transpose-kernel
-  [{:keys [kernel-name input output element-dtype target-dialect]
-    :or {target-dialect :opencl-intel}}]
+  [{:keys [kernel-name input output element-dtype target-dialect row-extent-dtype column-extent-dtype]
+    :or {target-dialect :opencl-intel row-extent-dtype :int column-extent-dtype :int}}]
   (let [kernel-body (transpose-body
                      {:kernel-name kernel-name :input input :output output
-                      :element-dtype element-dtype})]
+                      :element-dtype element-dtype
+                      :row-extent-dtype row-extent-dtype :column-extent-dtype column-extent-dtype})]
     {:source (emitter/emit-scalar-kernel
               kernel-name kernel-body
               {:target-dialect target-dialect
