@@ -35,6 +35,29 @@
                                     [parameter (:dtype (get values (get bound parameter)))]))
                            (:capture-parameters attributes))})))
 
+(defn contraction-host-form
+  "Materialize retained contraction semantics for the host boundary only.
+   The numerical GPU route consumes contraction-binding, never this source spelling."
+  [program equation]
+  (let [{:keys [facts bindings]} (contraction-binding program equation)
+        form (contraction-facts/surface-form facts)
+        renamings (vec (remove (fn [[parameter value]] (= parameter value))
+                              (sort-by (comp pr-str key) bindings)))
+        occupied (into #{} (filter symbol?) (tree-seq coll? seq [form bindings]))]
+    (if (seq renamings)
+      ;; External SSA names are simultaneous bindings. Read all of them before
+      ;; introducing lexical parameters: a->b, b->a must not capture either read.
+      (let [temporaries (mapv (fn [_]
+                               (first (remove occupied
+                                              (repeatedly #(gensym "contract_arg__")))))
+                             renamings)
+            reads (mapcat (fn [temporary [_ value]] [temporary value])
+                          temporaries renamings)
+            parameters (mapcat (fn [[parameter _] temporary] [parameter temporary])
+                               renamings temporaries)]
+        (list 'let* (vec (concat reads parameters)) form))
+      form)))
+
 (defn scalar-folds->source
   "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
   [expression]

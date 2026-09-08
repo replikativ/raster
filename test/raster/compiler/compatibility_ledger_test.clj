@@ -19,7 +19,7 @@
 (def ^:private target :ze:compatibility-ledger)
 
 ;; This is staged contraction syntax, not the explicit-map Q4 projection below.
-;; Track the frontend gap separately from candidate KernelBody/device coverage.
+;; Track public frontend admission separately from candidate KernelBody/device coverage.
 (deftm staged-byte-float-contract!
   [a :- (Array byte) b :- (Array byte) da :- (Array float)
    db :- (Array float) out :- (Array float)] :- Void
@@ -90,7 +90,7 @@
 
     :staged-byte-float-contraction-gpu
     (pipeline/compile-report #'staged-byte-float-contract!
-                             :target-device target :dtype :byte)
+                             :target-device target :dtype :float)
 
     :symbolic-dense-contraction-gpu
     (let [compilation (equation-first/compile

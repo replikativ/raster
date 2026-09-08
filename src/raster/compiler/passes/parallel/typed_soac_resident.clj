@@ -26,9 +26,11 @@
 (defn- emit-equation
   [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
   (list '= id (vec results)
+        (if (= :contract kind)
+          (list 'contract attributes (vec arrays) (vec captures))
         (list (symbol (name kind)) attributes (vec arrays) (vec captures)
               (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
-                                   (vec body-results)))))
+                                   (vec body-results))))))
 
 (defn- parameter-parts
   [info]
@@ -43,10 +45,11 @@
   [equations]
   (reduce
    (fn [uses equation]
-     (let [{:keys [id arrays captures attributes]} (operation-info equation)]
+     (let [{:keys [id kind arrays captures attributes]} (operation-info equation)]
        (-> uses
            (into (map (fn [value] [value {:equation id :role :array}]) arrays))
-           (into (map (fn [value] [value {:equation id :role :capture}]) captures))
+           (into (map (fn [value] [value {:equation id :role (if (= :contract kind)
+                                                             :contract-capture :capture)}]) captures))
            ;; The transform has its own typed scalar boundary. Rewriting the primary
            ;; lambda cannot turn a transform scalar into a resident buffer load.
            (into (map (fn [value] [value {:equation id :role :result-transform}])
@@ -103,7 +106,7 @@
               :else value))]
     (expand id #{})))
 
-(defn- rewrite-consumer
+(defn- rewrite-lambda-consumer
   [info values scalar-defs dependent roots]
   (let [{:keys [accumulators elements capture-parameters]} (parameter-parts info)
         capture-substitutions
@@ -144,6 +147,13 @@
            :body-results (mapv #(util/subst-syms body-substitutions %) global-bodies)
            :attributes (assoc-in (:attributes info) [:attributes :stable-array-captures]
                                  (vec (filter stable-after referenced-values))))))
+
+(defn- rewrite-consumer
+  [info values scalar-defs dependent roots]
+  ;; A contraction's scalar closure is not a resident-buffer lambda. Its capture uses
+  ;; are explicit escape sites above, so unrelated resident reductions can still proceed.
+  (if (= :contract (:kind info)) info
+      (rewrite-lambda-consumer info values scalar-defs dependent roots)))
 
 (defn realize
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.

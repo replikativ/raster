@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.arrays]
+            [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.core :refer [deftm]]
@@ -146,6 +147,31 @@
         (is (= 1 (count (:outputs linked))))
         (is (= (:emitted compilation)
                (emitted-program/validate! (:emitted compilation))))))))
+
+(deftest public-staged-contraction-preserves-independent-types-on-cuda-and-hip
+  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'ledger/staged-byte-float-contract! {:target target :dtype :float})
+          linked (equation-first/lower compilation
+                                       [(byte-array 8) (byte-array 16)
+                                        (float-array 2) (float-array 4) (float-array 2)])
+          kernels (:kernels compilation)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count kernels)))
+      (is (= module-target (:target (first kernels))))
+      (is (every? #(get-in % [:attributes :kernel-body]) kernels))
+      (is (str/includes? (:source (first kernels)) "rstr_dp4a"))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
+      (is (empty? (:outputs linked)) "the public Void destination remains a state buffer")
+      (doseq [[slot short-buffer] [[0 (byte-array 7)] [2 (float-array 1)]
+                                  [4 (float-array 1)]]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (equation-first/lower
+                      compilation
+                      (assoc [(byte-array 8) (byte-array 16) (float-array 2)
+                              (float-array 4) (float-array 2)] slot short-buffer)))
+            "core, scale and destination capacities are checked before allocation"))
+      (is (= (:emitted compilation) (emitted-program/validate! (:emitted compilation)))))))
 
 (deftest public-elementwise-map-uses-portable-kernel-body
   (doseq [[target module-target]

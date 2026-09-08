@@ -388,6 +388,12 @@
                               (reduction/scalar? (:reduction %)))))
                (:operations equation))))
 
+(defn- graph-contraction-equation? [equation]
+  (let [algorithm (:algorithm equation)]
+    (and (soac-dialect/program-form? algorithm)
+         (= 1 (count (soac-dialect/equations algorithm)))
+         (= 'contract (soac-dialect/operation-kind (first (soac-dialect/equations algorithm)))))))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -1061,6 +1067,7 @@
                                                           (graph-reduction-equation? equation)]
                                                       (if (and typed-equation?
                                                                (or scalar-reduction?
+                                                                   (graph-contraction-equation? equation)
                                                                    (get-in equation
                                                                            [:attributes
                                                                             :kernel-graph])))
@@ -1115,14 +1122,15 @@
                                                   (= :body (first (:site equation)))))
                                          scalar-reduction?
                                          (graph-reduction-equation? equation)]
-                                     (if (and typed-equation? scalar-reduction?)
+                                     (if (and typed-equation?
+                                              (or scalar-reduction? (graph-contraction-equation? equation)))
                                        (do
                                          (swap! stats update :segop-reused (fnil inc 0))
                                          (emit-scheduled-graph!
                                           (:graph
                                            (equation-graph/make-for-equation
                                             parallel-program equation))
-                                          :ze-reduces
+                                          (if (graph-contraction-equation? equation) :ze-contracts :ze-reduces)
                                           (boolean (host-scalar-result?
                                                     parallel-program equation))
                                           equation))

@@ -83,12 +83,12 @@
   (zipmap (concat (:array-parameters attributes) (:capture-parameters attributes))
           (concat arrays captures)))
 
-(defn validate-values!
-  "Check independent storage types/capacities and scalar capture declarations.
-   Logical result shape is the free-axis space, not a shared flattened operand extent."
-  [attributes arrays captures values result]
-  (let [bound (bindings attributes arrays captures)
-        source (:contraction attributes)
+(defn storage-requirements
+  "Derive lexical storage requirements once from validated contraction maps.
+   Frontend value construction and closure validation share this projection."
+  [attributes]
+  (validate! attributes)
+  (let [source (:contraction attributes)
         domain (into {} (concat (:free-axes source) (:contract-axes source)))
         core (map #(assoc % :dtype (:dtype source)
                            :map (facts/operand-axis-map source %)) (:operands source))
@@ -97,22 +97,34 @@
                                    (let [visible (into {} (concat (:free-axes source)
                                                                  (take (inc index) (:contract-axes source))))]
                                      (map #(vector % visible) (:operands stage))))
-                                 (range) (:stages source)))
+                                 (range) (:stages source)))]
+    (mapv (fn [[{:keys [sym dtype] amap :map :as operand} visible-domain]]
+            (let [pairs (vec (mapcat identity (:groups amap)))
+                  ids (mapv first pairs)]
+              (when-not (and (seq pairs) (= (count ids) (count (set ids)))
+                             (every? #(= (second %) (get visible-domain (first %))) pairs))
+                (fail! :operand-map {:operand operand :domain visible-domain}))
+              (when-not (dtype/known? dtype)
+                (fail! :operand-storage-dtype {:operand operand}))
+              {:parameter sym :dtype (dtype/canon dtype)
+               :elements (reduce *' 1 (map second pairs))}))
+          operands)))
+
+(defn validate-values!
+  "Check independent storage types/capacities and scalar capture declarations.
+   Logical result shape is the free-axis space, not a shared flattened operand extent."
+  [attributes arrays captures values result]
+  (let [bound (bindings attributes arrays captures)
+        source (:contraction attributes)
         output-type (dtype/canon (or (:out-dtype source) (:dtype (first (:stages source)))))]
-    (doseq [[{:keys [sym dtype] amap :map :as operand} visible-domain] operands]
-      (let [pairs (vec (mapcat identity (:groups amap)))
-            ids (mapv first pairs)
-            value (get values (get bound sym))
-            shape (:shape value)]
-        (when-not (and (seq pairs) (= (count ids) (count (set ids)))
-                       (every? #(= (second %) (get visible-domain (first %))) pairs))
-          (fail! :operand-map {:operand operand :domain visible-domain}))
-        (let [required (reduce *' 1 (map second pairs))]
-          (when-not (and (dtype/known? dtype) (= :tensor (:kind value)) (plain-storage? value)
-                       (= (dtype/canon dtype) (:dtype value))
-                       (seq shape) (every? #(and (integer? %) (pos? %)) shape)
-                       (>= (reduce *' 1 shape) required))
-            (fail! :operand-storage {:operand operand :value value :required required})))))
+    (doseq [{:keys [parameter dtype elements] :as requirement} (storage-requirements attributes)
+            :let [value (get values (get bound parameter))
+                  shape (:shape value)]]
+      (when-not (and (= :tensor (:kind value)) (plain-storage? value)
+                     (= dtype (:dtype value))
+                     (seq shape) (every? #(and (integer? %) (pos? %)) shape)
+                     (>= (reduce *' 1 shape) elements))
+        (fail! :operand-storage {:operand requirement :value value :required elements})))
     (doseq [id captures :let [value (get values id)]]
       (when-not (and (= :tensor (:kind value)) (= [] (:shape value)) (plain-storage? value)
                      (dtype/known? (:dtype value)))

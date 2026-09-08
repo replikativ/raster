@@ -1,9 +1,34 @@
 (ns raster.compiler.ir.contraction-closure-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.segop-opencl :as emitter]
+            [raster.compiler.compatibility-ledger-test :as ledger]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.contraction-closure-test :as fixture]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.device-probe :as probe]))
+
+(deftest public-staged-contraction-compiles-links-and-runs
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "public typed staged contraction")
+    (let [output (float-array (repeat 2 -555.0))
+          compilation (equation-first/compile
+                       #'ledger/staged-byte-float-contract! {:target :ocl:0 :dtype :float})
+          plan (equation-first/lower
+                compilation [(byte-array (repeat 8 1))
+                             (byte-array (concat (repeat 8 2) (repeat 8 3)))
+                             (float-array (repeat 2 0.5))
+                             (float-array (repeat 4 0.25)) output])
+          output-id (some (fn [[id node]] (when (identical? output (:source node)) id))
+                          (:nodes plan))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations])))
+      (is (some? output-id) "resolve the state buffer by source identity, not kernel ABI spelling")
+      (let [executable (link/instantiate! plan)]
+        (try
+          (link/run! executable)
+          (is (= [2.0 3.0] (vec (link/download executable output-id))))
+          (finally (link/close! executable)))))))
 
 (deftest retained-contraction-runs-through-the-resident-graph-binder
   (if-not @probe/opencl-available?
