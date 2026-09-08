@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
 
@@ -16,6 +17,19 @@
     (emit/generate-scan-kernel-graph
      (lower/scan-kernel-graph
       node operations {:array-types {'values :float 'out :float}}))))
+
+(deftest direct-scalar-ranges-are-projected-without-evaluating-derived-expressions
+  (let [graph (emitted-graph)
+        conditions (graph-call/direct-scalar-range-preconditions graph)]
+    (is (seq conditions))
+    (is (every? #(= 'n (:expression %)) conditions))
+    (is (precondition/check! conditions {'n 1025}))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (graph-call/direct-scalar-range-preconditions
+                  (get-in graph [:nodes 0 :operation]))))
+    (doseq [n [-1 2147483648]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
+                            (precondition/check! conditions {'n n}))))))
 
 (deftest scalar-preconditions-precede-temporary-sizing
   (let [graph (assoc-in (emitted-graph) [:nodes 0 :operation :preconditions]

@@ -20,6 +20,7 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.layout-stage :as layout-stage]
@@ -946,10 +947,11 @@
      :selector
      {:kind :runtime-expression-cases
       :cases (block-io/fallback-cases
-              (block-io/matrix-preconditions
-               m n k (cond-> []
-                       (get batching :row true) (conj (klaunch/product m k))
-                       (get batching :col true) (conj (klaunch/product k n))))
+              (into (graph-call/direct-scalar-range-preconditions graph)
+                    (block-io/matrix-preconditions
+                     m n k (cond-> []
+                             (get batching :row true) (conj (klaunch/product m k))
+                             (get batching :col true) (conj (klaunch/product k n)))))
               :f32-scalar)
       :default :xmx-batched}}))
 
