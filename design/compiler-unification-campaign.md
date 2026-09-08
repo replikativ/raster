@@ -170,6 +170,14 @@ emitter's general integer overflow semantics or the typed staged lowering itself
 equivalence still needs a per-stage conversion/rounding contract; exact-arithmetic distribution
 is not a proof of bitwise equivalence.
 
+DP4A staged admission now belongs to `passes.parallel.staged-contraction-schedule`, not the
+OpenCL emitter. Both routing and the retained source generator consume the same checked packed
+maps; the old emitter-owned admission entry is removed. The next production slice is typed
+packed-stage loops and lifts, using existing ScalarLoad/ScalarCompute/ForLoop operations and
+shared scalar lowering. DP4A instruction acceptance itself proves no accumulation bounds: retain
+the schedule's prefix gate. General scalar integer stages additionally need a checked recurrence
+proof (including zero trips and cross-carry dependencies), not weakened KernelBody validation.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through

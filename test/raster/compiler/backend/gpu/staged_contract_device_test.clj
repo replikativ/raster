@@ -18,6 +18,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.contract-stages :as cs]
             [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.backend.gpu.segop-opencl :as sco]))
 
 (def ^:private gpu?
@@ -293,17 +294,17 @@
               :inputs '[a b] :dtype :byte :out-dtype :float
               :operands [{:sym 'a :map good-a} {:sym 'b :map good-b}]}]
     (testing "the honest case is legal"
-      (is (:ok (sco/staged-inner-dp4a-legal? spec))))
+      (is (:ok (staged-schedule/inner-dp4a-plan spec))))
     (testing "a MISDECLARED operand map is caught, not trusted — assuming a layout while having
               checked only the axis symbols is how a transpose rewrite silently miscompiled before"
       (is (= :declared-map-does-not-match-the-body-index
-             (:reason (sco/staged-inner-dp4a-legal?
+             (:reason (staged-schedule/inner-dp4a-plan
                        (assoc-in spec [:operands 0 :map]
                                  (am/of-groups [[['i M]] [['t B] ['blk NB]]])))))))
     (testing "an operand that is NOT contiguous in the inner stage axis cannot be packed"
       (let [nn-b (am/of-groups [[['blk NB] ['t B]] [['j N]]])]   ; b[(blk t), j] — j innermost
         (is (= :inner-stage-axis-is-not-contiguous
-               (:reason (sco/staged-inner-dp4a-legal?
+               (:reason (staged-schedule/inner-dp4a-plan
                          (-> spec
                              (assoc-in [:operands 1 :map] nn-b)
                              (assoc :body (list 'raster.numeric/*
@@ -311,7 +312,7 @@
                                                 (list 'aget 'b (am/index-expr nn-b)))))))))))
     (testing "a float inner accumulator is not a dp4a shape"
       (is (= :inner-stage-accumulator-not-integral
-             (:reason (sco/staged-inner-dp4a-legal?
+             (:reason (staged-schedule/inner-dp4a-plan
                        (assoc-in spec [:stages 1 :dtype] :float))))))
     (testing "requesting tensorize when illegal THROWS — it never silently degrades to scalar,
               because a silent degradation is an invisible perf cliff"

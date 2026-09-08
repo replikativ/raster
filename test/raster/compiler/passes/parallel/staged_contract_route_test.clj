@@ -157,7 +157,7 @@
             [:operands [{:sym 'a :map (get ms 'a)} {:sym 'b :map (get ms 'b)}]])))
 
 (deftest packed-inner-stage-proves-all-int32-prefixes
-  (let [gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+  (let [gate (requiring-resolve 'raster.compiler.passes.parallel.staged-contraction-schedule/inner-dp4a-plan)
         spec (fn [extent accumulator]
                (let [maps (mapv (fn [axis] {:groups [[[axis 1]] [['t extent]]]}) '[i j])
                      index (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)]
@@ -219,7 +219,7 @@
     (let [ma {:groups [['[i 4]] ['[blk 4] '[t 32]]]}
           mb {:groups [['[j 4]] ['[blk 4] '[t 32]]]}
           idx (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)
-          gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+          gate (requiring-resolve 'raster.compiler.passes.parallel.staged-contraction-schedule/inner-dp4a-plan)
           base {:stages [{:axis 'blk :extent 4 :dtype :float :init 0.0 :lift 'inner}
                          {:axis 't :extent 32 :dtype :int :init 0}]
                 :operands [{:sym 'a :map ma} {:sym 'b :map mb}]
