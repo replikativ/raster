@@ -54,6 +54,29 @@
     (is (= '(clojure.core/aget C j) (last consumer)))
     (is (= 'r (last normalized)))))
 
+(deftest physical-reads-consume-the-preceding-logical-writer
+  (let [options {:dtype :float :array-types {'A :float 'B :float 'C :float 'D :float}}
+        outputs (fn [source]
+                  (-> source (frontend/normalize-source options)
+                      (frontend/form->program options) dialect/outputs set))]
+    (is (= '#{consumed last-write}
+           (outputs '(let* [first-write (raster.par/map! C i 4 nil (aget A i))
+                            consumed (raster.par/map! D j 4 nil (aget first-write j))
+                            last-write (raster.par/map! C k 4 nil (aget B k))]
+                       last-write)))
+        "a read before overwrite consumes the first writer, not the final writer")
+    (is (= '#{last-write}
+           (outputs '(let* [first-write (raster.par/map! C i 4 nil (aget A i))
+                            last-write (raster.par/map! C j 4 nil (aget first-write j))]
+                       last-write)))
+        "inout reads are processed before registering their own write")
+    (is (= '#{first-write last-write}
+           (outputs '(let* [first-write (raster.par/map! C i 4 nil (aget A i))
+                            observed (observe first-write)
+                            last-write (raster.par/map! C j 4 nil (aget first-write j))]
+                       last-write)))
+        "an opaque host read keeps its preceding producer externally visible")))
+
 (deftest direct-front-end-builds-the-typed-map-reduction-program
   (let [direct (frontend/form->program source {:dtype :float :array-types {'x :float}})
         equations (dialect/equations direct)]

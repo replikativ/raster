@@ -2452,6 +2452,23 @@
                  parameters
                  [(util/subst-syms (zipmap captures parameters) expr)])))))
 
+(defn- physical-read-uses
+  "Resolve storage reads to their latest preceding logical writer. Reads precede writes
+   within one description, so an inout map consumes its predecessor, not its own result."
+  [descriptions physical-outputs]
+  (reduce
+   (fn [{:keys [writers] :as state} description]
+     (let [scalar? (= :scalar (:kind description))
+           reads (if scalar? (util/free-syms (:expr description))
+                     (concat (:inputs description) (:scalars description)))
+           host? (and scalar? (not (supported-description? physical-outputs description)))
+           writes (into {} (map (fn [result storage] [(:destination storage) result])
+                                (:results description) (:result-storage description)))]
+       (-> state
+           (update (if host? :host-uses :operation-uses) into (keep writers reads))
+           (update :writers merge writes))))
+   {:writers {} :host-uses #{} :operation-uses #{}} descriptions))
+
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
@@ -2489,9 +2506,12 @@
                       (:sym %))
                    descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
-        operation-uses (set (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
-                                    (mapcat #(util/free-syms (:expr %)) typed-scalars)))
-        host-uses (set (mapcat #(util/free-syms (:expr %)) host-scalars))
+        physical-uses (physical-read-uses descriptions physical-outputs)
+        operation-uses (into (:operation-uses physical-uses)
+                             (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
+                                     (mapcat #(util/free-syms (:expr %)) typed-scalars)))
+        host-uses (into (:host-uses physical-uses)
+                        (mapcat #(util/free-syms (:expr %)) host-scalars))
         body-uses (set (mapcat util/free-syms body))
         ;; Destination-writing source forms return the destination buffer, while TypedSOAC names
         ;; the fresh logical result produced by that write. Preserve the public return by
