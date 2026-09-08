@@ -12,6 +12,7 @@
         which is the one failure mode that produces plausible wrong numbers instead of an error."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.contract-route :as cr]
+            [raster.compiler.ir.contraction-facts :as facts]
             [raster.par :as par]
             [raster.numeric]))
 
@@ -172,6 +173,27 @@
              (:reason (gate (spec 131072 accumulator))))))
     (is (= :unproved-dp4a-accumulator-range
            (:reason (gate (assoc-in (spec 32 :long) [:stages 0 :init] 'unknown)))))))
+
+(deftest staged-route-does-not-reconstruct-or-reparse-source
+  (let [[_ output free-axes contract-axes body & options] (staged-form-with-maps)
+        verified (facts/from-components
+                  {:out output :free-axes free-axes :contract-axes contract-axes
+                   :body body :opts (assoc (apply hash-map options) :out-dtype :double)
+                   :dtype :byte})]
+    (is (nil? (:form verified)))
+    (doseq [peak? [false true]]
+      (let [legacy (cr/route-contraction (concat (staged-form-with-maps) [:out-dtype :double])
+                                        :dtype :byte :prefer-peak? peak?)
+            typed (with-redefs-fn
+                    {#'facts/contraction-facts (fn [& _] (throw (ex-info "source reparsed" {})))
+                     #'cr/compatibility-form! (fn [& _] (throw (ex-info "source reconstructed" {})))}
+                    #(cr/route-contraction nil :facts verified :dtype :byte :prefer-peak? peak?))]
+        (is (= :staged-segred (:strategy typed)))
+        (is (= :double (:out-dtype typed)))
+        (is (= (select-keys legacy [:abi :arguments :scalar-args :array-params :lift-operands
+                                   :dtype :out-dtype :out-elems :stages :tensorized :packed :wg :grid])
+               (select-keys typed [:abi :arguments :scalar-args :array-params :lift-operands
+                                  :dtype :out-dtype :out-elems :stages :tensorized :packed :wg :grid])))))))
 
 (deftest prefer-peak-tensorizes-the-inner-stage
   (let [form (staged-form-with-maps)
