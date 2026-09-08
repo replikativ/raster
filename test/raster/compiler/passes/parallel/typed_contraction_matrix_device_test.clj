@@ -57,7 +57,7 @@
      :precision :mixed-f16-f32)))
 
 (defn- typed-epilogue-dispatch
-  [device-id]
+  [device-id scalar-dtype]
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/*
                            (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
@@ -77,7 +77,7 @@
          {:target-device device-id
           :dtype :float
           :array-types {'A :float 'B :float 'C :float 'bias :float}
-          :scalar-types {'m :int 'n :int 'k :int 'scale :float}})
+          :scalar-types {'m scalar-dtype 'n scalar-dtype 'k scalar-dtype 'scale :float}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
@@ -262,7 +262,8 @@
 (deftest typed-result-transform-executes-inside-the-matrix-store
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "typed matrix result transform")
-    (let [device-id :ze:0
+    (doseq [scalar-dtype [:int :long]]
+     (let [device-id :ze:0
           m 8
           n 32
           k 32
@@ -277,13 +278,13 @@
                     (float (* scale
                               (+ (double (aget base index))
                                  (double (aget bias (mod index n))))))))
-          scheduled (typed-epilogue-dispatch device-id)
+          scheduled (typed-epilogue-dispatch device-id scalar-dtype)
           runtime-arguments
           [:a :b :c :bias
            {:type :float :value scale}
-           {:type :int :value m}
-           {:type :int :value n}
-           {:type :int :value k}]
+           {:type scalar-dtype :value m}
+           {:type scalar-dtype :value n}
+           {:type scalar-dtype :value k}]
           selected (dispatch/select-alternative scheduled runtime-arguments)]
       (is (= :xmx-direct (executable/strategy selected)))
       (gpu/with-gpu-session [session device-id]
@@ -297,4 +298,4 @@
             (gpu/run-kernel-graph! session handle)
             (is (< (relative-l1 (gpu/download session :c) expected) 1.0e-3))
             (finally
-              (gpu/release-kernel-graph! session handle))))))))
+              (gpu/release-kernel-graph! session handle)))))))))
