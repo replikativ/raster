@@ -1187,7 +1187,10 @@
       (is (= [:portable-segred] (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
       (is (= :mixed-dpas-index-width-not-lowered
              (get-in dispatch [:attributes :matrix-graph-decline :reason])))
-      (is (every? #(= :long (:dtype %)) (filter #(= :scalar (:kind %)) (:abi dispatch)))))))
+      (let [scalar-slots (filter #(= :scalar (:kind %))
+                                 (:abi (first (:alternatives dispatch))))]
+        (is (= (if batched? 4 3) (count scalar-slots)))
+        (is (every? #(= :long (:dtype %)) scalar-slots))))))
 
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source
