@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.ze-runtime :as ze]))
@@ -25,6 +26,56 @@
 
 (def ^:private args
   [:resident-x :resident-out {:type :float :value 2.0} {:type :int :value 513}])
+
+(deftest scalar-preconditions-cannot-be-bypassed-by-direct-calls-or-launch-overrides
+  (let [constrained (assoc artifact :preconditions [{:expression 'n :op :>= :value 64}
+                                                   {:expression 'n :op :<= :value 1024}])
+        bad (assoc args 3 {:type :int :value 32})
+        raw (assoc (kcall/make artifact bad) :artifact constrained)]
+    (is (kcall/kernel-call? (kcall/make constrained args)))
+    (is (true? (kcall/validate-preconditions! constrained (assoc args 0 nil 1 nil)))
+        "scalar preflight does not need allocated pointers")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"differs from the registered artifact"
+                          (kcall/validate-registered! (kcall/make constrained args) artifact)))
+    (doseq [call [#(kcall/make constrained bad)
+                  #(kcall/make constrained bad {:group-count [1]})
+                  #(kcall/realize-launch constrained bad)
+                  #(kcall/validate! raw)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed" (call))))
+    (is (not= (:source-hash (tuning/executable-signature artifact))
+              (:source-hash (tuning/executable-signature constrained)))
+        "constraints participate in tuning identity")))
+
+(deftest preconditions-use-only-integral-scalar-abi-values
+  (doseq [expression ['missing 'x 'scale]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the integral scalar ABI"
+                          (kart/validate! (assoc artifact :preconditions
+                                                 [{:expression expression :op :>= :value 1}])))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"checked integer comparison"
+                        (kart/validate! (assoc artifact :preconditions
+                                               [{:expression 'n :op :eval :value 1}])))))
+
+(deftest preconditions-preserve-checked-arithmetic-and-order
+  (let [overflow (klaunch/product Long/MAX_VALUE 2)
+        guarded (assoc artifact :preconditions [{:expression 'n :op :>= :value 64}
+                                                {:expression overflow :op :>= :value 0}])]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
+                          (kcall/make guarded (assoc args 3 {:type :int :value 32}))))
+    (is (thrown? ArithmeticException (kcall/make guarded args)))))
+
+(deftest preconditions-cannot-hide-invalid-long-values-or-literal-specializations
+  (let [wide (kart/make {:kernel-name "wide_guard" :source "__kernel void wide_guard(__global float* out, long n) {}"
+                         :abi [(kabi/slot 'out :output :float) (kabi/slot 'n :scalar :long)]
+                         :arguments ['out 'n]
+                         :launch (klaunch/spec {:workgroup-size [1] :group-count [1]})
+                         :preconditions [{:expression 'n :op :>= :value 0}]})]
+    (doseq [value [1.5 (inc' Long/MAX_VALUE) (dec' Long/MIN_VALUE)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
+                            (kcall/make wide [:out {:type :long :value value}]))))
+    (let [literal (assoc wide :arguments ['out 64] :preconditions [{:expression 64 :op :>= :value 64}])]
+      (is (kcall/kernel-call? (kcall/make literal [:out {:type :long :value 64}])))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal specialization"
+                            (kcall/make literal [:out {:type :long :value 32}]))))))
 
 (deftest scheduled-call-overrides-cannot-overflow-hardware-indices
   (let [kernel (body/make

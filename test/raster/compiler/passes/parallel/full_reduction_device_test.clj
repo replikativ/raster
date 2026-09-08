@@ -54,7 +54,7 @@
                [(:kernel-dtype slot) (:type value) (:value value)])]
     (is (= graph (executable/validate! graph)))
     (is (= #{[:int :int 1025] [:long :long 1025]} (set uses)))
-    (is (thrown? ArithmeticException
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside its physical ABI range"
                  (graph-call/make graph buffers {'n {:type :long :value (inc (long Integer/MAX_VALUE))}})))
     (is (thrown? clojure.lang.ExceptionInfo
                  (graph-call/make graph buffers {'n {:type :long :value -1}})))

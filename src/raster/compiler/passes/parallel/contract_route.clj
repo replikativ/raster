@@ -1032,7 +1032,7 @@
                    {:family family
                     :strategy strategy
                     :artifact (-> (select-keys artifact
-                                               [:target :source :abi :arguments :launch :effects])
+                                               [:target :source :abi :arguments :launch :preconditions :effects])
                                   (update :source str/replace kernel-name "<entry-point>"))}))
                candidates)]]
     (format "raster_typed_contraction_dispatch_%08x"

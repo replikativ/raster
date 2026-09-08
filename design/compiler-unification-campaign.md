@@ -436,6 +436,19 @@ retained dtype; negative accesses, indirect coordinates and unknown domains do n
 capacities. Larger declared storage remains intact. This is not general gather bounds checking
 or symbolic shape inference. Exact-size CPU OpenCL execution is correctness evidence only.
 
+Executable scalar preconditions now use the existing checked launch/storage expression algebra,
+referencing physical ABI slot names. Binding validates scalar ranges and literal specializations;
+graph preflight checks every node before scratch allocation. Registry and tuning identities retain
+these constraints, and forced/cached selection cannot bypass them. Focused validation: 65 tests,
+374 assertions. This supplies enforcement, not proof that target requirements have been supplied.
+
+Next: derive Intel matrix restrictions from the verified schedule and share them between selection
+and artifact binding. The [Intel 2D block-I/O specification](https://registry.khronos.org/OpenCL/extensions/intel/cl_intel_subgroup_2d_block_io.html)
+requires at least 64-byte row widths and 64-byte base alignment; the existing tiny FP16 N/K=16
+device cases do not establish legality despite passing this driver. Validate surface maxima,
+pitch and view-slice alignment as well, widen linear output arithmetic, and keep the retained-Long
+DPAS admission gate closed until the complete contract is enforced. These target fixes remain open.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.

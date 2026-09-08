@@ -7,7 +7,9 @@
   (:require [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
-            [raster.compiler.ir.kernel-launch :as klaunch])
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.scalar-range :as scalar-range])
   (:import [java.lang.foreign MemorySegment]))
 
 (defrecord KernelCall [artifact arguments geometry])
@@ -105,7 +107,8 @@
                  [value]))
              plan logical-values))))
 
-(defn- scalar-value!
+(defn validate-scalar-value!
+  "Validate a physical scalar against the declared ABI dtype before any conversion or arithmetic."
   [slot value]
   (when-not (and (map? value) (contains? value :value) (contains? value :type))
     (throw (ex-info "kernel scalar argument must be a typed value"
@@ -114,12 +117,13 @@
     (throw (ex-info "kernel scalar argument has the wrong kernel dtype"
                     {:slot slot :expected (:kernel-dtype slot) :actual (:type value)
                      :value value})))
-  (when (and (= :int (:kernel-dtype slot))
-             (not (and (integer? (:value value))
-                       (<= Integer/MIN_VALUE (:value value) Integer/MAX_VALUE))))
-    (throw (ex-info "kernel int scalar argument is outside its physical ABI range"
-                    {:reason :kernel-scalar-range :slot slot :value value
-                     :minimum Integer/MIN_VALUE :maximum Integer/MAX_VALUE})))
+  (when (contains? #{:int :long} (:kernel-dtype slot))
+    (let [{:keys [lower upper]} (scalar-range/for-dtype (:kernel-dtype slot))]
+      (when-not (and (integer? (:value value)) (<= lower (:value value) upper))
+        (throw (ex-info (str "kernel " (name (:kernel-dtype slot))
+                             " scalar argument is outside its physical ABI range")
+                        {:reason :kernel-scalar-range :slot slot :value value
+                         :minimum lower :maximum upper})))))
   (when (and (= :bound (:role slot))
              (or (not (integer? (:value value))) (neg? (:value value))))
     (throw (ex-info "kernel extent bound must be a non-negative integer"
@@ -177,6 +181,8 @@
                 (catch UnsupportedOperationException _ false))
       :else false)))
 
+(declare validate-preconditions!)
+
 (defn validate!
   "Validate and return a KernelCall. This is driver-independent: a backend subsequently checks
    that pointer values are its resident buffer representation and match ABI storage dtypes."
@@ -209,10 +215,11 @@
                       {:kernel-name (:kernel-name artifact)
                        :expected (:shared-memory-bytes spec)
                        :actual (:shared-memory-bytes geometry)})))
+    (validate-preconditions! artifact arguments)
     (validate-body-launch! artifact geometry)
     (doseq [[slot value] (map vector abi arguments)]
       (if (= :scalar (:kind slot))
-        (scalar-value! slot value)
+        (validate-scalar-value! slot value)
         (do
           (when (nil? value)
             (throw (ex-info "kernel pointer argument cannot be nil"
@@ -246,16 +253,36 @@
                              :value compiler-value :indexes (vec indexes) :values values})))
           (first values))))))
 
+(defn validate-preconditions!
+  "Validate scalar representations and executable constraints without requiring resident pointers.
+  Used by direct calls and graph preflight before temporary allocation."
+  [artifact arguments]
+  (let [artifact (kart/validate! artifact)
+        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+    (doseq [[slot compiler-value value] (map vector (:abi artifact) (:arguments artifact) arguments)
+            :when (= :scalar (:kind slot))]
+      (validate-scalar-value! slot value)
+      (when (and (contains? #{:int :long} (:kernel-dtype slot))
+                 (integer? compiler-value) (not= compiler-value (:value value)))
+        (throw (ex-info "kernel scalar differs from its literal specialization"
+                        {:reason :kernel-scalar-specialization :slot slot
+                         :expected compiler-value :actual (:value value)}))))
+    (let [scalars (into {} (keep (fn [[slot value]]
+                                  (when (= :scalar (:kind slot)) [(:name slot) (:value value)])))
+                        (map vector (:abi artifact) arguments))]
+      (precondition/check! (:preconditions artifact) scalars))))
+
 (defn realize-launch
   "Realize an artifact's launch from a complete ABI-ordered runtime argument vector.
 
    This deliberately does not construct a KernelCall: compatibility staging may reserve the
    artifact's result pointer itself, but it must still honor the exact symbolic launch (including
-   occupancy caps) before that allocation exists. Scalar representation and pointer checks remain
-   the caller's responsibility and KernelCall performs them for resident execution."
+   occupancy caps) before that allocation exists. Scalar representations, specializations and
+   preconditions are checked here; KernelCall checks resident pointers when they exist."
   [artifact arguments]
   (let [artifact (kart/validate! artifact)
         arguments (kabi/validate-arguments! (:abi artifact) arguments)
+        _ (validate-preconditions! artifact arguments)
         geometry (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))]
     (validate-body-launch! artifact geometry)))
 
@@ -280,9 +307,7 @@
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
          ;; Extent/range checks precede launch realization.  Otherwise a negative bound can first
          ;; fail as an incidental zero-sized grid—or, for a clamped schedule, realize a valid grid.
-         _ (doseq [[slot value] (map vector (:abi artifact) arguments)
-                   :when (= :scalar (:kind slot))]
-             (scalar-value! slot value))
+         _ (validate-preconditions! artifact arguments)
          resolver (or resolve-value (argument-resolver artifact arguments))
          ;; An override replaces the group vector; check its final geometry below, not the
          ;; unused default grid. Staging callers of realize-launch have no such override.
@@ -318,7 +343,7 @@
   [call registered]
   (let [artifact (:artifact (validate! call))
         registered (kart/validate! registered)
-        compiler-fields [:kernel-name :target :source :abi :arguments :launch :temporaries
+        compiler-fields [:kernel-name :target :source :abi :arguments :launch :preconditions :temporaries
                          :effects :provenance :attributes]]
     (when-not (= (select-keys artifact compiler-fields)
                  (select-keys registered compiler-fields))

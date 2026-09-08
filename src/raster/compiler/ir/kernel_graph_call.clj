@@ -52,10 +52,14 @@
         (throw (ex-info "graph symbolic scalar requires an explicitly typed runtime value"
                         {:reason :kernel-graph-call-scalar-type
                          :argument argument :slot slot :value value})))
-      (when-not (= (:kernel-dtype slot) (:type value))
+      (when-not (contains? (set [(:dtype slot) (:kernel-dtype slot)]) (:type value))
         (throw (ex-info "kernel graph scalar argument has the wrong ABI dtype"
                         {:reason :kernel-graph-call-scalar-type
-                         :argument argument :slot slot :value value}))))
+                         :argument argument :slot slot :value value})))
+      ;; Direct graph callers may provide the logical dtype; the common KernelExecutable binder
+      ;; provides the slot's physical dtype. Validate the supplied declared representation before
+      ;; any node-specific conversion. Neither path accepts an unrelated type or unchecked range.
+      (kcall/validate-scalar-value! (assoc slot :kernel-dtype (:type value)) value))
     scalar-values))
 
 (defn- scalar-number
@@ -76,10 +80,12 @@
   [scalar-values expression]
   (klaunch/resolve-expression #(scalar-number scalar-values %) expression))
 
+(declare preflight!)
+
 (defn temporary-specs
   "Resolve graph-owned temporary storage to core allocation specs: `{id [dtype elements nil]}`."
   [graph scalar-values]
-  (let [graph (kgraph/validate! graph)]
+  (let [graph (preflight! graph scalar-values)]
     (into {}
           (map (fn [{:keys [id dtype elements]}]
                  (let [n (resolve-integer scalar-values elements)]
@@ -89,13 +95,11 @@
                    [id [dtype n nil]])))
           (:temporaries graph))))
 
-(defn- cast-scalar
-  [dtype value]
-  (case dtype
-    :int (Math/toIntExact (long value))
-    :long (long value)
-    (throw (ex-info "derived graph scalar is only defined for integer ABI slots"
-                    {:dtype dtype :value value}))))
+(defn- physical-scalar
+  [slot value]
+  (let [typed {:type (:kernel-dtype slot) :value value}]
+    (kcall/validate-scalar-value! slot typed)
+    (executable/physical-runtime-scalar slot typed)))
 
 (defn- scalar-argument
   [scalar-values slot compiler-value]
@@ -107,13 +111,27 @@
       (if (= (:type value) (:kernel-dtype slot))
         value
         (if (every? #{:int :long} [(:type value) (:kernel-dtype slot)])
-          (executable/physical-runtime-scalar slot (:value value))
+          (physical-scalar slot (:value value))
           (throw (ex-info "graph scalar requires an unsupported physical conversion"
                           {:reason :kernel-graph-call-scalar-conversion
                            :slot slot :value value})))))
-    (let [value (resolve-integer scalar-values compiler-value)]
-      {:type (:kernel-dtype slot)
-       :value (cast-scalar (:kernel-dtype slot) value)})))
+    (physical-scalar slot (resolve-integer scalar-values compiler-value))))
+
+(defn preflight!
+  "Check every node's scalar ABI and preconditions before graph-owned allocation.
+  Enclosing-program shape values remain available for storage sizing, not as extra call arguments."
+  [graph scalar-values]
+  (let [graph (executable/validate! graph)
+        public-values (select-keys scalar-values (map second (scalar-interface graph)))
+        _ (validate-scalar-values! graph public-values)]
+    (doseq [{:keys [operation]} (:nodes graph)]
+      (let [artifact (kart/validate! operation)
+            arguments (mapv (fn [slot compiler-value]
+                              (when (= :scalar (:kind slot))
+                                (scalar-argument public-values slot compiler-value)))
+                            (:abi artifact) (:arguments artifact))]
+        (kcall/validate-preconditions! artifact arguments)))
+    graph))
 
 (defn validate!
   "Validate and return a KernelGraphCall."
