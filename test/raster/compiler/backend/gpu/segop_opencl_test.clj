@@ -21,12 +21,35 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
+
+(deftest map-access-proof-declines-negative-and-indirect-coordinates
+  (doseq [expression ['(aget a (- i 1))
+                      '(aget a (int (aget b j)))]]
+    (let [graph (capacity-fixture/inferred-graph expression)
+          operation (get-in graph [:nodes 0 :operation])]
+      (is (nil? (map-reads/static-read-requirements
+                 operation {:dtype :float :array-types {'a :float 'b :float 'C :float}}))))))
+
+(deftest public-outer-product-derives-unknown-input-capacities
+  (doseq [[expression expected]
+          [['(* (aget a i) (aget b j)) {'a 4 'b 3}]
+           ['(+ (aget a i) (aget a j)) {'a 4}]
+           ['(let* [k (+ i j)] (aget a k)) {'a 6}]]]
+    (let [graph (capacity-fixture/inferred-graph expression)
+          emitted (sg/generate-kernel-graph graph)
+          artifact (get-in emitted [:nodes 0 :operation])]
+      (is (= expected (into {} (map (juxt :id :elements)) (:inputs graph))))
+      (is (= :kernel-body (kart/emission-route artifact)))
+      (is (= (into {} (map (fn [[id n]] [id [n]])) expected)
+             (into {} (comp (filter #(= :input (:kind %))) (map (juxt :id :shape)))
+                   (get-in artifact [:attributes :kernel-body :parameters])))))))
 
 (deftest typed-map-preserves-independent-static-graph-capacities
   (doseq [a-capacity [4 8]

@@ -20,3 +20,14 @@
          algorithm (get-in typed [:equations 0 :algorithm])
          scheduled (:form (segop-lower/segop-lower-pass typed options))]
      (equation-graph/make algorithm scheduled))))
+
+(defn inferred-graph
+  "No input shapes are supplied: graph requirements must follow the typed access expressions."
+  ([] (inferred-graph '(* (aget a i) (aget b j))))
+  ([expression]
+   (let [options {:dtype :float :array-types {'a :float 'b :float 'C :float}}
+         source (list 'let* ['r (list 'raster.par/contract 'C '[[i 4] [j 3]] [] expression)] 'r)
+         typed (:program (typed-route/attempt source :float (:array-types options) options))
+         algorithm (get-in typed [:equations 0 :algorithm])
+         scheduled (:form (segop-lower/segop-lower-pass typed options))]
+     (equation-graph/make algorithm scheduled))))

@@ -5,7 +5,9 @@
    literals and exact widening casts. Unknown values retain their full declared range, so the
    analysis can certify `:no-overflow` only when a canonical scalar operation is representable
    for every runtime value admitted by the typed contract."
-  (:require [raster.compiler.core.dtype :as dtype]))
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.kernel-launch :as launch]))
+
 
 (def ^:private integral-bounds
   {:byte [Byte/MIN_VALUE Byte/MAX_VALUE]
@@ -87,3 +89,53 @@
       (when (and (= divisor-value (:upper divisor)) (pos? divisor-value))
         {:lower (quot (:lower numerator) divisor-value)
          :upper (quot (:upper numerator) divisor-value)}))))
+
+(defn typed-index-range
+  "Conditional interval proof for a bounded typed index tree.
+   Leaf domains must hold at the access. Every intermediate must fit its declared integer
+   width; exact widening, add/subtract/multiply and nonnegative div/rem by a positive constant
+   are supported. Unknowns or a tree exceeding 128 nodes return nil, never an assumed bound."
+  [expression leaf-types leaf-ranges]
+  (try
+    (let [remaining (volatile! 128)
+          check! (fn check! [x]
+                   (when (neg? (vswap! remaining dec))
+                     (throw (ex-info "index proof budget" {})))
+                   (cond
+                     (launch/index-expr? x) (doseq [a (:arguments x)] (check! a))
+                     (launch/index-cast? x) (check! (:argument x))
+                     (or (integer? x) (symbol? x)) nil
+                     :else (throw (ex-info "unsupported index proof leaf" {}))))]
+      (check! expression)
+      (launch/typed-expression-dtype expression leaf-types)
+      (letfn [(visit [x]
+                (let [type (launch/typed-expression-dtype x leaf-types)
+                      result
+                      (cond
+                        (integer? x) (literal x type)
+                        (symbol? x) (get leaf-ranges x)
+                        (launch/index-cast? x) (visit (:argument x))
+                        (launch/index-expr? x)
+                        (let [args (mapv visit (:arguments x))
+                              [a b] args]
+                          (when (every? some? args)
+                            (case (:op x)
+                              (:add :mul)
+                              (reduce (fn [a b]
+                                        (let [r (arithmetic (if (= :add (:op x)) :+ :*) [a b])]
+                                          (when (contained-in-dtype? r type) r)))
+                                      args)
+                              :sub (when (= 2 (count args)) (arithmetic :- args))
+                              (:floor-div :mod)
+                              (when (and (= 2 (count args)) (<= 0 (:lower a))
+                                         (= (:lower b) (:upper b)) (pos? (:lower b)))
+                                (if (= :floor-div (:op x))
+                                  (quotient args)
+                                  {:lower 0 :upper (min (:upper a) (dec (:lower b)))}))
+                              nil)))
+                        :else nil)]
+                  (when (and result (<= (:lower result) (:upper result))
+                             (contained-in-dtype? result type))
+                    result)))]
+        (visit expression)))
+    (catch clojure.lang.ExceptionInfo _ nil)))

@@ -349,6 +349,13 @@ claims are limited to tested hardware and workloads. Discuss the results before 
 
 ## Working loop
 
+Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
+For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
+minimum storage independently of output size. Every integer arithmetic prefix must fit its
+retained dtype; negative accesses, indirect coordinates and unknown domains do not establish
+capacities. Larger declared storage remains intact. This is not general gather bounds checking
+or symbolic shape inference. Exact-size CPU OpenCL execution is correctness evidence only.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.
