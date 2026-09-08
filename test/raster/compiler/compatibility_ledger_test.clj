@@ -18,6 +18,20 @@
 (def ^:private ledger-path "test/raster/compiler/compatibility_ledger.edn")
 (def ^:private target :ze:compatibility-ledger)
 
+;; This is staged contraction syntax, not the explicit-map Q4 projection below.
+;; Track the frontend gap separately from candidate KernelBody/device coverage.
+(deftm staged-byte-float-contract!
+  [a :- (Array byte) b :- (Array byte) da :- (Array float)
+   db :- (Array float) out :- (Array float)] :- Void
+  (raster.par/contract out [[i 1] [j 2]] [[blk 2] [t 4]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* blk 4) t))
+                      (raster.arrays/aget b (+ (* j 8) (* blk 4) t)))
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0
+              :lift (* inner (aget da _) (aget db _))
+              :operands [{:sym da :dtype :float :map {:groups [[[i 1] [blk 2]]]}}
+                         {:sym db :dtype :float :map {:groups [[[j 2] [blk 2]]]}}]}
+             {:axis t :extent 4 :dtype :int :init 0}]))
+
 (deftm prefix-sum-gpu
   [input :- (Array float) n :- Long] :- (Array float)
   (let [output (float-array n)]
@@ -73,6 +87,10 @@
   (case id
     :dense-relu-jvm
     (pipeline/compile-report #'nn/predict-fn)
+
+    :staged-byte-float-contraction-gpu
+    (pipeline/compile-report #'staged-byte-float-contract!
+                             :target-device target :dtype :byte)
 
     :symbolic-dense-contraction-gpu
     (let [compilation (equation-first/compile
@@ -134,6 +152,7 @@
   (let [{:keys [schema-version workloads]} (edn/read-string (slurp ledger-path))]
     (is (= 1 schema-version))
     (is (= #{:dense-relu-jvm
+             :staged-byte-float-contraction-gpu
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu

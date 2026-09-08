@@ -60,6 +60,22 @@ Exit: public product workloads use the typed route without reconstructed facts o
 
 ## 2. Retire the remaining compatibility paths — active
 
+The public staged Byte→Int32→Float contraction is now a separate compatibility-ledger
+workload. Unlike the explicit-map Q4 row projection (already KernelBody), it declines
+direct TypedSOAC admission and reaches retained `:staged-segred` emission. Its current
+compatibility path requires explicit `:dtype :byte`; default Float policy emits Float
+operand pointers despite declared Byte inputs, which the resident binder correctly
+rejects. Do not count fixture-only staged KernelBody emission as this public vertical.
+
+The next admission must retain the existing `SoacContract`/`ContractionFacts` payload,
+including nested stage boundaries, typed lifts and storage dependencies, through the
+typed program and projection. Flat ProductReduction components are simultaneous
+accumulators, not nested stages. Check operand/lift/output types independently; do not
+relax the frontend option gate or flatten stages into a scalar fold. Existing fusion
+rules must decline staged nodes until their legality preserves those boundaries.
+Acceptance includes exact fact transport without reparsing, public mixed-storage
+execution, source return/effect preservation, and checked graph capacities/aliasing.
+
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
 
