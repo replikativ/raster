@@ -40,7 +40,7 @@
   This is deliberately partial: computed node arguments, allocation products and artifact
   preconditions still require ordinary binding preflight. No expression is evaluated here."
   [graph]
-  (let [graph (executable/validate! graph)
+  (let [graph (executable/validate! (kgraph/validate! graph))
         public (scalar-interface graph)
         public-ids (set (map second public))
         bindings (concat public

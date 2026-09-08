@@ -24,6 +24,9 @@
     (is (seq conditions))
     (is (every? #(= 'n (:expression %)) conditions))
     (is (precondition/check! conditions {'n 1025}))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (graph-call/direct-scalar-range-preconditions
+                  (get-in graph [:nodes 0 :operation]))))
     (doseq [n [-1 2147483648]]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
                             (precondition/check! conditions {'n n}))))))

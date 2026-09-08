@@ -498,6 +498,13 @@ extra mixed-width rejection cases; forward/input-gradient/weight-gradient and a 
 AD/SGD update also passed (two tests, 12 assertions). These are correctness results, not measured
 projection throughput or a claim that every oversized workload has an executable fallback.
 
+Graph admission can now reuse direct public/node scalar ABI ranges from the existing scalar-range
+facts. The batched matrix selector consumes these guards, including its private Int grid-Z count,
+before surface arithmetic. This helper deliberately does not evaluate computed arguments or
+replace artifact preconditions and allocation preflight. Oversized Long batches select fallback;
+forced graph binding still rejects them. Focused validation: 32 tests / 741 assertions, followed
+by a six-assertion graph-only API check. Public batch admission remains a separate follow-up.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.
