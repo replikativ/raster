@@ -86,3 +86,11 @@ not establish accuracy on arbitrary input distributions. The scalar-dimension an
 fixed-shape workloads have distinct comparison identities. There is no automatic ladder
 runner, external adapter, tuning experiment or matched accelerator suite yet. No SOTA or
 cross-vendor performance claim is justified until comparisons run on the named devices.
+
+`:variant :relu` selects the public contraction with a typed ReLU result transform. An explicit
+`:gemm-precision :f32-scalar` or `:mixed-f16-f32` is forwarded to the compiler; the resolved
+policy is recorded in the identity. Policy is not evidence that a particular matrix instruction
+executed. The explicit ReLU workload has its own identity and is checked through generated
+KernelBody candidates. Composing a contraction-return alias with an in-place map is currently
+excluded: its stable-read/output alias boundary is rejected by the binder. Retain that case as
+a compiler regression until storage normalization admits it safely; do not benchmark a bypass.

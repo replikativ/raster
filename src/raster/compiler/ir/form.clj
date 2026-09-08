@@ -89,13 +89,18 @@
         (and (symbol? head)
              (some? (namespace head))
              (.startsWith ^String (namespace head) "raster.par"))
-        (let [n (name head)
-              ;; `contract` writes+returns its `out` buffer (arg 0) even though it does not
-              ;; end in `!` — it is redomap-shaped (an annotated fused map+reduce into out),
-              ;; so its return type is arg 0 like the mutating `*!` forms, not arg 1.
-              mutating? (or (.endsWith n "!") (= n "contract"))]
-          {:kind :par :introduces-scope? true :liftable? false :head head
-           :return-type-arg (if mutating? 0 1)})
+        (let [;; Semantic return contracts of compiler primitives, not a naming heuristic.
+              ;; Effect-only, scalar-returning and unknown forms must not inherit a buffer
+              ;; type merely because their name ends in !. Only the exact public namespace
+              ;; establishes these contracts; a similarly named extension is unknown.
+              return-index (when (= "raster.par" (namespace head))
+                             (case (name head)
+                               ("map!" "contract" "scan" "scan-exclusive" "scatter!"
+                                "gather" "reduce-by-key" "rng-fill!" "active-ids!" "stencil!") 0
+                               "reduce" 1
+                               nil))]
+          (cond-> {:kind :par :introduces-scope? true :liftable? false :head head}
+            (some? return-index) (assoc :return-type-arg return-index)))
 
         ;; do block — sequential, liftable (effects + result)
         (= 'do head)

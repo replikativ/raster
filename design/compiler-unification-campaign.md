@@ -353,6 +353,18 @@ claims are limited to tested hardware and workloads. Discuss the results before 
 
 ## Working loop
 
+Dense workload follow-up: public parameterized GEMM and its explicit typed ReLU epilogue have
+precision-selectable correctness canaries. An ordinary contraction-return alias followed by an
+in-place map exposed two boundaries: lexical return-type propagation (now uses exact primitive
+operand-return semantics, not suffix guessing), then stable-read alias normalization (still
+rejected at binding). Closing the latter and measuring automatic fusion remains required; an
+explicit epilogue is not evidence that source composition fuses automatically.
+
+Future mechanized proofs may use the sibling Lean project. Start with small existing contracts
+(bounded integer range transfer, access/capacity refinement and alias legality), replaying the
+same counterexamples as executable tests. No proof assistant integration or whole-compiler
+correctness claim is implied, and this does not block workload-driven retirement.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

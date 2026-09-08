@@ -211,17 +211,23 @@
 ;; ================================================================
 
 (deftest par-mutating-detection-test
-  (testing "mutating par forms (ending in !) have return-type-arg 0"
+  (testing "map returns its destination"
     (let [info (form/form-info '(raster.par/map! out n f))]
       (is (= 0 (:return-type-arg info)))))
 
-  (testing "non-mutating par forms have return-type-arg 1"
+  (testing "reduce returns its accumulator"
     (let [info (form/form-info '(raster.par/reduce out init n f))]
       (is (= 1 (:return-type-arg info)))))
 
-  (testing "raster.par/scan! is mutating"
-    (let [info (form/form-info '(raster.par/scan! out n f))]
-      (is (= 0 (:return-type-arg info))))))
+  (testing "scan and reduce-by-key return their destination, not their keys or seed"
+    (doseq [head '[raster.par/scan raster.par/scan-exclusive raster.par/reduce-by-key
+                  raster.par/gather raster.par/contract]]
+      (is (= 0 (:return-type-arg (form/form-info (list head 'out 'other)))))))
+  (testing "effects, scalar results and unknown forms have no operand-return contract"
+    (doseq [head '[raster.par/atomic-add! raster.par/map-void! raster.par/map2!
+                  raster.par/butterfly! raster.par/collect! raster.par/product-reduce!
+                  raster.par/segmented-fold-map! raster.par/unknown! raster.par.extension/map!]]
+      (is (nil? (:return-type-arg (form/form-info (list head 'out 'other))))))))
 
 ;; ================================================================
 ;; scope-info — binder decomposition + rebuild round-trip
