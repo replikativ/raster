@@ -9,6 +9,7 @@
     SoacReduce  — parallel fold with associative operator
     SoacScan    — parallel prefix scan (inclusive)"
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -320,7 +321,7 @@
   "Get the set of input array symbols for a SOAC node."
   [node]
   (if (contract? node)
-    (set (map :sym (:operands (:facts node))))
+    (:reads (contraction-facts/dependencies (:facts node)))
     (:inputs node)))
 
 (defn soac-outputs
@@ -345,10 +346,13 @@
   output buffers that must be defined before the SOAC runs. Pure par/map SOACs
   don't have external output buffers — their output IS their binding symbol."
   [node]
+  (if (contract? node)
+    (let [{:keys [reads writes scalars]} (contraction-facts/dependencies (:facts node))]
+      (set/union reads writes scalars))
   (set/union (or (:inputs node) #{})
              (if (:pure? node) #{} (set (filter symbol? (or (:outputs node) #{}))))
              (or (:scalars node) #{})
              (util/free-syms (:bound node))
              (if (soac-reduce? node)
                (reduce set/union #{} (map util/free-syms (reduction/neutrals (:reduction node))))
-               (if (:init node) (util/free-syms (:init node)) #{}))))
+               (if (:init node) (util/free-syms (:init node)) #{})))))

@@ -40,6 +40,10 @@
                           (concat [:min-elements 0] opts)))))
 
 (deftest declared-gpu-parameter-types-preserve-the-scalar-array-partition
+  (is (= {:scalar-types {'scale :float 'bias :double}
+          :array-types {'packed :byte 'scales :float 'result :double}}
+         (opencl-pass/derive-param-types '[packed scales result scale bias]
+                                         '[bytes floats doubles float double] :byte)))
   (is (= {:scalar-types {'in :long 'scale :float}
           :array-types {'packed :int 'metadata :byte 'values :float 'cache :half}}
          (opencl-pass/derive-param-types

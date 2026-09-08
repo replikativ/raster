@@ -139,9 +139,10 @@
                 (and (contains? array-ids id) (soac/soac-reduce? node)) [(:bound node)]
                 (contains? array-ids id) (unknown-vector-shape)
                 :else [])
-        declared-types (if (contains? array-ids id) array-types scalar-types)
-        value-dtype (or (get declared-types id)
-                        (when (symbol? id) (get declared-types (symbol (name id))))
+        type-id (if (and result? (soac/contract? node)) (get-in node [:facts :out]) id)
+        declared-types (if (contains? array-ids type-id) array-types scalar-types)
+        value-dtype (or (get declared-types type-id)
+                        (when (symbol? type-id) (get declared-types (symbol (name type-id))))
                         (:elem-type node)
                         dtype
                         :double)]

@@ -156,8 +156,9 @@
   scalars specialize to the selected kernel dtype. Physical narrowing belongs to a scheduled
   ABI conversion with a range check, not source type derivation.
   Array params: the tag's element dtype, with float-family (float/double)
-  mapped to the KERNEL dtype (a single-precision kernel reads float buffers regardless of a
+  mapped to a floating-point KERNEL dtype (a single-precision kernel reads float buffers regardless of a
   parametric (All [T]) param's default).
+  Integral kernel policies retain declared floating types rather than turning scales into bytes.
   Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
   opencl-pass reads. ONE derivation, both compile paths."
   [params tags dtype]
@@ -166,12 +167,14 @@
                                     (case (dtype/dtype-for-scalar-tag t)
                                       :long [p :long]
                                       :int [p :int]
-                                      (:double :float) [p dtype]
+                                      (:double :float) [p (if (dtype/fp-dtype? dtype)
+                                                           dtype (dtype/dtype-for-scalar-tag t))]
                                       nil))
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]
                                    (when-let [dt (dtype/dtype-for-array-tag t)]
-                                     [p (if (#{:float :double} dt) dtype dt)]))
+                                     [p (if (and (#{:float :double} dt) (dtype/fp-dtype? dtype))
+                                          dtype dt)]))
                                  (map vector params tags)))}))
 
 (def ^:private fatal-reasons

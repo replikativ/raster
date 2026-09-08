@@ -22,6 +22,8 @@
    the whole extraction fail. Trusting a declared layout while having checked only its axis
    symbols is how a transpose rewrite risked a silent miscompile."
   (:require [clojure.walk :as walk]
+            [clojure.set :as set]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.axis-map :as am]
@@ -199,6 +201,45 @@
   (let [[_ out free-axes contract-axes body] form]
     (from-components {:out out :free-axes free-axes :contract-axes contract-axes
                       :body body :opts (form-opts form) :dtype dtype :form form})))
+
+(defn dependencies
+  "Project storage and scalar dependencies from the sole contraction payload.
+   Lexical stage/epilogue binders are local to their expressions, not global exclusions.
+   This projects dependencies only; it does not flatten numerical stage semantics."
+  [facts]
+  (when-not (facts? facts)
+    (throw (ex-info "dependency projection requires contraction facts" {:reason :contraction-facts-required})))
+  (doseq [operand (:operands facts)
+          :when (seq (aget-terms (:decode operand)))]
+    (throw (ex-info "decode storage captures require an explicit operand contract"
+                    {:reason :contraction-decode-storage-dependencies :operand operand})))
+  (let [axes (concat (:free-axes facts) (:contract-axes facts))
+        indices (set (map first axes))
+        stages (:stages facts)
+        epilogue (:epilogue facts)
+        reads (set (map :sym (concat (:operands facts)
+                                    (contract-stages/lift-operands stages)
+                                    (:operands epilogue))))
+        writes #{(:out facts)}
+        stage-indices (contract-stages/stage-index-exprs stages)
+        epilogue-indices (into {} (map (fn [{:keys [sym map]}] [sym (am/index-expr map)]))
+                              (:operands epilogue))
+        refs (apply set/union #{}
+                    (concat
+                     [(util/free-syms (:body facts) indices)
+                      (util/free-syms (:init facts))
+                      (util/free-syms (od/rewrite-aget-indices (:expr epilogue) epilogue-indices)
+                                      (cond-> indices (:acc epilogue) (conj (:acc epilogue))))]
+                     (map #(util/free-syms (second %)) axes)
+                     (map #(util/free-syms (:init %)) stages)
+                     (map #(util/free-syms
+                            (contract-stages/substitute-operand-indices (:lift %) stage-indices)
+                            (conj indices 'inner)) stages)
+                     (map #(util/free-syms (:decode %) (conj indices 'x)) (:operands facts))
+                     (map #(util/free-syms (am/index-expr (:map %)) indices)
+                          (:operands epilogue))
+                     (map #(util/free-syms (:sym %)) (:scalars epilogue))))]
+    {:reads reads :writes writes :scalars (set/difference refs reads writes)}))
 
 (defn scalar-reduction-view
   "Project the canonical one-component ProductReduction into the contraction facts needed by

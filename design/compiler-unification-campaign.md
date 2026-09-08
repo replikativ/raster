@@ -76,6 +76,15 @@ rules must decline staged nodes until their legality preserves those boundaries.
 Acceptance includes exact fact transport without reparsing, public mixed-storage
 execution, source return/effect preservation, and checked graph capacities/aliasing.
 
+The dependency prerequisite projects core, stage-lift and epilogue storage plus scalar
+captures once from ContractionFacts. SOAC and SegOp accessors share it; stage/epilogue
+binders have local scope, and declared maps replace placeholder indices before capture
+analysis. Decode expressions reading undeclared storage are explicitly rejected. A direct
+lowering test checks equation operands/effects and Byte input, Float scale/output/result,
+and integral scalar types. Floating declarations now specialize only under floating
+kernel policies, and contraction result aliases inherit the destination type. This
+repairs the existing dependency envelope, not direct TypedSOAC staged admission.
+
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
 
