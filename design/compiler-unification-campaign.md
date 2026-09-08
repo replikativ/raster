@@ -228,6 +228,15 @@ evidence. Investigate a generic, explicitly typed/aligned packed storage load (w
 then repeat resident comparisons before retiring the production source emitter. Do not introduce
 a quantization-specific memory ABI or bypass the common body verifier to obtain that load.
 
+One general target-cleanup slice exposes canonical counted loops when their literal bounds prove
+the final induction increment representable. The shared exact range helper includes that exit
+increment, not just indices observed inside the loop. Ordinary and asynchronous pipelined loops
+share one syntax helper; unknown bounds and explicit IndexCasts (including retained Long bounds)
+keep the existing unsigned-distance guard. Scalar yields and event rotation stay before advance.
+This does not strengthen recurrence facts or alter accumulation order, and the noisy laptop probes
+do not establish a throughput improvement. Device tests cover zero/nonunit/reversed loop counts,
+staged reductions and the existing asynchronous workgroup pipeline.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through

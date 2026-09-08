@@ -3,6 +3,21 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as ranges]))
 
+(deftest counted-loop-proof-includes-the-terminal-increment
+  (doseq [[lower upper step terminal]
+          [[0 8 1 8] [0 8 3 9] [8 8 3 8] [9 8 3 9] [-5 4 3 4]
+           [(dec Integer/MAX_VALUE) Integer/MAX_VALUE 1 Integer/MAX_VALUE]
+           [(dec Integer/MAX_VALUE) Integer/MAX_VALUE 2 (inc (long Integer/MAX_VALUE))]
+           [Long/MIN_VALUE Long/MAX_VALUE 1 Long/MAX_VALUE]
+           [(dec Long/MAX_VALUE) Long/MAX_VALUE 2 (inc (bigint Long/MAX_VALUE))]]]
+    (is (= {:lower lower :upper terminal} (ranges/counted-loop-index-range lower upper step))))
+  (doseq [[lower upper step] [[0 'n 1] ['n 4 1] [0 4 'step] [0 4 0] [0 4 -1] [0 4 1.0]]]
+    (is (nil? (ranges/counted-loop-index-range lower upper step))))
+  (doseq [lower (range -4 5) upper (range -4 5) step [1 2 3]]
+    (let [indices (vec (take-while #(< % upper) (iterate #(+ % step) lower)))
+          terminal (if (seq indices) (+ (peek indices) step) lower)]
+      (is (= {:lower lower :upper terminal} (ranges/counted-loop-index-range lower upper step))))))
+
 (deftest accumulation-proof-includes-intermediate-prefixes
   (let [term (ranges/arithmetic :* (repeat 2 (ranges/for-dtype :byte)))
         prove #(ranges/accumulation-prefixes (ranges/literal 0 :long) term %)]
