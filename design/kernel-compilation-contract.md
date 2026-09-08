@@ -24,3 +24,25 @@ cache do not yet consume this contract; silently ignoring it would be incorrect.
 
 This is a prerequisite for target-selected intrinsic lowering, not a new semantic
 IR, an optimized kernel promotion, or a change to the default OpenCL dialect.
+
+## Explicit intrinsic candidates
+
+The shared typed emitter accepts an opt-in physical implementation selection:
+
+```clojure
+{:target-features {:intrinsic-implementations {:dp4a :opencl-packed-dot}}}
+```
+
+The canonical intrinsic registry owns the helper and its compiler requirements.
+Only consumed helpers contribute requirements. `emit-scalar-module` returns source
+and requirements together; `emit-artifact` transports both automatically. The
+source-only `emit-scalar-kernel` API rejects selections with nonempty requirements.
+The native OpenCL helper uses signed packed dot followed by unsigned accumulation
+and bit reinterpretation, preserving Int32 wrap rather than saturating the result.
+
+This explicit candidate does not infer device acceleration or change automatic
+selection. Its source feature guard additionally requires packed-dot frontend
+support. `native-dot-validation/run!` (under the bench alias) explicitly validates
+150 mixed-sign and accumulator-limit cases on a capable device, poisoning output
+before each execution; unsupported devices fail rather than silently skip this
+opt-in experiment. Generic CI remains independent of this hardware capability.

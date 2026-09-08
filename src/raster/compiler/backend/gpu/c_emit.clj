@@ -1935,6 +1935,32 @@
      body)
     @result))
 
+(defn intrinsic-helper-module
+  "Select intrinsic implementations and their compiler requirements together.
+   Selection is explicit target policy, not semantic or type inference."
+  [body-str target-dialect implementations]
+  (let [helpers
+        (keep (fn [[id {:keys [c c-helper-src target-helper-src] :as descriptor}]]
+                (when (and (:fn c)
+                           (re-find (re-pattern (str "\\b" (java.util.regex.Pattern/quote (:fn c)) "\\(")) body-str))
+                  (if-let [selected (get implementations id)]
+                    (let [implementation (get-in descriptor [:implementations selected])]
+                      (when-not (contains? (:dialects implementation) target-dialect)
+                        (throw (ex-info "unsupported intrinsic implementation for target"
+                                        {:intrinsic id :implementation selected :target target-dialect})))
+                      implementation)
+                    {:source (or (get target-helper-src target-dialect) c-helper-src)})))
+              intrinsics/table)
+        contracts (keep :compilation helpers)
+        standards (set (keep :language-standard contracts))]
+    (when (> (count standards) 1)
+      (throw (ex-info "conflicting intrinsic compilation standards" {:standards standards})))
+    {:source (str/join "\n" (distinct (keep :source helpers)))
+     :compilation (if (seq contracts)
+                    {:language-standard (first standards)
+                     :extensions (into #{} (mapcat :extensions) contracts)}
+                    {})}))
+
 (defn intrinsic-helper-sources
   "The C helper DEFINITIONS for every registry intrinsic whose C function is CALLED in
    `body-str`, each once, in table order. Registry-driven: an intrinsic that carries a
@@ -1948,14 +1974,7 @@
   ([body-str]
    (intrinsic-helper-sources body-str nil))
   ([body-str target-dialect]
-   (->> intrinsics/table
-       (keep (fn [[_ {:keys [c c-helper-src target-helper-src]}]]
-               (let [helper-src (or (get target-helper-src target-dialect) c-helper-src)]
-                 (when (and helper-src (:fn c)
-                          (re-find (re-pattern (str "\\b" (java.util.regex.Pattern/quote (:fn c)) "\\(")) body-str))
-                   helper-src))))
-       distinct
-       (str/join "\n"))))
+   (:source (intrinsic-helper-module body-str target-dialect {}))))
 
 (defn helper-sources
   "Target helper definitions required by an already-emitted C-family body."

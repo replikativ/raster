@@ -1244,7 +1244,7 @@
             (merge parameters allocations) (:views kernel-body))))
 
 (defn- emit-scalar-kernel*
-  [kernel-name kernel-body {:keys [parameter-names]}]
+  [kernel-name kernel-body {:keys [parameter-names target-features]}]
   (let [kernel-body (body/validate! kernel-body)
         operations (vec (scalar-body-operations (:operations kernel-body)))
         unsupported (remove #(contains? scalar-operation-kinds
@@ -1343,6 +1343,9 @@
                       1 (str (target-type (get types (:id index))) " " name " = "
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
+        intrinsic-module (ce/intrinsic-helper-module
+                          operation-source (:id *scalar-dialect*)
+                          (:intrinsic-implementations target-features))
         helper-source
         (c-dialect/helper-source
          *scalar-dialect*
@@ -1354,8 +1357,7 @@
               (when (and (c-dialect/opencl? *scalar-dialect*)
                          (str/includes? operation-source "atomic_add_float("))
                 ce/opencl-atomic-add-float-helper)
-              (ce/intrinsic-helper-sources operation-source
-                                           (:id *scalar-dialect*))))
+              (:source intrinsic-module)))
         storage-declarations (concat parameters (:allocations kernel-body))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
@@ -1369,7 +1371,8 @@
                           (get-in kernel-body [:schedule :subgroup-size]))
         attribute (c-dialect/subgroup-attribute
                    *scalar-dialect* subgroup-size uses-subgroups?)]
-    (str (c-dialect/preamble *scalar-dialect*
+    {:compilation (:compilation intrinsic-module)
+     :source (str (c-dialect/preamble *scalar-dialect*
                              {:uses-half? uses-half? :uses-double? uses-double?
                               :uses-subgroups? uses-subgroups?})
          helper-source
@@ -1385,9 +1388,9 @@
                         parameters))
          ") {\n"
          allocation-source index-source operation-source
-         "}\n")))
+         "}\n")}))
 
-(defn emit-scalar-kernel
+(defn emit-scalar-module
   "Lower a verified scalar/control KernelBody directly to a C-family target dialect.
 
   The body already fixes schedules, types, layouts, masks, convergence and numerical conversion
@@ -1396,7 +1399,7 @@
   selection cannot alter the scheduled body. `target-features` may only select a capability-gated
   physical implementation (for example Ampere `cp.async`) with the same verified semantics."
   ([kernel-name kernel-body]
-   (emit-scalar-kernel kernel-name kernel-body {}))
+   (emit-scalar-module kernel-name kernel-body {}))
   ([kernel-name kernel-body {:keys [target-dialect subgroup-attribute target-features] :as options
                              :or {target-dialect :opencl-intel subgroup-attribute :intel}}]
    (let [target-dialect (if (and (= :opencl-intel target-dialect)
@@ -1407,3 +1410,14 @@
                (merge (c-dialect/resolve! target-dialect)
                       (select-keys target-features [:compute-capability :architecture]))]
        (emit-scalar-kernel* kernel-name kernel-body options)))))
+
+(defn emit-scalar-kernel
+  "Source-only projection. Runtime artifacts must consume emit-scalar-module requirements too."
+  ([kernel-name kernel-body] (emit-scalar-kernel kernel-name kernel-body {}))
+  ([kernel-name kernel-body options]
+   (let [module (emit-scalar-module kernel-name kernel-body options)]
+     (when (seq (:compilation module))
+       (throw (ex-info "explicit compilation requirements need emit-scalar-module"
+                       {:reason :discarded-compilation-contract
+                        :compilation (:compilation module)})))
+     (:source module))))
