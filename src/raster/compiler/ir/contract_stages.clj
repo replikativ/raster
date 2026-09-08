@@ -43,6 +43,7 @@
    and may reference its own axis plus extra operand arrays, each with a declared axis-map (so a
    scale is indexed by ITS map, not by pattern-matching — same rule as the epilogue seam)."
   (:require [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.core.dtype :as dt]
             [clojure.set :as set]
@@ -95,6 +96,8 @@
      • accumulator dtypes must not NARROW going outward: a float inner accumulator feeding an
        integral outer accumulator truncates every partial sum. (int → float, the quant case, is
        the whole point and is fine.)
+     • initial accumulators must be proven zero (an omitted init means zero). Seeded folds
+       have extra terms that the flat equivalent does not represent.
      • no layout/distribution-changing op in a lift."
   [stages contract-axes & {:keys [inner] :or {inner 'inner}}]
   (let [stages (vec stages)
@@ -144,6 +147,12 @@
                :else nil)))
          (butlast stages)))
        ;; dtypes must not narrow outward (inner → outer)
+       ;; The flat equivalent distributes products over sums, not seeded folds. A nonzero
+       ;; seed contributes once per enclosing iteration and is absent from that equivalent.
+       (first (keep (fn [{:keys [axis init]}]
+                      (when-not (or (nil? init) (constant/zero-value? init))
+                        {:ok false :reason :nonzero-stage-identity :axis axis :init init}))
+                    stages))
        ;; an accumulator dtype the compiler cannot spell is a REFUSAL, not a silent substitution
        (first (keep (fn [{:keys [axis dtype]}]
                       (when-not (dt/known? dtype)

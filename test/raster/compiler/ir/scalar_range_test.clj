@@ -3,6 +3,19 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as ranges]))
 
+(deftest accumulation-proof-includes-intermediate-prefixes
+  (let [term (ranges/arithmetic :* (repeat 2 (ranges/for-dtype :byte)))
+        prove #(ranges/accumulation-prefixes (ranges/literal 0 :long) term %)]
+    (is (= {:lower -16256 :upper 16384} term))
+    (is (ranges/contained-in-dtype? (prove 131068) :int))
+    (is (not (ranges/contained-in-dtype? (prove 131072) :int)))
+    (is (= 2147483648 (:upper (prove 131072))))
+    (is (= (*' Long/MAX_VALUE 16384) (:upper (prove Long/MAX_VALUE))))
+    (doseq [n [nil 'n -1 1.5]] (is (nil? (prove n)))))
+  (is (= {:lower -5 :upper 10}
+         (ranges/accumulation-prefixes {:lower 10 :upper 10}
+                                      {:lower -3 :upper -2} 5))))
+
 (deftest typed-index-ranges-cover-every-small-domain-value
   (doseq [width [1 2 7 12] divisor [1 2 3 5]
           op [:floor-div :mod]]

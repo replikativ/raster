@@ -161,6 +161,15 @@ The next caller audit distinguishes a remaining source edge from demonstrated ru
 | JVM SIMD / scalar | `pipeline` → `par_simd` or source expansion | Bound SegOps coexist with traversal of the retained source projection. |
 | CPU C/SIMD | `cpu/aot` → `cpu/csimd` | Bound SegOps preferred; compatibility reconstruction and distinct vector emission remain. |
 
+Before migrating staged contractions, their numerical admission must preserve the claimed
+flat-equivalence law: stage initializers are proven zero using the shared checked-constant
+semantics, and packed signed-byte accumulation requires every prefix to fit the DP4A instruction's
+Int32 result, even when the surrounding accumulator is Long. The reusable interval-prefix proof
+uses unbounded host arithmetic. This closes those admission gaps, not the remaining source
+emitter's general integer overflow semantics or the typed staged lowering itself. Finite-precision
+equivalence still needs a per-stage conversion/rounding contract; exact-arithmetic distribution
+is not a proof of bitwise equivalence.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through

@@ -57,6 +57,13 @@
              {:lower (reduce min products) :upper (reduce max products)})
         nil))))
 
+(defn accumulation-prefixes
+  "Enclose every prefix of up to `count` additions of values in `term`, starting at `initial`.
+   Unknown or nonintegral counts decline; proof arithmetic remains unbounded."
+  [initial term count]
+  (when (and (integer? count) (not (neg? count)))
+    (arithmetic :+ [initial (arithmetic :* [term {:lower 0 :upper count}])])))
+
 (defn hull
   "The least interval containing every non-nil input interval, or nil when an input is
   unknown.  It is used for control-flow joins rather than as an assertion mechanism."
