@@ -1,14 +1,12 @@
 (ns raster.compiler.passes.parallel.contract-route
-  "Routing brain for tensor contractions: a `(raster.par/contract …)` SOAC form → the
-   hardware-optimal kernel choice, via the tensorize LEGALITY GATE.
+  "Route verified tensor contractions to legal target schedules and executable artifacts.
 
    This is the pipeline INTEGRATION seam for the SOAC contraction ladder — the piece that
    makes the emitters load-bearing instead of proven-but-bypassed. `route-contraction`
-   decides: if the DPAS/XMX gate accepts (canonical matmul, f16, pitch-aligned) → the peak
-   tensorized kernel (byte-identical to the hand-wired GEMM front door); otherwise → the
-   portable register-tiled kernel (any dtype, arbitrary dims). Same decision the walker/
-   opencl-pass makes when it meets a contraction; kept in ONE place so the gate's hardware
-   knowledge lives with the emitters, not scattered across passes.
+   selects matrix, register-tiled or portable schedules when their contracts admit the operation.
+   Matrix emission consumes verified KernelBody; the historical handwritten GEMM is test-only.
+   Unsupported general/staged cases still have explicit compatibility paths. Legality and
+   schedule selection are not claims of measured optimality.
 
    Returns a launch-ready descriptor. Strategies: :segmap (0 contract axes), :portable-segred
    (scheduled general), :naive-segred (explicit migration fallback), :regtiled (portable tiled),
@@ -129,6 +127,16 @@
              (map str/trim)
              (remove str/blank?)
              vec)))))
+
+(defn- descriptor-scalar-arguments
+  "Project compatibility descriptor values through the emitted physical scalar ABI.
+  Epilogue captures have their own ordered bindings; do not infer a second set of scalar types."
+  [abi values]
+  (let [slots (filterv #(not= :epilogue (:role %)) (kabi/scalar-slots abi))]
+    (when-not (= (count slots) (count values))
+      (throw (ex-info "contraction descriptor scalar values disagree with the emitted ABI"
+                      {:reason :contraction-scalar-projection :slots slots :values values})))
+    (mapv (fn [slot value] {:type (:kernel-dtype slot) :value value}) slots values)))
 
 (defn validate-descriptor
   "Check a launch descriptor against the kernel source it describes, and THROW on a mismatch.
@@ -452,7 +460,7 @@
            :stages (:stages k)
          ;; the operand BUFFERS are bound unchanged; only the kernel's view of them widens to int32
            :tensorized (:tensorized k) :packed (:packed k)
-           :scalar-args [{:type :int :value nseg}]
+           :scalar-args (descriptor-scalar-arguments (:abi k) [nseg])
            :wg [256 1]
            :grid [(ceil-div nseg 256) 1]})
 
@@ -513,16 +521,14 @@
                     (compatibility-form! (or contract-form (cf/surface-form contract-facts)) :segmap)
                     :dtype dtype)
                    out-sym :dtype dtype))
-              workgroup-size (or (:workgroup-size portable) 256)
-              scalar-dtypes (into {} (map (juxt :name :dtype)) abi)]
+              workgroup-size (or (:workgroup-size portable) 256)]
           (cond->
            {:strategy :segmap
             :emission-route (if emitted :kernel-body :verified-segmap-opencl)
             :kernel-body (:body portable)
             :kernel-name kernel-name :source source :array-params array-params :abi abi
             :dtype dtype :out-dtype dtype :wg [workgroup-size] :grid [(ceil-div nseg workgroup-size)]
-            :scalar-args (conj (mapv (fn [p] {:type (get scalar-dtypes p :int) :value p}) scalar-params)
-                               {:type :int :value nseg})
+            :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
             :out-elems nseg :dims [nseg]}
             (not emitted) (assoc :fallback-reason (:reason portable)
                                  :declines [{:leaf :portable-kernel-body
@@ -593,10 +599,8 @@
               :fused-epilogue (boolean epilogue)
               :kernel-body (:body portable)
               :dtype dtype :out-dtype dtype
-         ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
-         ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
-              :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
-                                 {:type :int :value nseg})
+         ;; Values follow the emitter's scalar order; widths come only from its typed ABI.
+              :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
               :out-elems nseg :dims [nseg]
               :wg [workgroup-size]
               :grid [(ceil-div nseg workgroup-size)]}
@@ -1524,7 +1528,7 @@
              :epilogue-params (:epilogue-params dpas)
              :wg (:workgroup dpas)                       ; derived from that tile
              :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
-             :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
+             :scalar-args (descriptor-scalar-arguments (:abi dpas) (:dims dpas))
              :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
           (if register-tiled?
@@ -1704,7 +1708,7 @@
                           :dtype :byte :out-dtype (:out-dtype k)
                           :out-elems (:out-elems k)
                           :tensorized (:tensorized k) :packed (:packed k)
-                          :scalar-args [{:type :int :value nseg}]
+                          :scalar-args (descriptor-scalar-arguments (:abi k) [nseg])
                           :wg [256 1] :grid [(ceil-div nseg 256) 1]}
                    (seq pre-steps) (assoc :pre-steps pre-steps))))]
     (cond
