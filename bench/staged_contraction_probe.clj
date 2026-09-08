@@ -6,6 +6,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as retained]
             [raster.compiler.backend.gpu.staged-contraction-fixtures :as fixtures]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
             [raster.gpu.core :as gpu]
@@ -30,9 +31,13 @@
   "Measure one [rows outputs blocks block-width] with a small exact dyadic host oracle.
    revision/environment identify the invocation; executable hashes identify actual emitted code.
    All candidates share logical Byte inputs and one output. Compilation/binding and transfers are
-   outside device samples. No autotuning cache or production route is changed."
-  [{:keys [shape revision environment rounds warmup-rounds]
-    :or {rounds 12 warmup-rounds 3}}]
+   outside device samples. No autotuning cache or production route is changed.
+   :comparison-mode :typed-native-dot compares one typed schedule with emulated/native dot;
+   both use explicit CL3.0. The default :retained keeps the three historical candidates."
+  [{:keys [shape revision environment rounds warmup-rounds comparison-mode]
+    :or {rounds 12 warmup-rounds 3 comparison-mode :retained}}]
+  (when-not (contains? #{:retained :typed-native-dot} comparison-mode)
+    (throw (ex-info "unknown probe comparison mode" {:comparison-mode comparison-mode})))
   (when-not (and (vector? shape) (= 4 (count shape))
                  (every? #(and (integer? %) (pos? %)) shape)
                  (string? revision) (seq revision) (string? environment) (seq environment))
@@ -48,9 +53,18 @@
                             {:host-products work :resident-bytes bytes})))
         facts (fixtures/packed-facts m n blocks width)
         ;; Lower first: admission checks static index/capacity and DP4A prefix ranges.
-        typed (target/emit-static-dense-graph "probe_typed" (staged/lower facts) :opencl-portable)
-        candidates [[:typed typed] [:scalar (retained-artifact facts false)]
-                    [:packed (retained-artifact facts true)]]
+        scheduled (staged/lower facts)
+        typed (target/emit-static-dense-graph "probe_typed" scheduled :opencl-portable
+                 (if (= :typed-native-dot comparison-mode)
+                   {:attributes {:compilation {:language-standard "CL3.0"}}} {}))
+        candidates (if (= :typed-native-dot comparison-mode)
+                     [[:typed typed]
+                      [:native (target/emit-static-dense-graph
+                                "probe_native" scheduled :opencl-portable
+                                {:target-features
+                                 {:intrinsic-implementations {:dp4a :opencl-packed-dot}}})]]
+                     [[:typed typed] [:scalar (retained-artifact facts false)]
+                      [:packed (retained-artifact facts true)]])
         ;; Positive products ensure even complete periodic cycles cannot hide a zero-writing bug.
         a (byte-array (map #(inc (mod % 3)) (range (* m blocks width))))
         b (byte-array (map #(inc (mod % 5)) (range (* n blocks width))))
@@ -76,7 +90,8 @@
                   handle (gpu/bind-kernel-executable!
                           sess id executable
                           (cond-> [:a :b :da :db :out]
-                            (not= id :typed) (conj {:type :int :value (* m n)}))
+                            (= :kernel-artifact (executable/kind executable))
+                            (conj {:type :int :value (* m n)}))
                           {:profile? true})]
               (swap! bound conj {:id id :handle handle
                                 :bind-ms (/ (- (System/nanoTime) start) 1.0e6)
@@ -87,6 +102,7 @@
                 (when-not (= expected actual)
                   (throw (ex-info "candidate failed exact dyadic oracle" {:candidate id}))))))
           {:kind :internal-staged-candidate-comparison :shape shape
+           :comparison-mode comparison-mode
            :revision revision :environment environment :device (ocl/selected-device-info)
            :input-recipe {:a :index-mod3-plus1 :b :index-mod5-plus1 :da 0.5 :db 0.25}
            :validation {:passed? true :oracle :explicit-host-dot-dyadic-lift :comparison :exact}
