@@ -17,7 +17,8 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.passes.parallel.staged-contraction-admission :as admission]))
+            [raster.compiler.passes.parallel.staged-contraction-admission :as admission]
+            [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stages]))
 
 (def decline! admission/decline!)
 (def declined? admission/declined?)
@@ -135,13 +136,17 @@
                    (instance? raster.compiler.ir.segop.SegContract operation))
               :typed-node {:node node})
     (let [equation (first equations)
-          {:keys [facts bindings]} (projection/contraction-binding algorithm equation)
+          {:keys [facts bindings scalar-types]} (projection/contraction-binding algorithm equation)
           expected (assoc (segop/->SegContract (second equation) facts (:dtype facts)
                                               (:device-id operation))
                           :bindings bindings)]
       (require! (= expected operation) :typed-operation
                 {:expected expected :operation operation})
-      (let [lowered (lower facts)
+      (let [lowered (try (lower facts)
+                         (catch clojure.lang.ExceptionInfo e
+                           (if (declined? e)
+                             (scalar-stages/lower facts :scalar-types scalar-types)
+                             (throw e))))
             arguments (mapv #(get bindings % %) (:arguments lowered))
             rebound (scheduled/make
                      (-> (into {} lowered)

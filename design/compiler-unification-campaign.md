@@ -666,3 +666,26 @@ Known capacity is supplied at compilation for these larger-buffer cases. General
 adaptation and dynamic view specialization still need their own invocation/view contracts; exact
 invocation tensor-shape checks remain intact. Indexed captures can conservatively limit fusion;
 recovering pointwise fusion through explicit views belongs with the broader typed fusion work.
+
+### Generic floating staged reductions
+
+Static floating staged contractions now use the same retained closure and resident graph route
+as packed contractions. Their arbitrary-depth reduction loops and per-stage conversions are
+constructed with the shared scalar SSA builder and emitted through the common target emitters;
+there is no floating-stage source template. The packed schedule remains preferred when its
+legality proof applies. This ordered scalar schedule establishes a general correctness baseline,
+not a claim of competitive tiling or throughput.
+
+Frontend capability analysis constructs the same typed stage plan as lowering, without target
+emission or device work. Each buffer retains one declared storage dtype; captures require
+authoritative types. Explicit and implicit compound scalar conversion boundaries require retained
+type evidence, preserving checked integer arithmetic before floating conversion. This stricter
+contract is opt-in for the new route; older packed scalar owners still need separate migration.
+Portable OpenCL rejects checked trapping arithmetic, while Intel OpenCL, CUDA and HIP provide
+the corresponding target helpers. Target-neutral admission does not imply universal target support.
+
+Validation covers three floating stages, scalar captures, cancellation and signed-zero identities,
+common resident binding, public compilation/execution, all four source dialects, unsupported-domain
+declines, and retained checked integer arithmetic. Broader integer stage schedules, dynamic domains,
+cooperative scheduling, target capability-driven alternatives and external performance comparisons
+remain follow-ups; the older staged fallback is not yet fully retired.
