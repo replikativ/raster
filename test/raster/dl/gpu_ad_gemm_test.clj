@@ -1,18 +1,17 @@
 (ns raster.dl.gpu-ad-gemm-test
   "GPU-AD validation: the matmuls an AD-transformed train step emits — the forward projection
    (linear-nb → dgemm-nt!, :nt) and its two backward gradients (linear-dx → dgemm!, :nn;
-   linear-dW → dgemm-tn!, :tn) — each lower through compile-gpu-program to a RESIDENT XMX GEMM
-   graph and match the CPU BLAS reference. This is the empirical end of the framework claim
+   linear-dW → dgemm-tn!, :tn) — each lower through compile-gpu-program to a resident typed
+   contraction executable and match the CPU BLAS reference. This is the empirical end of the framework claim
    that AD-transformed IR flows through the GPU pipeline: the backward kernels ARE ordinary
    GEMMs, so recognizing them on the resident path (incl. the :tn weight-gradient variant) is
    what makes gradient computation run on device.
 
-   The full mse∘linear-nb TRAIN STEP does NOT yet fully lower (its loss reduction + the
-   daxpy-diff-into! elementwise gradient have no resident kernel in the composed AD path);
-   compile-gpu-program returns nil for it (clean staging-fn fallback). That current boundary is
-   asserted below so progress flips it — see .internal/ad_gpu_residency.md.
+   The full mse∘linear-nb train step returning updated weights is checked for resident
+   compilation and, on a device, numerical agreement with the CPU update.
 
-   Level-Zero / Intel-XMX only (the fp16 DPAS GEMM kernel). Skips cleanly without a GPU."
+   Device checks use Level Zero. Schedule selection retains precision and index-width legality;
+   residency is not a claim that an XMX candidate was selected. Skips visibly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
             [raster.dl.array-ops :as ops]
@@ -345,7 +344,7 @@
                        (let [vg ((raster.ad.reverse/value+grad #'gpu-ad-probe-loss)
                                  W x tgt batch in-f out-f)
                              dW (clojure.core/nth vg 1)]
-                         (raster.dl.optim/sgd-step! W dW (raster.arrays/alength W) lr)
+                         (raster.dl.optim/sgd-step! W dW (raster.arrays/alength W) (float lr))
                          W)))]
     (testing "full AD train step compiles to a fully-resident program (pins residency)"
       ;; :on-non-resident :nil = probe the boundary without throwing (default is :throw now)
@@ -353,4 +352,18 @@
         (is (some? p)
             "mse∘linear train step must extract fully resident (matmuls + fused loss + SGD)")
         (when p
-          (is (seq (:steps p)) "resident descriptor carries kernel steps"))))))
+          (is (seq (:steps p)) "resident descriptor carries kernel steps"))))
+    (testing "a small AD/SGD update executes numerically, not only as a resident descriptor"
+      (if-not @gp/gpu-available?
+        (gp/gpu-skip! "gpu-ad-full-train-step-execution")
+        (let [batch 2 in-f 3 out-f 2 lr 0.01
+              weights (rnd (* in-f out-f) 31)
+              input (rnd (* batch in-f) 32)
+              target (rnd (* batch out-f) 33)
+              expected (@train (aclone weights) input target batch in-f out-f lr)
+              {:keys [out]} (run-resident train
+                                         [weights input target batch in-f out-f lr])]
+          (is (< (rel-err out expected) 1e-3)
+              "the GPU update matches the complete CPU AD and SGD composition")
+          (is (not= (vec weights) (vec expected))
+              "the fixture performs a nontrivial weight update"))))))
