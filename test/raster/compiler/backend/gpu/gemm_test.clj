@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
@@ -295,6 +296,34 @@
         (is (re-find #"int batch" (:source batched)))
         (is (every? #(re-find (re-pattern (str % " \\+= ")) (:source batched))
                     ["A" "B" "C"]))))))
+
+(deftest direct-split-matrix-requires-whole-positive-k-fragments
+  (let [emitted (gemm/emit-scheduled-split-k-kernel
+                 {:kernel-name "partition_contract" :a 'a :b 'b :c 'partials
+                  :m 'm :n 'n :k 'k :kc 'chunk :splits 'partitions
+                  :tile (hardware/derive-gemm-tile {})})
+        conditions (:preconditions emitted)
+        values {'m 8 'n 32 'k 64 'partitions 2}]
+    (doseq [chunk [16 32 64]]
+      (is (precondition/check! conditions (assoc values 'chunk chunk))))
+    (doseq [chunk [-16 0 1 17 31]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
+                            (precondition/check! conditions (assoc values 'chunk chunk)))))))
+
+(deftest partition-contract-binds-literal-limits-and-rejects-unknown-ranges
+  (let [emitted (gemm/emit-scheduled-split-k-kernel
+                 {:kernel-name "literal_partition" :a 'a :b 'b :c 'partials
+                  :m 8 :n 32 :k 64 :kc 'chunk :splits 'partitions
+                  :tile (hardware/derive-gemm-tile {})})
+        kernel (:kernel-body emitted)
+        {:keys [m n k]} (get-in kernel [:attributes :dimension-parameters])
+        values {m 8 n 32 k 64 'chunk 32 'partitions 2}]
+    (is (precondition/check! (:preconditions emitted) values))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
+                          (precondition/check! (:preconditions emitted) (assoc values k 32))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"canonical uniform grid-Z"
+                          (block-io/body-requirements
+                           (assoc-in kernel [:attributes :iteration-range :k] [1 64]))))))
 
 (deftest layout-variants-are-graph-topology-not-runtime-conventions
   (doseq [[variant expected-node-count transpose-phase]
