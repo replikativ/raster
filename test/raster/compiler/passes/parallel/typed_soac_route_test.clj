@@ -1167,7 +1167,7 @@
 (deftest long-dimensions-admit-only-guarded-unbatched-matrix-schedules
   (doseq [batched? [false true]
           widths [{'m :long 'n :long 'k :long} {'m :int 'n :int 'k :long}]]
-    (let [declined? (or batched? (some #{:int} (vals widths)))
+    (let [declined? (some #{:int} (vals widths))
           contract (if batched?
                      '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
                         (* (aget A (+ (* (+ (* b m) i) k) l)) (aget B (+ (* l n) j))))
@@ -1193,12 +1193,14 @@
           (is (= :mixed-dpas-index-width-not-lowered
                  (get-in dispatch [:attributes :matrix-graph-decline :reason]))))
         (let [{:keys [abi arguments]} (executable/common-view (kdispatch/default-alternative dispatch))]
-          (is (= #{:portable-segred :xmx-direct :xmx-split-k}
+          (is (= (if batched? #{:portable-segred :xmx-batched}
+                               #{:portable-segred :xmx-direct :xmx-split-k})
                  (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
-          (doseq [[dimensions expected] [[{'m 16 'n 32 'k 32} :xmx-direct]
+          (doseq [[dimensions expected] [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
                                          [{'m 16 'n 16 'k 32} :portable-segred]
                                          [{'m 2147483648 'n 32 'k 32} :portable-segred]]
-                  :let [values (mapv (fn [slot argument]
+                  :let [dimensions (assoc dimensions 'batch 2)
+                        values (mapv (fn [slot argument]
                                        (if (= :scalar (:kind slot))
                                          {:type :long :value (get dimensions argument)} argument))
                                      abi arguments)]]
@@ -1207,9 +1209,9 @@
           (doseq [dimensions [{'m 16 'n 16 'k 32} {'m 2147483648 'n 32 'k 32}]]
             (is (thrown? clojure.lang.ExceptionInfo
                          (kernel-graph-call/temporary-specs
-                          (kdispatch/alternative dispatch :xmx-direct)
+                          (kdispatch/alternative dispatch (if batched? :xmx-batched :xmx-direct))
                           (into {} (map (fn [[id value]] [id {:type :long :value value}]))
-                                dimensions)))))))
+                                (cond-> dimensions batched? (assoc 'batch 2)))))))))
       (let [scalar-slots (filter #(= :scalar (:kind %))
                                  (:abi (first (:alternatives dispatch))))]
         (is (= (if batched? 4 3) (count scalar-slots)))

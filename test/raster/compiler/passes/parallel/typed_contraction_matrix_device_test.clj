@@ -42,13 +42,14 @@
      :precision :mixed-f16-f32))))
 
 (defn- typed-batched-dispatch
-  [device-id]
+  [device-id scalar-dtype]
   (let [{:keys [form]}
         (pipeline/schedule-parallel-form
          batched-source {:target-device device-id
                          :dtype :float
                          :array-types {'A :float 'B :float 'C :float}
-                         :scalar-types {'batch :int 'm :int 'n :int 'k :int}})
+                         :scalar-types {'batch scalar-dtype 'm scalar-dtype
+                                        'n scalar-dtype 'k scalar-dtype}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
@@ -229,20 +230,21 @@
 (deftest batched-typed-contraction-executes-with-shared-weights
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "batched typed contraction matrix KernelExecutable")
-    (let [device-id :ze:0
+    (doseq [scalar-dtype [:int :long]]
+     (let [device-id :ze:0
           batch 2
           m 8
           n 32
           k 32
           a (input-array (* batch m k) 41)
           b (input-array (* k n) 43)
-          scheduled (typed-batched-dispatch device-id)
+          scheduled (typed-batched-dispatch device-id scalar-dtype)
           runtime-arguments
           [:a :b :c
-           {:type :int :value batch}
-           {:type :int :value m}
-           {:type :int :value n}
-           {:type :int :value k}]
+           {:type scalar-dtype :value batch}
+           {:type scalar-dtype :value m}
+           {:type scalar-dtype :value n}
+           {:type scalar-dtype :value k}]
           selected (dispatch/select-alternative scheduled runtime-arguments)]
       (is (= :xmx-batched (executable/strategy selected)))
       (gpu/with-gpu-session [session device-id]
@@ -257,7 +259,7 @@
                                 (batched-reference a b batch m n k))
                    1.0e-3))
             (finally
-              (gpu/release-kernel-graph! session handle))))))))
+              (gpu/release-kernel-graph! session handle)))))))))
 
 (deftest typed-result-transform-executes-inside-the-matrix-store
   (if-not @gpu-probe/gpu-available?
