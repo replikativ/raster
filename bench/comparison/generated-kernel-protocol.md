@@ -70,6 +70,24 @@ above. This controls one ordering confound, not cache/thermal drift. The summary
 is only the existing coefficient-of-variation heuristic; it neither proves stationarity nor
 selects a winner. No tuning cache or production selector is changed by this measurement API.
 
+`bench/staged_contraction_probe.clj` provides an opt-in internal three-way comparison using this
+API. In a `:bench` REPL, require `staged-contraction-probe` and call `run!` with
+`{:shape [1 128 32 32] :revision "<git revision>" :environment "<machine/session identity>"}`.
+Its returned plain EDN includes input recipe, selected OpenCL device, executable signatures,
+binding times, ordered raw device samples and exact dyadic reference validation. It caps reference
+work at eight million products and logical resident storage at 64 MiB; these are not total JVM or
+driver memory caps. Positive periodic inputs prevent an all-zero oracle. Broader signed and
+cancellation correctness remains covered separately by the staged-contraction device tests.
+
+The saved internal probe `bench/results/staged-paired-fa7319e4.edn` uses 6 warmup rounds and 24
+measured rotating rounds on the Intel Arc laptop. Median microseconds for typed/scalar/packed:
+`[1 128 32 32]`: 38.958 / 24.166 / 32.708; `[4 128 32 32]`: 41.041 / 19.687 / 32.500.
+All candidates passed their host oracle, but every series failed the default CV heuristic.
+These warm resident, shared-host measurements do not justify promotion or an external performance
+claim. They suggest examining loop/index code and backend vectorization as well as packed loads;
+the retained packed path is not necessarily the fastest baseline. The report identifies the exact
+measured revision; later runner serialization changes preserve the same recorded numeric samples.
+
 Pin external revisions before measurement. Retain individual shapes and failures; publish
 any aggregate only alongside them. Tune on a declared training set and measure held-out
 shapes, with a stated budget for each implementation. Do not update reference baselines

@@ -93,9 +93,11 @@
            :scope {:cache :warm :timing :device-event :transfers-included? false
                    :public-compiler-path? false :promotion? false}
            :candidates (mapv #(dissoc % :handle) @bound)
-           :comparison (gpu/measure-bound-kernel-graphs-interleaved!
-                        sess (mapv #(assoc (select-keys % [:id :handle]) :before-sample! poison!) @bound)
-                        :rounds rounds :warmup-rounds warmup-rounds)}
+           :comparison (update
+                        (gpu/measure-bound-kernel-graphs-interleaved!
+                         sess (mapv #(assoc (select-keys % [:id :handle]) :before-sample! poison!) @bound)
+                         :rounds rounds :warmup-rounds warmup-rounds)
+                        :measurements #(update-vals % (fn [m] (into {} m))))}
           (finally
             (doseq [{:keys [handle]} (reverse @bound)]
               (gpu/release-kernel-graph! sess handle))))))))
