@@ -391,3 +391,51 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
                               (graph-call/temporary-specs graph values)))
         (is (map? (graph-call/temporary-specs graph values)))))))
+
+(deftest matrix-stages-derive-logical-widths-from-their-graph
+  (doseq [variant [:nn :nt :tn :tt]
+          widths [[:long :long :long] [:long :int :long]]]
+    (let [interface (executable/common-view (dispatch/default-alternative (emitted variant)))
+          by-argument (zipmap [:m :n :k] widths)
+          interface (update interface :abi
+                            (fn [slots]
+                              (mapv (fn [slot argument]
+                                      (if-let [dtype (get by-argument argument)]
+                                        (assoc slot :dtype dtype :kernel-dtype dtype) slot))
+                                    slots (:arguments interface))))
+          {:keys [alternatives]}
+          (gemm/emit-matrix-alternatives
+           {:id [:graph-widths variant widths] :a 'a :b 'b :c 'c :m :m :n :n :k :k
+            :variant variant :tile (hardware/derive-gemm-tile {}) :fill-workgroups 32
+            :external-interface interface})
+          values (zipmap [:m :n :k] (mapv (fn [dtype value] {:type dtype :value value})
+                                         widths [3 32 1024]))]
+      (doseq [graph alternatives]
+        (is (map? (graph-call/temporary-specs graph values)))
+        (doseq [node (:nodes graph)
+                binding (get-in node [:operation :attributes :scheduled-kernel-body :scalar-bindings])]
+          (is (= (launch/typed-expression-dtype (:value binding) by-argument) (:dtype binding)))
+          (is (= (if (= :long (:dtype binding)) :checked-range :identity)
+                 (:conversion binding))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
+                              (graph-call/temporary-specs graph
+                                                         (assoc-in values [:m :value] 2147483648))))))))
+
+(deftest batched-matrix-stages-retain-the-public-long-environment
+  (let [spec {:id :long-batch :a 'a :b 'b :c 'c :batch 'batch :m 'm :n 'n :k 'k
+              :variant :nn :tile (hardware/derive-gemm-tile {})
+              :batching {:row true :col false}}
+        base (:graph (gemm/emit-batched-matrix-alternative spec))
+        interface (update (executable/common-view base) :abi
+                          #(mapv (fn [slot] (if (= :scalar (:kind slot))
+                                             (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
+        graph (:graph (gemm/emit-batched-matrix-alternative
+                       (assoc spec :external-interface interface)))
+        values (zipmap '[batch m n k] (mapv #(hash-map :type :long :value %) [2 8 32 32]))
+        bindings (mapcat #(get-in % [:operation :attributes :scheduled-kernel-body :scalar-bindings])
+                         (:nodes graph))]
+    (is (every? #(= :long (:dtype %)) bindings))
+    (is (every? #(= :checked-range (:conversion %)) bindings))
+    (is (map? (graph-call/temporary-specs graph values)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
+                          (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))))))
