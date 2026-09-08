@@ -279,6 +279,7 @@
         (layout-emitter/cast-body
          {:id stage-id :input in :output out
           :source-dtype :float :destination-dtype :half :vector-width vector-width
+          :extent-dtype (klaunch/typed-expression-dtype elements scalar-types)
           :rounding :nearest-even :overflow :ieee})]
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name
@@ -310,7 +311,9 @@
         kernel-name (c-emit/c-symbol kernel-name)
         kernel-body
         (layout-emitter/transpose-body
-         {:id stage-id :input in :output out :element-dtype :half})]
+         {:id stage-id :input in :output out :element-dtype :half
+          :row-extent-dtype (klaunch/typed-expression-dtype rows scalar-types)
+          :column-extent-dtype (klaunch/typed-expression-dtype cols scalar-types)})]
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name
       :source stage
@@ -575,7 +578,8 @@
             :scalar-types scalar-types :target-dialect target-dialect))))
 
 (defn- split-k-combine-plan
-  [stage-id]
+  ([stage-id] (split-k-combine-plan stage-id {'mn :int 'splits :int}))
+  ([stage-id scalar-types]
   (let [form '(raster.par/contract C [[i mn]] [[s splits]]
                                    (clojure.core/aget
                                     partials (clojure.core/+ (clojure.core/* s mn) i)))
@@ -585,11 +589,11 @@
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'partials :float 'C :float}
-                  :scalar-types {'mn :int 'splits :int}})
+                  :scalar-types scalar-types})
         _ (when-not (:ok planned)
             (throw (ex-info "split-K combination did not admit the portable contraction schedule"
                             {:reason :raster/bug :plan planned})))]
-    {:operation operation :body (:body planned) :plan planned}))
+    {:operation operation :body (:body planned) :plan planned})))
 
 (defn emit-split-k-combine-kernel
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
@@ -606,7 +610,10 @@
 
 (defn- combine-artifact
   [kernel-name operation partials c mn splits target-dialect scalar-types]
-  (let [{body :body} (split-k-combine-plan (:id operation))]
+  (let [{body :body} (split-k-combine-plan
+                    (:id operation)
+                    {'mn (klaunch/typed-expression-dtype mn scalar-types)
+                     'splits (klaunch/typed-expression-dtype splits scalar-types)})]
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name :source operation :body body
       :arguments [partials c mn splits mn]

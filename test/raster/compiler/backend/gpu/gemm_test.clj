@@ -415,7 +415,7 @@
         (doseq [node (:nodes graph)
                 binding (get-in node [:operation :attributes :scheduled-kernel-body :scalar-bindings])]
           (is (= (launch/typed-expression-dtype (:value binding) by-argument) (:dtype binding)))
-          (is (= (if (= :long (:dtype binding)) :checked-range :identity)
+          (is (= (if (= (:kernel-dtype binding) (:dtype binding)) :identity :checked-range)
                  (:conversion binding))))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                               (graph-call/temporary-specs graph
@@ -435,7 +435,7 @@
         bindings (mapcat #(get-in % [:operation :attributes :scheduled-kernel-body :scalar-bindings])
                          (:nodes graph))]
     (is (every? #(= :long (:dtype %)) bindings))
-    (is (every? #(= :checked-range (:conversion %)) bindings))
+    (is (= #{:identity :checked-range} (set (map :conversion bindings))))
     (is (map? (graph-call/temporary-specs graph values)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                           (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))))))
