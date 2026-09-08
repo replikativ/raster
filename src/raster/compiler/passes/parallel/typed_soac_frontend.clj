@@ -16,6 +16,7 @@
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
+            [raster.compiler.passes.parallel.staged-scalar-body :as scalar-stage-body]
             [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -956,7 +957,7 @@
            io)))
 
 (defn- staged-contract-description
-  [id symbol source array-types]
+  [id symbol source array-types scalar-types]
   (let [declared (fn [id]
                    (some-> (or (get array-types id)
                                (get array-types (clojure.core/symbol (name id)))) dtype/canon))
@@ -976,7 +977,12 @@
                         :capture-parameters (vec (sort-by pr-str scalars))}]
         (when (try (staged-admission/analyze! facts) true
                    (catch clojure.lang.ExceptionInfo e
-                     (if (staged-admission/declined? e) false (throw e))))
+                     (if (staged-admission/declined? e)
+                       (try (scalar-stage-body/analyze! facts :scalar-types scalar-types) true
+                            (catch clojure.lang.ExceptionInfo scalar-error
+                              (if (= :staged-scalar-body-declined (:reason (ex-data scalar-error)))
+                                false (throw scalar-error))))
+                       (throw e))))
           (contraction-closure/validate! attributes)
           {:kind :contract :id id :sym symbol :facts facts :closure attributes
            :inputs reads :outputs #{(:out facts)} :scalars scalars
@@ -985,7 +991,7 @@
            :result-storage [{:destination (:out facts) :access :write :host-return :buffer}]})))))
 
 (defn- operation-description
-  [id symbol expression default-dtype array-types]
+  [id symbol expression default-dtype array-types scalar-types]
   (cond
     ;; SplitMix64 is pointwise scalar algebra, not a semantic parallel primitive. Preserve the
     ;; public convenience operation's fixed-width ABI here, then expose an ordinary typed map to
@@ -1245,7 +1251,7 @@
           description (operation-description
                        id symbol
                        (vary-meta reduce-form assoc :raster.type/elem-type elem-type)
-                       default-dtype array-types)
+                       default-dtype array-types scalar-types)
           {:keys [product inputs scalars index extent]} description
           expressions (:results (reduction/fold-region product))]
       ;; This internal compatibility spelling owns storage, not a second reduction algebra.
@@ -1308,7 +1314,7 @@
       ;; result transform. Staged quantization carries additional schedule/load contracts and must
       ;; not be admitted by dropping those facts.
       (if (seq (:stages facts))
-        (staged-contract-description id symbol facts array-types)
+        (staged-contract-description id symbol facts array-types scalar-types)
       (if (empty? contract-axes)
         ;; A static zero-reduction contraction is a map, not a fold from a fabricated zero.
         ;; Coordinate decomposition is the existing axis-flattening operation. Required input
@@ -1834,7 +1840,7 @@
     (first (descriptor/call-args expression))))
 
 (defn- source-descriptions
-  [pairs default-dtype array-types]
+  [pairs default-dtype array-types scalar-types]
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
@@ -1843,7 +1849,7 @@
     (fn [{:keys [array-types scalar-definitions] :as state} [id [symbol expression]]]
       (let [description
             (or (binding [*scalar-definitions* scalar-definitions]
-                  (operation-description id symbol expression default-dtype array-types))
+                  (operation-description id symbol expression default-dtype array-types scalar-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
@@ -2059,13 +2065,13 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types values shape-equalities]
+  [source {:keys [dtype array-types scalar-types values shape-equalities]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types)
+          descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
                                           shape-equalities values)
           physical-outputs (physical-output-symbols descriptions)
           declined (remove #(supported-description? physical-outputs %) descriptions)
@@ -2822,7 +2828,7 @@
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
           descriptions (preserve-map-storage-inputs
-                         (normalize-extents (source-descriptions pairs dtype array-types)
+                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
                                             shape-equalities values)
                          values)]
       (when (and (even? (count bindings))
