@@ -30,6 +30,25 @@
     (is (= "+" (kart/attribute a :c-op)))
     (is (identical? a (kart/validate! a)))))
 
+(deftest compilation-contract-is-explicit-and-not-arbitrary-flags
+  (is (= {} (kart/compilation (kart/make base))))
+  (doseq [standard ["CL1.2" "CL2.0" "CL3.0"]]
+    (let [contract {:language-standard standard :extensions #{"cl_khr_integer_dot_product"}}
+          a (kart/make (assoc-in base [:attributes :compilation] contract))]
+      (is (= contract (kart/compilation a)))
+      (is (= {:source "same" :compilation contract}
+             (kart/compilation-identity {:source "same"} a)))))
+  (is (= {:source "same"} (kart/compilation-identity {:source "same"} (kart/make base))))
+  (doseq [bad [nil [] {:flags "-cl-fast-relaxed-math"} {:language-standard "CL9.0"}
+               {:language-standard "CL3.0 -DUNSAFE"}
+               {:language-standard "CL3.0" :extensions ["cl_khr_integer_dot_product"]}
+               {:language-standard "CL3.0" :extensions #{"cl_x -DUNSAFE"}}]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"compilation requirements"
+                         (kart/make (assoc-in base [:attributes :compilation] bad)))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (kart/compilation {:target :cuda-c
+                                  :attributes {:compilation {:language-standard "CL3.0"}}}))))
+
 (deftest artifact-refuses-an-unverified-module-or-call
   (testing "source and ABI parameter order cannot diverge"
     (is (thrown-with-msg?

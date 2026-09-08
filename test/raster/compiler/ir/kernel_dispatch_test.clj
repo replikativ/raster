@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.core :as gpu]
+            [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
 
@@ -36,6 +37,28 @@
 
 (def ^:private subgroup
   (artifact "dispatch_subgroup" :subgroup-score-reuse 16))
+
+(deftest compiler-requirements-cannot-collide-under-one-entry-point
+  (let [cl3 (-> reference
+                (assoc-in [:attributes :strategy] :cl3)
+                (assoc-in [:attributes :compilation] {:language-standard "CL3.0"}))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting modules"
+                         (kdispatch/make {:id "compilation-conflict"
+                                          :alternatives [reference cl3]
+                                          :default-strategy :reference
+                                          :selector {:kind :fixed-strategy :strategy :reference}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not yet consume"
+                         (ze/register-kernel! "compile_contract_rejected" cl3)))
+    (is (nil? (ze/kernel-registry-entry "compile_contract_rejected")))))
+
+(deftest opencl-compilation-options-check-exact-device-extension-tokens
+  (let [options (ns-resolve 'raster.gpu.ocl-runtime 'compilation-options)
+        req {:language-standard "CL3.0" :extensions #{"cl_khr_integer_dot_product"}}]
+    (is (nil? (options {} {})))
+    (is (= "-cl-std=CL3.0"
+           (options req {:extensions "cl_other cl_khr_integer_dot_product\ncl_last"})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lacks required"
+                         (options req {:extensions "cl_khr_integer_dot_product_suffix"})))))
 
 (def ^:private dispatch
   (kdispatch/make
@@ -116,6 +139,15 @@
                 (kgraph/->ValueUse 'out :write)] #{'width} [:stage-one])]
       :effects (:effects reference)
       :attributes {:strategy :two-stage}})))
+
+(deftest graph-node-compilation-requirements-invalidate-tuning
+  (let [graph (staged-graph)
+        changed (assoc-in graph [:nodes 1 :operation :attributes :compilation]
+                          {:language-standard "CL3.0"})
+        before (tuning/executable-signature graph)
+        after (tuning/executable-signature changed)]
+    (is (not= (:source-hash before) (:source-hash after)))
+    (is (= (dissoc before :source-hash) (dissoc after :source-hash)))))
 
 (deftest runtime-scalars-select-an-abi-compatible-artifact
   (is (kdispatch/kernel-dispatch? dispatch))

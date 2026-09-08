@@ -19,7 +19,8 @@
             MemoryLayout MemorySegment SymbolLookup ValueLayout
             AddressLayout]
            [java.lang.invoke MethodHandle])
-  (:require [raster.compiler.core.dtype :as dt]
+  (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -912,11 +913,24 @@
   [dispatch-id]
   (get @kernel-dispatch-registry dispatch-id))
 
+(defn- compilation-options
+  [compilation device-info]
+  (let [requirements (kart/compilation {:target :opencl-c :attributes {:compilation compilation}})
+        supported (set (str/split (:extensions device-info "") #"\s+"))
+        missing (seq (remove supported (:extensions requirements)))
+        _ (when missing
+            (throw (ex-info "OpenCL device lacks required compiler extensions"
+                            {:reason :opencl-compilation-requirements :missing (set missing)})))]
+    (when-let [standard (:language-standard requirements)] (str "-cl-std=" standard))))
+
 (defn- compile-program!
   "Compile OpenCL C source to a cl_program. Returns the program handle."
-  ^MemorySegment [^String source]
+  ^MemorySegment [^String source compilation]
   (ensure-init!)
-  (let [{:keys [context device arena]} @state
+  (let [{:keys [context device arena device-info]} @state
+        options (if-let [options (compilation-options compilation device-info)]
+                  (.allocateFrom ^Arena arena ^String options)
+                  MemorySegment/NULL)
         err-seg (.allocate ^Arena arena I32)
         ;; Create string pointer
         src-seg (.allocateFrom ^Arena arena source)
@@ -933,10 +947,11 @@
         dev-seg (.allocateFrom ^Arena arena PTR device)
         ret (int (.invokeWithArguments ^MethodHandle @h-clBuildProgram
                                        (into-array Object [program (int 1) dev-seg
-                                                           MemorySegment/NULL MemorySegment/NULL MemorySegment/NULL])))]
+                                                           options MemorySegment/NULL MemorySegment/NULL])))]
     (when (not= CL_SUCCESS ret)
       ;; Get build log for diagnostics
-      (let [log-size-seg (.allocate ^Arena arena I64)
+      (try
+        (let [log-size-seg (.allocate ^Arena arena I64)
             _ (.invokeWithArguments ^MethodHandle @h-clGetProgramBuildInfo
                                     (into-array Object [program device (int CL_PROGRAM_BUILD_LOG)
                                                         (long 0) MemorySegment/NULL log-size-seg]))
@@ -946,8 +961,10 @@
                                     (into-array Object [program device (int CL_PROGRAM_BUILD_LOG)
                                                         log-size log-buf log-size-seg]))
             build-log (.getString log-buf 0)]
-        (throw (ex-info (str "clBuildProgram failed: " build-log)
-                        {:error ret :build-log build-log}))))
+          (throw (ex-info (str "clBuildProgram failed: " build-log)
+                          {:error ret :build-log build-log})))
+        (finally
+          (.invokeWithArguments ^MethodHandle @h-clReleaseProgram (into-array Object [program])))))
     program))
 
 (defn- ensure-kernel-loaded!
@@ -967,7 +984,7 @@
             _ (when-not source
                 (throw (ex-info "Kernel has no :source for OpenCL compilation"
                                 {:kernel-name kernel-name})))
-            program (compile-program! source)
+            program (compile-program! source (kart/compilation info))
             err-seg (.allocate ^Arena arena I32)
             kname-seg (.allocateFrom ^Arena arena ^String kernel-name)
             kernel-handle (.invokeWithArguments ^MethodHandle @h-clCreateKernel

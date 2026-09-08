@@ -31,6 +31,31 @@
   (and x (= "raster.compiler.ir.kernel_artifact.KernelArtifact"
             (.getName (class x)))))
 
+(defn compilation
+  "Checked target compiler requirements, stored in the existing artifact attributes.
+   Empty requirements preserve runtime defaults. Explicit OpenCL language/extension requirements
+   are not arbitrary compiler flags or permission to change numerical policy."
+  [artifact]
+  (let [contract (get-in artifact [:attributes :compilation] {})]
+    (when-not (and (map? contract)
+                   (every? #{:language-standard :extensions} (keys contract))
+                   (or (empty? contract)
+                       (and (= :opencl-c (:target artifact))
+                            (contains? #{"CL1.2" "CL2.0" "CL3.0"} (:language-standard contract))
+                            (set? (:extensions contract #{}))
+                            (every? #(and (string? %) (re-matches #"cl_[A-Za-z0-9_]+" %))
+                                    (:extensions contract #{})))))
+      (throw (ex-info "invalid kernel compilation requirements"
+                      {:reason :kernel-artifact-compilation :target (:target artifact)
+                       :compilation contract})))
+    contract))
+
+(defn compilation-identity
+  "Add compiler requirements to an existing executable fingerprint only when nonempty."
+  [identity artifact]
+  (let [contract (compilation artifact)]
+    (cond-> identity (seq contract) (assoc :compilation contract))))
+
 (defn validate!
   "Validate `artifact` and return it unchanged. Validation includes the emitted target C-family
    signature, so no unverified KernelArtifact can enter a runtime registry."
@@ -75,6 +100,7 @@
       (when-not (map? value)
         (throw (ex-info (str "kernel artifact " k " must be a map")
                         {:kernel-name kernel-name k value}))))
+    (compilation artifact)
     artifact))
 
 (defn make
