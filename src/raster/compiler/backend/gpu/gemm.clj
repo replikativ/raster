@@ -361,7 +361,7 @@
   front doors. Caller identities remain the KernelBody ABI identities; OpenCL parameter spelling
   is solely a target concern. Optional views, hardware indices, and K bounds are explicit schedule
   values used by the split-K and batched wrappers below. An optional epilogue becomes a typed
-  ScalarRegion on every store and is lowered as part of the body."
+  ScalarSSARegion on every store and is lowered as part of the body."
   [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
            target-dialect
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers

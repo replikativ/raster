@@ -456,8 +456,15 @@ scalar C stores are not over-aligned. Projection verification rejects stripped r
 Intel block-I/O now admits subgroup 16 only, and C linear stores widen before multiplication.
 Focused Arc direct, split-K, batched/shared-weight and fused-SSA-epilogue execution passes with
 legal surface widths. Non-allocating tests cover maximum surfaces and rejected odd-height/K48
-batched slices. This does not admit retained Long dimensions or prove legacy ScalarRegion source
-epilogue indexing safe at large sizes; production SSA epilogues retain typed storage addressing.
+batched slices. This does not admit retained Long dimensions.
+
+Executable matrix stores now require ScalarSSARegion. The semantic ScalarRegion descriptor remains
+an input to scheduling, but cannot bypass typed lowering into KernelBody. The old source-expression
+store emitter, tag reconstruction and op-map-derived call whitelist are removed. Ordered epilogue
+ABI checks remain shared; an explicit rejection test prevents reintroducing unlowered store regions.
+The existing typed SSA storage-address emitter serves matrix epilogues on both Intel and CUDA.
+Fresh capped-REPL validation: 68 tests, 688 assertions including Arc matrix execution. This removes
+a duplicate lowering path; it is not a new tensor IR or a performance claim.
 
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
