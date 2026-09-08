@@ -165,12 +165,20 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private contract-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (contract ?attributes [??arrays] [??captures]))
+                      (success {:kind :contract :id equation-id :results results
+                                :attributes attributes :arrays arrays :captures captures}))))
+
 (defn equation-info
   "Return a normalized equation description, using Pattern as the dialect matcher."
   [equation]
   (when-let [matched
              (some #(when (map? %) %)
-                   [(scalar-equation-rule equation)
+                   [(contract-equation-rule equation)
+                    (scalar-equation-rule equation)
                     (map-equation-rule equation)
                     (scatter-equation-rule equation)
                     (effect-map-equation-rule equation)
@@ -181,14 +189,15 @@
                     (segmented-fold-map-equation-rule equation)
                     (scan-equation-rule equation)])]
     (let [{:keys [lambda element-lambda map-lambda]} (dialect/operation-parts equation)]
-      (merge (dissoc matched :local-definitions)
-             (dialect/lambda-parts (or lambda element-lambda map-lambda))))))
+      (if (= :contract (:kind matched))
+        matched
+        (merge (dissoc matched :local-definitions)
+               (dialect/lambda-parts (or lambda element-lambda map-lambda)))))))
 
 (defn- equation-references
   [equation]
-  (let [{:keys [arrays captures]} (equation-info equation)]
-    (into (vec (concat arrays captures))
-          (filter dialect/value-id? (dialect/operation-extents equation)))))
+  (into (dialect/operation-inputs equation)
+        (filter dialect/value-id? (dialect/operation-extents equation))))
 
 (defn- element-symbols
   [n]

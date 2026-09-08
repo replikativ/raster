@@ -85,6 +85,19 @@ and integral scalar types. Floating declarations now specialize only under float
 kernel policies, and contraction result aliases inherit the destination type. This
 repairs the existing dependency envelope, not direct TypedSOAC staged admission.
 
+The next dialect slice represents a `contract` equation as a lexical closure over the
+same ContractionFacts, with ordered external array/capture value IDs. SSA renames those
+IDs, not the nested stage expressions or axis binders. Validation checks independent
+storage dtypes/capacities, scalar closure, output shape and explicit read/write storage
+contracts. Existing flat fusion rules recognize but do not rewrite this operation.
+The binding projection retains the original facts for the generated staged body and
+maps its arguments onto graph value IDs. This is a prerequisite: the public frontend
+still needs admission and production routing before its compatibility ledger can close.
+Closure validation is not an independent arithmetic type checker: it checks declared
+storage/scalar types and lexical scope. The existing scheduling and scalar-body lowerers
+must still prove instruction types and numerical legality. Unlowered representations,
+layouts and sharding decline, and outer lifts cannot refer to inner-stage coordinates.
+
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
 

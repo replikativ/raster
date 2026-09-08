@@ -82,6 +82,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-closure :as contraction]
             [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
@@ -490,6 +491,7 @@
              [sta stencil-attributes?]
              [ra reduce-attributes?]
              [sra segmented-reduce-attributes?]
+             [cta contraction/attributes?]
              [pra product-reduce-attributes?]
              [fa fold-attributes?]
              [sfma segmented-fold-map-attributes?]
@@ -540,6 +542,7 @@
              (stencil ?sta [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (contract ?cta [(?:* ?id:array)] [(?:* ?id:capture)])
              (product-reduce ?pra [(?:* ?id:array)] [(?:* ?id:capture)]
                              ?l:element ?l:combine)
              (segmented-fold-map ?sfma [(?:* ?id:array)] [(?:* ?id:capture)]
@@ -621,6 +624,10 @@
       (let [[_ attributes arrays captures destinations lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures
          :destinations destinations :lambda lambda})
+
+      (= 'contract kind)
+      (let [[_ attributes arrays captures] operation]
+        {:kind kind :attributes attributes :arrays arrays :captures captures})
 
       :else
       (let [[_ attributes arrays captures lambda] operation]
@@ -884,7 +891,7 @@
                  {:equation equation-id :index index :index-expression index-expression
                   :radius radius :load form}))))))
 
-(defn- validate-equation!
+(defn- validate-lambda-equation!
   [equation]
   (let [[_ equation-id results operation] equation
         {:keys [kind attributes arrays captures destinations lambda element-lambda combine-lambda
@@ -1406,7 +1413,22 @@
              {:equation equation-id :operation kind}))
     equation))
 
-(defn- validate-equation-types!
+(defn- validate-equation!
+  [equation]
+  (if (= 'contract (operation-kind equation))
+    (let [{:keys [attributes arrays captures]} (operation-parts equation)
+          results (nth equation 2)]
+      (when-not (and (distinct-vector? results) (= 1 (count results))
+                     (distinct-vector? arrays) (distinct-vector? captures)
+                     (empty? (set/intersection (set arrays) (set captures))))
+        (fail! :typed-soac-contraction-operands
+               "a contraction requires one result and distinct ordered storage/capture values"
+               {:equation equation}))
+      (contraction/bindings attributes arrays captures)
+      equation)
+    (validate-lambda-equation! equation)))
+
+(defn- validate-lambda-equation-types!
   [values equation]
   (let [[_ equation-id results] equation
         {:keys [kind attributes arrays]} (operation-parts equation)
@@ -1552,6 +1574,14 @@
 
       nil)))
 
+(defn- validate-equation-types!
+  [values equation]
+  (if (= 'contract (operation-kind equation))
+    (let [{:keys [attributes arrays captures]} (operation-parts equation)]
+      (contraction/validate-values! attributes arrays captures values
+                                   (get values (first (nth equation 2)))))
+    (validate-lambda-equation-types! values equation)))
+
 (defn- validate-result-storage!
   [program-facts equation]
   (let [[_ equation-id results] equation
@@ -1559,7 +1589,7 @@
         storage (result-storage program-facts equation-id)]
     (when storage
       (when-not (contains? #{'map 'scatter 'effect-map 'stencil 'segmented-reduce 'scan
-                             'product-reduce 'segmented-fold-map} kind)
+                             'product-reduce 'segmented-fold-map 'contract} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"
                {:equation equation-id :operation kind :storage storage}))
@@ -1582,6 +1612,12 @@
                  {:equation equation-id :operation-destinations
                   (:destinations (operation-parts equation))
                   :storage-destinations destinations}))
+        (when (and (= 'contract kind)
+                   (seq (set/intersection (set destinations)
+                                          (set (operation-inputs equation)))))
+          (fail! :typed-soac-stable-read-alias
+                 "contraction read storage must not alias its output"
+                 {:equation equation-id :destinations destinations}))
         (when (and (contains? #{'stencil 'segmented-fold-map 'scan} kind)
                    (seq (set/intersection
                          (set destinations)
@@ -1612,6 +1648,14 @@
         (doseq [[result destination] (map vector results destinations)
                 :let [logical (get-in program-facts [:values result])
                       physical (get-in program-facts [:values destination])]]
+          (when (and (= 'contract kind)
+                     (not (and (seq (:shape physical))
+                                (every? #(and (integer? %) (pos? %)) (:shape physical))
+                                (>= (reduce *' 1 (:shape physical))
+                                    (reduce *' 1 (:shape logical))))))
+            (fail! :typed-soac-contraction-output-capacity
+                   "contraction destination must cover its free-axis result space"
+                   {:equation equation-id :logical logical :physical physical}))
           (when-not physical
             (fail! :typed-soac-result-storage-value
                    "a physical result destination requires an AbstractValue"
@@ -1661,6 +1705,13 @@
     (doseq [equation equations]
       (validate-equation! equation)
       (validate-equation-types! values equation)
+      (when (and (= 'contract (operation-kind equation))
+                 (seq (operation-inputs equation))
+                 (not (contains? (get-in program-facts [:equations (second equation) :effects])
+                                 :memory/read)))
+        (fail! :typed-soac-contraction-read-effect
+               "contraction storage reads must remain explicit in equation effects"
+               {:equation (second equation)}))
       (validate-result-storage! program-facts equation))
     (let [definitions (mapcat #(nth % 2) equations)
           definition-set (set definitions)
@@ -1771,13 +1822,16 @@
                                    (update-in [:result-transform :scalars]
                                               #(mapv (fn [scalar]
                                                        (update scalar :value rename)) %)))
-                      attributes (if (= 'scalar kind)
+                      attributes (if (contains? #{'scalar 'contract} kind)
                                    attributes
                                    (update attributes :extent
                                            #(if (value-id? %) (rename %) %)))
                       operation (case kind
                                   scalar
                                   (list kind attributes (mapv rename captures) lambda)
+
+                                  contract
+                                  (list kind attributes (mapv rename arrays) (mapv rename captures))
 
                                   product-reduce
                                   (list kind attributes (mapv rename arrays)
