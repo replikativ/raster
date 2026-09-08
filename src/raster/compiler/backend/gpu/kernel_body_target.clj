@@ -122,16 +122,16 @@
            (let [names (validate-target-names!
                         kernel-name kernel-body
                         (scalar-parameter-names kernel-body parameter-names))]
-             {:source (scalar-target/emit-scalar-kernel
+             (merge (scalar-target/emit-scalar-module
                        kernel-name kernel-body
                        {:target-dialect target-dialect
                         :target-features target-features
                         :parameter-names names})
-              :target (c-dialect/target dialect)
+              {:target (c-dialect/target dialect)
               :target-dialect (:id dialect)
               :parameter-names names
               :parameter-alignments {}
-              :target-facts (scalar-target-facts kernel-body dialect target-features)}))
+              :target-facts (scalar-target-facts kernel-body dialect target-features)})))
          names (validate-target-names! kernel-name kernel-body (:parameter-names emitted))
          projected-abi (project-abi scheduled names (:parameter-alignments emitted))]
      (scheduled-body/validate-artifact-projection!
@@ -161,7 +161,9 @@
                            :body-family (if matrix? :matrix :scalar-control)
                            :legality (:legality scheduled)
                            :numerics (:numerics scheduled)
-                           :target-facts (:target-facts emitted)})})))))
+                           :target-facts (:target-facts emitted)}
+                          (when (seq (:compilation emitted))
+                            {:compilation (:compilation emitted)}))})))))
 
 (defn emit-static-dense-graph
   "Place one ScheduledKernelBody behind the existing checked graph binding boundary.

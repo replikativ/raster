@@ -118,6 +118,17 @@
    ;; The VECTOR schedules (AVX2 maddubs, wasm i32x4.dot) are :wi8-dot above.
    :dp4a {:arity 3 :kind :dp4a
           :c {:fn "rstr_dp4a"}
+          :implementations
+          {:opencl-packed-dot
+           {:dialects #{:opencl-intel :opencl-portable}
+            :compilation {:language-standard "CL3.0"
+                          :extensions #{"cl_khr_integer_dot_product"}}
+            :source (str "#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable\n"
+                         "#if !defined(__opencl_c_integer_dot_product_input_4x8bit_packed)\n"
+                         "#error packed_integer_dot_unavailable\n#endif\n"
+                         "inline int rstr_dp4a(int a, int b, int acc) {\n"
+                         "    return as_int(as_uint(acc) + as_uint(dot_4x8packed_ss_int(as_uint(a), as_uint(b))));\n"
+                         "}\n")}}
           :target-helper-src
           {:cuda (str "__device__ __forceinline__ int rstr_dp4a(int a, int b, int acc) {\n"
                       "    return __dp4a(a, b, acc);\n"
