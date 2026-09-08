@@ -211,6 +211,23 @@ and throughput, then migrate descriptor construction and remove the superseded e
 loads are not an aligned packed-word throughput claim. More general stages still need the checked
 recurrence and typed lift-region coverage described above.
 
+The follow-up device comparison binds the same logical Byte ABI for typed, retained scalar and
+retained packed emission, with independently poisoned outputs. Dyadic scale cases compare exactly;
+non-dyadic cancellation compares against explicitly stage-rounded host arithmetic with tolerance
+relative to contribution magnitudes. An all-zero result must fail that tolerance. Prepared kernel
+handles are released after synchronous execution.
+
+A small shared-laptop Arc probe (OpenCL profiling events, 3 warmup rounds and 12 interleaved timed
+samples per candidate, 64 work-items/group, uploads/compilation excluded) gave the following median
+milliseconds for `[rows outputs blocks block-width]`: `[1 128 32 32]` typed 0.052708, retained scalar
+0.039166, retained packed 0.032708; `[4 128 32 32]` typed 0.041770, scalar 0.039062, packed 0.031458.
+All outputs matched the independent reference. Samples were noisy (e.g. typed second-case range
+0.040104–0.072187 ms); this is a directional probe, not a reproducible performance baseline or
+regression in the unchanged production route. Do not promote the byte-load candidate on this
+evidence. Investigate a generic, explicitly typed/aligned packed storage load (with byte fallback),
+then repeat resident comparisons before retiring the production source emitter. Do not introduce
+a quantization-specific memory ABI or bypass the common body verifier to obtain that load.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through
