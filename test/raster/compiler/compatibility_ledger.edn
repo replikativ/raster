@@ -3,13 +3,12 @@
  "Exact fast-lane compiler signatures for representative ML and scientific workloads. Improvements update this debt downward; unexpected route, fallback, or emitter drift fails CI. Large numerical/performance comparisons live in the cold benchmark lane."
  :workloads
  {:staged-byte-float-contraction-gpu
-  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
-           :declines {[:soac-fused-stats :typed-soac-declined :typed-soac-source-coverage] 1}}
-   :fusion {:vertical 0 :horizontal 0 :iterations 0 :placements 0}
-   :lowering {:segops 1 :kernel-graphs 0 :structured-loops 0 :typed-reused 0
-              :typed-scalar-equations 0 :backend-reused 1 :backend-relowered 0 :fallback 0}
-   :emission {:kernel-count 1 :targets [:opencl-c] :strategies [:staged-segred]
-              :fallback-reasons [] :declines {} :routes {:segcontract 1}}}
+  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true :declines {}}
+   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
+   :lowering {:segops 1 :kernel-graphs 0 :structured-loops 0 :typed-reused 1
+              :typed-scalar-equations 0 :backend-reused 0 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
+              :fallback-reasons [] :declines {} :routes {:kernel-body 1}}}
 
   :dense-relu-jvm
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true :declines {}}

@@ -7,6 +7,7 @@
    owned nodes, and the emitted call enters LinkPlan as a ProgramLinkInstance. No driver object,
    kernel name, or legacy resident descriptor participates."
   (:require [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -214,9 +215,22 @@
                abstract (or (get program-values physical-id) (get program-values result))
                [state token]
                (allocate-result state invocation-id physical-id abstract scalars :result)]
-           (-> state
-               (assoc-in [:buffers result] token)
-               (update-in [:storage token :compiler-values] conj result))))
+           (let [logical (get program-values result)
+                 shape (concrete-shape result logical scalars (:buffers state) (:storage state))
+                 backing (get-in state [:storage token])
+                 prefix? (< (reduce *' 1 shape) (reduce *' 1 (:shape backing)))
+                 producer (some #(when (some #{result} (nth % 2)) %)
+                                (soac/equations (:algorithm emitted)))]
+             (if (and prefix? (contains? '#{contract map} (soac/operation-kind producer)))
+               (let [view-token (storage-id invocation-id :result-view result)]
+                 (-> state
+                     (add-storage view-token result logical shape nil :unspecified)
+                     (assoc-in [:storage view-token :backing] token)
+                     (assoc-in [:storage view-token :result-view] [result physical-id])
+                     (assoc-in [:buffers result] view-token)))
+               (-> state
+                   (assoc-in [:buffers result] token)
+                   (update-in [:storage token :compiler-values] conj result))))))
        state (:results equation)))))
 
 (defn lower
@@ -251,13 +265,19 @@
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.
         call (program-call/make parallel-program (:buffers realized) call-scalars
-                                (:loop-scratch realized) evaluate-host)
+                                (:loop-scratch realized) evaluate-host
+                                (into {} (keep :result-view) (vals (:storage realized))))
         resident-outputs (into [] (remove (comp typed-scalar? val)) (:outputs call))
         output-tokens (set (map val resident-outputs))
         storage (:storage realized)
         nodes
-        (mapv (fn [[token {:keys [shape source abstract]}]]
+        (mapv (fn [[token {:keys [shape source abstract backing]}]]
                 (link/node {:id token :dtype (:dtype abstract) :shape shape :device target
+                            :allocation-id (or backing token)
+                            :byte-size (when backing
+                                         (let [base-shape (get-in storage [backing :shape])]
+                                           (bview/required-byte-span (:dtype abstract) base-shape
+                                                                     (bview/dense-strides base-shape))))
                             :role (cond
                                     (and source (contains? output-tokens token)) :state
                                     source :state
@@ -279,6 +299,10 @@
       :nodes nodes
       :values values
       :instances [instance]
+      :aliases (into #{} (for [left nodes right nodes
+                              :when (and (not= (:id left) (:id right))
+                                         (bview/overlaps? (:view left) (:view right)))]
+                          #{(:id left) (:id right)}))
       :outputs (mapv val resident-outputs)
       :attributes {:source :typed-invocation
                    :invocation-plan invocation-id

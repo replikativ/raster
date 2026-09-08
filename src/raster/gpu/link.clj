@@ -186,7 +186,9 @@
               prepared-program
               (parallel-program/prepare-with!
                (:call instance)
-               {:bind! (fn [key graph buffers scalars]
+               {:buffer-view (fn [value-id]
+                               (:view (resident-link-value plan node-views value-id)))
+                :bind! (fn [key graph buffers scalars]
                          (let [resident-buffers
                                (into {}
                                      (map (fn [[compiler-value value-id]]

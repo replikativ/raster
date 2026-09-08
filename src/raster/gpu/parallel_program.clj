@@ -6,6 +6,8 @@
    consume the exact carry bindings selected by the call IR."
   (:refer-clojure :exclude [run!])
   (:require [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
 (declare release-prepared!)
@@ -101,9 +103,29 @@
 
    Preparation is transactional: a failed binding releases all earlier handles in reverse order.
    `run-prepared!` streams loop replay from the bounded binding table, so preparation remains
-   constant in the loop trip count."
-  [call {:keys [bind! run! release!] :as executor}]
+   constant in the loop trip count. Calls with logical result views additionally require the
+   executor's `:buffer-view` resolver from a buffer token to its checked live BufferView; exact
+   logical extent and prefix aliasing are checked before the first bind."
+  [call {:keys [bind! run! release! buffer-view] :as executor}]
   (let [call (program-call/validate! call)]
+    (doseq [step (:steps call)
+            [result physical] (:result-views step)]
+      (when-not (ifn? buffer-view)
+        (throw (ex-info "result views require checked runtime buffer-view resolution"
+                        {:reason :parallel-program-result-view-resolver :result result})))
+      (let [view (bview/validate-view! (buffer-view (get (:buffers call) result)))
+            base (bview/validate-view! (buffer-view (get (:buffers call) physical)))
+            expected (get-in call [:program :values result])
+            expected-elements (reduce *' 1 (map #(graph-call/resolve-integer (:scalar-values call) %)
+                                                 (:shape expected)))]
+        (when-not (and (= (:dtype expected) (:dtype view))
+                       (= expected-elements (reduce *' 1 (:shape view))))
+          (throw (ex-info "runtime result view differs from its logical tensor contract"
+                          {:reason :parallel-program-result-view-shape :result result
+                           :expected expected :actual view})))
+        (when-not (bview/prefix-view? base view)
+          (throw (ex-info "runtime result view is not a prefix of its physical destination"
+                          {:reason :parallel-program-result-view :result result :physical physical})))))
     (doseq [[operation function] [[:bind! bind!] [:run! run!] [:release! release!]]]
       (when-not (ifn? function)
         (throw (ex-info "parallel program executor requires callable operations"

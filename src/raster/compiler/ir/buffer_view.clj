@@ -153,6 +153,23 @@
   (let [{:keys [shape strides]} (validate-view! view)]
     (= strides (dense-strides shape))))
 
+(defn contains-contiguous-view?
+  "Whether base covers a dense, same-dtype view in the identical allocation contract."
+  [base child]
+  (let [base (validate-view! base) child (validate-view! child)]
+    (and (= (:allocation base) (:allocation child))
+         (= (:dtype base) (:dtype child))
+         (contiguous? base) (contiguous? child)
+         (<= (:byte-offset base) (:byte-offset child))
+         (<= (+' (:byte-offset child) (:byte-length child))
+             (+' (:byte-offset base) (:byte-length base))))))
+
+(defn prefix-view?
+  "Whether child is a dense, same-dtype, zero-relative-offset view of base."
+  [base child]
+  (and (contains-contiguous-view? base child)
+       (= (:byte-offset base) (:byte-offset child))))
+
 (defn subview
   "Construct a view whose byte range is contained in `base`. Shape/strides describe the new
    logical interpretation; `byte-offset` is relative to the base view."

@@ -42,7 +42,7 @@
   [equation]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
-    (if (= 'segmented-fold-map kind)
+    (if (contains? #{'segmented-fold-map 'contract} kind)
       {:locals [] :bodies []}
       (let [{:keys [locals body-results]}
             (dialect/lambda-parts (or lambda element-lambda))
@@ -389,6 +389,12 @@
            :site [:binding result]
            :source source}))
 
+      contract
+      (let [host-binding (or (get-in placement-facts [:attributes :host-binding]) (first results))
+            source (projection/contraction-host-form program equation)]
+        {:equation-id equation-id :placement placement :pairs [[host-binding source]]
+         :site [:binding host-binding] :source source})
+
       segmented-reduce
       (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
                              (first results))
@@ -621,7 +627,7 @@
                      (resident/realize typed-result)
                      [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
                (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
-                                           :segmented-reduce :product-reduce
+                                           :segmented-reduce :contract :product-reduce
                                            :segmented-fold-map :scan}
                                          (:kind (fusion/equation-info %)))
                              (dialect/equations typed-result))

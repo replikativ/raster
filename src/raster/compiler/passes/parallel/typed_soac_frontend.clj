@@ -14,6 +14,8 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.contraction-closure :as contraction-closure]
+            [raster.compiler.passes.parallel.staged-contraction-admission :as staged-admission]
             [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -953,6 +955,35 @@
             :source-operation :reducing-scatter}
            io)))
 
+(defn- staged-contract-description
+  [id symbol source array-types]
+  (let [declared (fn [id]
+                   (some-> (or (get array-types id)
+                               (get array-types (clojure.core/symbol (name id)))) dtype/canon))
+        core-types (mapv (comp declared :sym) (:operands source))]
+    (when (and (seq core-types) (every? some? core-types) (apply = core-types)
+               (not= symbol (:out source)))
+      (let [operands (or (get-in source [:opts :operands])
+                         (mapv #(assoc % :map (contraction-facts/operand-axis-map source %))
+                               (:operands source)))
+            facts (contraction-facts/from-components
+                   (-> (select-keys source [:out :free-axes :contract-axes :body :opts])
+                       (assoc :dtype (first core-types))
+                       (assoc-in [:opts :operands] operands)))
+            {:keys [reads scalars]} (contraction-facts/dependencies facts)
+            attributes {:contraction facts
+                        :array-parameters (vec (sort-by pr-str reads))
+                        :capture-parameters (vec (sort-by pr-str scalars))}]
+        (when (try (staged-admission/analyze! facts) true
+                   (catch clojure.lang.ExceptionInfo e
+                     (if (staged-admission/declined? e) false (throw e))))
+          (contraction-closure/validate! attributes)
+          {:kind :contract :id id :sym symbol :facts facts :closure attributes
+           :inputs reads :outputs #{(:out facts)} :scalars scalars
+           :results [(effect-result-id id 0)]
+           :effect-only? true :host-binding symbol
+           :result-storage [{:destination (:out facts) :access :write :host-return :buffer}]})))))
+
 (defn- operation-description
   [id symbol expression default-dtype array-types]
   (cond
@@ -1276,6 +1307,8 @@
       ;; The direct slice is scalar segmented-reduction algebra plus an optional closed typed
       ;; result transform. Staged quantization carries additional schedule/load contracts and must
       ;; not be admitted by dropping those facts.
+      (if (seq (:stages facts))
+        (staged-contract-description id symbol facts array-types)
       (if (empty? contract-axes)
         ;; A static zero-reduction contraction is a map, not a fold from a fabricated zero.
         ;; Coordinate decomposition is the existing axis-flattening operation. Required input
@@ -1345,7 +1378,7 @@
            ;; transform that reads the destination (an accumulating GEMM) makes it read-write.
            :result-storage [{:destination out
                              :access (if (contains? epilogue-arrays out) :read-write :write)
-                             :host-return :buffer}]}))))
+                             :host-return :buffer}]})))))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
@@ -1923,7 +1956,7 @@
   [descriptions]
   (let [written (reduce set/union #{}
                         (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce
-                                               :segmented-reduce :product-reduce
+                                               :segmented-reduce :contract :product-reduce
                                                :segmented-fold-map :scan} (:kind %))
                                 (:outputs %) #{})
                              descriptions))
@@ -1965,6 +1998,7 @@
     :stencil (and (= 1 (count (:result-storage description)))
                   (symbol? (get-in description [:result-storage 0 :destination])))
     :reduce true
+    :contract true
     :segmented-reduce (and (vector? (:segment-axes description))
                            (symbol? (get-in description [:result-storage 0 :destination])))
     :product-reduce (and (seq (:segment-axes description))
@@ -2129,7 +2163,9 @@
                               (declare-result-conversion body fold-dtype)))
                           casts bodies)
         all-expressions (into (mapv :init locals) expressions)
-        [pointwise stable] ((juxt filter remove) #(pointwise-input? all-expressions % index) inputs)
+        [pointwise stable] ((juxt filter remove)
+                            #(and (not (contains? (:storage-inputs description) %))
+                                  (pointwise-input? all-expressions % index)) inputs)
         arrays (vec (sort-by pr-str pointwise))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
@@ -2293,6 +2329,11 @@
                 (dialect/lambda-form
                  (vec (concat [(:accumulator component)] elements capture-parameters))
                  results)))))
+
+(defn- contract-equation
+  [{:keys [id results closure]}]
+  (list '= id results
+        (list 'contract closure (:array-parameters closure) (:capture-parameters closure))))
 
 (defn- segmented-reduce-equation
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
@@ -2472,13 +2513,13 @@
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
-        operations (filter #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
+        operations (filter #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
                                          :product-reduce :segmented-fold-map :scan} (:kind %))
                            descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter :effect-map :stencil) (:results %)
                                               :scan [(:sym %)]
-                                              :segmented-reduce (:results %)
+                                              (:contract :segmented-reduce) (:results %)
                                               :product-reduce (:results %)
                                               :segmented-fold-map (:results %)
                                               (:outputs %))
@@ -2488,7 +2529,7 @@
                         (:map :scatter :effect-map :stencil)
                         (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
-                        :segmented-reduce (if (:effect-only? %) [] (:results %))
+                        (:contract :segmented-reduce) (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
                         :segmented-fold-map (if (:effect-only? %) [] (:results %))
                         (:outputs %))
@@ -2595,7 +2636,7 @@
   (or (get types id)
       (when (symbol? id) (get types (clojure.core/symbol (name id))))))
 
-(defn- equation-values
+(defn- ordinary-equation-values
   [equation default-dtype array-types scalar-types known-values]
   (let [[_ _ results] equation
         {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
@@ -2670,6 +2711,49 @@
                                          (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 
+(defn- equation-values
+  [equation default-dtype array-types scalar-types known-values]
+  (if (= 'contract (dialect/operation-kind equation))
+    (let [{:keys [attributes arrays captures]} (dialect/operation-parts equation)
+          source (:contraction attributes)
+          bindings (contraction-closure/bindings attributes arrays captures)
+          requirements (group-by :parameter (contraction-closure/storage-requirements attributes))]
+      (merge
+       (into {} (map (fn [[parameter requirements]]
+                       (let [id (get bindings parameter)]
+                         [id (or (get known-values id)
+                                 (tensor-value (value-dtype id default-dtype array-types)
+                                               [(apply max (map :elements requirements))]))])) requirements))
+       (into {} (map (fn [id]
+                       [id (or (get known-values id)
+                               (when-let [declared (declared-type scalar-types id)]
+                                 (tensor-value declared [])))])) captures)
+       {(first (nth equation 2))
+        (tensor-value (or (:out-dtype source) (:dtype (first (:stages source))))
+                      (mapv second (:free-axes source)))}))
+    (ordinary-equation-values equation default-dtype array-types scalar-types known-values)))
+
+(defn- contraction-storage-values
+  "Aggregate access lower bounds, without replacing a declared buffer's capacity.
+   Closure validation separately checks every access against these storage values."
+  [equations default-dtype array-types known-values]
+  (let [requirements
+        (mapcat (fn [equation]
+                  (when (= 'contract (dialect/operation-kind equation))
+                    (let [{:keys [attributes arrays captures]} (dialect/operation-parts equation)
+                          bindings (contraction-closure/bindings attributes arrays captures)]
+                      (conj (mapv (fn [{:keys [parameter elements]}]
+                                    [(get bindings parameter) elements])
+                                  (contraction-closure/storage-requirements attributes))
+                            [(get-in attributes [:contraction :out])
+                             (reduce *' 1 (map second (get-in attributes [:contraction :free-axes])))]))))
+                equations)]
+    (into {} (map (fn [[id accesses]]
+                    [id (or (get known-values id)
+                            (tensor-value (value-dtype id default-dtype array-types)
+                                          [(apply max (map second accesses))]))]))
+          (group-by first requirements))))
+
 (defn- merge-value
   ([values id contract] (merge-value values id contract {}))
   ([values id contract shape-equalities]
@@ -2693,6 +2777,31 @@
 
 (declare form->program*)
 
+(defn- preserve-map-storage-inputs
+  "Use existing indexed captures when a pointwise map reads a larger backing buffer.
+   Element operands retain their exact logical shape; no tensor type is weakened."
+  [descriptions values]
+  (let [requirements
+        (mapcat (fn [description]
+                  (when (= :contract (:kind description))
+                    (conj (mapv (juxt :parameter :elements)
+                                (contraction-closure/storage-requirements (:closure description)))
+                          [(get-in description [:facts :out])
+                           (reduce *' 1 (map second (get-in description [:facts :free-axes])))])))
+                descriptions)
+        capacities (merge (into {} (map (fn [[id accesses]] [id (apply max (map second accesses))]))
+                                (group-by first requirements))
+                          (into {} (keep (fn [[id value]]
+                                           (when (and (seq (:shape value))
+                                                      (every? integer? (:shape value)))
+                                             [id (reduce *' 1 (:shape value))]))) values))]
+    (mapv (fn [{:keys [kind extent inputs] :as description}]
+            (if (and (= :map kind) (integer? extent))
+              (assoc description :storage-inputs
+                     (set (filter #(when-let [capacity (get capacities %)]
+                                     (> capacity extent)) inputs)))
+              description)) descriptions)))
+
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
 
@@ -2712,21 +2821,24 @@
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types)
-                                          shape-equalities values)]
+          descriptions (preserve-map-storage-inputs
+                         (normalize-extents (source-descriptions pairs dtype array-types)
+                                            shape-equalities values)
+                         values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
-                 (some #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
+                 (some #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
                                      :product-reduce :segmented-fold-map :scan}
                                    (:kind %))
                        descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
-              (filterv #(contains? #{:map :scatter :effect-map :stencil :reduce :segmented-reduce
+              (filterv #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
                                      :product-reduce :segmented-fold-map :scan} (:kind %))
                        descriptions)
               physical-outputs (physical-output-symbols descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
+                                               :contract (contract-equation %)
                                                :scatter (scatter-equation %)
                                                :effect-map (effect-map-equation %)
                                                :stencil (stencil-equation %)
@@ -2767,11 +2879,12 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :scatter :effect-map :stencil :reduce :segmented-reduce
+                          (:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
                                 :product-reduce :segmented-fold-map :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
+                                        :contract (contract-equation description)
                                         :map (map-equation description)
                                         :scatter (scatter-equation description)
                                         :effect-map (effect-map-equation description)
@@ -2812,7 +2925,9 @@
                                      [destination
                                       (tensor-value
                                        (value-dtype destination dtype array-types)
-                                       [(list 'unknown-dimension destination)])])
+                                       (if (= :contract (:kind description))
+                                         [(reduce *' 1 (map second (get-in description [:facts :free-axes])))]
+                                         [(list 'unknown-dimension destination)]))])
                                    (:result-storage description))))
                     equation-descriptions)
               inferred-values (reduce (fn [contracts equation]
@@ -2820,7 +2935,9 @@
                                                    (equation-values equation dtype array-types'
                                                                     scalar-types
                                                                     contracts)))
-                                      destination-values equations)
+                                      (merge destination-values
+                                             (contraction-storage-values equations dtype array-types' values))
+                                      equations)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)
               equation-facts
@@ -2834,7 +2951,9 @@
                                 (contains? graph-shape-scalar-ids (:sym description))
                                 (update :attributes assoc :graph-shape-definition true)
                                 storage
-                                (-> (assoc :effects #{:memory/write}
+                                (-> (assoc :effects (if (= :contract (:kind description))
+                                                     #{:memory/read :memory/write}
+                                                     #{:memory/write})
                                            :aliases (into {}
                                                           (map (fn [result {:keys [destination]}]
                                                                  [result destination])

@@ -13,6 +13,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
 (defn- program []
@@ -34,6 +35,58 @@
                                  :equations {'contraction equation-facts}})
      [(list '= 'contraction '[result] (list 'contract attributes '[a b da db] []))]
      '[result])))
+
+(deftest public-contractions-share-capacity-not-exact-access-shapes
+  (let [first-source (fixtures/packed-facts 3 5 3 32)
+        second-source (assoc (fixtures/packed-facts 1 2 2 32) :out 'other)
+        source (list 'let* ['first-effect (raster.compiler.ir.contraction-facts/surface-form first-source)
+                           'second-effect (raster.compiler.ir.contraction-facts/surface-form second-source)]
+                     'out)
+        options {:dtype :float :array-types '{a :byte b :byte da :float db :float
+                                              out :float other :float}}
+        inferred (frontend/form->program source options)
+        supplied (frontend/form->program
+                  source (assoc options :values {'a (av/tensor {:dtype :byte :shape [576]})
+                                                 'out (av/tensor {:dtype :float :shape [30]})}))]
+    (is (= 2 (count (soac/equations inferred))))
+    (is (= [288] (get-in (soac/facts inferred) [:values 'a :shape])))
+    (is (= [576] (get-in (soac/facts supplied) [:values 'a :shape])))
+    (is (= [30] (get-in (soac/facts supplied) [:values 'out :shape])))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (frontend/form->program
+                  source (assoc options :values {'a (av/tensor {:dtype :byte :shape [287]})}))))))
+
+(deftest contraction-prefix-composes-with-a-map-over-larger-storage
+  (let [source (list 'let*
+                     ['contract-effect (raster.compiler.ir.contraction-facts/surface-form
+                                        (fixtures/packed-facts 3 5 3 32))
+                      'map-effect '(raster.par/map! out index 15 float
+                                     (raster.numeric/* (raster.arrays/aget out index) 2.0))]
+                     'out)
+        p (frontend/form->program
+           source {:dtype :float :array-types '{a :byte b :byte da :float db :float out :float}
+                   :values {'out (av/tensor {:dtype :float :shape [30]})}})
+        map-op (soac/operation-parts (second (soac/equations p)))]
+    (is (= '[contract map] (mapv soac/operation-kind (soac/equations p))))
+    (is (= [30] (get-in (soac/facts p) [:values 'out :shape])))
+    (is (empty? (:arrays map-op)))
+    (is (= ['out] (:captures map-op)))
+    (is (= p (soac/validate! p)))))
+
+(deftest unsupported-staged-schedules-do-not-become-authoritative-typed-islands
+  (let [source (fixtures/packed-facts 3 5 3 32)
+        options {:dtype :float :array-types '{a :byte b :byte da :float db :float out :float}
+                 :scalar-types {'scale :float}}
+        form-for (fn [facts]
+                   (list 'let* ['effect (raster.compiler.ir.contraction-facts/surface-form facts)] 'out))]
+    (doseq [unsupported [(-> source
+                            (assoc-in [:stages 1 :dtype] :float)
+                            (assoc-in [:opts :stages 1 :dtype] :float))
+                         (-> source
+                             (assoc-in [:stages 0 :lift] '(* inner scale))
+                             (assoc-in [:opts :stages 0 :lift] '(* inner scale)))]]
+      (is (nil? (frontend/form->program (form-for unsupported) options))
+          "unsupported valid staged semantics remain available to the compatibility route"))))
 
 (deftest typed-contraction-retains-the-canonical-payload-through-ssa
   (let [p (program)
@@ -94,6 +147,19 @@
       (is false "outer lift cannot read an inner-stage coordinate")
       (catch clojure.lang.ExceptionInfo e
         (is (= :stage-lift-scope (:missing-rule (ex-data e))))))))
+
+(deftest host-contraction-renaming-is-simultaneous
+  (let [p (soac/remap-values (program) {'a 'b 'b 'a 'da 'db 'db 'da})
+        [_ bindings _] (projection/contraction-host-form p (first (soac/equations p)))]
+    (is (= [:external-b :external-a :external-db :external-da :external-out]
+           (eval (list 'let* '[a :external-a b :external-b da :external-da
+                              db :external-db out :external-out]
+                       (list 'let* bindings '[a b da db out])))))
+    (let [identity-program (program)
+          equation (first (soac/equations identity-program))]
+      (is (= (projection/contraction-host-form identity-program equation)
+             (raster.compiler.ir.contraction-facts/surface-form
+              (:facts (projection/contraction-binding identity-program equation))))))))
 
 (deftest retained-contraction-binds-generated-storage-without-source-reparse
   (let [p (soac/remap-values (program) {'a [:arg 0] 'b [:arg 1] 'da [:arg 2]
