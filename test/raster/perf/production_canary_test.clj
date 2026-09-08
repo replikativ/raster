@@ -78,17 +78,20 @@
           (is (seq candidates))
           (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %)) candidates)))))))
 
-(deftest composed-return-alias-retains-the-memory-safety-gate
-  ;; Known gap: the lexical type survives, but storage aliases are not yet normalized into
-  ;; a pointwise inout boundary. Do not weaken stable-read validation to make this run.
+(deftest composed-return-alias-uses-a-pointwise-inout-boundary
   (let [prepared (compiled/lower #'canary/gemm-relu-composed!
                                  (into (canary/gemm-arguments [3 4 5]) [3 4 5])
                                  {:target :ocl:0 :dtype :float :constants ['A 'B]
                                   :gemm-precision :f32-scalar :on-non-resident :throw})]
     (is (= 2 (get-in (canary/compilation-evidence prepared) [:resident-step-count])))
-    (when @probe/opencl-available?
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
-                           (compiled/instantiate! prepared))))))
+    (if-not @probe/opencl-available?
+      (probe/opencl-skip! "composed GEMM return-alias numerics")
+      (with-redefs [microbench/do-bench once-only]
+        (let [result (canary/gemm! {:shape [3 4 5] :variant :relu-composed
+                                   :gemm-precision :f32-scalar :target :ocl:0
+                                   :environment-tag "ci-correctness-only"})]
+          (is (:validated? result))
+          (is (= :gemm-relu-composed-resident (get-in result [:identity :workload]))))))))
 
 (deftest opencl-parameterized-gemm-shape-canary
   (if-not @probe/opencl-available?

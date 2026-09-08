@@ -7,6 +7,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
@@ -16,6 +17,42 @@
           y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
+
+(deftest returned-buffer-identity-is-normalized-before-access-contracts
+  (let [source '(let* [r (raster.par/contract C [[i 4]] [] (clojure.core/aget A i))
+                       alias r
+                       mapped (raster.par/map! C j 4 nil (clojure.core/aget alias j))
+                       closure (fn [C] r)
+                       data (quote r)]
+                 mapped)
+        normalized (frontend/normalize-source source {:array-types {'A :float 'C :float}})
+        bindings (into {} (map vec (partition 2 (second normalized))))]
+    (is (= 'raster.par/contract (first (get bindings 'r))) "producer effect stays")
+    (is (= 'C (get bindings 'alias)))
+    (is (= '(clojure.core/aget C j) (last (get bindings 'mapped))))
+    (is (= #{'C} (util/free-syms (get bindings 'closure))) "replacement avoids capture")
+    (is (= '(quote r) (get bindings 'data)))
+    (is (= 'mapped (last normalized)))))
+
+(deftest same-return-type-is-not-a-buffer-identity-proof
+  (let [source '(let* [r (raster.par/reduce acc A i 1 B)] r)
+        normalized (frontend/normalize-source source {:array-types {'A :float 'B :float}})]
+    (is (= 'r (last normalized)))))
+
+(deftest returned-buffer-alias-survives-an-incoming-name-being-shadowed
+  (let [source '(let* [r (raster.par/contract C [[i 4]] [] (clojure.core/aget A i))
+                       C B
+                       mapped (raster.par/map! D j 4 nil (clojure.core/aget r j))]
+                 r)
+        normalized (frontend/normalize-source source {:array-types {'A :float 'B :float
+                                                                    'C :float 'D :float}})
+        pairs (mapv vec (partition 2 (second normalized)))
+        renamed (first (second pairs))
+        consumer (second (last pairs))]
+    (is (not= 'C renamed))
+    (is (= 'B (second (second pairs))))
+    (is (= '(clojure.core/aget C j) (last consumer)))
+    (is (= 'r (last normalized)))))
 
 (deftest direct-front-end-builds-the-typed-map-reduction-program
   (let [direct (frontend/form->program source {:dtype :float :array-types {'x :float}})

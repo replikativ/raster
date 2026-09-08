@@ -100,7 +100,10 @@
                                "reduce" 1
                                nil))]
           (cond-> {:kind :par :introduces-scope? true :liftable? false :head head}
-            (some? return-index) (assoc :return-type-arg return-index)))
+            (some? return-index) (assoc :return-type-arg return-index)
+            ;; These destination-returning primitives preserve object identity, not merely
+            ;; dtype. A reduction's init only supplies a type; it is NOT an alias promise.
+            (= 0 return-index) (assoc :return-alias-arg 0)))
 
         ;; do block — sequential, liftable (effects + result)
         (= 'do head)

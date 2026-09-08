@@ -217,12 +217,14 @@
 
   (testing "reduce returns its accumulator"
     (let [info (form/form-info '(raster.par/reduce out init n f))]
-      (is (= 1 (:return-type-arg info)))))
+      (is (= 1 (:return-type-arg info)))
+      (is (nil? (:return-alias-arg info)))))
 
   (testing "scan and reduce-by-key return their destination, not their keys or seed"
     (doseq [head '[raster.par/scan raster.par/scan-exclusive raster.par/reduce-by-key
                   raster.par/gather raster.par/contract]]
-      (is (= 0 (:return-type-arg (form/form-info (list head 'out 'other)))))))
+      (is (= 0 (:return-type-arg (form/form-info (list head 'out 'other)))))
+      (is (= 0 (:return-alias-arg (form/form-info (list head 'out 'other)))))))
   (testing "effects, scalar results and unknown forms have no operand-return contract"
     (doseq [head '[raster.par/atomic-add! raster.par/map-void! raster.par/map2!
                   raster.par/butterfly! raster.par/collect! raster.par/product-reduce!

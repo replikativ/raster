@@ -91,6 +91,8 @@ cross-vendor performance claim is justified until comparisons run on the named d
 `:gemm-precision :f32-scalar` or `:mixed-f16-f32` is forwarded to the compiler; the resolved
 policy is recorded in the identity. Policy is not evidence that a particular matrix instruction
 executed. The explicit ReLU workload has its own identity and is checked through generated
-KernelBody candidates. Composing a contraction-return alias with an in-place map is currently
-excluded: its stable-read/output alias boundary is rejected by the binder. Retain that case as
-a compiler regression until storage normalization admits it safely; do not benchmark a bypass.
+KernelBody candidates. `:variant :relu-composed` uses an ordinary contraction-return alias
+followed by an in-place map. Exact destination-return identities are normalized before storage
+contracts, so this now executes through the pointwise inout path without bypassing the ABI
+checks. It still has two resident stages, versus one for the explicit epilogue: report that
+automatic-fusion gap rather than treating the two implementations as equally fused.

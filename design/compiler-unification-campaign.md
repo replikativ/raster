@@ -365,6 +365,12 @@ Future mechanized proofs may use the sibling Lean project. Start with small exis
 same counterexamples as executable tests. No proof assistant integration or whole-compiler
 correctness claim is implied, and this does not block workload-driven retirement.
 
+The returned-buffer follow-up separates same-type facts from exact identity facts. Known
+destination-return aliases are normalized before access analysis; producers and public return
+bindings remain intact. Scope-aware substitution and alpha-renaming of incoming free identities
+prevent local shadowing from redirecting a physical buffer. The composed GEMM/ReLU canary now
+executes safely through two generated stages. Automatic epilogue fusion remains the next gap.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

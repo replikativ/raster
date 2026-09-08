@@ -1648,17 +1648,29 @@
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (util/uniquify-rebindings source)]
+  (let [source (util/uniquify-rebindings (util/free-syms source) source)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
             {:keys [normalized]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
-                         local-scalar-types]
+                         local-scalar-types buffer-aliases]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [[state expression] (if (par/par-rng-fill-form? expression)
+               (let [expression (util/subst-syms buffer-aliases expression)
+                     return-index (:return-alias-arg (form/form-info expression))
+                     returned (if (symbol? expression) expression
+                                  (when (some? return-index)
+                                    (nth (rest expression) return-index nil)))
+                     ;; Only exact destination-return identity, never a same-dtype guess.
+                     ;; Keep the effectful producer binding; rewrite subsequent references
+                     ;; to its physical buffer before read/write contracts are constructed.
+                     state (if (and (symbol? returned)
+                                    (contains? (:arrays *declared-kinds*) returned))
+                             (assoc-in state [:buffer-aliases symbol] returned)
+                             state)
+                     [state expression] (if (par/par-rng-fill-form? expression)
                                           ;; rng-fill! evaluates its int count before its long seed.
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
@@ -1776,7 +1788,7 @@
                    :else
                    (update state :normalized conj [symbol expression]))))
              {:normalized [] :compound-extents {} :allocation-lengths {}
-              :scalar-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+              :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
       source)))
