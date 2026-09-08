@@ -50,8 +50,8 @@
 (deftest rms-norm-gpu-lowers
   (when (gpu-available?)
     (testing "the existing typed library deftm rms-norm! lowers to a correct OpenCL kernel"
-      ;; Proves the GPU emitter reads the deftm's DECLARED types (Double eps/gain-offset stay
-      ;; float not int-by-name-regex; Long features types the index integer), types loop recur
+      ;; The float specialization retains Float scalar storage for eps/gain-offset while
+      ;; features retains its declared Long ABI; it also types loop recur
       ;; counters from var-types (int, not float), and enables fp64 when the body uses double.
       ;; A real library op (par/map-void! over rows, reduce+map inside), not a hand-shaped kernel.
       (let [rows 4 feat 256
@@ -62,7 +62,7 @@
           (gpu/compile! sess :rn #'nn/rms-norm!)
           (gpu/alloc! sess {:x [:float (alength x) x] :w [:float feat w] :out [:float (* rows feat) nil]})
           (gpu/prepare! sess :rn {"x" :x "weight" :w "out" :out}
-                        [{:type :float :value 1.0e-6} {:type :int :value feat} {:type :float :value 1.0}]
+                        [{:type :float :value 1.0e-6} {:type :long :value feat} {:type :float :value 1.0}]
                         rows {:kernel-phase :rn})  ; scalars ordered by name: eps, features, gain-offset
           (gpu/invoke-bound! sess :rn)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-3))
@@ -115,7 +115,7 @@
                             :positions [:int nrows positions]})
           ;; scalars by name: head-dim heads theta; nrows is represented in the launch bound.
           (gpu/prepare! sess :rope {"x" :x "out" :out "positions" :positions}
-                        [{:type :int :value hd} {:type :int :value heads} {:type :float :value theta}]
+                        [{:type :long :value hd} {:type :long :value heads} {:type :float :value theta}]
                         (* nrows heads (quot hd 2)) {:kernel-phase :rope})
           (gpu/invoke-bound! sess :rope)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
@@ -137,8 +137,8 @@
                             :out [:float (* nq hd) nil] :sc [:float (* nq cl) nil]})
           ;; scalars by name: cache-len group head-dim n-kv scale ; par bound = n-q
           (gpu/prepare! sess :at {"q" :q "k" :k "v" :v "out" :out "sc" :sc}
-                        [{:type :int :value cl} {:type :int :value group} {:type :int :value hd}
-                         {:type :int :value nkv} {:type :float :value scale}]
+                        [{:type :long :value cl} {:type :long :value group} {:type :long :value hd}
+                         {:type :long :value nkv} {:type :float :value scale}]
                         nq {:kernel-phase :at})
           (gpu/invoke-bound! sess :at)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
@@ -165,7 +165,7 @@
         (try
           (gpu/compile! sess :g #'qk/i8gemv-dp4a!)
           (gpu/alloc! sess {:wp [:int (alength wp) wp] :xp [:int (alength xp) xp] :y [:float out nil]})
-          (gpu/invoke! sess :g {"wp" :wp "xp" :xp "y" :y} [{:type :int :value kw}] out)
+          (gpu/invoke! sess :g {"wp" :wp "xp" :xp "y" :y} [{:type :long :value kw}] out)
           (let [ygpu (gpu/download sess :y)]
             (is (every? (fn [o] (= (int (aget yref o)) (int (aget ^floats ygpu o)))) (range out))))
           (finally (gpu/close-session! sess)))))))
@@ -181,7 +181,7 @@
             ycpu (float-array out)
             _ (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq ycpu in out 0 out)
             sym {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
-            scal [{:type :int :value in}]
+            scal [{:type :long :value in}]
             sess (gpu/make-session :ze:0)]
         (try
           (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a-rows!)
@@ -191,11 +191,11 @@
                             :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
                             :y [:float out nil]})
           ;; synchronous bound dispatch
-          (gpu/prepare! sess :q4kdp sym (conj scal {:type :int :value out}) out)
+          (gpu/prepare! sess :q4kdp sym (conj scal {:type :long :value out}) out)
           (gpu/invoke-bound! sess :q4kdp)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "sync bound")
           ;; async bound dispatch: zero result, batch-launch, sync, then read
-          (gpu/prepare! sess :q4kdp sym (conj scal {:type :int :value out}) out {:async? true})
+          (gpu/prepare! sess :q4kdp sym (conj scal {:type :long :value out}) out {:async? true})
           (dotimes [_ 3] (gpu/invoke-bound! sess :q4kdp))
           (gpu/sync! sess)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "async bound + sync!")
@@ -224,8 +224,8 @@
                             :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
                             :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)]
                             :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
-          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
-          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :long :value in} {:type :long :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :long :value in} {:type :long :value out}] out {:kernel-phase :mm})
           (gpu/invoke-bound! sess :a)
           (gpu/invoke-bound! sess :b)
           (is (< (maxerr (:ycpu a) (gpu/download sess :ay)) 1e-3) "binding A correct")
@@ -264,9 +264,9 @@
           (gpu/prepare! sess :quant {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
                         [] (* nsb 8) {:kernel-phase :quant :index 0})
           (gpu/prepare! sess :quant2 {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
-                        [{:type :int :value in}] (* nsb 8) {:kernel-phase :quant :index 1})
+                        [{:type :long :value in}] (* nsb 8) {:kernel-phase :quant :index 1})
           (gpu/prepare! sess :mm {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
-                        [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
+                        [{:type :long :value in} {:type :long :value out}] out {:kernel-phase :mm})
           (gpu/record-graph! sess [:quant :quant2 :mm])
           (gpu/replay! sess)
           (let [ygpu (gpu/download sess :y)
@@ -304,15 +304,15 @@
                             :y [:float (* nrows out) nil]})
           (let [bindings {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}]
             (gpu/prepare! sess :quant-rows-max bindings
-                          [{:type :int :value in} {:type :int :value width}] (* nrows nsub)
+                          [{:type :long :value in} {:type :long :value width}] (* nrows nsub)
                           {:kernel-phase :quant-rows :index 0})
             (gpu/prepare! sess :quant-rows-pack bindings
-                          [{:type :int :value in} {:type :int :value width}]
+                          [{:type :long :value in} {:type :long :value width}]
                           (* nrows nsub) {:kernel-phase :quant-rows :index 1}))
           (gpu/prepare! sess :q4k-rows
                         {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp
                          "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
-                        [{:type :int :value in} {:type :int :value out}]
+                        [{:type :long :value in} {:type :long :value out}]
                         (* nrows out) {:kernel-phase :q4k-rows})
           (gpu/record-graph! sess [:quant-rows-max :quant-rows-pack :q4k-rows])
           (gpu/replay! sess)
@@ -336,8 +336,8 @@
           (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:axp [:int (alength ^ints (:xp a)) (:xp a)] :axs [:float (alength ^floats (:xs a)) (:xs a)] :abs [:int (alength ^ints (:bsums a)) (:bsums a)] :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
                             :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)] :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
-          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
-          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :long :value in} {:type :long :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :long :value in} {:type :long :value out}] out {:kernel-phase :mm})
           (gpu/record-graph! sess [:a :b])
           (gpu/replay! sess)
           (is (< (maxerr (:y a) (gpu/download sess :ay)) 1e-3) "graph op A")
@@ -368,7 +368,7 @@
           (gpu/invoke! sess :q4kdp
                        {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db
                         "aq" :aq "bq" :bq "y" :y}
-                       [{:type :int :value in} {:type :int :value out}] out)
+                       [{:type :long :value in} {:type :long :value out}] out)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
@@ -391,7 +391,7 @@
                             :y [:float out nil]})
           (gpu/invoke! sess :q6kdp
                        {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "sc" :sc "ds" :ds "y" :y}
-                       [{:type :int :value in}] out)
+                       [{:type :long :value in}] out)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
@@ -413,6 +413,6 @@
                             :y [:float out nil]})
           (gpu/invoke! sess :q6k
                        {"xq" :xq "xs" :xs "bsums" :bsums "wq" :wq "sc" :sc "ds" :ds "y" :y}
-                       [{:type :int :value in}] out)
+                       [{:type :long :value in}] out)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
