@@ -3,6 +3,7 @@
    backend-neutral KernelExecutable binder.  This is the device guard that permits the old
    Level Zero GEMM-specific binding surface to disappear without losing its numerical oracle."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -25,19 +26,20 @@
      step))
 
 (defn- typed-dispatch
-  [device-id]
+  ([device-id] (typed-dispatch device-id :int))
+  ([device-id scalar-dtype]
   (let [{:keys [form]}
         (pipeline/schedule-parallel-form
          source {:target-device device-id
                  :dtype :float
                  :array-types {'A :float 'B :float 'C :float}
-                 :scalar-types {'m :int 'n :int 'k :int}})
+                 :scalar-types {'m scalar-dtype 'n scalar-dtype 'k scalar-dtype}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
      :dtype :float
      :desc (hardware/descriptor-for device-id)
-     :precision :mixed-f16-f32)))
+     :precision :mixed-f16-f32))))
 
 (defn- typed-batched-dispatch
   [device-id]
@@ -55,7 +57,7 @@
      :precision :mixed-f16-f32)))
 
 (defn- typed-epilogue-dispatch
-  [device-id]
+  [device-id scalar-dtype]
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/*
                            (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
@@ -75,7 +77,7 @@
          {:target-device device-id
           :dtype :float
           :array-types {'A :float 'B :float 'C :float 'bias :float}
-          :scalar-types {'m :int 'n :int 'k :int 'scale :float}})
+          :scalar-types {'m scalar-dtype 'n scalar-dtype 'k scalar-dtype 'scale :float}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
@@ -143,18 +145,28 @@
       (/ difference (max scale 1.0e-30)))))
 
 (defn- run-contraction
-  [device-id scheduled m n k]
+  ([device-id scheduled m n k] (run-contraction device-id scheduled m n k :int))
+  ([device-id scheduled m n k scalar-dtype]
+   (run-contraction device-id scheduled m n k scalar-dtype :nn))
+  ([device-id scheduled m n k scalar-dtype variant]
   (let [a (input-array (* m k) 17)
         b (input-array (* k n) 29)
+        transpose (fn [^floats values rows columns]
+                    (float-array (for [column (range columns) row (range rows)]
+                                   (aget values (+ (* row columns) column)))))
+        stored-a (if (contains? #{:tn :tt} variant) (transpose a m k) a)
+        stored-b (if (contains? #{:nt :tt} variant) (transpose b k n) b)
         runtime-arguments
         [:a :b :c
-         {:type :int :value m}
-         {:type :int :value n}
-         {:type :int :value k}]
-        selected (dispatch/select-alternative scheduled runtime-arguments)]
+         {:type scalar-dtype :value m}
+         {:type scalar-dtype :value n}
+         {:type scalar-dtype :value k}]
+        selected (if (dispatch/kernel-dispatch? scheduled)
+                   (dispatch/select-alternative scheduled runtime-arguments)
+                   scheduled)]
     (gpu/with-gpu-session [session device-id]
-      (gpu/alloc! session {:a [:float (* m k) a]
-                           :b [:float (* k n) b]
+      (gpu/alloc! session {:a [:float (* m k) stored-a]
+                           :b [:float (* k n) stored-b]
                            :c [:float (* m n) nil]})
       (let [handle (gpu/bind-kernel-executable!
                     session [:typed-contraction m n k] selected runtime-arguments)]
@@ -164,7 +176,30 @@
            :actual (gpu/download session :c)
            :expected (reference a b m n k)}
           (finally
-            (gpu/release-kernel-graph! session handle)))))))
+            (gpu/release-kernel-graph! session handle))))))))
+
+(deftest long-graph-interface-executes-layout-matrix-and-combine
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "Long matrix graph interface")
+    (let [device-id :ze:0
+          interface (update (executable/common-view
+                             (dispatch/default-alternative (typed-dispatch device-id))) :abi
+                            #(mapv (fn [slot] (if (= :scalar (:kind slot))
+                                               (assoc slot :dtype :long :kernel-dtype :long)
+                                               slot)) %))]
+      ;; This exercises the graph constructor and common binder; it deliberately does not
+      ;; bypass the still-closed Long admission gate in the public typed contraction route.
+      (doseq [variant [:nn :nt :tn :tt]
+              :let [{:keys [alternatives]}
+                    (gemm/emit-matrix-alternatives
+                     {:id [:long-device-matrix variant] :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
+                      :variant variant :tile (hardware/derive-gemm-tile {})
+                      :fill-workgroups 32 :split-factors [2] :external-interface interface})]
+              strategy [:xmx-direct :xmx-split-k-2]
+              :let [graph (some #(when (= strategy (executable/strategy %)) %) alternatives)
+                    {:keys [actual expected]} (run-contraction device-id graph 8 32 64 :long variant)]]
+        (is (some? graph))
+        (is (< (relative-l1 actual expected) 1.0e-3))))))
 
 (deftest ordinary-typed-contraction-executes-the-matrix-schedule
   (if-not @gpu-probe/gpu-available?
@@ -180,6 +215,16 @@
               (run-contraction :ze:0 scheduled 13 32 8192)]
           (is (= :xmx-split-k strategy))
           (is (< (relative-l1 actual expected) 1.0e-3)))))))
+
+(deftest public-long-contraction-executes-guarded-matrix-schedules
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "public Long typed contraction")
+    (let [scheduled (typed-dispatch :ze:0 :long)]
+      (doseq [[m n k expected-strategy] [[16 32 32 :xmx-direct] [13 32 8192 :xmx-split-k]]
+              :let [{:keys [strategy actual expected]}
+                    (run-contraction :ze:0 scheduled m n k :long)]]
+        (is (= expected-strategy strategy))
+        (is (< (relative-l1 actual expected) 1.0e-3))))))
 
 (deftest batched-typed-contraction-executes-with-shared-weights
   (if-not @gpu-probe/gpu-available?
@@ -217,7 +262,8 @@
 (deftest typed-result-transform-executes-inside-the-matrix-store
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "typed matrix result transform")
-    (let [device-id :ze:0
+    (doseq [scalar-dtype [:int :long]]
+     (let [device-id :ze:0
           m 8
           n 32
           k 32
@@ -232,13 +278,13 @@
                     (float (* scale
                               (+ (double (aget base index))
                                  (double (aget bias (mod index n))))))))
-          scheduled (typed-epilogue-dispatch device-id)
+          scheduled (typed-epilogue-dispatch device-id scalar-dtype)
           runtime-arguments
           [:a :b :c :bias
            {:type :float :value scale}
-           {:type :int :value m}
-           {:type :int :value n}
-           {:type :int :value k}]
+           {:type scalar-dtype :value m}
+           {:type scalar-dtype :value n}
+           {:type scalar-dtype :value k}]
           selected (dispatch/select-alternative scheduled runtime-arguments)]
       (is (= :xmx-direct (executable/strategy selected)))
       (gpu/with-gpu-session [session device-id]
@@ -252,4 +298,4 @@
             (gpu/run-kernel-graph! session handle)
             (is (< (relative-l1 (gpu/download session :c) expected) 1.0e-3))
             (finally
-              (gpu/release-kernel-graph! session handle))))))))
+              (gpu/release-kernel-graph! session handle)))))))))

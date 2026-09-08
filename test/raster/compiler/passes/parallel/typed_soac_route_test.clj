@@ -8,6 +8,7 @@
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
@@ -1163,9 +1164,11 @@
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
 
-(deftest long-dimensions-decline-int-only-matrix-schedules
-  (doseq [batched? [false true]]
-    (let [contract (if batched?
+(deftest long-dimensions-admit-only-guarded-unbatched-matrix-schedules
+  (doseq [batched? [false true]
+          widths [{'m :long 'n :long 'k :long} {'m :int 'n :int 'k :long}]]
+    (let [declined? (or batched? (some #{:int} (vals widths)))
+          contract (if batched?
                      '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
                         (* (aget A (+ (* (+ (* b m) i) k) l)) (aget B (+ (* l n) j))))
                      '(raster.par/contract C [[i m] [j n]] [[l k]]
@@ -1174,7 +1177,7 @@
                           (list 'let* ['step contract] 'step)
                           {:target-device :ze:0 :dtype :float
                            :array-types {'A :float 'B :float 'C :float}
-                           :scalar-types {'batch :long 'm :long 'n :long 'k :long}})
+                           :scalar-types (assoc widths 'batch :long)})
           dispatch (contract-route/route-typed-contraction-dispatch
                      (-> form :equations first :algorithm)
                      (-> form :equations first :operations first)
@@ -1184,13 +1187,33 @@
                             :subgroup-size 16 :max-workgroup-size 1024
                             :grf-bytes-per-lane 256 :machine-lanes 8192
                             :shared-local-memory 131072})]
-      (is (= [:portable-segred] (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
-      (is (= :mixed-dpas-index-width-not-lowered
-             (get-in dispatch [:attributes :matrix-graph-decline :reason])))
+      (if declined?
+        (do
+          (is (= [:portable-segred] (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
+          (is (= :mixed-dpas-index-width-not-lowered
+                 (get-in dispatch [:attributes :matrix-graph-decline :reason]))))
+        (let [{:keys [abi arguments]} (executable/common-view (kdispatch/default-alternative dispatch))]
+          (is (= #{:portable-segred :xmx-direct :xmx-split-k}
+                 (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
+          (doseq [[dimensions expected] [[{'m 16 'n 32 'k 32} :xmx-direct]
+                                         [{'m 16 'n 16 'k 32} :portable-segred]
+                                         [{'m 2147483648 'n 32 'k 32} :portable-segred]]
+                  :let [values (mapv (fn [slot argument]
+                                       (if (= :scalar (:kind slot))
+                                         {:type :long :value (get dimensions argument)} argument))
+                                     abi arguments)]]
+            (is (= expected (kdispatch/alternative-strategy
+                             (kdispatch/select-alternative dispatch values)))))
+          (doseq [dimensions [{'m 16 'n 16 'k 32} {'m 2147483648 'n 32 'k 32}]]
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (kernel-graph-call/temporary-specs
+                          (kdispatch/alternative dispatch :xmx-direct)
+                          (into {} (map (fn [[id value]] [id {:type :long :value value}]))
+                                dimensions)))))))
       (let [scalar-slots (filter #(= :scalar (:kind %))
                                  (:abi (first (:alternatives dispatch))))]
         (is (= (if batched? 4 3) (count scalar-slots)))
-        (is (every? #(= :long (:dtype %)) scalar-slots))))))
+        (is (= (set (vals widths)) (set (map :dtype scalar-slots))))))))
 
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source

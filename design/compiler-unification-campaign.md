@@ -487,6 +487,17 @@ unknown sliced forms fail closed. This protects direct artifact binding, not onl
 chunks. Focused validation: 32 tests, 745 assertions including Arc execution. It does not prove that
 an arbitrary caller supplied enough partitions to cover K, nor add CUDA partition constraints.
 
+The first guarded Long admission is unbatched dense contraction with all three dimension
+expressions retained as Long. Layout and combine extents stay wide; matrix coordinates are
+checked specializations, and surface selectors retain the portable fallback. Batched and mixed
+widths remain declined pending their separate admission proofs. All four graph orientations
+execute on Arc through direct and explicit split schedules; ordinary public Long contraction
+executes direct and dynamic split schedules. Selector fallback and forced-alternative rejection
+are both tested. The affected route suite passed 85 tests / 1272 assertions before adding the
+extra mixed-width rejection cases; forward/input-gradient/weight-gradient and a complete tiny
+AD/SGD update also passed (two tests, 12 assertions). These are correctness results, not measured
+projection throughput or a claim that every oversized workload has an executable fallback.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.
