@@ -11,6 +11,7 @@
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.kernel-body :as body]))
 
 (defn- record-kind? [simple-name value]
@@ -742,6 +743,29 @@
   (let [prefix (apply str (repeat depth "  "))]
     (apply str (map #(str prefix % "\n") (str/split-lines source)))))
 
+(defn- counted-loop-syntax
+  "A canonical counted loop only when its terminal increment is representable. Dynamic and
+   signed-edge domains retain the guarded advance; no overflow policy is weakened."
+  [operation index-name index-type names depth]
+  (let [{:keys [lower upper step]} operation
+        ordinary? (and (every? integer? [lower upper step])
+                       (every? #(scalar-range/literal % index-type) [lower upper step])
+                       (scalar-range/contained-in-dtype?
+                        (scalar-range/counted-loop-index-range lower upper step) index-type))
+        upper-source (emit-index-expression upper names)
+        step-source (if (integer? step) (str step) (emit-index-expression step names))
+        unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)]
+    {:loop-header (str "for (" (target-type index-type) " " index-name " = "
+                       (emit-index-expression lower names) "; " index-name " < " upper-source ";"
+                       (when ordinary? (str " " index-name " += " step-source)) ") {")
+     :checked-advance
+     (when-not ordinary?
+       (str (indent-lines
+             (inc depth)
+             (str "if ((" unsigned-type ")(" upper-source ") - (" unsigned-type ")(" index-name
+                  ") <= (" unsigned-type ")(" step-source ")) break;"))
+            (indent-lines (inc depth) (str index-name " += " step-source ";"))))}))
+
 (declare emit-scalar-operations)
 
 (defn- add-value
@@ -926,23 +950,8 @@
           [body-source body-context] (emit-scalar-operations body-operations loop-context
                                                              (inc depth))
           index-type (get-in loop-context [:types (:id index)])
-          unsigned-index-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)
-          upper-source (emit-index-expression (:upper operation) (:names context))
-          step-source (if (integer? (:step operation))
-                        (str (:step operation))
-                        (emit-index-expression (:step operation) (:names context)))
-          loop-header (str "for (" (target-type index-type)
-                           " " index-name " = "
-                           (emit-index-expression (:lower operation) (:names context)) "; "
-                           index-name " < "
-                           upper-source ";) {")
-          checked-advance
-          (str (indent-lines
-                (inc depth)
-                (str "if ((" unsigned-index-type ")(" upper-source ") - ("
-                     unsigned-index-type ")(" index-name ") <= ("
-                     unsigned-index-type ")(" step-source ")) break;"))
-               (indent-lines (inc depth) (str index-name " += " step-source ";")))]
+          {:keys [loop-header checked-advance]}
+          (counted-loop-syntax operation index-name index-type (:names context) depth)]
       [(str initializers
             (when (get-in operation [:attributes :unroll])
               (indent-lines depth "#pragma unroll"))
@@ -1037,21 +1046,8 @@
                             (:events binding-group) temporaries))
                      binding-groups next-event-names))))
           index-type (get-in loop-context [:types (:id index)])
-          unsigned-index-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)
-          upper-source (emit-index-expression (:upper operation) (:names context))
-          step-source (str (:step operation))
-          loop-header (str "for (" (target-type index-type)
-                           " " index-name " = "
-                           (emit-index-expression (:lower operation) (:names context)) "; "
-                           index-name " < "
-                           upper-source ";) {")
-          checked-advance
-          (str (indent-lines
-                (inc depth)
-                (str "if ((" unsigned-index-type ")(" upper-source ") - ("
-                     unsigned-index-type ")(" index-name ") <= ("
-                     unsigned-index-type ")(" step-source ")) break;"))
-               (indent-lines (inc depth) (str index-name " += " step-source ";")))
+          {:keys [loop-header checked-advance]}
+          (counted-loop-syntax operation index-name index-type (:names context) depth)
           output-groups
           (mapv (fn [result binding-group]
                   (assoc binding-group :id result))

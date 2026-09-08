@@ -57,6 +57,17 @@
              {:lower (reduce min products) :upper (reduce max products)})
         nil))))
 
+(defn counted-loop-index-range
+  "Static positive-step counted-loop indices, INCLUDING the increment which exits the loop.
+   Unknown bounds/steps return nil. Exact host arithmetic avoids overflow in the proof itself.
+   Empty loops include only the initializer; no increment is evaluated. This is an index proof,
+   not a proof about loop-carried accumulators or whether runtime scalar bounds fit their ABI."
+  [lower upper step]
+  (when (and (integer? lower) (integer? upper) (integer? step) (pos? step))
+    (let [distance (max 0 (-' upper lower))
+          trips (quot (+' distance (dec step)) step)]
+      {:lower lower :upper (+' lower (*' trips step))})))
+
 (defn accumulation-prefixes
   "Enclose every prefix of up to `count` additions of values in `term`, starting at `initial`.
    Unknown or nonintegral counts decline; proof arithmetic remains unbounded."
