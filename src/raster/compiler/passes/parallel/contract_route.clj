@@ -1221,9 +1221,9 @@
                                      (when (= :scalar (:kind slot))
                                        [argument (:dtype slot)])))
                            (map vector abi arguments))
-        ;; All-Long unbatched shapes retain wide layout/combine extents; matrix coordinates
-        ;; use explicit checked specialization. Mixed-width products and batch admission
-        ;; remain separate gates, never implicit narrowing conversions.
+        ;; Uniform Long shapes retain wide layout/combine extents; matrix coordinates and
+        ;; grid-Z counts use checked specialization plus ABI-derived admission guards.
+        ;; Mixed-width products remain a separate gate, never implicit narrowing conversions.
         wide-dimensions (delay
                           (filterv #(not= :int (klaunch/typed-expression-dtype % scalar-types))
                                    (cond-> (vec (:dimensions matrix-view))
@@ -1258,9 +1258,9 @@
                  :matrix (get-in options [:desc :matrix])}}
 
       (and (seq @wide-dimensions)
-           (or (:batched? matrix-view)
-               (not-every? #(= :long (klaunch/typed-expression-dtype % scalar-types))
-                           (:dimensions matrix-view))))
+           (not-every? #(= :long (klaunch/typed-expression-dtype % scalar-types))
+                       (cond-> (vec (:dimensions matrix-view))
+                         (:batched? matrix-view) (conj (:batch matrix-view)))))
       {:alternatives []
        :decline {:reason :mixed-dpas-index-width-not-lowered
                  :dimensions @wide-dimensions :required-dtype :int}}
