@@ -52,13 +52,14 @@
         (throw (ex-info "graph symbolic scalar requires an explicitly typed runtime value"
                         {:reason :kernel-graph-call-scalar-type
                          :argument argument :slot slot :value value})))
-      (when-not (= (:dtype slot) (:type value))
+      (when-not (contains? (set [(:dtype slot) (:kernel-dtype slot)]) (:type value))
         (throw (ex-info "kernel graph scalar argument has the wrong ABI dtype"
                         {:reason :kernel-graph-call-scalar-type
                          :argument argument :slot slot :value value})))
-      ;; The graph boundary accepts the logical public dtype. Each node converts and validates
-      ;; its own physical ABI below; validate the original value before any such conversion.
-      (kcall/validate-scalar-value! (assoc slot :kernel-dtype (:dtype slot)) value))
+      ;; Direct graph callers may provide the logical dtype; the common KernelExecutable binder
+      ;; provides the slot's physical dtype. Validate the supplied declared representation before
+      ;; any node-specific conversion. Neither path accepts an unrelated type or unchecked range.
+      (kcall/validate-scalar-value! (assoc slot :kernel-dtype (:type value)) value))
     scalar-values))
 
 (defn- scalar-number

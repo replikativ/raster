@@ -49,6 +49,10 @@
                                                         (if (= :scalar (:kind slot))
                                                           (assoc slot :dtype :long) slot)) slots)))) %)))]
     (is (= graph (graph-call/preflight! graph {'n {:type :long :value 1025}})))
+    (is (= graph (graph-call/preflight! graph {'n {:type :int :value 1025}}))
+        "the common executable binder may supply the public slot's physical representation")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"wrong ABI dtype"
+                          (graph-call/preflight! graph {'n {:type :float :value 1025.0}})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                           (graph-call/preflight! graph
                                                  {'n {:type :long :value (+' (bigint Long/MAX_VALUE) 2)}})))))
