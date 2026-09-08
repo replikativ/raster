@@ -385,6 +385,15 @@ program-wide shape bookkeeping must remain available for capacity checks, but on
 declared scalar arguments enter KernelGraphCall. The binder now projects that interface without
 weakening exact call validation; both device cases execute after the fix.
 
+The next real-device model probes exposed a distinct schedule legality gap: public linear
+projection dimensions retain Long, while mixed-DPAS layout/matrix stages currently bind int
+extents. That candidate now declines explicitly as `:mixed-dpas-index-width-not-lowered`,
+leaving generated portable contraction schedules available. Tiny forward, input-gradient and
+weight-gradient executions match CPU references, and the full AD train-step compiles resident.
+This is not an optimized-training result. Restore that optimization with width-preserving
+matrix/layout schedules or guarded specialization whose range proof covers dimensions, products
+and indexing; do not narrow retained types implicitly or relax ScheduledKernelBody validation.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its
