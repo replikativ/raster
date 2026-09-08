@@ -38,6 +38,72 @@
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
 
+(deftest static-dense-body-graph-retains-source-and-required-capacities
+  (let [value (-> (fixture)
+                  (assoc-in [:body :parameters 0 :shape] [2 3])
+                  (assoc-in [:body :operations 0 :coordinates] [0 0])
+                  (assoc-in [:body :parameters 0 :layout] (layout/row-major [2 3] :float)))]
+    (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [emitted (target/emit-static-dense-graph "dense_graph" value dialect)
+            leaf (get-in emitted [:nodes 0 :operation])]
+        (is (= '[input output] (:arguments emitted)))
+        (is (= [6 1] (mapv :elements (concat (:inputs emitted) (:outputs emitted)))))
+        (is (= (:effects value) (:effects emitted)))
+        (is (identical? value (get-in leaf [:attributes :scheduled-kernel-body])))
+        (is (= (:source (target/emit-artifact "dense_graph" value dialect)) (:source leaf)))
+        (is (empty? (:temporaries emitted)))))))
+
+(deftest static-dense-body-graph-declines-unproved-storage
+  (doseq [shape [[0] ['n]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (target/emit-static-dense-graph
+                  "unknown_graph"
+                  (-> (fixture)
+                      (assoc-in [:body :parameters 0 :shape] shape)
+                      (assoc-in [:body :parameters 0 :layout] (layout/row-major shape :float)))
+                  :opencl-portable))))
+  (is (= :kernel-body-graph-storage
+         (reason-of #(target/emit-static-dense-graph
+                      "strided_graph"
+                      (assoc-in (fixture) [:body :parameters 0 :layout :strides] [2])
+                      :opencl-portable))))
+  (is (= :kernel-body-graph-capacity
+         (reason-of #(target/emit-static-dense-graph
+                      "oversized_graph"
+                      (-> (fixture)
+                          (assoc-in [:body :parameters 0 :shape] [Long/MAX_VALUE])
+                          (assoc-in [:body :parameters 0 :layout]
+                                    (layout/row-major [Long/MAX_VALUE] :float)))
+                      :opencl-portable)))))
+
+(deftest static-dense-body-graph-preserves-public-and-derived-scalars
+  (let [base (fixture)
+        value (scheduled/make
+               (-> base
+                   (update :body update :parameters into
+                           [(body/->KernelParameter 'n :scalar :int [] nil nil :bound)
+                            (body/->KernelParameter 'next-n :scalar :int [] nil nil :bound)])
+                   (assoc :arguments ['input 'output 'rows (launch/sum 'rows 1)])
+                   (dissoc :scalar-bindings)))
+        emitted (target/emit-static-dense-graph "scalar_graph" value :opencl-portable)]
+    (is (= '[input output rows] (:arguments emitted)))
+    (is (= [(graph/scalar 'rows :int)] (:scalars emitted)))
+    (is (= #{'rows} (set (get-in emitted [:nodes 0 :scalar-uses]))))
+    (is (= ['input 'output 'rows (launch/sum 'rows 1)]
+           (get-in emitted [:nodes 0 :operation :arguments])))))
+
+(deftest static-dense-body-graph-preserves-inout-storage
+  (let [base (fixture)
+        value (scheduled/make
+               (-> base
+                   (assoc-in [:body :parameters 1 :kind] :inout)
+                   (assoc-in [:effects :uses 1 :access] :read-write)))
+        emitted (target/emit-static-dense-graph "inout_graph" value :opencl-portable)]
+    (is (= '[input output] (mapv :id (:inputs emitted))))
+    (is (= ['output] (mapv :id (:outputs emitted))))
+    (is (= [1] (mapv :elements (:outputs emitted))))
+    (is (= [:input :inout] (mapv :kind (:abi emitted))))))
+
 (deftest scheduled-body-binds-one-operation-to-one-complete-kernel-plan
   (let [value (fixture)]
     (is (scheduled/scheduled-kernel-body? value))

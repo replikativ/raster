@@ -32,6 +32,21 @@
          (when-not (staged/declined? e) (throw e))
          (:missing-rule (ex-data e)))))
 
+(deftest packed-candidate-uses-generic-checked-graph-storage
+  (let [source (fixtures/packed-facts 3 5 3 32)
+        scheduled (staged/lower source)]
+    (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [graph (target/emit-static-dense-graph "packed_graph" scheduled dialect)
+            leaf (get-in graph [:nodes 0 :operation])]
+        (is (= '[a b da db out] (:arguments graph)))
+        (is (= [288 480 9 15 15]
+               (mapv :elements (concat (:inputs graph) (:outputs graph)))))
+        (is (= [:byte :byte :float :float :float] (mapv :dtype (:abi graph))))
+        (is (empty? (:scalars graph)))
+        (is (= '[a b da db out 15] (:arguments leaf)) "launch count stays target-private")
+        (is (= source (get-in leaf [:attributes :scheduled-kernel-body :source])))
+        (is (= (:effects scheduled) (:effects graph)))))))
+
 (deftest packed-schedule-declines-unproved-domains
   (let [source (fixtures/packed-facts 3 5 3 32)]
     (doseq [[label transform expected]

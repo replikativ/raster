@@ -8,10 +8,13 @@
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-target]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-body-abi :as body-abi]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
 
 (defn- record-kind?
@@ -159,3 +162,58 @@
                            :legality (:legality scheduled)
                            :numerics (:numerics scheduled)
                            :target-facts (:target-facts emitted)})})))))
+
+(defn emit-static-dense-graph
+  "Place one ScheduledKernelBody behind the existing checked graph binding boundary.
+
+   Every external buffer receives its required element capacity, derived from positive static
+   dense parameter shapes. Strided layouts, unknown extents and repeated public buffer identities
+   are not admitted by this convenience projection. It preserves the exact source operation,
+   effects, ordered public ABI and target-private scalar bindings; it does not select a schedule
+   or prove source/body equivalence on behalf of the scheduling pass."
+  ([kernel-name scheduled target-dialect]
+   (emit-static-dense-graph kernel-name scheduled target-dialect {}))
+  ([kernel-name scheduled target-dialect options]
+   (let [scheduled (scheduled-body/validate! scheduled)
+         parameters (into {} (map (juxt :id identity)) (get-in scheduled [:body :parameters]))
+         required-elements
+         (into {}
+               (for [[id {:keys [kind dtype shape layout] :as parameter}] parameters
+                     :when (not= :scalar kind)]
+                 (do
+                   (when-not (and (seq shape) (every? #(and (integer? %) (pos? %)) shape)
+                                  (layout/row-major-unit? layout))
+                     (throw (ex-info "single-body graph requires positive static dense storage"
+                                     {:reason :kernel-body-graph-storage :parameter parameter})))
+                   (let [elements (reduce *' 1 shape)
+                         bytes (*' elements (dtype/bytes-of dtype))]
+                     (when (> bytes Long/MAX_VALUE)
+                       (throw (ex-info "single-body graph storage exceeds addressable byte capacity"
+                                       {:reason :kernel-body-graph-capacity :parameter parameter
+                                        :required-elements elements :required-bytes bytes})))
+                     [id (long elements)]))))
+         artifact (emit-artifact kernel-name scheduled target-dialect options)
+         {:keys [abi arguments]} (graph/public-interface (:abi artifact) (:arguments artifact))
+         pointers (filterv #(not= :scalar (:kind (first %))) (mapv vector abi arguments))
+         buffers (mapv (fn [[slot argument]]
+                         (graph/buffer argument (:dtype slot) (required-elements (:name slot))
+                                       :device (:kind slot))) pointers)
+         node (graph/->ScheduledKernel
+               [:scheduled-body kernel-name] (:source scheduled)
+               (mapv #(graph/->ValueUse (:value %) (:access %)) (get-in scheduled [:effects :uses]))
+               (graph/scalar-argument-uses (:abi artifact) (:arguments artifact)) [])
+         semantic-graph
+         (graph/make
+          {:inputs (filterv #(contains? #{:input :inout} (:role %)) buffers)
+           :outputs (filterv #(contains? #{:output :inout} (:role %)) buffers)
+           :scalars (graph/interface-scalars abi arguments)
+           :abi abi :arguments arguments :nodes [node]
+           :effects (:effects scheduled)
+           :provenance {:lowering :scheduled-kernel-body-graph}
+           :attributes {:storage-contract :static-dense}})]
+     (scheduled-body/validate-against-node! scheduled node semantic-graph)
+     (let [emitted (graph/map-operations semantic-graph (constantly artifact))]
+       (when-not (graph/dataflow-equivalent? semantic-graph emitted)
+         (throw (ex-info "single-body target projection changed graph dataflow"
+                         {:reason :kernel-body-graph-dataflow})))
+       emitted))))

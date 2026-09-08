@@ -203,6 +203,15 @@ lift regions and unsupported domains decline. The required shapes are not proof 
 raw backend caller supplied enough storage. Production admission must retain the checked resident
 capacity boundary; the low-level OpenCL test binds known correctly sized buffers.
 
+The generic `emit-static-dense-graph` projection now places a ScheduledKernelBody behind the
+existing KernelGraph binding boundary. It derives every external buffer's required capacity from
+positive static dense shapes, preserving logical storage dtypes, exact source/effects, public
+scalar dependencies and target-private scalar expressions. Unknown/strided storage is rejected;
+this is neither a new memory ABI nor an access proof for arbitrary producers. Tests exercise
+operand, lift and output shortages through both session and descriptor binding, writable aliases,
+and device replay with poisoned output. The staged candidate can use this boundary without
+changing production schedule selection; performance admission remains outstanding.
+
 Candidate validation covers signed-byte extremes, block widths 4/32/64, multiple blocks, distinct
 row scales and masked launch tails on OpenCL; CUDA/HIP compile fixtures exercise the same typed
 schedule. The old staged source emitter remains production-selected. Before promotion, compare
