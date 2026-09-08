@@ -26,19 +26,20 @@
      step))
 
 (defn- typed-dispatch
-  [device-id]
+  ([device-id] (typed-dispatch device-id :int))
+  ([device-id scalar-dtype]
   (let [{:keys [form]}
         (pipeline/schedule-parallel-form
          source {:target-device device-id
                  :dtype :float
                  :array-types {'A :float 'B :float 'C :float}
-                 :scalar-types {'m :int 'n :int 'k :int}})
+                 :scalar-types {'m scalar-dtype 'n scalar-dtype 'k scalar-dtype}})
         equation (first (:equations form))]
     (contract-route/route-typed-contraction-dispatch
      (:algorithm equation) (first (:operations equation))
      :dtype :float
      :desc (hardware/descriptor-for device-id)
-     :precision :mixed-f16-f32)))
+     :precision :mixed-f16-f32))))
 
 (defn- typed-batched-dispatch
   [device-id]
@@ -214,6 +215,16 @@
               (run-contraction :ze:0 scheduled 13 32 8192)]
           (is (= :xmx-split-k strategy))
           (is (< (relative-l1 actual expected) 1.0e-3)))))))
+
+(deftest public-long-contraction-executes-guarded-matrix-schedules
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "public Long typed contraction")
+    (let [scheduled (typed-dispatch :ze:0 :long)]
+      (doseq [[m n k expected-strategy] [[16 32 32 :xmx-direct] [13 32 8192 :xmx-split-k]]
+              :let [{:keys [strategy actual expected]}
+                    (run-contraction :ze:0 scheduled m n k :long)]]
+        (is (= expected-strategy strategy))
+        (is (< (relative-l1 actual expected) 1.0e-3))))))
 
 (deftest batched-typed-contraction-executes-with-shared-weights
   (if-not @gpu-probe/gpu-available?
