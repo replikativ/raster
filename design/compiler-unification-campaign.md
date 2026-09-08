@@ -423,6 +423,12 @@ is not a standalone overflow proof: binding must check parent-capacity products,
 intermediate multiplication (a trailing zero must not conceal an overflowing prefix). Focused
 tests cover these non-allocating limits plus the existing real-device split/batched matrix routes.
 
+The opt-in [matrix-width canary](matrix-width-canary.md) compares the generated DPAS leaf with
+the test-only historical source using poisoned output and device events. The initial small Arc
+run is numerically correct but partly nonstationary; retain raw samples rather than declaring
+parity. Public projection performance remains a separate open gate: matrix pitch/coordinate and
+linear-address bounds must be completed before restoring the retained-Long optimized route.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its
