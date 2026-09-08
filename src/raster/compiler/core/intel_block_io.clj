@@ -7,6 +7,29 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-precondition :as precondition]))
 
+(defn- partition-preconditions
+  "Accept the canonical full-K or uniform grid-Z partition. Fragment alignment must hold at
+  every partition boundary, not merely at the full surface width. Matrix-plan analysis also
+  verifies that these declared bounds are the actual loop bounds."
+  [kernel-body k]
+  (let [[lower upper] (get-in kernel-body [:attributes :iteration-range :k])]
+    (if (= [0 k] [lower upper])
+      []
+      (let [[group chunk] (:arguments lower)
+            limit (second (:arguments upper))
+            group-binding (some #(when (= group (:id %)) %) (:indices kernel-body))
+            chunk-parameter (some #(when (= chunk (:id %)) %) (:parameters kernel-body))]
+        (when-not (and (= lower (body/expression :mul group chunk))
+                       (= :group (:source group-binding)) (= 2 (:axis group-binding))
+                       (= :scalar (:kind chunk-parameter))
+                       (or (= limit k) (integer? limit))
+                       (= upper (body/expression :min (body/expression :add lower chunk) limit)))
+          (throw (ex-info "Intel matrix K partition requires a canonical uniform grid-Z range"
+                          {:reason :matrix-partition-contract :lower lower :upper upper})))
+        (cond-> [{:expression chunk :op :> :value 0}
+                 {:expression (body/expression :mod chunk 16) :op := :value 0}]
+          (integer? limit) (conj {:expression k :op := :value limit}))))))
+
 (defn matrix-preconditions
   "Conditions on the two dense half surfaces A[M,K] and B[K,N]. Optional slice strides are in
   elements and describe rebasing an input pointer between workgroups, not the scalar C stores."
@@ -46,7 +69,8 @@
                      (:indices kernel-body))
         strides (for [view (:views kernel-body) :when (contains? inputs (:buffer view))]
                   (walk/postwalk-replace groups (:element-offset view)))]
-    {:preconditions (matrix-preconditions m n k strides)
+    {:preconditions (into (matrix-preconditions m n k strides)
+                          (partition-preconditions kernel-body k))
      :parameter-alignments (zipmap inputs (repeat 64))}))
 
 (defn static-failure

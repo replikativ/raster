@@ -475,6 +475,18 @@ rejection. Focused validation: 83 tests, 1084 assertions. The public Long-DPAS a
 closed. Existing int-sized layout/combine slots still impose capacity limits; complete their wide
 lowering and selector admission before promising a fallback for every oversized specialization.
 
+The following width slice preserves graph-derived physical extents in cast, transpose and generic
+split-combine bodies. The segment-count ABI follows its own shape expression, independently of
+wide coordinate uses; mixed Int-output/Long-reduction cases remain valid. Allocation-free checks
+cover multi-billion-element layout and combine plans. Focused validation: 53 tests, 909 assertions,
+plus three Arc matrix tests with eight assertions. Public Long-DPAS admission remains closed.
+
+Intel split-K artifacts additionally require positive, K16-aligned chunks, derived from canonical
+scheduled partition bounds. Literal terminal K bounds are tied to the physical K parameter;
+unknown sliced forms fail closed. This protects direct artifact binding, not only graph-generated
+chunks. Focused validation: 32 tests, 745 assertions including Arc execution. It does not prove that
+an arbitrary caller supplied enough partitions to cover K, nor add CUDA partition constraints.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.
