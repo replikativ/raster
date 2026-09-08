@@ -458,14 +458,23 @@
         interface (update (executable/common-view base) :abi
                           #(mapv (fn [slot] (if (= :scalar (:kind slot))
                                              (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
-        graph (:graph (gemm/emit-batched-matrix-alternative
-                       (assoc spec :external-interface interface)))
+        {graph :graph selector :selector}
+        (gemm/emit-batched-matrix-alternative (assoc spec :external-interface interface))
         values (zipmap '[batch m n k] (mapv #(hash-map :type :long :value %) [2 8 32 32]))
         bindings (mapcat #(get-in % [:operation :attributes :scheduled-kernel-body :scalar-bindings])
                          (:nodes graph))]
     (is (every? #(= :long (:dtype %)) bindings))
     (is (= #{:identity :checked-range} (set (map :conversion bindings))))
     (is (map? (graph-call/temporary-specs graph values)))
+    (doseq [[batch fallback?] [[2 false] [2147483648 true]]]
+      (let [scalars (assoc (into {} (map (fn [[id value]] [id (:value value)])) values)
+                           'batch batch)]
+        (is (= fallback?
+               (boolean
+                (some (fn [{:keys [expression op value]}]
+                        (precondition/compare-value?
+                         op (launch/resolve-expression scalars expression) value))
+                      (:cases selector)))))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                           (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))))))
 

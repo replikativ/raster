@@ -8,7 +8,8 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kgraph]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.scalar-range :as scalar-range]))
 
 (defrecord ScheduledKernelCall [id call dependencies])
 (defrecord KernelGraphCall [graph buffers scalar-values nodes])
@@ -33,6 +34,28 @@
   [graph]
   (filterv (fn [[slot _]] (= :scalar (:kind slot)))
            (mapv vector (:abi graph) (:arguments graph))))
+
+(defn direct-scalar-range-preconditions
+  "Project physical integer ranges for direct public scalar bindings into selector conditions.
+  This is deliberately partial: computed node arguments, allocation products and artifact
+  preconditions still require ordinary binding preflight. No expression is evaluated here."
+  [graph]
+  (let [graph (executable/validate! graph)
+        public (scalar-interface graph)
+        public-ids (set (map second public))
+        bindings (concat public
+                         (mapcat (fn [{:keys [operation]}]
+                                   (map vector (:abi operation) (:arguments operation)))
+                                 (:nodes graph)))]
+    (vec
+     (distinct
+      (mapcat (fn [[slot argument]]
+                (when (and (= :scalar (:kind slot)) (contains? public-ids argument))
+                  (when-let [{:keys [lower upper]} (scalar-range/for-dtype (:kernel-dtype slot))]
+                    [{:expression argument :op :>=
+                      :value (if (= :bound (:role slot)) (max 0 lower) lower)}
+                     {:expression argument :op :<= :value upper}])))
+              bindings)))))
 
 (defn- validate-scalar-values!
   [graph scalar-values]
