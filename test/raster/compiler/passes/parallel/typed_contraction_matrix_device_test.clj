@@ -3,6 +3,7 @@
    backend-neutral KernelExecutable binder.  This is the device guard that permits the old
    Level Zero GEMM-specific binding surface to disappear without losing its numerical oracle."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -143,15 +144,18 @@
       (/ difference (max scale 1.0e-30)))))
 
 (defn- run-contraction
-  [device-id scheduled m n k]
+  ([device-id scheduled m n k] (run-contraction device-id scheduled m n k :int))
+  ([device-id scheduled m n k scalar-dtype]
   (let [a (input-array (* m k) 17)
         b (input-array (* k n) 29)
         runtime-arguments
         [:a :b :c
-         {:type :int :value m}
-         {:type :int :value n}
-         {:type :int :value k}]
-        selected (dispatch/select-alternative scheduled runtime-arguments)]
+         {:type scalar-dtype :value m}
+         {:type scalar-dtype :value n}
+         {:type scalar-dtype :value k}]
+        selected (if (dispatch/kernel-dispatch? scheduled)
+                   (dispatch/select-alternative scheduled runtime-arguments)
+                   scheduled)]
     (gpu/with-gpu-session [session device-id]
       (gpu/alloc! session {:a [:float (* m k) a]
                            :b [:float (* k n) b]
@@ -164,7 +168,29 @@
            :actual (gpu/download session :c)
            :expected (reference a b m n k)}
           (finally
-            (gpu/release-kernel-graph! session handle)))))))
+            (gpu/release-kernel-graph! session handle))))))))
+
+(deftest long-graph-interface-executes-layout-matrix-and-combine
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "Long matrix graph interface")
+    (let [device-id :ze:0
+          interface (update (executable/common-view
+                             (dispatch/default-alternative (typed-dispatch device-id))) :abi
+                            #(mapv (fn [slot] (if (= :scalar (:kind slot))
+                                               (assoc slot :dtype :long :kernel-dtype :long)
+                                               slot)) %))
+          {:keys [alternatives]}
+          (gemm/emit-matrix-alternatives
+           {:id :long-device-matrix :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
+            :variant :nn :tile (hardware/derive-gemm-tile {})
+            :fill-workgroups 32 :split-factors [2] :external-interface interface})]
+      ;; This exercises the graph constructor and common binder; it deliberately does not
+      ;; bypass the still-closed Long admission gate in the public typed contraction route.
+      (doseq [strategy [:xmx-direct :xmx-split-k-2]
+              :let [graph (some #(when (= strategy (executable/strategy %)) %) alternatives)
+                    {:keys [actual expected]} (run-contraction device-id graph 8 32 64 :long)]]
+        (is (some? graph))
+        (is (< (relative-l1 actual expected) 1.0e-3))))))
 
 (deftest ordinary-typed-contraction-executes-the-matrix-schedule
   (if-not @gpu-probe/gpu-available?
