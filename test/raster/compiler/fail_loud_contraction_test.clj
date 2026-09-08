@@ -141,7 +141,7 @@
   ;; Σ(a−za)(b−zb). Load-bearing, since q4_0/q8_0 zero-points are 8 and 128.
   (let [am (requiring-resolve 'raster.compiler.ir.axis-map/of-groups)
         idx (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)
-        gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+        gate (requiring-resolve 'raster.compiler.passes.parallel.staged-contraction-schedule/inner-dp4a-plan)
         ma (am [['[i 4]] ['[blk 4] '[t 32]]])
         mb (am [['[j 4]] ['[blk 4] '[t 32]]])
         base {:stages [{:axis 'blk :extent 4 :dtype :float :init 0.0 :lift 'inner}

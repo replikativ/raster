@@ -36,6 +36,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
@@ -446,7 +447,7 @@
                     :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
                                                 :float)}
               tz? (and prefer-peak? (seq operands)
-                       (:ok (sco/staged-inner-dp4a-legal? spec)))
+                       (:ok (staged-schedule/inner-dp4a-plan spec)))
               k (sco/generate-staged-contraction-kernel
                  (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
           {:strategy :staged-segred
@@ -1695,7 +1696,7 @@
                    (and (number? k-extent) (zero? (mod (long k-extent) 4))
                         (:ok (cf/check-layout (cf/contraction-facts form :dtype :byte)
                                               (:dp4a cf/leaf-layouts)))
-                        (:ok (sco/staged-inner-dp4a-legal? (spec form true)))))
+                        (:ok (staged-schedule/inner-dp4a-plan (spec form true)))))
         emit (fn [form tz? pre-steps]
                (let [k (sco/generate-staged-contraction-kernel (spec form tz?) out-sym)]
                  (cond-> {:strategy (if tz? :dp4a :quant-naive)
