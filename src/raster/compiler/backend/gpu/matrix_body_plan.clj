@@ -13,6 +13,24 @@
 (defn- value-id? [value]
   (or (symbol? value) (keyword? value)))
 
+(defn- cast-leaf!
+  [expression]
+  (let [argument (:argument expression)]
+    (when-not (or (value-id? argument) (integer? argument))
+      (throw (ex-info "matrix indices must widen leaves before arithmetic"
+                      {:reason :kernel-body-matrix-plan-unimplemented
+                       :expression expression})))
+    argument))
+
+(defn- mathematical-index
+  "Project exact leaf casts only; late widening of arithmetic is not an equivalence proof."
+  [expression]
+  (cond
+    (record-kind? "IndexCast" expression) (cast-leaf! expression)
+    (record-kind? "IndexExpr" expression)
+    (update expression :arguments #(mapv mathematical-index %))
+    :else expression))
+
 (defn- only!
   [owner values]
   (let [values (vec values)]
@@ -41,6 +59,7 @@
   scheduled matrix bodies. Returns nil for nonlinear/unknown expressions."
   [expression needle]
   (cond
+    (record-kind? "IndexCast" expression) (coefficient (cast-leaf! expression) needle)
     (= expression needle) 1
     (or (number? expression) (value-id? expression)) 0
     (not (record-kind? "IndexExpr" expression)) nil
@@ -74,6 +93,8 @@
   subset accepted by the matrix-plan boundary."
   [expression]
   (cond
+    ;; Exact casts of leaves preserve values. Casts of arithmetic may hide prior overflow.
+    (record-kind? "IndexCast" expression) (affine-form (cast-leaf! expression))
     (number? expression) {:constant expression :coefficients {}}
     (value-id? expression) {:constant 0 :coefficients {expression 1}}
     (not (record-kind? "IndexExpr" expression)) nil
@@ -104,7 +125,7 @@
        (= :lt (:op predicate))
        (= 2 (count (:arguments predicate)))
        (affine= (first (:arguments predicate)) lhs-constant lhs-coefficients)
-       (= rhs (second (:arguments predicate)))))
+       (= (mathematical-index rhs) (mathematical-index (second (:arguments predicate))))))
 
 (defn- binding-of [indices source axis]
   (:id (only! (str (name source) " index on axis " axis)
@@ -173,6 +194,9 @@
         k-parameter (:k dimension-parameters)
         dimension-values (:dimension-values attributes)
         schedule-parameters (filterv #(= :schedule (:role %)) parameters)
+        _ (require! (every? #(= :int (:dtype %)) (:dimension parameters-by-role))
+                    "matrix hardware dimensions currently require int representation"
+                    {:parameters (:dimension parameters-by-role)})
         _ (require! (every? #(and (= :scalar (:kind %)) (= :int (:dtype %)))
                             schedule-parameters)
                     "matrix schedule parameters must be scalar integers"
@@ -212,11 +236,12 @@
         _ (require! (record-kind? "ForLoop" inner-loop)
                     "outer K loop must contain the matrix-fragment loop" {:operation inner-loop})
         _ (doseq [loop [outer-loop inner-loop]]
-            (require! (and (= :int (get-in loop [:index :type]))
+            (require! (and (= :long (get-in loop [:index :type]))
+                           (= (get-in outer-loop [:index :type]) (get-in loop [:index :type]))
                            (empty? (:iter-args loop)) (empty? (:results loop))
                            (record-kind? "Yield" (peek (:operations loop)))
                            (empty? (:values (peek (:operations loop)))))
-                      "matrix target requires int induction and no scalar loop-carried state"
+                      "matrix target requires long induction and no scalar loop-carried state"
                       {:loop loop}))
         inner-ops (butlast (:operations inner-loop))
         prefetches (vec (filter #(record-kind? "TilePrefetch" %) inner-ops))
@@ -243,12 +268,14 @@
         inner-index (get-in inner-loop [:index :id])
         [k-lower k-upper] (get-in attributes [:iteration-range :k]
                                   [(:lower outer-loop) (:upper outer-loop)])
-        _ (require! (and (= k-lower (:lower outer-loop)) (= k-upper (:upper outer-loop))
+        _ (require! (and (= (mathematical-index k-lower) (mathematical-index (:lower outer-loop)))
+                         (= (mathematical-index k-upper) (mathematical-index (:upper outer-loop)))
                          (= outer-index (:lower inner-loop))
                          (= :min (get-in inner-loop [:upper :op]))
                          (affine= (first (get-in inner-loop [:upper :arguments]))
                                   block-k {outer-index 1})
-                         (= k-upper (second (get-in inner-loop [:upper :arguments]))))
+                         (= (mathematical-index k-upper)
+                            (mathematical-index (second (get-in inner-loop [:upper :arguments])))))
                     "matrix K loops do not describe blocked exact-fragment traversal"
                     {:outer outer-loop :inner inner-loop})
         _ (require! (and (seq lhs-loads) (seq rhs-loads)
@@ -365,7 +392,8 @@
         range-predicate? (fn [predicate]
                            (and (record-kind? "Predicate" predicate)
                                 (= :lt (:op predicate))
-                                (= [k-lower k-upper] (:arguments predicate))))
+                                (= (mapv mathematical-index [k-lower k-upper])
+                                   (mapv mathematical-index (:arguments predicate)))))
         _ (require! (and (= (if sliced-k? 3 2) (count guard-predicates))
                          (some #(lt-affine? % 0 {m-base-id 1} m-parameter) guard-predicates)
                          (some #(lt-affine? % 0 {(first n-base-ids) 1} n-parameter)
@@ -407,6 +435,7 @@
      :ncols ncols :lhs-ids lhs-ids :rhs-ids rhs-ids :mad-by-operands mad-by-operands
      :stores stores :prefetch prefetch-distance :result-dtype (:dtype out-param)
      :dimension-parameters dimension-parameters
+     :index-dtype (get-in outer-loop [:index :type])
      :dimension-values dimension-values
      :parameters parameters
      :schedule-parameters schedule-parameters
