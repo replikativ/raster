@@ -351,7 +351,8 @@
 
    `contract-form` may be nil when verified `:facts` and a scheduled operation are supplied.
    Ordinary typed matrix, register-tiled, portable and full-reduction routes need no source
-   spelling. Staged, SegMap and source fallbacks require one explicitly; the int8 compatibility
+   spelling. Staged routing also consumes verified facts directly; source fallbacks require a
+   compatibility spelling explicitly. The int8 compatibility
    leaf performs its temporary projection locally until it consumes the typed scalar vocabulary.
 
    Canonical f16 products first become a target-neutral KernelBody and are then lowered by the
@@ -422,8 +423,7 @@
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
         (and (seq stages) (> (count stages) 1))
-        (let [contract-form (compatibility-form! contract-form :staged-segred)
-              ;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+        (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
               _ (let [cmb (:combine (cf/scalar-reduction-view contract-facts))]
@@ -441,11 +441,10 @@
                   ;; input is the form, so there is no separately-computed value to pass
                   ;; inconsistently (which is what made the span rule unfireable)
                     :contract-axes (:contract-axes contract-facts)
-                    :body (nth contract-form 4)
-                    :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
+                    :body (:body contract-facts)
+                    :inputs (vec (sort-by name (contract-operand-arrays (:body contract-facts))))
                     :operands operands
-                    :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
-                                                :float)}
+                    :dtype dtype :out-dtype (or (:out-dtype contract-facts) :float)}
               tz? (and prefer-peak? (seq operands)
                        (:ok (staged-schedule/inner-dp4a-plan spec)))
               k (sco/generate-staged-contraction-kernel

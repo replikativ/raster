@@ -188,6 +188,13 @@ OpenCL, with CUDA/HIP source compilation in CI. It is a portability prerequisite
 four byte loads match the throughput of an aligned packed-word load or that staged emission is
 already unified.
 
+Staged route construction now reads the body and output dtype from the same verified contraction
+facts as its axes and stages. It no longer reconstructs or reparses a compatibility form just to
+build the existing staged emitter's spec. Regression tests disable both source entry points and
+compare ordered ABI, scalar bindings, launch geometry and stage metadata for scalar and packed paths,
+including a non-default output dtype. The staged algorithm is still source-emitted; this retires
+an input-representation duplication, not the remaining target emission path.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through
