@@ -5,7 +5,8 @@
    scheduling value above both: every alternative implements the same logical call and differs
    only in its emitted schedule. Selection is pure data evaluated after symbolic ABI scalars
    become concrete and before a backend binder sees the selected executable."
-  (:require [raster.compiler.ir.kernel-executable :as kexec]
+  (:require [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.kernel-precondition :as precondition]))
 
@@ -184,7 +185,9 @@
       ;; denotes the same emitted module/signature; otherwise backend registration is ambiguous.
       (doseq [[kernel-name entries] (group-by first named-artifacts)]
         (let [implementations (set (map (fn [[_ artifact]]
-                                          (select-keys artifact [:target :source :abi :arguments :preconditions]))
+                                          (kart/compilation-identity
+                                           (select-keys artifact [:target :source :abi :arguments :preconditions])
+                                           artifact))
                                         entries))]
           (when-not (= 1 (count implementations))
             (throw (ex-info "kernel dispatch reuses an entry point for conflicting modules"

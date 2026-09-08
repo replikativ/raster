@@ -1791,6 +1791,10 @@
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
    (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
+         _ (when (seq (kart/compilation kernel-info))
+             (throw (ex-info "Level Zero offline compilation does not yet consume explicit compiler requirements"
+                             {:reason :unsupported-compilation-contract :backend :ze
+                              :compilation (kart/compilation kernel-info)})))
          info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))

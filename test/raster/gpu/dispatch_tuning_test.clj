@@ -30,6 +30,15 @@
 (def ^:private reference (artifact "tune_reference" :reference 64))
 (def ^:private subgroup (artifact "tune_subgroup" :subgroup 16))
 
+(deftest compilation-requirements-invalidate-executable-identity
+  (let [explicit (assoc-in reference [:attributes :compilation] {:language-standard "CL3.0"})
+        feature (assoc-in explicit [:attributes :compilation :extensions] #{"cl_khr_integer_dot_product"})
+        signatures (mapv tuning/executable-signature [reference explicit feature])]
+    (is (= 3 (count (set (map :source-hash signatures)))))
+    (is (= 1 (count (set (map :abi-hash signatures)))))
+    (is (= (tuning/executable-signature reference)
+           (tuning/executable-signature (assoc-in reference [:attributes :compilation] {}))))))
+
 (def ^:private dispatch
   (kdispatch/make
    {:id "dispatch-tuning-test"

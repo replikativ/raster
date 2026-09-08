@@ -6,7 +6,8 @@
    winners at sampled runtime scalar values into a piecewise selector, and atomically caches it.
    Applying a result rechecks the full identity: device, emitted sources, ABI, numerical mode, and
    layout. A stale or cross-device result therefore cannot silently select a kernel."
-  (:require [raster.compiler.ir.kernel-dispatch :as kdispatch]
+  (:require [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.tuning-cache :as cache])
@@ -57,12 +58,15 @@
                                    {:id (:id node)
                                     :uses (:uses node)
                                     :dependencies (:dependencies node)
-                                    :artifact (select-keys (:operation node)
+                                    :artifact (kart/compilation-identity (select-keys (:operation node)
                                                            [:kernel-name :target :source :abi
-                                                            :arguments :launch :preconditions :temporaries])})
+                                                            :arguments :launch :preconditions :temporaries])
+                                                                         (:operation node))})
                                  (:nodes executable))}
-                   (select-keys executable
-                                [:kernel-name :target :source :launch :preconditions :temporaries]))]
+                   (kart/compilation-identity
+                    (select-keys executable
+                                 [:kernel-name :target :source :launch :preconditions :temporaries])
+                    executable))]
     {:kind (kexec/kind executable)
      :strategy (kdispatch/alternative-strategy executable)
      :target (kexec/target executable)
