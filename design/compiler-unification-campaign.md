@@ -705,3 +705,15 @@ frontend admission. Decoded operands and broader integer stage schedules remain 
 Public validation includes post-reduction placement on Arc, all common source dialects, short
 epilogue-buffer rejection before allocation, and CUDA/HIP vendor fixtures using the same public
 workload. Whole staged-emitter retirement remains contingent on the uncovered numerical contracts.
+
+### Shared load-transform semantics
+
+The host contraction macro and retained staged emitter now share the same capture-avoiding
+per-operand load-transform substitution. The host previously ignored `:decode`, so it was not a
+valid numerical oracle for decoded kernels. Decode applies to the core summand before stage lifts
+and the final result transform. Summand locals are alpha-renamed before substitution so they cannot
+capture decode free variables or inherit a shadowed outer array's transformation.
+
+This correctness prerequisite does not yet admit decoded loads to the generated staged schedule.
+That migration still requires retained types for the raw-load binder, decoded scalar expressions,
+and any integer widening/overflow semantics; no target-side type inference is introduced here.

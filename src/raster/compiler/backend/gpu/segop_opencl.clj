@@ -1726,13 +1726,7 @@
         ;; read is matched via the registry — the literal `(= 'aget (first f))` here meant a decode
         ;; was SILENTLY DROPPED for every walker-spelled operand, emitting `a[l]*b[l]` where the
         ;; semantics are `(a[l]-zp)*b[l]`. A wrong answer, not a slow one.
-        body (if (empty? decodes)
-               body
-               (descriptor/rewrite-aget-reads
-                body
-                (fn [f] (let [arr (descriptor/aget-array-sym f)]
-                          (when (contains? decodes arr)
-                            (util/subst-syms {'x f} (get decodes arr)))))))
+        body (cf/apply-load-transforms body decodes)
         ;; EPILOGUE — the store splice. An epilogue is a lift on a virtual outermost level of
         ;; extent 1, which is why it needs no linearity (nothing to distribute over one iteration)
         ;; while a real stage lift does. Gives this emitter the dequant scale that the two quant
