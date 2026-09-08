@@ -3,10 +3,72 @@
             [raster.compiler.backend.gpu.segop-opencl :as emitter]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-closure-test :as fixture]
+            [raster.core :refer [deftm]]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
             [raster.gpu.device-probe :as probe]))
+
+(deftm staged-prefix-map!
+  [a :- (Array byte) b :- (Array byte) da :- (Array float)
+   db :- (Array float) out :- (Array float)] :- Void
+  (ledger/staged-byte-float-contract! a b da db out)
+  (raster.par/map! out index 2 float
+                   (raster.numeric/* (raster.arrays/aget out index) 2.0)))
+
+(deftest public-staged-prefix-map-preserves-the-backing-buffer-tail
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "public staged contraction and prefix map")
+    (let [output (float-array [0.0 0.0 -555.0 -777.0])
+          compilation (equation-first/compile
+                       #'staged-prefix-map!
+                       {:target :ocl:0 :dtype :float
+                        :values {'out (av/tensor {:dtype :float :shape [4]})}})
+          plan (equation-first/lower
+                compilation [(byte-array (repeat 8 1))
+                             (byte-array (concat (repeat 8 2) (repeat 8 3)))
+                             (float-array (repeat 2 0.5))
+                             (float-array (repeat 4 0.25)) output])
+          output-id (some (fn [[id node]] (when (identical? output (:source node)) id))
+                          (:nodes plan))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (some? output-id))
+      (let [executable (link/instantiate! plan)]
+        (try
+          (link/run! executable)
+          (is (= [4.0 6.0 -555.0 -777.0] (vec (link/download executable output-id))))
+          (finally (link/close! executable)))))))
+
+(deftm staged-prefix-copy!
+  [a :- (Array byte) b :- (Array byte) da :- (Array float)
+   db :- (Array float) out :- (Array float) destination :- (Array float)] :- Void
+  (ledger/staged-byte-float-contract! a b da db out)
+  (raster.par/map! destination index 2 float
+                   (raster.numeric/* (raster.arrays/aget out index) 2.0)))
+
+(deftest public-staged-prefix-map-supports-a-disjoint-destination
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "public staged contraction and disjoint prefix map")
+    (let [output (float-array [0.0 0.0 -555.0 -777.0])
+          destination (float-array [-333.0 -444.0])
+          compilation (equation-first/compile
+                       #'staged-prefix-copy!
+                       {:target :ocl:0 :dtype :float
+                        :values {'out (av/tensor {:dtype :float :shape [4]})}})
+          plan (equation-first/lower
+                compilation [(byte-array (repeat 8 1))
+                             (byte-array (concat (repeat 8 2) (repeat 8 3)))
+                             (float-array (repeat 2 0.5))
+                             (float-array (repeat 4 0.25)) output destination])
+          node-for (fn [source]
+                     (some (fn [[id node]] (when (identical? source (:source node)) id)) (:nodes plan)))
+          executable (link/instantiate! plan)]
+      (try
+        (link/run! executable)
+        (is (= [2.0 3.0 -555.0 -777.0] (vec (link/download executable (node-for output)))))
+        (is (= [4.0 6.0] (vec (link/download executable (node-for destination)))))
+        (finally (link/close! executable))))))
 
 (deftest public-staged-contraction-compiles-links-and-runs
   (if-not @probe/opencl-available?

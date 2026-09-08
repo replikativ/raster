@@ -639,3 +639,30 @@ by a six-assertion graph-only API check. Public batch admission remains a separa
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.
+
+### Public staged contractions and result-prefix storage
+
+The bounded Byte/Int32/Float staged contraction now enters the retained TypedSOAC closure from
+ordinary public `par/contract` syntax, including canonical derivation of operand maps. Declared
+Byte inputs and Float scale/output arrays remain independent under Float compilation policy.
+Frontend admission and KernelBody lowering share a non-emitting schedule-domain check; unsupported
+staged semantics are not silently flattened or accepted beyond the generated schedule's coverage.
+The compatibility ledger records this workload as typed and KernelBody-emitted. This does not
+retire all staged fallback schedules, generalize every precision/stage combination, or prove SOTA
+performance. Those remain explicit follow-ups to the common generated schedule vertical.
+
+Storage access requirements are lower bounds, aggregated across contractions. Known larger
+capacities are preserved. A map reading a smaller static prefix uses the existing indexed capture
+representation, not a weakened element-tensor shape. Logical prefix results get LinkPlan views
+over their physical destination allocation, with no additional copy or initializer. Emitted calls
+retain the semantic result/destination relation; planning and runtime independently check actual
+view identity, type, extent and prefix containment. Runtime view resolution is mandatory before
+binding such calls. A partial write establishes only its proven logical prefix, not the tail.
+
+Validation includes hardware-free CUDA/HIP public compilation, short-buffer and forged-view
+rejection, retained-call mutation checks, fresh-prefix initialization, and Arc execution of
+contraction alone, in-place prefix map, and disjoint-destination map with unchanged tail values.
+Known capacity is supplied at compilation for these larger-buffer cases. General runtime capacity
+adaptation and dynamic view specialization still need their own invocation/view contracts; exact
+invocation tensor-shape checks remain intact. Indexed captures can conservatively limit fusion;
+recovering pointwise fusion through explicit views belongs with the broader typed fusion work.

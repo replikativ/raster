@@ -21,6 +21,19 @@
                           (view/view allocation {:id :other-name :dtype :float
                                                  :shape [1024]})))))
 
+(deftest prefix-views-require-the-same-allocation-and-typed-range
+  (let [base (view/view allocation {:dtype :float :shape [16]})
+        prefix (view/subview base {:shape [8]})
+        shifted (view/subview base {:shape [8] :byte-offset 4})]
+    (is (view/prefix-view? base prefix))
+    (is (not (view/prefix-view? prefix base)))
+    (is (view/contains-contiguous-view? base shifted))
+    (is (not (view/prefix-view? base shifted)))
+    (is (not (view/prefix-view? base (assoc-in prefix [:allocation :id] :unrelated))))
+    (is (not (view/prefix-view? base (assoc-in prefix [:allocation :ownership] :borrowed))))
+    (is (not (view/prefix-view? base (view/view allocation {:dtype :int :shape [8]}))))
+    (is (not (view/prefix-view? base (view/view allocation {:dtype :float :shape [8] :strides [2]}))))))
+
 (deftest strided-views-state-their-physical-span
   (let [columns (view/view allocation {:id :columns :dtype :float
                                        :shape [4 8] :strides [64 2]})]

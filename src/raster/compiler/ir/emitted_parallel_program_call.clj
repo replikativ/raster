@@ -102,6 +102,8 @@
       (checked-scalar values id value))
     step))
 
+(declare validate-result-views!)
+
 (defn validate-equation-call!
   [call]
   (when-not (emitted-equation-call? call)
@@ -135,13 +137,31 @@
       (fail! :emitted-program-equation-graph
              "emitted equation call graph differs from its certified operation"
              {:equation (:id equation)}))
+    (validate-result-views! equation (or (:result-views call) {}))
     call))
 
+(defn- validate-result-views!
+  [equation result-views]
+  (when-not (map? result-views)
+    (fail! :emitted-program-result-views "result views must be a map" {:result-views result-views}))
+  (let [algorithm (:algorithm (first (:operations equation)))
+        physical (physical-results algorithm)]
+    (doseq [[result destination] result-views]
+      (let [producer (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm))]
+        (when-not (and (some #{result} (:results equation))
+                       (= destination (get physical result))
+                       (contains? '#{contract map} (soac/operation-kind producer)))
+          (fail! :emitted-program-result-view
+                 "result view must retain a prefix-producing physical storage relation"
+                 {:equation (:id equation) :result result :destination destination}))))
+    result-views))
+
 (defn- prepare-equation-call
-  [equation values buffers scalars]
+  [equation values buffers scalars result-views]
   (let [emitted (emitted-equation/validate! (first (:operations equation)))
         graph (:graph emitted)
         result-storage (physical-results (:algorithm emitted))
+        result-views (validate-result-views! equation (select-keys result-views (:results equation)))
         buffers
         (reduce
          (fn [bindings result]
@@ -157,11 +177,15 @@
                                           :physical-result physical}))]
              (when (and (not= ::missing physical-binding)
                         (not= ::missing logical-binding)
-                        (not= physical-binding logical-binding))
+                        (not= physical-binding logical-binding)
+                        (not= physical (get result-views result)))
                (fail! :emitted-program-result-alias
                       "logical and physical result bindings disagree"
                       {:equation (:id equation) :result result :physical-result physical}))
-             (assoc bindings physical selected result selected)))
+             (assoc bindings physical selected result
+                    (if (contains? result-views result)
+                      (require-buffer bindings result :result-view)
+                      selected))))
          buffers (:results equation))
         runtime-arguments
         (mapv (fn [slot argument]
@@ -180,8 +204,9 @@
         bindings (executable/graph-bindings graph runtime-arguments)
         outputs (select-keys buffers (:results equation))]
     {:call (validate-equation-call!
-            (->EmittedEquationCall equation graph (:buffers bindings)
-                                   (:scalar-values bindings) outputs))
+            (assoc (->EmittedEquationCall equation graph (:buffers bindings)
+                                         (:scalar-values bindings) outputs)
+                   :result-views result-views))
      :buffers buffers}))
 
 (defn- evaluate-host-equations
@@ -257,6 +282,10 @@
              "emitted program call must retain one step per equation"
              {:expected (count (:equations parallel-program)) :actual (count steps)}))
     (doseq [[equation step] (map vector (:equations parallel-program) steps)]
+      (when (and (seq (:result-views step)) (not (emitted-equation-call? step)))
+        (fail! :emitted-program-result-views
+               "only emitted numerical equations may declare prefix result views"
+               {:equation (:id equation)}))
       (cond
         (evaluated-host-equation? step)
         (do (validate-host-step! (:values parallel-program) step)
@@ -266,6 +295,14 @@
 
         (emitted-equation-call? step)
         (do (validate-equation-call! step)
+            (doseq [[result physical] (:result-views step)]
+              (when-not (and (= (get buffers physical) (get (:buffers step) physical))
+                             (= (get buffers result) (get (:outputs step) result))
+                             (or (not (contains? outputs result))
+                                 (= (get buffers result) (get outputs result))))
+                (fail! :emitted-program-result-view-bindings
+                       "result-view tokens must agree with actual step and exported bindings"
+                       {:equation (:id equation) :result result :physical physical})))
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
                      "emitted graph step changed equation identity" {:equation (:id equation)})))
@@ -417,9 +454,23 @@
    `buffers` may include preallocated intermediate and output storage in addition to inputs.
    `scalar-values` contains typed runtime scalars. `loop-scratch` maps loop output IDs to alternate
    carry buffers. `evaluate-host` is called only for effect-free scalar equations that do not
-   depend on device results."
-  [parallel-program buffers scalar-values loop-scratch evaluate-host]
+   depend on device results.
+   Optional `result-views` maps logical results to their prefix-producing physical destinations.
+   This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
+   validates concrete views, and runtime preparation requires checked view resolution."
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host]
+   (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
   (let [parallel-program (emitted-program/validate! parallel-program)
+        _ (when-not (and (map? result-views)
+                         (every? (set (mapcat :results
+                                             (filter #(emitted-equation/emitted-equation?
+                                                       (first (:operations %)))
+                                                     (:equations parallel-program))))
+                                 (keys result-views)))
+            (fail! :emitted-program-result-views
+                   "result-view declarations must name emitted numerical results"
+                   {:result-views result-views}))
         values (:values parallel-program)
         overlapping-runtime-values (set/intersection (set (keys buffers))
                                                      (set (keys scalar-values)))
@@ -468,7 +519,7 @@
 
              :else
              (let [{:keys [call buffers]}
-                   (prepare-equation-call equation values buffers scalars)]
+                   (prepare-equation-call equation values buffers scalars result-views)]
                {:buffers buffers :steps (conj steps call)})))
          {:buffers buffers :steps []}
          (:equations parallel-program))
@@ -485,4 +536,4 @@
     (validate!
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) final-buffers scalars loop-scratch outputs
-      {:execution :stage-once-host-repetition :source-inspected false}))))
+      {:execution :stage-once-host-repetition :source-inspected false})))))

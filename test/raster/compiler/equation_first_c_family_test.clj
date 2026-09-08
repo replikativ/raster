@@ -5,6 +5,12 @@
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
             [raster.numeric]
@@ -163,6 +169,44 @@
       (is (str/includes? (:source (first kernels)) "rstr_dp4a"))
       (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (empty? (:outputs linked)) "the public Void destination remains a state buffer")
+      (let [call (:call (first (:instances linked)))
+            equation (get-in call [:program :equations 0])
+            algorithm (get-in equation [:operations 0 :algorithm])
+            result (first (:results equation))
+            physical (first (soac/physical-results algorithm (first (soac/equations algorithm))))
+            make-call #(program-call/make (:program call)
+                                          (assoc (:buffers call) result :unrelated-result)
+                                          (:scalar-values call) {} nil %)
+            forged (make-call {result physical})
+            binds (atom 0)
+            executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
+            reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+        (is (= :emitted-program-result-views (reason #(make-call {:not-a-result physical}))))
+        (is (= :parallel-program-result-view-resolver
+               (reason #(program-runtime/prepare-with! forged executor))))
+        (is (= :emitted-program-result-view-bindings
+               (reason #(program-call/validate!
+                         (assoc-in forged [:steps 0 :buffers physical] :wrong-kernel-buffer)))))
+        (is (= :emitted-program-result-view-bindings
+               (reason #(program-call/validate!
+                         (assoc-in forged [:steps 0 :outputs result] :wrong-logical-buffer)))))
+        (is (= :parallel-program-result-view-shape
+               (reason #(program-runtime/prepare-with!
+                         forged (assoc executor :buffer-view
+                                       (fn [token]
+                                         (bview/view
+                                          (bview/allocation {:id :shared :byte-size 8 :device target
+                                                             :memory-space :device :ownership :owned})
+                                          {:dtype :float :shape [(if (= token :unrelated-result) 1 2)]})))))))
+        (is (= :parallel-program-result-view
+               (reason #(program-runtime/prepare-with!
+                         forged (assoc executor :buffer-view
+                                       (fn [token]
+                                         (bview/view
+                                          (bview/allocation {:id token :byte-size 8 :device target
+                                                             :memory-space :device :ownership :owned})
+                                          {:dtype :float :shape [2]})))))))
+        (is (zero? @binds) "unrelated result views must fail before staging any graph"))
       (doseq [[slot short-buffer] [[0 (byte-array 7)] [2 (float-array 1)]
                                   [4 (float-array 1)]]]
         (is (thrown? clojure.lang.ExceptionInfo
@@ -172,6 +216,36 @@
                               (float-array 4) (float-array 2)] slot short-buffer)))
             "core, scale and destination capacities are checked before allocation"))
       (is (= (:emitted compilation) (emitted-program/validate! (:emitted compilation)))))))
+
+(deftest staged-result-views-initialize-only-the-written-prefix
+  (let [output (float-array 4)
+        compilation (equation-first/compile
+                     #'ledger/staged-byte-float-contract!
+                     {:target cuda-target :dtype :float
+                      :values {'out (av/tensor {:dtype :float :shape [4]})}})
+        linked (equation-first/lower compilation [(byte-array 8) (byte-array 16)
+                                                  (float-array 2) (float-array 4) output])
+        call (:call (first (:instances linked)))
+        result (first (get-in call [:steps 0 :equation :results]))
+        prefix (get (:buffers call) result)
+        base (get (:buffers call) 'out)
+        fresh (-> linked
+                  (assoc-in [:nodes base :source] nil)
+                  (assoc-in [:nodes base :role] :internal)
+                  (assoc :outputs [prefix]))
+        reason (fn [plan] (try (link-plan/validate! plan) nil
+                              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (not= base prefix))
+    (is (= (get-in linked [:nodes base :view :allocation])
+           (get-in linked [:nodes prefix :view :allocation]))
+        "result views share storage without another allocation")
+    (is (nil? (get-in linked [:nodes prefix :source])))
+    (is (nil? (reason fresh)) "the contraction produces its entire logical prefix")
+    (is (= :link-unproduced-output (reason (assoc fresh :outputs [base])))
+        "writing a prefix cannot initialize or export the untouched tail")
+    (is (= :program-link-result-view
+           (reason (assoc-in fresh [:nodes prefix :view :byte-offset] 4)))
+        "a claimed prefix may not be shifted into another part of the allocation")))
 
 (deftest public-elementwise-map-uses-portable-kernel-body
   (doseq [[target module-target]

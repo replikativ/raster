@@ -2163,7 +2163,9 @@
                               (declare-result-conversion body fold-dtype)))
                           casts bodies)
         all-expressions (into (mapv :init locals) expressions)
-        [pointwise stable] ((juxt filter remove) #(pointwise-input? all-expressions % index) inputs)
+        [pointwise stable] ((juxt filter remove)
+                            #(and (not (contains? (:storage-inputs description) %))
+                                  (pointwise-input? all-expressions % index)) inputs)
         arrays (vec (sort-by pr-str pointwise))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
@@ -2775,6 +2777,31 @@
 
 (declare form->program*)
 
+(defn- preserve-map-storage-inputs
+  "Use existing indexed captures when a pointwise map reads a larger backing buffer.
+   Element operands retain their exact logical shape; no tensor type is weakened."
+  [descriptions values]
+  (let [requirements
+        (mapcat (fn [description]
+                  (when (= :contract (:kind description))
+                    (conj (mapv (juxt :parameter :elements)
+                                (contraction-closure/storage-requirements (:closure description)))
+                          [(get-in description [:facts :out])
+                           (reduce *' 1 (map second (get-in description [:facts :free-axes])))])))
+                descriptions)
+        capacities (merge (into {} (map (fn [[id accesses]] [id (apply max (map second accesses))]))
+                                (group-by first requirements))
+                          (into {} (keep (fn [[id value]]
+                                           (when (and (seq (:shape value))
+                                                      (every? integer? (:shape value)))
+                                             [id (reduce *' 1 (:shape value))]))) values))]
+    (mapv (fn [{:keys [kind extent inputs] :as description}]
+            (if (and (= :map kind) (integer? extent))
+              (assoc description :storage-inputs
+                     (set (filter #(when-let [capacity (get capacities %)]
+                                     (> capacity extent)) inputs)))
+              description)) descriptions)))
+
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.
 
@@ -2794,8 +2821,10 @@
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
-          descriptions (normalize-extents (source-descriptions pairs dtype array-types)
-                                          shape-equalities values)]
+          descriptions (preserve-map-storage-inputs
+                         (normalize-extents (source-descriptions pairs dtype array-types)
+                                            shape-equalities values)
+                         values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (some #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce

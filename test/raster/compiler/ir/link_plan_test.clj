@@ -47,6 +47,26 @@
                   :bindings {'x x 'w w 'y y}
                   :scalars {'n 16}}))
 
+(deftest initialized-alias-coverage-is-directional
+  (let [make-node (fn [id shape offset source]
+                    (link/node {:id id :dtype :float :shape shape :device :ze:0
+                                :role :internal :allocation-id :shared :byte-size 16
+                                :byte-offset offset :source source}))
+        base (make-node :base [4] 0 (float-array 4))
+        prefix (make-node :prefix [2] 0 nil)
+        plan #(link/make {:id :coverage :target :ze:0
+                          :nodes (into %1 [(n :x :input (float-array 16))
+                                           (n :w :constant (float-array 16)) (n :tmp :internal)])
+                          :instances [(instance :unrelated :x :w :tmp)]
+                          :aliases #{#{:base :prefix}} :outputs [%2]})]
+    (is (link/link-plan? (plan [base prefix] :prefix)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (plan [(make-node :base [4] 0 nil)
+                        (make-node :prefix [2] 0 (float-array 2))] :base)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (plan [(make-node :base [2] 8 nil)
+                        (make-node :prefix [3] 0 (float-array 3))] :base)))))
+
 (defn- valid-plan []
   (let [x (float-array 16) w0 (float-array 16) w1 (float-array 16)]
     (link/make

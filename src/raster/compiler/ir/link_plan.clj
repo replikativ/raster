@@ -856,6 +856,18 @@
 (defn- validate-program-buffer-contracts!
   [nodes values {:keys [id call roles]}]
   (let [program-values (get-in call [:program :values])]
+    (doseq [step (:steps call)
+            [result physical] (:result-views step)]
+      (let [logical-token (get (:buffers call) result)
+            physical-token (get (:buffers call) physical)
+            logical-view (:view (program-value-node! nodes values id result logical-token))
+            physical-view (:view (program-value-node! nodes values id physical physical-token))]
+        (when-not (and (= logical-token (get (:outputs step) result))
+                       (bview/prefix-view? physical-view logical-view))
+          (throw (ex-info "logical result view must be a prefix of its declared physical destination"
+                          {:reason :program-link-result-view :instance id :result result
+                           :physical-result physical :logical-view logical-view
+                           :physical-view physical-view})))))
     (doseq [[compiler-value value-id] (:buffers call)]
       (let [expected (get program-values compiler-value)
             link-value (get values value-id)
@@ -945,10 +957,25 @@
         (cond
           (program-call/evaluated-host-equation? step) []
           (program-call/emitted-equation-call? step)
-          [(program-graph-fact nodes values id step-index
-                               (get-in step [:equation :id])
-                               (:graph step) (:buffers step)
-                               (:scalar-values call) (:scalar-values step))]
+          [(assoc (program-graph-fact nodes values id step-index
+                                     (get-in step [:equation :id])
+                                     (:graph step) (:buffers step)
+                                     (:scalar-values call) (:scalar-values step))
+                  :produced-views
+                  (set (map (fn [[result _]]
+                              (:id (program-value-node! nodes values id result
+                                                        (get (:outputs step) result))))
+                            (:result-views step)))
+                  :partial-writes
+                  (set (keep (fn [[result physical]]
+                               (let [base (program-value-node! nodes values id physical
+                                                               (get (:buffers call) physical))
+                                     child (program-value-node! nodes values id result
+                                                                (get (:outputs step) result))]
+                                 (when (< (get-in child [:view :byte-length])
+                                          (get-in base [:view :byte-length]))
+                                   (:id base))))
+                             (:result-views step))))]
           (loop-call/structured-loop-call? step)
           (mapv (fn [iteration]
                   (let [{:keys [buffers scalar-values]}
@@ -984,14 +1011,24 @@
                                                        (contains? #{:input :constant :state} role))
                                                id)))
                                      nodes))
-        written (volatile! #{})]
-    (doseq [{:keys [instance step phase facts]} step-facts]
+        initially-initialized @initialized
+        written (volatile! #{})
+        initialized-view?
+        (fn [node-id]
+          (or (contains? @initialized node-id)
+              (let [view (get-in nodes [node-id :view])]
+                (and (bview/contiguous? view)
+                     (some (fn [initialized-id]
+                             (let [cover (get-in nodes [initialized-id :view])]
+                               (bview/contains-contiguous-view? cover view)))
+                           initially-initialized)))))]
+    (doseq [{:keys [instance step phase facts produced-views partial-writes]} step-facts]
       (let [by-node (reduce (fn [m {:keys [node access]}]
                               (update m node merge-access access)) {} facts)]
         (doseq [[node-id access] by-node
                 :let [role (get-in nodes [node-id :role])]]
           (when (and (contains? #{:read :read-write} access)
-                     (not (contains? @initialized node-id)))
+                     (not (initialized-view? node-id)))
             (throw (ex-info "link plan reads an internal node before an ordered producer writes it"
                             {:reason :link-read-before-write :instance instance :step step
                              :phase phase :node node-id})))
@@ -1000,7 +1037,8 @@
             (throw (ex-info "link plan writes a read-only node"
                             {:reason :link-write-read-only :instance instance :step step
                              :phase phase :node node-id :role role})))
-          (when (contains? #{:write :read-write} access)
+          (when (and (contains? #{:write :read-write} access)
+                     (not (contains? partial-writes node-id)))
             (vswap! initialized conj node-id)
             (vswap! written conj node-id)))
         (doseq [[left-id left-access] by-node
@@ -1011,10 +1049,14 @@
                           (contains? #{:write :read-write} right-access))]
           (throw (ex-info "one linked kernel step cannot access overlapping aliases when either writes"
                           {:reason :link-same-step-alias-hazard :instance instance :step step
-                           :phase phase :nodes #{left-id right-id}})))))
+                           :phase phase :nodes #{left-id right-id}}))))
+      ;; Only prefix-producing semantic operations contribute these checked views.
+      ;; A write through the larger pointer does not establish the untouched tail.
+      (vswap! initialized into produced-views)
+      (vswap! written into produced-views))
     (doseq [node-id outputs]
       (when-not (or (contains? @written node-id)
-                    (contains? @initialized node-id))
+                    (initialized-view? node-id))
         (throw (ex-info "link plan exports a node with no value"
                         {:reason :link-unproduced-output :node node-id}))))
     plan))

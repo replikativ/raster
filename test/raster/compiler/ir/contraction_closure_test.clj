@@ -56,6 +56,23 @@
                  (frontend/form->program
                   source (assoc options :values {'a (av/tensor {:dtype :byte :shape [287]})}))))))
 
+(deftest contraction-prefix-composes-with-a-map-over-larger-storage
+  (let [source (list 'let*
+                     ['contract-effect (raster.compiler.ir.contraction-facts/surface-form
+                                        (fixtures/packed-facts 3 5 3 32))
+                      'map-effect '(raster.par/map! out index 15 float
+                                     (raster.numeric/* (raster.arrays/aget out index) 2.0))]
+                     'out)
+        p (frontend/form->program
+           source {:dtype :float :array-types '{a :byte b :byte da :float db :float out :float}
+                   :values {'out (av/tensor {:dtype :float :shape [30]})}})
+        map-op (soac/operation-parts (second (soac/equations p)))]
+    (is (= '[contract map] (mapv soac/operation-kind (soac/equations p))))
+    (is (= [30] (get-in (soac/facts p) [:values 'out :shape])))
+    (is (empty? (:arrays map-op)))
+    (is (= ['out] (:captures map-op)))
+    (is (= p (soac/validate! p)))))
+
 (deftest unsupported-staged-schedules-do-not-become-authoritative-typed-islands
   (let [source (fixtures/packed-facts 3 5 3 32)
         options {:dtype :float :array-types '{a :byte b :byte da :float db :float out :float}
