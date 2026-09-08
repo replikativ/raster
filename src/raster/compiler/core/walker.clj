@@ -1539,8 +1539,16 @@
                                walked)))
                          args walked-args)
                     walked-args)
-        result (apply list (walk f ctx) cast-args)]
-    result))
+        result (apply list (walk f ctx) cast-args)
+        ;; Compiler forms can return an existing operand without being an ordinary
+        ;; dispatched call (e.g. contract returns its destination). Use the shared
+        ;; form contract during the lexical walk, before a following binding is
+        ;; consumed. Late result typing cannot repair an already unresolved call.
+        return-index (:return-type-arg (form/form-info result))
+        returned (when (some? return-index) (nth walked-args return-index nil))
+        return-tag (or (inf/hint-tag returned)
+                       (when (symbol? returned) (ctx-get-tag ctx returned)))]
+    (if return-tag (vary-meta result assoc :raster.type/tag return-tag) result)))
 
 ;; ================================================================
 ;; Branch: primitive cast (idempotent)

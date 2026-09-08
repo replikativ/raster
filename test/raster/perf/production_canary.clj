@@ -34,6 +34,21 @@
    These cases are not a claim of representative frontier-scale throughput."
   [[64 64 64] [1 256 256] [8 256 256] [127 65 33] [256 256 256]])
 
+(deftm gemm-relu-composed! [A :- (Array float) B :- (Array float) C :- (Array float)
+                    m :- Long n :- Long k :- Long] :- (Array float)
+  (let [product (raster.par/contract C [[i m] [j n]] [[p k]]
+                 (* (arrays/aget A (+ (* i k) p)) (arrays/aget B (+ (* p n) j)))
+                 :init (float 0.0))]
+    (raster.par/map! C q (* m n) nil (max (float 0.0) (arrays/aget product q)))))
+
+(deftm gemm-relu! [A :- (Array float) B :- (Array float) C :- (Array float)
+                    m :- Long n :- Long k :- Long] :- (Array float)
+  (raster.par/contract C [[i m] [j n]] [[p k]]
+    (* (arrays/aget A (+ (* i k) p)) (arrays/aget B (+ (* p n) j)))
+    :init (float 0.0)
+    :epilogue {:acc acc :expr (max (float 0.0) acc)
+               :operands [] :scalars [] :dtype :float}))
+
 (defn- valid-measurement? [result]
   (let [median (get-in result [:measurement :median-ns])]
     (and (true? (:validated? result)) (number? median)
@@ -115,8 +130,15 @@
    (compiled/lower #'gemm64! args {:target target :dtype :float :on-non-resident :throw
                                   :constants ['A 'B]}))
   ([target args shape]
-   (compiled/lower #'gemm-mnk! (into args (map long (checked-shape shape)))
-                   {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]})))
+   (prepare-gemm target args shape {}))
+  ([target args shape {:keys [variant gemm-precision] :or {variant :plain}}]
+   (let [entry (case variant
+                 :plain #'gemm-mnk!
+                 :relu #'gemm-relu!
+                 (throw (ex-info "unknown GEMM canary variant" {:variant variant})))]
+     (compiled/lower entry (into args (map long (checked-shape shape)))
+                     (cond-> {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]}
+                       gemm-precision (assoc :gemm-precision gemm-precision))))))
 
 (defn compilation-evidence
   "Describe alternatives from the exact prepared program, without recompiling it.
@@ -143,14 +165,23 @@
                         [(:artifact step)])))})
            (:steps descriptor))}))
 
-(defn gemm! [{:keys [environment-tag target compiler-revision shape] :or {target :ocl:0}}]
+(defn gemm! [{:keys [environment-tag target compiler-revision shape variant gemm-precision]
+              :or {target :ocl:0 variant :plain}}]
   (let [dimensions (checked-shape (or shape [64 64 64]))
-        identity (identity-for (if shape :gemm-mnk-resident :gemm64-resident) target :float dimensions
+        parameterized? (or shape gemm-precision (not= :plain variant))
+        workload (case variant
+                   :plain (if parameterized? :gemm-mnk-resident :gemm64-resident)
+                   :relu :gemm-relu-resident
+                   (throw (ex-info "unknown GEMM canary variant" {:variant variant})))
+        identity (identity-for workload target :float dimensions
                                :host-synchronized-replay environment-tag)
         args (gemm-arguments dimensions)
-        expected (vec (gemm-reference (first args) (second args) dimensions))
+        product (gemm-reference (first args) (second args) dimensions)
+        expected (if (= :plain variant) (vec product) (mapv #(max (float 0.0) %) product))
         started (System/nanoTime)
-        prepared (if shape (prepare-gemm target args dimensions) (prepare-gemm target args))
+        prepared (if parameterized?
+                   (prepare-gemm target args dimensions {:variant variant :gemm-precision gemm-precision})
+                   (prepare-gemm target args))
         compile-ns (- (System/nanoTime) started)
         started (System/nanoTime)
         c (compiled/instantiate! prepared)

@@ -16,6 +16,20 @@
 ;; classify-form
 ;; ================================================================
 
+(deftest operand-return-contract-is-carried-into-following-bindings
+  (doseq [init ['(raster.par/contract out [[i n]] [[j n]] 1.0)
+                '(raster.par/reduce-by-key out keys values n +)]]
+    (let [walked (wb (list 'let* ['result init] 'result)
+                     {'out 'floats 'keys 'ints 'values 'floats 'n 'long})
+          binding (first (second walked))]
+      (is (= 'floats (:raster.type/tag (meta binding))))
+      (is (= 'floats (:raster.type/tag (meta (last walked))))))))
+
+(deftest scalar-and-unknown-par-calls-do-not-inherit-array-return-tags
+  (doseq [expression ['(raster.par/atomic-add! out 0 1)
+                      '(raster.par/unknown! out 0 1)]]
+    (is (nil? (:raster.type/tag (meta (wb expression {'out 'ints})))))))
+
 (deftest classify-let-test
   (testing "let forms"
     (let [ctx (walker/make-ctx {})]

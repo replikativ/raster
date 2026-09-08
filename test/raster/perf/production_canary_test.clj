@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.perf.production-canary :as canary]
             [raster.runtime.microbench :as microbench]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.device-probe :as probe]))
 
 (defn- once-only [f & _]
@@ -59,6 +60,35 @@
                                      (float-array [1 2 3 4 5 6]) [2 2 3]))))
   (doseq [shape [[0 4 5] [-1 4 5] [3 4] [3 4 1.5] [Integer/MAX_VALUE 2 1]]]
     (is (thrown? clojure.lang.ExceptionInfo (canary/gemm-arguments shape)))))
+
+(deftest opencl-generated-gemm-epilogue-and-policy
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "public generated GEMM epilogue and precision policy")
+    (with-redefs [microbench/do-bench once-only]
+      (doseq [precision [:f32-scalar :mixed-f16-f32]]
+        (let [result (canary/gemm! {:shape [3 4 5] :variant :relu
+                                   :gemm-precision precision :target :ocl:0
+                                   :environment-tag "ci-correctness-only"})
+              evidence (:compilation result)
+              candidates (mapcat :alternatives (:steps evidence))]
+          (is (:validated? result))
+          (is (= precision (get-in result [:identity :numerical-policy])))
+          (is (= :gemm-relu-resident (get-in result [:identity :workload])))
+          (is (= 1 (:resident-step-count evidence)))
+          (is (seq candidates))
+          (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %)) candidates)))))))
+
+(deftest composed-return-alias-retains-the-memory-safety-gate
+  ;; Known gap: the lexical type survives, but storage aliases are not yet normalized into
+  ;; a pointwise inout boundary. Do not weaken stable-read validation to make this run.
+  (let [prepared (compiled/lower #'canary/gemm-relu-composed!
+                                 (into (canary/gemm-arguments [3 4 5]) [3 4 5])
+                                 {:target :ocl:0 :dtype :float :constants ['A 'B]
+                                  :gemm-precision :f32-scalar :on-non-resident :throw})]
+    (is (= 2 (get-in (canary/compilation-evidence prepared) [:resident-step-count])))
+    (when @probe/opencl-available?
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
+                           (compiled/instantiate! prepared))))))
 
 (deftest opencl-parameterized-gemm-shape-canary
   (if-not @probe/opencl-available?
