@@ -26,6 +26,29 @@
 
 (defn- stats-of [form] (:stats (slp/segop-lower-pass form {})))
 
+(deftest staged-contraction-equation-retains-storage-dependencies-and-result-type
+  (let [source
+        '(let* [result
+                (raster.par/contract out [[i 2]] [[blk 2] [t 4]]
+                  (raster.numeric/* (aget a (+ (* i 8) (* blk 4) t)) gain)
+                  :stages [{:axis blk :extent 2 :dtype :float :init 0.0
+                            :lift (raster.numeric/* inner (aget scales _))
+                            :operands [{:sym scales :dtype :float
+                                        :map {:groups [[[i 2]] [[blk 2]]]}}]}
+                           {:axis t :extent 4 :dtype :int :init 0}])]
+           result)
+        p (:form (slp/segop-lower-pass
+                   source {:dtype :byte :array-types {'a :byte 'scales :float 'out :float}
+                           :scalar-types {'gain :int}}))
+        equation (first (:equations p))
+        result (first (:results equation))]
+    (is (= ['a 'gain 'out 'scales] (:operands equation)))
+    (is (= #{:memory/read :memory/write} (:effects equation)))
+    (is (= {:dtype :byte :shape ['?]} (select-keys (get-in p [:values 'a]) [:dtype :shape])))
+    (doseq [id ['scales 'out result]]
+      (is (= {:dtype :float :shape ['?]} (select-keys (get-in p [:values id]) [:dtype :shape]))))
+    (is (= {:dtype :int :shape []} (select-keys (get-in p [:values 'gain]) [:dtype :shape])))))
+
 (deftest an-ordinary-binding-is-silent
   (testing "most bindings are not par forms. Reporting them as 'declined' would drown the signal —
             absence of a decline must keep meaning 'nothing to lower here'"

@@ -8,7 +8,56 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]))
+
+(deftest contraction-dependencies-include-stage-and-epilogue-storage
+  (let [facts (cf/from-components
+               {:out 'out :free-axes [['i 2]] :contract-axes [['blk 2] ['t 4]]
+                :dtype :byte
+                :body '(* inner (aget a (+ (* i 8) (* blk 4) t)))
+                :opts {:decode {'a '(+ x offset)}
+                       :stages [{:axis 'blk :extent 2 :dtype :float :init 0.0
+                                 :lift '(* inner beta (aget scale _))
+                                 :operands [{:sym 'scale :dtype :float
+                                             :map (am/of-axes [['i 2] ['blk 2]])}]}
+                                {:axis 't :extent 4 :dtype :int :init 0}]
+                       :epilogue {:acc 'acc :expr '(+ acc bias (aget residual i))
+                                  :operands [{:sym 'residual :dtype :float
+                                              :map (am/of-axes [['i 2]])}]
+                                  :scalars [{:sym 'bias :dtype :float}]}}})
+        deps {:reads #{'a 'scale 'residual} :writes #{'out}
+              :scalars #{'inner 'beta 'bias 'offset}}
+        node (soac/->SoacContract 0 'result facts)
+        scheduled (segop/->SegContract 0 facts :byte :ocl:0)]
+    (is (= deps (cf/dependencies facts)))
+    (is (= (:reads deps) (soac/soac-inputs node)))
+    (is (= (:reads deps) (segop/operation-inputs scheduled)))
+    (is (= (:scalars deps) (segop/operation-scalars scheduled)))
+    (is (= #{'a 'scale 'residual 'out 'inner 'beta 'bias 'offset}
+           (soac/node-all-free-syms node)))
+    (is (contains? (:scalars (cf/dependencies facts)) 'inner)
+        "the lift placeholder does not bind an identically named body capture")
+    (doseq [index ['_ '(ignored-index hidden)]]
+      (is (= deps (cf/dependencies
+                   (assoc-in facts [:epilogue :expr]
+                             (list '+ 'acc 'bias (list 'aget 'residual index)))))
+          "declared epilogue maps replace spelled index expressions before dependency projection"))))
+
+(deftest contraction-axis-binders-do-not-bind-their-own-extents
+  (let [facts (cf/from-components {:out 'out :free-axes [['i 'i]]
+                                    :contract-axes [['k 4]] :dtype :float
+                                    :body '(aget a (+ (* i 4) k))})]
+    (is (= #{'i} (:scalars (cf/dependencies facts))))))
+
+(deftest undeclared-decode-storage-cannot-become-a-scalar-capture
+  (let [facts (cf/from-components {:out 'out :free-axes [['i 2]]
+                                    :contract-axes [['k 4]] :dtype :byte
+                                    :body '(aget a (+ (* i 4) k))
+                                    :opts {:decode {'a '(+ x (aget hidden k))}}})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"decode storage captures"
+                         (cf/dependencies facts)))))
 
 (def ^:private ma (am/of-groups '[[[i 4]] [[blk 4] [t 32]]]))
 (def ^:private mb (am/of-groups '[[[j 6]] [[blk 4] [t 32]]]))

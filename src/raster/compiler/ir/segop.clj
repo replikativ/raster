@@ -14,6 +14,7 @@
   Each SegOp carries a KernelGrid with pre-computed launch config
   based on raster.runtime.hardware device properties."
   (:require [clojure.set :as set]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.runtime.hardware :as hw]
             [raster.compiler.core.hardware :as chw]
             [raster.compiler.core.util :as util]
@@ -155,8 +156,7 @@
   "Physical tensor inputs of a scheduled operation, including a SegContract schedule view."
   [operation]
   (if (instance? SegContract operation)
-    (let [facts (:facts operation)]
-      (disj (set (map :sym (:operands facts))) (:out facts)))
+    (:reads (contraction-facts/dependencies (:facts operation)))
     (or (:inputs operation) #{})))
 
 (defn operation-outputs
@@ -184,14 +184,7 @@
    checked projection of axis bounds rather than a duplicate record field."
   [operation]
   (if (instance? SegContract operation)
-    (let [facts (:facts operation)
-          arrays (set/union (operation-inputs operation) (operation-outputs operation))
-          axes (concat (:free-axes facts) (:contract-axes facts))
-          axis-indices (set (map first axes))
-          expressions (conj (mapv second axes) (:body facts))]
-      (set/difference
-       (reduce set/union #{} (map scalar-entry-references expressions))
-       arrays axis-indices))
+    (:scalars (contraction-facts/dependencies (:facts operation)))
     (let [space (:space operation)
           axes (into #{(:flat-idx space)} (map :name) (:dims space))
           arrays (set/union (operation-inputs operation) (operation-outputs operation))
