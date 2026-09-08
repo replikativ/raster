@@ -466,6 +466,15 @@ The existing typed SSA storage-address emitter serves matrix epilogues on both I
 Fresh capped-REPL validation: 68 tests, 688 assertions including Arc matrix execution. This removes
 a duplicate lowering path; it is not a new tensor IR or a performance claim.
 
+Mixed-precision graph emission now derives each node's logical scalar widths from the original
+GraphScalar environment through the existing checked expression algebra. Matrix, cast, transpose,
+split-combine and batched stages state identity or checked Long-to-int bindings before target
+projection; emitted ABIs are not rewritten afterward. Mixed-width/all-Long graph tests cover all
+four orientations, direct/split execution plans, shared-weight batches and pre-allocation overflow
+rejection. Focused validation: 83 tests, 1084 assertions. The public Long-DPAS admission gate remains
+closed. Existing int-sized layout/combine slots still impose capacity limits; complete their wide
+lowering and selector admission before promising a fallback for every oversized specialization.
+
 One small memory-capped REPL; focused affected tests locally. Full suites and hardware-free vendor
 compilers run on CircleCI. Review candidate/certificate boundaries; squash only exact reviewed heads
 with all required checks green. Never alter the concurrently edited main-checkout north-star file.

@@ -141,7 +141,7 @@
 
 (defn- emit-scheduled-body-artifact
   [{:keys [kernel-name source body arguments effects legality numerics phase target-dialect
-           parameter-names provenance attributes]
+           parameter-names provenance attributes scalar-types]
     :or {target-dialect :opencl-intel effects {:kind :tensor-contraction-stage}
          provenance {} attributes {}}}]
   (let [uses (scheduled-body/derive-uses body arguments)
@@ -150,6 +150,7 @@
          {:source source
           :body body
           :arguments arguments
+          :scalar-bindings (scheduled-body/derive-scalar-bindings body arguments scalar-types)
           :effects (assoc effects :uses uses)
           :legality legality
           :numerics numerics
@@ -258,7 +259,7 @@
     :policy {:permutation [1 0]}}))
 
 (defn- convert-artifact
-  [kernel-name stage phase target-dialect]
+  [kernel-name stage phase target-dialect scalar-types]
   (let [{stage-id :id in :input out :output input-shape :input-shape policy :policy}
         (layout-stage/validate! stage)
         elements (first input-shape)
@@ -283,6 +284,7 @@
      {:kernel-name kernel-name
       :source stage
       :body kernel-body :arguments [in out elements]
+      :scalar-types scalar-types
       :effects {:kind :layout-transform-stage}
       :legality {:kind :dense-affine-cast :vector-width vector-width}
       :numerics {:mode :bounded-error :policy :f32-to-f16-storage
@@ -296,7 +298,7 @@
       :parameter-names {in "input" out "output" :layout-elements "n"}})))
 
 (defn- transpose-artifact
-  [kernel-name stage phase target-dialect]
+  [kernel-name stage phase target-dialect scalar-types]
   (let [{stage-id :id in :input out :output
          [rows cols] :input-shape} (layout-stage/validate! stage)
         _ (when-not (and (= :half (:input-dtype stage)) (= :half (:output-dtype stage))
@@ -313,6 +315,7 @@
      {:kernel-name kernel-name
       :source stage
       :body kernel-body :arguments [in out rows cols]
+      :scalar-types scalar-types
       :effects {:kind :layout-transform-stage}
       :legality {:kind :bijective-affine-permutation :permutation [1 0]}
       :numerics {:mode :exact :policy :bit-preserving-permutation}
@@ -459,7 +462,7 @@
   (emit-scheduled-matrix-kernel (batched-matrix-spec spec)))
 
 (defn- emit-scheduled-matrix-artifact
-  [{:keys [kernel-name target-dialect parameter-names argument-values source-operation phase]
+  [{:keys [kernel-name target-dialect parameter-names argument-values source-operation phase scalar-types]
     :or {target-dialect :opencl-intel argument-values {}}
     :as spec}]
   (let [kernel-name (c-emit/c-symbol kernel-name)
@@ -480,6 +483,7 @@
                                        :phase phase})))
           :body kernel-body
           :arguments arguments
+          :scalar-bindings (scheduled-body/derive-scalar-bindings kernel-body arguments scalar-types)
           :effects {:kind :tensor-contraction-stage :uses uses}
           :legality {:kind :matrix-instruction-tiling
                      :scheduled-body (:id kernel-body)}
@@ -521,7 +525,7 @@
       :schedule {:kind :matrix-instruction-tiling :tile tile}})))
 
 (defn- gemm-artifact
-  [stage kernel-name phase target-dialect]
+  [stage kernel-name phase target-dialect scalar-types]
   (let [{stage-id :id a :lhs b :rhs c :result
          [m n k] :dimensions reduction :reduction epilogue :epilogue
          batching :batching schedule :schedule} (matrix-stage/validate! stage)
@@ -553,7 +557,7 @@
                    :source-operation stage
                    :provenance {:operation-id stage-id :phase phase}}]
     (emit-scheduled-matrix-artifact
-     (cond
+     (assoc (cond
        batching
        (assoc (batched-matrix-spec
                (assoc emit-args
@@ -567,7 +571,8 @@
               :phase phase :source-operation stage
               :argument-values {:k-chunk kc :splits splits})
 
-       :else emit-args))))
+       :else emit-args)
+            :scalar-types scalar-types :target-dialect target-dialect))))
 
 (defn- split-k-combine-plan
   [stage-id]
@@ -600,11 +605,12 @@
      {:kernel-name kernel-name :source source :kernel-body kernel-body :workgroup-size 256})))
 
 (defn- combine-artifact
-  [kernel-name operation partials c mn splits target-dialect]
+  [kernel-name operation partials c mn splits target-dialect scalar-types]
   (let [{body :body} (split-k-combine-plan (:id operation))]
     (emit-scheduled-body-artifact
      {:kernel-name kernel-name :source operation :body body
       :arguments [partials c mn splits mn]
+      :scalar-types scalar-types
       :effects {:kind :tensor-contraction-stage}
       :legality {:kind :portable-contraction :purpose :split-k-combine}
       :numerics {:mode :reassociated :policy :sequential-segment-fold
@@ -688,24 +694,24 @@
     {:partials (first partials) :output (first outputs) :mn mn :splits splits}))
 
 (defn- emit-stage-artifact
-  [target-dialect prefix {:keys [operation] :as node}]
+  [target-dialect prefix scalar-types {:keys [operation] :as node}]
   (let [phase (last (:id node))]
     (cond
       (layout-stage/layout-stage? operation)
       (case (:operation operation)
         :cast (convert-artifact (str prefix "_" (name phase)) operation
-                                phase target-dialect)
+                                phase target-dialect scalar-types)
         :transpose (transpose-artifact (str prefix "_" (name phase)) operation
-                                       phase target-dialect))
+                                       phase target-dialect scalar-types))
 
       (matrix-stage/matrix-stage? operation)
       (gemm-artifact operation (str prefix "_" (name phase))
-                     :matrix-contract target-dialect)
+                     :matrix-contract target-dialect scalar-types)
 
       (instance? raster.compiler.ir.segop.SegRed operation)
       (let [{:keys [partials output mn splits]} (split-combine-values operation)]
         (combine-artifact (str prefix "_" (name phase)) operation
-                          partials output mn splits target-dialect))
+                          partials output mn splits target-dialect scalar-types))
 
       :else
       (throw (ex-info "GEMM stage has no ScheduledKernelBody lowering"
@@ -721,6 +727,7 @@
   [stage-graph {:keys [target-dialect prefix refinement]
                 :or {target-dialect :opencl-intel prefix "scheduled_gemm"}}]
   (let [stage-graph (kgraph/validate! stage-graph)
+        scalar-types (into {} (map (juxt :id :dtype)) (:scalars stage-graph))
         _ (when (and refinement
                      (not= stage-graph (graph-refinement/scheduled-graph refinement)))
             (throw (ex-info "GEMM emission refinement does not retain the exact scheduled graph"
@@ -729,7 +736,7 @@
         (kgraph/map-operations
          stage-graph
          (fn [node]
-           (let [artifact (emit-stage-artifact target-dialect prefix node)
+           (let [artifact (emit-stage-artifact target-dialect prefix scalar-types node)
                  scheduled (kart/attribute artifact :scheduled-kernel-body)]
              (scheduled-body/validate-against-node! scheduled node stage-graph)
              (scheduled-body/validate-artifact-projection! scheduled artifact)

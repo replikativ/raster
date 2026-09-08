@@ -80,18 +80,28 @@
      [] (map vector (:parameters kernel-body) arguments))))
 
 (defn derive-scalar-bindings
-  "Derive ordered identity scalar bindings. Schedules needing a representation conversion must
-   construct and certify that conversion explicitly rather than relying on an ABI rewrite."
-  [kernel-body arguments]
+  "Derive ordered scalar bindings before target projection. With a typed graph environment,
+   logical expression widths come from that environment and any Long→int specialization is
+   explicitly checked-range. Without one, retain the body's declared identity bindings."
+  ([kernel-body arguments] (derive-scalar-bindings kernel-body arguments nil))
+  ([kernel-body arguments scalar-types]
   (let [kernel-body (body/validate! kernel-body)]
     (mapv (fn [[parameter argument]]
-            {:parameter (:id parameter)
-             :value argument
-             :dtype (:dtype parameter)
-             :kernel-dtype (:dtype parameter)
-             :conversion :identity})
+            (let [physical (:dtype parameter)
+                  logical (if (nil? scalar-types) physical
+                            (if (contains? #{:int :long} physical)
+                              (launch/typed-expression-dtype argument scalar-types)
+                              (get scalar-types argument)))
+                  conversion (cond (= logical physical) :identity
+                                   (= [:long :int] [logical physical]) :checked-range
+                                   :else (fail! :scheduled-kernel-body-scalar-bindings
+                                                "graph scalar has no supported representation conversion"
+                                                {:parameter parameter :argument argument
+                                                 :logical logical :physical physical}))]
+              {:parameter (:id parameter) :value argument :dtype logical
+               :kernel-dtype physical :conversion conversion}))
           (filter (fn [[parameter _]] (= :scalar (:kind parameter)))
-                  (map vector (:parameters kernel-body) arguments)))))
+                  (map vector (:parameters kernel-body) arguments))))))
 
 (defn- validate-scalar-bindings!
   [kernel-body arguments scalar-bindings]
