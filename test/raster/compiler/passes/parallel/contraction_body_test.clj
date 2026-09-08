@@ -110,6 +110,28 @@
         (is (string? (:source emitted)))
         (is (= :long (:kernel-dtype (last (:abi emitted)))))))))
 
+(deftest descriptor-scalars-project-the-retained-physical-abi
+  (doseq [[m-type k-type] [[:long :int] [:int :long] [:long :long]]]
+    (let [routed (route/route-contraction matvec :dtype :double :desc {}
+                                          :scalar-types {'m m-type 'k k-type})
+          slots (filterv #(= :scalar (:kind %)) (:abi routed))]
+      (is (= :portable-segred (:strategy routed)))
+      (is (= [k-type m-type m-type] (mapv :type (:scalar-args routed))))
+      (is (= (mapv :kernel-dtype slots) (mapv :type (:scalar-args routed))))
+      (is (= 3 (launch/resolve-expression {'m 3 'k 5}
+                                         (:value (last (:scalar-args routed))))))))
+  (let [form '(raster.par/contract y [[i m]] [[l k]] (* scale (aget x l)))
+        verified (facts/contraction-facts form :dtype :double)
+        operation (update (lower/contract-form->segred form :dtype :double :facts verified)
+                          :scalars conj 'scale)
+        routed (route/route-contraction nil :dtype :double :desc {} :facts verified
+                                        :scheduled-operation operation
+                                        :array-types {'x :float}
+                                        :scalar-types {'m :long 'k :int 'scale :float})]
+    (is (= [:int :long :float :long] (mapv :type (:scalar-args routed))))
+    (is (= (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi routed)))
+           (mapv :type (:scalar-args routed))))))
+
 (deftest mixed-storage-cannot-select-a-uniform-pointer-leaf
   (let [form '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
                                  (* (aget A (+ (* i 16) l)) (aget B (+ (* l 8) j))))
