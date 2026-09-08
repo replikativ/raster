@@ -20,23 +20,17 @@
 (deftest contraction-local-binders-have-authoritative-types
   (let [source (walked {})
         opts (apply hash-map (drop 5 source))]
-    (is (= 'float (:raster.type/tag (meta (get-in opts [:decode 'a])))))
+    (is (not (contains? opts :decode)) "load transforms expand before their consumers are typed")
     (is (= 'float (:raster.type/tag (meta (get-in opts [:stages 0 :lift])))))
     (is (= 'double (:raster.type/tag (meta (get-in opts [:epilogue :expr])))))
     (is (= 'rows (second (first (nth source 2)))) "extent stays in the outer scope")
     (is (= 'float (:raster.type/tag (meta (nth source 4)))))))
 
 (deftest raw-load-binder-type-is-not-inherited-from-an-outer-x
-  (let [opts (apply hash-map (drop 5 (walked {'a 'bytes 'shift 'long})))
-        decode (get-in opts [:decode 'a])]
-    (is (nil? (:raster.type/tag (meta decode)))
-        "the existing inference leaves unproved narrow arithmetic untagged")
-    (is (some #(= '(clojure.core/byte x) %) (tree-seq coll? seq decode))
-        "the raw-load binder has the Byte storage type, not outer Long x"))
-  (let [opts (apply hash-map (drop 5 (walked {'a 'Object})))
-        decode (get-in opts [:decode 'a])]
-    (is (not-any? #(and (symbol? %) (= 'x %) (= 'long (:raster.type/tag (meta %))))
-                  (tree-seq coll? seq decode)))))
+  (doseq [types [{} {'a 'bytes 'shift 'long} {'a 'Object}]]
+    (let [source (walked types)]
+      (is (not-any? #{'x} (tree-seq coll? seq (nth source 4)))
+          "the placeholder is replaced hygienically before ordinary type inference"))))
 
 (deftest unknown-lexical-bindings-mask-rewalk-metadata
   (let [x (with-meta 'x {:raster.type/tag 'long :tag 'long :line 17})

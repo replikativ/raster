@@ -977,6 +977,13 @@
 (defmethod walk-form :par-contract [source ctx]
   (let [[head output free-axes contract-axes body & options] source
         opts (apply hash-map options)
+        ;; Expand load lambdas BEFORE typing their consumers. Substitution after typing
+        ;; preserves stale arithmetic tags when a decode changes the load's precision.
+        body (if (seq (:decode opts))
+               ((requiring-resolve 'raster.compiler.ir.contraction-facts/apply-load-transforms)
+                body (:decode opts))
+               body)
+        opts (dissoc opts :decode)
         axis-context (fn [axes]
                        (reduce (fn [env [axis _]] (ctx-assoc-type env axis 'long)) ctx axes))
         body-ctx (axis-context (concat free-axes contract-axes))
@@ -987,12 +994,6 @@
          (fn [result key value]
            (assoc result key
                   (case key
-                    :decode
-                    (into (empty value)
-                          (map (fn [[operand expression]]
-                                 (let [raw-type (dtype/dtype-for-array-tag (ctx-get-tag ctx operand))
-                                       env (ctx-assoc-type body-ctx 'x (scalar-tag raw-type))]
-                                   [operand (walk expression env)]))) value)
                     :stages
                     (mapv (fn [index stage]
                             (let [env (axis-context (concat free-axes (take (inc index) contract-axes)))
