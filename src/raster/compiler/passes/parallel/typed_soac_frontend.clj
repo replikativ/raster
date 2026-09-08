@@ -1276,6 +1276,24 @@
       ;; The direct slice is scalar segmented-reduction algebra plus an optional closed typed
       ;; result transform. Staged quantization carries additional schedule/load contracts and must
       ;; not be admitted by dropping those facts.
+      (if (empty? contract-axes)
+        ;; A static zero-reduction contraction is a map, not a fold from a fabricated zero.
+        ;; Coordinate decomposition is the existing axis-flattening operation. Required input
+        ;; capacities are derived later from actual typed loads, independently of output size.
+        (when (and (seq free-axes) (empty? opts) (not= symbol out)
+                   (contains? #{:float :double} contraction-dtype)
+                   (every? #(and (integer? (second %)) (pos? (second %))) free-axes)
+                   (<= (reduce *' 1 (map second free-axes)) Integer/MAX_VALUE)
+                   (not-any? #(= out (:sym %)) (:operands facts)))
+          (let [[index extent body] (contraction-facts/flatten-contract-axes
+                                    free-axes (:body facts))
+                io (extract-io body index [out])]
+            (merge {:kind :map :id id :sym symbol :results [symbol]
+                    :index index :extent extent :locals [] :casts [nil] :bodies [body]
+                    :result-storage [{:destination out :access :write :host-return :buffer}]
+                    :host-binding symbol :elem-type contraction-dtype
+                    :source-operation :raster.par/contract}
+                   io)))
       (when (and (seq contract-axes)
                  (or (seq free-axes)
                      ;; The first rank-zero tensor reduction uses the ordinary pointwise
@@ -1327,7 +1345,7 @@
            ;; transform that reads the destination (an accumulating GEMM) makes it read-write.
            :result-storage [{:destination out
                              :access (if (contains? epilogue-arrays out) :read-write :write)
-                             :host-return :buffer}]})))
+                             :host-return :buffer}]}))))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))

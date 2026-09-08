@@ -14,7 +14,8 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
-            [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]))
+            [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
 (defn- fail!
   [reason message data]
@@ -392,7 +393,28 @@
          buffer-specs (into {}
                             (map (fn [id] [id (storage-spec values derived-scalars id)]))
                             (set/union inputs outputs temporary-ids))
-         read-requirements (product-read-requirements values operations derived-scalars)
+         read-requirements
+         (reduce
+          (fn [requirements operation]
+            (if (and (some (fn [id]
+                             (unresolved-capacity? id (get values id)
+                                                   (get-in buffer-specs [id :elements])))
+                           (:inputs operation))
+                     (every? (fn [id]
+                          (let [value (get values id)]
+                            (and (= {:kind :plain} (:representation value))
+                                 (nil? (:logical-layout value)))))
+                        (:inputs operation)))
+              (merge-with into requirements
+                          (into {} (map (fn [[id extent]] [id [extent]]))
+                                (map-reads/static-read-requirements
+                                 operation
+                                 {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
+                                  :scalar-types (into {} (keep (fn [[id v]]
+                                                                (when (empty? (:shape v))
+                                                                  [id (:dtype v)]))) values)})))
+              requirements))
+          (product-read-requirements values operations derived-scalars) operations)
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
                          (let [extents (vec (distinct

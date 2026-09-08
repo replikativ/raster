@@ -361,6 +361,10 @@
                             (get-in (segop-emit/generate-kernel-graph
                                      (capacity-fixture/graph) :target-dialect dialect)
                                     [:nodes 0 :operation]))
+           (write-artifact! directory suffix "public-outer-product"
+                            (get-in (segop-emit/generate-kernel-graph
+                                     (capacity-fixture/inferred-graph) :target-dialect dialect)
+                                    [:nodes 0 :operation]))
            (write-artifact! directory suffix "mixed-contraction"
                             (mixed-contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "segmented-fold-map"

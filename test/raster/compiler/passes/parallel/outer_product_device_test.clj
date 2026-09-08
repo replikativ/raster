@@ -10,7 +10,7 @@
 (deftest opencl-typed-map-independent-input-capacities
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "typed map independent capacities")
-    (let [graph (emit/generate-kernel-graph (capacity-fixture/graph))]
+    (let [graph (emit/generate-kernel-graph (capacity-fixture/inferred-graph))]
       (gpu/with-gpu-session [session :ocl:0]
         (gpu/alloc! session {:a [:float 4 (float-array [1 2 3 4])]
                              :b [:float 3 (float-array [10 20 30])]
