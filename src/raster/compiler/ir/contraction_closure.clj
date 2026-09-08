@@ -7,6 +7,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as stages]
             [raster.compiler.ir.contraction-facts :as facts]))
@@ -14,6 +15,13 @@
 (defn- fail! [rule data]
   (throw (ex-info "typed contraction closure is not proved"
                   (assoc data :reason :typed-soac-contraction :missing-rule rule))))
+
+(defn plain-storage?
+  "The current closure has no view/representation lowering. Do not erase such facts."
+  [value]
+  (and (= {:kind :plain} (:representation value))
+       (nil? (:logical-layout value))
+       (nil? (:sharding value))))
 
 (defn attributes?
   [x]
@@ -52,7 +60,17 @@
                    (symbol? (:out contraction))
                    (not (contains? (set indices) (:out contraction)))
                    (not (contains? (:reads dependencies) (:out contraction))))
-      (fail! :lexical-boundary {:dependencies dependencies :attributes attributes})))
+      (fail! :lexical-boundary {:dependencies dependencies :attributes attributes}))
+    (doseq [[index stage] (map-indexed vector stage-list)
+            :when (:lift stage)]
+      (let [visible (into (set (concat array-parameters capture-parameters ['inner]))
+                          (map first (concat (:free-axes contraction)
+                                             (take (inc index) (:contract-axes contraction)))))
+            lift (stages/substitute-operand-indices
+                  (:lift stage) (stages/stage-index-exprs stage-list))
+            unbound (util/free-syms lift visible)]
+        (when (seq unbound)
+          (fail! :stage-lift-scope {:axis (:axis stage) :unbound unbound :visible visible})))))
   attributes)
 
 (defn bindings
@@ -74,27 +92,32 @@
         domain (into {} (concat (:free-axes source) (:contract-axes source)))
         core (map #(assoc % :dtype (:dtype source)
                            :map (facts/operand-axis-map source %)) (:operands source))
-        operands (concat core (stages/lift-operands (:stages source)))
+        operands (concat (map #(vector % domain) core)
+                         (mapcat (fn [index stage]
+                                   (let [visible (into {} (concat (:free-axes source)
+                                                                 (take (inc index) (:contract-axes source))))]
+                                     (map #(vector % visible) (:operands stage))))
+                                 (range) (:stages source)))
         output-type (dtype/canon (or (:out-dtype source) (:dtype (first (:stages source)))))]
-    (doseq [{:keys [sym dtype] amap :map :as operand} operands]
+    (doseq [[{:keys [sym dtype] amap :map :as operand} visible-domain] operands]
       (let [pairs (vec (mapcat identity (:groups amap)))
             ids (mapv first pairs)
             value (get values (get bound sym))
             shape (:shape value)]
         (when-not (and (seq pairs) (= (count ids) (count (set ids)))
-                       (every? #(= (second %) (get domain (first %))) pairs))
-          (fail! :operand-map {:operand operand :domain domain}))
+                       (every? #(= (second %) (get visible-domain (first %))) pairs))
+          (fail! :operand-map {:operand operand :domain visible-domain}))
         (let [required (reduce *' 1 (map second pairs))]
-          (when-not (and (dtype/known? dtype) (= :tensor (:kind value))
+          (when-not (and (dtype/known? dtype) (= :tensor (:kind value)) (plain-storage? value)
                        (= (dtype/canon dtype) (:dtype value))
                        (seq shape) (every? #(and (integer? %) (pos? %)) shape)
                        (>= (reduce *' 1 shape) required))
             (fail! :operand-storage {:operand operand :value value :required required})))))
     (doseq [id captures :let [value (get values id)]]
-      (when-not (and (= :tensor (:kind value)) (= [] (:shape value))
+      (when-not (and (= :tensor (:kind value)) (= [] (:shape value)) (plain-storage? value)
                      (dtype/known? (:dtype value)))
         (fail! :scalar-capture {:id id :value value})))
-    (when-not (and (= :tensor (:kind result)) (= output-type (:dtype result))
+    (when-not (and (= :tensor (:kind result)) (plain-storage? result) (= output-type (:dtype result))
                    (= (mapv second (:free-axes source)) (:shape result)))
       (fail! :result-type {:result result :dtype output-type
                           :shape (mapv second (:free-axes source))})))

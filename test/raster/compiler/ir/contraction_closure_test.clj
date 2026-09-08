@@ -67,6 +67,15 @@
              [:short-scale #(assoc-in % ['da :shape] [8])]
              [:wrong-core-type #(assoc-in % ['a :dtype] :float)]
              [:wrong-scale-type #(assoc-in % ['da :dtype] :byte)]
+             [:encoded-input #(assoc-in % ['a :representation] {:kind :quantized})]
+             [:strided-input #(assoc-in % ['a :logical-layout] {:strides [2]})]
+             [:sharded-input #(assoc-in % ['a :sharding] {:axis 0})]
+             [:encoded-output #(-> %
+                                   (assoc-in ['result :representation] {:kind :quantized})
+                                   (assoc-in ['out :representation] {:kind :quantized}))]
+             [:strided-output #(-> %
+                                   (assoc-in ['result :logical-layout] {:strides [2]})
+                                   (assoc-in ['out :logical-layout] {:strides [2]}))]
              [:short-output #(assoc-in % ['out :shape] [14])]
              [:wrong-result-shape #(assoc-in % ['result :shape] [15])]]]
       (testing (name label)
@@ -74,7 +83,12 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (soac/validate! (rewrite-attributes #(assoc % :array-parameters '[a b da])))))
     (is (thrown? clojure.lang.ExceptionInfo
-                 (soac/validate! (rewrite-attributes #(assoc-in % [:contraction :stages 1 :init] 1)))))))
+                 (soac/validate! (rewrite-attributes #(assoc-in % [:contraction :stages 1 :init] 1)))))
+    (try
+      (soac/validate! (rewrite-attributes #(assoc-in % [:contraction :stages 0 :lift] '(* inner t))))
+      (is false "outer lift cannot read an inner-stage coordinate")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :stage-lift-scope (:missing-rule (ex-data e))))))))
 
 (deftest retained-contraction-binds-generated-storage-without-source-reparse
   (let [p (soac/remap-values (program) {'a [:arg 0] 'b [:arg 1] 'da [:arg 2]
