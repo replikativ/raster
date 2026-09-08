@@ -121,7 +121,9 @@
       (fn []
         (let [handle (gpu/bind-kernel-graph!
                       sess :prefix graph {'values :values 'out :out}
-                      {'n {:type :int :value 1025}} {:profile? true})
+                      {'n {:type :int :value 1025}
+                       'enclosing-count {:type :long :value 1025}
+                       '(extent values) {:type :long :value 1025}} {:profile? true})
               event (gpu/submit-kernel-graph! sess handle)
               _ (is (gpu/gpu-event? event))
               _ (is (gpu/event-complete? sess event))
@@ -136,6 +138,9 @@
               temporary (first (vals (get-in @sess [:kernel-graphs :prefix
                                                     :temporary-buffers])))]
           (is (gpu/kernel-graph-handle? handle))
+          (is (= {'n {:type :int :value 1025}}
+                 (get-in @sess [:kernel-graphs :prefix :graph-call :scalar-values]))
+              "enclosing shape bookkeeping does not widen the executable scalar ABI")
           (is (= 3 (count @registered)))
           (is (= 3 (count @bound)))
           (is (= 1 (count @recorded)))

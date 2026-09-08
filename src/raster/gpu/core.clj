@@ -1436,6 +1436,8 @@
    ResidentBufferView. Distinct graph identities may share an allocation when their physical
    ranges and declared accesses are legal. `scalar-values` maps symbolic compiler values to
    explicitly typed runtime scalars, e.g. `{'n {:type :int :value 4096}}`.
+   This environment may also contain program-wide shape values used by buffer extents;
+   only declared public scalar arguments are passed into the executable graph call.
 
    The graph owns its temporary allocations and dedicated bound kernel handles. Binding validates
    the complete graph call, lowers dependencies to logical queue/event edges, then records a
@@ -1478,7 +1480,13 @@
                register! (rt-resolve device-id "register-kernel!")
                bind-call! (rt-resolve device-id "bind-kernel-call")
                record! (rt-resolve device-id "record-graph!")
-               graph-call (kgcall/make graph all-buffers scalar-values)
+               ;; Buffer extents above may use enclosing-program shape values. They are not
+               ;; executable arguments: preserve the graph call's exact public ABI boundary.
+               call-scalars (select-keys scalar-values
+                                         (keep (fn [[slot argument]]
+                                                 (when (= :scalar (:kind slot)) argument))
+                                               (map vector (:abi graph) (:arguments graph))))
+               graph-call (kgcall/make graph all-buffers call-scalars)
                execution-plan (execution/from-kernel-graph-call graph-call)]
            (doseq [node (:nodes graph)]
              (let [artifact (:operation node)]

@@ -378,6 +378,13 @@ The public static 3×4×5 GEMM/ReLU case is one generated stage and device-check
 Dynamic composed GEMM remains two stages: its normalized extent scalar separates the equations,
 and symbolic extent equivalence plus legal scalar placement are not yet proved by this rule.
 
+Real Intel Arc checks also cover the static composed case and awkward 127×65×33 explicit
+GEMM/ReLU under both precision policies. These are numerical checks, not timing claims.
+The public equation-first RK4 and symbolic GEMM device checks exposed a runtime boundary:
+program-wide shape bookkeeping must remain available for capacity checks, but only the graph's
+declared scalar arguments enter KernelGraphCall. The binder now projects that interface without
+weakening exact call validation; both device cases execute after the fix.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its
