@@ -55,7 +55,8 @@
       (when-not (= (:kernel-dtype slot) (:type value))
         (throw (ex-info "kernel graph scalar argument has the wrong ABI dtype"
                         {:reason :kernel-graph-call-scalar-type
-                         :argument argument :slot slot :value value}))))
+                         :argument argument :slot slot :value value})))
+      (kcall/validate-scalar-value! slot value))
     scalar-values))
 
 (defn- scalar-number
@@ -76,10 +77,12 @@
   [scalar-values expression]
   (klaunch/resolve-expression #(scalar-number scalar-values %) expression))
 
+(declare preflight!)
+
 (defn temporary-specs
   "Resolve graph-owned temporary storage to core allocation specs: `{id [dtype elements nil]}`."
   [graph scalar-values]
-  (let [graph (kgraph/validate! graph)]
+  (let [graph (preflight! graph scalar-values)]
     (into {}
           (map (fn [{:keys [id dtype elements]}]
                  (let [n (resolve-integer scalar-values elements)]
@@ -114,6 +117,22 @@
     (let [value (resolve-integer scalar-values compiler-value)]
       {:type (:kernel-dtype slot)
        :value (cast-scalar (:kernel-dtype slot) value)})))
+
+(defn preflight!
+  "Check every node's scalar ABI and preconditions before graph-owned allocation.
+  Enclosing-program shape values remain available for storage sizing, not as extra call arguments."
+  [graph scalar-values]
+  (let [graph (executable/validate! graph)
+        public-values (select-keys scalar-values (map second (scalar-interface graph)))
+        _ (validate-scalar-values! graph public-values)]
+    (doseq [{:keys [operation]} (:nodes graph)]
+      (let [artifact (kart/validate! operation)
+            arguments (mapv (fn [slot compiler-value]
+                              (when (= :scalar (:kind slot))
+                                (scalar-argument public-values slot compiler-value)))
+                            (:abi artifact) (:arguments artifact))]
+        (kcall/validate-preconditions! artifact arguments)))
+    graph))
 
 (defn validate!
   "Validate and return a KernelGraphCall."

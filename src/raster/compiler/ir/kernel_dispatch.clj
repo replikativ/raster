@@ -6,7 +6,8 @@
    only in its emitted schedule. Selection is pure data evaluated after symbolic ABI scalars
    become concrete and before a backend binder sees the selected executable."
   (:require [raster.compiler.ir.kernel-executable :as kexec]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.kernel-precondition :as precondition]))
 
 (defrecord KernelDispatch
            [id
@@ -111,7 +112,7 @@
             (throw (ex-info "kernel dispatch expression case has invalid fields"
                             {:id (:id dispatch) :index index :rule rule})))
           (validate-expression! [:cases index] (:expression rule))
-          (when-not (contains? #{:< :<= := :>= :>} (:op rule))
+          (when-not (contains? precondition/comparison-ops (:op rule))
             (throw (ex-info "kernel dispatch expression case has an invalid comparison"
                             {:id (:id dispatch) :index index :op (:op rule)})))
           (when-not (finite-number? (:value rule))
@@ -183,7 +184,7 @@
       ;; denotes the same emitted module/signature; otherwise backend registration is ambiguous.
       (doseq [[kernel-name entries] (group-by first named-artifacts)]
         (let [implementations (set (map (fn [[_ artifact]]
-                                          (select-keys artifact [:target :source :abi :arguments]))
+                                          (select-keys artifact [:target :source :abi :arguments :preconditions]))
                                         entries))]
           (when-not (= 1 (count implementations))
             (throw (ex-info "kernel dispatch reuses an entry point for conflicting modules"
@@ -228,15 +229,6 @@
 (defn- runtime-number
   [value]
   (if (and (map? value) (contains? value :value)) (:value value) value))
-
-(defn- compare-value?
-  [op actual expected]
-  (case op
-    :< (< actual expected)
-    :<= (<= actual expected)
-    := (= actual expected)
-    :>= (>= actual expected)
-    :> (> actual expected)))
 
 (defn select-alternative
   "Select an executable alternative from concrete ABI-ordered values.
@@ -287,7 +279,7 @@
 
               :runtime-expression-cases
               (or (some (fn [{:keys [expression op value strategy]}]
-                          (when (compare-value?
+                          (when (precondition/compare-value?
                                  op
                                  (klaunch/resolve-expression environment expression)
                                  value)

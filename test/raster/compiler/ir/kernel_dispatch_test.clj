@@ -4,6 +4,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -46,6 +47,26 @@
                :threshold 256
                :at-least :subgroup-score-reuse
                :otherwise :reference}}))
+
+(deftest forced-and-cached-choices-still-enforce-binding-preconditions
+  (let [guarded (assoc subgroup :preconditions [{:expression 'width :op :>= :value 256}])
+        choice (assoc dispatch :alternatives [reference guarded])
+        arguments [:x :out {:type :long :value 32}]
+        fixed (assoc choice :selector {:kind :fixed-strategy :strategy :subgroup-score-reuse})]
+    (is (= reference (kdispatch/select-alternative choice arguments)))
+    (doseq [selected [(kdispatch/select-alternative choice arguments :subgroup-score-reuse)
+                      (kdispatch/select-alternative fixed arguments)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
+                            (kcall/make selected arguments))))))
+
+(deftest shared-entry-points-cannot-hide-different-preconditions
+  (let [a (artifact "shared_constraint_entry" :a 64)
+        b (assoc (artifact "shared_constraint_entry" :b 64)
+                 :preconditions [{:expression 'width :op :>= :value 256}])]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting modules"
+                          (kdispatch/make {:id "conflicting-constraints" :alternatives [a b]
+                                           :default-strategy :a
+                                           :selector {:kind :fixed-strategy :strategy :a}})))))
 
 (deftest logical-scalars-narrow-only-at-the-target-abi
   (let [narrowed (assoc-in reference [:abi 2 :kernel-dtype] :int)]

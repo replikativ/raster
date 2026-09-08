@@ -13,7 +13,7 @@
   (:import [java.nio.charset StandardCharsets]
            [java.security MessageDigest]))
 
-(def tuning-version 2)
+(def tuning-version 3)
 
 (defrecord DispatchTuning
            [key identity selector measurements])
@@ -59,10 +59,10 @@
                                     :dependencies (:dependencies node)
                                     :artifact (select-keys (:operation node)
                                                            [:kernel-name :target :source :abi
-                                                            :arguments :launch :temporaries])})
+                                                            :arguments :launch :preconditions :temporaries])})
                                  (:nodes executable))}
                    (select-keys executable
-                                [:kernel-name :target :source :launch :temporaries]))]
+                                [:kernel-name :target :source :launch :preconditions :temporaries]))]
     {:kind (kexec/kind executable)
      :strategy (kdispatch/alternative-strategy executable)
      :target (kexec/target executable)

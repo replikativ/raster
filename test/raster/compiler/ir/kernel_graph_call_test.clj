@@ -17,6 +17,42 @@
      (lower/scan-kernel-graph
       node operations {:array-types {'values :float 'out :float}}))))
 
+(deftest scalar-preconditions-precede-temporary-sizing
+  (let [graph (assoc-in (emitted-graph) [:nodes 0 :operation :preconditions]
+                        [{:expression '_n_bound :op :>= :value 64}])]
+    (is (= graph (graph-call/preflight! graph {'n {:type :int :value 1025}})))
+    (with-redefs [graph-call/resolve-integer
+                  (fn [& _] (throw (ex-info "temporary sizing happened first" {})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
+                            (graph-call/temporary-specs graph {'n {:type :int :value 32}}))))))
+
+(deftest later-node-preconditions-resolve-derived-physical-scalars
+  (let [graph (emitted-graph)
+        derived-slot (:name (last (get-in graph [:nodes 1 :operation :abi])))
+        guarded (assoc-in graph [:nodes 1 :operation :preconditions]
+                          [{:expression derived-slot :op :>= :value 5}])]
+    (is (= guarded (graph-call/preflight! guarded {'n {:type :int :value 1025}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
+                          (graph-call/temporary-specs guarded {'n {:type :int :value 1000}})))))
+
+(deftest public-long-scalars-are-validated-before-private-conversion
+  (let [graph (-> (emitted-graph)
+                  (update :scalars #(mapv (fn [scalar] (assoc scalar :dtype :long)) %))
+                  (update :abi #(mapv (fn [slot]
+                                       (if (= :scalar (:kind slot))
+                                         (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
+                  (update :nodes
+                          #(mapv (fn [node]
+                                   (update-in node [:operation :abi]
+                                              (fn [slots]
+                                                (mapv (fn [slot]
+                                                        (if (= :scalar (:kind slot))
+                                                          (assoc slot :dtype :long) slot)) slots)))) %)))]
+    (is (= graph (graph-call/preflight! graph {'n {:type :long :value 1025}})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
+                          (graph-call/preflight! graph
+                                                 {'n {:type :long :value (+' (bigint Long/MAX_VALUE) 2)}})))))
+
 (deftest emitted-graph-becomes-an-ordered-vector-of-kernel-calls
   (let [graph (emitted-graph)
         ids (set (map :id (concat (:inputs graph) (:outputs graph) (:temporaries graph))))
