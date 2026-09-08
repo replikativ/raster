@@ -221,8 +221,13 @@
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= 3 (count (dialect/equations result))))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
-    (is (= '[left middle right] (dialect/outputs result))
-        "the effect result remains observable and ordered between the two reads")))
+    (is (= '[left right] (dialect/outputs result))
+        "the right-hand read consumes middle's physical result, not another public output")
+    (is (= '[left middle right] (mapv #(first (nth % 2)) (dialect/equations result)))
+        "the intervening write remains ordered between the two reads")
+    (is (= #{:memory/write} (get-in (dialect/facts result) [:equations 1 :effects])))
+    (is (= [{:destination 'x :access :read-write :host-return :buffer}]
+           (get-in (dialect/facts result) [:equations 1 :attributes :result-storage])))))
 
 (deftest aliased-equations-decline-unproved-fusion
   (let [program (source-program map-map-source {'x :float})
@@ -338,7 +343,8 @@
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
 
 (defn- contract-result-map-program
-  [map-expression]
+  ([map-expression] (contract-result-map-program map-expression 'D))
+  ([map-expression destination]
   (frontend/form->program
    (list 'let*
          ['contract-step
@@ -347,11 +353,31 @@
             (* (clojure.core/aget A (+ (* i 16) l))
                (clojure.core/aget B (+ (* l 8) j))))
           'map-step
-          (list 'raster.par/map! 'D 't 32 nil map-expression)]
+          (list 'raster.par/map! destination 't 32 nil map-expression)]
          'map-step)
    {:dtype :float
     :array-types '{A :float B :float C :float D :float bias :float residual :float}
-    :scalar-types '{scale :float}}))
+    :scalar-types '{scale :float}})))
+
+(deftest same-destination-result-map-fuses-without-reading-old-output
+  (let [program (contract-result-map-program '(max (float 0.0) (clojure.core/aget C t)) 'C)
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        facts (dialect/facts result)
+        operation (dialect/operation-parts (first (dialect/equations result)))]
+    (is (= 1 (:vertical stats)))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= :write (get-in facts [:equations 0 :attributes :result-storage 0 :access])))
+    (is (= 'C (get-in facts [:equations 0 :attributes :result-storage 0 :destination])))
+    (is (empty? (get-in operation [:attributes :result-transform :operands])))
+    (is (= result (dialect/validate! result)))))
+
+(deftest same-destination-fusion-refuses-neighbor-reads
+  (doseq [expression ['(clojure.core/aget C (mod (+ t 1) 32))
+                      '(+ (clojure.core/aget C t) (clojure.core/aget C (mod (+ t 1) 32)))]]
+    (let [program (contract-result-map-program expression 'C)
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= program result))
+      (is (zero? (:vertical stats))))))
 
 (deftest segmented-reduce-result-map-becomes-a-typed-result-transform
   (let [program (contract-result-map-program

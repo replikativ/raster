@@ -1,5 +1,8 @@
 (ns raster.perf.production-canary-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
+            [raster.gpu.link :as link]
             [raster.perf.production-canary :as canary]
             [raster.runtime.microbench :as microbench]
             [raster.gpu.compiled :as compiled]
@@ -8,6 +11,33 @@
 (defn- once-only [f & _]
   (f)
   {:median-ns 100 :stationary? true})
+
+(deftm static-gemm-relu! [A :- (Array float) B :- (Array float) C :- (Array float)] :- (Array float)
+  (let [product (raster.par/contract C [[i 3] [j 4]] [[p 5]]
+                 (* (arrays/aget A (+ (* i 5) p)) (arrays/aget B (+ (* p 4) j)))
+                 :init (float 0.0))]
+    (raster.par/map! C q 12 nil (max (float 0.0) (arrays/aget product q)))))
+
+(deftest static-public-composition-fuses-through-the-generated-route
+  (let [args (canary/gemm-arguments [3 4 5])
+        prepared (compiled/lower #'static-gemm-relu! args
+                                 {:target :ocl:0 :dtype :float :constants ['A 'B]
+                                  :gemm-precision :f32-scalar :on-non-resident :throw})
+        evidence (canary/compilation-evidence prepared)]
+    (is (= 1 (:resident-step-count evidence)))
+    (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %))
+                (mapcat :alternatives (:steps evidence))))
+    (if-not @probe/opencl-available?
+      (probe/opencl-skip! "static public GEMM plus map fusion")
+      (let [live (compiled/instantiate! prepared)]
+        (try
+          (link/run! (:executable live))
+          (let [output (first (:out-tree live))
+                actual (vec (link/download (:executable live) (:node output)))
+                expected (mapv #(max (float 0.0) %)
+                               (canary/gemm-reference (first args) (second args) [3 4 5]))]
+            (is (= expected actual)))
+          (finally (compiled/close! live)))))))
 
 (deftest explicit-baseline-and-comparability
   (let [sample {:identity {:workload :example :environment-tag "fixture"}
@@ -78,17 +108,20 @@
           (is (seq candidates))
           (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %)) candidates)))))))
 
-(deftest composed-return-alias-retains-the-memory-safety-gate
-  ;; Known gap: the lexical type survives, but storage aliases are not yet normalized into
-  ;; a pointwise inout boundary. Do not weaken stable-read validation to make this run.
+(deftest composed-return-alias-uses-a-pointwise-inout-boundary
   (let [prepared (compiled/lower #'canary/gemm-relu-composed!
                                  (into (canary/gemm-arguments [3 4 5]) [3 4 5])
                                  {:target :ocl:0 :dtype :float :constants ['A 'B]
                                   :gemm-precision :f32-scalar :on-non-resident :throw})]
     (is (= 2 (get-in (canary/compilation-evidence prepared) [:resident-step-count])))
-    (when @probe/opencl-available?
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
-                           (compiled/instantiate! prepared))))))
+    (if-not @probe/opencl-available?
+      (probe/opencl-skip! "composed GEMM return-alias numerics")
+      (with-redefs [microbench/do-bench once-only]
+        (let [result (canary/gemm! {:shape [3 4 5] :variant :relu-composed
+                                   :gemm-precision :f32-scalar :target :ocl:0
+                                   :environment-tag "ci-correctness-only"})]
+          (is (:validated? result))
+          (is (= :gemm-relu-composed-resident (get-in result [:identity :workload]))))))))
 
 (deftest opencl-parameterized-gemm-shape-canary
   (if-not @probe/opencl-available?

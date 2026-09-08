@@ -1163,6 +1163,35 @@
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
 
+(deftest long-dimensions-decline-int-only-matrix-schedules
+  (doseq [batched? [false true]]
+    (let [contract (if batched?
+                     '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
+                        (* (aget A (+ (* (+ (* b m) i) k) l)) (aget B (+ (* l n) j))))
+                     '(raster.par/contract C [[i m] [j n]] [[l k]]
+                        (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))))
+          {:keys [form]} (pipeline/schedule-parallel-form
+                          (list 'let* ['step contract] 'step)
+                          {:target-device :ze:0 :dtype :float
+                           :array-types {'A :float 'B :float 'C :float}
+                           :scalar-types {'batch :long 'm :long 'n :long 'k :long}})
+          dispatch (contract-route/route-typed-contraction-dispatch
+                     (-> form :equations first :algorithm)
+                     (-> form :equations first :operations first)
+                     :dtype :float :precision :mixed-f16-f32
+                     :desc {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                            :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                            :subgroup-size 16 :max-workgroup-size 1024
+                            :grf-bytes-per-lane 256 :machine-lanes 8192
+                            :shared-local-memory 131072})]
+      (is (= [:portable-segred] (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
+      (is (= :mixed-dpas-index-width-not-lowered
+             (get-in dispatch [:attributes :matrix-graph-decline :reason])))
+      (let [scalar-slots (filter #(= :scalar (:kind %))
+                                 (:abi (first (:alternatives dispatch))))]
+        (is (= (if batched? 4 3) (count scalar-slots)))
+        (is (every? #(= :long (:dtype %)) scalar-slots))))))
+
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]

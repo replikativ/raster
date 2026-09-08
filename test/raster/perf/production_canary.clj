@@ -135,6 +135,7 @@
    (let [entry (case variant
                  :plain #'gemm-mnk!
                  :relu #'gemm-relu!
+                 :relu-composed #'gemm-relu-composed!
                  (throw (ex-info "unknown GEMM canary variant" {:variant variant})))]
      (compiled/lower entry (into args (map long (checked-shape shape)))
                      (cond-> {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]}
@@ -172,6 +173,7 @@
         workload (case variant
                    :plain (if parameterized? :gemm-mnk-resident :gemm64-resident)
                    :relu :gemm-relu-resident
+                   :relu-composed :gemm-relu-composed-resident
                    (throw (ex-info "unknown GEMM canary variant" {:variant variant})))
         identity (identity-for workload target :float dimensions
                                :host-synchronized-replay environment-tag)

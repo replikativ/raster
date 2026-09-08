@@ -365,6 +365,37 @@ Future mechanized proofs may use the sibling Lean project. Start with small exis
 same counterexamples as executable tests. No proof assistant integration or whole-compiler
 correctness claim is implied, and this does not block workload-driven retirement.
 
+The returned-buffer follow-up separates same-type facts from exact identity facts. Known
+destination-return aliases are normalized before access analysis; producers and public return
+bindings remain intact. Scope-aware substitution and alpha-renaming of incoming free identities
+prevent local shadowing from redirecting a physical buffer. The composed GEMM/ReLU canary now
+executes safely through two generated stages. Automatic epilogue fusion remains the next gap.
+
+Static same-destination contraction→map now uses the existing segmented-reduction result-transform
+rule. Its sole lane-owned read becomes the completed accumulator; the fused destination is write-only.
+Other destination operands, neighbor reads and externally live intermediates remain excluded.
+The public static 3×4×5 GEMM/ReLU case is one generated stage and device-checked on CPU OpenCL.
+Dynamic composed GEMM remains two stages: its normalized extent scalar separates the equations,
+and symbolic extent equivalence plus legal scalar placement are not yet proved by this rule.
+
+Real Intel Arc checks also cover the static composed case and awkward 127×65×33 explicit
+GEMM/ReLU under both precision policies. These are numerical checks, not timing claims.
+The public equation-first RK4 and symbolic GEMM device checks exposed a runtime boundary:
+program-wide shape bookkeeping must remain available for capacity checks, but only the graph's
+declared scalar arguments enter KernelGraphCall. The binder now projects that interface without
+weakening exact call validation; both device cases execute after the fix.
+
+The next real-device model probes exposed a distinct schedule legality gap: public linear
+projection dimensions retain Long, while mixed-DPAS layout/matrix stages currently bind int
+extents. That candidate now declines explicitly as `:mixed-dpas-index-width-not-lowered`,
+leaving generated portable contraction schedules available. Tiny forward, input-gradient and
+weight-gradient executions match CPU references, and the full AD train-step compiles resident.
+The existing train-step gate also executes a 2×3×2 AD/SGD update on an available GPU, checking
+output extent, numerical agreement with CPU AD and a nontrivial update from the saved input.
+This is not an optimized-training result. Restore that optimization with width-preserving
+matrix/layout schedules or guarded specialization whose range proof covers dimensions, products
+and indexing; do not narrow retained types implicitly or relax ScheduledKernelBody validation.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

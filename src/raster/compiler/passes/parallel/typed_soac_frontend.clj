@@ -1648,17 +1648,29 @@
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (util/uniquify-rebindings source)]
+  (let [source (util/uniquify-rebindings (util/free-syms source) source)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
             {:keys [normalized]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
-                         local-scalar-types]
+                         local-scalar-types buffer-aliases]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [[state expression] (if (par/par-rng-fill-form? expression)
+               (let [expression (util/subst-syms buffer-aliases expression)
+                     return-index (:return-alias-arg (form/form-info expression))
+                     returned (if (symbol? expression) expression
+                                  (when (some? return-index)
+                                    (nth (rest expression) return-index nil)))
+                     ;; Only exact destination-return identity, never a same-dtype guess.
+                     ;; Keep the effectful producer binding; rewrite subsequent references
+                     ;; to its physical buffer before read/write contracts are constructed.
+                     state (if (and (symbol? returned)
+                                    (contains? (:arrays *declared-kinds*) returned))
+                             (assoc-in state [:buffer-aliases symbol] returned)
+                             state)
+                     [state expression] (if (par/par-rng-fill-form? expression)
                                           ;; rng-fill! evaluates its int count before its long seed.
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
@@ -1776,7 +1788,7 @@
                    :else
                    (update state :normalized conj [symbol expression]))))
              {:normalized [] :compound-extents {} :allocation-lengths {}
-              :scalar-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
+              :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
       source)))
@@ -2440,6 +2452,23 @@
                  parameters
                  [(util/subst-syms (zipmap captures parameters) expr)])))))
 
+(defn- physical-read-uses
+  "Resolve storage reads to their latest preceding logical writer. Reads precede writes
+   within one description, so an inout map consumes its predecessor, not its own result."
+  [descriptions physical-outputs]
+  (reduce
+   (fn [{:keys [writers] :as state} description]
+     (let [scalar? (= :scalar (:kind description))
+           reads (if scalar? (util/free-syms (:expr description))
+                     (concat (:inputs description) (:scalars description)))
+           host? (and scalar? (not (supported-description? physical-outputs description)))
+           writes (into {} (map (fn [result storage] [(:destination storage) result])
+                                (:results description) (:result-storage description)))]
+       (-> state
+           (update (if host? :host-uses :operation-uses) into (keep writers reads))
+           (update :writers merge writes))))
+   {:writers {} :host-uses #{} :operation-uses #{}} descriptions))
+
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
@@ -2477,9 +2506,12 @@
                       (:sym %))
                    descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
-        operation-uses (set (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
-                                    (mapcat #(util/free-syms (:expr %)) typed-scalars)))
-        host-uses (set (mapcat #(util/free-syms (:expr %)) host-scalars))
+        physical-uses (physical-read-uses descriptions physical-outputs)
+        operation-uses (into (:operation-uses physical-uses)
+                             (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
+                                     (mapcat #(util/free-syms (:expr %)) typed-scalars)))
+        host-uses (into (:host-uses physical-uses)
+                        (mapcat #(util/free-syms (:expr %)) host-scalars))
         body-uses (set (mapcat util/free-syms body))
         ;; Destination-writing source forms return the destination buffer, while TypedSOAC names
         ;; the fresh logical result produced by that write. Preserve the public return by

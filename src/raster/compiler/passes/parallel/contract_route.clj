@@ -1216,6 +1216,16 @@
                                    :matrix)
         matrix-view (when (and matrix-enabled? (= :float (dtype/canon dtype)))
                       (cf/dense-matrix-view facts))
+        scalar-types (into {} (keep (fn [[slot argument]]
+                                     (when (= :scalar (:kind slot))
+                                       [argument (:dtype slot)])))
+                           (map vector abi arguments))
+        ;; Matrix/layout schedules currently bind int extents. Retained long extents must
+        ;; not reach those schedules through an implicit narrowing conversion.
+        wide-dimensions (delay
+                          (filterv #(not= :int (klaunch/typed-expression-dtype % scalar-types))
+                                   (cond-> (vec (:dimensions matrix-view))
+                                     (:batched? matrix-view) (conj (:batch matrix-view)))))
         target-schedule (when (and (= :mixed-f16-f32 precision) (:ok matrix-view))
                           (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))]
     (cond
@@ -1244,6 +1254,11 @@
        :decline {:reason :mixed-dpas-target-capability
                  :backend (get-in options [:desc :backend])
                  :matrix (get-in options [:desc :matrix])}}
+
+      (seq @wide-dimensions)
+      {:alternatives []
+       :decline {:reason :mixed-dpas-index-width-not-lowered
+                 :dimensions @wide-dimensions :required-dtype :int}}
 
       :else
       (let [[m n k] (:dimensions matrix-view)
