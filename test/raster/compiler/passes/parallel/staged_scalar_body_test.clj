@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.equation-first :as equation-first]
-            [raster.core :refer [deftm]]
+            [raster.compiler.fixtures.staged-contracts :as fixtures]
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contraction-facts :as facts]
@@ -38,33 +38,13 @@
                                    :map (am/of-axes '[[j 3] [blk 2] [sub 3]])}]}
                       {:axis 't :extent 4 :dtype :float :init 0.0}]}})))
 
-(deftm public-three-stage!
-  [a :- (Array float) b :- (Array float) weights :- (Array float)
-   out :- (Array float) scale :- Float] :- Void
-  (raster.par/contract out [[i 2] [j 3]] [[blk 2] [sub 3] [t 4]]
-    (raster.numeric/* (raster.arrays/aget a (+ (* i 24) (* blk 12) (* sub 4) t))
-                      (raster.arrays/aget b (+ (* j 24) (* blk 12) (* sub 4) t)))
-    :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift (* inner scale)}
-             {:axis sub :extent 3 :dtype :float :init 0.0 :lift (* inner (aget weights _))
-              :operands [{:sym weights :dtype :float :map {:groups [[[j 3] [blk 2] [sub 3]]]}}]}
-             {:axis t :extent 4 :dtype :float :init 0.0}]))
-
-(deftm public-long-stage!
-  [a :- (Array float) b :- (Array float) out :- (Array float) gain :- Long] :- Void
-  (raster.par/contract out [[i 1]] [[blk 2] [t 4]]
-    (raster.numeric/* (raster.arrays/aget a (+ (* blk 4) t))
-                      (raster.arrays/aget b (+ (* blk 4) t)))
-    :stages [{:axis blk :extent 2 :dtype :float :init 0.0
-              :lift (* inner (double (clojure.core/+ gain 1)))}
-             {:axis t :extent 4 :dtype :float :init 0.0}]))
-
 (deftest public-stages-retain-checked-integer-arithmetic
   ;; Compile only: deliberately overflowing a device trap would poison the shared device context.
   (hardware/register-target-device! :cuda:checked-stage-test
                                     {:type :cuda :capabilities {:compute-capability [8 0]
                                                                :warp-size 32 :subgroup-sizes [32]
                                                                :max-workgroup-size 1024}})
-  (let [compilation (equation-first/compile #'public-long-stage!
+  (let [compilation (equation-first/compile #'fixtures/checked-long-stage!
                                           {:target :cuda:checked-stage-test :dtype :float})
         body (get-in compilation [:kernels 0 :attributes :kernel-body])]
     (is (= :none (get-in compilation [:stats :fallback])))
@@ -75,7 +55,7 @@
                                     {:type :cuda :capabilities {:compute-capability [8 0]
                                                                :warp-size 32 :subgroup-sizes [32]
                                                                :max-workgroup-size 1024}})
-  (let [compilation (equation-first/compile #'public-three-stage!
+  (let [compilation (equation-first/compile #'fixtures/floating-three-stage!
                                             {:target :cuda:scalar-stage-test :dtype :float})
         plan (equation-first/lower compilation [(float-array 48) (float-array 72)
                                                  (float-array 18) (float-array 6) (float 0.25)])]
@@ -88,7 +68,7 @@
   (if-not @probe/opencl-available?
     (probe/opencl-skip! "public floating staged contraction")
     (let [output (float-array (repeat 6 -555.0))
-          compilation (equation-first/compile #'public-three-stage! {:target :ocl:0 :dtype :float})
+          compilation (equation-first/compile #'fixtures/floating-three-stage! {:target :ocl:0 :dtype :float})
           plan (equation-first/lower compilation
                                      [(float-array (repeat 48 1.0)) (float-array (repeat 72 2.0))
                                       (float-array (repeat 18 0.5)) output (float 0.25)])
