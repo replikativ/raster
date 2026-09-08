@@ -23,6 +23,17 @@
     (* (arrays/aget A (+ (* i 64) k)) (arrays/aget B (+ (* k 64) j)))
     :init (float 0.0)))
 
+(deftm gemm-mnk! [A :- (Array float) B :- (Array float) C :- (Array float)
+                   m :- Long n :- Long k :- Long] :- (Array float)
+  (raster.par/contract C [[i m] [j n]] [[p k]]
+    (* (arrays/aget A (+ (* i k) p)) (arrays/aget B (+ (* p n) j)))
+    :init (float 0.0)))
+
+(def gemm-shapes
+  "Small opt-in shape ladder, including decode, multi-row projection and awkward tails.
+   These cases are not a claim of representative frontier-scale throughput."
+  [[64 64 64] [1 256 256] [8 256 256] [127 65 33] [256 256 256]])
+
 (defn- valid-measurement? [result]
   (let [median (get-in result [:measurement :median-ns])]
     (and (true? (:validated? result)) (number? median)
@@ -72,21 +83,40 @@
      :compiler-revision compiler-revision :compile-ns compile-ns :validated? true
      :measurement (measure thunk)}))
 
-(defn gemm-arguments []
-  [(float-array (map #(float (/ (- (mod % 13) 6) 8.0)) (range 4096)))
-   (float-array (map #(float (/ (- (mod % 11) 5) 8.0)) (range 4096)))
-   (float-array 4096)])
+(defn- checked-shape [shape]
+  (when-not (and (vector? shape) (= 3 (count shape))
+                 (every? #(and (integer? %) (<= 1 % Integer/MAX_VALUE)) shape)
+                 (every? #(<= % Integer/MAX_VALUE)
+                         (let [[m n k] shape] [(*' m n) (*' m k) (*' k n)])))
+    (throw (ex-info "GEMM canary requires positive [m n k] with int-sized buffers" {:shape shape})))
+  shape)
 
-(defn gemm-reference [^floats a ^floats b]
-  (float-array
-   (for [i (range 64) j (range 64)]
-     (float (reduce + 0.0
-                    (for [k (range 64)]
-                      (* (double (aget a (+ (* i 64) k))) (double (aget b (+ (* k 64) j))))))))))
+(defn gemm-arguments
+  ([] (gemm-arguments [64 64 64]))
+  ([shape]
+   (let [[m n k] (checked-shape shape)]
+     [(float-array (map #(float (/ (- (mod % 13) 6) 8.0)) (range (* m k))))
+      (float-array (map #(float (/ (- (mod % 11) 5) 8.0)) (range (* k n))))
+      (float-array (* m n))])))
 
-(defn prepare-gemm [target args]
-  (compiled/lower #'gemm64! args {:target target :dtype :float :on-non-resident :throw
-                                 :constants ['A 'B]}))
+(defn gemm-reference
+  ([a b] (gemm-reference a b [64 64 64]))
+  ([^floats a ^floats b shape]
+   (let [[m n k] (checked-shape shape)]
+     (float-array
+      (for [i (range m) j (range n)]
+        (float (reduce + 0.0
+                       (for [p (range k)]
+                         (* (double (aget a (+ (* i k) p)))
+                            (double (aget b (+ (* p n) j))))))))))))
+
+(defn prepare-gemm
+  ([target args]
+   (compiled/lower #'gemm64! args {:target target :dtype :float :on-non-resident :throw
+                                  :constants ['A 'B]}))
+  ([target args shape]
+   (compiled/lower #'gemm-mnk! (into args (map long (checked-shape shape)))
+                   {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]})))
 
 (defn compilation-evidence
   "Describe alternatives from the exact prepared program, without recompiling it.
@@ -113,13 +143,14 @@
                         [(:artifact step)])))})
            (:steps descriptor))}))
 
-(defn gemm! [{:keys [environment-tag target compiler-revision] :or {target :ocl:0}}]
-  (let [identity (identity-for :gemm64-resident target :float [64 64 64]
+(defn gemm! [{:keys [environment-tag target compiler-revision shape] :or {target :ocl:0}}]
+  (let [dimensions (checked-shape (or shape [64 64 64]))
+        identity (identity-for (if shape :gemm-mnk-resident :gemm64-resident) target :float dimensions
                                :host-synchronized-replay environment-tag)
-        args (gemm-arguments)
-        expected (vec (gemm-reference (first args) (second args)))
+        args (gemm-arguments dimensions)
+        expected (vec (gemm-reference (first args) (second args) dimensions))
         started (System/nanoTime)
-        prepared (prepare-gemm target args)
+        prepared (if shape (prepare-gemm target args dimensions) (prepare-gemm target args))
         compile-ns (- (System/nanoTime) started)
         started (System/nanoTime)
         c (compiled/instantiate! prepared)

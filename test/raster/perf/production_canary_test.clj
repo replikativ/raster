@@ -51,3 +51,23 @@
         (is (:validated? result))
         (is (= :host-synchronized-replay (get-in result [:identity :timing-source])))
         (is (seq (:execution result)))))))
+
+(deftest gemm-shape-inputs-and-rejection
+  (is (= [15 20 12] (mapv alength (canary/gemm-arguments [3 4 5]))))
+  (is (= [22.0 28.0 49.0 64.0]
+         (vec (canary/gemm-reference (float-array [1 2 3 4 5 6])
+                                     (float-array [1 2 3 4 5 6]) [2 2 3]))))
+  (doseq [shape [[0 4 5] [-1 4 5] [3 4] [3 4 1.5] [Integer/MAX_VALUE 2 1]]]
+    (is (thrown? clojure.lang.ExceptionInfo (canary/gemm-arguments shape)))))
+
+(deftest opencl-parameterized-gemm-shape-canary
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "parameterized production GEMM shape numerics")
+    (with-redefs [microbench/do-bench once-only]
+      (doseq [shape [[1 7 5] [3 4 5]]]
+        (let [result (canary/gemm! {:shape shape :target :ocl:0
+                                   :environment-tag "ci-correctness-only"})]
+          (is (:validated? result))
+          (is (= shape (get-in result [:identity :shape])))
+          (is (= :gemm-mnk-resident (get-in result [:identity :workload])))
+          (is (seq (:execution result))))))))

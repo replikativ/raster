@@ -68,8 +68,21 @@ not a regression-test pass.
 
 ## Current evidence boundary
 
-The existing production canary measures one generated resident GEMM shape and the public
-CPU sum-of-squares path. It has no matched external accelerator suite yet. The next code
-slice is a shape ladder using the same public preparation and evidence extraction, followed
-by baseline adapters. No SOTA or cross-vendor performance claim is justified until those
-comparisons have run on the named devices.
+The production canary retains the original fixed GEMM and accepts an optional `:shape [m n k]`
+for the public scalar-dimension `gemm-mnk!` entry point. `gemm-shapes` lists small suggested
+cases. Run one case per options file, output file and explicit baseline, using the existing
+canary CLI. For example, the options below select an awkward-tail case (replace revision,
+environment and device with the actual run identity):
+
+```clojure
+{:case :gemm :shape [127 65 33] :target :ocl:0
+ :compiler-revision "<exact revision>" :environment-tag "<stable machine/driver tag>"
+ :output "bench/results/gemm-127-65-33.edn"}
+```
+
+Without a baseline the CLI reports `:unbaselined` and exits 2, rather than blessing its own
+measurement. The fixture uses small dyadic inputs and exact reference comparison; it does
+not establish accuracy on arbitrary input distributions. The scalar-dimension and original
+fixed-shape workloads have distinct comparison identities. There is no automatic ladder
+runner, external adapter, tuning experiment or matched accelerator suite yet. No SOTA or
+cross-vendor performance claim is justified until comparisons run on the named devices.
