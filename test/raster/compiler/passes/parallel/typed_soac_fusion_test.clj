@@ -221,8 +221,13 @@
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= 3 (count (dialect/equations result))))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
-    (is (= '[left middle right] (dialect/outputs result))
-        "the effect result remains observable and ordered between the two reads")))
+    (is (= '[left right] (dialect/outputs result))
+        "the right-hand read consumes middle's physical result, not another public output")
+    (is (= '[left middle right] (mapv #(first (nth % 2)) (dialect/equations result)))
+        "the intervening write remains ordered between the two reads")
+    (is (= #{:memory/write} (get-in (dialect/facts result) [:equations 1 :effects])))
+    (is (= [{:destination 'x :access :read-write :host-return :buffer}]
+           (get-in (dialect/facts result) [:equations 1 :attributes :result-storage])))))
 
 (deftest aliased-equations-decline-unproved-fusion
   (let [program (source-program map-map-source {'x :float})
