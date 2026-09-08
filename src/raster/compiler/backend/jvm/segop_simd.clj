@@ -206,10 +206,12 @@
         (and (= a idx-sym) (expr-free-of? b idx-sym))
         b
         ;; (+ base (long j)) / (+ (long j) base)
-        (and (seq? b) (contains? #{'long 'int} (first b)) (= idx-sym (second b))
+        (and (seq? b) (= 2 (count b))
+             (contains? '#{long int} (descriptor/cast-result-tag (first b))) (= idx-sym (second b))
              (expr-free-of? a idx-sym))
         a
-        (and (seq? a) (contains? #{'long 'int} (first a)) (= idx-sym (second a))
+        (and (seq? a) (= 2 (count a))
+             (contains? '#{long int} (descriptor/cast-result-tag (first a))) (= idx-sym (second a))
              (expr-free-of? b idx-sym))
         b
         ;; (+ base (+ ... j ...)) — recurse into nested +
@@ -301,7 +303,7 @@
          (expr-free-of? (nth expr 2) idx-sym))
     true
     (and (seq? expr)
-         (contains? #{'double 'float 'long 'int} (first expr))
+         (contains? '#{double float long int} (descriptor/cast-result-tag (first expr)))
          (= 2 (count expr)))
     (simd-able? (second expr) idx-sym)
     (and (seq? expr) (= 2 (count expr))
@@ -564,7 +566,7 @@
            (expr-free-of? (nth expr 2) idx-sym))
       (list broadcast species-sym (list cast-fn expr))
 
-      (and (seq? expr) (contains? #{'double 'float 'long 'int} (first expr))
+      (and (seq? expr) (contains? '#{double float long int} (descriptor/cast-result-tag (first expr)))
            (= 2 (count expr)))
       (recur-fn (second expr))
 

@@ -10,6 +10,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.cse :as cse]
@@ -18,6 +19,12 @@
 
 (def ^:private call-head util/call-head)
 (def ^:private call-args util/call-args)
+
+(defn- known-vg-element [elements target index-expression]
+  (let [index (:value (constant/value index-expression))
+        values (get elements target)]
+    (when (and (symbol? target) values (integer? index) (<= 0 index) (< index (count values)))
+      (nth values index))))
 
 (defn- value-ctor-call?
   "True if body is a bare (->Type ...) constructor for a registered value type.
@@ -1062,14 +1069,7 @@
        ;; Check for (nth <vg-sym> N) — resolve to element symbol
                    (let [nth-resolved
                          (when (and (seq? init) (= 'clojure.core/nth (first init)) (= 3 (count init)))
-                           (let [target (second init)
-                                 idx-expr (nth init 2)
-                                 idx (cond (integer? idx-expr) idx-expr
-                                           (and (seq? idx-expr) (= 'long (first idx-expr))) (second idx-expr)
-                                           :else nil)]
-                             (when (and (symbol? target) idx (contains? @vg-elements target))
-                               (let [elems (get @vg-elements target)]
-                                 (when (< idx (count elems)) (clojure.core/nth elems idx))))))]
+                           (known-vg-element @vg-elements (second init) (nth init 2)))]
                      (if nth-resolved
                        (do (swap! result-pairs conj [sym nth-resolved])
                            (reset! any-inlined? true))
@@ -1209,15 +1209,7 @@
      (let [resolve-vg-nth (fn resolve-vg-nth [expr]
                             (cond
                               (and (seq? expr) (= 'clojure.core/nth (first expr)) (= 3 (count expr)))
-                              (let [target (second expr)
-                                    idx-expr (clojure.core/nth expr 2)
-                                    idx (cond (integer? idx-expr) idx-expr
-                                              (and (seq? idx-expr) (= 'long (first idx-expr))) (second idx-expr)
-                                              :else nil)]
-                                (if (and (symbol? target) idx (contains? @vg-elements target))
-                                  (let [elems (get @vg-elements target)]
-                                    (if (< idx (count elems)) (clojure.core/nth elems idx) expr))
-                                  expr))
+                              (or (known-vg-element @vg-elements (second expr) (nth expr 2)) expr)
                               (seq? expr) (let [r (apply list (map resolve-vg-nth expr))]
                                             (if-let [m (meta expr)] (with-meta r m) r))
                               (vector? expr) (mapv resolve-vg-nth expr)

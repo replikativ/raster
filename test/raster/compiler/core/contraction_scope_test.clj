@@ -51,4 +51,6 @@
   (doseq [tag ['float 'long]]
     (let [ctx (walker/make-ctx {:type-env {'x {:tag tag}}})
           expression (list (symbol "clojure.core" (name tag)) 'x)]
-      (is (every? #(= expression %) (take 5 (iterate #(walker/walk % ctx) expression)))))))
+      (let [walks (take 5 (rest (iterate #(walker/walk % ctx) expression)))]
+        (is (every? #(= expression %) walks))
+        (is (every? #(= tag (:raster.type/tag (meta %))) walks))))))

@@ -2,6 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.c-emit :as c-emit]))
 
+(deftest qualified-primitive-casts-emit-like-their-bare-spelling
+  (doseq [cast '[double float long int byte]]
+    (is (= (c-emit/emit-expr (list cast 'x) 'i #{} "i")
+           (c-emit/emit-expr (list (symbol "clojure.core" (name cast)) 'x) 'i #{} "i")))))
+
 (deftest portable-identifiers-cover-the-cuda-and-hip-cpp-language
   (is (not (c-emit/c-identifier? "class")))
   (is (not (c-emit/c-identifier? "default")))

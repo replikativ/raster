@@ -546,8 +546,9 @@
               (vary-meta result assoc :raster.type/tag rt)
               result)
             ;; Primitive cast — (double x), (float x), etc.
-            (contains? types/primitive-info head)
-            (vary-meta result assoc :raster.type/tag head)
+            (and (not (contains? type-env head))
+                 (or (descriptor/cast-op? head) (contains? types/primitive-info head)))
+            (vary-meta result assoc :raster.type/tag (or (descriptor/cast-result-tag head) head))
             ;; if — result type is the (agreeing) type of its value branches.
             ;; A recur branch carries no value, so the result is the OTHER branch;
             ;; this also types loop bodies of the form (if test (recur ...) acc).

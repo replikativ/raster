@@ -675,7 +675,7 @@
   [expr acc-sym]
   (or (= expr acc-sym)
       (and (seq? expr)
-           (= 'double (first expr))
+           (= 'double (descriptor/cast-result-tag (first expr)))
            (= 2 (count expr))
            (= (second expr) acc-sym))))
 
