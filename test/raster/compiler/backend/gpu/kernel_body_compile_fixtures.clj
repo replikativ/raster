@@ -6,6 +6,8 @@
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
+            [raster.compiler.backend.gpu.staged-contraction-fixtures :as staged-fixtures]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
@@ -21,6 +23,7 @@
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
+            [raster.compiler.passes.parallel.staged-contraction-body :as staged-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -417,6 +420,11 @@
                           (body-emit/emit-scalar-kernel
                            "word_shifts_i32" (body-fixtures/word-shifts-body :int 1)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "candidate-staged-packed"
+                          (:source (body-target/emit-artifact
+                                    "candidate_staged_packed"
+                                    (staged-body/lower (staged-fixtures/packed-facts 3 5 3 32))
+                                    dialect)))
            (write-source! directory suffix "word-shifts-i64"
                           (body-emit/emit-scalar-kernel
                            "word_shifts_i64" (body-fixtures/word-shifts-body :long 1)
