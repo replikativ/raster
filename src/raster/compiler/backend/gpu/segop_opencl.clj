@@ -36,6 +36,7 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
+            [raster.compiler.passes.parallel.staged-contraction-body :as staged-body]
             [raster.compiler.passes.parallel.product-reduction-body :as product-body]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
@@ -610,12 +611,28 @@
               (throw (ex-info "kernel graph scalar has inconsistent emitted ABI dtypes"
                               {:reason :kernel-graph-scalar-dtype
                                :argument argument :slots (mapv first pairs)}))))
+        ;; Public graph slots are not physical kernel parameters. Preserve established names
+        ;; where possible, but vector SSA identities need generated names that cannot capture
+        ;; a later caller's symbol (or collide with another graph slot).
+        interface-ids (concat (map :id external-buffers) scalar-arguments)
+        reserved-names (set (keep #(when (instance? clojure.lang.Named %) (name %)) interface-ids))
+        interface-names
+        (:names
+         (reduce (fn [{:keys [used] :as state} [ordinal id]]
+                   (let [named? (instance? clojure.lang.Named id)
+                         chosen (loop [candidate (if named? (name id) (str "graph_value_" ordinal))]
+                                  (if (or (contains? used candidate)
+                                          (and (not named?) (contains? reserved-names candidate)))
+                                    (recur (str candidate "_")) candidate))]
+                     (-> state (update :used conj chosen) (assoc-in [:names id] chosen))))
+                 {:used #{} :names {}} (map-indexed vector interface-ids)))
         pointer-abi (mapv (fn [{:keys [id dtype role]}]
                             (kabi/slot id (case role
                                             :input :input
                                             :output :output
                                             :inout :inout)
                                        dtype
+                                       :c-name (get interface-names id)
                                        :role (case role
                                                :input :operand
                                                :output :result
@@ -644,6 +661,7 @@
                                         :argument argument :scheduled (:dtype declared)
                                         :target supplied-dtype})))
                              (kabi/slot argument :scalar logical-dtype
+                                        :c-name (get interface-names argument)
                                         :kernel-dtype kernel-dtype :role role)))
                          scalar-arguments)
         explicit-scalars
@@ -922,6 +940,23 @@
      (kernel-body-c-dialect/target target)
      scalar-types)))
 
+(defn- generate-staged-contraction-graph
+  [graph {:keys [target-dialect scalar-types scheduled-equation-algorithm
+                 scheduled-equation-body]
+          :or {target-dialect :opencl-intel scalar-types {}}}]
+  (let [emitted (kgraph/map-operations
+                 graph
+                 (fn [node]
+                   (kernel-body-target/emit-artifact
+                    (str "graph_staged_" (gensym ""))
+                    (staged-body/schedule-for-node node graph scheduled-equation-algorithm
+                                                   scheduled-equation-body)
+                    target-dialect)))]
+    (finalize-emitted-graph emitted
+                            (kernel-body-c-dialect/target
+                             (kernel-body-c-dialect/resolve! target-dialect))
+                            scalar-types)))
+
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
 
@@ -934,6 +969,11 @@
         opencl? (kernel-body-c-dialect/opencl?
                  (kernel-body-c-dialect/resolve! target-dialect))]
     (cond
+      (and (seq (:nodes graph))
+           (every? #(instance? raster.compiler.ir.segop.SegContract (:operation %))
+                   (:nodes graph)))
+      (generate-staged-contraction-graph graph opts)
+
       (scan/associative-scan? (get-in graph [:attributes :scan-algebra]))
       (apply generate-scan-kernel-graph graph (mapcat identity opts))
 

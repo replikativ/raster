@@ -2,10 +2,15 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.staged-contraction-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.backend.gpu.segop-opencl :as emitter]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
+            [raster.compiler.ir.parallel-program :as parallel]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.soac-lower :as lower]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
@@ -105,3 +110,55 @@
       (let [graph (target/emit-static-dense-graph "typed_closure" bound dialect)]
         (is (= [[:arg 0] [:arg 1] [:arg 2] [:arg 3] [:output 0]] (:arguments graph)))
         (is (= [:byte :byte :float :float :float] (mapv :dtype (:abi graph))))))))
+
+(defn production-graph
+  "Small shared retained-contraction fixture for structural and device boundary tests."
+  [value-map]
+  (let [algorithm (soac/remap-values (program) value-map)
+        facts (soac/facts algorithm)
+        operations (lower/lower-typed-contract algorithm :ocl:0)
+        equation (parallel/->ProgramEquation
+                  'contraction [:binding 'result] nil (:inputs facts) (soac/outputs algorithm)
+                  algorithm operations (:effects facts) {} {})
+        body (parallel/make {:dialect :segop :values (:values facts) :inputs (:inputs facts)
+                             :equations [equation] :outputs (soac/outputs algorithm)
+                             :effects (:effects facts) :operation? segop/segop-node?})
+        graph (equation-graph/make algorithm body)]
+    {:algorithm algorithm :body body :graph graph :operations operations}))
+
+(deftest typed-contraction-uses-the-production-graph-emission-boundary
+  (let [{:keys [algorithm body graph operations]}
+        (production-graph {'a [:arg 0] 'b [:arg 1] 'da [:arg 2]
+                           'db [:arg 3] 'out [:output 0] 'result [:result 0]})]
+    (is (= #{[:arg 0] [:arg 1] [:arg 2] [:arg 3]} (segop/operation-inputs (first operations))))
+    (is (= #{[:output 0]} (segop/operation-outputs (first operations))))
+    (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [emitted (emitter/generate-kernel-graph
+                     graph :target-dialect dialect :scheduled-equation-algorithm algorithm
+                     :scheduled-equation-body body)]
+        (is (= 1 (count (:nodes emitted))))
+        (is (re-find #"rstr_dp4a" (get-in emitted [:nodes 0 :operation :source])))))
+    (doseq [[node graph' algorithm']
+            [[(assoc-in (first (:nodes graph)) [:operation :bindings 'a] [:arg 1]) graph algorithm]
+             [(first (:nodes graph)) (update-in graph [:inputs 0 :elements] dec) algorithm]
+             [(first (:nodes graph)) graph (soac/remap-values algorithm {[:arg 0] [:different 0]})]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (staged/schedule-for-node node graph' algorithm' body))))
+    (let [tampered (assoc-in body [:equations 0 :operations 0 :facts :init] 1.0)
+          tampered-graph (equation-graph/make algorithm tampered)]
+      (try
+        (staged/schedule-for-node (first (:nodes tampered-graph)) tampered-graph algorithm tampered)
+        (is false "a graph rebuilt from a modified operation must not certify that operation")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :typed-operation (:missing-rule (ex-data e)))))))))
+
+(deftest graph-only-abi-names-cannot-capture-user-symbols
+  (let [{:keys [algorithm body graph]}
+        (production-graph {'a [:arg 0] 'b 'graph_value_0})
+        emitted (emitter/generate-kernel-graph
+                 graph :target-dialect :opencl-portable :scheduled-equation-algorithm algorithm
+                 :scheduled-equation-body body)
+        names (mapv :c-name (:abi emitted))]
+    (is (= (count names) (count (set names))))
+    (is (= "graph_value_0" (:c-name (first (filter #(= 'graph_value_0 (:name %)) (:abi emitted))))))
+    (is (some #{[:arg 0]} (:arguments emitted)))))

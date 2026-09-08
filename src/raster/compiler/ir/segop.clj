@@ -116,6 +116,8 @@
 ;; contract-route from these facts + the device descriptor at emission time — putting them here
 ;; would mix target-specific emission into semantic lowering. What this node guarantees is that
 ;; the backend receives the SAME facts segop-lower verified, instead of re-parsing the form.
+;; Typed closure lowering adds :bindings, mapping lexical facts parameters to external SSA
+;; values. This is a binding environment, not a second copy of operand/shape/type inference.
 
 (defrecord SegScan
            [id          ;; int
@@ -156,14 +158,15 @@
   "Physical tensor inputs of a scheduled operation, including a SegContract schedule view."
   [operation]
   (if (instance? SegContract operation)
-    (:reads (contraction-facts/dependencies (:facts operation)))
+    (into #{} (map #(get (:bindings operation) % %))
+          (:reads (contraction-facts/dependencies (:facts operation))))
     (or (:inputs operation) #{})))
 
 (defn operation-outputs
   "Physical tensor outputs of a scheduled operation, including a SegContract schedule view."
   [operation]
   (if (instance? SegContract operation)
-    #{(get-in operation [:facts :out])}
+    #{(let [out (get-in operation [:facts :out])] (get (:bindings operation) out out))}
     (set (or (:outputs operation) #{}))))
 
 (defn- scalar-entry-references
@@ -184,7 +187,8 @@
    checked projection of axis bounds rather than a duplicate record field."
   [operation]
   (if (instance? SegContract operation)
-    (:scalars (contraction-facts/dependencies (:facts operation)))
+    (into #{} (map #(get (:bindings operation) % %))
+          (:scalars (contraction-facts/dependencies (:facts operation))))
     (let [space (:space operation)
           axes (into #{(:flat-idx space)} (map :name) (:dims space))
           arrays (set/union (operation-inputs operation) (operation-outputs operation))

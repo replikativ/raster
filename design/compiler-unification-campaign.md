@@ -98,6 +98,14 @@ storage/scalar types and lexical scope. The existing scheduling and scalar-body 
 must still prove instruction types and numerical legality. Unlowered representations,
 layouts and sharding decline, and outer lifts cannot refer to inner-stage coordinates.
 
+Production graph lowering now transports that closure as a bound SegContract, with
+canonical dependency accessors used by graph construction. Before generated staged
+emission, the existing graph projection certificate and an exact operation/binding
+comparison both run; the resulting ScheduledKernelBody is checked against that node.
+This route uses the common C-family graph emitter and resident graph binder. A small
+Arc device test exercises vector SSA IDs and distinct row/column outputs. Public
+frontend admission and the compatibility-ledger transition remain the next step.
+
 Read-only inventory at #383 identifies these priorities; dynamic reachability must be measured
 before treating a definition as live or dead:
 

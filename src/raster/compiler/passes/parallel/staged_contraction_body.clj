@@ -15,8 +15,12 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.staged-contraction-schedule :as schedule]))
 
 (defn- decline! [rule message data]
@@ -196,3 +200,30 @@
                    :storage-elements sizes :output-elements (long n)}
         :numerics {:mode :reassociated :policy :staged-int32-float
                    :accumulator-dtype :float :rounding :nearest-even}}))))
+
+(defn schedule-for-node
+  "Refine an exact retained typed contraction graph node through the existing staged body.
+   Graph/algorithm agreement is checked before lexical bindings reach the emitted ABI."
+  [node graph algorithm scheduled-program]
+  (equation-graph/validate-projection! graph algorithm scheduled-program)
+  (let [equations (soac/equations algorithm)
+        operation (:operation node)]
+    (require! (and (= 1 (count equations))
+                   (some #{node} (:nodes graph))
+                   (instance? raster.compiler.ir.segop.SegContract operation))
+              :typed-node {:node node})
+    (let [equation (first equations)
+          {:keys [facts bindings]} (projection/contraction-binding algorithm equation)
+          expected (assoc (segop/->SegContract (second equation) facts (:dtype facts)
+                                              (:device-id operation))
+                          :bindings bindings)]
+      (require! (= expected operation) :typed-operation
+                {:expected expected :operation operation})
+      (let [lowered (lower facts)
+            arguments (mapv #(get bindings % %) (:arguments lowered))
+            rebound (scheduled/make
+                     (-> (into {} lowered)
+                         (assoc :source operation :arguments arguments)
+                         (assoc-in [:effects :uses]
+                                   (scheduled/derive-uses (:body lowered) arguments))))]
+        (scheduled/validate-against-node! rebound node graph)))))

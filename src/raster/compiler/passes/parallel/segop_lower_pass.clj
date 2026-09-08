@@ -365,6 +365,8 @@
                           (first (soac-dialect/equations scheduling-algorithm)))
                     lowered (case kind
                               scalar {:operations []}
+                              contract {:operations (soac-lower/lower-typed-contract
+                                                      scheduling-algorithm device-id)}
                               map {:operations (soac-lower/lower-typed-map
                                                 scheduling-algorithm device-id :dtype dtype)}
                               scatter {:operations (soac-lower/lower-typed-scatter

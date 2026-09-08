@@ -444,15 +444,15 @@
   (when-not (vector? segops)
     (throw (ex-info "scheduled SegOps must be an ordered vector" {:segops segops})))
   (doseq [operation segops]
-    (when-not (segop/segop? operation)
+    (when-not (segop/segop-node? operation)
       (throw (ex-info "scheduled SegOp graph contains a non-SegOp operation"
                       {:operation operation :actual (type operation)}))))
   (let [input-ids (set inputs)
         output-ids (set outputs)
         external-ids (set/union input-ids output-ids)
         operation-ids (reduce set/union #{}
-                              (map #(set/union (set (or (segop/segop-inputs %) #{}))
-                                               (set (or (segop/segop-outputs %) #{})))
+                              (map #(set/union (set (segop/operation-inputs %))
+                                               (set (segop/operation-outputs %)))
                                    segops))
         temporary-ids (set (keys temporaries))
         expected-temporaries (set/difference operation-ids external-ids)]
@@ -484,8 +484,8 @@
                              (ordered temporary-ids))
           nodes (loop [ops segops index 0 previous [] result []]
                   (if-let [op (first ops)]
-                    (let [ins (set (or (segop/segop-inputs op) #{}))
-                          outs (set (or (segop/segop-outputs op) #{}))
+                    (let [ins (set (segop/operation-inputs op))
+                          outs (set (segop/operation-outputs op))
                           uses (mapv #(operation-use ins outs %)
                                      (ordered (set/union ins outs)))
                           ;; A scheduled-node identity is not a SegOp identity. The position makes

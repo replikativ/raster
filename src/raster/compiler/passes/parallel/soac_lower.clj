@@ -26,7 +26,21 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.passes.parallel.segred-body :as segred-body]))
+
+(defn lower-typed-contract
+  "Retain one typed contraction and its lexical bindings as a semantic SegContract.
+   Scheduling, target selection and emission remain downstream."
+  [program device-id]
+  (let [equations (soac-dialect/equations (soac-dialect/validate! program))]
+    (when-not (= 1 (count equations))
+      (throw (ex-info "contraction lowering requires one typed equation"
+                      {:reason :typed-soac-contraction-equation-count})))
+    (let [equation (first equations)
+          {:keys [facts bindings]} (typed-projection/contraction-binding program equation)]
+      [(assoc (segop/->SegContract (second equation) facts (:dtype facts) device-id)
+              :bindings bindings)])))
 
 (declare lower-reduce)
 (declare lower-map)
