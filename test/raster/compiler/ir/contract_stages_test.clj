@@ -86,6 +86,28 @@
                        {:axis t :extent 32 :dtype :int :init 0}]
                      '[[blk 4] [t 32]]))))))
 
+(deftest typed-identity-casts-preserve-stage-linearity
+  (testing "only casts proved identical to the child accumulator can disappear"
+    (doseq [[expression dtype] [['(clojure.core/float inner) :float]
+                                ['(clojure.core/int inner) :int]
+                                ['(clojure.core/float (clojure.core/float inner)) :float]]]
+      (is (= [] (cs/linear-in-inner expression 'inner dtype))))
+    (doseq [[expression dtype] [['(float inner) :float]
+                                ['(clojure.core/float inner) nil]
+                                ['(float inner) :double]
+                                ['(double inner) :float]
+                                ['(float (int inner)) :float]]]
+      (is (nil? (cs/linear-in-inner expression 'inner dtype)))))
+  (testing "typed lift legality and flattening preserve every non-inner factor"
+    (let [stages '[{:axis blk :extent 2 :dtype :double :init 0.0
+                   :lift (raster.numeric/* (clojure.core/float inner) gain)}
+                  {:axis t :extent 4 :dtype :float :init 0.0}]]
+      (is (:ok (cs/stages-legal? stages '[[blk 2] [t 4]])))
+      (is (= '(raster.numeric/* term gain) (cs/flat-equivalent stages 'term)))
+      (is (= :lift-not-linear-in-inner
+             (:reason (cs/stages-legal? (assoc-in stages [0 :lift] '(double inner))
+                                       '[[blk 2] [t 4]])))))))
+
 (deftest rejections
   (testing "stages must cover the contract axes exactly, outer→inner"
     (is (= :stages-do-not-match-contract-axes

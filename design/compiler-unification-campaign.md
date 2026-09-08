@@ -717,3 +717,15 @@ capture decode free variables or inherit a shadowed outer array's transformation
 This correctness prerequisite does not yet admit decoded loads to the generated staged schedule.
 That migration still requires retained types for the raw-load binder, decoded scalar expressions,
 and any integer widening/overflow semantics; no target-side type inference is introduced here.
+
+### Contraction lexical typing (in progress)
+
+The source walker now supplies contraction-local type contexts for axes, decoded raw loads,
+child-stage accumulators and completed-result accumulators. It uses existing inference rather
+than teaching target emitters to reconstruct these types. Explicitly unknown lexical bindings
+mask stale reference metadata; absent bindings still retain metadata-based rewalk evidence.
+
+Compiler-generated scalar casts are qualified so stage linearity can distinguish genuine
+identity conversions from caller-local functions. Flattening only removes a cast when its
+canonical identity and child accumulator dtype prove it redundant. Decoded GPU admission is
+still gated separately; this prerequisite does not retire uncovered staged fallback cases.
