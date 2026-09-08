@@ -297,10 +297,14 @@
   fallback; it is fully compositional because it enters a segmented TypedSOAC reduction, so its
   output fuses with downstream SOACs (epilogue) like any reduction.
 
+  Optional :decode maps operand symbols to scalar expressions in x, the raw load.
+  These transforms apply to core summand loads before stage lifts and the final epilogue;
+  their free variables belong to the contraction scope, not summand-local bindings.
+
   Example (C[m,n] = A[m,k]·B[k,n], row-major):
     (raster.par/contract C [[i m] [j n]] [[l k]]
       (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))"
-  [out free-axes contract-axes body & {:keys [init combine stages epilogue]
+  [out free-axes contract-axes body & {:keys [init combine stages epilogue decode]
                                        :or {init 0.0 combine '+}}]
   (assert (vector? free-axes) "par/contract: free-axes must be a vector of [idx bound]")
   (assert (vector? contract-axes)
@@ -315,6 +319,10 @@
             (let [legal ((requiring-resolve 'raster.compiler.ir.contract-stages/stages-legal?)
                          stages contract-axes)]
               (assert (:ok legal) (str "par/contract: illegal :stages (" (:reason legal) ")"))))
+        body (if (seq decode)
+               ((requiring-resolve 'raster.compiler.ir.contraction-facts/apply-load-transforms)
+                body decode)
+               body)
         body (if (seq stages)
                ((requiring-resolve 'raster.compiler.ir.contract-stages/flat-equivalent) stages body)
                body)

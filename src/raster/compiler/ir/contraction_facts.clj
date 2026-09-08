@@ -124,6 +124,22 @@
                        :sym sym :declared (am/index-expr declared) :actual idx})))
     declared))
 
+(defn apply-load-transforms
+  "Apply per-operand scalar load transforms to the core summand only.
+   The raw-load binder x is substituted capture-avoidingly; stage lifts and result
+   transforms are separate regions and must not receive these transformations."
+  [expression decodes]
+  (if (empty? decodes)
+    expression
+    (od/rewrite-aget-reads
+     ;; Decode declarations close over the surrounding scope, not locals in the summand.
+     ;; Freshen the summand first: its binders cannot capture decode captures, and a locally
+     ;; shadowed array must not acquire the outer array's load transform.
+     (util/alpha-convert expression)
+     (fn [read]
+       (when-let [decode (get decodes (od/aget-array-sym read))]
+         (util/subst-syms {'x read} decode))))))
+
 (defn surface-form
   "Spell contraction components in the temporary `raster.par/contract` target vocabulary."
   [{:keys [out free-axes contract-axes body opts metadata]}]
