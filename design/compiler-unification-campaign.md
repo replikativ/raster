@@ -195,6 +195,22 @@ compare ordered ABI, scalar bindings, launch geometry and stage metadata for sca
 including a non-default output dtype. The staged algorithm is still source-emitted; this retires
 an input-representation duplication, not the remaining target emission path.
 
+The first typed packed-stage **candidate** now constructs ScheduledKernelBody directly from those
+facts. Two-level Int32-dot/Float-lift reductions use byte loads, explicit word packing, DP4A, nested
+typed carries and masked stores through the common target projector. Static AxisMap products bound
+required storage and index arithmetic; semantic decode declarations, unproved prefixes, arbitrary
+lift regions and unsupported domains decline. The required shapes are not proof that an arbitrary
+raw backend caller supplied enough storage. Production admission must retain the checked resident
+capacity boundary; the low-level OpenCL test binds known correctly sized buffers.
+
+Candidate validation covers signed-byte extremes, block widths 4/32/64, multiple blocks, distinct
+row scales and masked launch tails on OpenCL; CUDA/HIP compile fixtures exercise the same typed
+schedule. The old staged source emitter remains production-selected. Before promotion, compare
+old scalar/packed and typed candidates on the same workload, including finite-precision rounding
+and throughput, then migrate descriptor construction and remove the superseded emission. Four byte
+loads are not an aligned packed-word throughput claim. More general stages still need the checked
+recurrence and typed lift-region coverage described above.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through

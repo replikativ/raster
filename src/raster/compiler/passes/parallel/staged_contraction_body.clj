@@ -1,0 +1,198 @@
+(ns raster.compiler.passes.parallel.staged-contraction-body
+  "A bounded packed staged-contraction schedule, expressed entirely as typed KernelBody.
+
+   Packing is four byte loads plus word operations, not a pointer reinterpretation. This is a
+   correctness-first schedule; aligned vector loads and throughput tuning are separate work."
+  (:require [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
+            [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as conversion]
+            [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.contract-stages :as stages]
+            [raster.compiler.ir.contraction-facts :as facts]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled]
+            [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.parallel.staged-contraction-schedule :as schedule]))
+
+(defn- decline! [rule message data]
+  (throw (ex-info message (assoc data :reason :staged-kernel-body-declined
+                                 :missing-rule rule))))
+
+(defn declined? [e]
+  (= :staged-kernel-body-declined (:reason (ex-data e))))
+
+(defn- require! [condition rule data]
+  (when-not condition (decline! rule "typed staged schedule is not proved" data)))
+
+(defn- extent! [amap domain]
+  (let [pairs (vec (mapcat identity (:groups amap)))
+        axes (mapv first pairs)]
+    (require! (and (seq pairs) (= (count axes) (count (set axes)))
+                   (every? (fn [[a n :as pair]]
+                             (and (= 2 (count pair)) (contains? domain a)
+                                  (= n (get domain a)))) pairs))
+              :operand-domain {:map amap :domain domain})
+    (let [n (reduce *' 1 (map second pairs))]
+      (require! (<= n Integer/MAX_VALUE) :address-range {:map amap :elements n})
+      (long n))))
+
+(defn lower
+  "Schedule source-free verified contraction facts. Unsupported domains decline explicitly.
+   Returns a ScheduledKernelBody with byte storage and Int32 packed dot accumulators."
+  [source & {:keys [workgroup-size] :or {workgroup-size 64}}]
+  (when-not (facts/facts? source)
+    (throw (ex-info "staged body requires verified contraction facts" {:reason :raster/bug})))
+  (let [{:keys [free-axes contract-axes out]} source
+        stage-list (:stages source)
+        [outer inner] stage-list
+        axes (vec (concat free-axes contract-axes))
+        axis-ids (mapv first axes)
+        domain (into {} axes)
+        operands (vec (get-in source [:opts :operands]))
+        lifts (stages/lift-operands stage-list)
+        arrays (vec (concat operands lifts))
+        array-ids (mapv :sym arrays)
+        legality (stages/stages-legal? stage-list contract-axes)
+        reduction (facts/scalar-reduction-view source)]
+    (require! (:ok legality) :stage-legality legality)
+    ;; Decode is semantic evidence on canonical facts, not necessarily copied into the optional
+    ;; scheduling declarations. A body-replacing packed leaf must not discard either source.
+    (require! (and (not (seq (get-in source [:opts :decode])))
+                   (not-any? :decode (:operands source)))
+              :decoded-operands {:operands (:operands source)})
+    (require! (and (= 2 (count stage-list)) (= :int (dtype/canon (:dtype inner)))
+                   (= :float (dtype/canon (:dtype outer)))
+                   (= :float (or (:out-dtype source) :float))
+                   (nil? (:epilogue source))
+                   (contains? '#{+ clojure.core/+ raster.numeric/+} (:combine reduction))
+                   (constant/zero-value? (:neutral reduction)))
+              :stage-contract {:stages stage-list :reduction reduction})
+    (require! (and (seq free-axes) (= (count axis-ids) (count (set axis-ids)))
+                   (every? symbol? axis-ids)
+                   (every? #(and (integer? %) (pos? %) (<= % Integer/MAX_VALUE))
+                           (map second axes))
+                   (integer? workgroup-size) (<= 1 workgroup-size 256)
+                   (zero? (bit-and workgroup-size (dec workgroup-size))))
+              :iteration-domain {:axes axes :workgroup-size workgroup-size})
+    (require! (and (= (count array-ids) (count (set array-ids)))
+                   (every? symbol? array-ids) (symbol? out)
+                   (= (count (concat axis-ids array-ids [out '_nseg 'inner]))
+                      (count (set (concat axis-ids array-ids [out '_nseg 'inner]))))
+                   (every? #(and (= :float (:dtype %)) (nil? (:decode %))) lifts))
+              :parameter-identities {:axes axis-ids :arrays arrays :output out})
+    (let [plan (schedule/inner-dp4a-plan
+                {:stages stage-list :body (:body source) :operands operands
+                 :dtype (:dtype source)})
+          _ (require! (:ok plan) :packed-admission plan)
+          n (reduce *' 1 (map second free-axes))
+          _ (require! (<= (*' workgroup-size (quot (+ n (dec workgroup-size)) workgroup-size))
+                          Integer/MAX_VALUE)
+                      :launch-range {:elements n})
+          sizes (merge (into {} (map (fn [{:keys [sym map]}] [sym (extent! map domain)]) operands))
+                       (into {} (map (fn [{:keys [sym map]}]
+                                       [sym (extent! map (dissoc domain (:axis inner)))]) lifts)))
+          ;; The stage contract gives lift reads their declared maps. Admit scalar factors only;
+          ;; arbitrary calls, local binders and casts need their own retained region contract.
+          factors (stages/linear-in-inner (:lift outer) 'inner)
+          lift-ids (set (map :sym lifts))
+          _ (require! (every? #(or (number? %)
+                                  (and (descriptor/aget-call? %)
+                                       (contains? lift-ids (descriptor/aget-array-sym %)))) factors)
+                      :lift-region {:lift (:lift outer)})
+          reserved (atom (set (filter symbol? (tree-seq coll? seq source))))
+          fresh (fn [prefix]
+                  (loop [id (gensym prefix)]
+                    (if (contains? @reserved id) (recur (gensym prefix))
+                        (do (swap! reserved conj id) id))))
+          group (fresh "stage_group") lane (fresh "stage_lane") segment (fresh "stage_segment")
+          mask (fresh "stage_active") packed-index (fresh "stage_word")
+          inner-carry (fresh "stage_dot") inner-result (fresh "stage_dot_result")
+          outer-carry (fresh "stage_sum") outer-result (fresh "stage_sum_result")
+          scope (set (concat axis-ids [group lane segment packed-index '_nseg]))
+          lower-index #(index/lower %1 (into scope %2) decline!)
+          builder (scalar/make-lowerer
+                   {:arrays (set array-ids)
+                    :array-types (merge (zipmap (map :sym operands) (repeat :byte))
+                                        (zipmap (map :sym lifts) (repeat :float)))
+                    :scalar-types {} :index-scope scope :lower-index lower-index :predicate mask
+                    :source-region [source @reserved inner-carry inner-result outer-carry]
+                    :id-prefix (str (fresh "stage_scalar")) :decline! decline!
+                    :conversion-policy (fn [from to]
+                                         (when (contains? #{[:byte :int] [:int :float]} [from to])
+                                           (conversion/policy from to :reject)))})
+          pack (fn [{:keys [sym map]}]
+                 (reduce
+                  (fn [word offset]
+                    (let [coordinate (walk/postwalk-replace
+                                      {(:axis inner) (list 'clojure.core/+ (list 'clojure.core/* packed-index 4) offset)}
+                                      (am/index-expr map))
+                          loaded ((:cast builder)
+                                  ((:load builder) sym [(lower-index coordinate scope)]) :int coordinate)
+                          byte-word ((:compute builder) :bit-and :int
+                                     [(:result loaded) (body/literal 255 :int)] {})
+                          shifted ((:compute builder) :shl :int
+                                   [(:result byte-word) (body/literal (* offset 8) :int)] {})
+                          joined ((:compute builder) :bit-or :int [(:result word) (:result shifted)] {})]
+                      {:operations (vec (concat (:operations word) (:operations loaded)
+                                                (:operations byte-word) (:operations shifted) (:operations joined)))
+                       :result (:result joined)}))
+                  {:operations [] :result (body/literal 0 :int)} (range 4)))
+          [a b] (mapv pack operands)
+          dot ((:compute builder) :dp4a :int [(:result a) (:result b) inner-carry] {})
+          lift-expr (walk/postwalk-replace
+                     {'inner inner-result}
+                     (stages/substitute-operand-indices (:lift outer) (stages/stage-index-exprs stage-list)))
+          lift ((:lower builder) lift-expr :float {inner-result :int})
+          add ((:compute builder) :+ :float [outer-carry (:result lift)] {})
+          parameter (fn [id kind type count role]
+                      (body/->KernelParameter id kind type [count] :global
+                                              (layout/row-major [count] type) role))
+          parameters (vec (concat (map #(parameter (:sym %) :input :byte (sizes (:sym %)) :operand) operands)
+                                  (map #(parameter (:sym %) :input :float (sizes (:sym %)) :lift) lifts)
+                                  [(parameter out :output :float (long n) :result)
+                                   (body/->KernelParameter '_nseg :scalar :int [] nil nil :bound)]))
+          arguments (vec (concat array-ids [out (long n)]))
+          kernel (body/make
+                  {:id [:staged-packed out]
+                   :parameters parameters :stable-reads (mapv body/stable-read array-ids)
+                   :indices (vec (concat
+                                  [(body/->IndexBinding group :group 0) (body/->IndexBinding lane :local 0)
+                                   (body/->IndexCompute segment (body/expression :add (body/expression :mul group workgroup-size) lane))]
+                                  (map-indexed
+                                   (fn [i [axis extent]]
+                                     (body/->IndexCompute axis
+                                      (body/expression :mod
+                                       (body/expression :floor-div segment (reduce *' 1 (map second (drop (inc i) free-axes)))) extent)))
+                                   free-axes)))
+                   :masks [(body/->Mask mask [(body/predicate :lt segment (long n))
+                                             (body/predicate :lt segment '_nseg)])]
+                   :operations
+                   [(body/->ForLoop
+                     (body/value (:axis outer) :int) 0 (:extent outer) 1
+                     [(body/->LoopArg (body/value outer-carry :float) (body/literal 0.0 :float))]
+                     (vec (concat
+                           [(body/->ForLoop
+                             (body/value packed-index :int) 0 (:packed-extent plan) 1
+                             [(body/->LoopArg (body/value inner-carry :int) (body/literal 0 :int))]
+                             (vec (concat (:operations a) (:operations b) (:operations dot)
+                                          [(body/->Yield [(:result dot)])]))
+                             [(body/value inner-result :int)] {})]
+                           (:operations lift) (:operations add) [(body/->Yield [(:result add)])]))
+                     [(body/value outer-result :float)] {})
+                    (body/->ScalarStore out [segment] outer-result mask)]
+                   :launch (launch/spec {:workgroup-size [workgroup-size]
+                                         :group-count [(quot (+ (long n) (dec workgroup-size)) workgroup-size)]})
+                   :schedule {:strategy :staged-packed :workgroup-size workgroup-size}
+                   :attributes {:kind :staged-packed :packing :byte-loads}})]
+      (scheduled/make
+       {:source source :body kernel :arguments arguments
+        :effects {:kind :staged-contraction :uses (scheduled/derive-uses kernel arguments)}
+        :legality {:kind :staged-packed :stage-legality legality :packed-plan plan
+                   :storage-elements sizes :output-elements (long n)}
+        :numerics {:mode :reassociated :policy :staged-int32-float
+                   :accumulator-dtype :float :rounding :nearest-even}}))))
