@@ -61,8 +61,8 @@
     (when-let [invalid (first (remove finite-nonnegative? samples))]
       (throw (ex-info "measurement samples must be finite, non-negative nanoseconds"
                       {:sample invalid})))
-    (when-not (and (number? cv-threshold) (not (neg? (double cv-threshold))))
-      (throw (ex-info "measurement cv-threshold must be non-negative"
+    (when-not (finite-nonnegative? cv-threshold)
+      (throw (ex-info "measurement cv-threshold must be finite and non-negative"
                       {:cv-threshold cv-threshold})))
     (when-not (#{:warm :cold} cold-warm)
       (throw (ex-info "measurement cold-warm must be :warm or :cold"
@@ -95,6 +95,51 @@
                      (double compile-ms)
                      hashes
                      samples))))
+
+(defn measure-interleaved!
+  "Compare already-prepared device sample functions in rotating round-robin order.
+
+   Candidates are an ordered vector of {:id keyword :sample-fn fn}. Each callback returns
+   device nanoseconds and owns required restoration/synchronization. Compilation, allocation,
+   validation and persistence belong to the caller. Warmup samples are checked but not reported.
+   Fixed rounds bound the number of callbacks, not wall time. Raw chronological samples and
+   per-candidate Measurement values are returned; no winner or performance admission is inferred.
+   Rotation balances ordinal position over complete cycles, not cache or thermal conditions.
+   Summary :stationary? is the existing CV heuristic, not a drift test or admission proof."
+  [candidates & {:keys [rounds warmup-rounds timing-source cv-threshold]
+                 :or {rounds 12 warmup-rounds 3 timing-source :device-event
+                      cv-threshold 0.05}}]
+  (when-not (and (vector? candidates) (seq candidates)
+                 (every? #(and (keyword? (:id %)) (ifn? (:sample-fn %))) candidates)
+                 (= (count candidates) (count (set (map :id candidates)))))
+    (throw (ex-info "interleaved measurement requires unique named sample functions" {})))
+  (doseq [[field n minimum] [[:rounds rounds 1] [:warmup-rounds warmup-rounds 0]]]
+    (when-not (and (integer? n) (<= minimum n Integer/MAX_VALUE))
+      (throw (ex-info "invalid interleaved measurement round count" {:field field :value n}))))
+  ;; Validate summary metadata before performing any device work.
+  (summarize [0.0] :timing-source timing-source :cv-threshold cv-threshold)
+  (let [n (count candidates)
+        run-round
+        (fn [phase round]
+          (mapv (fn [position]
+                  (let [{:keys [id sample-fn]} (nth candidates (mod (+ round position) n))
+                        sample (sample-fn)]
+                    (when-not (finite-nonnegative? sample)
+                      (throw (ex-info "invalid interleaved device sample"
+                                      {:candidate id :phase phase :round round :sample sample})))
+                    {:candidate id :round round :position position :ns (double sample)}))
+                (range n)))]
+    (dotimes [round warmup-rounds] (run-round :warmup round))
+    (let [samples (into [] (mapcat #(run-round :measurement %)) (range rounds))]
+      {:order :rotating-round-robin
+       :candidate-order (mapv :id candidates)
+       :rounds rounds :warmup-rounds warmup-rounds
+       :samples samples
+       :measurements
+       (into {} (for [{:keys [id]} candidates]
+                  [id (summarize (mapv :ns (filter #(= id (:candidate %)) samples))
+                                 :warmup-iterations warmup-rounds
+                                 :timing-source timing-source :cv-threshold cv-threshold)]))})))
 
 (defn measure!
   "Measure an explicit device-sample function under a bounded, do_bench-style discipline.
@@ -149,4 +194,3 @@
                  :timing-source timing-source
                  :compile-ms compile-ms
                  :hashes hashes))))
-

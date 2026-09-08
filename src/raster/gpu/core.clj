@@ -2227,6 +2227,22 @@
        :device-wall-ms (:wall-ms prof)
        :host-wall-ms (/ (- t1 t0) 1.0e6)})))
 
+(defn- graph-device-sampler
+  [sess graph before-sample!]
+  (let [device-id (:device-id @sess)
+        replay-fn (rt-resolve device-id "replay-graph!")
+        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")]
+    (fn []
+      (when before-sample! (before-sample!))
+      (replay-fn graph)
+      (let [wall-ms (:wall-ms (read-ts-fn graph))]
+        (when-not (and (number? wall-ms)
+                      (Double/isFinite (double wall-ms))
+                      (not (neg? (double wall-ms))))
+          (throw (ex-info "device graph profiler returned no finite wall duration"
+                          {:device-id device-id :wall-ms wall-ms})))
+        (* 1.0e6 (double wall-ms))))))
+
 (defn measure-graph!
   "Repeatedly measure a PROFILING runtime graph with backend device events.
 
@@ -2239,19 +2255,7 @@
    measurement/measure!, including :budget-ms, :warmup-iterations, :flush-fn, :cold-warm,
    :compile-ms, and :hashes."
   [sess graph & {:keys [before-sample!] :as opts}]
-  (let [device-id (:device-id @sess)
-        replay-fn (rt-resolve device-id "replay-graph!")
-        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")
-        sample-fn (fn []
-                    (when before-sample! (before-sample!))
-                    (replay-fn graph)
-                    (let [wall-ms (:wall-ms (read-ts-fn graph))]
-                      (when-not (and (number? wall-ms)
-                                     (Double/isFinite (double wall-ms))
-                                     (not (neg? (double wall-ms))))
-                        (throw (ex-info "device graph profiler returned no finite wall duration"
-                                        {:device-id device-id :wall-ms wall-ms})))
-                      (* 1.0e6 (double wall-ms))))
+  (let [sample-fn (graph-device-sampler sess graph before-sample!)
         measurement-opts (-> opts
                              (dissoc :before-sample!)
                              (assoc :timing-source :device-event))]
@@ -2282,6 +2286,33 @@
       (throw (ex-info "bound kernel graph was not recorded with :profile? true"
                       {:handle handle})))
     (apply measure-graph! sess runtime-graph (mapcat identity opts))))
+
+(defn measure-bound-kernel-graphs-interleaved!
+  "Device-event comparison of already-bound profiling graphs without exposing runtime handles.
+
+   candidates: ordered vector of {:id keyword :handle KernelGraphHandle :before-sample! fn?}.
+   Restoration runs before every replay, including warmup, outside the measured device interval.
+   The caller owns independent correctness validation, candidate identity and handle lifetime.
+   Compilation and transfers are not timed; this is a warm resident comparison, not end-to-end
+   performance or automatic schedule selection. Options are measure-interleaved! round bounds
+   and cv-threshold; timing-source is always :device-event."
+  [sess candidates & {:as opts}]
+  (when-not (vector? candidates)
+    (throw (ex-info "interleaved graph candidates must be an ordered vector" {})))
+  (when (seq (remove #{:rounds :warmup-rounds :cv-threshold} (keys opts)))
+    (throw (ex-info "unsupported interleaved graph measurement option" {:options (keys opts)})))
+  (let [samplers
+        (mapv (fn [{:keys [id handle before-sample!]}]
+                (when-not (or (nil? before-sample!) (ifn? before-sample!))
+                  (throw (ex-info "before-sample! must be callable" {:candidate id})))
+                (let [{:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)]
+                  (when-not profile?
+                    (throw (ex-info "bound kernel graph was not recorded with :profile? true"
+                                    {:handle handle})))
+                  {:id id :sample-fn (graph-device-sampler sess runtime-graph before-sample!)}))
+              candidates)]
+    (apply measurement/measure-interleaved! samplers
+           (mapcat identity (assoc opts :timing-source :device-event)))))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.

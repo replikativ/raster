@@ -60,6 +60,16 @@ an end-to-end series when packing, transfers or page routing are required. Do no
 costs behind a resident-only comparison. Include cold compilation/tuning in amortization
 reports but never silently mix it into warm execution samples.
 
+For a bounded warm resident A/B/C comparison, bind all candidates with profiling enabled,
+validate each independently, then use `gpu/measure-bound-kernel-graphs-interleaved!` with an
+ordered vector of `{:id :candidate-name :handle handle :before-sample! restore-fn}`. The optional
+restore callback runs before every replay outside device timing. `:rounds` defaults to 12 and
+`:warmup-rounds` to 3. Each round rotates the starting candidate; complete cycles balance ordinal
+position. Persist both chronological `:samples` and per-candidate `:measurements` with the identities
+above. This controls one ordering confound, not cache/thermal drift. The summary's `:stationary?`
+is only the existing coefficient-of-variation heuristic; it neither proves stationarity nor
+selects a winner. No tuning cache or production selector is changed by this measurement API.
+
 Pin external revisions before measurement. Retain individual shapes and failures; publish
 any aggregate only alongside them. Tune on a declared training set and measure held-out
 shapes, with a stated budget for each implementation. Do not update reference baselines
