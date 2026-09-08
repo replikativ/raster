@@ -689,3 +689,19 @@ common resident binding, public compilation/execution, all four source dialects,
 declines, and retained checked integer arithmetic. Broader integer stage schedules, dynamic domains,
 cooperative scheduling, target capability-driven alternatives and external performance comparisons
 remain follow-ups; the older staged fallback is not yet fully retired.
+
+### Staged scalar result transforms
+
+Floating staged contractions can now execute their scalar epilogue after the entire nested
+reduction, through the same strict scalar builder. The retained closure checks accumulator scope
+and excludes closed reduction indices; shared storage requirements include declared epilogue
+operand maps over free axes. Explicit scalar declarations must agree with authoritative capture
+types, both at schedule admission and after SSA value binding. No stage/epilogue source template
+or operator registry is added.
+
+The generated path retains the current output dtype and casts the completed scalar transform
+explicitly. Destination-reading transforms still require an inout storage proof and decline before
+frontend admission. Decoded operands and broader integer stage schedules remain separate work.
+Public validation includes post-reduction placement on Arc, all common source dialects, short
+epilogue-buffer rejection before allocation, and CUDA/HIP vendor fixtures using the same public
+workload. Whole staged-emitter retirement remains contingent on the uncovered numerical contracts.

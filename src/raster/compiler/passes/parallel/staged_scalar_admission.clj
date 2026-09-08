@@ -21,15 +21,19 @@
     (decline! :static-domain "scalar staged schedule requires static extents" {:source source}))
   (when-not (and (contains? '#{+ clojure.core/+ raster.numeric/+} (:combine source))
                  (constant/zero-value? (:init source))
-                 (nil? (:epilogue source))
                  (empty? (get-in source [:opts :decode]))
                  (not-any? :decode (:operands source)))
     (decline! :numerical-contract "scalar staged schedule does not implement these numerical extensions"
               {:source source}))
   (let [{:keys [reads scalars]} (facts/dependencies source)
+        _ (when (some #(= (:out source) (:sym %)) (get-in source [:epilogue :operands]))
+            (decline! :result-transform-inout
+                      "destination-reading result transforms require an inout storage proof"
+                      {:source source}))
         attributes {:contraction source :array-parameters (vec (sort-by pr-str reads))
                     :capture-parameters (vec (sort-by pr-str scalars))}
         _ (closure/validate! attributes)
+        _ (closure/validate-result-scalar-types! source scalar-types)
         requirements (closure/storage-requirements attributes)
         stage-list (:stages source)
         axes (vec (concat (:free-axes source) (:contract-axes source)))
