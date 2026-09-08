@@ -26,6 +26,18 @@
       (is (= 128 (cs/contract-extent s)))
       (is (= [] (cs/lift-operands s))))))
 
+(deftest staged-sums-require-zero-identities
+  (doseq [position [0 1] init [1 -1 0.5 'seed '(int 4294967296) ##NaN ##Inf]]
+    (is (= :nonzero-stage-identity
+           (:reason (cs/stages-legal? (assoc-in q8-stages [position :init] init)
+                                      '[[blk 4] [t 32]])))))
+  (doseq [init [nil 0 0.0 -0.0 '(int 0) '(float 0)]]
+    (is (:ok (cs/stages-legal? (mapv #(assoc % :init init) q8-stages)
+                               '[[blk 4] [t 32]]))))
+  (is (= :nonzero-stage-identity
+         (:reason (cs/stages-legal? '[{:axis l :extent 1 :dtype :float :init 1}]
+                                    '[[l 1]])))))
+
 (deftest two-stage-block-quant
   (testing "the q8_0 shape is legal"
     (is (:ok (cs/stages-legal? q8-stages '[[blk 4] [t 32]]))))

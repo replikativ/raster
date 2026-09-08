@@ -56,6 +56,20 @@
     (testing "route-contraction validated it on the way out (it returned at all)"
       (is (some? (:kernel-name r))))))
 
+(deftest staged-route-validates-and-normalizes-identities
+  (let [replace-stages (fn [f]
+                         (let [form (staged-form :byte)
+                               opts (apply hash-map (drop 5 form))]
+                           (concat (take 5 form)
+                                   (mapcat identity (update opts :stages f)))))]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"nonzero-stage-identity"
+         (cr/route-contraction (replace-stages #(assoc-in % [1 :init] 1)) :dtype :byte)))
+    (let [r (cr/route-contraction
+             (replace-stages #(assoc-in % [1 :init] '(int 0))) :dtype :byte)]
+      (is (re-find #"int acc_1 = 0;" (:source r)))
+      (is (= 0 (get-in r [:stages 1 :init]))))))
+
 (deftest staging-beats-dtype-in-the-dispatch
   (testing "an int8 staged contraction must NOT be captured by the flat int8 leaves — they have a
             single accumulator and cannot express a per-block scale at all"
@@ -141,6 +155,23 @@
                    (list 'aget 'b (idx (get ms 'b))))]
             (drop 5 (staged-form :byte))
             [:operands [{:sym 'a :map (get ms 'a)} {:sym 'b :map (get ms 'b)}]])))
+
+(deftest packed-inner-stage-proves-all-int32-prefixes
+  (let [gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+        spec (fn [extent accumulator]
+               (let [maps (mapv (fn [axis] {:groups [[[axis 1]] [['t extent]]]}) '[i j])
+                     index (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)]
+                 {:dtype :byte
+                  :stages [{:axis 't :extent extent :dtype accumulator :init 0}]
+                  :body (list '* (list 'aget 'a (index (first maps)))
+                              (list 'aget 'b (index (second maps))))
+                  :operands (mapv (fn [sym m] {:sym sym :map m}) '[a b] maps)}))]
+    (doseq [accumulator [:int :long]]
+      (is (:ok (gate (spec 131068 accumulator))))
+      (is (= :unproved-dp4a-accumulator-range
+             (:reason (gate (spec 131072 accumulator))))))
+    (is (= :unproved-dp4a-accumulator-range
+           (:reason (gate (assoc-in (spec 32 :long) [:stages 0 :init] 'unknown)))))))
 
 (deftest prefer-peak-tensorizes-the-inner-stage
   (let [form (staged-form-with-maps)

@@ -31,6 +31,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
@@ -1646,6 +1647,19 @@
        :body body :declared (mapv :sym operands)}
       (not int-acc?) {:ok false :reason :inner-stage-accumulator-not-integral
                       :dtype (:dtype inner-stage)}
+      ;; The hardware operation consumes AND returns int32, even when the enclosing carry is
+      ;; Long. Prove every prefix, not merely the final sum of a sampled input. This also keeps
+      ;; scalar and packed accumulation exact for all admitted signed-byte operands.
+      (not (scalar-range/contained-in-dtype?
+            (scalar-range/accumulation-prefixes
+             (when (or (nil? (:init inner-stage))
+                       (constant/zero-value? (:init inner-stage)))
+               (scalar-range/literal 0 :int))
+             (scalar-range/arithmetic :* (repeat 2 (scalar-range/for-dtype :byte)))
+             (:extent inner-stage))
+            :int))
+      {:ok false :reason :unproved-dp4a-accumulator-range
+       :dtype (:dtype inner-stage) :extent (:extent inner-stage)}
       :else
       (or
        ;; the declared map must PROVABLY be the operand's actual index expression
@@ -1719,7 +1733,7 @@
         _ (when-not (:ok legal)
             (throw (ex-info (str "staged contraction: illegal stages (" (:reason legal) ")")
                             (assoc legal :stages stages :contract-axes contract-axes))))
-        stages (vec stages)
+        stages (mapv #(update % :init constant/literal-or-original) stages)
         ;; TENSORIZE THE INNER STAGE: the innermost accumulation is already an exact int32 sum over
         ;; a short K-contiguous run, which is exactly dp4a's shape. Requested explicitly (a schedule
         ;; choice), then GATED — a rejection falls back to the scalar nest, never to a wrong kernel.
