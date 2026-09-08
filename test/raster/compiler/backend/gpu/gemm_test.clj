@@ -394,7 +394,7 @@
 
 (deftest matrix-stages-derive-logical-widths-from-their-graph
   (doseq [variant [:nn :nt :tn :tt]
-          widths [[:long :long :long] [:long :int :long]]]
+          widths [[:long :long :long] [:long :int :long] [:int :int :long]]]
     (let [interface (executable/common-view (dispatch/default-alternative (emitted variant)))
           by-argument (zipmap [:m :n :k] widths)
           interface (update interface :abi
@@ -415,7 +415,7 @@
         (doseq [node (:nodes graph)
                 binding (get-in node [:operation :attributes :scheduled-kernel-body :scalar-bindings])]
           (is (= (launch/typed-expression-dtype (:value binding) by-argument) (:dtype binding)))
-          (is (= (if (= :long (:dtype binding)) :checked-range :identity)
+          (is (= (if (= (:kernel-dtype binding) (:dtype binding)) :identity :checked-range)
                  (:conversion binding))))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                               (graph-call/temporary-specs graph
@@ -435,7 +435,29 @@
         bindings (mapcat #(get-in % [:operation :attributes :scheduled-kernel-body :scalar-bindings])
                          (:nodes graph))]
     (is (every? #(= :long (:dtype %)) bindings))
-    (is (every? #(= :checked-range (:conversion %)) bindings))
+    (is (= #{:identity :checked-range} (set (map :conversion bindings))))
     (is (map? (graph-call/temporary-specs graph values)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
                           (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))))))
+
+(deftest long-layout-and-combine-extents-do-not-narrow-shape-products
+  (let [interface (update (executable/common-view (dispatch/default-alternative (emitted :nn)))
+                          :abi #(mapv (fn [slot] (if (= :scalar (:kind slot))
+                                                 (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
+        {:keys [alternatives]}
+        (gemm/emit-matrix-alternatives
+         {:id :wide-products :a 'a :b 'b :c 'c :m :m :n :n :k :k :variant :nn
+          :tile (hardware/derive-gemm-tile {}) :fill-workgroups 32 :split-factors [2]
+          :external-interface interface})
+        direct (first alternatives)
+        split (some #(when (= :xmx-split-k-2 (executable/strategy %)) %) alternatives)
+        values (fn [m n k] (zipmap [:m :n :k] (mapv #(hash-map :type :long :value %) [m n k])))
+        input-specs (graph-call/temporary-specs direct (values 65536 32 65536))
+        output-specs (graph-call/temporary-specs split (values 65536 65536 64))
+        combine (:operation (last (:nodes split)))]
+    (is (some #{4294967296} (map second (vals input-specs))))
+    (is (some #{8589934592} (map second (vals output-specs))))
+    (is (every? #(= :long (:kernel-dtype %)) (filter #(= :scalar (:kind %)) (:abi combine))))
+    (is (re-find #"long mn" (:source combine)))
+    (is (every? #(= :identity (:conversion %))
+                (get-in combine [:attributes :scheduled-kernel-body :scalar-bindings])))))
