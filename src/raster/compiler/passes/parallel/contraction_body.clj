@@ -169,12 +169,17 @@
                         (apply body/expression (:op expression)
                                (map widen-index (:arguments expression)))
                         :else expression))
-        lower-index (fn [expression scope]
-                      (widen-index (lower-index expression scope)))
         segment-count-source (if map-only?
                                (reduce (fn [a d] (list '* a (:bound d)))
                                        (:bound (first segment-dims)) (rest segment-dims))
                                (segop/seg-space-num-segments-expr space))
+        segment-count-dtype
+        (launch/typed-expression-dtype
+         (index-expression/to-launch-expression
+          (lower-index segment-count-source index-scope) decline!)
+         (into {} (map (fn [id] [id (dtype/canon (scalar-dtype id))])) scalars))
+        lower-index (fn [expression scope]
+                      (widen-index (lower-index expression scope)))
         segment-count (lower-index segment-count-source index-scope)
         launch-segment-count (index-expression/to-launch-expression segment-count decline!)
         reduced-bound (when reduced-dim (lower-index (:bound reduced-dim) index-scope))
@@ -255,7 +260,8 @@
                    scalars)
               transform-operand-parameters
               transform-scalar-parameters
-              [(body/->KernelParameter '_nseg :scalar :int [] nil nil :bound)]))]
+              [(body/->KernelParameter '_nseg :scalar segment-count-dtype
+                                       [] nil nil :bound)]))]
     (let [parameter-map (into {} (map (juxt :id clojure.core/identity)) parameters)
           lowered-transform
           (when result-region

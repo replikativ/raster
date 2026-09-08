@@ -99,13 +99,16 @@
     (is (= :float (get parameters 'x)))
     (is (= :float (get parameters 'scale)))
     (is (= :double (get parameters 'y)))
+    (is (= :long (get parameters '_nseg)))
     (is (= :long (get-in loop [:index :type])))
     (is (some #(and (= :cast (get-in % [:expression :op]))
                     (= :double (get-in % [:expression :result-type])))
               (:operations loop)))
     (doseq [target [:opencl-intel :cuda :hip]]
-      (is (string? (:source (emit/generate-contraction-kernel-artifact
-                            kernel :target-dialect target)))))))
+      (let [emitted (emit/generate-contraction-kernel-artifact
+                     kernel :target-dialect target)]
+        (is (string? (:source emitted)))
+        (is (= :long (:kernel-dtype (last (:abi emitted)))))))))
 
 (deftest mixed-storage-cannot-select-a-uniform-pointer-leaf
   (let [form '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
