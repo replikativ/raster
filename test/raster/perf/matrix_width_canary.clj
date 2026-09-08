@@ -4,6 +4,7 @@
   compilation, precision conversion, transfer throughput, or external SOTA libraries."
   (:refer-clojure :exclude [run!])
   (:require [raster.compiler.backend.gpu.typed-matrix-device-support :as support]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.reference.gemm-opencl :as reference]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
@@ -37,6 +38,7 @@
                  (every? (fn [shape]
                            (and (vector? shape) (= 3 (count shape))
                                 (every? #(and (integer? %) (<= 1 % 1024)) shape)
+                                (nil? (apply block-io/static-failure shape))
                                 (zero? (mod (second shape) 16))
                                 (zero? (mod (nth shape 2) 16))
                                 (<= (apply * shape) 33554432))) shapes))
@@ -47,7 +49,7 @@
                             [:attributes :strategy] :typed-body)
         tile (get-in generated [:attributes :tile])
         baseline (artifact/make
-                  (merge (select-keys generated [:abi :arguments :launch :effects])
+                  (merge (select-keys generated [:abi :arguments :launch :effects :preconditions])
                          {:kernel-name "matrix_width_reference"
                           :source (apply reference/emit-gemm-tiled "matrix_width_reference"
                                          :c-dtype :float :prefetch (:num-stages tile)
