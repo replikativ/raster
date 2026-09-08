@@ -385,12 +385,12 @@
             "must still reproduce the hand-tuned Arc tile")
         (is (= [256 1] (:wg r)))
         (is (= [4 2] (:grid r)))))                     ; ceil(512/128), ceil(256/128)
-    (testing "a part with HALF the GRF and subgroup 8 gets a rescaled tile AND launch geometry"
-      (let [small {:matrix {:m 8 :n 8 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+    (testing "a part with HALF the GRF and legal subgroup 16 gets a rescaled tile AND launch geometry"
+      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 16} :grf-bytes-per-lane 128}
             r (route/route-contraction mm :dtype :half :desc small)]
         (is (= {:block-m 64 :block-n 64 :sg-m 16 :sg-n 16 :block-k 32}
                (select-keys (:tile r) [:block-m :block-n :sg-m :sg-n :block-k])))
-        (is (= [128 1] (:wg r)) "workgroup = (bm/sgm)·(bn/sgn)·subgroup = 4·4·8")
+        (is (= [256 1] (:wg r)) "workgroup = (bm/sgm)·(bn/sgn)·subgroup = 4·4·16")
         (is (= [8 4] (:grid r)) "grid follows the smaller block tile")))
     (testing "an explicit tile (e.g. an autotune result) overrides the derivation"
       (let [t (hw {} {:wg-subgroups 4})
@@ -398,7 +398,12 @@
         (is (= t (:tile r)))
         (is (not= (:block-m (hw {})) (:block-m t)) "the override must actually differ")))
     (testing "the emitted kernel source carries the derived tile, not a constant"
-      (let [small {:matrix {:m 8 :n 8 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 16} :grf-bytes-per-lane 128}
             src (:source (route/route-contraction mm :dtype :half :desc small))]
-        (is (re-find #"intel_reqd_sub_group_size\(8\)" src)
-            "subgroup size must follow the descriptor into the kernel attribute")))))
+        (is (re-find #"intel_reqd_sub_group_size\(16\)" src)
+            "a supported subgroup size follows the descriptor into the kernel attribute")))
+    (testing "hardware descriptors cannot override the target instruction restrictions"
+      (let [unsupported {:matrix {:m 8 :n 8 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+            routed (route/route-contraction mm :dtype :half :desc unsupported)]
+        (is (= :regtiled (:strategy routed)))
+        (is (not (re-find #"intel_reqd_sub_group_size" (:source routed))))))))
