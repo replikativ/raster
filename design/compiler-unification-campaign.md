@@ -178,6 +178,16 @@ shared scalar lowering. DP4A instruction acceptance itself proves no accumulatio
 the schedule's prefix gate. General scalar integer stages additionally need a checked recurrence
 proof (including zero trips and cross-carry dependencies), not weakened KernelBody validation.
 
+A REPL packing probe lowers four byte reads and existing bit operations into verified KernelBody
+without reinterpreting the public byte-buffer ABI. Its target emission exposed an adjacent shift
+contract gap: C-family word shifts now explicitly mask counts to the retained Int/Long width,
+shift unsigned words, and restore arithmetic-right sign bits. Byte shifts decline centrally until
+source lowering supplies an explicit promotion/result contract. This does not authorize narrowing
+Long source shifts to Int. The shared fixture covers sign-bit packing and signed/count extrema on
+OpenCL, with CUDA/HIP source compilation in CI. It is a portability prerequisite, not evidence that
+four byte loads match the throughput of an aligned packed-word load or that staged emission is
+already unified.
+
 Public matmul/dA/dB probes on CPU OpenCL select generated portable contractions, not the
 handwritten gather fallback. Their artifact adapter previously reported semantic `:segcontract`
 provenance as the emission route. The follow-up propagates the actual emitter's route through

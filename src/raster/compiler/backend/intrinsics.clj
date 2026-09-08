@@ -71,9 +71,11 @@
    :bit-and {:arity 2 :kind :infix :wasm {:i32 :i32.and :i64 :i64.and} :c "&" :wgsl "&"}
    :bit-or  {:arity 2 :kind :infix :wasm {:i32 :i32.or :i64 :i64.or} :c "|" :wgsl "|"}
    :bit-xor {:arity 2 :kind :infix :wasm {:i32 :i32.xor :i64 :i64.xor} :c "^" :wgsl "^"}
-   :shl     {:arity 2 :kind :infix :wasm {:i32 :i32.shl :i64 :i64.shl} :c "<<" :wgsl "<<"}
-   :shr     {:arity 2 :kind :infix :wasm {:i32 :i32.shr_s :i64 :i64.shr_s} :c ">>" :wgsl ">>"}
-   :ushr    {:arity 2 :kind :infix :wasm {:i32 :i32.shr_u :i64 :i64.shr_u} :c ">>" :wgsl ">>"}
+   ;; Canonical word shifts mask counts by the retained operand width. Byte promotion is a
+   ;; source-lowering decision, not an implicit eight-bit shift/result convention.
+   :shl     {:arity 2 :kind :infix :scalar-dtypes #{:int :long} :wasm {:i32 :i32.shl :i64 :i64.shl} :c "<<" :wgsl "<<"}
+   :shr     {:arity 2 :kind :infix :scalar-dtypes #{:int :long} :wasm {:i32 :i32.shr_s :i64 :i64.shr_s} :c ">>" :wgsl ">>"}
+   :ushr    {:arity 2 :kind :infix :scalar-dtypes #{:int :long} :wasm {:i32 :i32.shr_u :i64 :i64.shr_u} :c ">>" :wgsl ">>"}
    ;; integer remainder / modulo / quotient
    :rem  {:arity 2 :kind :special :wasm {:i32 :i32.rem_s} :c "%" :wgsl "%"}
    :mod  {:arity 2 :kind :special :c :floored-mod :wgsl :floored-mod}
@@ -250,6 +252,7 @@
         numeric? (or integral? floating?)]
     (and op
          (cond
+           (:scalar-dtypes (descriptor op)) (contains? (:scalar-dtypes (descriptor op)) dtype)
            (contains? integral-ops op) integral?
            (contains? floating-ops op) floating?
            :else numeric?))))
