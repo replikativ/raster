@@ -26,7 +26,6 @@
 
     (or (record-kind? "ForLoop" operation)
         (record-kind? "PipelinedFor" operation)
-        (record-kind? "Loop" operation)
         (record-kind? "Guard" operation))
     (:operations operation)
 

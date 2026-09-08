@@ -35,13 +35,14 @@
              (fn [operations]
                (mapv
                 (fn [operation]
-                  (if (instance? raster.compiler.ir.kernel_body.Loop operation)
+                  (if (instance? raster.compiler.ir.kernel_body.ForLoop operation)
                     (update-in
                      operation [:operations 0 :operations]
                      (fn [inner]
-                       (conj inner (first (filter #(instance?
-                                                   raster.compiler.ir.kernel_body.MatrixMad %)
-                                                 inner)))))
+                       (let [mad (first (filter #(instance?
+                                                 raster.compiler.ir.kernel_body.MatrixMad %)
+                                               inner))]
+                         (conj (pop inner) mad (peek inner)))))
                     operation))
                 operations)))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"fragment product"

@@ -116,7 +116,7 @@
         scheduled-contract (artifact/attribute contract :scheduled-kernel-body)
         stage (:source scheduled-contract)
         combine-body (artifact/attribute combine :kernel-body)
-        outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.Loop %)
+        outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
                                   (get-in kernel-body [:operations 0 :operations])))]
     (is (= :xmx-split-k (executable/strategy graph)))
     (is (= #{'a 'b 'c} (set (keys buffers))))

@@ -55,12 +55,12 @@
     :operations [(body/->Guard
                   :in-bounds
                   [(body/->FragmentInit :acc 0.0)
-                   (body/->Loop
-                    'k 0 16 16
+                   (body/->ForLoop
+                    (body/value 'k :int) 0 16 16 []
                     [(body/->TileLoad :lhs 'A ['group-x 'k] :in-bounds :cached)
                      (body/->TileLoad :rhs 'B ['k 'group-x] :in-bounds :cached)
-                     (body/->MatrixMad :acc :lhs :rhs matrix)]
-                    {:unroll true})
+                     (body/->MatrixMad :acc :lhs :rhs matrix)
+                     (body/->Yield [])] [] {:unroll true})
                    (body/->TileStore 'C :acc ['group-x 0] :in-bounds nil)])]
     :schedule {:matrix matrix}
     :launch (launch/spec {:workgroup-size [16] :group-count [1]})
@@ -804,18 +804,18 @@
             (body/value 'bad :float) :reduce :subgroup 16 'x-value :bit-and nil
             (body/full-participation) :implementation-defined)])))))
 
-(deftest scalar-ssa-cannot-shadow-legacy-loop-indices
+(deftest scalar-ssa-cannot-shadow-typed-loop-indices
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo #"not globally unique"
        (scalar-body
-        [(body/->Loop
-          'legacy-index 0 1 1
+        [(body/->ForLoop
+          (body/value 'loop-index :int) 0 1 1 []
           [(body/->ScalarCompute
-            (body/value 'legacy-index :float)
+            (body/value 'loop-index :float)
             (body/scalar-expression :+ :float
                                     [(body/literal 1.0 :float)
-                                     (body/literal 2.0 :float)]))]
-          {})]))))
+                                     (body/literal 2.0 :float)]))
+           (body/->Yield [])] [] {})]))))
 
 (deftest hardware-index-axes-must-exist-in-the-launch-contract
   (let [kernel (scalar-body [])]

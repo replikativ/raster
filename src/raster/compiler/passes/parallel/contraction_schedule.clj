@@ -216,11 +216,12 @@
                               (fragment-id "rhs" nn)
                               matrix))))
         init-ops (mapv #(body/->FragmentInit % 0.0) accumulator-ids)
-        fragment-loop (body/->Loop k-fragment 'k-block
+        fragment-loop (body/->ForLoop (body/value k-fragment :int) 'k-block
                                    (body/expression :min (add 'k-block block-k) k-upper)
-                                   matrix-k one-k-step
+                                   matrix-k [] (conj one-k-step (body/->Yield [])) []
                                    {:unroll true :matrix-step matrix-k})
-        k-loop (body/->Loop 'k-block k-lower k-upper block-k [fragment-loop]
+        k-loop (body/->ForLoop (body/value 'k-block :int) k-lower k-upper block-k []
+                              [fragment-loop (body/->Yield [])] []
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
