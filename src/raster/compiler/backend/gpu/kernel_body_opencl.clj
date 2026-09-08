@@ -541,12 +541,21 @@
       (and integral? (contains? #{:min :max} op))
       (str (name op) "(" (str/join ", " arguments) ")")
 
-      ;; Signed right shift is not the target-neutral unsigned-shift contract.
-      (= :ushr op)
+      ;; Word shifts have the JVM/WASM width-masked count contract, independent of the
+      ;; source language's choice to widen an operand. Unsigned shifts also avoid signed
+      ;; left-shift overflow; arithmetic right shift explicitly restores the sign bits.
+      (contains? #{:shl :shr :ushr} op)
       (let [[value amount] arguments
-            unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* operand-type)]
-        (str "(" (target-type operand-type) ")((" unsigned-type ")(" value ") >> "
-             amount ")"))
+            unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* operand-type)
+            word (str "((" unsigned-type ")(" value "))")
+            count (str "(((" unsigned-type ")(" amount ")) & "
+                       (dec (* 8 (dtype/bytes-of operand-type))) ")")
+            shifted (case op
+                      :shl (str "(" word " << " count ")")
+                      :ushr (str "(" word " >> " count ")")
+                      :shr (str "((" value " < 0) ? ~(~" word " >> " count ") : ("
+                                word " >> " count "))"))]
+        (str "(" (target-type operand-type) ")(" shifted ")"))
 
       ;; OpenCL's integral abs returns an unsigned type, while KernelBody currently declares a
       ;; same-signed-type result. Refuse the mismatch until the IR states that representation step.

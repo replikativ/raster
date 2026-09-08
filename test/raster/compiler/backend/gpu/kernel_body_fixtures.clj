@@ -4,6 +4,29 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]))
 
+(defn word-shifts-body
+  "Typed word shifts share an input row and store left/arithmetic-right/logical-right results."
+  [type width]
+  (body/make
+   {:id [:word-shifts type width]
+    :parameters [(body/->KernelParameter 'x :input type [width] :global
+                                        (layout/row-major [width] type) :input)
+                 (body/->KernelParameter 'counts :input type [width] :global
+                                        (layout/row-major [width] type) :input)
+                 (body/->KernelParameter 'out :output type [(* 3 width)] :global
+                                        (layout/row-major [(* 3 width)] type) :result)]
+    :indices [(body/->IndexBinding 'lane :local 0)]
+    :operations
+    (into [(body/->ScalarLoad (body/value 'x-value type) 'x ['lane] nil nil :cached)
+           (body/->ScalarLoad (body/value 'count-value type) 'counts ['lane] nil nil :cached)]
+          (map-indexed
+           (fn [position op]
+             (body/->ScalarStore 'out [(body/expression :add
+                                                      (body/expression :mul 'lane 3) position)]
+                                  (body/scalar-expression op type ['x-value 'count-value]) nil))
+           [:shl :shr :ushr]))
+    :launch (launch/spec {:workgroup-size [width] :group-count [1]})}))
+
 (defn workgroup-memory-body
   "A workgroup reverses one row through explicitly allocated local storage and a barrier."
   [width]

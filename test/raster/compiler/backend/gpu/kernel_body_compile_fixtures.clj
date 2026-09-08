@@ -413,6 +413,14 @@
                           (body-emit/emit-scalar-kernel
                            "trapping_arithmetic" (body-fixtures/trapping-arithmetic-body)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "word-shifts-i32"
+                          (body-emit/emit-scalar-kernel
+                           "word_shifts_i32" (body-fixtures/word-shifts-body :int 1)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "word-shifts-i64"
+                          (body-emit/emit-scalar-kernel
+                           "word_shifts_i64" (body-fixtures/word-shifts-body :long 1)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "swizzled-workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "swizzled_workgroup_memory"
