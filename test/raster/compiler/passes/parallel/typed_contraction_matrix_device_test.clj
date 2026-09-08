@@ -146,8 +146,15 @@
 (defn- run-contraction
   ([device-id scheduled m n k] (run-contraction device-id scheduled m n k :int))
   ([device-id scheduled m n k scalar-dtype]
+   (run-contraction device-id scheduled m n k scalar-dtype :nn))
+  ([device-id scheduled m n k scalar-dtype variant]
   (let [a (input-array (* m k) 17)
         b (input-array (* k n) 29)
+        transpose (fn [^floats values rows columns]
+                    (float-array (for [column (range columns) row (range rows)]
+                                   (aget values (+ (* row columns) column)))))
+        stored-a (if (contains? #{:tn :tt} variant) (transpose a m k) a)
+        stored-b (if (contains? #{:nt :tt} variant) (transpose b k n) b)
         runtime-arguments
         [:a :b :c
          {:type scalar-dtype :value m}
@@ -157,8 +164,8 @@
                    (dispatch/select-alternative scheduled runtime-arguments)
                    scheduled)]
     (gpu/with-gpu-session [session device-id]
-      (gpu/alloc! session {:a [:float (* m k) a]
-                           :b [:float (* k n) b]
+      (gpu/alloc! session {:a [:float (* m k) stored-a]
+                           :b [:float (* k n) stored-b]
                            :c [:float (* m n) nil]})
       (let [handle (gpu/bind-kernel-executable!
                     session [:typed-contraction m n k] selected runtime-arguments)]
@@ -178,17 +185,18 @@
                              (dispatch/default-alternative (typed-dispatch device-id))) :abi
                             #(mapv (fn [slot] (if (= :scalar (:kind slot))
                                                (assoc slot :dtype :long :kernel-dtype :long)
-                                               slot)) %))
-          {:keys [alternatives]}
-          (gemm/emit-matrix-alternatives
-           {:id :long-device-matrix :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
-            :variant :nn :tile (hardware/derive-gemm-tile {})
-            :fill-workgroups 32 :split-factors [2] :external-interface interface})]
+                                               slot)) %))]
       ;; This exercises the graph constructor and common binder; it deliberately does not
       ;; bypass the still-closed Long admission gate in the public typed contraction route.
-      (doseq [strategy [:xmx-direct :xmx-split-k-2]
+      (doseq [variant [:nn :nt :tn :tt]
+              :let [{:keys [alternatives]}
+                    (gemm/emit-matrix-alternatives
+                     {:id [:long-device-matrix variant] :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
+                      :variant variant :tile (hardware/derive-gemm-tile {})
+                      :fill-workgroups 32 :split-factors [2] :external-interface interface})]
+              strategy [:xmx-direct :xmx-split-k-2]
               :let [graph (some #(when (= strategy (executable/strategy %)) %) alternatives)
-                    {:keys [actual expected]} (run-contraction device-id graph 8 32 64 :long)]]
+                    {:keys [actual expected]} (run-contraction device-id graph 8 32 64 :long variant)]]
         (is (some? graph))
         (is (< (relative-l1 actual expected) 1.0e-3))))))
 
