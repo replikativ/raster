@@ -6,6 +6,7 @@
   never silently discarded. Shared-memory staging and WGMMA are later schedules over the same
   typed contraction and KernelBody vocabulary."
   (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]))
 
 (defn- decline!
@@ -49,8 +50,9 @@
                        mi ni ki subgroup block-m block-n sg-m sg-n
                        block-k lhs-ids rhs-ids stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets]}]
-  (let [[M N K] dimensions]
+                       buffer-offsets index-dtype]}]
+  (let [[M N K] dimensions
+        index-type (c-dialect/type-name (c-dialect/resolve! :cuda) index-dtype)]
     (decline! (= {:family :mma :m 16 :n 16 :k 16 :subgroup 32} instruction)
               :cuda-mma-instruction-unsupported {:instruction instruction})
     (decline! (= :float result-dtype)
@@ -107,12 +109,12 @@
        (apply str (for [m ms n ns] (str "  wmma::fill_fragment(acc" m "_" n ", 0.0f);\n")))
        "  " (frag "matrix_a" "row_major") " " (str/join ", " (for [m ms] (str "a" m))) ";\n"
        "  " (frag "matrix_b" "row_major") " " (str/join ", " (for [n ns] (str "b" n))) ";\n"
-       "  for (int k = 0; k < K; k += " block-k ") {\n"
+       "  for (" index-type " k = 0; k < K; k += " block-k ") {\n"
        (apply str
               (for [ks (range ksteps)]
                 (let [koff (* ks ki)]
                   (str
-                   "    { int pk = k + " (+ koff (* prefetch ki)) ";\n"
+                   "    { " index-type " pk = k + " (+ koff (* prefetch ki)) ";\n"
                    "      if (pk < K && ((int)threadIdx.x % " subgroup ") == 0) {\n"
                    (apply str
                           (for [m ms]

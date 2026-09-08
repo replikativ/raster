@@ -147,6 +147,11 @@
         m-base 'm-base
         n-base (fn [nn] (symbol (str "n-base-" nn)))
         add (fn [& xs] (apply body/expression :add xs))
+        wide (fn widen [expression]
+               (if (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+                 (update expression :arguments #(mapv widen %))
+                 (body/index-cast expression :long :exact)))
+        k-add (fn [& xs] (apply body/expression :add (map wide xs)))
         mul (fn [& xs] (apply body/expression :mul xs))
         floor-div (fn [x y] (body/expression :floor-div x y))
         rem (fn [x y] (body/expression :mod x y))
@@ -172,11 +177,11 @@
                         (cond-> [(body/predicate :lt m-base m-parameter)
                                  (body/predicate :lt (n-base 0) n-parameter)]
                           (not= [0 k-parameter] [k-lower k-upper])
-                          (conj (body/predicate :lt k-lower k-upper))))
-           (body/->Mask :k-active [(body/predicate :lt 'k-fragment k-upper)])
+                          (conj (body/predicate :lt (wide k-lower) (wide k-upper)))))
+           (body/->Mask :k-active [(body/predicate :lt 'k-fragment (wide k-upper))])
            (body/->Mask :prefetch-active
                         [(body/predicate :lt
-                                         (add 'k-fragment (* num-stages matrix-k)) k-upper)])]
+                                         (k-add 'k-fragment (* num-stages matrix-k)) (wide k-upper))])]
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->Mask
              (fragment-id "store" mm nn)
@@ -202,7 +207,7 @@
           (for [mm (range m-fragments)]
             (body/->TilePrefetch
              row-buffer [(add m-base (* mm matrix-m))
-                         (add k-fragment (* num-stages matrix-k))]
+                         (k-add k-fragment (* num-stages matrix-k))]
              [matrix-m matrix-k] row-layout :prefetch-active num-stages))
           (for [nn (range n-fragments)]
             (body/->TileLoad (fragment-id "rhs" nn) col-buffer
@@ -216,11 +221,12 @@
                               (fragment-id "rhs" nn)
                               matrix))))
         init-ops (mapv #(body/->FragmentInit % 0.0) accumulator-ids)
-        fragment-loop (body/->Loop k-fragment 'k-block
-                                   (body/expression :min (add 'k-block block-k) k-upper)
-                                   matrix-k one-k-step
+        fragment-loop (body/->ForLoop (body/value k-fragment :long) 'k-block
+                                   (body/expression :min (k-add 'k-block block-k) (wide k-upper))
+                                   matrix-k [] (conj one-k-step (body/->Yield [])) []
                                    {:unroll true :matrix-step matrix-k})
-        k-loop (body/->Loop 'k-block k-lower k-upper block-k [fragment-loop]
+        k-loop (body/->ForLoop (body/value 'k-block :long) (wide k-lower) (wide k-upper) block-k []
+                              [fragment-loop (body/->Yield [])] []
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})

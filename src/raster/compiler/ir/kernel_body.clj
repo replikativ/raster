@@ -62,7 +62,6 @@
 (defrecord TileLoad [fragment buffer coordinates mask cache])
 (defrecord TilePrefetch [buffer coordinates shape layout mask distance])
 (defrecord MatrixMad [accumulator lhs rhs instruction])
-(defrecord Loop [index lower upper step operations attributes])
 (defrecord Guard [mask operations])
 (defrecord TileStore [buffer fragment coordinates mask value-region])
 
@@ -389,7 +388,6 @@
                "raster.compiler.ir.kernel_body.TileLoad"
                "raster.compiler.ir.kernel_body.TilePrefetch"
                "raster.compiler.ir.kernel_body.MatrixMad"
-               "raster.compiler.ir.kernel_body.Loop"
                "raster.compiler.ir.kernel_body.Guard"
                "raster.compiler.ir.kernel_body.TileStore"
                "raster.compiler.ir.kernel_body.IndexCompute"
@@ -639,29 +637,6 @@
           (throw (ex-info "matrix MAD fragment dtypes do not agree with their layouts"
                           {:reason :kernel-body-matrix-fragment-dtype
                            :accumulator acc :lhs lhs :rhs rhs :instruction matrix}))))
-
-      (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
-      (do
-        (when-not (symbol? (:index operation))
-          (throw (ex-info "kernel loop requires a symbolic induction value"
-                          {:index (:index operation)})))
-        (when-not (and (expression? (:lower operation)) (expression? (:upper operation))
-                       (integer? (:step operation)) (pos? (:step operation)))
-          (throw (ex-info "kernel loop requires explicit bounds and a positive static step"
-                          {:loop operation})))
-        (when-not (map? (:attributes operation))
-          (throw (ex-info "kernel loop attributes must be a map" {:loop operation})))
-        (let [outside (remove scope
-                              (into (expression-references (:lower operation))
-                                    (expression-references (:upper operation))))]
-          (when (seq outside)
-            (throw (ex-info "kernel loop bounds reference values outside their scope"
-                            {:loop operation :references (vec outside) :scope scope}))))
-        (when (contains? scope (:index operation))
-          (throw (ex-info "kernel loop induction value shadows an existing value"
-                          {:index (:index operation) :scope scope})))
-        (validate-operations! (:operations operation) storage fragments masks
-                              (conj scope (:index operation)) epilogue-abi))
 
       (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
       (do
@@ -1797,16 +1772,6 @@
        (update context :control-uniformity set/intersection guard-uniformity))
       values)
 
-    (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
-    (let [loop-uniformity (reduce set/intersection control-uniformity
-                                  [(expression-uniformity (:lower operation) values)
-                                   (expression-uniformity (:upper operation) values)])]
-      (validate-dataflow-operations!
-       (:operations operation)
-       (assoc values (:index operation) {:type :int :uniformity loop-uniformity})
-       (assoc context :control-uniformity loop-uniformity))
-      values)
-
     (record-kind? "raster.compiler.ir.kernel_body.Yield" operation)
     (throw (ex-info "Yield is only legal as a structured region terminator"
                     {:reason :kernel-body-misplaced-yield :operation operation}))
@@ -1835,7 +1800,6 @@
 
     (or (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
         (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
-        (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
         (record-kind? "raster.compiler.ir.kernel_body.Guard" operation))
     [(:operations operation)]
 

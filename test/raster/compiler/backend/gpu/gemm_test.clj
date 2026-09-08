@@ -1,5 +1,6 @@
 (ns raster.compiler.backend.gpu.gemm-test
   (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
@@ -116,7 +117,7 @@
         scheduled-contract (artifact/attribute contract :scheduled-kernel-body)
         stage (:source scheduled-contract)
         combine-body (artifact/attribute combine :kernel-body)
-        outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.Loop %)
+        outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
                                   (get-in kernel-body [:operations 0 :operations])))]
     (is (= :xmx-split-k (executable/strategy graph)))
     (is (= #{'a 'b 'c} (set (keys buffers))))
@@ -170,8 +171,10 @@
     (is (= [:m :n :k] (mapv :id dimensions))
         "the body retains graph ABI identities instead of a parallel M/N/K convention")
     (is (= :float (:dtype result)))
-    (is (= (:source contract) oracle)
-        "direct KernelBody lowering preserves the proven f32 GEMM source exactly")))
+    (is (= (:source contract) (-> oracle
+                                  (str/replace "int k =" "long k =")
+                                  (str/replace "int pk =" "long pk =")))
+        "direct lowering preserves the oracle except for explicitly widened K arithmetic")))
 
 (deftest production-xmx-epilogue-is-part-of-the-certified-stage
   (let [tile (hardware/derive-gemm-tile {})
@@ -280,7 +283,12 @@
         (is (body/kernel-body? (:kernel-body split)))
         (is (= 1 (count (get-in split [:kernel-body :views]))))
         (is (re-find #"int KC, int splits" (:source split)))
-        (is (re-find #"int k_begin" (:source split)))
+        (is (re-find #"long k_begin" (:source split)))
+        (is (str/includes? (:source split)
+                           "long k_begin = ((long)(k_slice) * (long)(KC));"))
+        (is (str/includes? (:source split)
+                           "long k_end = min((((long)(k_slice) * (long)(KC)) + (long)(KC)), (long)(K));")
+            "emission uses widened typed bounds, not late casts of semantic metadata")
         (is (= 3 (count (get-in batched [:kernel-body :views]))))
         (is (re-find #"int batch" (:source batched)))
         (is (every? #(re-find (re-pattern (str % " \\+= ")) (:source batched))

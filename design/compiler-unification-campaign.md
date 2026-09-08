@@ -405,6 +405,16 @@ long cast and mixed-width transpose. The mixed-DPAS Long admission gate remains 
 matrix, split-K and batched stages also retain widths consistently; this prerequisite alone does
 not restore optimized Long-dimension GEMM.
 
+The next prerequisite retires the last legacy KernelBody `Loop` record: matrix K traversal now
+uses the same typed `ForLoop`/`Yield` vocabulary as scalar/control kernels. Matrix induction and
+prefetch lookahead use long arithmetic with exact widening of leaves before computation, including
+split-K bounds. The matrix-plan boundary rejects narrow induction and late casts of arithmetic;
+it does not erase casts as an unchecked algebraic equivalence. Intel and CUDA emission retain
+the induction width. Focused Arc execution covers direct, split-K, shared-weight batched GEMM and
+fused epilogues. Public matrix dimensions and Intel block-I/O coordinates still have int contracts;
+pitch, output-product and hardware-coordinate bounds must be addressed before admitting retained
+Long dimensions. This change is correctness/unification evidence, not a performance claim.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

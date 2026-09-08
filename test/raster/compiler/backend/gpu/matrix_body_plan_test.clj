@@ -1,9 +1,11 @@
 (ns raster.compiler.backend.gpu.matrix-body-plan-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (defn- matrix-body
@@ -26,6 +28,30 @@
     (is (= [16 16 16 32]
            ((juxt :mi :ni :ki :subgroup) plan)))))
 
+(deftest matrix-k-arithmetic-requires-widening-before-computation
+  (let [kernel (matrix-body :dpas)
+        narrow (walk/postwalk
+                (fn [node]
+                  (cond
+                    (instance? raster.compiler.ir.kernel_body.IndexCast node) (:argument node)
+                    (instance? raster.compiler.ir.kernel_body.ForLoop node)
+                    (assoc-in node [:index :type] :int)
+                    :else node)) kernel)
+        late (update-in kernel [:operations 0 :operations]
+                        (fn [operations]
+                          (mapv (fn [op]
+                                  (if (instance? raster.compiler.ir.kernel_body.ForLoop op)
+                                    (assoc op :lower
+                                           (body/index-cast (body/expression :add 0 0) :long :exact))
+                                    op)) operations)))]
+    (is (= :long (:index-dtype (matrix-plan/analyze kernel))))
+    (is (body/kernel-body? (body/validate! narrow)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires long induction"
+                          (matrix-plan/analyze narrow)))
+    (is (body/kernel-body? (body/validate! late)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"widen leaves before arithmetic"
+                          (matrix-plan/analyze late)))))
+
 (deftest matrix-plan-rejects-structure-hidden-by-set-comparisons
   (let [kernel (matrix-body :dpas)]
     (testing "duplicate matrix operations cannot replace a missing pair"
@@ -35,13 +61,14 @@
              (fn [operations]
                (mapv
                 (fn [operation]
-                  (if (instance? raster.compiler.ir.kernel_body.Loop operation)
+                  (if (instance? raster.compiler.ir.kernel_body.ForLoop operation)
                     (update-in
                      operation [:operations 0 :operations]
                      (fn [inner]
-                       (conj inner (first (filter #(instance?
-                                                   raster.compiler.ir.kernel_body.MatrixMad %)
-                                                 inner)))))
+                       (let [mad (first (filter #(instance?
+                                                 raster.compiler.ir.kernel_body.MatrixMad %)
+                                               inner))]
+                         (conj (pop inner) mad (peek inner)))))
                     operation))
                 operations)))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"fragment product"

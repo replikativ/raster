@@ -209,9 +209,10 @@
   [kernel-name {:keys [mi ni ki subgroup block-m block-n block-k sg-m sg-n
                        ncols lhs-ids rhs-ids mad-by-operands stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets]}
+                       buffer-offsets index-dtype k-bounds]}
    {:keys [epilogue epilogue-params parameter-names]}]
-  (let [nms (count lhs-ids)
+  (let [index-type (dtype/ctype :opencl index-dtype)
+        nms (count lhs-ids)
         nns (count rhs-ids)
         ksteps (quot block-k ki)
         acc-id (fn [m n] (:accumulator (get mad-by-operands
@@ -246,13 +247,13 @@
                           (str "    " pointer " += "
                                (emit-wide-expression offset index-names) ";\n"))))
         k-range-lines (when sliced-k?
-                        (str "    int k_begin = "
-                             (emit-index-expression k-lower index-names) ";\n"
-                             "    int k_end = "
-                             (emit-index-expression k-upper index-names) ";\n"
+                        (str "    " index-type " k_begin = "
+                             (emit-index-expression (first k-bounds) index-names) ";\n"
+                             "    " index-type " k_end = "
+                             (emit-index-expression (second k-bounds) index-names) ";\n"
                              "    if (k_begin >= k_end) return;\n"))
         kstep (fn [kpos]
-                (str "        { int pk = " kpos " + " (* prefetch ki) ";\n"
+                (str "        { " index-type " pk = " kpos " + " (* prefetch ki) ";\n"
                      "          if (pk < " k-end ") {\n"
                      (apply str
                             (for [m ms]
@@ -317,7 +318,7 @@
                           (for [m ms]
                             (str "        intel_sub_group_2d_block_prefetch_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" position ", " (amul m) "));\n")))
                    "    }\n")))
-     "    int k = " k-begin ";\n"
+     "    " index-type " k = " k-begin ";\n"
      "    for (; k + " (dec block-k) " < " k-end "; k += " block-k ") {\n"
      (apply str
             (for [ks (range ksteps)]
