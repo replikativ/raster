@@ -318,6 +318,10 @@ choices, differential correctness, and measured kernel/allocation/compile-cost c
 
 ## 4. Measure generated production kernels and selection — GEMM evidence active; broader ladder queued
 
+The [generated-kernel comparison protocol](../bench/comparison/generated-kernel-protocol.md)
+defines baseline selection, per-shape records and measurement boundaries. Baseline adapters
+and external accelerator measurements remain follow-up implementation work.
+
 Begin with existing production canaries, not independent handwritten builders:
 
 - `test/raster/perf/production_canary.clj`: public AOT sumsq and resident generated GEMM;
