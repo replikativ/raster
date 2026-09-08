@@ -7,6 +7,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as stages]
@@ -30,6 +31,28 @@
                     (= (count %) (count (set %))))
                [(:array-parameters x) (:capture-parameters x)])))
 
+(defn result-expression
+  "Resolve a result transform's declared operand maps without changing its scalar binders."
+  [source]
+  (let [epilogue (:epilogue source)]
+    (descriptor/rewrite-aget-indices
+     (:expr epilogue)
+     (into {} (map (fn [{:keys [sym map]}] [sym (am/index-expr map)])) (:operands epilogue)))))
+
+(defn validate-result-scalar-types!
+  "Check explicit result-transform capture declarations against authoritative scalar types."
+  [source scalar-types]
+  (let [declarations (get-in source [:epilogue :scalars])
+        ids (mapv :sym declarations)]
+    (when-not (and (every? symbol? ids) (= (count ids) (count (set ids))))
+      (fail! :result-transform-scalars {:declarations declarations}))
+    (doseq [{:keys [sym dtype]} declarations]
+      (when-not (and (dtype/known? dtype)
+                     (= (dtype/canon dtype) (some-> (get scalar-types sym) dtype/canon)))
+        (fail! :result-transform-scalar-type
+               {:scalar sym :declared dtype :actual (get scalar-types sym)}))))
+  source)
+
 (defn validate!
   "Validate lexical closure and the currently admitted static staged semantics.
    Numerical/layout extensions must retain their own contracts before admission."
@@ -48,7 +71,6 @@
     (when-not (:ok legality) (fail! :stage-legality legality))
     (when-not (and (contains? '#{+ clojure.core/+ raster.numeric/+} (:combine contraction))
                    (constant/zero-value? (:init contraction))
-                   (nil? (:epilogue contraction))
                    (empty? (get-in contraction [:opts :decode]))
                    (not-any? :decode (:operands contraction)))
       (fail! :numerical-contract {:contraction contraction}))
@@ -61,6 +83,18 @@
                    (not (contains? (set indices) (:out contraction)))
                    (not (contains? (:reads dependencies) (:out contraction))))
       (fail! :lexical-boundary {:dependencies dependencies :attributes attributes}))
+    (when-let [epilogue (:epilogue contraction)]
+      (let [acc (:acc epilogue)
+            external (set (concat array-parameters capture-parameters))
+            visible (into (conj external acc) (map first (:free-axes contraction)))
+            unbound (util/free-syms (result-expression contraction) visible)]
+        (when-not (and (symbol? acc) (some? (:expr epilogue))
+                       (not (contains? external acc))
+                       (not (contains? (set indices) acc))
+                       (not= (:out contraction) acc)
+                       (or (nil? (:dtype epilogue)) (dtype/known? (:dtype epilogue)))
+                       (empty? unbound))
+          (fail! :result-transform-scope {:epilogue epilogue :unbound unbound :visible visible}))))
     (doseq [[index stage] (map-indexed vector stage-list)
             :when (:lift stage)]
       (let [visible (into (set (concat array-parameters capture-parameters ['inner]))
@@ -97,7 +131,9 @@
                                    (let [visible (into {} (concat (:free-axes source)
                                                                  (take (inc index) (:contract-axes source))))]
                                      (map #(vector % visible) (:operands stage))))
-                                 (range) (:stages source)))]
+                                 (range) (:stages source))
+                         (map #(vector % (into {} (:free-axes source)))
+                              (get-in source [:epilogue :operands])))]
     (mapv (fn [[{:keys [sym dtype] amap :map :as operand} visible-domain]]
             (let [pairs (vec (mapcat identity (:groups amap)))
                   ids (mapv first pairs)]
@@ -117,6 +153,9 @@
   (let [bound (bindings attributes arrays captures)
         source (:contraction attributes)
         output-type (dtype/canon (or (:out-dtype source) (:dtype (first (:stages source)))))]
+    (validate-result-scalar-types!
+     source (into {} (map (fn [id] [id (:dtype (get values (bound id)))]))
+                  (:capture-parameters attributes)))
     (doseq [{:keys [parameter dtype elements] :as requirement} (storage-requirements attributes)
             :let [value (get values (get bound parameter))
                   shape (:shape value)]]

@@ -16,6 +16,17 @@
               :operands [{:sym weights :dtype :float :map {:groups [[[j 3] [blk 2] [sub 3]]]}}]}
              {:axis t :extent 4 :dtype :float :init 0.0}]))
 
+(deftm floating-result-transform!
+  [a :- (Array float) b :- (Array float) bias :- (Array float)
+   out :- (Array float) gain :- Float] :- Void
+  (raster.par/contract out [[i 2]] [[blk 2] [t 4]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 8) (* blk 4) t))
+                      (raster.arrays/aget b (+ (* blk 4) t)))
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift inner}
+             {:axis t :extent 4 :dtype :float :init 0.0}]
+    :epilogue {:acc value :expr (+ value (aget bias _) gain) :dtype :float
+               :operands [{:sym bias :dtype :float :map {:groups [[[i 2]]]}}]}))
+
 (deftm checked-long-stage!
   [a :- (Array float) b :- (Array float) out :- (Array float) gain :- Long] :- Void
   (raster.par/contract out [[i 1]] [[blk 2] [t 4]]

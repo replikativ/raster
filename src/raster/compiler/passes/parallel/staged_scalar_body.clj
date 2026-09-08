@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.contract-stages :as stages]
+            [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
@@ -66,6 +67,22 @@
                                         [(body/->Yield [(:result sum)])]))
                            [(body/value result dt)] {})]}))
         computation (build-stage 0)
+        result-transform
+        (when-let [epilogue (:epilogue source)]
+          (let [legality (body/scalar-region-legal? epilogue)
+                _ (when-not (:ok legality)
+                    (decline! :result-transform "staged result transform is not a scalar store region"
+                              legality))
+                dt (dtype/canon (or (:dtype epilogue) out-type))
+                expression (walk/postwalk-replace
+                            {(:acc epilogue) (:result computation)}
+                            (closure/result-expression source))
+                expression (if (and (seq? expression)
+                                    (not (or (:tag (meta expression)) (:raster.type/tag (meta expression)))))
+                             (vary-meta expression assoc :raster.type/tag (dtype/scalar-tag-for-dtype dt))
+                             expression)
+                lowered ((:lower builder) expression dt {(:result computation) (:dtype computation)})]
+            ((:cast builder) lowered out-type expression)))
         arrays (:array-parameters attributes)
         captures (:capture-parameters attributes)
         parameter (fn [id kind dt elements]
@@ -90,8 +107,9 @@
                                       (reduce *' 1 (map second (drop (inc i) (:free-axes source))))) extent)))
                                  (:free-axes source))))
                  :masks [(body/->Mask mask [(body/predicate :lt segment n)])]
-                 :operations (conj (:operations computation)
-                                   (body/->ScalarStore (:out source) [segment] (:result computation) mask))
+                 :operations (conj (into (:operations computation) (:operations result-transform))
+                                   (body/->ScalarStore (:out source) [segment]
+                                                        (or (:result result-transform) (:result computation)) mask))
                  :launch (launch/spec {:workgroup-size [workgroup-size]
                                        :group-count [(quot (+ n (dec workgroup-size)) workgroup-size)]})
                  :schedule {:strategy :staged-scalar :workgroup-size workgroup-size}}]

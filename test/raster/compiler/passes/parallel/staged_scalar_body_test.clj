@@ -104,7 +104,7 @@
   (doseq [[source rule]
           [[(assoc (three-stage-facts) :free-axes '[[i n] [j 3]]) :static-domain]
            [(assoc (three-stage-facts) :free-axes '[[i 0] [j 3]]) :static-domain]
-           [(assoc (three-stage-facts) :epilogue {:acc 'value :expr 'value}) :numerical-contract]
+           [(assoc (three-stage-facts) :combine 'max) :numerical-contract]
            [(update (three-stage-facts) :body
                     #(list 'clojure.core/identity %)) :scalar-expression]]]
     (let [failure (try (staged/analyze! source :scalar-types {'scale :float}) nil
