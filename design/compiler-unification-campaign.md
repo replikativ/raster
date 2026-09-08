@@ -415,6 +415,14 @@ fused epilogues. Public matrix dimensions and Intel block-I/O coordinates still 
 pitch, output-product and hardware-coordinate bounds must be addressed before admitting retained
 Long dimensions. This change is correctness/unification evidence, not a performance claim.
 
+Contiguous leading-slice BufferViews now carry exact long leaf products in KernelBody itself.
+The shared validator checks scalar types and preserves parent-shape/launch correspondence;
+late casts, narrow factors and non-integral extents are rejected. Scalar and matrix emission
+consume that expression without a separate matrix-only widening helper. Offset correspondence
+is not a standalone overflow proof: binding must check parent-capacity products, including every
+intermediate multiplication (a trailing zero must not conceal an overflowing prefix). Focused
+tests cover these non-allocating limits plus the existing real-device split/batched matrix routes.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

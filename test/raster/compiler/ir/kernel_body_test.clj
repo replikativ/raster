@@ -141,12 +141,19 @@
                              (layout/row-major [16 16 16] :half))
                    (assoc-in [:launch :group-count] [16]))
         view (body/->BufferView 'A-slab 'A
-                                (body/expression :mul 'group-x 16 16)
+                                (body/leading-slice-offset 'group-x [16 16])
                                 [16 16] (layout/row-major [16 16] :half))
         viewed (-> kernel
                    (assoc :views [view])
                    (assoc-in [:operations 0 :operations 1 :operations 0 :buffer] 'A-slab))]
     (is (= viewed (body/validate! viewed)))
+    (testing "address factors are exact long leaves, not late or narrowing casts"
+      (doseq [offset [(body/expression :mul 'group-x 16 16)
+                      (body/index-cast (body/expression :mul 'group-x 16 16) :long :exact)
+                      (assoc-in (:element-offset view) [:arguments 0 :overflow] :wrap)
+                      (assoc-in (:element-offset view) [:arguments 0 :dtype] :int)]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"widen leaves"
+                              (body/validate! (assoc-in viewed [:views 0 :element-offset] offset))))))
     (testing "a view may only reference declared storage"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared storage"
                             (body/validate! (assoc viewed :views [(assoc view :buffer 'missing)])))))
@@ -159,6 +166,30 @@
     (testing "the parent extent is tied to the hardware axis launch bound"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"launch-bounded"
                             (body/validate! (assoc-in viewed [:launch :group-count 0] 15)))))))
+
+(deftest view-offsets-use-declared-scalar-types
+  (let [make-view (fn [extent-type]
+                    (body/make
+                     {:id :typed-view
+                      :parameters [(body/->KernelParameter 'A :input :float [2 'width] :global
+                                                            (layout/row-major [2 'width] :float) :input)
+                                   (body/->KernelParameter 'width :scalar extent-type [] nil nil :dimension)]
+                      :indices [(body/->IndexBinding 'row :group 0)]
+                      :views [(body/->BufferView 'slice 'A
+                                                (body/leading-slice-offset 'row ['width])
+                                                ['width] (layout/row-major ['width] :float))]
+                      :launch (launch/spec {:workgroup-size [1] :group-count [2]})}))]
+    (doseq [extent-type [:int :long]]
+      (is (body/kernel-body? (make-view extent-type))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only exact widening"
+                          (make-view :float)))))
+
+(deftest view-capacity-products-are-checked-before-any-allocation
+  (let [resolve-capacity #(launch/resolve-expression {} (apply launch/product %))]
+    (is (= 8589934592 (resolve-capacity [2 65536 65536])))
+    (is (thrown? ArithmeticException
+                 (resolve-capacity [Integer/MAX_VALUE Integer/MAX_VALUE 3 0]))
+        "a trailing zero cannot conceal an overflowing address prefix")))
 
 (deftest scalar-regions-are-checked-against-the-ordered-kernel-abi
   (let [region (body/->ScalarRegion
