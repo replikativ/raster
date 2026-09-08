@@ -39,7 +39,7 @@
                     (layout/row-major [2] :half) :result)
                    (body/->KernelParameter 'scale :scalar :float [] nil nil :scale)]
       :views [(body/->BufferView
-               'x-row 'x (body/expression :mul group 16) [16]
+               'x-row 'x (body/leading-slice-offset group [16]) [16]
                (layout/row-major [16] :half))]
       :stable-reads [(body/stable-read 'x) (body/stable-read 'bias)]
       :indices [(body/->IndexBinding group :group 0)
@@ -209,7 +209,7 @@
                                    'y "output_rows" 'scale "scale"}})]
     (is (str/includes? source "__global const half* restrict input_rows"))
     (is (str/includes? source
-                       "input_rows[((long)((rstr_query_row * 16)) + ((long)(rstr_lane)"))
+                       "input_rows[((long)(((long)(rstr_query_row) * (long)(16))) + ((long)(rstr_lane)"))
     (is (str/includes? source "((rstr_lane < 16)) ? input_rows"))
     (is (str/includes? source "float rstr_loop_result = rstr_clean;"))
     (is (str/includes? source "sub_group_reduce_add(rstr_loop_result)"))

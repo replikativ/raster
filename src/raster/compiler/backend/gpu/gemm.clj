@@ -395,7 +395,7 @@
      :additional-indices [(kbody/->IndexBinding z :group 2)]
      :buffer-shapes {c [splits m n]}
      :buffer-views [{:id c-view :buffer c
-                     :element-offset (kbody/expression :mul z m n)
+                     :element-offset (kbody/leading-slice-offset z [m n])
                      :shape [m n]}]
      :operation-buffers {c c-view}
      :k-range [k-lower k-upper]
@@ -423,13 +423,13 @@
         b-shape (if col-batched? [batch k n] [k n])
         buffer-views
         (cond-> [{:id c-view :buffer c
-                  :element-offset (kbody/expression :mul z m n) :shape [m n]}]
+                  :element-offset (kbody/leading-slice-offset z [m n]) :shape [m n]}]
           row-batched?
           (conj {:id a-view :buffer a
-                 :element-offset (kbody/expression :mul z m k) :shape [m k]})
+                 :element-offset (kbody/leading-slice-offset z [m k]) :shape [m k]})
           col-batched?
           (conj {:id b-view :buffer b
-                 :element-offset (kbody/expression :mul z k n) :shape [k n]}))
+                 :element-offset (kbody/leading-slice-offset z [k n]) :shape [k n]}))
         operation-buffers
         (cond-> {c c-view}
           row-batched? (assoc a a-view)

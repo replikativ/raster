@@ -107,6 +107,13 @@
   [argument target-dtype overflow]
   (->IndexCast argument target-dtype overflow))
 
+(defn leading-slice-offset
+  "Construct a contiguous leading-slice address, widening every factor before multiplication.
+  The owning BufferView still requires a matching parent shape and launch bound."
+  [group-index shape]
+  (apply expression :mul
+         (map #(index-cast % :long :exact) (into [group-index] shape))))
+
 (defn predicate
   "Construct an explicit target-neutral bounds predicate."
   [op & arguments]
@@ -251,6 +258,10 @@
     (= 1 divisor) true
     (integer? value) (zero? (mod value divisor))
     (value-id? value) false
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" value)
+    (and (= :exact (:overflow value))
+         (or (integer? (:argument value)) (value-id? (:argument value)))
+         (expression-divisible? (:argument value) divisor))
     (not (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)) false
     (contains? #{:add :sub} (:op value))
     (every? #(expression-divisible? % divisor) (:arguments value))
@@ -2205,6 +2216,16 @@
                                                   "raster.compiler.ir.kernel_body.IndexExpr" offset)
                                                  (= :mul (:op offset)))
                                         (:arguments offset))
+                     _ (when-not (and (seq offset-arguments)
+                                      (every? #(and (record-kind?
+                                                    "raster.compiler.ir.kernel_body.IndexCast" %)
+                                                   (= :long (:dtype %)) (= :exact (:overflow %))
+                                                   (or (integer? (:argument %))
+                                                       (value-id? (:argument %))))
+                                              offset-arguments))
+                         (throw (ex-info "kernel buffer view must widen leaves before address arithmetic"
+                                         {:reason :kernel-body-view-index-width :view view})))
+                     offset-arguments (mapv :argument offset-arguments)
                      slice-index (first offset-arguments)
                      group-axis (get group-axes slice-index)]
                  (when-not (and (= 1 prefix-rank)
@@ -2341,6 +2362,8 @@
                      :control-uniformity all-uniform
                      :launch launch
                      :schedule schedule}]
+        (doseq [view views]
+          (expression-info! (:element-offset view) initial-values))
         (doseq [region (scalar-ssa-store-regions operations)]
           (validate-scalar-ssa-dataflow! region initial-values context))
         (validate-dataflow-operations! operations initial-values context))))

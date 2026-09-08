@@ -74,13 +74,6 @@
                           {:reason :kernel-body-opencl-unimplemented
                            :expression expression}))))
 
-(defn- emit-wide-expression
-  [expression env]
-  (if (and (record-kind? "IndexExpr" expression) (= :mul (:op expression)))
-    (str/join " * " (map #(str "(long)" (emit-index-expression % env))
-                         (:arguments expression)))
-    (str "(long)" (emit-index-expression expression env))))
-
 (defn- nested-operations [operations]
   (mapcat (fn [operation]
             (cons operation
@@ -245,7 +238,7 @@
                       (when-let [offset (get buffer-offsets role)]
                         (when-not (and (number? offset) (zero? offset))
                           (str "    " pointer " += "
-                               (emit-wide-expression offset index-names) ";\n"))))
+                               (emit-index-expression offset index-names) ";\n"))))
         k-range-lines (when sliced-k?
                         (str "    " index-type " k_begin = "
                              (emit-index-expression (first k-bounds) index-names) ";\n"
