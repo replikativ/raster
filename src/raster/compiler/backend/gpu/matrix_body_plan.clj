@@ -445,6 +445,7 @@
                        (:id %))
                     indices)
      :k-lower k-lower :k-upper k-upper
+     :k-bounds [(:lower outer-loop) (:upper outer-loop)]
      :buffer-offsets {:lhs (some-> lhs-storage :view :element-offset)
                       :rhs (some-> rhs-storage :view :element-offset)
                       :result (some-> out-storage :view :element-offset)}}))

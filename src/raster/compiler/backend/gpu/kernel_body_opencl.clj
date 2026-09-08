@@ -209,7 +209,7 @@
   [kernel-name {:keys [mi ni ki subgroup block-m block-n block-k sg-m sg-n
                        ncols lhs-ids rhs-ids mad-by-operands stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets index-dtype]}
+                       buffer-offsets index-dtype k-bounds]}
    {:keys [epilogue epilogue-params parameter-names]}]
   (let [index-type (dtype/ctype :opencl index-dtype)
         nms (count lhs-ids)
@@ -248,9 +248,9 @@
                                (emit-wide-expression offset index-names) ";\n"))))
         k-range-lines (when sliced-k?
                         (str "    " index-type " k_begin = "
-                             (emit-wide-expression k-lower index-names) ";\n"
+                             (emit-index-expression (first k-bounds) index-names) ";\n"
                              "    " index-type " k_end = "
-                             (emit-wide-expression k-upper index-names) ";\n"
+                             (emit-index-expression (second k-bounds) index-names) ";\n"
                              "    if (k_begin >= k_end) return;\n"))
         kstep (fn [kpos]
                 (str "        { " index-type " pk = " kpos " + " (* prefetch ki) ";\n"
