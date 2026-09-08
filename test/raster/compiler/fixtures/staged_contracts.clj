@@ -1,0 +1,26 @@
+(ns raster.compiler.fixtures.staged-contracts
+  "Public staged workloads shared by numerical tests, the debt ledger and vendor compile gates."
+  (:require [raster.core :refer [deftm]]
+            [raster.arrays]
+            [raster.numeric]
+            [raster.par]))
+
+(deftm floating-three-stage!
+  [a :- (Array float) b :- (Array float) weights :- (Array float)
+   out :- (Array float) scale :- Float] :- Void
+  (raster.par/contract out [[i 2] [j 3]] [[blk 2] [sub 3] [t 4]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 24) (* blk 12) (* sub 4) t))
+                      (raster.arrays/aget b (+ (* j 24) (* blk 12) (* sub 4) t)))
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift (* inner scale)}
+             {:axis sub :extent 3 :dtype :float :init 0.0 :lift (* inner (aget weights _))
+              :operands [{:sym weights :dtype :float :map {:groups [[[j 3] [blk 2] [sub 3]]]}}]}
+             {:axis t :extent 4 :dtype :float :init 0.0}]))
+
+(deftm checked-long-stage!
+  [a :- (Array float) b :- (Array float) out :- (Array float) gain :- Long] :- Void
+  (raster.par/contract out [[i 1]] [[blk 2] [t 4]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* blk 4) t))
+                      (raster.arrays/aget b (+ (* blk 4) t)))
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0
+              :lift (* inner (double (clojure.core/+ gain 1)))}
+             {:axis t :extent 4 :dtype :float :init 0.0}]))

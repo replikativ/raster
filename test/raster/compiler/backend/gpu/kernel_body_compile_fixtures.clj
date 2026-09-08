@@ -12,6 +12,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -274,6 +275,10 @@
                 :capabilities capabilities})
     (vec
      (concat
+      (:kernels (equation-first/compile
+                 #'staged-public/floating-three-stage! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'staged-public/checked-long-stage! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

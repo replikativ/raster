@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is use-fixtures]]
             [raster.arrays]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.attention :as attention]
@@ -92,6 +93,10 @@
     (pipeline/compile-report #'staged-byte-float-contract!
                              :target-device target :dtype :float)
 
+    :staged-floating-contraction-gpu
+    (pipeline/compile-report #'staged-public/floating-three-stage!
+                             :target-device target :dtype :float)
+
     :symbolic-dense-contraction-gpu
     (let [compilation (equation-first/compile
                        #'contract/contract-mm {:target target :dtype :float})
@@ -153,6 +158,7 @@
     (is (= 1 schema-version))
     (is (= #{:dense-relu-jvm
              :staged-byte-float-contraction-gpu
+             :staged-floating-contraction-gpu
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
