@@ -1,5 +1,8 @@
 (ns raster.perf.production-canary-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
+            [raster.gpu.link :as link]
             [raster.perf.production-canary :as canary]
             [raster.runtime.microbench :as microbench]
             [raster.gpu.compiled :as compiled]
@@ -8,6 +11,33 @@
 (defn- once-only [f & _]
   (f)
   {:median-ns 100 :stationary? true})
+
+(deftm static-gemm-relu! [A :- (Array float) B :- (Array float) C :- (Array float)] :- (Array float)
+  (let [product (raster.par/contract C [[i 3] [j 4]] [[p 5]]
+                 (* (arrays/aget A (+ (* i 5) p)) (arrays/aget B (+ (* p 4) j)))
+                 :init (float 0.0))]
+    (raster.par/map! C q 12 nil (max (float 0.0) (arrays/aget product q)))))
+
+(deftest static-public-composition-fuses-through-the-generated-route
+  (let [args (canary/gemm-arguments [3 4 5])
+        prepared (compiled/lower #'static-gemm-relu! args
+                                 {:target :ocl:0 :dtype :float :constants ['A 'B]
+                                  :gemm-precision :f32-scalar :on-non-resident :throw})
+        evidence (canary/compilation-evidence prepared)]
+    (is (= 1 (:resident-step-count evidence)))
+    (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %))
+                (mapcat :alternatives (:steps evidence))))
+    (if-not @probe/opencl-available?
+      (probe/opencl-skip! "static public GEMM plus map fusion")
+      (let [live (compiled/instantiate! prepared)]
+        (try
+          (link/run! (:executable live))
+          (let [output (first (:out-tree live))
+                actual (vec (link/download (:executable live) (:node output)))
+                expected (mapv #(max (float 0.0) %)
+                               (canary/gemm-reference (first args) (second args) [3 4 5]))]
+            (is (= expected actual)))
+          (finally (compiled/close! live)))))))
 
 (deftest explicit-baseline-and-comparability
   (let [sample {:identity {:workload :example :environment-tag "fixture"}

@@ -96,3 +96,8 @@ followed by an in-place map. Exact destination-return identities are normalized 
 contracts, so this now executes through the pointwise inout path without bypassing the ABI
 checks. It still has two resident stages, versus one for the explicit epilogue: report that
 automatic-fusion gap rather than treating the two implementations as equally fused.
+
+The static public composition regression now fuses to one generated stage. This does not close
+the parameterized canary gap: normalized dynamic extent computation still separates its producer
+and consumer. Report static and dynamic workloads separately, and do not infer measured speedups
+from a reduced stage count.

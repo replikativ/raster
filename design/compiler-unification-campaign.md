@@ -371,6 +371,13 @@ bindings remain intact. Scope-aware substitution and alpha-renaming of incoming 
 prevent local shadowing from redirecting a physical buffer. The composed GEMM/ReLU canary now
 executes safely through two generated stages. Automatic epilogue fusion remains the next gap.
 
+Static same-destination contraction→map now uses the existing segmented-reduction result-transform
+rule. Its sole lane-owned read becomes the completed accumulator; the fused destination is write-only.
+Other destination operands, neighbor reads and externally live intermediates remain excluded.
+The public static 3×4×5 GEMM/ReLU case is one generated stage and device-checked on CPU OpenCL.
+Dynamic composed GEMM remains two stages: its normalized extent scalar separates the equations,
+and symbolic extent equivalence plus legal scalar placement are not yet proved by this rule.
+
 Static zero-reduction-axis public contractions now enter the existing typed SegMap path.
 For unresolved plain input capacities, a bounded proof over the actual lowered loads derives
 minimum storage independently of output size. Every integer arithmetic prefix must fit its

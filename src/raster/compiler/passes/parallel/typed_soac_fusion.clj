@@ -632,14 +632,14 @@
       (rebuild-boundary program facts equations))))
 
 (defn- single-write-boundary?
-  [facts equation-id result destination]
+  [facts equation-id result destination allowed-access]
   (let [equation-facts (get-in facts [:equations equation-id])
         storage (get-in equation-facts [:attributes :result-storage])]
     (and (= #{:memory/write} (:effects equation-facts))
          (= {result destination} (:aliases equation-facts))
          (= 1 (count storage))
          (= destination (:destination (first storage)))
-         (= :write (:access (first storage))))))
+         (= allowed-access (:access (first storage))))))
 
 (defn- result-map-transform
   "Translate one pointwise map region into a typed post-reduction scalar region.
@@ -757,11 +757,13 @@
            :when (not (contains? (set (dialect/outputs program)) consumed-destination))
            :when (= 1 (count (filter #(= consumed-destination %)
                                      (:arrays consumer))))
-           :when (single-write-boundary? facts (:id producer) produced consumed-destination)
+           :when (single-write-boundary? facts (:id producer) produced consumed-destination :write)
            :when (single-write-boundary? facts (:id consumer) consumer-result
-                                         consumer-destination)
+                                         consumer-destination
+                                         (if (= consumed-destination consumer-destination)
+                                           :read-write :write))
            :when (empty? (set/intersection
-                          #{consumed-destination consumer-destination}
+                          (set [consumed-destination consumer-destination])
                           (set (map :value (:operands transform)))))
            :when (host-barrier-free? program producer consumer)
            :when transform]
@@ -805,6 +807,11 @@
           facts (-> (transfer-result-boundary (dialect/facts program)
                                               (:id producer) (:id consumer)
                                               :segmented-reduce-result-map)
+                    ;; The consumer's sole pointwise read of the produced destination is
+                    ;; now an accumulator use, not a read of pre-existing output storage.
+                    ;; Other reads of either destination already decline the candidate.
+                    (assoc-in [:equations (:id producer) :attributes :result-storage 0 :access]
+                              :write)
                     (update-in [:values (first (:results consumer))]
                                assoc
                                :shape (dialect/segmented-reduce-result-shape
