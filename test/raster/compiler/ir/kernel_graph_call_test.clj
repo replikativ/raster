@@ -40,7 +40,7 @@
                   (update :scalars #(mapv (fn [scalar] (assoc scalar :dtype :long)) %))
                   (update :abi #(mapv (fn [slot]
                                        (if (= :scalar (:kind slot))
-                                         (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
+                                         (assoc slot :dtype :long) slot)) %))
                   (update :nodes
                           #(mapv (fn [node]
                                    (update-in node [:operation :abi]

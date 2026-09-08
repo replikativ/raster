@@ -321,7 +321,7 @@
         (is (= :scheduled-kernel-body-scalar-bindings (:reason (ex-data exception))))))
     (try
       (graph-call/make emitted {'u :resident-u 'du :resident-du}
-                       {'n {:type :int :value (inc (long Integer/MAX_VALUE))}})
+                       {'n {:type :long :value (inc (long Integer/MAX_VALUE))}})
       (is false "a proved narrowing still rejects an out-of-range runtime extent")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :kernel-scalar-range (:reason (ex-data exception))))))))

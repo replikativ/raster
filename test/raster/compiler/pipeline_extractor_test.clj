@@ -18,6 +18,15 @@
 
 (def ^:private nr-key :raster.compiler.pipeline/non-resident)
 
+(deftest structured-scalar-arguments-are-realized-with-checked-arithmetic
+  (let [compile-arg (deref #'pipeline/expr->arg-fn)
+        product (compile-arg '[rows width] '[extent (* rows width)]
+                             (klaunch/product 'extent 2))
+        rounded (compile-arg '[n] [] (klaunch/ceil-div (klaunch/product 'n 3) 16))]
+    (is (= 30 (product [3 5])))
+    (is (= 4 (rounded [17])))
+    (is (thrown? ArithmeticException (rounded [Long/MAX_VALUE])))))
+
 (defn- why [form] (get-in (pipeline/extract-gpu-program form) [nr-key :why]))
 
 (deftest effect-only-executable-results-never-alias-an-output-buffer

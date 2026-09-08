@@ -1667,9 +1667,10 @@
   [param-syms scalar-lets expr]
   (let [clean-params (mapv strip-meta param-syms)
         clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
-    (if (klaunch/index-algebra? expr)
-      ;; A scheduled body may project its extent as KernelBody index algebra. Evaluate it with
-      ;; the launch resolver over the same parameter/scalar-let environment instead of handing
+    (if (and (record? expr) (klaunch/expression? expr))
+      ;; A scheduled body may project its extent as launch/storage or KernelBody index algebra.
+      ;; Evaluate every structured expression through the checked launch resolver over the same
+      ;; parameter/scalar-let environment instead of handing
       ;; a compiler record to the runtime binder as if it were a number.
       (let [symbol-fn (memoize (fn [sym] (expr->arg-fn param-syms scalar-lets sym)))]
         (fn [args]
