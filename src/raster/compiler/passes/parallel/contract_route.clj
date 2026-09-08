@@ -17,6 +17,7 @@
    :out-elems :wg/:grid (uniform 1-3D geometry) :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.util :as util]
             [clojure.string :as str]
@@ -1260,6 +1261,11 @@
        :decline {:reason :mixed-dpas-index-width-not-lowered
                  :dimensions @wide-dimensions :required-dtype :int}}
 
+      (apply block-io/static-failure (:dimensions matrix-view))
+      {:alternatives []
+       :decline {:reason :matrix-surface-contract
+                 :condition (apply block-io/static-failure (:dimensions matrix-view))}}
+
       :else
       (let [[m n k] (:dimensions matrix-view)
             {:keys [row col]} (:bindings matrix-view)
@@ -1417,7 +1423,7 @@
     :non-aget-operand :not-a-contraction :not-2-free :body-has-unmodeled-terms
     ;; dtype / orientation / alignment
     :dtype-not-dpas :non-canonical-orientation :n-pitch-unaligned :k-pitch-unaligned
-    :non-zero-matrix-init :partial-matrix-k-fragment :matrix-family-not-lowered
+    :non-zero-matrix-init :partial-matrix-k-fragment :matrix-family-not-lowered :matrix-surface-contract
     :matrix-instruction-not-lowered
     ;; declared-operand and quant-leaf legality
     :operand-without-a-declared-map :missing-declared-contract-axes

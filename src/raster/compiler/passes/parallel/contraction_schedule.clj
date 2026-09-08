@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
@@ -28,7 +29,7 @@
 (defn- lowered-dpas-instruction?
   [{:keys [family m n k subgroup]}]
   (and (= :dpas family) (= 8 m) (= 16 k)
-       (contains? #{8 16} subgroup) (= n subgroup)))
+       (= 16 subgroup) (= n subgroup)))
 
 (defn- tile-valid?
   [{:keys [block-m block-n block-k sg-m sg-n matrix num-stages]}]
@@ -371,6 +372,9 @@
       ;; bounds final fragment.  Until a zero-filled fragment load exists, refuse it loudly.
        (not (zero? (mod (long K) (long matrix-k))))
        (decline :partial-matrix-k-fragment {:K K :matrix-k matrix-k})
+
+       (block-io/static-failure M N K)
+       (decline :matrix-surface-contract {:condition (block-io/static-failure M N K)})
 
       ;; Helper strings are target source pasted above a kernel and have no KernelBody meaning.
       ;; Refuse them so callers express the computation in the typed scalar expression instead.

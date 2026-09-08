@@ -131,6 +131,7 @@
     (is (= (-> (:source oracle)
                (str/replace "int k =" "long k =")
                (str/replace "int pk =" "long pk =")
+               (str/replace "C[row*N+col]" "C[(long)row*(long)N+(long)col]")
                normalize)
            (normalize (:source routed)))
         "the schedule matches the oracle with explicitly widened K induction and lookahead")

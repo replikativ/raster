@@ -139,6 +139,7 @@
         :source (:source emitted)
         :abi projected-abi
         :arguments (:arguments scheduled)
+        :preconditions (or (:preconditions emitted) [])
         :launch (scheduled-body/realized-launch scheduled)
         :temporaries []
         :effects (:effects scheduled)

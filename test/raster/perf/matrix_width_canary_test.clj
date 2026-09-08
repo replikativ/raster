@@ -19,6 +19,7 @@
       (is (false? (:passed? ((:validate! case) {})))))))
 
 (deftest canary-rejects-unbounded-work-before-device-access
-  (doseq [shapes [[] [[1024 1024 1024]] [[0 16 16]] [[16 17 16]]]]
+  (doseq [shapes [[] [[1024 1024 1024]] [[0 16 16]] [[16 17 16]]
+                  [[16 16 32]] [[16 32 16]]]]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bounded positive aligned"
                           (canary/run! :missing-device shapes)))))
