@@ -46,3 +46,12 @@ support. `native-dot-validation/run!` (under the bench alias) explicitly validat
 150 mixed-sign and accumulator-limit cases on a capable device, poisoning output
 before each execution; unsupported devices fail rather than silently skip this
 opt-in experiment. Generic CI remains independent of this hardware capability.
+
+The portable helper also performs unsigned wrapping accumulation, then reconstructs
+the signed result using only representable casts. The signed four-byte dot itself
+fits Int32; adding the accumulator directly in signed C does not. The validation
+runner accepts `:portable` for device execution, and `run-c!` runs the same 150
+cases under an optimizing C compiler with undefined-behavior sanitization, without
+requiring a GPU. This sanitizer check reproduces signed overflow with the former
+helper and passes with the corrected helper. Prior benchmark files identify the
+older source revision and must not be treated as measurements of this correction.

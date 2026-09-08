@@ -2,14 +2,19 @@
   "Explicit device validation; run on an OpenCL device with packed integer dot support.
    No silent capability skip and no dependency on this device in the ordinary CI suite."
   (:refer-clojure :exclude [run!])
-  (:require [raster.compiler.backend.gpu.kernel-body-opencl :as emit]
+  (:require [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as emit]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.gpu.ocl-runtime :as ocl]))
+            [raster.gpu.ocl-runtime :as ocl])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
 
 (defn reference [a b acc]
   (let [lane (fn [word shift]
@@ -27,7 +32,40 @@
              acc [0 -1 1 Integer/MIN_VALUE Integer/MAX_VALUE]]
          [a b acc])))
 
-(defn run! []
+(defn run-c!
+  "Hardware-free portable-helper oracle under C undefined-behavior sanitization.
+   Requires a C compiler with UBSan; compiler absence/failure is an error, not a skip."
+  ([] (run-c! "cc"))
+  ([compiler]
+   (let [directory (Files/createTempDirectory "raster-dot-ubsan-" (make-array FileAttribute 0))
+         binary (.resolve directory "dot-validation")
+         source (str "#include <limits.h>\n_Static_assert(INT_MAX == 2147483647, \"32 bit int required\");\nstatic "
+                     (:c-helper-src (intrinsics/descriptor 'dp4a))
+                     "\nint main(void) {\nvolatile int cases[][4] = {\n"
+                     (str/join ",\n" (for [[a b acc] (cases)]
+                                          (str "{" a "," b "," acc "," (reference a b acc) "}")))
+                     "};\nfor (unsigned i=0; i<sizeof(cases)/sizeof(cases[0]); ++i) {\n"
+                     "if (rstr_dp4a(cases[i][0],cases[i][1],cases[i][2]) != cases[i][3]) return 1;\n"
+                     "}\nreturn 0; }\n")]
+     (try
+       (let [compiled (shell/sh compiler "-x" "c" "-std=c11" "-O2"
+                                "-fsanitize=undefined" "-fno-sanitize-recover=undefined"
+                                "-o" (str binary) "-" :in source)]
+         (when-not (zero? (:exit compiled))
+           (throw (ex-info "portable dot sanitizer compilation failed" compiled))))
+       (let [result (shell/sh (str binary))]
+         (when-not (zero? (:exit result))
+           (throw (ex-info "portable dot sanitizer validation failed" result)))
+         {:implementation :portable :cases (count (cases)) :passed? true :sanitizer :undefined})
+       (finally
+         (Files/deleteIfExists binary)
+         (Files/deleteIfExists directory))))))
+
+(defn run!
+  ([] (run! :native))
+  ([implementation]
+  (when-not (contains? #{:native :portable} implementation)
+    (throw (ex-info "unknown dot validation implementation" {:implementation implementation})))
   (let [kernel-body
         (body/make
          {:id :native-dot-validation
@@ -46,7 +84,8 @@
                 "native_dot_edges" kernel-body
                 {:target-dialect :opencl-portable
                  :parameter-names {'out "rstr_output"}
-                 :target-features {:intrinsic-implementations {:dp4a :opencl-packed-dot}}})
+                 :target-features (when (= :native implementation)
+                                    {:intrinsic-implementations {:dp4a :opencl-packed-dot}})})
         compiled (artifact/make
                   {:kernel-name "native_dot_edges" :target :opencl-c :source (:source module)
                    :abi [(abi/slot 'a :scalar :int :c-name "rstr_a")
@@ -69,9 +108,10 @@
             (ocl/launch-registered-bound! bound)
             (let [actual (first (ocl/buffer->array output))]
               (when-not (= expected actual)
-                (throw (ex-info "native integer dot differs from wrapping reference"
-                                {:inputs inputs :expected expected :actual actual}))))
+                (throw (ex-info "integer dot differs from wrapping reference"
+                                {:implementation implementation
+                                 :inputs inputs :expected expected :actual actual}))))
             (finally (ocl/destroy-prepared! bound)))))
-      {:cases (count (cases)) :passed? true :device (ocl/selected-device-info)
+      {:implementation implementation :cases (count (cases)) :passed? true :device (ocl/selected-device-info)
        :compilation (:compilation module)}
-      (finally (ocl/free-buffer! output)))))
+      (finally (ocl/free-buffer! output))))))

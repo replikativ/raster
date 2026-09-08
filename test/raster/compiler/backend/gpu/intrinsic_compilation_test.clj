@@ -8,6 +8,14 @@
 
 (def selection {:dp4a :opencl-packed-dot})
 
+(deftest portable-dot-retains-wrapping-accumulation
+  (let [{:keys [source compilation]}
+        (c/intrinsic-helper-module "rstr_dp4a(a,b,c)" :opencl-portable {})]
+    (is (= {} compilation))
+    (is (re-find #"unsigned int sum = \(unsigned int\)acc" source))
+    (is (re-find #"sum <= 2147483647u \? \(int\)sum : -1 - \(int\)\(~sum\)" source))
+    (is (not (re-find #"return acc \+" source)))))
+
 (deftest helpers-carry-only-consumed-requirements
   (is (= {:source "" :compilation {}}
          (c/intrinsic-helper-module "x + y" :opencl-portable selection)))

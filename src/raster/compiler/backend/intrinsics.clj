@@ -147,7 +147,8 @@
                              "    int b1 = (int)((ub >> 8) & 255u); b1 = b1 < 128 ? b1 : b1 - 256;\n"
                              "    int b2 = (int)((ub >> 16) & 255u); b2 = b2 < 128 ? b2 : b2 - 256;\n"
                              "    int b3 = (int)((ub >> 24) & 255u); b3 = b3 < 128 ? b3 : b3 - 256;\n"
-                             "    return acc + a0*b0 + a1*b1 + a2*b2 + a3*b3;\n"
+                             "    unsigned int sum = (unsigned int)acc + (unsigned int)(a0*b0 + a1*b1 + a2*b2 + a3*b3);\n"
+                             "    return sum <= 2147483647u ? (int)sum : -1 - (int)(~sum);\n"
                              "}\n")
           :wasm :scalar-lanes}
    ;; broader elementary set — all wasm via composition/polynomial (see
