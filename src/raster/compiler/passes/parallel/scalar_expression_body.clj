@@ -83,6 +83,9 @@
            conversion-policy load-other source-region require-source-types?]
     :or {id-prefix "scalar"}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
+        normalized-form (fn [form type source]
+                          (with-meta form (assoc (meta source) :raster.type/tag
+                                                 (dtype/scalar-tag-for-dtype type))))
         counter (atom 0)
         reserved (atom (set (concat arrays (keys array-types) (keys scalar-types) index-scope)))
         reserve! (fn [form]
@@ -189,6 +192,8 @@
                     ;; retain their existing owner policy: quantized loops still carry widened
                     ;; integers around narrower intrinsic results and need separate reconciliation.
                     expected (canon-type expected)
+                    _ (when (and require-source-types? (seq? expression))
+                        (source-type expression expected env))
                     retained (when (seq? expression) (retained-type expression))
                     operation-type (if (and (dtype/fp-dtype? expected)
                                             retained (or require-source-types?
@@ -359,11 +364,13 @@
                   ;; the KernelBody vocabulary stays binary.
                   (and (seq? expression) (= 2 (count expression))
                        (contains? '#{inc clojure.core/inc} (first expression)))
-                  (lower (list 'clojure.core/+ (second expression) 1) expected env)
+                  (lower (normalized-form (list 'clojure.core/+ (second expression) 1)
+                                          expected expression) expected env)
 
                   (and (seq? expression) (= 2 (count expression))
                        (contains? '#{dec clojure.core/dec} (first expression)))
-                  (lower (list 'clojure.core/- (second expression) 1) expected env)
+                  (lower (normalized-form (list 'clojure.core/- (second expression) 1)
+                                          expected expression) expected env)
 
                   ;; Unary subtraction is the existing negation intrinsic for floating values:
                   ;; spelling it as 0-x would lose the sign of zero. Integral negation instead
@@ -371,11 +378,11 @@
                   (and (seq? expression)
                        (= :- (intrinsics/canonical (descriptor/semantic-op expression)))
                        (= 1 (count (descriptor/call-args expression))))
-                  (lower (if (dtype/fp-dtype? expected)
+                  (lower (normalized-form (if (dtype/fp-dtype? expected)
                            (list :neg (first (descriptor/call-args expression)))
                            (list (descriptor/semantic-op expression)
                                  (body/literal 0 expected)
-                                 (first (descriptor/call-args expression))))
+                                 (first (descriptor/call-args expression)))) expected expression)
                          expected env)
 
                   (seq? expression)
@@ -393,9 +400,8 @@
                       ;; the binary KernelBody vocabulary. This is normalization, not algebraic
                       ;; reassociation: `(- a b c)` becomes `(- (- a b) c)`.
                       (lower (reduce (fn [left right]
-                                       (with-meta (list (descriptor/semantic-op expression) left right)
-                                         (assoc (meta expression) :raster.type/tag
-                                                (dtype/scalar-tag-for-dtype expected))))
+                                       (normalized-form (list (descriptor/semantic-op expression) left right)
+                                                        expected expression))
                                      arguments)
                              expected env)
                       (do
@@ -410,12 +416,9 @@
                                              (dtype/canon
                                               (or (source-type (first arguments) :int env) :int))
                                              expected)
-                              lowered (mapv #(do
-                                               (when (and require-source-types? (seq? %))
-                                                 (source-type % operand-type env))
-                                               (cast-lowered
-                                                (lower % operand-type env)
-                                                operand-type expression))
+                              lowered (mapv #(cast-lowered
+                                              (lower % operand-type env)
+                                              operand-type expression)
                                             arguments)
                               result-type (if comparison? :predicate operand-type)
                               ;; Typed source arithmetic has a semantic overflow contract: normal

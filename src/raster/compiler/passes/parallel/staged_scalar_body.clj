@@ -45,6 +45,15 @@
                               {'inner (:result child)}
                               (stages/substitute-operand-indices lift (stages/stage-index-exprs stage-list)))
                              (:body source))
+                ;; The stage contract declares its root result type; nested expressions must
+                ;; retain their own checked types, never inherit a consumer's conversion.
+                expression (if (seq? expression)
+                             (vary-meta expression
+                                        #(if (or (:raster.type/tag %) (:tag %)) %
+                                           (assoc % :raster.type/tag
+                                                  (dtype/scalar-tag-for-dtype
+                                                   (if child dt (:dtype source))))))
+                             expression)
                 term ((:lower builder) expression dt (if child {(:result child) (:dtype child)} {}))
                 sum ((:compute builder) :+ dt [carry (:result term)] {})]
             {:result result :dtype dt

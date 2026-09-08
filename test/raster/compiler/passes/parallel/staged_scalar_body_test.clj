@@ -143,6 +143,13 @@
                                (assoc-in (three-stage-facts) [:stages 0 :lift] (list '* 'inner addition))
                                :scalar-types {'gain :long}) nil
                               (catch clojure.lang.ExceptionInfo e (ex-data e)))
+        branch-failure (try (staged/analyze!
+                             (assoc-in (three-stage-facts) [:stages 0 :lift]
+                                       (list '* 'inner
+                                             (with-meta (list 'if true addition 0.0)
+                                               {:raster.type/tag 'float})))
+                             :scalar-types {'gain :long}) nil
+                            (catch clojure.lang.ExceptionInfo e (ex-data e)))
         typed-addition (with-meta addition {:raster.type/tag 'long})
         scheduled (staged/lower (source typed-addition) :scalar-types {'gain :long})
         implicit-conversion (staged/lower
@@ -153,6 +160,8 @@
     (is (= :scalar-source-type (:missing-rule failure)))
     (is (= :staged-scalar-body-declined (:reason implicit-failure)))
     (is (= :scalar-source-type (:missing-rule implicit-failure)))
+    (is (= :staged-scalar-body-declined (:reason branch-failure)))
+    (is (= :scalar-source-type (:missing-rule branch-failure)))
     (is (some #(and (map? %) (= :trap (:overflow %)))
               (tree-seq coll? seq (:body scheduled))))
     (is (some #(and (map? %) (= :trap (:overflow %)))
@@ -162,6 +171,15 @@
     (is (= :kernel-body-c-trap-unsupported
            (try (target/emit-artifact "checked_stage" scheduled :opencl-portable) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest scalar-normalization-preserves-authoritative-stage-types
+  (doseq [lift (concat
+                (map #(list '* 'inner (with-meta % {:raster.type/tag 'float}))
+                     ['(clojure.core/inc scale) '(clojure.core/dec scale) '(- scale)])
+                ['(* inner scale 2.0)])]
+    (let [scheduled (staged/lower (assoc-in (three-stage-facts) [:stages 0 :lift] lift)
+                                  :scalar-types {'scale :float})]
+      (is (= :staged-scalar (get-in scheduled [:body :schedule :strategy]))))))
 
 (deftest malformed-stage-closures-remain-errors
   (let [failure (try (staged/analyze! (assoc (three-stage-facts) :out 'a)
