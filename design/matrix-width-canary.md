@@ -40,3 +40,24 @@ exceeded the 0.10 coefficient-of-variation threshold. The stationary pairs are c
 only those pairs would discard contradictory/noisy observations. These data do not establish
 performance parity, peak throughput, or SOTA competitiveness. Stabilize and repeat measurements
 before treating a change as a performance win or regression.
+
+## Contract/typed-store repeat, 2026-09-08
+
+[Raw repeat](measurements/2026-09-08-matrix-contract-arc.edn), compiler
+`b7f53d26dfe3e1fd5944acb3836a662951ee44d5`, Intel Arc Level Zero, installed
+`libze-intel-gpu1` and `intel-opencl-icd` version `26.05.37020.3-0`.
+The generated candidate now includes the surface contract and wide C addressing; both candidates
+retain the same ABI preconditions. The legacy source remains a test-only comparison.
+
+| M×N×K | Round 0 generated/reference µs | Round 1 generated/reference µs |
+| --- | ---: | ---: |
+| 128×128×128 | 15.521 / 13.542 | 13.229 / 13.438 |
+| 256×256×256 | 26.042 / 24.167 | 25.833 / 24.167 |
+| 32×256×1024 | 71.458 / 69.688 | 71.458 / 68.750 |
+
+All twelve numerical validations passed (maximum relative L1 1.24e-7), but **all twelve timing
+series failed stationarity**. Several medians favor the reference; do not dismiss that signal,
+but do not infer a compiler regression from this noisy shared-laptop run. The 128³ ordering
+reverses between rounds. Preserve all raw samples, establish a quiet repeat with stable clocks,
+then isolate the generated wide-addressing change if the gap persists. Do not relax correct
+index arithmetic to recover an unverified timing difference. No autotuning winner was published.
