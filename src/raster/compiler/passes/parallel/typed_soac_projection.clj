@@ -9,8 +9,31 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.soac-dialect :as dialect]))
+
+(defn contraction-binding
+  "Project a retained contraction closure without rebuilding its numerical payload.
+   Scheduling consumes :facts; ordered kernel arguments use the returned lexical bindings.
+   This deliberately does not project staged facts through a flat scalar reduction."
+  [program equation]
+  (let [program (dialect/validate! program)
+        {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)]
+    (when-not (and (= 'contract kind) (some #{equation} (dialect/equations program)))
+      (throw (ex-info "contraction binding requires a member contraction equation"
+                      {:reason :typed-soac-contraction-projection :equation equation})))
+    (let [source (:contraction attributes)
+          bound (assoc (contraction-closure/bindings attributes arrays captures)
+                       (:out source) (first (dialect/physical-results program equation)))
+          values (:values (dialect/facts program))]
+      {:facts source :bindings bound
+       :array-types (into {} (map (fn [parameter]
+                                   [parameter (:dtype (get values (get bound parameter)))]))
+                          (conj (:array-parameters attributes) (:out source)))
+       :scalar-types (into {} (map (fn [parameter]
+                                    [parameter (:dtype (get values (get bound parameter)))]))
+                           (:capture-parameters attributes))})))
 
 (defn scalar-folds->source
   "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
