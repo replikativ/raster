@@ -4,17 +4,13 @@
   Matrix fragments retain their Intel OpenCL leaf. The general scalar/control path is shared by
   OpenCL, CUDA and HIP through thin target dialect descriptors; geometry is recovered from explicit
   index/operation IR, never from the source algorithm or a second schedule registry."
-  (:require [clojure.set :as set]
-            [clojure.string :as str]
-            [clojure.walk :as walk]
+  (:require [clojure.string :as str]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
-            [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]))
 
 (defn- record-kind? [simple-name value]
@@ -81,85 +77,10 @@
                     (nested-operations nested))))
           operations))
 
-(def ^:private scalar-builtins
-  (into #{"float" "double" "half" "int" "long" "short" "char"
-          "uint" "ulong" "ushort" "uchar" "if"}
-        (comp (filter string?) (filter #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" %)))
-        (vals ce/op-map)))
-
-(defn- validate-emitted-scalar-calls!
-  [region emitted]
-  (let [calls (into #{} (map second) (re-seq #"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(" emitted))
-        ;; rstr_dp4a is accompanied by a helper in general kernels, but matrix store regions do not
-        ;; inject helper source. Keep the scalar-region target vocabulary self-contained.
-        unsupported (set/difference calls (disj scalar-builtins "rstr_dp4a"))]
-    (when (seq unsupported)
-      (throw (ex-info "OpenCL scalar region contains calls without a typed target lowering"
-                      {:reason :scalar-region-opencl-call-unsupported
-                       :calls (vec (sort unsupported)) :region region})))
-    emitted))
-
-(defn- scalar-tag [dtype]
-  (symbol (name dtype)))
-
-(defn- array-tag [dtype]
-  (symbol (str (name dtype) "s")))
-
-(defn- lower-scalar-region
-  [kernel-body region parameter-names]
-  (let [parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
-        operand-ids (set (map :sym (:operands region)))
-        scalar-ids (remove operand-ids (rest (:parameters region)))
-        free-syms (subvec (vec (get-in kernel-body [:attributes :axis-symbols])) 0 2)
-        [i-sym j-sym] free-syms
-        ctype (dtype/ctype :opencl (:result-dtype region))
-        array-syms (set (map (comp #(symbol (name %)) :sym) (:operands region)))
-        int-vars (into #{} (map #(symbol (name %))) free-syms)
-        indices (into {} (map (juxt :sym (comp axis-map/index-expr :map)))
-                      (:operands region))
-        expression (descriptor/rewrite-aget-indices (:expression region) indices)
-        accumulator (first (:parameters region))
-        accumulator-token (str "__acc_" (name (gensym "")))
-        typed-parameters
-        (into {}
-              (for [id (rest (:parameters region))
-                    :let [parameter (get parameters id)]]
-                [id (with-meta (symbol (get parameter-names id))
-                      {:raster.type/tag (if (= :scalar (:kind parameter))
-                                          (scalar-tag (:dtype parameter))
-                                          (array-tag (:dtype parameter)))})]))
-        replacements (assoc typed-parameters accumulator
-                            (with-meta (symbol accumulator-token)
-                              {:raster.type/tag (scalar-tag (:result-dtype region))}))
-        emitted (validate-emitted-scalar-calls!
-                 region
-                 (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* ctype
-                           ce/*int-vars* (into ce/*int-vars* int-vars)]
-                   (ce/emit-expr
-                    (walk/postwalk-replace replacements expression)
-                    (gensym "z__") array-syms)))
-        params (apply str
-                      (concat
-                       (for [{:keys [sym dtype] :or {dtype :float}} (:operands region)]
-                         (str ", __global const " (dtype/ctype :opencl dtype)
-                              "* restrict " (get parameter-names sym)))
-                       (for [id scalar-ids
-                             :let [parameter (get parameters id)]]
-                         (str ", " (dtype/ctype :opencl (:dtype parameter))
-                              " " (get parameter-names id)))))]
-    {:epilogue (fn [accumulator-expression row col]
-                 (-> emitted
-                     (str/replace accumulator-token (str "(" accumulator-expression ")"))
-                     (str/replace (re-pattern (str "\\b" (ce/c-symbol i-sym) "\\b")) row)
-                     (str/replace (re-pattern (str "\\b" (ce/c-symbol j-sym) "\\b")) col)))
-     :epilogue-params params
-     :region region}))
-
 (declare lower-scalar-ssa-region)
 
 (defn lower-store-region
-  "Lower the one verified ScalarRegion shared by all matrix stores to OpenCL scalar syntax.
+  "Lower the one verified ScalarSSARegion shared by all matrix stores to OpenCL scalar syntax.
 
   Returns nil for identity stores. This is a target lowering of typed KernelBody data: callers
   never supply source callbacks, parameter declaration strings, or helper source."
@@ -177,9 +98,7 @@
       (throw (ex-info "all matrix tile stores must carry the same scalar region"
                       {:reason :raster/bug :regions (vec regions)})))
     (when-let [region (first regions)]
-      (if (record-kind? "ScalarSSARegion" region)
-        (lower-scalar-ssa-region kernel-body region parameter-names)
-        (lower-scalar-region kernel-body region parameter-names))))))
+      (lower-scalar-ssa-region kernel-body region parameter-names)))))
 
 (defn- require!
   [condition message data]
@@ -349,7 +268,7 @@
 (defn emit-matrix-kernel
   "Lower a verified f16 DPAS KernelBody directly to OpenCL C.
 
-  ScalarRegion stores are lowered as part of this boundary. The optional target map contains only
+  ScalarSSARegion stores are lowered as part of this boundary. The optional target map contains only
   target naming policy; it cannot inject source or replace the store expression."
   ([kernel-name kernel-body]
    (emit-matrix-kernel kernel-name kernel-body {}))

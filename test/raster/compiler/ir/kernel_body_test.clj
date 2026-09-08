@@ -192,11 +192,13 @@
         "a trailing zero cannot conceal an overflowing address prefix")))
 
 (deftest scalar-regions-are-checked-against-the-ordered-kernel-abi
-  (let [region (body/->ScalarRegion
+  (let [semantic-region (body/->ScalarRegion
                 ['value 'bias 'scale]
                 '(raster.numeric/* (raster.numeric/+ value (aget bias group-x)) scale)
                 [{:sym 'bias :map (axis-map/of-axes [['group-x 16]]) :dtype :half}]
                 :float)
+        region (body/->ScalarSSARegion (:parameters semantic-region) (:operands semantic-region)
+                                      ['i 'j] :float [] 'value :float)
         kernel (-> (minimal-body)
                    (update :parameters into
                            [(body/->KernelParameter
@@ -205,6 +207,11 @@
                             (body/->KernelParameter 'scale :scalar :float [] nil nil :epilogue)])
                    (assoc-in [:operations 0 :operations 2 :value-region] region))]
     (is (= kernel (body/validate! kernel)))
+    (testing "semantic source regions must be lowered before entering executable KernelBody"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be typed scalar SSA"
+                            (body/validate! (assoc-in kernel
+                                                     [:operations 0 :operations 2 :value-region]
+                                                     semantic-region)))))
     (testing "operand identities occupy the ordered prefix after the accumulator"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered prefix"
                             (body/validate!

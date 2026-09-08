@@ -491,21 +491,6 @@
                             {:scalar id :parameter parameter})))))
       region)))
 
-(defn- validate-scalar-region!
-  [region storage epilogue-abi]
-  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarRegion" region)
-    (throw (ex-info "tile-store value region must be a ScalarRegion" {:region region})))
-  (when-not (and (some? (:expression region))
-                 (dtype/known? (:result-dtype region)))
-    (throw (ex-info "tile-store scalar region is incomplete or has ambiguous parameters"
-                    {:region region})))
-  (validate-scalar-region-boundary! region storage epilogue-abi #{:epilogue} #{:epilogue})
-  (let [legal (scalar-region-legal? region)]
-    (when-not (:ok legal)
-      (throw (ex-info "tile-store scalar region is not store-local"
-                      (assoc legal :region region)))))
-  region)
-
 (defn- validate-scalar-ssa-region!
   [region storage masks scope epilogue-abi]
   (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion" region)
@@ -668,9 +653,7 @@
                            :buffer p :coordinates (:coordinates operation)})))
         (mask (:mask operation))
         (when-let [region (:value-region operation)]
-          (if (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion" region)
-            (validate-scalar-ssa-region! region storage masks scope epilogue-abi)
-            (validate-scalar-region! region storage epilogue-abi))))
+          (validate-scalar-ssa-region! region storage masks scope epilogue-abi)))
 
       (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
       (do
