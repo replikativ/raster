@@ -25,6 +25,13 @@
                    (clojure.core/aget B (+ (* l n) j))))]
      step))
 
+(def ^:private both-batched-source
+  '(let* [step (raster.par/contract
+                C [[b batch] [i m] [j n]] [[l k]]
+                (* (clojure.core/aget A (+ (* (+ (* b m) i) k) l))
+                   (clojure.core/aget B (+ (* (+ (* b k) l) n) j))))]
+     step))
+
 (defn- typed-dispatch
   ([device-id] (typed-dispatch device-id :int))
   ([device-id scalar-dtype]
@@ -42,10 +49,11 @@
      :precision :mixed-f16-f32))))
 
 (defn- typed-batched-dispatch
-  [device-id scalar-dtype]
+  [device-id scalar-dtype both-batched?]
   (let [{:keys [form]}
         (pipeline/schedule-parallel-form
-         batched-source {:target-device device-id
+         (if both-batched? both-batched-source batched-source)
+                        {:target-device device-id
                          :dtype :float
                          :array-types {'A :float 'B :float 'C :float}
                          :scalar-types {'batch scalar-dtype 'm scalar-dtype
@@ -115,7 +123,7 @@
     result))
 
 (defn- batched-reference
-  [^floats a ^floats b batch m n k]
+  [^floats a ^floats b batch m n k both-batched?]
   (let [result (float-array (* batch m n))]
     (dotimes [batch-index batch]
       (dotimes [i m]
@@ -128,7 +136,8 @@
                      (recur (inc l)
                             (+ sum
                                (* (f16 (aget a (+ (* (+ (* batch-index m) i) k) l)))
-                                  (f16 (aget b (+ (* l n) j))))))
+                                  (f16 (aget b (+ (if both-batched? (* batch-index k n) 0)
+                                                  (* l n) j))))))
                      sum)))))))
     result))
 
@@ -230,15 +239,17 @@
 (deftest batched-typed-contraction-executes-with-shared-weights
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "batched typed contraction matrix KernelExecutable")
-    (doseq [scalar-dtype [:int :long]]
+    (doseq [scalar-dtype [:int :long]
+            both-batched? [false true]]
      (let [device-id :ze:0
           batch 2
           m 8
           n 32
           k 32
           a (input-array (* batch m k) 41)
-          b (input-array (* k n) 43)
-          scheduled (typed-batched-dispatch device-id scalar-dtype)
+          b-elements (* (if both-batched? batch 1) k n)
+          b (input-array b-elements 43)
+          scheduled (typed-batched-dispatch device-id scalar-dtype both-batched?)
           runtime-arguments
           [:a :b :c
            {:type scalar-dtype :value batch}
@@ -249,14 +260,14 @@
       (is (= :xmx-batched (executable/strategy selected)))
       (gpu/with-gpu-session [session device-id]
         (gpu/alloc! session {:a [:float (* batch m k) a]
-                             :b [:float (* k n) b]
+                             :b [:float b-elements b]
                              :c [:float (* batch m n) nil]})
         (let [handle (gpu/bind-kernel-executable!
                       session :typed-batched-contraction selected runtime-arguments)]
           (try
             (gpu/run-kernel-graph! session handle)
             (is (< (relative-l1 (gpu/download session :c)
-                                (batched-reference a b batch m n k))
+                                (batched-reference a b batch m n k both-batched?))
                    1.0e-3))
             (finally
               (gpu/release-kernel-graph! session handle)))))))))

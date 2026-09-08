@@ -1164,10 +1164,14 @@
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
 
-(deftest long-dimensions-admit-only-guarded-unbatched-matrix-schedules
+(deftest uniform-long-dimensions-use-guarded-matrix-schedules
   (doseq [batched? [false true]
-          widths [{'m :long 'n :long 'k :long} {'m :int 'n :int 'k :long}]]
-    (let [declined? (some #{:int} (vals widths))
+          widths (cond-> [{'m :long 'n :long 'k :long} {'m :int 'n :int 'k :long}]
+                   batched? (into [{'batch :int 'm :long 'n :long 'k :long}
+                                   {'batch :long 'm :int 'n :int 'k :int}]))]
+    (let [scalar-types (merge {'batch :long} widths)
+          effective-types (if batched? scalar-types widths)
+          declined? (> (count (set (vals effective-types))) 1)
           contract (if batched?
                      '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
                         (* (aget A (+ (* (+ (* b m) i) k) l)) (aget B (+ (* l n) j))))
@@ -1177,7 +1181,7 @@
                           (list 'let* ['step contract] 'step)
                           {:target-device :ze:0 :dtype :float
                            :array-types {'A :float 'B :float 'C :float}
-                           :scalar-types (assoc widths 'batch :long)})
+                           :scalar-types scalar-types})
           dispatch (contract-route/route-typed-contraction-dispatch
                      (-> form :equations first :algorithm)
                      (-> form :equations first :operations first)
@@ -1196,26 +1200,31 @@
           (is (= (if batched? #{:portable-segred :xmx-batched}
                                #{:portable-segred :xmx-direct :xmx-split-k})
                  (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
-          (doseq [[dimensions expected] [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
-                                         [{'m 16 'n 16 'k 32} :portable-segred]
-                                         [{'m 2147483648 'n 32 'k 32} :portable-segred]]
-                  :let [dimensions (assoc dimensions 'batch 2)
+          (doseq [[dimensions expected]
+                  (cond-> [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
+                           [{'m 16 'n 16 'k 32} :portable-segred]
+                           [{'m 2147483648 'n 32 'k 32} :portable-segred]
+                           [{'m 3 'n 32 'k 48} (if batched? :portable-segred :xmx-direct)]]
+                    batched? (conj [{'batch 2147483648 'm 16 'n 32 'k 32} :portable-segred]))
+                  :let [dimensions (merge {'batch 2} dimensions)
                         values (mapv (fn [slot argument]
                                        (if (= :scalar (:kind slot))
                                          {:type :long :value (get dimensions argument)} argument))
                                      abi arguments)]]
             (is (= expected (kdispatch/alternative-strategy
                              (kdispatch/select-alternative dispatch values)))))
-          (doseq [dimensions [{'m 16 'n 16 'k 32} {'m 2147483648 'n 32 'k 32}]]
+          (doseq [dimensions (cond-> [{'m 16 'n 16 'k 32} {'m 2147483648 'n 32 'k 32}]
+                               batched? (conj {'batch 2147483648 'm 16 'n 32 'k 32}
+                                              {'batch 2 'm 3 'n 32 'k 48}))]
             (is (thrown? clojure.lang.ExceptionInfo
                          (kernel-graph-call/temporary-specs
                           (kdispatch/alternative dispatch (if batched? :xmx-batched :xmx-direct))
                           (into {} (map (fn [[id value]] [id {:type :long :value value}]))
-                                (cond-> dimensions batched? (assoc 'batch 2)))))))))
+                                (if batched? (merge {'batch 2} dimensions) dimensions))))))))
       (let [scalar-slots (filter #(= :scalar (:kind %))
                                  (:abi (first (:alternatives dispatch))))]
         (is (= (if batched? 4 3) (count scalar-slots)))
-        (is (= (set (vals widths)) (set (map :dtype scalar-slots))))))))
+        (is (= (set (vals effective-types)) (set (map :dtype scalar-slots))))))))
 
 (deftest dynamic-f32-contraction-owns-its-dpas-graph-alternatives
   (let [source
