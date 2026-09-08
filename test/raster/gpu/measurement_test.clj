@@ -79,3 +79,31 @@
           :pending-inputs (atom #{}) :closed? (atom false)})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :before-sample!"
                           (link/measure! executable :budget-ms 1)))))
+
+(deftest interleaved-bound-graphs-use-device-events-and-restore-before-every-replay
+  (let [calls (atom [])
+        session (atom {:device-id :probe})
+        candidates (mapv (fn [id] {:id id :handle id
+                                  :before-sample! #(swap! calls conj [:restore id])}) [:a :b])]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'resolve-kernel-graph-entry)
+       (fn [_ handle] {:profile? (not= :unprofiled handle) :runtime-graph handle})
+       #'raster.gpu.core/rt-resolve
+       (fn [_ name]
+         (case name
+           "replay-graph!" #(swap! calls conj [:replay %])
+           "read-graph-timestamps!" (fn [id] (swap! calls conj [:timestamp id]) {:wall-ms 0.001})))}
+      (fn []
+        (doseq [opts [[:timing-source :host] [:rounds 0]]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (apply gpu/measure-bound-kernel-graphs-interleaved! session candidates opts))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (gpu/measure-bound-kernel-graphs-interleaved!
+                      session (assoc-in candidates [1 :handle] :unprofiled))))
+        (is (empty? @calls))
+        (let [result (gpu/measure-bound-kernel-graphs-interleaved!
+                      session candidates :warmup-rounds 1 :rounds 2)]
+          (is (= (vec (mapcat (fn [id] [[:restore id] [:replay id] [:timestamp id]])
+                             [:a :b :a :b :b :a])) @calls))
+          (is (= [1000.0 1000.0] (get-in result [:measurements :a :samples-ns])))
+          (is (= :device-event (get-in result [:measurements :b :timing-source]))))))))
