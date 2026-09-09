@@ -269,6 +269,7 @@
   (loop [expression expression]
     (if (and (seq? expression)
              (descriptor/cast-op? (descriptor/semantic-op expression))
+             (not= :wrap (descriptor/cast-integral-narrowing (descriptor/semantic-op expression)))
              (= 1 (count (descriptor/call-args expression))))
       (recur (first (descriptor/call-args expression)))
       expression)))

@@ -36,7 +36,9 @@
         (try
           {:value (case tag
                     byte (byte (:value operand))
-                    int (int (:value operand))
+                    int (if (= :wrap (descriptor/cast-integral-narrowing (first expression)))
+                          (unchecked-int (:value operand))
+                          (int (:value operand)))
                     long (long (:value operand))
                     float (float (:value operand))
                     double (double (:value operand)))}

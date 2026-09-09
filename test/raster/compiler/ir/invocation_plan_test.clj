@@ -6,6 +6,10 @@
 (defn- scalar [dtype]
   (av/tensor {:dtype dtype :shape []}))
 
+(deftest wrapping-casts-are-not-shape-identities
+  (is (= 'xs (#'invocation/shape-source '(clojure.core/long (alength xs)))))
+  (is (nil? (#'invocation/shape-source '(clojure.core/unchecked-int (alength xs))))))
+
 (defn- array-value [dtype extent]
   (av/tensor {:dtype dtype :shape [extent] :representation {:kind :plain}}))
 

@@ -24,6 +24,7 @@
     (is (= 7 (aot/resolve-int-expr (list cast 'n) {'n 7})))))
 
 (deftest scratch-sizes-use-checked-constant-evidence
+  (is (= 1 (aot/resolve-int-expr '(clojure.core/unchecked-int n) {'n 4294967297})))
   (is (= 8 (#'aot/const-int-size '(clojure.core/long (clojure.core/int 8)))))
   (doseq [expression ['(int 4294967296) -1 'n '(long n)]]
     (is (nil? (#'aot/const-int-size expression)))))

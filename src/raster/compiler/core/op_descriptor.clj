@@ -425,10 +425,15 @@
 ;; --- Primitive casts ---
 
 (def cast-ops
-  "Primitive cast symbols and their result types."
-  {'long 'long, 'int 'int, 'byte 'byte, 'double 'double, 'float 'float
-   'clojure.core/long 'long, 'clojure.core/int 'int
-   'clojure.core/byte 'byte, 'clojure.core/double 'double, 'clojure.core/float 'float})
+  "Primitive source conversion contracts. Width and narrowing policy have one owner."
+  (assoc (into {} (map (fn [[op tag]] [op {:result-tag tag :integral-narrowing :reject}]))
+               {'long 'long, 'int 'int, 'byte 'byte, 'double 'double, 'float 'float
+                'clojure.core/long 'long, 'clojure.core/int 'int
+                'clojure.core/byte 'byte, 'clojure.core/double 'double,
+                'clojure.core/float 'float})
+         ;; Only the resolved core spelling is admitted: a lexical function named
+         ;; unchecked-int is not a source conversion contract.
+         'clojure.core/unchecked-int {:result-tag 'int :integral-narrowing :wrap}))
 
 (defn cast-op?
   "True if sym is a primitive cast operation."
@@ -438,7 +443,12 @@
 (defn cast-result-tag
   "Return the result type tag for a cast op, or nil."
   [sym]
-  (get cast-ops sym))
+  (get-in cast-ops [sym :result-tag]))
+
+(defn cast-integral-narrowing
+  "Explicit source narrowing policy, or nil for a non-cast."
+  [sym]
+  (get-in cast-ops [sym :integral-narrowing]))
 
 ;; --- Scalar ops (type-preserving, pure) ---
 

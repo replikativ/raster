@@ -117,9 +117,12 @@
   [x :- Double] :- Double (Math/floor x))
 (deftm floor [x :- Float] :- Float (float (Math/floor (double x))))
 
-(deftm round "Round x to the nearest integer (half-up)."
+(deftm round
+  "Round to the nearest integer, with ties toward positive infinity (including negative ties).
+   Float returns Integer; Double returns Long. NaN yields zero; overflow and infinities
+   saturate to the result width. This is not ties-to-even or a wrapping integer conversion."
   [x :- Double] :- Long (Math/round x))
-(deftm round [x :- Float] :- Integer (Math/round (float x)))
+(deftm round [x :- Float] :- Integer (Math/round x))
 
 (deftm trunc
   "Truncate towards zero (round towards zero)."

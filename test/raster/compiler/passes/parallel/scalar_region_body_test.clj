@@ -33,6 +33,22 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires one argument"
                          (lower '(Math/round (aget x i) (aget x i)) :long {'i :int})))))
 
+(deftest explicit-integer-wrapping-does-not-relax-the-owner-policy
+  (let [lower (:lower (scalar/make-lowerer
+                      {:array-types {} :arrays #{} :scalar-types {'x :long 'f :double}
+                       :lower-index (fn [expression _] expression)
+                       :conversion-policy conversion/policy
+                       :decline! (fn [rule message data]
+                                   (throw (ex-info message (assoc data :rule rule))))}))
+        result (lower '(clojure.core/unchecked-int x) :int {'x :long})]
+    (is (= :int (:type result)))
+    (is (= {:rounding :exact :overflow :wrap}
+           (get-in (last (:operations result)) [:expression :options])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
+                         (lower '(clojure.core/int x) :int {'x :long})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
+                         (lower '(clojure.core/unchecked-int f) :int {'f :double})))))
+
 (defn- mixed-region [lowerer]
   ((:lower-region lowerer)
    '{:bindings [candidate (aget x i) better (> candidate old-value)]

@@ -162,7 +162,7 @@
                                (body/scalar-expression operator result-type arguments options))]
                  :result result :type result-type :range range}))
 
-            (cast-lowered [lowered target expression]
+            (cast-lowered [lowered target expression & [explicit-narrowing]]
               (let [target (dtype/canon target)]
                 (if (= target (:type lowered))
                   lowered
@@ -170,9 +170,11 @@
                         [rounding overflow]
                         ;; Map/fold retain their existing device-wrap default. A stricter owner
                         ;; supplies its conversion contract rather than inheriting that policy.
-                        (or (if conversion-policy
-                              (conversion-policy source target)
-                              (scalar-conversion/policy source target :wrap))
+                        (or (if (= :wrap explicit-narrowing)
+                              (scalar-conversion/policy source target :wrap)
+                              (if conversion-policy
+                                (conversion-policy source target)
+                                (scalar-conversion/policy source target :wrap)))
                             (decline! :cast-policy
                                       "scalar cast has no portable rounding and overflow policy"
                                       {:expression expression :source source :target target}))
@@ -265,7 +267,8 @@
                                 (descriptor/cast-result-tag (first expression)))
                         source-expected (dtype/canon (source-type (second expression) target env))
                         lowered (lower (second expression) source-expected env)]
-                    (cast-lowered lowered target expression))
+                    (cast-lowered lowered target expression
+                                  (descriptor/cast-integral-narrowing (first expression))))
 
                   (and (seq? expression)
                        (= 'raster.numeric/oftype (descriptor/semantic-op expression))
