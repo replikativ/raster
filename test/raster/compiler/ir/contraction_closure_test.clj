@@ -73,17 +73,24 @@
     (is (= ['out] (:captures map-op)))
     (is (= p (soac/validate! p)))))
 
-(deftest unsupported-staged-schedules-do-not-become-authoritative-typed-islands
+(deftest staged-storage-precision-and-captures-remain-distinct
   (let [source (fixtures/packed-facts 3 5 3 32)
         options {:dtype :float :array-types '{a :byte b :byte da :float db :float out :float}
                  :scalar-types {'scale :float}}
         form-for (fn [facts]
                    (list 'let* ['effect (raster.compiler.ir.contraction-facts/surface-form facts)] 'out))]
-    (doseq [unsupported [(-> source
-                            (assoc-in [:stages 1 :dtype] :float)
-                            (assoc-in [:opts :stages 1 :dtype] :float))]]
-      (is (nil? (frontend/form->program (form-for unsupported) options))
-          "unsupported valid staged semantics remain available to the compatibility route"))
+    (let [mixed (-> source
+                    (assoc-in [:stages 1 :dtype] :float)
+                    (assoc-in [:opts :stages 1 :dtype] :float))
+          _ (is (nil? (frontend/form->program (form-for mixed) options))
+                "raw compound arithmetic cannot borrow its width from Byte storage")
+          mixed (update mixed :body vary-meta assoc :raster.type/tag 'long)
+          p (frontend/form->program (form-for mixed) options)
+          retained (get-in (soac/operation-parts (first (soac/equations p)))
+                           [:attributes :contraction])]
+      (is (= p (soac/validate! p)))
+      (is (= :byte (:dtype retained)))
+      (is (= :float (get-in retained [:stages 1 :dtype]))))
     (let [with-capture (-> source
                            (assoc-in [:stages 0 :lift] '(* inner scale))
                            (assoc-in [:opts :stages 0 :lift] '(* inner scale)))

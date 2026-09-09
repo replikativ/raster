@@ -1291,6 +1291,15 @@
                  :dtype (or (some-> (get array-types (second expression)) dtype/canon)
                             (:raster.type/elem-type (meta expression))
                             default-dtype :double))
+          ;; Select this schedule for explicit precision or mixed storage, without diverting
+          ;; homogeneous matrix contractions from their existing optimized schedule families.
+          mixed-storage? (some (fn [{:keys [sym]}]
+                                 (when-let [declared (get array-types sym)]
+                                   (not= (dtype/canon declared) (dtype/canon (:dtype facts)))))
+                               (:operands facts))
+          facts (if (or (contains? (:opts facts) :acc-dtype) mixed-storage?)
+                  (contraction-facts/single-axis-accumulator-stage facts)
+                  facts)
           {:keys [free-axes contract-axes out opts]} facts
           contraction-dtype (dtype/canon (:dtype facts))
           ;; A result transform that reads the destination reads the storage the contraction

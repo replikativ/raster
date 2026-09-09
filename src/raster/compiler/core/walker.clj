@@ -1028,6 +1028,7 @@
                           (range) stages)
                     :epilogue
                     (let [acc-tag (or (scalar-tag (:dtype (first stages)))
+                                      (scalar-tag (:acc-dtype opts))
                                       (some-> (ctx-get-tag ctx output) dtype/dtype-for-array-tag scalar-tag))
                           env (ctx-assoc-type (axis-context free-axes) (:acc value) acc-tag)]
                       (into (empty value)

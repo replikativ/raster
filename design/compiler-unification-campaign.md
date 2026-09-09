@@ -825,3 +825,33 @@ base case. Both have independent Arc references and public vendor compile fixtur
 mismatch and seeded stages remain errors; unproved Int prefix bounds remain capability declines.
 This admits explicit single-stage source contracts; the legacy router's implicit stage synthesis
 and layout-retargeting still need normalization before the old staged emitter can be removed.
+
+### Explicit accumulator policy enters the shared stage path
+
+For explicit `:acc-dtype`, a single-axis additive reduction with a proved zero identity and
+nonempty output axes can expose its canonical accumulator as a one-stage schedule. The helper
+reads dtype, combine and neutral from the existing ProductReduction view; it does not infer
+accumulation precision from Byte storage. Output dtype is retained independently. Integral zero
+is spelled at the accumulator width after stage legality proves the identity is zero.
+
+Source epilogue typing also retains `:acc-dtype` before output conversion. Public Arc cases cover
+decoded Byte/Int accumulation and a Double accumulator with Float storage and a rounding-sensitive
+epilogue. Both enter vendor compile fixtures. Rank-zero, multiple reduced axes, non-additive folds
+and undeclared accumulator precision retain their existing paths. Implicit legacy Byte policy still
+requires a numeric equivalence proof; this is not a blanket Byte-to-Int rewrite or emitter retirement.
+
+### Input storage does not choose accumulation precision
+
+Single-axis sums with input storage differing from the output can use the same canonical-stage
+projection without changing accumulator dtype. The frontend selects it for mixed storage or
+explicit accumulator policy; homogeneous contractions keep their existing schedule selection.
+This still requires one common declared dtype among core input arrays, not arbitrary heterogeneous
+operand storage. Existing rank/domain, layout, capture and numerical legality gates remain.
+
+For an innermost floating stage over integral storage, untyped compound roots now decline rather
+than borrowing arithmetic width from the buffer dtype. Retained source types govern operations;
+typed loads/casts use their existing scalar contracts. Tests inspect Long byte-product arithmetic
+separately from Float scale arithmetic. Public Arc execution of 1024 products of -128 by -128,
+then two products of 1 by 1, gives ordered Float result16777216 rather than Int-then-Float16777218.
+The public workload enters vendor compile fixtures. This is correctness/generalization work;
+packed replacement of a floating fold still requires an independent equivalence proof.
