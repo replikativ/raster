@@ -975,8 +975,8 @@
           n-sym (gensym "effect_n__")
           j-sym (gensym "effect_i__")
           {:keys [locals effects]} (:scalar-region segmap)
-          carried-effects? (soac-dialect/scheduled-effect-carries? effects)
-          generated-cast (partial effect-source/storage-cast carried-effects?)
+          strict-effects? (soac-dialect/strict-effect-scalar-policy? effects)
+          generated-cast (partial effect-source/storage-cast strict-effects?)
           _ (when (seq effects)
               (soac-dialect/validate-scheduled-effect-carries!
                effects (concat (:inputs segmap) (:outputs segmap) (:scalars segmap)
@@ -1009,7 +1009,8 @@
           (when (seq effects)
             (materialize-locals locals
                                 (effect-source/ordered-effects
-                                 effects {:emit-store effect-statement :emit-loop loop-statement})))
+                                 effects {:emit-store effect-statement :emit-loop loop-statement
+                                          :emit-region materialize-locals})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
                 (bc/desugar-invk (or typed-region-body (:lambda segmap))))]

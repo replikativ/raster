@@ -1420,11 +1420,15 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Result-valued store loops may also precede other store loops in the same ordered effect spine;
    the result scopes over those later loops, without moving their reads before earlier writes.
    The next source-admission gap is a scalar binding *between* such loops (prefill softmax is a
-   concrete workload). Reuse a nested `effect-region` for this lexical continuation, rather than
-   hoisting its locals, duplicating their evaluation per iteration, or adding a semantic attention
-   exception. Canonical validation, capture/conflict analysis, and both host and KernelBody
-   projections must support that nesting before the frontend admits it. Until then, this workload
-   still has a compatibility leaf; sequential correctness is not a parallel-performance claim.
+   concrete workload). The canonical dialect now admits a nested `effect-region` for this lexical
+   continuation: validation, host realization, and KernelBody lowering retain its evaluation point
+   and do not export its locals. This does not yet admit that source shape. Frontend capture/conflict
+   analysis and source projection must preserve the same boundary before prefill softmax can leave
+   its compatibility path. Parallel scheduling additionally needs a shared ownership proof for
+   reads and repeated writes by the same work item across distinct loop-local coordinates. Proving
+   each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
+   indirect or neighboring-row accesses must remain sequential. No attention-specific exception,
+   scalar hoisting, synthetic one-trip loop, or performance claim is needed for this IR extension.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

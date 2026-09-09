@@ -7,10 +7,10 @@
             [raster.compiler.core.dtype :as dtype]))
 
 (defn storage-cast
-  "Generated storage conversion, not a user-written cast. Carried FP32 regions use IEEE rounding
-   and overflow, matching KernelBody; existing non-carried host regions retain checked casts."
-  [carried? tag]
-  (if (and carried? (= 'float tag))
+  "Generated storage conversion, not a user-written cast. Strict FP32 regions use IEEE rounding
+   and overflow, matching KernelBody; legacy flat host regions retain checked casts."
+  [strict? tag]
+  (if (and strict? (= 'float tag))
     'clojure.core/unchecked-float
     (symbol "clojure.core" (name tag))))
 
@@ -72,14 +72,18 @@
 
 (defn ordered-effects
   "Spell scheduled effects as a host continuation. `emit-store` receives a store descriptor;
-   `emit-loop` receives a loop descriptor and its already-spelled ordered body. Both return forms.
+   `emit-loop` receives a loop descriptor and its already-spelled ordered body. `emit-region`
+   receives retained locals and their ordered body. All callbacks return forms.
    A carried result encloses only subsequent effects, never its initializer or preceding stores."
-  [effects {:keys [emit-store emit-loop] :as emitters}]
+  [effects {:keys [emit-store emit-loop emit-region] :as emitters}]
   (if-let [effect (first effects)]
     (let [loop (:loop effect)
-          form (if loop
-                 (emit-loop loop (ordered-effects (:effects loop) emitters))
-                 (emit-store effect))
+          form (cond
+                 (:region effect)
+                 (let [{:keys [locals effects]} (:region effect)]
+                   (emit-region locals (ordered-effects effects emitters)))
+                 loop (emit-loop loop (ordered-effects (:effects loop) emitters))
+                 :else (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]
       (if-let [result (get-in loop [:carry :result])]
         (list 'let* [(vary-meta result dissoc :tag) form] continuation)
