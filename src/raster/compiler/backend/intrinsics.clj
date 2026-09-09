@@ -36,13 +36,12 @@
 ;; Where backends could diverge on the same op, the CHOICE is recorded here —
 ;; an emitter deviating from this table is a bug, not a preference.
 ;;
-;; :round  Java semantics — floor(x+0.5) — everywhere possible. wasm lowers as
-;;         the floor(x+0.5) polynomial (NOT f64.nearest: round-half-EVEN).
-;;         KNOWN DEVIATION: the C backends emit native round() =
-;;         round-half-AWAY-from-zero, which differs from Java at NEGATIVE .5
-;;         ties (C round(-2.5) = -3, Java = -2). Exact half-ties are
-;;         measure-zero on real data; accepted for GPU speed. Fixing = emit
-;;         floor(x+0.5) in C too.
+;; :round  Typed source lowering expands Java's floating->integer overloads into
+;;         floor/fraction/select and saturating conversion. Ties go toward +infinity;
+;;         NaN becomes zero. Naive floor(x+0.5) is NOT exact at adjacent half-ties.
+;;         LEGACY DEBT: raw C :round still names native round (ties away from zero),
+;;         and wasm's polynomial still adds 0.5 before floor. Neither is the typed
+;;         source expansion; do not claim their numerical semantics are equivalent.
 ;; :mod    floored (Julia/Clojure mod). C/WGSL lower via the :floored-mod
 ;;         strategy; wasm computes a-floor(a/b)*b; JVM uses clojure.core/mod.
 ;; :rem    truncated (C %, JVM rem, wasm i32.rem_s) — all agree natively.
@@ -86,7 +85,10 @@
    :floor (math1 :f64.floor :f32.floor "floor")
    :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
    :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
-   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"} :wasm :poly} ; wasm: floor(x+0.5) poly (Java semantics)
+   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"} :wasm :poly
+           ;; Source overloads are not homogeneous FP intrinsics. Typed lowering expands
+           ;; these into ordinary SSA before target emission; raw legacy :round is separate.
+           :typed-expansion :java-round :source-signatures {:float :int :double :long}}
    :neg   {:arity 1 :kind :fn :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}

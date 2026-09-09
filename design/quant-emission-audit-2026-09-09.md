@@ -63,3 +63,23 @@ The nine scalar routes are the composable Q4/Q6 helpers and packed CPU dot varia
 The default CI corpus currently excludes both quant namespaces. Keep this focused inventory in
 the cold lane until an explicit workload/policy matrix can ratchet intended GPU entry points
 without treating CPU-only helpers or inappropriate dtype specializations as regressions.
+
+## First repair: shared typed Java rounding
+
+The typed scalar lowerer now consumes the existing intrinsic table's Float→Int and Double→Long
+source signatures. It expands rounding into ordinary floor, subtraction, comparison, selection,
+and saturating conversion operations; no quantization-specific kernel or new IR node is involved.
+The overload's result dtype is preserved before conversion to its consumer dtype. Unknown source
+overloads decline instead of being guessed from the output type.
+
+OpenCL uses its explicit saturating conversion. CUDA/HIP guard NaN and signed range boundaries
+before a truncating C++ cast; the upper guard compares against the exact power-of-two boundary,
+not a rounded integer maximum. Other unsupported rounding policies still decline.
+
+The targeted I8 packer rerun now reports validated TypedSOAC, one KernelBody kernel, independent
+effect iteration, and no emission decline. On Intel Arc, both rounding overloads match Java for
+164 inputs each (edge cases plus deterministic random bit patterns). The public packer also
+matches JVM packed words and scales across three rows, including half-ties and a zero row.
+Both overloads and the public packer join the CUDA/HIP compile fixtures. This is correctness and
+emission evidence, **not a throughput measurement**. The original 33-entry table remains the
+pre-repair baseline; Q8_K compatibility emission and the packed helper's lost type remain open.

@@ -336,6 +336,8 @@
       (:kernels (equation-first/compile
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'qk/quant-act-i8-rows-gpu! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 
 (defn- write-artifact!
@@ -446,6 +448,14 @@
            (write-source! directory suffix "trapping-arithmetic"
                           (body-emit/emit-scalar-kernel
                            "trapping_arithmetic" (body-fixtures/trapping-arithmetic-body)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "java-round-f32"
+                          (body-emit/emit-scalar-kernel
+                           "java_round_f32" (body-fixtures/java-round-body :float :int 1)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "java-round-f64"
+                          (body-emit/emit-scalar-kernel
+                           "java_round_f64" (body-fixtures/java-round-body :double :long 1)
                            {:target-dialect dialect}))
            (write-source! directory suffix "word-shifts-i32"
                           (body-emit/emit-scalar-kernel

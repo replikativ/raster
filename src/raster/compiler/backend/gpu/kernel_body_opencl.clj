@@ -464,16 +464,29 @@
              "(" argument-source ")")
         (str "(" (target-type result-type) ")(" argument-source ")"))
 
-      ;; Saturating FP->integer conversion has a direct OpenCL spelling only.
+      ;; Guard the C cast: out-of-range/NaN FP-to-integer conversion is undefined in C++.
+      ;; The upper comparison uses the exact power-of-two boundary, not rounded MAX_VALUE.
       (and source-fp? (not result-fp?) (= :saturate overflow))
       (if (c-dialect/opencl? *scalar-dialect*)
         (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
              "(" argument-source ")")
-        (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
+        (if (and (= :toward-zero rounding)
+                 (contains? #{:float :double} source-type)
+                 (scalar-range/for-dtype result-type))
+          (let [{:keys [lower upper]} (scalar-range/for-dtype result-type)
+                literal #(emit-scalar-value (body/literal %1 %2) context)
+                x (str "(" argument-source ")")]
+            (str "(isnan(" x ") ? " (literal 0 result-type)
+                 " : " x " >= " (literal (double (inc' upper)) source-type)
+                 " ? " (literal upper result-type)
+                 " : " x " <= " (literal (double lower) source-type)
+                 " ? " (literal lower result-type)
+                 " : (" (target-type result-type) ")" x ")"))
+          (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
                         {:reason :kernel-body-c-cast-policy
                          :dialect (:id *scalar-dialect*)
                          :source-type source-type :result-type result-type
-                         :rounding rounding :overflow overflow})))
+                         :rounding rounding :overflow overflow}))))
 
       ;; Integral widening is exact. Narrowing/exact and trapping conversions need a proof or
       ;; runtime check that this target layer does not currently carry.
