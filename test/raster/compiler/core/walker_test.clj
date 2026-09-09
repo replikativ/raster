@@ -143,6 +143,14 @@
     (is (= 'double (:raster.type/tag (meta (last walked))))
         "the induction variable does not escape the effect map")))
 
+(deftest malformed-effect-map-does-not-drop-source-operands
+  (doseq [form ['(raster.par/map-void! i n)
+               '(raster.par/map-void! i n nil (throw (Exception.)))
+               '(raster.par/map-void! [i] n nil)]]
+    (is (= :invalid-effect-map-form
+           (try (wb form) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest walk-nested-let-test
   (testing "nested let bindings are walked"
     (let [walked (wb '(let [a (raster.numeric/+ x y)

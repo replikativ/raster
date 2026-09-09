@@ -935,6 +935,9 @@
 (defmethod walk-form :par-map-void [form ctx]
   ;; The bound is outside the induction-variable scope, just as for map!.
   ;; Keep the effect-only SOAC intact; its body does not determine a return type.
+  (when-not (and (= 4 (count form)) (symbol? (second form)))
+    (throw (ex-info "map-void! requires a symbol index, a bound, and a body"
+                    {:reason :invalid-effect-map-form :form form})))
   (let [[_ i-sym bound-expr body-expr] form
         walked-bound (walk bound-expr ctx)
         idx-ctx (ctx-assoc-type ctx i-sym 'long)]
