@@ -784,13 +784,13 @@
             [])])))))
 
 (deftest loop-carried-integral-ranges-do-not-become-unchecked-proofs
-  (testing "a single checked body pass cannot certify repeated increment"
+  (testing "an additive fold cannot certify overflowing prefixes"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"not derivable from operand ranges"
          (scalar-body
           [(body/->ForLoop
             (body/value 'i :int) 0 4 1
-            [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+            [(body/->LoopArg (body/value 'carry :int) (body/literal (dec Integer/MAX_VALUE) :int))]
             [(body/->ScalarCompute
               (body/value 'next-carry :int)
               (body/scalar-expression :+ :int ['carry (body/literal 1 :int)]
@@ -811,6 +811,34 @@
             (body/value 'unsafe-after-zero-trip :int)
             (body/scalar-expression :- :int ['loop-result (body/literal 1 :int)]
                                     {:overflow :no-overflow}))])))))
+
+(deftest static-additive-loop-ranges-are-independently-derived
+  (let [fold (fn [n init term]
+               (body/->ForLoop
+                (body/value 'i :int) 0 n 1
+                [(body/->LoopArg (body/value 'carry :int) (body/literal init :int))]
+                [(body/->ScalarCompute
+                  (body/value 'next-carry :int)
+                  (body/scalar-expression :+ :int ['carry (body/literal term :int)]
+                                          {:overflow :no-overflow}))
+                 (body/->Yield ['next-carry])]
+                [(body/value 'loop-result :int)] {}))]
+    (doseq [n [1 3 5]]
+      (is (some? (scalar-body [(fold n 7 -2)]))))
+    (is (some? (scalar-body [(fold 3 (- Integer/MAX_VALUE 3) 1)])))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scalar-body [(fold 4 (- Integer/MAX_VALUE 3) 1)])))
+    (testing "a derived result range is available after the fold"
+      (is (some? (scalar-body
+                  [(fold 3 0 2)
+                   (body/->ScalarCompute
+                    (body/value 'after :int)
+                    (body/scalar-expression :+ :int ['loop-result (body/literal 1 :int)]
+                                            {:overflow :no-overflow}))]))))
+    (testing "the term may not depend on the evolving carry"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (scalar-body [(assoc-in (fold 3 0 1) [:operations 0 :expression :arguments]
+                                           ['carry 'carry])]))))))
 
 (deftest scalar-and-collective-operators-have-semantic-dtype-domains
   (testing "floating intrinsics do not accept integers"

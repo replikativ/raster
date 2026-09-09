@@ -1421,6 +1421,46 @@
                        :expected expected-types :actual actual-types})))
     yielded))
 
+(defn- additive-loop-ranges!
+  "Independently derive one static additive carry invariant from its actual SSA update.
+   Prefix operations must not reference the carry at all; their existing validators own types,
+   casts, addresses and overflow contracts. Unknown/control-flow recurrences stay conservative."
+  [operation loop-values context]
+  (let [args (:iter-args operation)
+        operations (:operations operation)
+        update-op (when (>= (count operations) 2) (nth operations (- (count operations) 2)))
+        yield-op (peek operations)
+        carry (get-in args [0 :binding :id])
+        type (some-> (get-in args [0 :binding :type]) canonical-type)
+        expression (:expression update-op)
+        operands (:arguments expression)
+        trips (scalar-range/counted-loop-trips (:lower operation) (:upper operation) (:step operation))]
+    (when (and (= 1 (count args)) (some? trips) (contains? #{:byte :int :long} type)
+               (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" update-op)
+               (record-kind? "raster.compiler.ir.kernel_body.Yield" yield-op)
+               (= [(:id (:result update-op))] (:values yield-op))
+               (= :+ (:op expression)) (= type (:result-type expression))
+               (= 2 (count operands)) (= 1 (count (filter #{carry} operands))))
+      (let [term (first (remove #{carry} operands))
+            prefix (subvec operations 0 (- (count operations) 2))]
+        (when (and (every? #(or (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" %)
+                               (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" %)) prefix)
+                   (not-any? #{carry} (tree-seq coll? seq [prefix term])))
+          ;; Outer ranges may originate in index arithmetic whose intermediate width was not
+          ;; numerically proved. Reconstruct evidence from literals, storage dtypes and checked
+          ;; scalar prefix operations only; do not borrow untracked external range provenance.
+          (let [proof-values (update-vals loop-values
+                                          #(assoc % :range (scalar-range/for-dtype (:type %))))
+                initial (scalar-value-info! (:initial (first args)) proof-values)
+                prefix-values (validate-dataflow-operations!
+                               prefix proof-values
+                               (assoc context :claimed (atom @(:claimed context))))
+                term-info (scalar-value-info! term prefix-values)
+                ranges (when (= type (:type term-info))
+                         (scalar-range/additive-loop-ranges (:range initial) (:range term-info) trips))]
+            (when (and ranges (scalar-range/contained-in-dtype? (:result ranges) type))
+              ranges)))))))
+
 (defn- static-workgroup-width!
   [launch]
   (let [workgroup (cond
@@ -1589,6 +1629,11 @@
                                         initial
                                         (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
+            additive-ranges (additive-loop-ranges! operation loop-values
+                                                    (assoc context :control-uniformity loop-control))
+            loop-values (if-let [entry (:entry additive-ranges)]
+                          (assoc-in loop-values [(:id (:binding (first iter-args))) :range] entry)
+                          loop-values)
             yielded (validate-region! "kernel for-loop body" (:operations operation)
                                       (mapv :binding iter-args) loop-values
                                       (assoc context :control-uniformity loop-control))]
@@ -1608,7 +1653,8 @@
                                     {:reason :kernel-body-loop-result
                                      :result result :yielded yielded-info})))
                   (assoc env (:id result)
-                         (assoc (conservative-loop-info yielded-info (:type result)) :uniformity
+                         (assoc (cond-> (conservative-loop-info yielded-info (:type result))
+                                  additive-ranges (assoc :range (:result additive-ranges))) :uniformity
                                 ;; The loop may execute zero times, so its result cannot be
                                 ;; more uniform than either the initial or backedge value.
                                 (reduce set/intersection loop-control
