@@ -9,6 +9,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
+            [raster.compiler.passes.parallel.staged-scalar-body :as recursive]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]))
@@ -33,10 +34,12 @@
    All candidates share logical Byte inputs and one output. Compilation/binding and transfers are
    outside device samples. No autotuning cache or production route is changed.
    :comparison-mode :typed-native-dot compares one typed schedule with emulated/native dot;
-   both use explicit CL3.0. The default :retained keeps the three historical candidates."
+   both use explicit CL3.0. :typed-recursive compares the specialized two-stage and generic
+   recursive generated schedules on the same two-stage workload. The default :retained keeps
+   the three historical candidates. None measures public compiler or external baseline throughput."
   [{:keys [shape revision environment rounds warmup-rounds comparison-mode]
     :or {rounds 12 warmup-rounds 3 comparison-mode :retained}}]
-  (when-not (contains? #{:retained :typed-native-dot} comparison-mode)
+  (when-not (contains? #{:retained :typed-native-dot :typed-recursive} comparison-mode)
     (throw (ex-info "unknown probe comparison mode" {:comparison-mode comparison-mode})))
   (when-not (and (vector? shape) (= 4 (count shape))
                  (every? #(and (integer? %) (pos? %)) shape)
@@ -57,12 +60,18 @@
         typed (target/emit-static-dense-graph "probe_typed" scheduled :opencl-portable
                  (if (= :typed-native-dot comparison-mode)
                    {:attributes {:compilation {:language-standard "CL3.0"}}} {}))
-        candidates (if (= :typed-native-dot comparison-mode)
+        candidates (case comparison-mode
+                     :typed-native-dot
                      [[:typed typed]
                       [:native (target/emit-static-dense-graph
                                 "probe_native" scheduled :opencl-portable
                                 {:target-features
                                  {:intrinsic-implementations {:dp4a :opencl-packed-dot}}})]]
+                     :typed-recursive
+                     [[:typed typed]
+                      [:recursive (target/emit-static-dense-graph
+                                   "probe_recursive" (recursive/lower facts) :opencl-portable)]]
+                     :retained
                      [[:typed typed] [:scalar (retained-artifact facts false)]
                       [:packed (retained-artifact facts true)]])
         ;; Positive products ensure even complete periodic cycles cannot hide a zero-writing bug.
