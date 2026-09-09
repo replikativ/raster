@@ -1419,12 +1419,13 @@ The immediate continuation after the verified double-buffered weighted-reduction
    launch shape as well as numerical parity. This is emission coverage, not a performance claim.
    Result-valued store loops may also precede other store loops in the same ordered effect spine;
    the result scopes over those later loops, without moving their reads before earlier writes.
-   The next source-admission gap is a scalar binding *between* such loops (prefill softmax is a
-   concrete workload). The canonical dialect now admits a nested `effect-region` for this lexical
+   Scalar bindings *between* such loops now enter a nested `effect-region` (prefill softmax is a
+   concrete workload). The canonical dialect represents this lexical
    continuation: validation, host realization, and KernelBody lowering retain its evaluation point
-   and do not export its locals. This does not yet admit that source shape. Frontend capture/conflict
-   analysis and source projection must preserve the same boundary before prefill softmax can leave
-   its compatibility path. Parallel scheduling additionally needs a shared ownership proof for
+   and do not export its locals. Source admission preserves sequential multi-binding lets and
+   includes continuation initializers in capture/read/conflict analysis without hoisting them.
+   Prefill softmax now emits one KernelBody kernel without a compatibility leaf; it is still
+   sequential. Parallel scheduling additionally needs a shared ownership proof for
    reads and repeated writes by the same work item across distinct loop-local coordinates. Proving
    each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
    indirect or neighboring-row accesses must remain sequential. No attention-specific exception,
