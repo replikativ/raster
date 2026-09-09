@@ -300,6 +300,10 @@
       (:kernels (equation-first/compile
                  #'staged-public/packed-byte-single-stage! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'staged-public/decoded-byte-explicit-accumulator! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'staged-public/explicit-double-accumulator-epilogue! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))

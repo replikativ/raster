@@ -31,6 +31,7 @@
     (probe/opencl-skip! "single-stage typed byte contraction")
     (doseq [[function width decode]
             [[#'fixtures/decoded-byte-single-stage! 3 #(- (long %) 7)]
+             [#'fixtures/decoded-byte-explicit-accumulator! 3 #(- (long %) 7)]
              [#'fixtures/packed-byte-single-stage! 4 long]]]
      (let [a (byte-array (take (* 2 width) [-128 127 0 11 -13 5 127 -128]))
           b (byte-array (take (* 2 width) [127 -128 9 0 11 -4 -128 127]))

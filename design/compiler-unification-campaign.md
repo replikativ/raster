@@ -825,3 +825,17 @@ base case. Both have independent Arc references and public vendor compile fixtur
 mismatch and seeded stages remain errors; unproved Int prefix bounds remain capability declines.
 This admits explicit single-stage source contracts; the legacy router's implicit stage synthesis
 and layout-retargeting still need normalization before the old staged emitter can be removed.
+
+### Explicit accumulator policy enters the shared stage path
+
+For explicit `:acc-dtype`, a single-axis additive reduction with a proved zero identity and
+nonempty output axes can expose its canonical accumulator as a one-stage schedule. The helper
+reads dtype, combine and neutral from the existing ProductReduction view; it does not infer
+accumulation precision from Byte storage. Output dtype is retained independently. Integral zero
+is spelled at the accumulator width after stage legality proves the identity is zero.
+
+Source epilogue typing also retains `:acc-dtype` before output conversion. Public Arc cases cover
+decoded Byte/Int accumulation and a Double accumulator with Float storage and a rounding-sensitive
+epilogue. Both enter vendor compile fixtures. Rank-zero, multiple reduced axes, non-additive folds
+and undeclared accumulator precision retain their existing paths. Implicit legacy Byte policy still
+requires a numeric equivalence proof; this is not a blanket Byte-to-Int rewrite or emitter retirement.

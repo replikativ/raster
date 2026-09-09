@@ -26,6 +26,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as contract-stages]
             [raster.compiler.ir.reduction :as reduction]))
@@ -275,6 +276,29 @@
      :dtype (first (reduction/dtypes (:reduction facts)))}))
 
 ;; ── body shape: what a leaf that DISCARDS the body must first account for ────────────
+(defn explicit-accumulator-stage
+  "Expose an explicitly declared single-axis accumulator as the stage schedule's base case.
+   Precision, combine and identity come from the canonical reduction, never operand storage.
+   Other reductions remain unchanged and retain their existing admission paths."
+  [source]
+  (if (and (contains? (:opts source) :acc-dtype)
+           (seq (:free-axes source))
+           (empty? (:stages source)) (= 1 (count (:contract-axes source))))
+    (let [{:keys [dtype combine neutral]} (scalar-reduction-view source)
+          [axis extent] (first (:contract-axes source))
+          stages [{:axis axis :extent extent :dtype dtype :init neutral}]]
+      (if (and (contains? '#{+ clojure.core/+ raster.numeric/+} combine)
+               (:ok (contract-stages/stages-legal? stages (:contract-axes source))))
+        (from-components
+         (-> (select-keys source [:out :free-axes :contract-axes :body :opts :dtype])
+             ;; Stage legality proved the identity is zero; spell that zero at integral width
+             ;; instead of carrying the surface default 0.0 into an integral KernelBody literal.
+             (assoc-in [:opts :stages] (cond-> stages
+                                         (not (dtype/fp-dtype? dtype)) (assoc-in [0 :init] 0)))
+             (assoc-in [:opts :out-dtype] (or (:out-dtype source) (:dtype source)))))
+        source))
+    source))
+
 (defn body-product-of
   "If `body` is exactly the product of agets on the operands named by `syms` (each once, no other
    factors), return those terms; otherwise nil.
