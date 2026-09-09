@@ -79,6 +79,18 @@ work at eight million products and logical resident storage at 64 MiB; these are
 driver memory caps. Positive periodic inputs prevent an all-zero oracle. Broader signed and
 cancellation correctness remains covered separately by the staged-contraction device tests.
 
+`:comparison-mode :typed-recursive` compares the specialized two-stage generated schedule with
+the recursive generated schedule on the same two-stage facts, ABI storage and dyadic oracle.
+This is a schedule-regression probe, not a public-source or external-baseline benchmark, and it
+does not measure three-stage throughput. Both paths use the default portable dot implementation.
+
+`bench/results/recursive-stage-f714a871.edn` retains two initial laptop samples, including raw
+rotating measurements and executable signatures. Both shapes pass the exact oracle. Median
+microseconds for specialized/recursive were 21.458 / 20.312 for `[3 5 3 32]` and
+12.291 / 10.937 for `[16 64 8 32]`. Every series failed the CV heuristic; these short, noisy runs
+do not establish a speedup or justify schedule promotion. The saved revision identifies the
+compiler commit plus the uncommitted probe-mode addition used for the measurement.
+
 The saved internal probe `bench/results/staged-paired-fa7319e4.edn` uses 6 warmup rounds and 24
 measured rotating rounds on the Intel Arc laptop. Median microseconds for typed/scalar/packed:
 `[1 128 32 32]`: 38.958 / 24.166 / 32.708; `[4 128 32 32]`: 41.041 / 19.687 / 32.500.
