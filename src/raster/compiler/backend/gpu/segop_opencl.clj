@@ -30,6 +30,7 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
@@ -460,6 +461,9 @@
         :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
        (catch clojure.lang.ExceptionInfo exception
          (if (and (kernel-body-c-dialect/opencl? target)
+                  ;; A source-shaped fallback cannot preserve the new carried-effect contract.
+                  (not (soac-dialect/scheduled-effect-carries?
+                        (get-in operation [:scalar-region :effects])))
                   (segmap-body/declined? exception))
            (try
              (kart/certify-scheduled-operation

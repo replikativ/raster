@@ -22,6 +22,7 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
+            [raster.compiler.passes.parallel.carried-effect-loop-fixture :as carried-fixture]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged-body]
@@ -397,6 +398,8 @@
                             (get-in (segop-emit/generate-kernel-graph
                                      (capacity-fixture/graph) :target-dialect dialect)
                                     [:nodes 0 :operation]))
+           (write-artifact! directory suffix "scheduled-carried-effect-loop"
+                            (carried-fixture/artifact (carried-fixture/scheduled-loop 8) dialect))
            (write-artifact! directory suffix "public-outer-product"
                             (get-in (segop-emit/generate-kernel-graph
                                      (capacity-fixture/inferred-graph) :target-dialect dialect)
