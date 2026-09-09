@@ -976,45 +976,12 @@
           j-sym (gensym "effect_i__")
           {:keys [locals effects]} (:scalar-region segmap)
           carried-effects? (soac-dialect/scheduled-effect-carries? effects)
-          generated-cast (fn [tag]
-                           (if (and carried-effects? (= 'float tag))
-                             'clojure.core/unchecked-float
-                             (symbol "clojure.core" (name tag))))
+          generated-cast (partial effect-source/storage-cast carried-effects?)
           _ (when (seq effects)
               (soac-dialect/validate-scheduled-effect-carries!
                effects (concat (:inputs segmap) (:outputs segmap) (:scalars segmap)
                                [index] (map :id locals))))
-          ;; Typed locals are materialized as explicit casts; source binder tags inside their
-          ;; initializers (a walker `^double v` over a primitive init) would make the JVM compiler
-          ;; refuse the form, so the tags are dropped here and the casts carry the types.
-          strip-binder-tags
-          (fn [form]
-            (clojure.walk/postwalk
-             (fn [x]
-               (if (and (seq? x) (contains? #{'let* 'loop*} (first x)) (vector? (second x)))
-                 (with-meta
-                   (list* (first x)
-                          (vec (map-indexed (fn [ordinal item]
-                                              (if (and (even? ordinal) (symbol? item)
-                                                       (:tag (meta item)))
-                                                (vary-meta item dissoc :tag)
-                                                item))
-                                            (second x)))
-                          (nnext x))
-                   (meta x))
-                 x))
-             form))
-          materialize-locals
-          (fn [locals body]
-            (if (seq locals)
-              (list 'let*
-                    (vec (mapcat (fn [{:keys [id dtype init]}]
-                                   (let [tag (dtype/scalar-tag-for-dtype dtype)]
-                                     [(with-meta id {:raster.type/tag tag})
-                                      (list (generated-cast tag) (strip-binder-tags init))]))
-                                 locals))
-                    body)
-              body))
+          materialize-locals (partial effect-source/typed-locals generated-cast)
           effect-statement
           (fn effect-statement
             [{:keys [destination dtype conflict destination-index predicate value] :as effect}]
@@ -1037,30 +1004,7 @@
               (if (contains? #{true 1} predicate)
                 store
                 (list 'if predicate store))))
-          loop-statement
-          (fn [{:keys [index lower extent locals carry]} ordered-body]
-                  (let [{:keys [parameter dtype init update]} carry
-                        ;; A typed FP carry rounds to its storage precision with IEEE overflow.
-                        ;; This generated conversion is not a user-written checked `float` call.
-                        tag (when carry (generated-cast (dtype/scalar-tag-for-dtype dtype)))
-                        index-tag (if carry 'clojure.core/long 'clojure.core/int)
-                        limit (gensym "effect_carry_limit__")
-                        initial (gensym "effect_carry_init__")
-                        loop-form
-                        (list 'let* (cond-> [limit (list index-tag extent)]
-                                      carry (conj initial (list tag (strip-binder-tags init))))
-                              (list 'loop* (cond-> [index (list index-tag lower)]
-                                             carry (conj parameter initial))
-                                    (list 'if (ix< index limit)
-                                          (materialize-locals
-                                           locals
-                                           (list 'do ordered-body
-                                                 (list* 'recur
-                                                        (cond-> [(list (if carry 'clojure.core/unchecked-inc
-                                                                         'clojure.core/unchecked-inc-int) index)]
-                                                          carry (conj (list tag (strip-binder-tags update)))))))
-                                          parameter)))]
-                    loop-form))
+          loop-statement (partial effect-source/counted-loop generated-cast)
           typed-region-body
           (when (seq effects)
             (materialize-locals locals

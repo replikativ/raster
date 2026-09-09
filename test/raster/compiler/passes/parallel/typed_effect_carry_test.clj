@@ -48,11 +48,50 @@
     (is (zero? (:vertical stats)))
     (is (zero? (:horizontal stats)))
     (is (= :explicit-typed-algorithm (get-in (route/program-envelope program) [:attributes :host-control])))
-    (is (= :carried-effect-realization
-           (try ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'scalar-region)
-                 (first (dialect/equations program)))
-                :accepted
-                (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e))))))))
+    (is (some? (-> ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'scalar-region)
+                   (first (dialect/equations program)))
+                  :bodies first dialect/effect-parts :carry)))))
+
+(defn- host-source [program]
+  (:source ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
+            (dialect/validate! program) (first (dialect/equations program)))))
+
+(deftest production-carries-share-scheduled-execution-and-hygiene
+  (doseq [trips [0 1 8] physical ['seed 'i 'acc 'sum 'loaded 'float]]
+    (let [program (dialect/remap-values (fixture/typed-program trips) {'seed physical})
+          operation (first (lower/lower-typed-effect-map program :ze:0))
+          arguments ['x 'words 'totals 'rows physical]
+          host (eval (list 'fn arguments (host-source program)))
+          scheduled (eval (list 'fn arguments (jvm/compile-effect-segmap operation)))
+          x (float-array (range 16))
+          host-words (float-array (repeat 16 -77)) host-totals (float-array 2)
+          words (float-array (repeat 16 -77)) totals (float-array 2)]
+      (scheduled x words totals 2 (float 0.25))
+      (is (nil? (host x host-words host-totals 2 (float 0.25))))
+      (is (= (vec words) (vec host-words)))
+      (is (= (vec totals) (vec host-totals))))))
+
+(deftest production-carry-preserves-generated-fp32-conversion-and-checked-source-arithmetic
+  (let [overflow-init (rewrite-loop (fixture/typed-program 0)
+                                    (fn [[op attrs extent _ lambda]]
+                                      (list op attrs extent 1.0e100 lambda)))
+        host (eval (list 'fn '[x words totals rows seed] (host-source overflow-init)))
+        totals (float-array 1)]
+    (host (float-array 16) (float-array 16) totals 1 (float 0.25))
+    (is (= Float/POSITIVE_INFINITY (aget totals 0))))
+  (let [checked (rewrite-loop
+                 (fixture/typed-program 1)
+                 (fn [[op attrs extent init [lam params [region locals effects _]]]]
+                   (list op attrs extent init
+                         (list lam params
+                               (list region locals effects
+                                     (with-meta '(clojure.core/+ 9223372036854775807 1)
+                                                {:raster.type/tag 'long}))))))
+        host (eval (list 'fn '[x words totals rows seed] (host-source checked)))
+        words (float-array (repeat 16 -77)) totals (float-array [-77])]
+    (is (thrown? ArithmeticException (host (float-array (range 16)) words totals 1 (float 0.25))))
+    (is (= 0.0 (aget words 0)) "the store precedes the failing recurrence")
+    (is (= -77.0 (aget totals 0)) "a failed recurrence never publishes its continuation result")))
 
 (deftest canonical-carries-reject-invalid-shapes-scope-and-hidden-writes
   (let [program (fixture/typed-program 1)

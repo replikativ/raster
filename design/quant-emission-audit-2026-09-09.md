@@ -142,10 +142,10 @@ it into the scheduled region; validation threads result scope through subsequent
 checks destination reads against read-write storage and explicit read effects. Existing pure-map
 fusion does not absorb these ordered effect maps.
 
-Direct canonical program envelopes and scheduled JVM/KernelBody emission are exercised. The
-production source-realization adapter explicitly refuses carried loops until its continuation
-binding is implemented; frontend recognition is still closed. No throughput claim or public
-quantizer migration follows from this slice.
+Direct canonical program envelopes and scheduled JVM/KernelBody emission are exercised. Production
+host realization now uses the same carried-loop construction as scheduled JVM emission; frontend
+recognition is still closed. No throughput claim or public quantizer migration follows from this
+slice.
 
 ## Hygienic effect-region instantiation
 
@@ -158,15 +158,27 @@ before element reads are synthesized. Physical core-named symbols such as `count
 
 Focused validation covers scope round trips, alpha-renaming, free variables, malformed forms,
 physical buffer/scalar collisions, and OpenCL device execution; CUDA/HIP compile fixtures include
-a colliding physical capture. The production continuation adapter and frontend admission remain
-the next gates before migrating the public Q8_K packers.
+a colliding physical capture. Frontend admission remains the next gate before migrating the public
+Q8_K packers.
 
 Scheduled JVM emission and production host realization now share ordered continuation construction
 through `effect-source/ordered-effects`. Store and loop spelling retain their existing target
-policies, but the `do`/result-binding spine is no longer duplicated. This preparatory extraction
-does not yet open carried source realization or frontend admission.
+policies, but the `do`/result-binding spine is no longer duplicated.
 
 Both projections also use `typed-soac-projection/instantiate-effect-region` for physical-name
 binding. The host adapter no longer reconstructs and substitutes each effect independently.
 Generated host casts are qualified so a physical value named `float` cannot capture them; user
 expressions are unchanged. Canonical-to-host tests cover colliding map, local, and core names.
+
+## Shared carried-loop host realization
+
+The existing scheduled JVM counted-loop builder, local materialization, and generated storage-cast
+policy are shared with production host realization. Both evaluate the bound and initializer once,
+execute stores before the recurrence, and scope the result over only subsequent effects. Generated
+FP32 conversions preserve IEEE overflow; user-written checked arithmetic still throws after any
+preceding stores. Existing ordinary source loops retain their induction policy.
+
+Parity tests exercise zero/one/eight trips, poisoned tails, physical-name collisions, overflowing
+FP32 initialization, and a checked Long recurrence that must fail before publishing its result.
+This admits canonical carried regions to host realization, not analyzed quantizer source. The
+frontend must still recognize a typed single-carry store loop without hoisting it into pure locals.
