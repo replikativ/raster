@@ -694,6 +694,59 @@
                    [effect]))
                effects)))
 
+(defn scheduled-effect-carries?
+  "Whether scheduled effects contain a result-carrying loop, including nested effect scopes."
+  [effects]
+  (boolean (some (fn [effect]
+                   (when-let [loop (:loop effect)]
+                     (or (:carry loop) (scheduled-effect-carries? (:effects loop))))) effects)))
+
+(defn validate-scheduled-effect-carries!
+  "Check the lexical contract of optional single-result carries in scheduled effect loops.
+
+   A carry is {:parameter symbol :result symbol :dtype dtype :init scalar :update scalar}.
+   Initializers see the enclosing region; updates additionally see the loop index, parameter
+   and ordered loop locals. Only the result escapes, and only to subsequent effects. This is
+   shared by JVM and KernelBody lowering; it does not admit new source/dialect forms."
+  [effects scope]
+  (letfn [(fail [message data]
+            (throw (ex-info message (assoc data :reason :scheduled-effect-carry))))
+          (closed! [expression bound field]
+            (when-let [unbound (seq (util/free-syms expression bound))]
+              (fail "effect carry expression is outside its lexical scope"
+                    {:field field :unbound (set unbound) :expression expression})))
+          (walk [effects bound]
+            (reduce
+             (fn [bound effect]
+               (if-let [{:keys [index lower extent locals effects carry]} (:loop effect)]
+                 (if carry
+                   (let [{:keys [parameter result dtype init update]} carry
+                         ids (concat [index parameter result] (map :id locals))]
+                     (when-not (and (= #{:parameter :result :dtype :init :update} (set (keys carry)))
+                                    (every? symbol? ids)
+                                    (= (count ids) (count (distinct ids)))
+                                    (empty? (set/intersection bound (set ids)))
+                                    (not-any? :loop effects)
+                                    (contains? #{:int :long :float :double} dtype))
+                       (fail "effect carry requires distinct typed lexical binders" {:carry carry}))
+                     (doseq [[field expression] [[:lower lower] [:extent extent] [:init init]]]
+                       (closed! expression bound field))
+                     (let [inner (reduce (fn [scope {:keys [id init]}]
+                                           (closed! init scope :local)
+                                           (conj scope id))
+                                         (conj bound index parameter) locals)
+                           after-effects (walk effects inner)]
+                       (closed! update after-effects :update))
+                     (conj bound result))
+                   ;; Ordinary loops do not export names, including any nested carried result.
+                   (do (walk effects (into (conj bound index) (map :id locals))) bound))
+                 (do (doseq [field [:destination-index :predicate :value]]
+                       (closed! (get effect field) bound field))
+                     bound)))
+             bound effects))]
+    (walk effects (set scope))
+    effects))
+
 (defn local-value
   "Construct one explicitly typed scalar-region SSA definition."
   [id dtype init]

@@ -9,12 +9,14 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
@@ -198,13 +200,19 @@
                         (index-expression/lower
                          expression (set/union index-scope extra-scope) decline!)
                         (merge index-types extra-types))))
+        carried-effects? (soac-dialect/scheduled-effect-carries? effects)
         lowerer (scalar-expression/make-lowerer
-                 {:array-types array-types :scalar-types scalar-types
-                  :arrays (set inputs) :index-scope index-scope
-                  :lower-index lower-index :predicate :map-active
-                  :source-region [locals result effects]
-                  :id-prefix "map" :decline! decline!})
+                 (cond-> {:array-types array-types :scalar-types scalar-types
+                          :arrays (set inputs) :index-scope index-scope
+                          :lower-index lower-index :predicate :map-active
+                          :source-region [locals result effects]
+                          :id-prefix "map" :decline! decline!}
+                   carried-effects? (assoc :require-source-types? true
+                                           :conversion-policy scalar-conversion/policy)))
         base-environment (assoc scalar-types index :long)
+        _ (when (seq effects)
+            (soac-dialect/validate-scheduled-effect-carries!
+             effects (concat inputs outputs (keys base-environment) (map :id locals))))
         lower-locals
         (fn [locals base-environment]
         (reduce
@@ -217,7 +225,8 @@
                                {:operation (:id segmap) :local id
                                 :scalar-region (:scalar-region segmap)}))
                  init (util/subst-syms substitutions init)
-                 lowered ((:lower lowerer) init local-type environment)]
+                 lowered ((:lower lowerer) init local-type environment)
+                 lowered (if carried-effects? ((:cast lowerer) lowered local-type init) lowered)]
              {:substitutions (assoc substitutions id (:result lowered))
               :operations (into operations (:operations lowered))
               :environment (assoc environment (:result lowered) (:type lowered))}))
@@ -279,7 +288,10 @@
             (if-let [loop (:loop effect)]
               (assoc effect :loop
                      (-> loop
+                         (update :lower substitute)
                          (update :extent substitute)
+                         (cond-> (:carry loop)
+                           (update :carry #(-> % (update :init substitute) (update :update substitute))))
                          (update :locals (fn [locals] (mapv #(update % :init substitute) locals)))
                          (update :effects (fn [effects]
                                             (mapv #(substitute-effect substitutions %) effects)))))
@@ -289,25 +301,49 @@
         (fn lower-effect
           [environment {:keys [destination conflict destination-index predicate value] :as effect}]
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower extent]} (:loop effect)]
+                    :keys [lower extent carry]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
             ;; locals are SSA values scoped to one iteration and its stores keep their own
             ;; per-destination contracts.
-            (let [loop-state (lower-locals loop-locals (assoc environment loop-index :long))
-                  inner (vec (mapcat #(lower-effect (:environment loop-state)
-                                                    (substitute-effect
-                                                     (:substitutions loop-state) %))
-                                     loop-effects))]
-              [(body/->ForLoop
-                (body/value loop-index :long)
-                (lower-index lower (set (keys environment)) environment)
-                (lower-index extent (set (keys environment)) environment)
-                1
-                []
-                (vec (concat (:operations loop-state) inner [(body/->Yield [])]))
-                []
-                {:association :ordered :source-order true})])
-          (do
+            (let [cast-carry (fn [expression environment]
+                               (let [lowered ((:lower lowerer) expression (:dtype carry) environment)]
+                                 ((:cast lowerer) lowered (:dtype carry) expression)))
+                  initial (when carry (cast-carry (:init carry) environment))
+                  ;; Lexical sibling loops may reuse source binders; KernelBody identities may not.
+                  source-index loop-index
+                  loop-index (if carry ((:fresh-binding lowerer) "effect-index") loop-index)
+                  parameter (when carry ((:fresh-binding lowerer) "effect-carry"))
+                  renames (cond-> {} carry (assoc source-index loop-index (:parameter carry) parameter))
+                  loop-locals (mapv #(update % :init (partial util/subst-syms renames)) loop-locals)
+                  loop-effects (mapv #(substitute-effect renames %) loop-effects)
+                  loop-environment (cond-> (assoc environment loop-index :long)
+                                     carry (assoc parameter (:dtype carry)))
+                  loop-state (lower-locals loop-locals loop-environment)
+                  inner (reduce (fn [{:keys [environment operations]} effect]
+                                  (let [next (lower-effect environment
+                                                           (substitute-effect (:substitutions loop-state) effect))]
+                                    (update next :operations #(into operations %))))
+                                {:environment (:environment loop-state) :operations []} loop-effects)
+                  update-value (when carry
+                                 (cast-carry
+                                  (util/subst-syms (:substitutions loop-state)
+                                                  (util/subst-syms renames (:update carry)))
+                                  (:environment inner)))
+                  loop-operation (body/->ForLoop
+                                  (body/value loop-index :long)
+                                  (lower-index lower (set (keys environment)) environment)
+                                  (lower-index extent (set (keys environment)) environment)
+                                  1
+                                  (if carry [(body/->LoopArg (body/value parameter (:dtype carry))
+                                                            (:result initial))] [])
+                                  (vec (concat (:operations loop-state) (:operations inner)
+                                               (:operations update-value)
+                                               [(body/->Yield (if carry [(:result update-value)] []))]))
+                                  (if carry [(body/value (:result carry) (:dtype carry))] [])
+                                  {:association :ordered :source-order true})]
+              {:operations (conj (vec (:operations initial)) loop-operation)
+               :environment (cond-> environment carry (assoc (:result carry) (:dtype carry)))})
+          (let [operations (do
           (when-not (contains? output-set destination)
             (decline! :effect-destination
                       "ordered effect targets an undeclared result"
@@ -338,11 +374,15 @@
                 (vec (concat (:operations lowered-predicate)
                              [(body/->IfRegion (:result lowered-predicate)
                                                (conj effect-operations (body/->Yield []))
-                                               [(body/->Yield [])] [])]))))))))
+                                               [(body/->Yield [])] [])]))))))]
+            {:operations operations :environment environment})))
         effect-operations
-        (vec (mapcat #(lower-effect environment
-                                    (substitute-effect (:substitutions local-state) %))
-                     effects))
+        (:operations
+         (reduce (fn [{:keys [environment operations]} effect]
+                   (let [next (lower-effect environment
+                                            (substitute-effect (:substitutions local-state) effect))]
+                     (update next :operations #(into operations %))))
+                 {:environment environment :operations []} effects))
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))

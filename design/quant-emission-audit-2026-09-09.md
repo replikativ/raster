@@ -99,3 +99,28 @@ The second phase still declines TypedSOAC admission. Its store loop also carries
 the frontend currently admits index-only store loops. The next generalization must preserve
 result-carrying effects and their order through the existing effect-region and KernelBody loop
 contracts. Do not conceal this with a quantization-specific emitter or a claimed typed route.
+
+## Scheduled carried-effect prerequisite
+
+The shared scheduled scalar region can now express a single typed carry/result on an ordered
+store loop. JVM lowering binds the result around the following effects; GPU lowering uses the
+existing KernelBody LoopArg/ForLoop/Yield contract. Loop locals and parameters do not escape,
+zero-trip loops return their initializer, and stores precede recurrence computation. Lexical
+sibling binders are renamed into collision-free KernelBody SSA identities.
+
+This is a **scheduled-region prerequisite**, not new TypedSOAC source admission. Canonical
+dialect projection and frontend recognition remain closed until the next slice. The public Q8_K
+packers therefore still use the measured compatibility route and unchanged two-phase schedule.
+
+Carried regions require retained compound source types and reject unsupported conversions rather
+than inheriting map emission's device-wrap defaults. Checked integer arithmetic retains its width
+before a floating carry conversion. Generated FP32 storage conversions use IEEE rounding/overflow
+in both JVM and KernelBody; they are distinct from user-written checked casts. Source-shaped
+compatibility emission is forbidden for this new scheduled contract. Nested loops inside a carried
+loop and multiple carry/result slots remain deliberately unsupported.
+
+Focused validation covers zero/one/eight iterations, continuation scope, sibling reuse, lower-bound
+substitution, shadowing of cast names, source overflow order, and fail-closed conversion/type cases.
+The OpenCL device oracle checks two independent rows and poisoned output tails. The same scheduled
+fixture joins hardware-free CUDA/HIP compiler gates; this does not claim vendor-device execution
+or any packing throughput improvement yet.

@@ -974,6 +974,15 @@
           n-sym (gensym "effect_n__")
           j-sym (gensym "effect_i__")
           {:keys [locals effects]} (:scalar-region segmap)
+          carried-effects? (soac-dialect/scheduled-effect-carries? effects)
+          generated-cast (fn [tag]
+                           (if (and carried-effects? (= 'float tag))
+                             'clojure.core/unchecked-float
+                             (symbol "clojure.core" (name tag))))
+          _ (when (seq effects)
+              (soac-dialect/validate-scheduled-effect-carries!
+               effects (concat (:inputs segmap) (:outputs segmap) (:scalars segmap)
+                               [index] (map :id locals))))
           ;; Typed locals are materialized as explicit casts; source binder tags inside their
           ;; initializers (a walker `^double v` over a primitive init) would make the JVM compiler
           ;; refuse the form, so the tags are dropped here and the casts carry the types.
@@ -1001,26 +1010,13 @@
                     (vec (mapcat (fn [{:keys [id dtype init]}]
                                    (let [tag (dtype/scalar-tag-for-dtype dtype)]
                                      [(with-meta id {:raster.type/tag tag})
-                                      (list tag (strip-binder-tags init))]))
+                                      (list (generated-cast tag) (strip-binder-tags init))]))
                                  locals))
                     body)
               body))
           effect-statement
           (fn effect-statement
             [{:keys [destination dtype conflict destination-index predicate value] :as effect}]
-            (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                      :keys [lower extent]} (:loop effect)]
-              (let [loop-n (gensym "effect_loop_n__")]
-                (list 'let* [loop-n (list 'int extent)]
-                      (list 'loop* [loop-index (list 'int lower)]
-                            (list 'if (ix< loop-index loop-n)
-                                  (list 'do
-                                        (materialize-locals
-                                         loop-locals
-                                         (list* 'do (mapv effect-statement loop-effects)))
-                                        (list 'recur
-                                              (list 'clojure.core/unchecked-inc-int loop-index)))
-                                  nil))))
             (let [reduction? (soac-dialect/reducing-scatter-conflict? conflict)
                   destination-dtype (or dtype (when reduction? (:dtype conflict)))
                   scalar-tag (when destination-dtype
@@ -1033,16 +1029,47 @@
                                 (with-meta destination
                                   {:tag array-tag :raster.type/tag array-tag})
                                 destination)
-                  value (if scalar-tag (list scalar-tag value) value)
+                  value (if scalar-tag (list (generated-cast scalar-tag) value) value)
                   store (if reduction?
                           (list 'raster.par/atomic-add! destination destination-index value)
                           (list 'clojure.core/aset destination destination-index value))]
               (if (contains? #{true 1} predicate)
                 store
-                (list 'if predicate store)))))
+                (list 'if predicate store))))
+          effect-spine
+          (fn effect-spine [items]
+            (if-let [effect (first items)]
+              (if-let [{:keys [index lower extent locals effects carry]} (:loop effect)]
+                  (let [{:keys [parameter result dtype init update]} carry
+                        ;; A typed FP carry rounds to its storage precision with IEEE overflow.
+                        ;; This generated conversion is not a user-written checked `float` call.
+                        tag (when carry (generated-cast (dtype/scalar-tag-for-dtype dtype)))
+                        index-tag (if carry 'clojure.core/long 'clojure.core/int)
+                        limit (gensym "effect_carry_limit__")
+                        initial (gensym "effect_carry_init__")
+                        loop-form
+                        (list 'let* (cond-> [limit (list index-tag extent)]
+                                      carry (conj initial (list tag (strip-binder-tags init))))
+                              (list 'loop* (cond-> [index (list index-tag lower)]
+                                             carry (conj parameter initial))
+                                    (list 'if (ix< index limit)
+                                          (materialize-locals
+                                           locals
+                                           (list 'do (effect-spine effects)
+                                                 (list* 'recur
+                                                        (cond-> [(list (if carry 'clojure.core/unchecked-inc
+                                                                         'clojure.core/unchecked-inc-int) index)]
+                                                          carry (conj (list tag (strip-binder-tags update)))))))
+                                          parameter)))]
+                    ;; The result's binding encloses only the continuation, never preceding effects.
+                    (if carry
+                      (list 'let* [result loop-form] (effect-spine (next items)))
+                      (list 'do loop-form (effect-spine (next items)))))
+                (list 'do (effect-statement effect) (effect-spine (next items))))
+              nil))
           typed-region-body
           (when (seq effects)
-            (materialize-locals locals (list* 'do (mapv effect-statement effects))))
+            (materialize-locals locals (effect-spine effects)))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
                 (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
