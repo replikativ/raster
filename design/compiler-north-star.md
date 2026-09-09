@@ -1424,8 +1424,11 @@ The immediate continuation after the verified double-buffered weighted-reduction
    continuation: validation, host realization, and KernelBody lowering retain its evaluation point
    and do not export its locals. Source admission preserves sequential multi-binding lets and
    includes continuation initializers in capture/read/conflict analysis without hoisting them.
-   Prefill softmax now emits one KernelBody kernel without a compatibility leaf; it is still
-   sequential. Parallel scheduling additionally needs a shared ownership proof for
+   Production admission temporarily declines sequential nested continuations with the explicit
+   `:sequential-effect-continuation` diagnostic. Prefill softmax retains its existing parallel
+   compatibility launch: replacing it with a single-work-item KernelBody would be a performance
+   regression, not convergence. Direct frontend/host/KernelBody tests exercise the new capability
+   independently of this gate. Removing the gate needs a shared ownership proof for
    reads and repeated writes by the same work item across distinct loop-local coordinates. Proving
    each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
    indirect or neighboring-row accesses must remain sequential. No attention-specific exception,

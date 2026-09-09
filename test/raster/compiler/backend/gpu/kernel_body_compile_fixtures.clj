@@ -344,8 +344,6 @@
       (:kernels (equation-first/compile
                  #'qk/quant-act-q8k-padded-rows-gpu! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
-                 #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
-      (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
 
 (defn- write-artifact!

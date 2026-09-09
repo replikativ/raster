@@ -9,10 +9,10 @@
   (walk/postwalk #(if (= before %) after %) form))
 
 (defn- execute-source [form]
-  (let [result (fixture/attempt form)]
-    (is (= :typed-soac (get-in result [:stats :route])))
+  (let [program (fixture/continuation-program form)]
+    (is (= :typed-soac (:dialect program)))
     (let [scheduled (:form (segop-lower/segop-lower-pass
-                            (:program result) {:target-device :ze:0 :dtype :float}))]
+                            program {:target-device :ze:0 :dtype :float}))]
       (eval (list 'fn '[x packed scales sums rows width seed]
                   (:form (par-simd/simd-pass scheduled :min-elements 1)))))))
 
