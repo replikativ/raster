@@ -57,16 +57,20 @@
              {:lower (reduce min products) :upper (reduce max products)})
         nil))))
 
+(defn counted-loop-trips
+  "Exact trip count for static positive-step exclusive-upper loops; unknown bounds decline."
+  [lower upper step]
+  (when (and (integer? lower) (integer? upper) (integer? step) (pos? step))
+    (quot (+' (max 0 (-' upper lower)) (dec step)) step)))
+
 (defn counted-loop-index-range
   "Static positive-step counted-loop indices, INCLUDING the increment which exits the loop.
    Unknown bounds/steps return nil. Exact host arithmetic avoids overflow in the proof itself.
    Empty loops include only the initializer; no increment is evaluated. This is an index proof,
    not a proof about loop-carried accumulators or whether runtime scalar bounds fit their ABI."
   [lower upper step]
-  (when (and (integer? lower) (integer? upper) (integer? step) (pos? step))
-    (let [distance (max 0 (-' upper lower))
-          trips (quot (+' distance (dec step)) step)]
-      {:lower lower :upper (+' lower (*' trips step))})))
+  (when-let [trips (counted-loop-trips lower upper step)]
+    {:lower lower :upper (+' lower (*' trips step))}))
 
 (defn accumulation-prefixes
   "Enclose every prefix of up to `count` additions of values in `term`, starting at `initial`.
@@ -74,6 +78,19 @@
   [initial term count]
   (when (and (integer? count) (not (neg? count)))
     (arithmetic :+ [initial (arithmetic :* [term {:lower 0 :upper count}])])))
+
+(defn additive-loop-ranges
+  "Enclose carry values on body entry and after a static additive loop.
+   The caller must independently prove the term range and its independence from evolving carries.
+   Zero trips preserve the initializer without requiring a term range. Body entry excludes the
+   final backedge, avoiding a spurious N+1 iteration. This does not select an overflow policy."
+  [initial term trips]
+  (when (and initial (integer? trips) (not (neg? trips)))
+    (if (zero? trips)
+      {:entry nil :result initial}
+      (when term
+        {:entry (accumulation-prefixes initial term (dec trips))
+         :result (accumulation-prefixes initial term trips)}))))
 
 (defn hull
   "The least interval containing every non-nil input interval, or nil when an input is

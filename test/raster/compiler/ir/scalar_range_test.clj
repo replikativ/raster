@@ -31,6 +31,23 @@
          (ranges/accumulation-prefixes {:lower 10 :upper 10}
                                       {:lower -3 :upper -2} 5))))
 
+(deftest additive-loop-carry-entry-excludes-the-final-backedge
+  (is (= {:entry {:lower 4 :upper 10} :result {:lower 4 :upper 13}}
+         (ranges/additive-loop-ranges {:lower 4 :upper 4} {:lower 2 :upper 3} 3)))
+  (is (= {:entry nil :result {:lower 17 :upper 17}}
+         (ranges/additive-loop-ranges {:lower 17 :upper 17} nil 0)))
+  (doseq [trips [-1 nil 'n 1.0]]
+    (is (nil? (ranges/additive-loop-ranges {:lower 0 :upper 0} {:lower 1 :upper 1} trips))))
+  (is (nil? (ranges/additive-loop-ranges {:lower 0 :upper 0} nil 1)))
+  (doseq [initial [-3 0 7] term [-4 -1 0 2 5] n (range 1 7)]
+    (let [{:keys [entry result]} (ranges/additive-loop-ranges
+                                {:lower initial :upper initial} {:lower term :upper term} n)
+          prefixes (map #(+ initial (* term %)) (range (inc n)))]
+      (is (every? #(<= (:lower entry) % (:upper entry)) (butlast prefixes)))
+      (is (every? #(<= (:lower result) % (:upper result)) prefixes))))
+  (is (= (bigint "18446744073709551615")
+         (ranges/counted-loop-trips Long/MIN_VALUE Long/MAX_VALUE 1))))
+
 (deftest typed-index-ranges-cover-every-small-domain-value
   (doseq [width [1 2 7 12] divisor [1 2 3 5]
           op [:floor-div :mod]]
