@@ -159,6 +159,13 @@
        ;; with the body so the raw AD payload never desyncs from the walked code.
        :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn)))})))
 
+(defn subst-scoped
+  "Capture-avoiding substitution for an IR owner's separately stored binders and ordered body.
+   Returns the common scope-info shape; uses the same scope engine as subst-syms."
+  [smap binders body]
+  (subst-scope smap {:binders binders :inits [] :body body}
+               false false (fn [sm expression] (get sm expression expression))))
+
 (defn subst-syms
   "Capture-avoiding substitution of free symbol occurrences per
    smap {old-sym → replacement-expr}, over a closed-core S-expression.

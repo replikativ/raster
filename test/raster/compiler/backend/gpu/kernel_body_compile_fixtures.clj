@@ -18,6 +18,7 @@
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
@@ -404,6 +405,11 @@
                             (carried-fixture/artifact
                              (first (soac-lower/lower-typed-effect-map
                                      (carried-fixture/typed-program 8) :ze:0)) dialect))
+           (write-artifact! directory suffix "typed-carried-effect-capture-collision"
+                            (carried-fixture/artifact
+                             (first (soac-lower/lower-typed-effect-map
+                                     (soac-dialect/remap-values (carried-fixture/typed-program 8) {'seed 'i}) :ze:0))
+                             dialect :scalar-types {'rows :long 'i :float}))
            (write-artifact! directory suffix "public-outer-product"
                             (get-in (segop-emit/generate-kernel-graph
                                      (capacity-fixture/inferred-graph) :target-dialect dialect)

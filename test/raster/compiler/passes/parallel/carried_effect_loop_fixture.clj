@@ -22,10 +22,10 @@
                {:destination 'totals :dtype :float :conflict :unique
                 :destination-index 'i :predicate true :value 'sum}]}}))
 
-(defn artifact [operation target]
+(defn artifact [operation target & {:keys [scalar-types] :or {scalar-types {'rows :long 'seed :float}}}]
   (emit/generate-scheduled-segmap-kernel
    operation :dtype :float :target-dialect target
-   :array-types {'x :float 'words :float 'totals :float} :scalar-types {'rows :long 'seed :float}))
+   :array-types {'x :float 'words :float 'totals :float} :scalar-types scalar-types))
 
 (defn typed-program [trips]
   (let [words-result [:carry 0] totals-result [:carry 1]

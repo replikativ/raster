@@ -78,6 +78,15 @@
         (= 'fold head)
         {:kind :fold :introduces-scope? true :liftable? false :head head}
 
+        (= 'effect-region head)
+        {:kind :effect-region :introduces-scope? true :liftable? false :head head}
+
+        (= 'effect-loop head)
+        {:kind :effect-loop :introduces-scope? true :liftable? false :head head}
+
+        (= 'effect head)
+        {:kind :effect :introduces-scope? false :liftable? false :head head}
+
         ;; Special forms — NOT liftable
         (contains? #{'try 'catch 'finally 'recur 'throw 'new} head)
         {:kind :special :introduces-scope? false :liftable? false :head head}
@@ -190,7 +199,7 @@
    Returns nil for non-binding forms (the caller recurses generically into all
    children). Otherwise returns:
 
-     {:scopes [{:binders [sym ...]   ;; symbols this scope introduces
+     {:scopes [{:binders [sym ...]   ;; symbols this scope introduces; nil for ordered effect-only slots
                 :inits   [expr ...]  ;; init exprs paired w/ binders (empty for
                                      ;;   fn*/dotimes/catch/par-idx — no init)
                 :body    [expr ...]  ;; exprs in which :binders are visible
@@ -300,6 +309,54 @@
                  (rl form 'fold attributes'
                      (list 'lambda (vec binders) (list 'region [] (vec body))))))}))
 
+        ;; An effect-region's result binders enter scope only after their loop initializer.
+        ;; Nil binder slots retain intervening stores in the same sequential spine.
+        :effect-region
+        (let [[_ locals effects result] form]
+          (when (and (contains? #{3 4} (count form)) (vector? locals) (vector? effects)
+                     (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))) locals))
+            (let [result? (= 4 (count form))
+              local-count (count locals)
+              carry? (fn [effect] (when (and (seq? effect) (= 'effect-loop (first effect)))
+                                    (get-in (second effect) [:carry :result])))
+              result-binders (mapv carry? effects)]
+            {:sequential? true
+             :scopes [{:binders (into (mapv second locals) result-binders)
+                       :inits (into (mapv #(nth % 3) locals) effects)
+                       :body (if result? [result] [])}]
+             :outer []
+             :rebuild
+             (fn [[{:keys [binders inits body]}] _]
+               (let [locals' (mapv (fn [local id init] (rl local (first local) id (nth local 2) init))
+                                   locals (take local-count binders) (take local-count inits))
+                     effects' (mapv (fn [effect original-result result]
+                                      (if original-result
+                                        (apply rl effect (first effect)
+                                               (assoc-in (second effect) [:carry :result] result)
+                                               (nnext effect))
+                                        effect))
+                                    (drop local-count inits) result-binders (drop local-count binders))]
+                 (apply rl form 'effect-region locals' effects' (when result? body))))})))
+
+        :effect-loop
+        (let [[_ attributes extent] form
+              carried? (= 5 (count form))
+              lambda (last form)]
+          (when (and (contains? #{4 5} (count form)) (map? attributes)
+                     (seq? lambda) (= 'lambda (first lambda)) (vector? (second lambda)))
+            (let [[_ parameters region] lambda]
+            {:sequential? false
+             :scopes [{:binders parameters :inits [] :body [region]}]
+             :outer (cond-> [(:lower attributes) extent] carried? (conj (nth form 3)))
+             :rebuild
+             (fn [[{:keys [binders body]}] [lower extent initial]]
+               (let [attributes' (cond-> (assoc attributes :index (first binders) :lower lower)
+                                   carried? (assoc-in [:carry :parameter] (second binders)))
+                     lambda (list 'lambda (vec binders) (first body))]
+                 (if carried?
+                   (rl form 'effect-loop attributes' extent initial lambda)
+                   (rl form 'effect-loop attributes' extent lambda))))})))
+
         ;; letfn* — mutual recursion: binders visible to their own inits
         ;; (matched as :call by form-info, so dispatch on head here)
         :call
@@ -396,7 +453,7 @@
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
-  (contains? #{:scope :lambda :par :fold} (:kind (form-info form))))
+  (contains? #{:scope :lambda :par :fold :effect-region :effect-loop} (:kind (form-info form))))
 
 (defn call-form?
   "True if the form is a function call (.invk or regular)."
