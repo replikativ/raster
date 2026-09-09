@@ -255,7 +255,9 @@
                       (tag-vec (list broadcast species-sym (list cast-fn expr))))
 
                   ;; Primitive cast — transparent
-                  (and (seq? expr) (contains? #{'double 'float} (first expr)) (= 2 (count expr)))
+                  (and (seq? expr)
+                       (contains? '#{double float} (descriptor/cast-result-tag (first expr)))
+                       (= 2 (count expr)))
                   (rewrite-body (second expr))
 
                   ;; Binary op
