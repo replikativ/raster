@@ -1,7 +1,7 @@
 (ns raster.compiler.fixtures.staged-contracts
   "Public staged workloads shared by numerical tests, the debt ledger and vendor compile gates."
   (:require [raster.core :refer [deftm]]
-            [raster.arrays]
+            [raster.arrays :as arrays]
             [raster.numeric]
             [raster.par]))
 
@@ -27,12 +27,15 @@
     :epilogue {:acc value :expr (+ value (aget bias _) gain) :dtype :float
                :operands [{:sym bias :dtype :float :map {:groups [[[i 2]]]}}]}))
 
+(defmacro decoded-read [array index]
+  `(raster.arrays/aget ~array ~index))
+
 (deftm floating-decoded-stages!
   [a :- (Array float) b :- (Array float) out :- (Array float)
    shift :- Float scale :- Float] :- Void
   (raster.par/contract out [[i 2]] [[blk 2] [t 4]]
-    (raster.numeric/* (raster.arrays/aget a (+ (* i 8) (* blk 4) t))
-                      (raster.arrays/aget b (+ (* blk 4) t)))
+    (raster.numeric/* (arrays/aget a (+ (* i 8) (* blk 4) t))
+                      (decoded-read b (+ (* blk 4) t)))
     :decode {a (- x shift) b (* x scale)}
     :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift inner}
              {:axis t :extent 4 :dtype :float :init 0.0}]))

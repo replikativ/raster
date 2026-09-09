@@ -14,6 +14,7 @@
   - Extensible: new form types can be added via defmethod"
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.util :as util]
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
@@ -974,19 +975,42 @@
 (defn- compiler-cast [tag expression]
   (list (symbol "clojure.core" (name tag)) expression))
 
+(defn- load-transform-source
+  "Resolve macros and free var names before load-lambda expansion, without assigning types.
+   The shared lexical substitution protects locals and quoted data from var qualification."
+  [body ctx]
+  (binding [*ns* (the-ns (:source-ns ctx))]
+    (let [expanded (mex/macroexpand-core body)
+          names (into {}
+                      (keep (fn [sym]
+                              (when (and (symbol? sym) (not (contains? (:type-env ctx) sym)))
+                                (let [v (try (ns-resolve *ns* sym) (catch Exception _ nil))]
+                                  (when (and (var? v) (not (:macro (meta v))))
+                                    [sym (symbol (str (ns-name (:ns (meta v))))
+                                                 (str (:name (meta v))))])))))
+                      (tree-seq coll? seq expanded))]
+      (util/subst-syms names expanded
+                       (fn [mapping sym]
+                         (if-let [resolved (get mapping sym)]
+                           (with-meta resolved (meta sym)) sym))))))
+
 (defmethod walk-form :par-contract [source ctx]
   (let [[head output free-axes contract-axes body & options] source
         opts (apply hash-map options)
-        ;; Expand load lambdas BEFORE typing their consumers. Substitution after typing
-        ;; preserves stale arithmetic tags when a decode changes the load's precision.
-        body (if (seq (:decode opts))
-               ((requiring-resolve 'raster.compiler.ir.contraction-facts/apply-load-transforms)
-                body (:decode opts))
-               body)
-        opts (dissoc opts :decode)
         axis-context (fn [axes]
                        (reduce (fn [env [axis _]] (ctx-assoc-type env axis 'long)) ctx axes))
         body-ctx (axis-context (concat free-axes contract-axes))
+        ;; Resolve names, then expand load lambdas BEFORE typing their consumers.
+        ;; Substitution after typing retains stale tags when a decode widens precision.
+        body (if (seq (:decode opts))
+               ((requiring-resolve 'raster.compiler.ir.contraction-facts/apply-load-transforms)
+                (load-transform-source body body-ctx)
+                (into {} (map (fn [[operand expression]]
+                                [operand (load-transform-source expression
+                                                                (ctx-assoc-type body-ctx 'x nil))]))
+                      (:decode opts)))
+               body)
+        opts (dissoc opts :decode)
         scalar-tag #(when (dtype/known? %) (dtype/scalar-tag-for-dtype %))
         stages (:stages opts)
         walked-options

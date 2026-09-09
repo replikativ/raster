@@ -18,6 +18,14 @@
    :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
               :fallback-reasons [] :declines {} :routes {:kernel-body 1}}}
 
+  :decoded-staged-contraction-gpu
+  {:route {:backend :opencl :source-dialect :typed-soac :typed-validated true :declines {}}
+   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
+   :lowering {:segops 1 :kernel-graphs 0 :structured-loops 0 :typed-reused 1
+              :typed-scalar-equations 0 :backend-reused 0 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
+              :fallback-reasons [] :declines {} :routes {:kernel-body 1}}}
+
   :dense-relu-jvm
   {:route {:backend :simd :source-dialect :typed-soac :typed-validated true :declines {}}
    :fusion {:vertical 1 :horizontal 0 :iterations 2 :placements 0}
