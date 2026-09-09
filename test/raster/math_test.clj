@@ -11,6 +11,18 @@
                                  sincos signum]]))
 
 (def ^:private tol 1e-12)
+(deftest rounding-has-explicit-width-and-boundary-semantics
+  (doseq [[cast expected-class reference]
+          [[double Long #(Math/round (double %))]
+           [unchecked-float Integer #(Math/round (unchecked-float %))]]
+          input [Double/NaN Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY
+                 -2.5 -1.5 -0.5 -0.0 0.0 0.5 1.5 2.5
+                 2147483648.0 9223372036854775808.0]]
+    (let [input (cast input)
+          result (round input)]
+      (is (= (reference input) result))
+      (is (= expected-class (class result))))))
+
 (def ^:private float-tol 1e-5)
 
 (defn- approx=

@@ -1034,14 +1034,27 @@
      ;; no-op → drop it (`(double)(double4)` is illegal C). A cast to a DIFFERENT element
      ;; type over a vector is a genuine per-lane precision change (a `^double` helper in a
      ;; float kernel) with no clean vector lowering → bail this kernel to the scalar loop.
+     (let [target-tag (or (descriptor/cast-result-tag (first expr)) 'short)
+           argument (second expr)
+           _ (when (= :wrap (descriptor/cast-integral-narrowing (first expr)))
+               (let [source-type (or (some-> (or (types/sym-type-tag argument)
+                                                (types/literal-tag argument))
+                                             dtype/dtype-for-scalar-tag)
+                                     (when (symbol? argument)
+                                       (some (fn [[type c-type]]
+                                               (when (= c-type (get *scalar-var-types* argument)) type))
+                                             (concat type-map (dtype/backend-types :opencl)))))]
+                 (when-not (and source-type (dtype/integral? source-type))
+                   (throw (ex-info "unchecked C narrowing requires a retained integral source type"
+                                   {:reason :unchecked-cast-source-type :expression expr})))))]
      (if (and *vec-width* (contains-vload? (second expr)))
-       (if (= (name (first expr)) *scalar-type*)
+       (if (= (name target-tag) *scalar-type*)
          (emit-expr (second expr) idx-sym array-syms opencl-idx)
          (throw (ex-info "vector precision cast" {:raster.compiler.backend.gpu.c-emit/bail true})))
-       (emit-cast (let [tag (name (first expr))]
+       (emit-cast (let [tag (name target-tag)]
                     ;; Narrow integer casts name JVM scalar tags; C spells them by width.
                     (get {"byte" "int8_t" "short" "int16_t"} tag (remap-type tag)))
-                  (emit-expr (second expr) idx-sym array-syms opencl-idx)))
+                  (emit-expr (second expr) idx-sym array-syms opencl-idx))))
 
      ;; TypedSOAC scalar Fold. It remains a semantic term through scheduling;
      ;; the C-family leaf chooses the portable one-work-item sequential schedule.

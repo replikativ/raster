@@ -266,7 +266,10 @@
       (cond
         (and (descriptor/cast-op? op)
              (contains? '#{int long} (descriptor/cast-result-tag op)))
-        (long (resolve-int-expr (second expr) env))
+        (let [value (resolve-int-expr (second expr) env)]
+          (if (= :wrap (descriptor/cast-integral-narrowing op))
+            (unchecked-int value)
+            (long value)))
         ;; arithmetic — classify by the SEMANTIC op (:raster.op/original metadata,
         ;; falling back to the head/impl symbol) via the shared intrinsics registry.
         :else

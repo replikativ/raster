@@ -41,34 +41,47 @@
                                        (Float/intBitsToFloat (.nextInt random))
                                        (Double/longBitsToDouble (.nextLong random))))))))
 
+(defn- check-unary-on-opencl! [input output values expected body name]
+  (let [ocl (find-ns 'raster.gpu.ocl-runtime)
+        register! (ns-resolve ocl 'register-kernel!)
+        buffer-of-array (ns-resolve ocl 'buffer-of-array)
+        make-buffer (ns-resolve ocl 'make-buffer)
+        bind-call (ns-resolve ocl 'bind-kernel-call)
+        launch! (ns-resolve ocl 'launch-registered-bound!)
+        read! (ns-resolve ocl 'buffer->array)
+        free! (ns-resolve ocl 'free-buffer!)
+        compiled (artifact/make
+                  {:kernel-name name :target :opencl-c
+                   :source (emit/emit-scalar-kernel name body {:target-dialect :opencl-portable})
+                   :abi (body-abi/project-contracts
+                         [(abi/slot 'x :input input :c-name "rstr_x" :role :input)
+                          (abi/slot 'y :output output :c-name "rstr_y" :role :result)] body)
+                   :arguments '[x y] :launch (:launch body) :effects {:kind :map}
+                   :provenance {:kernel-body (:id body)}})
+        x (buffer-of-array ((case input :float float-array :double double-array :long long-array) values) input)
+        y (make-buffer (count values) output)]
+    (try
+      (register! name compiled)
+      (launch! (bind-call (call/make compiled [x y])))
+      (is (= expected (vec (read! y))) (str name " JVM boundary oracle"))
+      (finally (free! y) (free! x)))))
+
+(deftest unchecked-int-matches-jvm-on-opencl
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "explicit wrapping integer conversion")
+    (let [rng (java.util.Random. 282)
+          values (vec (concat [Long/MIN_VALUE Long/MAX_VALUE Integer/MIN_VALUE Integer/MAX_VALUE
+                               -2147483649 2147483648 4294967295 4294967296 -1 0 1]
+                              (repeatedly 64 #(.nextLong rng))))]
+      (check-unary-on-opencl! :long :int values (mapv unchecked-int values)
+                             (fixtures/unchecked-int-body (count values)) "unchecked_int_test"))))
+
 (deftest java-round-matches-jvm-on-opencl
   (if-not @probe/opencl-available?
     (probe/opencl-skip! "typed Java round overloads and numerical edge cases")
-    (let [ocl (find-ns 'raster.gpu.ocl-runtime)
-          register! (ns-resolve ocl 'register-kernel!)
-          buffer-of-array (ns-resolve ocl 'buffer-of-array)
-          make-buffer (ns-resolve ocl 'make-buffer)
-          bind-call (ns-resolve ocl 'bind-kernel-call)
-          launch! (ns-resolve ocl 'launch-registered-bound!)
-          read! (ns-resolve ocl 'buffer->array)
-          free! (ns-resolve ocl 'free-buffer!)]
-      (doseq [[input output] [[:float :int] [:double :long]]]
-        (let [values (samples input)
-              expected (mapv (if (= input :float) #(Math/round (unchecked-float %)) #(Math/round (double %))) values)
-              body (fixtures/java-round-body input output (count values))
-              name (str "java_round_" (name input))
-              compiled (artifact/make
-                        {:kernel-name name :target :opencl-c
-                         :source (emit/emit-scalar-kernel name body {:target-dialect :opencl-portable})
-                         :abi (body-abi/project-contracts
-                               [(abi/slot 'x :input input :c-name "rstr_x" :role :input)
-                                (abi/slot 'y :output output :c-name "rstr_y" :role :result)] body)
-                         :arguments '[x y] :launch (:launch body) :effects {:kind :map}
-                         :provenance {:kernel-body (:id body)}})
-              x (buffer-of-array ((if (= input :float) float-array double-array) values) input)
-              y (make-buffer (count values) output)]
-          (try
-            (register! name compiled)
-            (launch! (bind-call (call/make compiled [x y])))
-            (is (= expected (vec (read! y))) (str input " Java round boundary oracle"))
-            (finally (free! y) (free! x))))))))
+    (doseq [[input output] [[:float :int] [:double :long]]]
+      (let [values (samples input)
+            expected (mapv (if (= input :float) #(Math/round (unchecked-float %)) #(Math/round (double %))) values)]
+        (check-unary-on-opencl! input output values expected
+                               (fixtures/java-round-body input output (count values))
+                               (str "java_round_" (name input)))))))

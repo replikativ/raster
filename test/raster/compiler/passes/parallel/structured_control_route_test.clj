@@ -33,6 +33,10 @@
             [raster.nn :as nn]
             [raster.ode.pde :as pde]))
 
+(deftest wrapping-casts-do-not-prove-shape-projections
+  (is (= 'xs (#'route/shape-projection-source '(clojure.core/long (alength xs)))))
+  (is (nil? (#'route/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
+
 (defn- evaluate-test-scalar-expression [expression operands]
   (cond
     (number? expression) expression

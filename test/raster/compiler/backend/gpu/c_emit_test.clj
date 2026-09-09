@@ -7,6 +7,18 @@
     (is (= (c-emit/emit-expr (list cast 'x) 'i #{} "i")
            (c-emit/emit-expr (list (symbol "clojure.core" (name cast)) 'x) 'i #{} "i")))))
 
+(deftest explicit-unchecked-integer-casts-require-integral-evidence
+  (doseq [value [4294967295 (with-meta 'word {:raster.type/tag 'long})]]
+    (is (.startsWith (c-emit/emit-expr (list 'clojure.core/unchecked-int value) nil #{} "idx")
+                     "(int)(")))
+  (is (= "(int)(word)"
+         (binding [c-emit/*scalar-var-types* {'word "long"}]
+           (c-emit/emit-expr '(clojure.core/unchecked-int word) nil #{} "idx"))))
+  (doseq [value [1.5 'unknown (with-meta 'floating {:raster.type/tag 'double})]]
+    (is (= :unchecked-cast-source-type
+           (try (c-emit/emit-expr (list 'clojure.core/unchecked-int value) nil #{} "idx")
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest portable-identifiers-cover-the-cuda-and-hip-cpp-language
   (is (not (c-emit/c-identifier? "class")))
   (is (not (c-emit/c-identifier? "default")))

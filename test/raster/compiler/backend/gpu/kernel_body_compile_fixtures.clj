@@ -470,6 +470,10 @@
                           (body-emit/emit-scalar-kernel
                            "java_round_f64" (body-fixtures/java-round-body :double :long 1)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "unchecked-int"
+                          (body-emit/emit-scalar-kernel
+                           "unchecked_int" (body-fixtures/unchecked-int-body 1)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "word-shifts-i32"
                           (body-emit/emit-scalar-kernel
                            "word_shifts_i32" (body-fixtures/word-shifts-body :int 1)

@@ -19,6 +19,14 @@
     (is (= form (constant/literal-or-original form)))
     (is (not (constant/equivalent? form form)))))
 
+(deftest explicit-wrapping-cast-is-not-a-checked-cast
+  (doseq [n [0 2147483647 2147483648 4294967295 Long/MIN_VALUE Long/MAX_VALUE]]
+    (is (= {:value (unchecked-int n)}
+           (constant/value (list 'clojure.core/unchecked-int n)))))
+  (is (nil? (constant/value '(int 2147483648))))
+  (is (nil? (constant/value '(unchecked-int 2147483648)))
+      "an unresolved bare call could be shadowed"))
+
 (deftest infinities-and-nan
   (is (constant/equivalent? 'Float/POSITIVE_INFINITY Double/POSITIVE_INFINITY))
   (is (not (constant/equivalent? 'Float/POSITIVE_INFINITY 'Double/NEGATIVE_INFINITY)))
