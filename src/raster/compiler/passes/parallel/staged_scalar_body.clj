@@ -60,18 +60,22 @@
                                         #(if (or (:raster.type/tag %) (:tag %)) %
                                            (assoc % :raster.type/tag
                                                   (dtype/scalar-tag-for-dtype
-                                                   (if child dt (:dtype source))))))
+                                                   (if (or child (contains? #{:int :long} dt))
+                                                     dt (:dtype source))))))
                              expression)
                 term ((:cast builder)
                       ((:lower builder) expression dt (if child {(:result child) (:dtype child)} {}))
                       dt expression)
-                sum ((:compute builder) :+ dt [carry (:result term)] {})]
+                sum ((:compute builder) :+ dt [carry (:result term)]
+                     (if (contains? #{:int :long} dt) {:overflow :no-overflow} {}))]
             {:result result :dtype dt
              :operations [(body/->ForLoop
                            (body/value axis :int) 0 extent 1
                            [(body/->LoopArg (body/value carry dt)
                                            (body/literal (constant/literal-or-original
-                                                          (if (nil? (:init stage)) 0.0 (:init stage))) dt))]
+                                                          (if (nil? (:init stage))
+                                                            (if (contains? #{:int :long} dt) 0 0.0)
+                                                            (:init stage))) dt))]
                            (vec (concat (:operations child) (:operations term) (:operations sum)
                                         [(body/->Yield [(:result sum)])]))
                            [(body/value result dt)] {})]})))
@@ -122,6 +126,10 @@
                  :launch (launch/spec {:workgroup-size [workgroup-size]
                                        :group-count [(quot (+ n (dec workgroup-size)) workgroup-size)]})
                  :schedule {:strategy :staged-scalar :workgroup-size workgroup-size}}]
+    (try (body/validate-spec! body-spec)
+         (catch clojure.lang.ExceptionInfo e
+           (decline! :kernel-body-proof "staged body does not satisfy the shared verifier"
+                     {:cause (ex-data e) :message (.getMessage e)})))
     {:source source :body-spec body-spec :arguments arguments
      :sizes sizes :output-elements n :out-type out-type}))
 

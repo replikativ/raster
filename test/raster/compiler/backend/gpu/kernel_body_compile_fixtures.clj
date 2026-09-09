@@ -288,6 +288,10 @@
       (:kernels (equation-first/compile
                  #'staged-public/packed-three-stage! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'staged-public/decoded-byte-three-wide! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'staged-public/widened-byte-three-wide! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))

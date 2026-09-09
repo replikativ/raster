@@ -4,6 +4,7 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.contraction-facts :as facts]
+            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.passes.parallel.staged-contraction-schedule :as packed-schedule]))
 
 (defn decline! [rule message data]
@@ -27,6 +28,11 @@
     (decline! :numerical-contract "scalar staged schedule does not implement these numerical extensions"
               {:source source}))
   (let [{:keys [reads scalars]} (facts/dependencies source)
+        _ (doseq [{:keys [sym map]} (get-in source [:opts :operands]) :when map]
+            (let [operand (some #(when (= sym (:sym %)) %) (:operands source))]
+              (when-not (and operand (am/index-matches? map (:idx operand)))
+                (decline! :operand-map "declared operand map disagrees with the actual load index"
+                          {:operand sym :map map :index (:idx operand)}))))
         _ (when (some #(= (:out source) (:sym %)) (get-in source [:epilogue :operands]))
             (decline! :result-transform-inout
                       "destination-reading result transforms require an inout storage proof"
@@ -42,7 +48,8 @@
                       (let [plan (packed-schedule/inner-dp4a-plan
                                   (assoc source :operands packed-operands))]
                         (when (:ok plan) plan)))
-        floating-stages (if packed-plan (pop stage-list) stage-list)
+        integral-inner? (contains? #{:int :long} (dtype/canon (:dtype (peek stage-list))))
+        floating-stages (if integral-inner? (pop stage-list) stage-list)
         axes (vec (concat (:free-axes source) (:contract-axes source)))
         n (reduce *' 1 (map second (:free-axes source)))
         out-type (dtype/canon (:dtype (first stage-list)))
@@ -51,7 +58,8 @@
                                  (vals (group-by :parameter requirements))))
             (decline! :storage-types "scalar staged storage requires one declared dtype per buffer"
                       {:requirements requirements :out-dtype (:out-dtype source)}))
-        _ (when-not (and (or packed-plan
+        _ (when-not (and (or (and integral-inner? (contains? #{:byte :int :long}
+                                                           (dtype/canon (:dtype source))))
                             (contains? #{:float :double} (dtype/canon (:dtype source))))
                          (every? #(contains? #{:float :double} (dtype/canon (:dtype %)))
                                  floating-stages)

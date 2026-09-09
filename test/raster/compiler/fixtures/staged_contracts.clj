@@ -30,6 +30,24 @@
 (defmacro decoded-read [array index]
   `(raster.arrays/aget ~array ~index))
 
+(deftm decoded-byte-three-wide!
+  [a :- (Array byte) b :- (Array byte) out :- (Array float) scale :- Float] :- Void
+  (raster.par/contract out [[i 2]] [[blk 2] [t 3]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 6) (* blk 3) t))
+                      (raster.arrays/aget b (+ (* i 6) (* blk 3) t)))
+    :decode {a (- (long x) 7)}
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift (* inner scale)}
+             {:axis t :extent 3 :dtype :int :init 0}]))
+
+(deftm widened-byte-three-wide!
+  [a :- (Array byte) b :- (Array byte) out :- (Array float) scale :- Float] :- Void
+  (raster.par/contract out [[i 2]] [[blk 2] [t 3]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 6) (* blk 3) t))
+                      (raster.arrays/aget b (+ (* i 6) (* blk 3) t)))
+    :decode {a (quot (* (long x) 33554432) 33554432)}
+    :stages [{:axis blk :extent 2 :dtype :float :init 0.0 :lift (* inner scale)}
+             {:axis t :extent 3 :dtype :int :init 0}]))
+
 (deftm packed-three-stage!
   [a :- (Array byte) b :- (Array byte) super-scale :- (Array float)
    sub-scale :- (Array float) out :- (Array float)] :- Void

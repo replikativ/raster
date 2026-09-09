@@ -188,16 +188,16 @@
 
             (lower [expression expected env]
               (let [expression (inline-lets expression)
-                    ;; Preserve floating rounding before consumer promotion. Integral contexts
-                    ;; retain their existing owner policy: quantized loops still carry widened
-                    ;; integers around narrower intrinsic results and need separate reconciliation.
+                    ;; Strict typed owners preserve operation width before any consumer cast.
+                    ;; Older packed owners retain their explicit widened-integer policy.
                     expected (canon-type expected)
                     _ (when (and require-source-types? (seq? expression))
                         (source-type expression expected env))
                     retained (when (seq? expression) (retained-type expression))
-                    operation-type (if (and (dtype/fp-dtype? expected)
-                                            retained (or require-source-types?
-                                                         (dtype/fp-dtype? retained)))
+                    operation-type (if (and retained
+                                            (or require-source-types?
+                                                (and (dtype/fp-dtype? expected)
+                                                     (dtype/fp-dtype? retained))))
                                      retained expected)
                     lowered (lower-value expression operation-type env)]
                 (if (not= operation-type expected)
@@ -445,9 +445,13 @@
                                             "scalar intrinsic operands require one dtype"
                                             {:expression expression :operand-type operand-type
                                              :actual (mapv :type lowered)}))
+                              result-range (if (= :quot operator)
+                                             (scalar-range/quotient operand-ranges)
+                                             proven-range)
                               computed (compute-ssa operator result-type (mapv :result lowered)
-                                                    options (when (= :no-overflow overflow)
-                                                              proven-range))]
+                                                    options (when (scalar-range/contained-in-dtype?
+                                                                    result-range result-type)
+                                                              result-range))]
                           (update computed :operations #(into (vec (mapcat :operations lowered)) %))))))
 
                   :else
