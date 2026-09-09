@@ -1429,6 +1429,13 @@ The immediate continuation after the verified double-buffered weighted-reduction
    each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
    indirect or neighboring-row accesses must remain sequential. No attention-specific exception,
    scalar hoisting, synthetic one-trip loop, or performance claim is needed for this IR extension.
+   A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
+   followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
+   FP64 pragma alone does not change the result. Device integration currently bounds normalized
+   values by two FP32 ULPs while checking untouched storage exactly; it does not certify FP64
+   division accuracy. Audit target arithmetic guarantees separately, and extend OpenCL feature
+   discovery beyond storage declarations to intermediate scalar types (the current FP64 preamble
+   scan misses those). Explicit cast/rounding and checked-integer contracts remain unchanged.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
