@@ -65,6 +65,18 @@
                       :array-types {'i :float 'out :float 'total :float} :scalar-types {'n :long})
                      [:attributes :emission-route]))))))
 
+(deftest host-effect-realization-shares-hygienic-physical-binding
+  (doseq [physical ['i 'shifted 'float 'count 'long]]
+    (let [program (dialect/remap-values (effect-program) {'x physical})
+          equation (first (dialect/equations program))
+          realized ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
+                    program equation)
+          execute (eval (list 'fn [physical 'out 'total 'n] (:source realized)))
+          out (float-array [-77 -77]) total (float-array 1)]
+      (is (nil? (execute (float-array [-1 2]) out total 2)))
+      (is (= [-77.0 3.0] (vec out)))
+      (is (= [1.0] (vec total))))))
+
 (defn- nested-operations
   [operations]
   (mapcat (fn [operation]

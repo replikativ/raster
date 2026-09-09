@@ -43,8 +43,21 @@
   [equation]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
         (dialect/operation-parts equation)]
-    (if (contains? #{'segmented-fold-map 'contract} kind)
+    (cond
+      (contains? #{'segmented-fold-map 'contract} kind)
       {:locals [] :bodies []}
+
+      (= 'effect-map kind)
+      (let [{:keys [index region]} (projection/instantiate-effect-region equation)
+            {:keys [locals body-results]}
+            (dialect/lambda-parts (list 'lambda [] (projection/scalar-folds->source region)))]
+        (when (dialect/scheduled-effect-carries? (mapv dialect/scheduled-effect body-results))
+          (throw (ex-info "carried effects require structured scheduled lowering"
+                          {:reason :typed-soac-production-subset
+                           :missing-rule :carried-effect-realization})))
+        {:index index :locals locals :bodies body-results})
+
+      :else
       (let [{:keys [locals body-results]}
             (dialect/lambda-parts (or lambda element-lambda))
             {:keys [elements capture-parameters destination-parameters]}
@@ -58,37 +71,11 @@
             project-expression
             (fn [expression]
               (projection/scalar-folds->source
-               (util/subst-syms substitutions expression)))
-            project-body
-            (fn project-body [body]
-              (if (= 'effect-map kind)
-                (let [{:keys [loop destination conflict destination-index predicate value]
-                       :as parts}
-                      (dialect/effect-parts body)]
-                  (if loop
-                    (let [_ (when (:carry parts)
-                              (throw (ex-info "carried effects require structured scheduled lowering"
-                                              {:reason :typed-soac-production-subset
-                                               :missing-rule :carried-effect-realization})))
-                          {:keys [locals body-results]} (dialect/lambda-parts (:lambda parts))]
-                      (list 'effect-loop {:index (:index parts) :lower (:lower parts)}
-                            (project-expression (:extent parts))
-                            (list 'lambda [(:index parts)]
-                                  (dialect/effect-lambda-region
-                                   (mapv (fn [{:keys [id dtype init]}]
-                                           (dialect/local-value id dtype
-                                                                (project-expression init)))
-                                         locals)
-                                   (mapv project-body body-results)))))
-                    (list 'effect (get substitutions destination destination) conflict
-                          (project-expression destination-index)
-                          (project-expression predicate)
-                          (project-expression value))))
-                (project-expression body)))]
+               (util/subst-syms substitutions expression)))]
         {:locals (mapv #(update % :init (fn [init]
                                           (project-expression init)))
                        locals)
-         :bodies (mapv project-body body-results)}))))
+         :bodies (mapv project-expression body-results)}))))
 
 (defn- storage-only-dtype?
   "A dtype with device storage but no JVM scalar: its values move bit-exactly between arrays
@@ -98,7 +85,7 @@
 
 (defn- typed-store-value
   [cast value]
-  (if cast (list cast value) value))
+  (if cast (list (symbol "clojure.core" (name cast)) value) value))
 
 (defn- materialize-region
   [locals body]
@@ -108,7 +95,7 @@
            (mapcat (fn [{:keys [id dtype init]}]
                      (let [tag (dtype/scalar-tag-for-dtype dtype)]
                        [(with-meta id {:raster.type/tag tag})
-                        (list tag init)]))
+                        (list (symbol "clojure.core" (name tag)) init)]))
                    locals))
           body)
     body))
@@ -129,7 +116,7 @@
   (let [[_ equation-id results] equation
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
-        {region-locals :locals bodies :bodies} (scalar-region equation)
+        {region-locals :locals bodies :bodies region-index :index} (scalar-region equation)
         placement-facts (get-in (dialect/facts program) [:equations equation-id])
         constituent-ids (or (some-> placement-facts :attributes :fusion/constituents keys set)
                             #{(or (get-in placement-facts [:provenance :source-binding-id])
@@ -344,7 +331,7 @@
                           effects {:emit-store statement :emit-loop loop-statement})
             effect-source
             (with-meta
-              (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+              (list 'raster.par/map-void! region-index (:extent attributes)
                     (materialize-region region-locals continuation))
               {:raster.type/elem-type (first result-dtypes)})]
         {:equation-id equation-id

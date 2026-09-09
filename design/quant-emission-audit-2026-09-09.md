@@ -165,3 +165,8 @@ Scheduled JVM emission and production host realization now share ordered continu
 through `effect-source/ordered-effects`. Store and loop spelling retain their existing target
 policies, but the `do`/result-binding spine is no longer duplicated. This preparatory extraction
 does not yet open carried source realization or frontend admission.
+
+Both projections also use `typed-soac-projection/instantiate-effect-region` for physical-name
+binding. The host adapter no longer reconstructs and substitutes each effect independently.
+Generated host casts are qualified so a physical value named `float` cannot capture them; user
+expressions are unchanged. Canonical-to-host tests cover colliding map, local, and core names.

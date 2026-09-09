@@ -327,9 +327,6 @@
     (let [[_ equation-id results _operation] equation
           {:keys [attributes arrays captures destinations lambda]}
           (soac-dialect/operation-parts equation)
-          {:keys [locals body-results]} (soac-dialect/lambda-parts lambda)
-          {:keys [elements capture-parameters destination-parameters]}
-          (soac-dialect/parameter-layout equation)
           facts (soac-dialect/facts program)
           values (:values facts)
           physical-results (soac-dialect/physical-results facts equation)
@@ -343,25 +340,7 @@
               (throw (ex-info "typed effect-map destination storage changed after validation"
                               {:reason :raster/bug :equation equation-id
                                :destinations destinations :physical physical-results})))
-          ;; Reserve the map index against the physical interface before building element reads.
-          ;; Those reads refer to this bound index, not a free capture of the old index spelling.
-          projected
-          (binding [util/*shadowing-locals*
-                    (into util/*shadowing-locals* (filter symbol? (concat arrays captures physical-results)))]
-            (let [interface-substitutions (into (zipmap capture-parameters captures)
-                                                (concat (map vector elements arrays)
-                                                        (map vector destination-parameters physical-results)))
-                  index-scope (util/subst-scoped interface-substitutions [(:index attributes)] [])
-                  map-index (first (:binders index-scope))
-                  region (util/subst-syms {(:index attributes) map-index} (nth lambda 2))
-                  substitutions (into (zipmap capture-parameters captures)
-                                      (concat (map (fn [parameter array]
-                                                     [parameter (list 'clojure.core/aget array map-index)])
-                                                   elements arrays)
-                                              (map vector destination-parameters physical-results)))]
-              ;; The region adapter keeps interleaved effect-result bindings lexical. Physical
-              ;; core names (count/float/long) are locals here, never calls to clojure.core.
-              {:index map-index :region (util/subst-syms substitutions region)}))
+          projected (typed-projection/instantiate-effect-region equation)
           attributes (assoc attributes :index (:index projected))
           {:keys [locals body-results]}
           (soac-dialect/lambda-parts (list 'lambda [] (:region projected)))

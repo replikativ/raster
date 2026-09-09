@@ -58,6 +58,35 @@
         (list 'let* (vec (concat reads parameters)) form))
       form)))
 
+(defn instantiate-effect-region
+  "Instantiate a validated effect-map's lexical parameters against its physical interface.
+   Return the hygienic map index and canonical region, without reconstructing host source.
+   Scheduled lowering and host realization must use this same binding operation."
+  [equation]
+  (let [{:keys [kind attributes arrays captures destinations lambda]}
+        (dialect/operation-parts equation)
+        {:keys [elements capture-parameters destination-parameters]}
+        (dialect/parameter-layout equation)]
+    (when-not (= 'effect-map kind)
+      (throw (ex-info "effect-region instantiation requires an effect-map"
+                      {:reason :typed-soac-effect-map-subset :equation equation})))
+    (binding [util/*shadowing-locals*
+              (into util/*shadowing-locals* (filter symbol? (concat arrays captures destinations)))]
+      ;; Reserve the index before synthesizing reads: those reads refer to this bound index,
+      ;; not a free capture of its old spelling. Core-named physical values remain locals.
+      (let [interface-substitutions (into (zipmap capture-parameters captures)
+                                         (concat (map vector elements arrays)
+                                                 (map vector destination-parameters destinations)))
+            index-scope (util/subst-scoped interface-substitutions [(:index attributes)] [])
+            map-index (first (:binders index-scope))
+            region (util/subst-syms {(:index attributes) map-index} (nth lambda 2))
+            substitutions (into (zipmap capture-parameters captures)
+                                (concat (map (fn [parameter array]
+                                               [parameter (list 'clojure.core/aget array map-index)])
+                                             elements arrays)
+                                        (map vector destination-parameters destinations)))]
+        {:index map-index :region (util/subst-syms substitutions region)}))))
+
 (defn scalar-folds->source
   "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
   [expression]
