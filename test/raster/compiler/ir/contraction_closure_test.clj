@@ -81,12 +81,17 @@
                    (list 'let* ['effect (raster.compiler.ir.contraction-facts/surface-form facts)] 'out))]
     (doseq [unsupported [(-> source
                             (assoc-in [:stages 1 :dtype] :float)
-                            (assoc-in [:opts :stages 1 :dtype] :float))
-                         (-> source
-                             (assoc-in [:stages 0 :lift] '(* inner scale))
-                             (assoc-in [:opts :stages 0 :lift] '(* inner scale)))]]
+                            (assoc-in [:opts :stages 1 :dtype] :float))]]
       (is (nil? (frontend/form->program (form-for unsupported) options))
-          "unsupported valid staged semantics remain available to the compatibility route"))))
+          "unsupported valid staged semantics remain available to the compatibility route"))
+    (let [with-capture (-> source
+                           (assoc-in [:stages 0 :lift] '(* inner scale))
+                           (assoc-in [:opts :stages 0 :lift] '(* inner scale)))
+          p (frontend/form->program (form-for with-capture) options)
+          operation (soac/operation-parts (first (soac/equations p)))]
+      (is (= p (soac/validate! p)))
+      (is (= '[scale] (:captures operation))
+          "recursive stage lowering now retains scalar lift captures"))))
 
 (deftest typed-contraction-retains-the-canonical-payload-through-ssa
   (let [p (program)
