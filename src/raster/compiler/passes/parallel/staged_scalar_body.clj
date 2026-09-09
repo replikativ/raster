@@ -11,6 +11,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.parallel.packed-stage-fragment :as packed-stage]
             [raster.compiler.passes.parallel.staged-scalar-admission :as admission]))
 
 (def decline! admission/decline!)
@@ -19,7 +20,7 @@
   "Construct the typed stage plan using the shared scalar lowerer. No target emission,
    KernelBody construction or driver work occurs during frontend capability checking."
   [source & {:keys [scalar-types workgroup-size] :or {scalar-types {} workgroup-size 64}}]
-  (let [{:keys [reads attributes stage-list axes n out-type sizes array-types]} (admission/analyze! source :scalar-types scalar-types
+  (let [{:keys [reads attributes stage-list axes n out-type sizes array-types packed-plan packed-operands]} (admission/analyze! source :scalar-types scalar-types
                                                     :workgroup-size workgroup-size)
         reserved (atom (set (filter symbol? (tree-seq coll? seq source))))
         fresh (fn [prefix]
@@ -27,8 +28,8 @@
                   (if (contains? @reserved id) (recur (gensym prefix))
                       (do (swap! reserved conj id) id))))
         group (fresh "stage_group") lane (fresh "stage_lane") segment (fresh "stage_segment")
-        mask (fresh "stage_mask")
-        scope (set (concat (map first axes) [group lane segment]))
+        mask (fresh "stage_mask") packed-index (fresh "stage_word")
+        scope (set (concat (map first axes) [group lane segment packed-index]))
         builder (scalar/make-lowerer
                  {:arrays reads :array-types array-types :scalar-types scalar-types
                   :require-source-types? true
@@ -37,7 +38,13 @@
                   :decline! decline!})
         build-stage
         (fn build-stage [depth]
-          (let [{:keys [axis extent lift] :as stage} (nth stage-list depth)
+          (if (and packed-plan (= depth (dec (count stage-list))))
+            (packed-stage/lower
+             {:builder builder :lower-index #(index/lower %1 (into scope %2) decline!)
+              :scope scope :operands packed-operands :inner (nth stage-list depth)
+              :plan packed-plan :packed-index packed-index
+              :carry (fresh "stage_dot") :result (fresh "stage_dot_result")})
+            (let [{:keys [axis extent lift] :as stage} (nth stage-list depth)
                 dt (dtype/canon (:dtype stage))
                 carry (fresh "stage_carry") result (fresh "stage_result")
                 child (when (< depth (dec (count stage-list))) (build-stage (inc depth)))
@@ -65,7 +72,7 @@
                                                           (if (nil? (:init stage)) 0.0 (:init stage))) dt))]
                            (vec (concat (:operations child) (:operations term) (:operations sum)
                                         [(body/->Yield [(:result sum)])]))
-                           [(body/value result dt)] {})]}))
+                           [(body/value result dt)] {})]})))
         computation (build-stage 0)
         result-transform
         (when-let [epilogue (:epilogue source)]

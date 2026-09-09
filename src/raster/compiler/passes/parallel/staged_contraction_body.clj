@@ -6,7 +6,6 @@
   (:require [clojure.walk :as walk]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.scalar-conversion :as conversion]
-            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as stages]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -14,6 +13,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
+            [raster.compiler.passes.parallel.packed-stage-fragment :as packed-stage]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -52,25 +52,10 @@
                     :conversion-policy (fn [from to]
                                          (when (contains? #{[:byte :int] [:int :float]} [from to])
                                            (conversion/policy from to :reject)))})
-          pack (fn [{:keys [sym map]}]
-                 (reduce
-                  (fn [word offset]
-                    (let [coordinate (walk/postwalk-replace
-                                      {(:axis inner) (list 'clojure.core/+ (list 'clojure.core/* packed-index 4) offset)}
-                                      (am/index-expr map))
-                          loaded ((:cast builder)
-                                  ((:load builder) sym [(lower-index coordinate scope)]) :int coordinate)
-                          byte-word ((:compute builder) :bit-and :int
-                                     [(:result loaded) (body/literal 255 :int)] {})
-                          shifted ((:compute builder) :shl :int
-                                   [(:result byte-word) (body/literal (* offset 8) :int)] {})
-                          joined ((:compute builder) :bit-or :int [(:result word) (:result shifted)] {})]
-                      {:operations (vec (concat (:operations word) (:operations loaded)
-                                                (:operations byte-word) (:operations shifted) (:operations joined)))
-                       :result (:result joined)}))
-                  {:operations [] :result (body/literal 0 :int)} (range 4)))
-          [a b] (mapv pack operands)
-          dot ((:compute builder) :dp4a :int [(:result a) (:result b) inner-carry] {})
+          inner-fragment (packed-stage/lower
+                          {:builder builder :lower-index lower-index :scope scope
+                           :operands operands :inner inner :plan plan :packed-index packed-index
+                           :carry inner-carry :result inner-result})
           lift-expr (walk/postwalk-replace
                      {'inner inner-result}
                      (stages/substitute-operand-indices (:lift outer) (stages/stage-index-exprs stage-list)))
@@ -103,12 +88,7 @@
                      (body/value (:axis outer) :int) 0 (:extent outer) 1
                      [(body/->LoopArg (body/value outer-carry :float) (body/literal 0.0 :float))]
                      (vec (concat
-                           [(body/->ForLoop
-                             (body/value packed-index :int) 0 (:packed-extent plan) 1
-                             [(body/->LoopArg (body/value inner-carry :int) (body/literal 0 :int))]
-                             (vec (concat (:operations a) (:operations b) (:operations dot)
-                                          [(body/->Yield [(:result dot)])]))
-                             [(body/value inner-result :int)] {})]
+                           (:operations inner-fragment)
                            (:operations lift) (:operations add) [(body/->Yield [(:result add)])]))
                      [(body/value outer-result :float)] {})
                     (body/->ScalarStore out [segment] outer-result mask)]
