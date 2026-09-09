@@ -65,6 +65,18 @@
                       :array-types {'i :float 'out :float 'total :float} :scalar-types {'n :long})
                      [:attributes :emission-route]))))))
 
+(deftest host-effect-realization-shares-hygienic-physical-binding
+  (doseq [physical ['i 'shifted 'float 'count 'long]]
+    (let [program (dialect/remap-values (effect-program) {'x physical})
+          equation (first (dialect/equations program))
+          realized ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
+                    program equation)
+          execute (eval (list 'fn [physical 'out 'total 'n] (:source realized)))
+          out (float-array [-77 -77]) total (float-array 1)]
+      (is (nil? (execute (float-array [-1 2]) out total 2)))
+      (is (= [-77.0 3.0] (vec out)))
+      (is (= [1.0] (vec total))))))
+
 (defn- nested-operations
   [operations]
   (mapcat (fn [operation]
@@ -338,6 +350,23 @@
       (is (nil? (execute x out 2 2)))
       (is (= [2.5 5.0 37.5 50.0] (mapv double out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
+
+(deftest production-host-store-loops-preserve-the-continuation
+  (let [source '(let* [effect
+                      (raster.par/map-void!
+                       r rows
+                       (loop* [i 0]
+                         (if (< i width)
+                           (do (aset out (+ (* r width) i) (float i))
+                               (recur (inc i))))))]
+                 effect)
+        result (route/attempt source :float {'out :float}
+                              {:scalar-types {'rows :long 'width :long}})
+        execute (eval (list 'fn '[out rows width] (get-in result [:program :source])))
+        out (float-array (repeat 6 -77))]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (nil? (execute out 2 3)))
+    (is (= [0.0 1.0 2.0 0.0 1.0 2.0] (vec out)))))
 
 (deftest effect-loops-must-be-closed-over-the-loop-index
   (let [program (:program (route/attempt row-loop-source :float {'x :float 'out :float}
