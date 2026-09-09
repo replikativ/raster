@@ -1629,8 +1629,13 @@
                                         initial
                                         (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
-            additive-ranges (additive-loop-ranges! operation loop-values
+            additive-ranges (try
+                              (additive-loop-ranges! operation loop-values
                                                     (assoc context :control-uniformity loop-control))
+                              ;; This optional derivation discards external range provenance.
+                              ;; Failure under those weaker facts must not reject a body that
+                              ;; ordinary validation can prove with its original environment.
+                              (catch clojure.lang.ExceptionInfo _ nil))
             loop-values (if-let [entry (:entry additive-ranges)]
                           (assoc-in loop-values [(:id (:binding (first iter-args))) :range] entry)
                           loop-values)

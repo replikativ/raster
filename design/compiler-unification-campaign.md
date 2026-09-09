@@ -766,3 +766,22 @@ The public workload is included in vendor compile fixtures and the compatibility
 Nonpacked integral folds, unproved overflow, decoded byte products and arbitrary mixed storage
 remain separate work. This closes a recursive composition gap, not whole staged source-emitter
 retirement or a throughput claim; vectorized packing and cooperative schedules still need measurement.
+
+### Independently checked additive carry ranges
+
+KernelBody validation can derive a static, single integral carry updated by `carry + term`.
+Only carry-independent scalar compute/load prefixes participate. The verifier derives term ranges
+through existing SSA validation, proves every prefix fits, and distinguishes body-entry prefixes
+(N−1 updates) from result prefixes (N updates). Ordinary body validation is replayed with that
+evidence; overflow policy is never changed by the proof.
+
+External range provenance is deliberately discarded during this optional analysis, and
+IndexCompute prefixes are excluded: mathematical index intervals alone do not prove intermediate
+machine-width safety. If this weaker analysis fails, ordinary validation with original facts still
+runs. Nested/control-flow/multi-carry recurrences retain conservative ranges. Tests cover fitting
+and overflowing prefixes, nonzero initialization, zero-trip preservation, carry dependence,
+post-loop facts, unsafe index-derived terms and safe fallback after speculative failure.
+
+This is a verifier prerequisite, not yet broader integer-stage admission or general index-arithmetic
+safety. Nonpacked/decoded byte reductions still need their source-to-schedule validation and device
+comparisons before a migrated source emitter can be retired.

@@ -840,6 +840,41 @@
                    (scalar-body [(assoc-in (fold 3 0 1) [:operations 0 :expression :arguments]
                                            ['carry 'carry])]))))))
 
+(deftest additive-loop-speculation-does-not-reject-ordinary-checked-bodies
+  (is (some?
+       (scalar-body
+        [(body/->ScalarCompute
+          (body/value 'external :int)
+          (body/scalar-expression :+ :int [(body/literal 0 :int) (body/literal 1 :int)]
+                                  {:overflow :no-overflow}))
+         (body/->ForLoop
+          (body/value 'i :int) 0 3 1
+          [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+          [(body/->ScalarCompute
+            (body/value 'term :int)
+            (body/scalar-expression :+ :int ['external (body/literal 1 :int)]
+                                    {:overflow :no-overflow}))
+           (body/->ScalarCompute
+            (body/value 'next-carry :int)
+            (body/scalar-expression :+ :int ['carry 'term] {:overflow :trap}))
+           (body/->Yield ['next-carry])]
+          [(body/value 'loop-result :int)] {})]))))
+
+(deftest additive-loop-proof-does-not-borrow-index-arithmetic-ranges
+  (is (thrown?
+       clojure.lang.ExceptionInfo
+       (scalar-body
+        [(body/->IndexCompute
+          'term (body/expression :min (body/expression :add Integer/MAX_VALUE 1) 1))
+         (body/->ForLoop
+          (body/value 'i :int) 0 3 1
+          [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+          [(body/->ScalarCompute
+            (body/value 'next-carry :int)
+            (body/scalar-expression :+ :int ['carry 'term] {:overflow :no-overflow}))
+           (body/->Yield ['next-carry])]
+          [(body/value 'loop-result :int)] {})]))))
+
 (deftest scalar-and-collective-operators-have-semantic-dtype-domains
   (testing "floating intrinsics do not accept integers"
     (is (thrown-with-msg?
