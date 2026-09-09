@@ -72,7 +72,9 @@ and saturating conversion operations; no quantization-specific kernel or new IR 
 The overload's result dtype is preserved before conversion to its consumer dtype. Unknown source
 overloads decline instead of being guessed from the output type.
 
-OpenCL uses its explicit saturating conversion. CUDA/HIP guard NaN and signed range boundaries
+OpenCL sanitizes NaN to floating zero before its explicit saturating conversion: the first CI
+PoCL run otherwise returned signed MIN_VALUE for NaN despite the Arc oracle passing. The same
+edge-case tests remain required on both devices. CUDA/HIP guard NaN and signed range boundaries
 before a truncating C++ cast; the upper guard compares against the exact power-of-two boundary,
 not a rounded integer maximum. Other unsupported rounding policies still decline.
 

@@ -473,8 +473,13 @@
       ;; The upper comparison uses the exact power-of-two boundary, not rounded MAX_VALUE.
       (and source-fp? (not result-fp?) (= :saturate overflow))
       (if (c-dialect/opencl? *scalar-dialect*)
+        ;; Some CPU OpenCL implementations lower NaN saturation to signed MIN_VALUE.
+        ;; Sanitize the input explicitly, keeping NaN out of the conversion itself even
+        ;; when a vectorizer evaluates both arms of an enclosing result selection.
         (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
-             "(" argument-source ")")
+             "((isnan(" argument-source ") ? "
+             (emit-scalar-value (body/literal 0.0 source-type) context)
+             " : " argument-source "))")
         (if (and (= :toward-zero rounding)
                  (contains? #{:float :double} source-type)
                  (scalar-range/for-dtype result-type))
