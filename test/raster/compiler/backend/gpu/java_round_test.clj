@@ -20,6 +20,8 @@
       (doseq [target [:opencl-portable :cuda :hip]]
         (let [source (emit/emit-scalar-kernel "java_round_test" body {:target-dialect target})]
           (is (not (str/includes? source "= round(")))
+          (when (and (= output :long) (not= target :opencl-portable))
+            (is (str/includes? source "(-9223372036854775807LL - 1LL)")))
           (is (str/includes? source (if (= target :opencl-portable) "_sat_rtz(" "isnan("))))))))
 
 (defn- samples [type]

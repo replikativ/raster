@@ -382,7 +382,12 @@
   (case (dtype/canon type)
     :byte (str "(" (target-type :byte) ")" value)
     :int (str value)
-    :long (str value (if (c-dialect/opencl? *scalar-dialect*) "L" "LL"))
+    :long (let [suffix (if (c-dialect/opencl? *scalar-dialect*) "L" "LL")]
+            ;; The positive magnitude of MIN_VALUE is not a signed C literal. Keeping
+            ;; both operands signed also prevents ternaries from promoting to unsigned.
+            (if (= value Long/MIN_VALUE)
+              (str "(-" Long/MAX_VALUE suffix " - 1" suffix ")")
+              (str value suffix)))
     :half (if (c-dialect/opencl? *scalar-dialect*)
             (str "(half)(" (emit-floating-literal value "f") ")")
             (str "__float2half_rn(" (emit-floating-literal value "f") ")"))
