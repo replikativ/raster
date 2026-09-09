@@ -56,7 +56,12 @@
                              (:body source))
                 ;; The stage contract declares its root result type; nested expressions must
                 ;; retain their own checked types, never inherit a consumer's conversion.
-                expression (if (seq? expression)
+                ;; Integral storage is not an arithmetic-width declaration for a floating
+                ;; fold. Leave untyped roots to strict scalar admission in that case; typed
+                ;; loads/casts remain understood, but compound arithmetic must retain its type.
+                expression (if (and (seq? expression)
+                                    (not (and (nil? child) (dtype/fp-dtype? dt)
+                                              (not (dtype/fp-dtype? (:dtype source))))))
                              (vary-meta expression
                                         #(if (or (:raster.type/tag %) (:tag %)) %
                                            (assoc % :raster.type/tag

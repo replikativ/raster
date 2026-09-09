@@ -82,6 +82,9 @@
     (let [mixed (-> source
                     (assoc-in [:stages 1 :dtype] :float)
                     (assoc-in [:opts :stages 1 :dtype] :float))
+          _ (is (nil? (frontend/form->program (form-for mixed) options))
+                "raw compound arithmetic cannot borrow its width from Byte storage")
+          mixed (update mixed :body vary-meta assoc :raster.type/tag 'long)
           p (frontend/form->program (form-for mixed) options)
           retained (get-in (soac/operation-parts (first (soac/equations p)))
                            [:attributes :contraction])]

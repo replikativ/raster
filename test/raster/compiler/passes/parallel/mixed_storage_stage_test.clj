@@ -2,10 +2,25 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.staged-contracts :as fixtures]
+            [raster.compiler.backend.gpu.staged-contraction-fixtures :as packed]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.staged-scalar-body :as staged]
             [raster.gpu.device-probe :as probe]
             [raster.gpu.link :as link]))
+
+(deftest raw-mixed-storage-arithmetic-needs-retained-width
+  (let [source (-> (packed/packed-facts 1 1 1 4)
+                   (assoc-in [:stages 1 :dtype] :float)
+                   (assoc-in [:opts :stages 1 :dtype] :float))
+        failure (try (staged/analyze! source) nil
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+    (is (= :scalar-source-type (:missing-rule failure)))
+    (let [typed (update source :body vary-meta assoc :raster.type/tag 'long)
+          operations (tree-seq coll? seq (:operations (:body (staged/lower typed))))
+          products (filter #(and (map? %) (= :* (:op %))) operations)]
+      (is (= {:long 1 :float 2} (frequencies (map :result-type products)))
+          "one Long byte product precedes the two Float scale products"))))
 
 (deftest homogeneous-contractions-keep-existing-schedule-selection
   (with-redefs [facts/single-axis-accumulator-stage
