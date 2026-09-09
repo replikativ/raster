@@ -61,6 +61,8 @@
 (defn linear-in-inner
   "If `lift` is LINEAR in `inner` — i.e. `inner` itself, or a product one of whose factors is
    `inner` — return the vector of the REMAINING factors (possibly empty). Otherwise nil.
+   With a child dtype, canonical core casts proved identical to that dtype are also accepted.
+   Bare cast names are not proof: a caller may bind a different function with that name.
 
    Linearity is what makes staging a schedule rather than a different computation: it is exactly
    the condition under which the accumulate distributes,
@@ -68,14 +70,23 @@
    so the lift factors can be pushed into the body to obtain the flat equivalent. A non-linear
    lift (say `(sqrt inner)`) has no flat form — it is a genuinely different reduction, and is
    refused rather than silently mis-scheduled."
-  [lift inner]
-  (cond
-    (= lift inner) []
-    (and (seq? lift) (mul-head? (first lift)))
-    (let [args (vec (rest lift))
-          n (count (filter #(= inner %) args))]
-      (when (= 1 n) (vec (remove #(= inner %) args))))
-    :else nil))
+  ([lift inner] (linear-in-inner lift inner nil))
+  ([lift inner inner-dtype]
+   (letfn [(identity-inner? [expression]
+             (or (= expression inner)
+                 (and inner-dtype (seq? expression) (= 2 (count expression))
+                      (= "clojure.core" (some-> (od/semantic-op expression) namespace))
+                      (od/cast-op? (od/semantic-op expression))
+                      (= (dt/canon inner-dtype)
+                         (dt/dtype-for-scalar-tag (od/cast-result-tag (od/semantic-op expression))))
+                      (identity-inner? (second expression)))))]
+     (cond
+       (identity-inner? lift) []
+       (and (seq? lift) (mul-head? (od/semantic-op lift)))
+       (let [args (vec (od/call-args lift))
+             n (count (filter identity-inner? args))]
+         (when (= 1 n) (vec (remove identity-inner? args))))
+       :else nil))))
 
 (declare contract-extent)
 
@@ -130,7 +141,7 @@
        ;; every outer stage: lift present, uses `inner` once, linear, no forbidden ops
        (first
         (keep
-         (fn [{:keys [axis lift]}]
+         (fn [[index {:keys [axis lift]}]]
            (let [nodes (tree-seq coll? seq lift)
                  uses (count (filter #(= inner %) nodes))
                  heads (into #{} (keep #(when (seq? %) (first %))) nodes)]
@@ -142,10 +153,10 @@
                (seq (set/intersection heads forbidden-in-lift))
                {:ok false :reason :layout-changing-op-in-lift :axis axis
                 :ops (set/intersection heads forbidden-in-lift)}
-               (nil? (linear-in-inner lift inner))
+               (nil? (linear-in-inner lift inner (:dtype (nth stages (inc index)))))
                {:ok false :reason :lift-not-linear-in-inner :axis axis :lift lift}
                :else nil)))
-         (butlast stages)))
+         (map-indexed vector (butlast stages))))
        ;; dtypes must not narrow outward (inner → outer)
        ;; The flat equivalent distributes products over sums, not seeded folds. A nonzero
        ;; seed contributes once per enclosing iteration and is absent from that equivalent.
@@ -216,9 +227,9 @@
   (let [stages (vec stages)
         idx-of (stage-index-exprs stages)
         factors (map #(substitute-operand-indices % idx-of)
-                     (mapcat (fn [{:keys [lift]}]
-                               (when lift (linear-in-inner lift inner)))
-                             (butlast stages)))]
+                     (mapcat (fn [[index {:keys [lift]}]]
+                               (when lift (linear-in-inner lift inner (:dtype (nth stages (inc index))))))
+                             (map-indexed vector (butlast stages))))]
     (if (empty? factors)
       body
       (cons 'raster.numeric/* (cons body (vec factors))))))

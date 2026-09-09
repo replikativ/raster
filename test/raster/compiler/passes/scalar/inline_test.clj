@@ -23,7 +23,15 @@
             [raster.par]
             [raster.numeric]
             [raster.arrays]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.ad.reverse :as rev]))
+
+(deftest value-gradient-projection-indices-use-checked-constant-evidence
+  (let [elements {'vg ['primal 'gradient]}]
+    (doseq [index [1 '(long 1) '(clojure.core/long 1) '(clojure.core/int (long 1))]]
+      (is (= 'gradient (#'inline/known-vg-element elements 'vg index))))
+    (doseq [index [-1 2 'n '(long n) '(int 4294967296) '(float 1)]]
+      (is (nil? (#'inline/known-vg-element elements 'vg index))))))
 
 ;; Monomorphic callee taking THREE args (mirrors the concrete-float finetune.train/gblock,
 ;; which takes 38 and was called with 37).

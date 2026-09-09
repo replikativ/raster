@@ -522,8 +522,8 @@
        (get type-map (:dtype attributes) *scalar-type*))
 
      (and (seq? expr) (= 2 (count expr))
-          (contains? #{'int 'float 'double 'long} (first expr)))
-     (get tag->ctype (first expr) *scalar-type*)
+          (descriptor/cast-op? (first expr)))
+     (get tag->ctype (descriptor/cast-result-tag (first expr)) *scalar-type*)
 
      (and (seq? expr) (descriptor/aget-op? (first expr))
           (>= (count expr) 3))
@@ -1027,7 +1027,7 @@
 
      ;; Primitive cast
      (and (seq? expr)
-          (contains? #{'double 'float 'long 'int 'byte 'short} (first expr))
+          (or (descriptor/cast-op? (first expr)) (= 'short (first expr)))
           (= 2 (count expr)))
      ;; Vectorizing: a cast the walker inserted around a now-vector expr. An element-type
      ;; cast MATCHING the element type (e.g. `(double x)` where x is a double vload) is a

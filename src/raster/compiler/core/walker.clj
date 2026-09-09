@@ -13,6 +13,7 @@
   - Testable: handlers can be unit-tested with synthetic contexts
   - Extensible: new form types can be added via defmethod"
   (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
@@ -131,13 +132,15 @@
 
   Reads the ctx type-env first (the per-walk cache), then falls back to a tag
   carried on the symbol itself (`:raster.type/tag` metadata stamped at the
-  reference site by a prior walk). Carrying the type on the AST means a re-walk
+  reference site by a prior walk), only when the symbol is absent from the environment.
+  An explicitly unknown lexical binding masks stale metadata. Carrying the type on the AST means a re-walk
   over restructured code (PE/CSE/inline) keeps a binding's type even when the
   re-derived ctx type-env doesn't reach into a nested scope (e.g. an ftm closure
   capturing an outer var)."
   [ctx sym]
-  (or (get-in (:type-env ctx) [sym :tag])
-      (when (symbol? sym) (:raster.type/tag (meta sym)))))
+  (if (contains? (:type-env ctx) sym)
+    (get-in (:type-env ctx) [sym :tag])
+    (when (symbol? sym) (:raster.type/tag (meta sym)))))
 
 (defn ctx-get-fn-info
   "Get fn-info for a symbol."
@@ -179,6 +182,12 @@
 
     ;; Parallel ops — resolve namespace aliases (par/reduce → raster.par/reduce)
     ;; so user code using aliases gets the typed handlers with proper type-env.
+    (and (seq? form)
+         (symbol? (first form))
+         (= 'raster.par/contract
+            (resolve-aliased-symbol (first form) (:source-ns ctx))))
+    :par-contract
+
     (and (seq? form)
          (let [head (first form)
                resolved (if (and (symbol? head) (namespace head))
@@ -317,7 +326,8 @@
 
     ;; Primitive cast — (double x), (long x), etc. — walk inner, don't re-cast
     (and (seq? form) (= 2 (count form))
-         (contains? types/primitive-info (first form)))
+         (not (contains? (:type-env ctx) (first form)))
+         (descriptor/cast-op? (first form)))
     :cast
 
     ;; try/catch/finally
@@ -390,7 +400,12 @@
   Preserves metadata and auto-hints field access on typed receivers.
   Resolves namespace-aliased symbols to fully qualified names."
   [form ctx]
-  (let [;; Resolve namespace-aliased symbols to fully qualified names
+  (let [;; An explicitly unknown local masks type evidence from an earlier scope.
+        form (if (and (symbol? form) (contains? (:type-env ctx) form)
+                      (nil? (get-in (:type-env ctx) [form :tag])))
+               (vary-meta form dissoc :tag :raster.type/tag :raster.type/element :raster.type/fn-info)
+               form)
+        ;; Resolve namespace-aliased symbols to fully qualified names
         form (if (and (symbol? form) (namespace form) (not (ctx-get-tag ctx form)))
                (resolve-aliased-symbol form (:source-ns ctx))
                form)
@@ -398,6 +413,7 @@
         ;; so downstream code can always resolve them. Only qualifies non-fn vars
         ;; (constants, def values). Skips locals, special forms, macros, and fns.
         form (if (and (symbol? form) (not (namespace form))
+                      (not (contains? (:type-env ctx) form))
                       (not (ctx-get-tag ctx form))
                       (not (special-symbol? form)))
                (if-let [v (try (ns-resolve (:source-ns ctx) form) (catch Exception _ nil))]
@@ -530,8 +546,9 @@
               (vary-meta result assoc :raster.type/tag rt)
               result)
             ;; Primitive cast — (double x), (float x), etc.
-            (contains? types/primitive-info head)
-            (vary-meta result assoc :raster.type/tag head)
+            (and (not (contains? type-env head))
+                 (or (descriptor/cast-op? head) (contains? types/primitive-info head)))
+            (vary-meta result assoc :raster.type/tag (or (descriptor/cast-result-tag head) head))
             ;; if — result type is the (agreeing) type of its value branches.
             ;; A recur branch carries no value, so the result is the OTHER branch;
             ;; this also types loop bodies of the form (if test (recur ...) acc).
@@ -946,6 +963,60 @@
         (with-meta result {:raster.type/elem-type elem-type})
         result))))
 
+(defn- stamp-operand-return
+  [result arguments ctx]
+  (let [index (:return-type-arg (form/form-info result))
+        returned (when (some? index) (nth arguments index nil))
+        tag (or (inf/hint-tag returned)
+                (when (symbol? returned) (ctx-get-tag ctx returned)))]
+    (if tag (vary-meta result assoc :raster.type/tag tag) result)))
+
+(defn- compiler-cast [tag expression]
+  (list (symbol "clojure.core" (name tag)) expression))
+
+(defmethod walk-form :par-contract [source ctx]
+  (let [[head output free-axes contract-axes body & options] source
+        opts (apply hash-map options)
+        axis-context (fn [axes]
+                       (reduce (fn [env [axis _]] (ctx-assoc-type env axis 'long)) ctx axes))
+        body-ctx (axis-context (concat free-axes contract-axes))
+        scalar-tag #(when (dtype/known? %) (dtype/scalar-tag-for-dtype %))
+        stages (:stages opts)
+        walked-options
+        (reduce-kv
+         (fn [result key value]
+           (assoc result key
+                  (case key
+                    :decode
+                    (into (empty value)
+                          (map (fn [[operand expression]]
+                                 (let [raw-type (dtype/dtype-for-array-tag (ctx-get-tag ctx operand))
+                                       env (ctx-assoc-type body-ctx 'x (scalar-tag raw-type))]
+                                   [operand (walk expression env)]))) value)
+                    :stages
+                    (mapv (fn [index stage]
+                            (let [env (axis-context (concat free-axes (take (inc index) contract-axes)))
+                                  env (ctx-assoc-type env 'inner
+                                                      (scalar-tag (:dtype (get stages (inc index)))))]
+                              (into (empty stage)
+                                    (map (fn [[k v]] [k (walk v (if (= k :lift) env ctx))])) stage)))
+                          (range) stages)
+                    :epilogue
+                    (let [acc-tag (or (scalar-tag (:dtype (first stages)))
+                                      (some-> (ctx-get-tag ctx output) dtype/dtype-for-array-tag scalar-tag))
+                          env (ctx-assoc-type (axis-context free-axes) (:acc value) acc-tag)]
+                      (into (empty value)
+                            (map (fn [[k v]] [k (walk v (if (= k :expr) env ctx))])) value))
+                    (walk value ctx))))
+         {} opts)]
+    (let [result (with-meta
+                   (apply list head (walk output ctx)
+                          (mapv (fn [[axis extent]] [axis (walk extent ctx)]) free-axes)
+                          (mapv (fn [[axis extent]] [axis (walk extent ctx)]) contract-axes)
+                          (walk body body-ctx) (mapcat identity walked-options))
+                   (meta source))]
+      (stamp-operand-return result (rest result) ctx))))
+
 (defmethod walk-form :par-reduce [form ctx]
   (let [[_ acc-sym init-expr i-sym bound-expr body-expr] form
         walked-init (walk init-expr ctx)
@@ -1323,7 +1394,7 @@
               ;; wrap the float arg in (double ...)
                 rewritten-args (if promotion-casts
                                  (mapv (fn [arg cast]
-                                         (if cast (list cast arg) arg))
+                                         (if cast (compiler-cast cast arg) arg))
                                        rewritten-args promotion-casts)
                                  rewritten-args)
               ;; Emit .invk when we have a typed-impl AND either:
@@ -1516,7 +1587,7 @@
         ;; Handles both unqualified symbols and namespace-aliased symbols (e.g. rev/value+grad).
         ;; Only qualify non-macro, non-special-form vars (macros like case/cond must stay unqualified
         ;; because the walker walks their raw args and cast-wrapping would corrupt macro semantics)
-        f (if (and (symbol? f) (not (inf/type-env-tag type-env f)))
+        f (if (and (symbol? f) (not (contains? type-env f)))
             (if-let [v (try (ns-resolve source-ns f) (catch Exception _ nil))]
               (if (and (var? v) (not (:macro (meta v))))
                 (symbol (str (.name (.ns ^clojure.lang.Var v)))
@@ -1534,21 +1605,14 @@
                              (if (and tag (contains? types/primitive-info tag)
                                       ;; Don't re-wrap already-cast args
                                       (not (and (seq? walked)
-                                                (contains? types/primitive-info (first walked)))))
-                               (list tag walked)
+                                                (descriptor/cast-op? (first walked)))))
+                               (compiler-cast tag walked)
                                walked)))
                          args walked-args)
                     walked-args)
-        result (apply list (walk f ctx) cast-args)
-        ;; Compiler forms can return an existing operand without being an ordinary
-        ;; dispatched call (e.g. contract returns its destination). Use the shared
-        ;; form contract during the lexical walk, before a following binding is
-        ;; consumed. Late result typing cannot repair an already unresolved call.
-        return-index (:return-type-arg (form/form-info result))
-        returned (when (some? return-index) (nth walked-args return-index nil))
-        return-tag (or (inf/hint-tag returned)
-                       (when (symbol? returned) (ctx-get-tag ctx returned)))]
-    (if return-tag (vary-meta result assoc :raster.type/tag return-tag) result)))
+        result (apply list (walk f ctx) cast-args)]
+    ;; Propagate operand-return contracts before a following binding is consumed.
+    (stamp-operand-return result walked-args ctx)))
 
 ;; ================================================================
 ;; Branch: primitive cast (idempotent)

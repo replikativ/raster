@@ -8,11 +8,20 @@
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]))
 
 (defn- numeric-invk [impl & arguments]
   (util/make-invk impl arguments))
+
+(deftest qualified-index-casts-retain-contiguous-simd-loads
+  (doseq [cast '[long int clojure.core/long clojure.core/int]
+          index [(list 'clojure.core/+ 'base (list cast 'i))
+                 (list 'clojure.core/+ (list cast 'i) 'base)]]
+    (let [read (list 'clojure.core/aget 'a index)]
+      (is (= '[a base] (ss/aget-form? read 'i)))
+      (is (ss/simd-able? (list 'clojure.core/double read) 'i)))))
 
 (defn- clang-avx2? []
   (try

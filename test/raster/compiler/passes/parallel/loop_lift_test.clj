@@ -2,7 +2,14 @@
   (:require [clojure.test :refer [deftest testing is]]
             [raster.par :as par]
             [raster.compiler.ir.par :as ir.par]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]))
+
+(deftest reduction-accumulator-casts-use-canonical-identity
+  (doseq [expression ['s '(double s) '(clojure.core/double s)]]
+    (is (patterns/acc-ref? expression 's)))
+  (doseq [expression ['(float s) '(clojure.core/int s) '(other/double s) '(double t)]]
+    (is (not (patterns/acc-ref? expression 's)))))
 
 ;; ================================================================
 ;; Map pattern detection

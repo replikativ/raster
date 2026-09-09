@@ -19,6 +19,15 @@
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
+(deftest qualified-integer-size-casts-use-the-shared-descriptor
+  (doseq [cast '[int long clojure.core/int clojure.core/long]]
+    (is (= 7 (aot/resolve-int-expr (list cast 'n) {'n 7})))))
+
+(deftest scratch-sizes-use-checked-constant-evidence
+  (is (= 8 (#'aot/const-int-size '(clojure.core/long (clojure.core/int 8)))))
+  (doseq [expression ['(int 4294967296) -1 'n '(long n)]]
+    (is (nil? (#'aot/const-int-size expression)))))
+
 (defn- clang-available? []
   (try
     (let [cc (or (System/getenv "RASTER_CC") "clang")

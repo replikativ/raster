@@ -23,6 +23,7 @@
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
@@ -263,8 +264,9 @@
     (seq? expr)
     (let [op (first expr)]
       (cond
-        (= 'int op)  (long (resolve-int-expr (second expr) env))
-        (= 'long op) (long (resolve-int-expr (second expr) env))
+        (and (descriptor/cast-op? op)
+             (contains? '#{int long} (descriptor/cast-result-tag op)))
+        (long (resolve-int-expr (second expr) env))
         ;; arithmetic — classify by the SEMANTIC op (:raster.op/original metadata,
         ;; falling back to the head/impl symbol) via the shared intrinsics registry.
         :else
@@ -544,10 +546,8 @@
   "Resolve a buffer size to a compile-time integer, seeing through the walker's
    (long N)/(int N) literal wrappers; nil if not a compile-time constant."
   [size]
-  (cond
-    (integer? size) (long size)
-    (and (seq? size) (#{'long 'int} (first size)) (integer? (second size))) (long (second size))
-    :else nil))
+  (let [value (:value (constant/value size))]
+    (when (and (integer? value) (<= 0 value Long/MAX_VALUE)) (long value))))
 
 (defn- local-scratch-size
   "If a buffer is small compile-time-constant scratch (not a returned result), its

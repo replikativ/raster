@@ -85,7 +85,7 @@
                                        [sym (extent! map (dissoc domain (:axis inner)))]) lifts)))
           ;; The stage contract gives lift reads their declared maps. Admit scalar factors only;
           ;; arbitrary calls, local binders and casts need their own retained region contract.
-          factors (stages/linear-in-inner (:lift outer) 'inner)
+          factors (stages/linear-in-inner (:lift outer) 'inner (:dtype inner))
           lift-ids (set (map :sym lifts))
           _ (require! (every? #(or (number? %)
                                   (and (descriptor/aget-call? %)
@@ -105,4 +105,3 @@
        :plan plan
        :n n
        :sizes sizes})))
-
