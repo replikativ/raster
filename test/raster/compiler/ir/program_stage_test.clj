@@ -22,6 +22,9 @@
   (nn/residual-add! at q output 4))
 
 (defn- descriptor []
+  ;; The literal extent 4 is intentionally below the staging backend's host-fallback
+  ;; threshold. Resident compilation must keep these effects on the device regardless
+  ;; of whether the walker retains `4` or a redundant `(long 4)` cast.
   (pipeline/compile-gpu-program #'staged-attention! :ze:0 :dtype :float))
 
 (defn- projection-bindings
