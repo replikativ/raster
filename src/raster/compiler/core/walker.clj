@@ -198,6 +198,12 @@
     :par-map
 
     (and (seq? form)
+         (symbol? (first form))
+         (= 'raster.par/map-void!
+            (resolve-aliased-symbol (first form) (:source-ns ctx))))
+    :par-map-void
+
+    (and (seq? form)
          (let [head (first form)
                resolved (if (and (symbol? head) (namespace head))
                           (resolve-aliased-symbol head (:source-ns ctx))
@@ -925,6 +931,16 @@
 ;; ================================================================
 ;; Branch: parallel ops (map!, reduce, scan, stencil!)
 ;; ================================================================
+
+(defmethod walk-form :par-map-void [form ctx]
+  ;; The bound is outside the induction-variable scope, just as for map!.
+  ;; Keep the effect-only SOAC intact; its body does not determine a return type.
+  (let [[_ i-sym bound-expr body-expr] form
+        walked-bound (walk bound-expr ctx)
+        idx-ctx (ctx-assoc-type ctx i-sym 'long)]
+    (with-meta (list 'raster.par/map-void! i-sym walked-bound
+                     (walk body-expr idx-ctx))
+      (meta form))))
 
 (defmethod walk-form :par-map [form ctx]
   ;; Handle both standard and offset variants:

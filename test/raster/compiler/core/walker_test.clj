@@ -119,6 +119,30 @@
     (is (nil? (:raster.op/original (meta mixed)))
         "retaining an inferred type does not pretend that a bare core call was devirtualized")))
 
+(deftest effect-map-index-has-a-lexical-type-scope
+  (let [walked (wb (with-meta
+                    '(raster.par/map-void! i (clojure.core/+ i i)
+                       (clojure.core/quot i width))
+                    {:line 123})
+                   {'i 'double 'width 'long})
+        [_ _ bound body] walked]
+    (is (= 'double (:raster.type/tag (meta bound)))
+        "the bound sees the outer binding, not the induction variable")
+    (is (= 'long (:raster.type/tag (meta body)))
+        "the existing scalar inference now sees both operand types")
+    (is (= 123 (:line (meta walked))))
+    (is (nil? (:raster.type/tag (meta walked)))
+        "an effect map does not inherit the body's scalar result"))
+  (let [walked (wb '(raster.par/map-void! i n (clojure.core/quot i unknown))
+                   {'n 'long})]
+    (is (nil? (:raster.type/tag (meta (last walked))))
+        "index scope does not invent types for unknown operands"))
+  (let [walked (wb '(do (raster.par/map-void! i n (clojure.core/quot i width))
+                        (clojure.core/+ i i))
+                   {'i 'double 'n 'long 'width 'long})]
+    (is (= 'double (:raster.type/tag (meta (last walked))))
+        "the induction variable does not escape the effect map")))
+
 (deftest walk-nested-let-test
   (testing "nested let bindings are walked"
     (let [walked (wb '(let [a (raster.numeric/+ x y)
