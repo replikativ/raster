@@ -785,3 +785,19 @@ post-loop facts, unsafe index-derived terms and safe fallback after speculative 
 This is a verifier prerequisite, not yet broader integer-stage admission or general index-arithmetic
 safety. Nonpacked/decoded byte reductions still need their source-to-schedule validation and device
 comparisons before a migrated source emitter can be retired.
+
+### Nonpacked integral stages through the shared verifier
+
+Static Int/Long inner folds now use the recursive staged scalar schedule when the shared
+KernelBody verifier proves every accumulation prefix fits. Four-byte packing is an optional
+schedule, not the semantic admission boundary: widths 1, 3 and 5 and normalized byte decodes
+are covered. Admission validates a normalized body specification through the same checks used
+when materializing KernelBody, without allocating a record or invoking a target emitter.
+
+Strict typed scalar lowering preserves retained integral operation widths before stage casts.
+Checked or wrapping arithmetic retains a mathematical range only when the entire range fits its
+machine dtype; this does not rewrite overflow policy. A public Long multiply/divide decode tests
+the distinction from premature Int arithmetic. Independent Arc references cover byte extrema and
+Float rounding, and both public decoded workloads enter the CUDA/HIP/OpenCL compile fixtures.
+Possible overflowing folds still decline before schedule admission. This is correctness and
+coverage work, not a throughput claim or proof that all staged source fallbacks can be removed.

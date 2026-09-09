@@ -22,15 +22,18 @@
 
 (deftest recursive-packed-stages-refuse-unproved-contracts
   (doseq [[case-id components]
-          [[:long-inner (assoc-in (source-components 4) [:opts :stages 2 :dtype] :long)]
-           [:nonzero-init (assoc-in (source-components 4) [:opts :stages 2 :init] 1)]
-           [:unaligned-extent (source-components 3)]
+          [[:nonzero-init (assoc-in (source-components 4) [:opts :stages 2 :init] 1)]
            [:wrong-map (assoc-in (source-components 4) [:opts :operands 0 :map]
                                 (am/of-axes '[[sb 2] [i 2] [blk 2] [t 4]]))]
            [:extra-factor (update (source-components 4) :body #(list '* % 2))]
            [:escaped-axis (assoc-in (source-components 4) [:opts :stages 0 :lift] '(* inner t))]]]
     (is (thrown? clojure.lang.ExceptionInfo (staged/lower (facts/from-components components)))
         (name case-id))))
+
+(deftest nonpacked-integer-stages-use-the-same-recursive-schedule
+  (doseq [components [(assoc-in (source-components 4) [:opts :stages 2 :dtype] :long)
+                      (source-components 3)]]
+    (is (some? (staged/lower (facts/from-components components))))))
 
 (deftest recursive-packed-stages-preserve-mixed-outer-dtypes
   (let [scheduled (staged/lower (facts/from-components (source-components 4)))

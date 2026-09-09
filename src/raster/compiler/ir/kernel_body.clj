@@ -1282,12 +1282,12 @@
              (and (contains? #{:byte :int :long} result-type)
                   (contains? #{:+ :- :*} canonical-op))]
          (if integral-arithmetic?
-           ;; A checked operation may trap and a wrapping operation may narrow modulo its
-           ;; representation.  Neither permits downstream arithmetic to borrow an unbounded
-           ;; mathematical interval; only an independently proved operation retains it.
-           (if (= :no-overflow (:overflow options))
-             (scalar-result-range canonical-op result-type infos)
-             (scalar-range/for-dtype result-type))
+           ;; Preserve a bounded mathematical result even when the instruction still carries
+           ;; its checked/wrapping policy. No policy is rewritten: if overflow is possible,
+           ;; the downstream fact remains the entire machine dtype.
+           (let [derived (scalar-result-range canonical-op result-type infos)]
+             (if (scalar-range/contained-in-dtype? derived result-type)
+               derived (scalar-range/for-dtype result-type)))
            (scalar-result-range canonical-op result-type infos))))}))
 
 (defn- expression-info!
@@ -2129,12 +2129,9 @@
         (clean-state! :kernel final-state))
       (set/difference @claimed reserved))))
 
-(defn validate!
-  "Verify a scheduled KernelBody and return it unchanged."
+(defn- validate-contents!
+  "Shared checks for a normalized schedule specification and a materialized KernelBody."
   [body]
-  (when-not (kernel-body? body)
-    (throw (ex-info "kernel body must be a KernelBody value"
-                    {:body body :actual (type body)})))
   (let [{:keys [id parameters views stable-reads allocations indices masks fragments operations
                 schedule launch provenance attributes]} body]
     (when (nil? id)
@@ -2403,6 +2400,27 @@
         (validate-dataflow-operations! operations initial-values context))))
   body)
 
+(defn validate!
+  "Verify a scheduled KernelBody and return it unchanged."
+  [body]
+  (when-not (kernel-body? body)
+    (throw (ex-info "kernel body must be a KernelBody value"
+                    {:body body :actual (type body)})))
+  (validate-contents! body))
+
+(defn- normalize-spec [spec]
+  (merge {:parameters [] :views [] :stable-reads [] :allocations [] :indices [] :masks []
+          :fragments [] :operations [] :schedule {} :launch {} :provenance {} :attributes {}}
+         spec))
+
+(defn validate-spec!
+  "Run the same semantic checks before materializing a KernelBody. No target or driver work.
+   Returns the normalized specification; this does not bypass validation at materialization."
+  [spec]
+  (when-not (map? spec)
+    (throw (ex-info "kernel specification must be a map" {:spec spec})))
+  (validate-contents! (normalize-spec spec)))
+
 (defn required-async-source-alignments
   "Return external input alignment preconditions implied by overlap-required async copies.
 
@@ -2428,12 +2446,11 @@
 
 (defn make
   "Construct and verify a target-neutral scheduled kernel body."
-  [{:keys [id parameters views stable-reads allocations indices masks fragments operations schedule
-           launch provenance attributes]
-    :or {parameters [] views [] stable-reads [] allocations [] indices [] masks [] fragments []
-         operations [] schedule {} launch {} provenance {} attributes {}}}]
-  (validate! (->KernelBody id parameters views stable-reads allocations indices masks fragments
-                           operations schedule launch provenance attributes)))
+  [spec]
+  (let [{:keys [id parameters views stable-reads allocations indices masks fragments operations
+                schedule launch provenance attributes]} (normalize-spec spec)]
+    (validate! (->KernelBody id parameters views stable-reads allocations indices masks fragments
+                             operations schedule launch provenance attributes))))
 
 (defn validate-launch-index-ranges!
   "Check the physical ranges of a verified body's hardware bindings at concrete launch time.

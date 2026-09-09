@@ -875,6 +875,17 @@
            (body/->Yield ['next-carry])]
           [(body/value 'loop-result :int)] {})]))))
 
+(deftest specification-and-materialized-kernel-share-validation
+  (let [kernel (scalar-body [])
+        spec (into {} kernel)]
+    (is (= spec (with-redefs [body/->KernelBody (fn [& _] (throw (Exception. "materialized")))]
+                  (body/validate-spec! spec))))
+    (is (= kernel (body/make spec)))
+    (doseq [invalid [(assoc spec :operations [:unknown])
+                     (assoc spec :parameters nil)]]
+      (is (thrown? clojure.lang.ExceptionInfo (body/validate-spec! invalid)))
+      (is (thrown? clojure.lang.ExceptionInfo (body/make invalid))))))
+
 (deftest scalar-and-collective-operators-have-semantic-dtype-domains
   (testing "floating intrinsics do not accept integers"
     (is (thrown-with-msg?

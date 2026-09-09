@@ -48,6 +48,16 @@
   (is (= (bigint "18446744073709551615")
          (ranges/counted-loop-trips Long/MIN_VALUE Long/MAX_VALUE 1))))
 
+(deftest quotient-proof-requires-a-positive-constant-divisor
+  (doseq [lo (range -9 10) hi (range lo 10) divisor [1 2 7]]
+    (let [proof (ranges/quotient [{:lower lo :upper hi}
+                                 {:lower divisor :upper divisor}])]
+      (is (every? #(<= (:lower proof) (quot % divisor) (:upper proof))
+                  (range lo (inc hi))))))
+  (doseq [divisor [nil {:lower 0 :upper 0} {:lower -1 :upper -1}
+                   {:lower -1 :upper 1} {:lower 1 :upper 2}]]
+    (is (nil? (ranges/quotient [(ranges/for-dtype :long) divisor])))))
+
 (deftest typed-index-ranges-cover-every-small-domain-value
   (doseq [width [1 2 7 12] divisor [1 2 3 5]
           op [:floor-div :mod]]
