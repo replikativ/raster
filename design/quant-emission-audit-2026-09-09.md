@@ -85,3 +85,17 @@ matches JVM packed words and scales across three rows, including half-ties and a
 Both overloads and the public packer join the CUDA/HIP compile fixtures. This is correctness and
 emission evidence, **not a throughput measurement**. The original 33-entry table remains the
 pre-repair baseline; Q8_K compatibility emission and the packed helper's lost type remain open.
+
+## Q8_K scale ownership
+
+Both row quantizers now publish each super-block scale only from sub-block `j=0`. Previously
+eight work-items performed non-atomic writes to the same slot; equal values do not establish
+race freedom. The valid-input contract remains complete launches over rows whose physical width
+is a multiple of 256. Packed-word and block-sum ownership, scratch size, two-phase scheduling,
+and the public ABI are unchanged. CPU row/padding checks, emitted store-guard checks, and real
+device quantization-to-Q4_K projection chains pass (five focused tests, 30 assertions).
+
+The second phase still declines TypedSOAC admission. Its store loop also carries a running sum;
+the frontend currently admits index-only store loops. The next generalization must preserve
+result-carrying effects and their order through the existing effect-region and KernelBody loop
+contracts. Do not conceal this with a quantization-specific emitter or a claimed typed route.

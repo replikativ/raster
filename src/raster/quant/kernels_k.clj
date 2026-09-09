@@ -89,7 +89,8 @@
 ;; phase 1 computes per-32-sub-block |max| (nsb*8 items, 32-deep), phase 2 folds the 8
 ;; sibling submaxes (float max is EXACT under reassociation → d is bit-identical to the
 ;; serial scan) and quantizes its 32 elements (nsb*8 items, ~40-deep). `submax` is an
-;; nrows*nsb*8 float scratch. The 8 same-value xs writes per super-block are benign.
+;; nrows*nsb*8 float scratch. Only sub-block zero publishes each super-block's scale;
+;; identical values do not make concurrent non-atomic writes a valid ownership contract.
 (deftm quant-act-q8k-rows-gpu!
   "Q8_K activation quantization over a row-major [nrows,in] tensor. The physical result is
   the ordered `(xp,xs,bsums)` representation with row-major leaves; `submax` is transient
@@ -121,7 +122,8 @@
                          sidx (+ (* row nsub) (* sb 8) j)
                          wbase (+ (* row (quot (long in) 4)) (* sb 64) (* j 8))
                          ebase (+ (* row (long in)) (* sb 256) (* j 32))]
-                     (ra/aset xs (+ (* row nsb) sb) (float d))
+                     (when (== j 0)
+                       (ra/aset xs (+ (* row nsb) sb) (float d)))
                      (let [bs (loop [w 0 s 0]
                                 (if (< w 8)
                      ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
@@ -183,7 +185,8 @@
                          wbase (+ (* row (quot (long padded-in) 4)) (* sb 64) (* j 8))
                          col-base (+ (* sb 256) (* j 32))
                          xbase (* row (long width))]
-                     (ra/aset xs (+ (* row nsb) sb) (float d))
+                     (when (== j 0)
+                       (ra/aset xs (+ (* row nsb) sb) (float d)))
                      (let [bs (loop [w 0 s 0]
                                 (if (< w 8)
                                   (let [col (+ col-base (* w 4))
