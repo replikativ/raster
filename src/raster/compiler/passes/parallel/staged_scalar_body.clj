@@ -62,7 +62,9 @@
                                                   (dtype/scalar-tag-for-dtype
                                                    (if child dt (:dtype source))))))
                              expression)
-                term ((:lower builder) expression dt (if child {(:result child) (:dtype child)} {}))
+                term ((:cast builder)
+                      ((:lower builder) expression dt (if child {(:result child) (:dtype child)} {}))
+                      dt expression)
                 sum ((:compute builder) :+ dt [carry (:result term)] {})]
             {:result result :dtype dt
              :operations [(body/->ForLoop
