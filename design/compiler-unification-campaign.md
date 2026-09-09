@@ -801,3 +801,16 @@ the distinction from premature Int arithmetic. Independent Arc references cover 
 Float rounding, and both public decoded workloads enter the CUDA/HIP/OpenCL compile fixtures.
 Possible overflowing folds still decline before schedule admission. This is correctness and
 coverage work, not a throughput claim or proof that all staged source fallbacks can be removed.
+
+### Separate accumulation, result-transform and storage precision
+
+The recursive staged schedule converts its completed result to the declared output storage dtype
+instead of requiring storage to equal the outer accumulator dtype. The shared conversion policy
+rejects unsupported floating-to-integral conversions and unrequested integral narrowing.
+An epilogue first converts to its own declared dtype, including a bare identity expression, then
+converts to storage dtype. Neither conversion changes the preceding accumulator types or rounding.
+
+Independent Arc cases distinguish Float accumulation then Double storage (0 rather than 1) and
+Double accumulation then a Float identity epilogue then Double storage (16777216 rather than
+16777217). Both are public vendor compile fixtures. Single-stage closure admission and the legacy
+quant router's implicit accumulator semantics remain separate retirement work.

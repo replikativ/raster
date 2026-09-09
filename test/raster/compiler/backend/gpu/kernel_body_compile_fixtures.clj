@@ -292,6 +292,10 @@
       (:kernels (equation-first/compile
                  #'staged-public/widened-byte-three-wide! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'staged-public/floating-stages-double-output! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'staged-public/double-stages-float-identity-output! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))

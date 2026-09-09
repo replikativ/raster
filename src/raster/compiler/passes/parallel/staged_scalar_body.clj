@@ -4,6 +4,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as constant]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.ir.contract-stages :as stages]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.kernel-body :as body]
@@ -80,6 +81,11 @@
                                         [(body/->Yield [(:result sum)])]))
                            [(body/value result dt)] {})]})))
         computation (build-stage 0)
+        store-cast (fn [lowered expression]
+                     (when-not (conversion/policy (:type lowered) out-type :reject)
+                       (decline! :result-conversion "result storage conversion needs an explicit supported policy"
+                                 {:source (:type lowered) :target out-type}))
+                     ((:cast builder) lowered out-type expression))
         result-transform
         (when-let [epilogue (:epilogue source)]
           (let [legality (body/scalar-region-legal? epilogue)
@@ -94,8 +100,16 @@
                                     (not (or (:tag (meta expression)) (:raster.type/tag (meta expression)))))
                              (vary-meta expression assoc :raster.type/tag (dtype/scalar-tag-for-dtype dt))
                              expression)
-                lowered ((:lower builder) expression dt {(:result computation) (:dtype computation)})]
-            ((:cast builder) lowered out-type expression)))
+                lowered ((:cast builder)
+                         ((:lower builder) expression dt {(:result computation) (:dtype computation)})
+                         dt expression)]
+            (store-cast lowered expression)))
+        ;; Storage conversion follows the complete staged computation (and optional epilogue).
+        ;; Changing the accumulator dtype here would change intermediate rounding.
+        stored-result (or result-transform
+                          (store-cast
+                           {:result (:result computation) :type (:dtype computation) :operations []}
+                           (:body source)))
         arrays (:array-parameters attributes)
         captures (:capture-parameters attributes)
         parameter (fn [id kind dt elements]
@@ -120,9 +134,9 @@
                                       (reduce *' 1 (map second (drop (inc i) (:free-axes source))))) extent)))
                                  (:free-axes source))))
                  :masks [(body/->Mask mask [(body/predicate :lt segment n)])]
-                 :operations (conj (into (:operations computation) (:operations result-transform))
+                 :operations (conj (into (:operations computation) (:operations stored-result))
                                    (body/->ScalarStore (:out source) [segment]
-                                                        (or (:result result-transform) (:result computation)) mask))
+                                                        (:result stored-result) mask))
                  :launch (launch/spec {:workgroup-size [workgroup-size]
                                        :group-count [(quot (+ n (dec workgroup-size)) workgroup-size)]})
                  :schedule {:strategy :staged-scalar :workgroup-size workgroup-size}}]

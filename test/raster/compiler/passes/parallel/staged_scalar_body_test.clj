@@ -170,8 +170,10 @@
 
 (deftest scalar-captures-require-authoritative-types
   (is (thrown? clojure.lang.ExceptionInfo (staged/lower (three-stage-facts))))
+  (is (some? (staged/lower (assoc (three-stage-facts) :out-dtype :double)
+                            :scalar-types {'scale :float})))
   (is (thrown? clojure.lang.ExceptionInfo
-               (staged/lower (assoc (three-stage-facts) :out-dtype :double)
+               (staged/lower (assoc (three-stage-facts) :out-dtype :int)
                              :scalar-types {'scale :float}))))
 
 (defn production-graph []
