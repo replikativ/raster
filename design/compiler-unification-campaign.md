@@ -747,3 +747,22 @@ fixtures for CUDA/HIP compilation. The compatibility ledger records the generate
 This does not claim mixed-storage or integer-overflow coverage, whole staged-emitter retirement,
 or competitive kernel throughput. Unnormalized direct typed facts remain explicitly gated;
 remaining precision/storage cases and measured schedule performance are still campaign work.
+
+### Recursive floating stages around a proved packed inner fold
+
+The generated staged schedule composes the existing verified byte-product Int32 fold beneath
+multiple Float/Double stages. Its shared packed fragment is also used by the original two-stage
+schedule; packing remains four byte loads and typed word operations, with no pointer reinterpretation.
+The existing packed admission proves exact-product replacement, contiguous declared maps,
+four-divisible extent, zero identity and every Int32 accumulation prefix. It is not a general
+integer-loop invariant or a new quantization-specific rule.
+
+Every outer stage explicitly converts its lifted term to its declared accumulator dtype, including
+identity lifts. Public three-stage compilation and resident Arc execution use the generated route;
+an independent reference rounds each Float stage with non-power-of-two scales. Hardware-free tests
+retain mixed Float/Double outer dtypes and reject unproved integer, layout and lexical cases.
+The public workload is included in vendor compile fixtures and the compatibility ledger.
+
+Nonpacked integral folds, unproved overflow, decoded byte products and arbitrary mixed storage
+remain separate work. This closes a recursive composition gap, not whole staged source-emitter
+retirement or a throughput claim; vectorized packing and cooperative schedules still need measurement.

@@ -3,7 +3,8 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.contraction-closure :as closure]
-            [raster.compiler.ir.contraction-facts :as facts]))
+            [raster.compiler.ir.contraction-facts :as facts]
+            [raster.compiler.passes.parallel.staged-contraction-schedule :as packed-schedule]))
 
 (defn decline! [rule message data]
   (throw (ex-info message (assoc data :reason :staged-scalar-body-declined :missing-rule rule))))
@@ -36,6 +37,12 @@
         _ (closure/validate-result-scalar-types! source scalar-types)
         requirements (closure/storage-requirements attributes)
         stage-list (:stages source)
+        packed-operands (get-in source [:opts :operands])
+        packed-plan (when (= :int (dtype/canon (:dtype (peek stage-list))))
+                      (let [plan (packed-schedule/inner-dp4a-plan
+                                  (assoc source :operands packed-operands))]
+                        (when (:ok plan) plan)))
+        floating-stages (if packed-plan (pop stage-list) stage-list)
         axes (vec (concat (:free-axes source) (:contract-axes source)))
         n (reduce *' 1 (map second (:free-axes source)))
         out-type (dtype/canon (:dtype (first stage-list)))
@@ -44,8 +51,10 @@
                                  (vals (group-by :parameter requirements))))
             (decline! :storage-types "scalar staged storage requires one declared dtype per buffer"
                       {:requirements requirements :out-dtype (:out-dtype source)}))
-        _ (when-not (and (every? #(contains? #{:float :double} (dtype/canon %))
-                                 (concat [(:dtype source)] (map :dtype stage-list)))
+        _ (when-not (and (or packed-plan
+                            (contains? #{:float :double} (dtype/canon (:dtype source))))
+                         (every? #(contains? #{:float :double} (dtype/canon (:dtype %)))
+                                 floating-stages)
                          (every? #(contains? scalar-types %) scalars)
                          (integer? workgroup-size) (<= 1 workgroup-size 256)
                          (every? #(<= (second %) Integer/MAX_VALUE) axes)
@@ -61,6 +70,8 @@
     {:reads reads
      :attributes attributes
      :stage-list stage-list
+     :packed-plan packed-plan
+     :packed-operands packed-operands
      :axes axes
      :n n
      :out-type out-type

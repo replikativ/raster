@@ -101,6 +101,10 @@
     (pipeline/compile-report #'staged-public/widening-decoded-stages!
                              :target-device target :dtype :float)
 
+    :recursive-packed-contraction-gpu
+    (pipeline/compile-report #'staged-public/packed-three-stage!
+                             :target-device target :dtype :float)
+
     :symbolic-dense-contraction-gpu
     (let [compilation (equation-first/compile
                        #'contract/contract-mm {:target target :dtype :float})
@@ -164,6 +168,7 @@
              :staged-byte-float-contraction-gpu
              :staged-floating-contraction-gpu
              :decoded-staged-contraction-gpu
+             :recursive-packed-contraction-gpu
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
