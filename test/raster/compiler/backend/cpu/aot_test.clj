@@ -189,6 +189,22 @@
     (is (contains? (:outputs operation) (:out-sym operation))
         "the scheduled store owns its physical destination before C emission")))
 
+(deftm axpy-inplace-map
+  [x :- (Array float) a :- (Array float) n :- Long] :- (Array float)
+  (raster.par/map! x i n float (rn/+ (ra/aget x i) (ra/aget a i))))
+
+(deftest scheduled-inplace-c-map-retains-writable-parameter-contract
+  (when (clang-available?)
+    (let [compiled (aot/compile-aot-c #'axpy-inplace-map :float :simd? true)
+          source (:c-source (meta compiled))]
+      (is (boolean (re-find #"(?m)^void .*\(float\* restrict x, const float\* restrict a," source))
+          "the scheduled destination is writable while its distinct input remains const")
+      (doseq [n [0 3 8 19]]
+        (let [x (float-array (range n)) a (float-array (repeat n 2))]
+          (compiled x a n)
+          (is (= (mapv #(+ 2.0 %) (range n)) (vec x)))
+          (is (= (vec (repeat n 2.0)) (vec a))))))))
+
 (deftest cpu-c-simd-map
   (when (clang-available?)
     (testing ":simd? true emits __m256 store loop for par/map!, matches scalar + interpreter"

@@ -458,9 +458,12 @@
         ;; clang elides it when the array is fully written before read.
         local-decls (apply str (for [[s size elem] local-buffers]
                                  (str (elem->ctype elem "double") " " (ce/c-symbol s) "[" size "] = {0};\n  ")))
-        ;; array params that the body writes (aset target) are in-place OUTPUT params —
-        ;; emit them non-const; read-only input arrays stay const.
-        written (written-array-syms stripped)
+        ;; Scheduled stores are authoritative even when the host projection retains par/map!
+        ;; rather than an aset spelling. Explicit host writes still count outside those regions.
+        ;; Use the same physical-output projection as graph consumers, not a C-only op registry.
+        written (into (written-array-syms stripped)
+                      (mapcat segop/operation-outputs)
+                      (mapcat :operations (:equations *scheduled-program*)))
         ;; param order: input arrays, output buffers, scalar params, array lengths —
         ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
