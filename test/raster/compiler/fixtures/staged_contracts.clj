@@ -27,6 +27,23 @@
     :epilogue {:acc value :expr (+ value (aget bias _) gain) :dtype :float
                :operands [{:sym bias :dtype :float :map {:groups [[[i 2]]]}}]}))
 
+(deftm floating-stages-double-output!
+  [a :- (Array double) out :- (Array double)] :- Void
+  (raster.par/contract out [[i 1]] [[blk 1] [t 3]]
+    (raster.arrays/aget a (+ (* i 3) (* blk 3) t))
+    :out-dtype :double
+    :stages [{:axis blk :extent 1 :dtype :float :init 0.0 :lift inner}
+             {:axis t :extent 3 :dtype :float :init 0.0}]))
+
+(deftm double-stages-float-identity-output!
+  [a :- (Array double) out :- (Array double)] :- Void
+  (raster.par/contract out [[i 1]] [[blk 1] [t 3]]
+    (raster.arrays/aget a (+ (* i 3) (* blk 3) t))
+    :out-dtype :double
+    :stages [{:axis blk :extent 1 :dtype :double :init 0.0 :lift inner}
+             {:axis t :extent 3 :dtype :double :init 0.0}]
+    :epilogue {:acc value :expr value :dtype :float}))
+
 (defmacro decoded-read [array index]
   `(raster.arrays/aget ~array ~index))
 

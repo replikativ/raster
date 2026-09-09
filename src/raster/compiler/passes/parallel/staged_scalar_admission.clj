@@ -52,8 +52,8 @@
         floating-stages (if integral-inner? (pop stage-list) stage-list)
         axes (vec (concat (:free-axes source) (:contract-axes source)))
         n (reduce *' 1 (map second (:free-axes source)))
-        out-type (dtype/canon (:dtype (first stage-list)))
-        _ (when-not (and (= out-type (dtype/canon (or (:out-dtype source) out-type)))
+        out-type (dtype/canon (or (:out-dtype source) (:dtype (first stage-list))))
+        _ (when-not (and (contains? #{:int :long :float :double} out-type)
                          (every? #(= 1 (count (set (map :dtype %))))
                                  (vals (group-by :parameter requirements))))
             (decline! :storage-types "scalar staged storage requires one declared dtype per buffer"
