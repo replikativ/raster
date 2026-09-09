@@ -1,6 +1,7 @@
 (ns raster.compiler.core.contraction-scope-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.walker :as walker]
+            [raster.compiler.ir.contraction-facts :as facts]
             [raster.par]))
 
 (defn walked [extra-types]
@@ -20,23 +21,17 @@
 (deftest contraction-local-binders-have-authoritative-types
   (let [source (walked {})
         opts (apply hash-map (drop 5 source))]
-    (is (= 'float (:raster.type/tag (meta (get-in opts [:decode 'a])))))
+    (is (not (contains? opts :decode)) "load transforms expand before their consumers are typed")
     (is (= 'float (:raster.type/tag (meta (get-in opts [:stages 0 :lift])))))
     (is (= 'double (:raster.type/tag (meta (get-in opts [:epilogue :expr])))))
     (is (= 'rows (second (first (nth source 2)))) "extent stays in the outer scope")
     (is (= 'float (:raster.type/tag (meta (nth source 4)))))))
 
 (deftest raw-load-binder-type-is-not-inherited-from-an-outer-x
-  (let [opts (apply hash-map (drop 5 (walked {'a 'bytes 'shift 'long})))
-        decode (get-in opts [:decode 'a])]
-    (is (nil? (:raster.type/tag (meta decode)))
-        "the existing inference leaves unproved narrow arithmetic untagged")
-    (is (some #(= '(clojure.core/byte x) %) (tree-seq coll? seq decode))
-        "the raw-load binder has the Byte storage type, not outer Long x"))
-  (let [opts (apply hash-map (drop 5 (walked {'a 'Object})))
-        decode (get-in opts [:decode 'a])]
-    (is (not-any? #(and (symbol? %) (= 'x %) (= 'long (:raster.type/tag (meta %))))
-                  (tree-seq coll? seq decode)))))
+  (doseq [types [{} {'a 'bytes 'shift 'long} {'a 'Object}]]
+    (let [source (walked types)]
+      (is (not-any? #{'x} (tree-seq coll? seq (nth source 4)))
+          "the placeholder is replaced hygienically before ordinary type inference"))))
 
 (deftest unknown-lexical-bindings-mask-rewalk-metadata
   (let [x (with-meta 'x {:raster.type/tag 'long :tag 'long :line 17})
@@ -54,3 +49,18 @@
       (let [walks (take 5 (rest (iterate #(walker/walk % ctx) expression)))]
         (is (every? #(= expression %) walks))
         (is (every? #(= tag (:raster.type/tag (meta %))) walks))))))
+
+(deftest decoded-normalization-preserves-lexical-bindings-and-quoted-data
+  (let [ctx (walker/make-ctx {:source-ns 'raster.compiler.core.contraction-scope-test
+                            :type-env {'a {:tag 'doubles} 'shift {:tag 'double}}})
+        source '(let [count (fn [v] (+ v 2))]
+                  [(aget a 0)
+                   (count 3)
+                   (let [a (double-array [7])] (aget a 0))
+                   '(count a)])
+        normalized (#'walker/load-transform-source source ctx)
+        decode (#'walker/load-transform-source '(+ x shift)
+                (assoc-in ctx [:type-env 'x] {:tag nil}))
+        transformed (facts/apply-load-transforms normalized {'a decode})
+        run (eval (list 'fn '[a shift] transformed))]
+    (is (= [11.0 5 7.0 '(count a)] (run (double-array [1]) 10.0)))))

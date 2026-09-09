@@ -89,6 +89,13 @@
 ;; try-resolve-call
 ;; ================================================================
 
+(deftest qualified-cast-preserves-widening-test
+  (let [env {'x {:tag 'float} 'epsilon {:tag 'float}}]
+    (is (= 'double (inf/infer-rewritten-tag
+                    '(clojure.core/double x) nil env)))
+    (is (= 'double (inf/infer-rewritten-tag
+                    '(clojure.core/+ (clojure.core/double x) epsilon) nil env)))))
+
 (deftest try-resolve-call-arithmetic-test
   (testing "resolves raster.numeric/+ for doubles"
     (let [result (inf/try-resolve-call 'raster.numeric/+ '(x y) (type-env {'x 'double 'y 'double}))]

@@ -282,6 +282,10 @@
       (:kernels (equation-first/compile
                  #'staged-public/floating-result-transform! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'staged-public/floating-decoded-stages! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'staged-public/widening-decoded-stages! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))

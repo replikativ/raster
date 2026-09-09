@@ -1131,8 +1131,10 @@
        (or
         (cond
            ;; Primitive cast — (double x), (long x), etc.
-          (contains? types/primitive-info head)
-          head
+          (and (not (contains? type-env head))
+               (or (descriptor/cast-result-tag head)
+                   (contains? types/primitive-info head)))
+          (or (descriptor/cast-result-tag head) head)
 
            ;; if/when expression — result type = numeric unification of the
            ;; branch types (widen mismatched numeric branches to the larger).
