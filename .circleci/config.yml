@@ -8,10 +8,7 @@ commands:
           name: Install Clojure CLI 1.12.0.1488
           command: |
             if ! command -v clojure &> /dev/null; then
-              curl -L -O https://download.clojure.org/install/linux-install-1.12.0.1488.sh
-              chmod +x linux-install-1.12.0.1488.sh
-              sudo ./linux-install-1.12.0.1488.sh
-              rm linux-install-1.12.0.1488.sh
+              sudo bash scripts/ci-install-clojure.sh
             fi
 
 executors:

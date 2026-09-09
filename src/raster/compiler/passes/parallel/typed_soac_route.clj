@@ -65,7 +65,11 @@
                        :as parts}
                       (dialect/effect-parts body)]
                   (if loop
-                    (let [{:keys [locals body-results]} (dialect/lambda-parts (:lambda parts))]
+                    (let [_ (when (:carry parts)
+                              (throw (ex-info "carried effects require structured scheduled lowering"
+                                              {:reason :typed-soac-production-subset
+                                               :missing-rule :carried-effect-realization})))
+                          {:keys [locals body-results]} (dialect/lambda-parts (:lambda parts))]
                       (list 'effect-loop {:index (:index parts) :lower (:lower parts)}
                             (project-expression (:extent parts))
                             (list 'lambda [(:index parts)]

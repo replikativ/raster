@@ -108,9 +108,8 @@ existing KernelBody LoopArg/ForLoop/Yield contract. Loop locals and parameters d
 zero-trip loops return their initializer, and stores precede recurrence computation. Lexical
 sibling binders are renamed into collision-free KernelBody SSA identities.
 
-This is a **scheduled-region prerequisite**, not new TypedSOAC source admission. Canonical
-dialect projection and frontend recognition remain closed until the next slice. The public Q8_K
-packers therefore still use the measured compatibility route and unchanged two-phase schedule.
+This first landing was a **scheduled-region prerequisite**, not new TypedSOAC source admission.
+The public Q8_K packers still use the measured compatibility route and unchanged two-phase schedule.
 
 Carried regions require retained compound source types and reject unsupported conversions rather
 than inheriting map emission's device-wrap defaults. Checked integer arithmetic retains its width
@@ -124,3 +123,28 @@ substitution, shadowing of cast names, source overflow order, and fail-closed co
 The OpenCL device oracle checks two independent rows and poisoned output tails. The same scheduled
 fixture joins hardware-free CUDA/HIP compiler gates; this does not claim vendor-device execution
 or any packing throughput improvement yet.
+
+## Canonical carried-effect projection
+
+The existing `effect-loop` also has an explicitly result-bearing form:
+
+```clojure
+(effect-loop {:index k :lower 0
+              :carry {:parameter acc :result sum :dtype :float}}
+  extent initial
+  (lambda [k acc]
+    (effect-region [typed-local ...] [ordered-effect ...] update)))
+```
+
+Initializer and update are grammar-visible scalar operands, not expressions hidden in attribute
+maps. The result-bearing region is legal only as a carried-loop body. Common projection preserves
+it into the scheduled region; validation threads result scope through subsequent effects and
+checks destination reads against read-write storage and explicit read effects. Existing pure-map
+fusion does not absorb these ordered effect maps.
+
+Direct canonical program envelopes and scheduled JVM/KernelBody emission are exercised. The
+production source-realization adapter explicitly refuses carried loops until its continuation
+binding is implemented; frontend recognition is still closed. A capture whose physical symbol
+collides with a map/loop/local/result binder currently fails projection rather than being silently
+captured. General hygienic physical-name projection is a follow-up before claiming unrestricted
+symbol-ID composability. No throughput claim or public quantizer migration follows from this slice.

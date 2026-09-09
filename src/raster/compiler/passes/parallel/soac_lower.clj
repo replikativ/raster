@@ -350,31 +350,48 @@
                         [parameter (list 'clojure.core/aget array (:index attributes))])
                       elements arrays)
                  (map vector destination-parameters physical-results)))
+          ;; Until region-wide hygienic instantiation lands, do not let physical capture names
+          ;; become loop/local references (the map index is a binder too, not just carry slots).
+          _ (when (some (comp :carry soac-dialect/effect-parts) body-results)
+              (let [loop-parts (keep #(let [part (soac-dialect/effect-parts %)]
+                                       (when (:loop part) part)) body-results)
+                    binders (into (set (cons (:index attributes) (map :id locals)))
+                                  (mapcat (fn [part]
+                                            (let [{:keys [parameters locals]}
+                                                  (soac-dialect/lambda-parts (:lambda part))]
+                                              (concat parameters (map :id locals)
+                                                      (when-let [result (get-in part [:carry :result])]
+                                                        [result])))))
+                                  loop-parts)
+                    physical (set (filter symbol? (concat arrays captures physical-results)))
+                    collisions (clojure.set/intersection binders physical)]
+                (when (seq collisions)
+                  (throw (ex-info "physical capture names collide with lexical effect binders"
+                                  {:reason :typed-soac-effect-capture-collision
+                                   :collisions collisions :equation equation-id})))))
           locals (mapv #(update % :init
                                 (fn [init] (util/subst-syms substitutions init)))
                        locals)
           lower-effect
-          (fn lower-effect [effect]
-            (let [{:keys [loop destination conflict destination-index predicate value]
-                   :as parts}
-                  (soac-dialect/effect-parts effect)]
+          (fn lower-effect [{:keys [loop destination conflict destination-index predicate value]}]
               (if loop
-                (let [{:keys [locals body-results]} (soac-dialect/lambda-parts (:lambda parts))]
-                  {:loop {:index (:index parts)
-                          :lower (:lower parts)
-                          :extent (util/subst-syms substitutions (:extent parts))
-                          :locals (mapv #(update % :init
-                                                 (fn [init] (util/subst-syms substitutions init)))
-                                        locals)
-                          :effects (mapv lower-effect body-results)}})
+                {:loop (-> loop
+                           (update :extent #(util/subst-syms substitutions %))
+                           (update :locals #(mapv (fn [local]
+                                                   (update local :init (partial util/subst-syms substitutions))) %))
+                           (update :effects #(mapv lower-effect %))
+                           (cond-> (:carry loop)
+                             (update :carry #(-> %
+                                                 (update :init (partial util/subst-syms substitutions))
+                                                 (update :update (partial util/subst-syms substitutions))))))}
                 {:destination (util/subst-syms substitutions destination)
                  :dtype (get destination-dtypes
                              (util/subst-syms substitutions destination))
                  :conflict conflict
                  :destination-index (util/subst-syms substitutions destination-index)
                  :predicate (util/subst-syms substitutions predicate)
-                 :value (util/subst-syms substitutions value)})))
-          effects (mapv lower-effect body-results)
+                 :value (util/subst-syms substitutions value)}))
+          effects (mapv (comp lower-effect soac-dialect/scheduled-effect) body-results)
           effect-leaves (soac-dialect/effect-leaves effects)
           stable (set (get-in attributes [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable captures))

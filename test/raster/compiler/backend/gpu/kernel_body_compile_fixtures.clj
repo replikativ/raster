@@ -400,6 +400,10 @@
                                     [:nodes 0 :operation]))
            (write-artifact! directory suffix "scheduled-carried-effect-loop"
                             (carried-fixture/artifact (carried-fixture/scheduled-loop 8) dialect))
+           (write-artifact! directory suffix "typed-carried-effect-loop"
+                            (carried-fixture/artifact
+                             (first (soac-lower/lower-typed-effect-map
+                                     (carried-fixture/typed-program 8) :ze:0)) dialect))
            (write-artifact! directory suffix "public-outer-product"
                             (get-in (segop-emit/generate-kernel-graph
                                      (capacity-fixture/inferred-graph) :target-dialect dialect)
