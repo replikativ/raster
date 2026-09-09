@@ -350,6 +350,25 @@
                         [parameter (list 'clojure.core/aget array (:index attributes))])
                       elements arrays)
                  (map vector destination-parameters physical-results)))
+          ;; Until region-wide hygienic instantiation lands, do not let physical capture names
+          ;; become loop/local references (the map index is a binder too, not just carry slots).
+          _ (when (some (comp :carry soac-dialect/effect-parts) body-results)
+              (let [loop-parts (keep #(let [part (soac-dialect/effect-parts %)]
+                                       (when (:loop part) part)) body-results)
+                    binders (into (set (cons (:index attributes) (map :id locals)))
+                                  (mapcat (fn [part]
+                                            (let [{:keys [parameters locals]}
+                                                  (soac-dialect/lambda-parts (:lambda part))]
+                                              (concat parameters (map :id locals)
+                                                      (when-let [result (get-in part [:carry :result])]
+                                                        [result])))))
+                                  loop-parts)
+                    physical (set (filter symbol? (concat arrays captures physical-results)))
+                    collisions (clojure.set/intersection binders physical)]
+                (when (seq collisions)
+                  (throw (ex-info "physical capture names collide with lexical effect binders"
+                                  {:reason :typed-soac-effect-capture-collision
+                                   :collisions collisions :equation equation-id})))))
           locals (mapv #(update % :init
                                 (fn [init] (util/subst-syms substitutions init)))
                        locals)

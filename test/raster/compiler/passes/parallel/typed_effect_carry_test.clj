@@ -83,12 +83,11 @@
     (is (= :kernel-body (get-in (fixture/artifact operation :opencl-portable) [:attributes :emission-route])))))
 
 (deftest capture-collisions-fail-closed-before-execution
-  (doseq [physical ['acc 'sum 'k]]
-    (let [program (dialect/remap-values (fixture/typed-program 1) {'seed physical})
-          operation (first (lower/lower-typed-effect-map program :ze:0))]
+  (doseq [physical ['acc 'sum 'k 'i 'loaded]]
+    (let [program (dialect/remap-values (fixture/typed-program 1) {'seed physical})]
       (is (= :accepted (reason program)))
-      (is (= :scheduled-effect-carry
-             (try (jvm/compile-effect-segmap operation) :accepted
+      (is (= :typed-soac-effect-capture-collision
+             (try (lower/lower-typed-effect-map program :ze:0) :accepted
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (deftest canonical-result-scope-follows-the-effect-spine

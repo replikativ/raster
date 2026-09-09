@@ -145,6 +145,6 @@ fusion does not absorb these ordered effect maps.
 Direct canonical program envelopes and scheduled JVM/KernelBody emission are exercised. The
 production source-realization adapter explicitly refuses carried loops until its continuation
 binding is implemented; frontend recognition is still closed. A capture whose physical symbol
-collides with a carry binder/result currently fails scheduled validation rather than being silently
+collides with a map/loop/local/result binder currently fails projection rather than being silently
 captured. General hygienic physical-name projection is a follow-up before claiming unrestricted
 symbol-ID composability. No throughput claim or public quantizer migration follows from this slice.
