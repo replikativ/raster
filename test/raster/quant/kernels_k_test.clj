@@ -223,6 +223,10 @@
         projection-kernels (:kernels projection-pipeline)
         projection-report (report/from-pipeline projection-pipeline)]
     (is (= 2 (count quant-kernels)) "Q8_K remains an ordered two-phase reduction")
+    (doseq [packing [(second quant-kernels) (second padded-kernels)]]
+      (is (re-find #"if \(\(\(long\)\(j\) == \(long\)\(0\)\)\) \{ xs\["
+                   (:source packing))
+          "exactly sub-block zero publishes the shared super-block scale"))
     (is (= '[[[submax :float] [x :float] [_n_bound :int]]
              [[bsums :int] [submax :float] [x :float] [xp :int]
               [xs :float] [in :long] [_n_bound :int]]]
