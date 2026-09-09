@@ -119,6 +119,61 @@
     (is (nil? (:raster.op/original (meta mixed)))
         "retaining an inferred type does not pretend that a bare core call was devirtualized")))
 
+(deftest effect-map-index-has-a-lexical-type-scope
+  (let [walked (wb (with-meta
+                    '(raster.par/map-void! i (clojure.core/+ i i)
+                       (clojure.core/quot i width))
+                    {:line 123})
+                   {'i 'double 'width 'long})
+        [_ _ bound body] walked]
+    (is (= 'double (:raster.type/tag (meta bound)))
+        "the bound sees the outer binding, not the induction variable")
+    (is (= 'long (:raster.type/tag (meta body)))
+        "the existing scalar inference now sees both operand types")
+    (is (= 123 (:line (meta walked))))
+    (is (nil? (:raster.type/tag (meta walked)))
+        "an effect map does not inherit the body's scalar result"))
+  (let [walked (wb '(raster.par/map-void! i n (clojure.core/quot i unknown))
+                   {'n 'long})]
+    (is (nil? (:raster.type/tag (meta (last walked))))
+        "index scope does not invent types for unknown operands"))
+  (let [walked (wb '(do (raster.par/map-void! i n (clojure.core/quot i width))
+                        (clojure.core/+ i i))
+                   {'i 'double 'n 'long 'width 'long})]
+    (is (= 'double (:raster.type/tag (meta (last walked))))
+        "the induction variable does not escape the effect map")))
+
+(deftest malformed-effect-map-does-not-drop-source-operands
+  (doseq [form ['(raster.par/map-void! i n)
+               '(raster.par/map-void! i n nil (throw (Exception.)))
+               '(raster.par/map-void! [i] n nil)]]
+    (is (= :invalid-effect-map-form
+           (try (wb form) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest java-static-overload-results-survive-nested-conversions
+  (doseq [[input-type result-type] [['float 'int] ['double 'long]]]
+    (let [walked (wb (list 'clojure.core/long
+                           (list 'Math/round (list input-type 'x)))
+                     {'x input-type})]
+      (is (= result-type (:raster.type/tag (meta (second walked)))))
+      (is (= 'long (:raster.type/tag (meta walked))))))
+  (is (= 'double (:raster.type/tag (meta (wb '(Math/sqrt (double x)) {'x 'double})))))
+  (is (nil? (:raster.type/tag (meta (wb '(Math/round unknown))))))
+  (is (nil? (:raster.type/tag (meta (wb '(unknown.namespace/round unknown)))))))
+
+(deftest java-static-result-resolution-uses-the-source-imports
+  (let [source-name (gensym "walker-source-")
+        source-ns (create-ns source-name)]
+    (try
+      (.importClass source-ns 'SourceMath java.lang.Math)
+      (is (= 'long
+             (:raster.type/tag
+              (meta (walker/walk-body '(SourceMath/round (clojure.core/double x))
+                                      {:source-ns source-ns
+                                       :type-env (te {'x 'double})})))))
+      (finally (remove-ns source-name)))))
+
 (deftest walk-nested-let-test
   (testing "nested let bindings are walked"
     (let [walked (wb '(let [a (raster.numeric/+ x y)

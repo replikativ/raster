@@ -198,6 +198,12 @@
     :par-map
 
     (and (seq? form)
+         (symbol? (first form))
+         (= 'raster.par/map-void!
+            (resolve-aliased-symbol (first form) (:source-ns ctx))))
+    :par-map-void
+
+    (and (seq? form)
          (let [head (first form)
                resolved (if (and (symbol? head) (namespace head))
                           (resolve-aliased-symbol head (:source-ns ctx))
@@ -630,6 +636,14 @@
               (if (and (seq tags) (every? some? tags) (apply = tags))
                 (vary-meta result assoc :raster.type/tag (first tags))
                 result))
+            ;; Java interop overload resolution already lives in central inference.
+            ;; Retain its result on the call itself, not only on a consuming let binder:
+            ;; nested scalar conversions in TypedSOAC must not rediscover the overload.
+            (and (symbol? head) (namespace head))
+            (if-let [rt (binding [*ns* (the-ns (:source-ns ctx))]
+                          (inf/static-method-return-tag head (rest result) type-env))]
+              (vary-meta result assoc :raster.type/tag rt)
+              result)
             :else result))
         result))))
 
@@ -925,6 +939,19 @@
 ;; ================================================================
 ;; Branch: parallel ops (map!, reduce, scan, stencil!)
 ;; ================================================================
+
+(defmethod walk-form :par-map-void [form ctx]
+  ;; The bound is outside the induction-variable scope, just as for map!.
+  ;; Keep the effect-only SOAC intact; its body does not determine a return type.
+  (when-not (and (= 4 (count form)) (symbol? (second form)))
+    (throw (ex-info "map-void! requires a symbol index, a bound, and a body"
+                    {:reason :invalid-effect-map-form :form form})))
+  (let [[_ i-sym bound-expr body-expr] form
+        walked-bound (walk bound-expr ctx)
+        idx-ctx (ctx-assoc-type ctx i-sym 'long)]
+    (with-meta (list 'raster.par/map-void! i-sym walked-bound
+                     (walk body-expr idx-ctx))
+      (meta form))))
 
 (defmethod walk-form :par-map [form ctx]
   ;; Handle both standard and offset variants:
