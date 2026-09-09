@@ -160,3 +160,8 @@ Focused validation covers scope round trips, alpha-renaming, free variables, mal
 physical buffer/scalar collisions, and OpenCL device execution; CUDA/HIP compile fixtures include
 a colliding physical capture. The production continuation adapter and frontend admission remain
 the next gates before migrating the public Q8_K packers.
+
+Scheduled JVM emission and production host realization now share ordered continuation construction
+through `effect-source/ordered-effects`. Store and loop spelling retain their existing target
+policies, but the `do`/result-binding spine is no longer duplicated. This preparatory extraction
+does not yet open carried source realization or frontend admission.

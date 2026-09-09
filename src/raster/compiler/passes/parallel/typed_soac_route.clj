@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.effect-source :as effect-source]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
@@ -306,7 +307,7 @@
             casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
             dtype-by-destination (zipmap physical-results result-dtypes)
             cast-by-destination (zipmap physical-results casts)
-            effects (mapv dialect/effect-parts bodies)
+            effects (mapv dialect/scheduled-effect bodies)
             _ (when-not (and (= (count results) (count physical-results)
                                 (count result-dtypes) (count casts))
                              (every? some? effects)
@@ -317,21 +318,15 @@
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results
                                  :storage storage :effects effects :dtypes result-dtypes})))
+            loop-statement
+            (fn [{:keys [index lower extent locals]} ordered-body]
+              (list 'loop* [index lower]
+                    (list 'if (list 'clojure.core/< index extent)
+                          (list 'do (materialize-region locals ordered-body)
+                                (list 'recur (list 'clojure.core/inc index)))
+                          nil)))
             statement
-            (fn statement [{:keys [loop destination conflict destination-index predicate value]
-                            :as parts}]
-                  (if loop
-                    (let [{:keys [locals body-results]} (dialect/lambda-parts (:lambda parts))
-                          loop-index (:index parts)]
-                      (list 'loop* [loop-index (:lower parts)]
-                            (list 'if (list 'clojure.core/< loop-index (:extent parts))
-                                  (list 'do
-                                        (materialize-region
-                                         locals
-                                         (list* 'do (mapv (comp statement dialect/effect-parts)
-                                                          body-results)))
-                                        (list 'recur (list 'clojure.core/inc loop-index)))
-                                  nil)))
+            (fn [{:keys [destination conflict destination-index predicate value]}]
                     (let [cast (get cast-by-destination destination)
                           result-dtype (get dtype-by-destination destination)
                           destination (with-meta destination
@@ -344,12 +339,13 @@
                                         destination destination-index typed-value)
                                   (list 'clojure.core/aset destination destination-index
                                         typed-value))]
-                      (if (contains? #{true 1} predicate) store (list 'if predicate store)))))
-            statements (mapv statement effects)
+                      (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+            continuation (effect-source/ordered-effects
+                          effects {:emit-store statement :emit-loop loop-statement})
             effect-source
             (with-meta
               (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                    (materialize-region region-locals (list* 'do statements)))
+                    (materialize-region region-locals continuation))
               {:raster.type/elem-type (first result-dtypes)})]
         {:equation-id equation-id
          :placement placement

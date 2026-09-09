@@ -339,6 +339,23 @@
       (is (= [2.5 5.0 37.5 50.0] (mapv double out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
 
+(deftest production-host-store-loops-preserve-the-continuation
+  (let [source '(let* [effect
+                      (raster.par/map-void!
+                       r rows
+                       (loop* [i 0]
+                         (if (< i width)
+                           (do (aset out (+ (* r width) i) (float i))
+                               (recur (inc i))))))]
+                 effect)
+        result (route/attempt source :float {'out :float}
+                              {:scalar-types {'rows :long 'width :long}})
+        execute (eval (list 'fn '[out rows width] (get-in result [:program :source])))
+        out (float-array (repeat 6 -77))]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (nil? (execute out 2 3)))
+    (is (= [0.0 1.0 2.0 0.0 1.0 2.0] (vec out)))))
+
 (deftest effect-loops-must-be-closed-over-the-loop-index
   (let [program (:program (route/attempt row-loop-source :float {'x :float 'out :float}
                                          {:scalar-types {'rows :long 'feat :long}}))

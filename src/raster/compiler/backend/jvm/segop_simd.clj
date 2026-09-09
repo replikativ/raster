@@ -21,6 +21,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.passes.parallel.effect-source :as effect-source]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.core.hardware :as hw]
             [clojure.set]
@@ -1036,11 +1037,9 @@
               (if (contains? #{true 1} predicate)
                 store
                 (list 'if predicate store))))
-          effect-spine
-          (fn effect-spine [items]
-            (if-let [effect (first items)]
-              (if-let [{:keys [index lower extent locals effects carry]} (:loop effect)]
-                  (let [{:keys [parameter result dtype init update]} carry
+          loop-statement
+          (fn [{:keys [index lower extent locals carry]} ordered-body]
+                  (let [{:keys [parameter dtype init update]} carry
                         ;; A typed FP carry rounds to its storage precision with IEEE overflow.
                         ;; This generated conversion is not a user-written checked `float` call.
                         tag (when carry (generated-cast (dtype/scalar-tag-for-dtype dtype)))
@@ -1055,21 +1054,18 @@
                                     (list 'if (ix< index limit)
                                           (materialize-locals
                                            locals
-                                           (list 'do (effect-spine effects)
+                                           (list 'do ordered-body
                                                  (list* 'recur
                                                         (cond-> [(list (if carry 'clojure.core/unchecked-inc
                                                                          'clojure.core/unchecked-inc-int) index)]
                                                           carry (conj (list tag (strip-binder-tags update)))))))
                                           parameter)))]
-                    ;; The result's binding encloses only the continuation, never preceding effects.
-                    (if carry
-                      (list 'let* [result loop-form] (effect-spine (next items)))
-                      (list 'do loop-form (effect-spine (next items)))))
-                (list 'do (effect-statement effect) (effect-spine (next items))))
-              nil))
+                    loop-form))
           typed-region-body
           (when (seq effects)
-            (materialize-locals locals (effect-spine effects)))
+            (materialize-locals locals
+                                (effect-source/ordered-effects
+                                 effects {:emit-store effect-statement :emit-loop loop-statement})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
                 (bc/desugar-invk (or typed-region-body (:lambda segmap))))]
