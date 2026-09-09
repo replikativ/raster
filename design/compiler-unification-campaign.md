@@ -814,3 +814,14 @@ Independent Arc cases distinguish Float accumulation then Double storage (0 rath
 Double accumulation then a Float identity epilogue then Double storage (16777216 rather than
 16777217). Both are public vendor compile fixtures. Single-stage closure admission and the legacy
 quant router's implicit accumulator semantics remain separate retirement work.
+
+### Explicit single-stage contractions share the same closure
+
+A nonempty stage list now admits its one-stage base case through the same lexical, storage,
+legality and shared KernelBody proofs as deeper nests. No special kernel or quantization rule is
+introduced. Public decoded width-three byte products use a proved Int fold followed by Float
+storage; exact width-four products use the existing packed fragment through that same recursive
+base case. Both have independent Arc references and public vendor compile fixtures. Extent
+mismatch and seeded stages remain errors; unproved Int prefix bounds remain capability declines.
+This admits explicit single-stage source contracts; the legacy router's implicit stage synthesis
+and layout-retargeting still need normalization before the old staged emitter can be removed.

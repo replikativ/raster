@@ -44,6 +44,23 @@
              {:axis t :extent 3 :dtype :double :init 0.0}]
     :epilogue {:acc value :expr value :dtype :float}))
 
+(deftm decoded-byte-single-stage!
+  [a :- (Array byte) b :- (Array byte) out :- (Array float)] :- Void
+  (raster.par/contract out [[i 2]] [[t 3]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 3) t))
+                      (raster.arrays/aget b (+ (* i 3) t)))
+    :decode {a (- (long x) 7)}
+    :out-dtype :float
+    :stages [{:axis t :extent 3 :dtype :int :init 0}]))
+
+(deftm packed-byte-single-stage!
+  [a :- (Array byte) b :- (Array byte) out :- (Array float)] :- Void
+  (raster.par/contract out [[i 2]] [[t 4]]
+    (raster.numeric/* (raster.arrays/aget a (+ (* i 4) t))
+                      (raster.arrays/aget b (+ (* i 4) t)))
+    :out-dtype :float
+    :stages [{:axis t :extent 4 :dtype :int :init 0}]))
+
 (defmacro decoded-read [array index]
   `(raster.arrays/aget ~array ~index))
 

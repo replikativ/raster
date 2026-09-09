@@ -63,7 +63,7 @@
         indices (mapv first axes)
         stage-list (:stages contraction)
         legality (stages/stages-legal? stage-list (:contract-axes contraction))]
-    (when-not (and (seq (:free-axes contraction)) (> (count stage-list) 1)
+    (when-not (and (seq (:free-axes contraction)) (seq stage-list)
                    (= (count indices) (count (set indices)))
                    (every? symbol? indices)
                    (every? #(and (integer? %) (pos? %)) (map second axes)))
