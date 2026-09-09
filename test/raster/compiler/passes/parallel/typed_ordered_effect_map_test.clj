@@ -48,6 +48,23 @@
        :effects #{:memory/write}})
      [equation] [])))
 
+(deftest element-array-name-does-not-capture-the-logical-map-index
+  (let [program (dialect/remap-values (effect-program) {'x 'i})
+        operation (first (soac-lower/lower-typed-effect-map program :ze:0))
+        execute (eval (list 'fn '[i out total n]
+                            ((requiring-resolve 'raster.compiler.backend.jvm.segop-simd/compile-effect-segmap)
+                             operation)))
+        out (float-array [-77 -77]) total (float-array 1)]
+    (execute (float-array [-1 2]) out total 2)
+    (is (= [-77.0 3.0] (vec out)))
+    (is (= [1.0] (vec total)))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (= :kernel-body
+             (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :dtype :float :target-dialect target
+                      :array-types {'i :float 'out :float 'total :float} :scalar-types {'n :long})
+                     [:attributes :emission-route]))))))
+
 (defn- nested-operations
   [operations]
   (mapcat (fn [operation]

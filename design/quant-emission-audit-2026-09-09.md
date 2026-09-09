@@ -144,7 +144,19 @@ fusion does not absorb these ordered effect maps.
 
 Direct canonical program envelopes and scheduled JVM/KernelBody emission are exercised. The
 production source-realization adapter explicitly refuses carried loops until its continuation
-binding is implemented; frontend recognition is still closed. A capture whose physical symbol
-collides with a map/loop/local/result binder currently fails projection rather than being silently
-captured. General hygienic physical-name projection is a follow-up before claiming unrestricted
-symbol-ID composability. No throughput claim or public quantizer migration follows from this slice.
+binding is implemented; frontend recognition is still closed. No throughput claim or public
+quantizer migration follows from this slice.
+
+## Hygienic effect-region instantiation
+
+Canonical effect regions and loops now describe their lexical scopes through the existing shared
+form adapter. Ordered stores occupy sequential initializer slots; a carried result enters scope
+only after its loop. Physical-name substitution therefore reuses the compiler's capture-avoiding
+substitution rather than a separate effect walker or a collision refusal. The map index is reserved
+before element reads are synthesized. Physical core-named symbols such as `count`, `float`, and
+`long` are explicitly authoritative locals during instantiation.
+
+Focused validation covers scope round trips, alpha-renaming, free variables, malformed forms,
+physical buffer/scalar collisions, and OpenCL device execution; CUDA/HIP compile fixtures include
+a colliding physical capture. The production continuation adapter and frontend admission remain
+the next gates before migrating the public Q8_K packers.

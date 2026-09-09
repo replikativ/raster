@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [clojure.walk :as walk]
             [raster.compiler.backend.jvm.segop-simd :as jvm]
+            [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.carried-effect-loop-fixture :as fixture]
             [raster.compiler.passes.parallel.soac-lower :as lower]
@@ -82,13 +83,38 @@
     (is (contains? (:inputs operation) 'words))
     (is (= :kernel-body (get-in (fixture/artifact operation :opencl-portable) [:attributes :emission-route])))))
 
-(deftest capture-collisions-fail-closed-before-execution
+(deftest physical-capture-collisions-are-hygienically-instantiated
   (doseq [physical ['acc 'sum 'k 'i 'loaded]]
-    (let [program (dialect/remap-values (fixture/typed-program 1) {'seed physical})]
+    (let [program (dialect/remap-values (fixture/typed-program 1) {'seed physical})
+          operation (first (lower/lower-typed-effect-map program :ze:0))
+          execute (eval (list 'fn ['x 'words 'totals 'rows physical] (jvm/compile-effect-segmap operation)))
+          totals (float-array 2)]
       (is (= :accepted (reason program)))
-      (is (= :typed-soac-effect-capture-collision
-             (try (lower/lower-typed-effect-map program :ze:0) :accepted
-                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+      (execute (float-array (range 16)) (float-array 16) totals 2 (float 0.25))
+      (is (= [0.25 8.25] (vec totals)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body
+               (get-in (emit/generate-scheduled-segmap-kernel
+                        operation :dtype :float :target-dialect target
+                        :array-types {'x :float 'words :float 'totals :float}
+                        :scalar-types {'rows :long physical :float})
+                       [:attributes :emission-route])))))))
+
+(deftest physical-core-names-are-authoritative-locals-during-instantiation
+  (doseq [physical ['count 'float 'long]]
+    (let [program (-> (walk/postwalk #(if (= 'i %) physical %) (fixture/typed-program 1))
+                      (dialect/remap-values {'seed physical}))
+          operation (first (lower/lower-typed-effect-map program :ze:0))
+          execute (eval (list 'fn ['x 'words 'totals 'rows physical] (jvm/compile-effect-segmap operation)))
+          totals (float-array 2)]
+      (execute (float-array (range 16)) (float-array 16) totals 2 (float 0.25))
+      (is (= [0.25 8.25] (vec totals)))
+      (is (= :kernel-body
+             (get-in (emit/generate-scheduled-segmap-kernel
+                      operation :dtype :float :target-dialect :opencl-portable
+                      :array-types {'x :float 'words :float 'totals :float}
+                      :scalar-types {'rows :long physical :float})
+                     [:attributes :emission-route]))))))
 
 (deftest canonical-result-scope-follows-the-effect-spine
   (let [base (fixture/typed-program 1)
