@@ -204,6 +204,15 @@
           (is (< (Math/abs (- (aget actual (+ (* row out) o)) (aget expected o))) 1e-3)
               (str "Q4_K row " row ", output " o)))))))
 
+(deftest i8-activation-packing-uses-typed-kernel-body
+  (let [compiled (pipeline/show-pipeline #'qk/quant-act-i8-rows-gpu!
+                                         :target-device :ocl:0 :dtype :float)
+        report (report/from-pipeline compiled)]
+    (is (= :typed-soac (get-in report [:route :source-dialect])))
+    (is (true? (get-in report [:route :typed-validated])))
+    (is (= {:kernel-body 1} (get-in report [:emission :routes])))
+    (is (empty? (get-in report [:emission :declines])))))
+
 (deftest row-capable-q4k-path-lowers-through-the-shared-gpu-pipeline
   (let [quant-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-rows-gpu!
                                                         :target-device :ze:0 :dtype :float))

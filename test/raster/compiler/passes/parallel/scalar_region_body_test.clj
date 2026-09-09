@@ -19,6 +19,20 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest java-round-keeps-overload-separate-from-consumer-type
+  (let [lower (:lower (lowerer))
+        widened (lower '(Math/round (aget x i)) :long {'i :int})
+        operations (:operations widened)]
+    (is (= :int (get-in (nth operations 6) [:result :type]))
+        "Float round returns Int even when its consumer requests Long")
+    (is (= :long (:type widened)))
+    (is (= {:rounding :exact :overflow :exact}
+           (get-in (last operations) [:expression :options])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"retained floating overload"
+                         (lower '(Math/round missing) :long {})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires one argument"
+                         (lower '(Math/round (aget x i) (aget x i)) :long {'i :int})))))
+
 (defn- mixed-region [lowerer]
   ((:lower-region lowerer)
    '{:bindings [candidate (aget x i) better (> candidate old-value)]

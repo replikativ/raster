@@ -2,7 +2,25 @@
   "Shared verifier, source-compile, and device fixtures for scheduled KernelBody operations."
   (:require [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
+
+(defn java-round-body [input-type output-type width]
+  (let [builder (scalar/make-lowerer
+                 {:array-types {'x input-type} :arrays #{'x} :scalar-types {'lane :int}
+                  :lower-index (fn [value _] value)
+                  :decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:lower builder) '(Math/round (aget x lane)) output-type {'lane :int})]
+    (body/make
+     {:id [:java-round input-type width]
+      :parameters [(body/->KernelParameter 'x :input input-type [width] :global
+                                          (layout/row-major [width] input-type) :input)
+                   (body/->KernelParameter 'y :output output-type [width] :global
+                                          (layout/row-major [width] output-type) :result)]
+      :stable-reads [(body/stable-read 'x)]
+      :indices [(body/->IndexBinding 'lane :local 0)]
+      :operations (conj (:operations lowered) (body/->ScalarStore 'y ['lane] (:result lowered) nil))
+      :launch (launch/spec {:workgroup-size [width] :group-count [1]})})))
 
 (defn word-shifts-body
   "Typed word shifts share an input row and store left/arithmetic-right/logical-right results."

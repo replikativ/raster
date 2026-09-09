@@ -382,7 +382,12 @@
   (case (dtype/canon type)
     :byte (str "(" (target-type :byte) ")" value)
     :int (str value)
-    :long (str value (if (c-dialect/opencl? *scalar-dialect*) "L" "LL"))
+    :long (let [suffix (if (c-dialect/opencl? *scalar-dialect*) "L" "LL")]
+            ;; The positive magnitude of MIN_VALUE is not a signed C literal. Keeping
+            ;; both operands signed also prevents ternaries from promoting to unsigned.
+            (if (= value Long/MIN_VALUE)
+              (str "(-" Long/MAX_VALUE suffix " - 1" suffix ")")
+              (str value suffix)))
     :half (if (c-dialect/opencl? *scalar-dialect*)
             (str "(half)(" (emit-floating-literal value "f") ")")
             (str "__float2half_rn(" (emit-floating-literal value "f") ")"))
@@ -464,16 +469,34 @@
              "(" argument-source ")")
         (str "(" (target-type result-type) ")(" argument-source ")"))
 
-      ;; Saturating FP->integer conversion has a direct OpenCL spelling only.
+      ;; Guard the C cast: out-of-range/NaN FP-to-integer conversion is undefined in C++.
+      ;; The upper comparison uses the exact power-of-two boundary, not rounded MAX_VALUE.
       (and source-fp? (not result-fp?) (= :saturate overflow))
       (if (c-dialect/opencl? *scalar-dialect*)
+        ;; Some CPU OpenCL implementations lower NaN saturation to signed MIN_VALUE.
+        ;; Sanitize the input explicitly, keeping NaN out of the conversion itself even
+        ;; when a vectorizer evaluates both arms of an enclosing result selection.
         (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
-             "(" argument-source ")")
-        (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
+             "((isnan(" argument-source ") ? "
+             (emit-scalar-value (body/literal 0.0 source-type) context)
+             " : " argument-source "))")
+        (if (and (= :toward-zero rounding)
+                 (contains? #{:float :double} source-type)
+                 (scalar-range/for-dtype result-type))
+          (let [{:keys [lower upper]} (scalar-range/for-dtype result-type)
+                literal #(emit-scalar-value (body/literal %1 %2) context)
+                x (str "(" argument-source ")")]
+            (str "(isnan(" x ") ? " (literal 0 result-type)
+                 " : " x " >= " (literal (double (inc' upper)) source-type)
+                 " ? " (literal upper result-type)
+                 " : " x " <= " (literal (double lower) source-type)
+                 " ? " (literal lower result-type)
+                 " : (" (target-type result-type) ")" x ")"))
+          (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
                         {:reason :kernel-body-c-cast-policy
                          :dialect (:id *scalar-dialect*)
                          :source-type source-type :result-type result-type
-                         :rounding rounding :overflow overflow})))
+                         :rounding rounding :overflow overflow}))))
 
       ;; Integral widening is exact. Narrowing/exact and trapping conversions need a proof or
       ;; runtime check that this target layer does not currently carry.

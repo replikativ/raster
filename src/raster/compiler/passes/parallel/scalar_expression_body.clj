@@ -385,6 +385,36 @@
                                  (first (descriptor/call-args expression)))) expected expression)
                          expected env)
 
+                  (and (seq? expression)
+                       (= :java-round (:typed-expansion
+                                       (intrinsics/descriptor
+                                        (intrinsics/canonical (descriptor/semantic-op expression))))))
+                  (let [arguments (vec (descriptor/call-args expression))
+                        intrinsic (intrinsics/descriptor
+                                   (intrinsics/canonical (descriptor/semantic-op expression)))
+                        _ (when-not (= 1 (count arguments))
+                            (decline! :scalar-expression "Java round requires one argument"
+                                      {:expression expression}))
+                        input-type (source-type (first arguments) nil env)
+                        result-type (get (:source-signatures intrinsic) input-type)
+                        _ (when-not result-type
+                            (decline! :scalar-source-type "Java round requires a retained floating overload"
+                                      {:expression expression :source input-type}))
+                        input (lower (first arguments) input-type env)
+                        base (compute-ssa :floor input-type [(:result input)] {} nil)
+                        fraction (compute-ssa :- input-type [(:result input) (:result base)] {} nil)
+                        up (compute-ssa :ge :predicate [(:result fraction) (body/literal 0.5 input-type)] {} nil)
+                        next (compute-ssa :+ input-type [(:result base) (body/literal 1.0 input-type)] {} nil)
+                        rounded (compute-ssa :select input-type [(:result up) (:result next) (:result base)] {} nil)
+                        converted (compute-ssa :cast result-type [(:result rounded)]
+                                               {:rounding :toward-zero :overflow :saturate} nil)]
+                    ;; Adding 0.5 before floor would double-round the predecessor of 0.5.
+                    ;; Saturation supplies Java's NaN=0 and signed endpoint semantics.
+                    (cast-lowered (assoc converted :operations
+                                         (vec (mapcat :operations
+                                                      [input base fraction up next rounded converted])))
+                                  expected expression))
+
                   (seq? expression)
                   (let [semantic-operation (descriptor/semantic-op expression)
                         operator (intrinsics/canonical semantic-operation)
