@@ -397,6 +397,26 @@
                        (when-let [parent (get parents digit)] (covered? parent))))]
     (every? covered? leaves)))
 
+(defn restrict-fixed-leaves
+  "Restrict an index form to a domain fixing dropped leaf digits to integer constants.
+
+   The caller must prove the store guard implies these equalities. Only dropped terminal
+   digits may be restricted: a digit contributing to an address (directly or through an
+   ancestor) requires substitution and offset reasoning, which this rule deliberately refuses.
+   Keep the domain witness so multi-store callers cannot combine proofs from different domains."
+  [form fixed]
+  (when form
+    (let [{:keys [terms leaves parents]} form
+          covered? (fn covered? [digit]
+                     (or (contains? terms digit)
+                         (when-let [parent (get parents digit)] (covered? parent))))]
+      (when (and (not (contains? form :fixed-leaves))
+                 (map? fixed)
+                 (every? integer? (vals fixed))
+                 (every? #(and (contains? leaves %) (not (covered? %))) (keys fixed)))
+        (assoc form :leaves (set/difference leaves (set (keys fixed)))
+                    :fixed-leaves fixed)))))
+
 (defn- supported-factor?
   "A symbolic factor of a coefficient is admissible only when some lower digit's radix vouches
    for it: it is a factor of that radix, or a quot fact bounds such a factor by it. Then a zero

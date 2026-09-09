@@ -1409,6 +1409,14 @@ The immediate continuation after the verified double-buffered weighted-reduction
    from source. Additional atomic monoids, privatized histogram schedules, nested
    structured C/SIMD sites, the remaining parallel forms, calibrated whole-graph placement costs,
    and deletion of the remaining graph/backend fallbacks remain.
+   Source result-valued store loops now enter the existing ordered effect-loop representation
+   with one typed carry, preserving stores-before-update and the exported result's lexical scope.
+   Guarded store independence uses a generic fixed-digit domain proof: an equality can fix an
+   omitted terminal mixed-radix digit, but differing guarded domains cannot share an injectivity
+   certificate. Q8_K dense/padded row quantizers use the existing typed math/bit primitives and
+   explicit wrapping conversions, exposing their whole-superblock layout to that algebra. Both
+   phases emit parallel KernelBody kernels without a compatibility leaf; regression tests check
+   launch shape as well as numerical parity. This is emission coverage, not a performance claim.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

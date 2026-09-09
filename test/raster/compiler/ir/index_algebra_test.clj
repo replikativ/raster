@@ -35,6 +35,22 @@
     (is (not (ia/injective? dropped)) "dropping the head digit makes heads collide")
     (is (nil? whole) "a decomposed index may not also appear whole")))
 
+(deftest dropped-digit-is-injective-only-on-a-proven-fixed-domain
+  (let [locals '[{:id q :init (quot idx 4)} {:id r :init (rem idx 4)}]
+        form (ia/index-form 'q 'idx 20 locals {})]
+    (is (not (ia/injective? form)))
+    (doseq [r (range 4)]
+      (let [restricted (ia/restrict-fixed-leaves form {'r r})
+            indices (filter #(= r (rem % 4)) (range 20))
+            addresses (map #(quot % 4) indices)]
+        (is (ia/injective? restricted))
+        (is (= {'r r} (:fixed-leaves restricted)))
+        (is (nil? (ia/restrict-fixed-leaves restricted {})) "cannot erase an existing domain witness")
+        (is (= (count addresses) (count (distinct addresses))))))
+    (doseq [fixed [{'q 0} {'idx 0} {'unknown 0} {'r 0.5}]]
+      (is (nil? (ia/restrict-fixed-leaves form fixed))))
+    (is (not (ia/injective? (ia/restrict-fixed-leaves form {}))))))
+
 (deftest constant-offsets-are-one-more-digit
   (let [rope (ia/index-form '(+ (+ (* t (* heads head-dim)) (* h head-dim)) i)
                             'idx '(* (* batch seq-len) (* heads hdim2)) rope-locals {})

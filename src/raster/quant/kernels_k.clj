@@ -9,6 +9,8 @@
   256 each row spans whole super-blocks, so the flat per-row arrays index as (row, block)."
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as ra]
+            [raster.numeric :as rn]
+            [raster.math :as math]
             [raster.par :as par]
             [raster.quant.kernels :as qc]))
 
@@ -94,7 +96,8 @@
 (deftm quant-act-q8k-rows-gpu!
   "Q8_K activation quantization over a row-major [nrows,in] tensor. The physical result is
   the ordered `(xp,xs,bsums)` representation with row-major leaves; `submax` is transient
-  reduction scratch. Batch is an ordinary outer shape axis and does not affect the format."
+  reduction scratch. `in` must be a multiple of 256. Batch is an ordinary outer shape axis
+  and does not affect the format."
   [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
    submax :- (Array float), in :- Long, nrows :- Long] :- Void
   (do
@@ -106,9 +109,11 @@
                                  (recur (inc k) (max m (max v (- v)))))
                                m))]
                      (ra/aset submax si (float m))))
-    (par/map-void! sj (* (long nrows) (quot (long in) 32))
+    ;; The public layout is whole 256-element super-blocks. Express its eight sub-blocks
+    ;; directly so the generic index proof sees the exact mixed-radix domain.
+    (par/map-void! sj (* (long nrows) (* 8 (quot (long in) 256)))
                    (let [nsb (quot (long in) 256)
-                         nsub (quot (long in) 32)
+                         nsub (* 8 nsb)
                          row (quot sj nsub)
                          row-sub (rem sj nsub)
                          sb (quot row-sub 8)
@@ -120,30 +125,30 @@
                          d (/ (double mx) 127.0)
                          id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
                          sidx (+ (* row nsub) (* sb 8) j)
-                         wbase (+ (* row (quot (long in) 4)) (* sb 64) (* j 8))
-                         ebase (+ (* row (long in)) (* sb 256) (* j 32))]
+                         wbase (* sidx 8)
+                         ebase (* sidx 32)]
                      (when (== j 0)
                        (ra/aset xs (+ (* row nsb) sb) (float d)))
                      (let [bs (loop [w 0 s 0]
                                 (if (< w 8)
                      ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
-                     ;; int8 range without an explicit clamp; the (long ...) cast types q.
+                     ;; int8 range without an explicit clamp; math/round retains its Long result.
                                   (let [e (+ ebase (* w 4))
-                                        q0 (long (Math/round (* (double (ra/aget x e)) id)))
-                                        q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
-                                        q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
-                                        q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                                        q0 (math/round (* (double (ra/aget x e)) id))
+                                        q1 (math/round (* (double (ra/aget x (+ e 1))) id))
+                                        q2 (math/round (* (double (ra/aget x (+ e 2))) id))
+                                        q3 (math/round (* (double (ra/aget x (+ e 3))) id))
                            ;; Keep bit-or binary in the shared IR. The JVM bytecode backend's
                            ;; primitive bit op is binary; passing four operands used to discard
                            ;; the high two lanes while OpenCL happened to accept the variadic form.
-                                        word (bit-or (bit-or (bit-and q0 0xFF)
-                                                             (bit-shift-left (bit-and q1 0xFF) 8))
-                                                     (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
-                                                             (bit-shift-left (bit-and q3 0xFF) 24)))]
-                                    (ra/aset xp (+ wbase w) (int word))
+                                        word (rn/bit-or (rn/bit-or (rn/bit-and q0 0xFF)
+                                                                  (rn/bit-shift-left (rn/bit-and q1 0xFF) 8))
+                                                        (rn/bit-or (rn/bit-shift-left (rn/bit-and q2 0xFF) 16)
+                                                                   (rn/bit-shift-left (rn/bit-and q3 0xFF) 24)))]
+                                    (ra/aset xp (+ wbase w) (unchecked-int word))
                                     (recur (inc w) (+ s q0 q1 q2 q3)))
                                   s))]
-                       (ra/aset bsums sidx (int bs)))))))
+                       (ra/aset bsums sidx (unchecked-int bs)))))))
 
 (deftm quant-act-q8k-padded-rows-gpu!
   "Quantize dense row-major `[nrows,width]` activations into Q8_K leaves laid out at
@@ -162,15 +167,16 @@
                          m (loop [k 0 m 0.0]
                              (if (< k 32)
                                (let [col (+ col-base k)]
-                                 (if (< col (long width))
-                                   (let [v (ra/aget x (+ xbase col))]
-                                     (recur (inc k) (max m (max v (- v)))))
-                                   (recur (inc k) m)))
+                                 (recur (inc k)
+                                        (if (< col (long width))
+                                          (let [v (ra/aget x (+ xbase col))]
+                                            (max m (max v (- v))))
+                                          m)))
                                m))]
                      (ra/aset submax si (float m))))
-    (par/map-void! sj (* (long nrows) (quot (long padded-in) 32))
+    (par/map-void! sj (* (long nrows) (* 8 (quot (long padded-in) 256)))
                    (let [nsb (quot (long padded-in) 256)
-                         nsub (quot (long padded-in) 32)
+                         nsub (* 8 nsb)
                          row (quot sj nsub)
                          row-sub (rem sj nsub)
                          sb (quot row-sub 8)
@@ -182,7 +188,7 @@
                          d (/ (double mx) 127.0)
                          id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
                          sidx (+ (* row nsub) (* sb 8) j)
-                         wbase (+ (* row (quot (long padded-in) 4)) (* sb 64) (* j 8))
+                         wbase (* sidx 8)
                          col-base (+ (* sb 256) (* j 32))
                          xbase (* row (long width))]
                      (when (== j 0)
@@ -191,25 +197,25 @@
                                 (if (< w 8)
                                   (let [col (+ col-base (* w 4))
                                         q0 (if (< col (long width))
-                                             (long (Math/round (* (double (ra/aget x (+ xbase col))) id)))
+                                             (math/round (* (double (ra/aget x (+ xbase col))) id))
                                              0)
                                         q1 (if (< (+ col 1) (long width))
-                                             (long (Math/round (* (double (ra/aget x (+ xbase col 1))) id)))
+                                             (math/round (* (double (ra/aget x (+ xbase col 1))) id))
                                              0)
                                         q2 (if (< (+ col 2) (long width))
-                                             (long (Math/round (* (double (ra/aget x (+ xbase col 2))) id)))
+                                             (math/round (* (double (ra/aget x (+ xbase col 2))) id))
                                              0)
                                         q3 (if (< (+ col 3) (long width))
-                                             (long (Math/round (* (double (ra/aget x (+ xbase col 3))) id)))
+                                             (math/round (* (double (ra/aget x (+ xbase col 3))) id))
                                              0)
-                                        word (bit-or (bit-or (bit-and q0 0xFF)
-                                                             (bit-shift-left (bit-and q1 0xFF) 8))
-                                                     (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
-                                                             (bit-shift-left (bit-and q3 0xFF) 24)))]
-                                    (ra/aset xp (+ wbase w) (int word))
+                                        word (rn/bit-or (rn/bit-or (rn/bit-and q0 0xFF)
+                                                                  (rn/bit-shift-left (rn/bit-and q1 0xFF) 8))
+                                                        (rn/bit-or (rn/bit-shift-left (rn/bit-and q2 0xFF) 16)
+                                                                   (rn/bit-shift-left (rn/bit-and q3 0xFF) 24)))]
+                                    (ra/aset xp (+ wbase w) (unchecked-int word))
                                     (recur (inc w) (+ s q0 q1 q2 q3)))
                                   s))]
-                       (ra/aset bsums sidx (int bs)))))))
+                       (ra/aset bsums sidx (unchecked-int bs)))))))
 
 ;; ---- dp4a int8-GEMV core (the format-agnostic hardware-accelerated path) ----
 ;; int8×int8 GEMV over int32-packed lanes: y[o] = Σ_w dp4a(wp[o*kw+w], xp[w]). par/dp4a
