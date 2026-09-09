@@ -636,6 +636,14 @@
               (if (and (seq tags) (every? some? tags) (apply = tags))
                 (vary-meta result assoc :raster.type/tag (first tags))
                 result))
+            ;; Java interop overload resolution already lives in central inference.
+            ;; Retain its result on the call itself, not only on a consuming let binder:
+            ;; nested scalar conversions in TypedSOAC must not rediscover the overload.
+            (and (symbol? head) (namespace head))
+            (if-let [rt (binding [*ns* (the-ns (:source-ns ctx))]
+                          (inf/static-method-return-tag head (rest result) type-env))]
+              (vary-meta result assoc :raster.type/tag rt)
+              result)
             :else result))
         result))))
 

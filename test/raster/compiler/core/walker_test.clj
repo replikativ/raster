@@ -151,6 +151,29 @@
            (try (wb form) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
+(deftest java-static-overload-results-survive-nested-conversions
+  (doseq [[input-type result-type] [['float 'int] ['double 'long]]]
+    (let [walked (wb (list 'clojure.core/long
+                           (list 'Math/round (list input-type 'x)))
+                     {'x input-type})]
+      (is (= result-type (:raster.type/tag (meta (second walked)))))
+      (is (= 'long (:raster.type/tag (meta walked))))))
+  (is (= 'double (:raster.type/tag (meta (wb '(Math/sqrt (double x)) {'x 'double})))))
+  (is (nil? (:raster.type/tag (meta (wb '(Math/round unknown))))))
+  (is (nil? (:raster.type/tag (meta (wb '(unknown.namespace/round unknown)))))))
+
+(deftest java-static-result-resolution-uses-the-source-imports
+  (let [source-name (gensym "walker-source-")
+        source-ns (create-ns source-name)]
+    (try
+      (.importClass source-ns 'SourceMath java.lang.Math)
+      (is (= 'long
+             (:raster.type/tag
+              (meta (walker/walk-body '(SourceMath/round (clojure.core/double x))
+                                      {:source-ns source-ns
+                                       :type-env (te {'x 'double})})))))
+      (finally (remove-ns source-name)))))
+
 (deftest walk-nested-let-test
   (testing "nested let bindings are walked"
     (let [walked (wb '(let [a (raster.numeric/+ x y)
