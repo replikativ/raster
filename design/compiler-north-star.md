@@ -1417,6 +1417,14 @@ The immediate continuation after the verified double-buffered weighted-reduction
    explicit wrapping conversions, exposing their whole-superblock layout to that algebra. Both
    phases emit parallel KernelBody kernels without a compatibility leaf; regression tests check
    launch shape as well as numerical parity. This is emission coverage, not a performance claim.
+   Result-valued store loops may also precede other store loops in the same ordered effect spine;
+   the result scopes over those later loops, without moving their reads before earlier writes.
+   The next source-admission gap is a scalar binding *between* such loops (prefill softmax is a
+   concrete workload). Reuse a nested `effect-region` for this lexical continuation, rather than
+   hoisting its locals, duplicating their evaluation per iteration, or adding a semantic attention
+   exception. Canonical validation, capture/conflict analysis, and both host and KernelBody
+   projections must support that nesting before the frontend admits it. Until then, this workload
+   still has a compatibility leaf; sequential correctness is not a parallel-performance claim.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
