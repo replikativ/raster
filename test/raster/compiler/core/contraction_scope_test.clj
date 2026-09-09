@@ -1,6 +1,7 @@
 (ns raster.compiler.core.contraction-scope-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.walker :as walker]
+            [raster.compiler.ir.contraction-facts :as facts]
             [raster.par]))
 
 (defn walked [extra-types]
@@ -48,3 +49,18 @@
       (let [walks (take 5 (rest (iterate #(walker/walk % ctx) expression)))]
         (is (every? #(= expression %) walks))
         (is (every? #(= tag (:raster.type/tag (meta %))) walks))))))
+
+(deftest decoded-normalization-preserves-lexical-bindings-and-quoted-data
+  (let [ctx (walker/make-ctx {:source-ns 'raster.compiler.core.contraction-scope-test
+                            :type-env {'a {:tag 'doubles} 'shift {:tag 'double}}})
+        source '(let [count (fn [v] (+ v 2))]
+                  [(aget a 0)
+                   (count 3)
+                   (let [a (double-array [7])] (aget a 0))
+                   '(count a)])
+        normalized (#'walker/load-transform-source source ctx)
+        decode (#'walker/load-transform-source '(+ x shift)
+                (assoc-in ctx [:type-env 'x] {:tag nil}))
+        transformed (facts/apply-load-transforms normalized {'a decode})
+        run (eval (list 'fn '[a shift] transformed))]
+    (is (= [11.0 5 7.0 '(count a)] (run (double-array [1]) 10.0)))))

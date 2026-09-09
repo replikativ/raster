@@ -729,3 +729,21 @@ Compiler-generated scalar casts are qualified so stage linearity can distinguish
 identity conversions from caller-local functions. Flattening only removes a cast when its
 canonical identity and child accumulator dtype prove it redundant. Decoded GPU admission is
 still gated separately; this prerequisite does not retire uncovered staged fallback cases.
+
+### Decoded loads enter the ordinary typed scalar region
+
+The source walker now normalizes load transforms before inferring contraction arithmetic.
+Source aliases and macros are resolved before the shared capture-avoiding substitution; the
+result is ordinary scalar arithmetic with explicit casts, not a second decoded KernelBody path.
+Typing the transformed expression from the start is essential: substituting a Double decode
+into an already Float-typed product would preserve an incorrect early rounding point.
+
+Qualified primitive casts use the existing operator descriptor for their result types in shared
+inference. The public decoded staged workloads use the generated staged-scalar schedule, with
+zero fallback and zero driver allocations during compilation/lowering. Validation includes
+alias/macro reads, an actual-device widening-rounding differential, and the same public-source
+fixtures for CUDA/HIP compilation. The compatibility ledger records the generated route.
+
+This does not claim mixed-storage or integer-overflow coverage, whole staged-emitter retirement,
+or competitive kernel throughput. Unnormalized direct typed facts remain explicitly gated;
+remaining precision/storage cases and measured schedule performance are still campaign work.
