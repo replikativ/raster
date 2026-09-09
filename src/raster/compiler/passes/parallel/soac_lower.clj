@@ -345,10 +345,11 @@
           {:keys [locals body-results]}
           (soac-dialect/lambda-parts (list 'lambda [] (:region projected)))
           lower-effect
-          (fn lower-effect [{:keys [loop destination conflict destination-index predicate value]}]
-              (if loop
-                {:loop (update loop :effects #(mapv lower-effect %))}
-                {:destination destination
+          (fn lower-effect [{:keys [loop region destination conflict destination-index predicate value]}]
+              (cond
+                region {:region (update region :effects #(mapv lower-effect %))}
+                loop {:loop (update loop :effects #(mapv lower-effect %))}
+                :else {:destination destination
                  :dtype (get destination-dtypes destination)
                  :conflict conflict
                  :destination-index destination-index

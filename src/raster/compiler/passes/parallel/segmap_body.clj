@@ -200,14 +200,14 @@
                         (index-expression/lower
                          expression (set/union index-scope extra-scope) decline!)
                         (merge index-types extra-types))))
-        carried-effects? (soac-dialect/scheduled-effect-carries? effects)
+        strict-effects? (soac-dialect/strict-effect-scalar-policy? effects)
         lowerer (scalar-expression/make-lowerer
                  (cond-> {:array-types array-types :scalar-types scalar-types
                           :arrays (set inputs) :index-scope index-scope
                           :lower-index lower-index :predicate :map-active
                           :source-region [locals result effects]
                           :id-prefix "map" :decline! decline!}
-                   carried-effects? (assoc :require-source-types? true
+                   strict-effects? (assoc :require-source-types? true
                                            :conversion-policy scalar-conversion/policy)))
         base-environment (assoc scalar-types index :long)
         _ (when (seq effects)
@@ -226,7 +226,7 @@
                                 :scalar-region (:scalar-region segmap)}))
                  init (util/subst-syms substitutions init)
                  lowered ((:lower lowerer) init local-type environment)
-                 lowered (if carried-effects? ((:cast lowerer) lowered local-type init) lowered)]
+                 lowered (if strict-effects? ((:cast lowerer) lowered local-type init) lowered)]
              {:substitutions (assoc substitutions id (:result lowered))
               :operations (into operations (:operations lowered))
               :environment (assoc environment (:result lowered) (:type lowered))}))
@@ -285,7 +285,15 @@
         substitute-effect
         (fn substitute-effect [substitutions effect]
           (let [substitute #(util/subst-syms substitutions %)]
-            (if-let [loop (:loop effect)]
+            (cond
+              (:region effect)
+              (update effect :region
+                      (fn [region]
+                        (-> region
+                            (update :locals #(mapv (fn [local] (update local :init substitute)) %))
+                            (update :effects #(mapv (partial substitute-effect substitutions) %)))))
+              (:loop effect)
+              (let [loop (:loop effect)]
               (assoc effect :loop
                      (-> loop
                          (update :lower substitute)
@@ -294,12 +302,24 @@
                            (update :carry #(-> % (update :init substitute) (update :update substitute))))
                          (update :locals (fn [locals] (mapv #(update % :init substitute) locals)))
                          (update :effects (fn [effects]
-                                            (mapv #(substitute-effect substitutions %) effects)))))
-              (reduce (fn [effect field] (update effect field substitute))
+                                            (mapv #(substitute-effect substitutions %) effects))))))
+              :else (reduce (fn [effect field] (update effect field substitute))
                       effect [:destination :destination-index :predicate :value]))))
         lower-effect
         (fn lower-effect
           [environment {:keys [destination conflict destination-index predicate value] :as effect}]
+          (if-let [{:keys [locals effects]} (:region effect)]
+            (let [state (lower-locals locals environment)
+                  inner (reduce (fn [{:keys [environment operations]} effect]
+                                  (let [next (lower-effect
+                                              environment
+                                              (substitute-effect (:substitutions state) effect))]
+                                    (update next :operations #(into operations %))))
+                                {:environment (:environment state) :operations (:operations state)}
+                                effects)]
+              ;; Nested locals/results remain lexical. Their operations still occur here, not
+              ;; in the enclosing region's prefix or inside each later loop iteration.
+              {:environment environment :operations (:operations inner)})
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
@@ -375,7 +395,7 @@
                              [(body/->IfRegion (:result lowered-predicate)
                                                (conj effect-operations (body/->Yield []))
                                                [(body/->Yield [])] [])]))))))]
-            {:operations operations :environment environment})))
+            {:operations operations :environment environment}))))
         effect-operations
         (:operations
          (reduce (fn [{:keys [environment operations]} effect]

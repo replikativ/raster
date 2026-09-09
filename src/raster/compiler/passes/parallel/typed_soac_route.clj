@@ -291,9 +291,9 @@
             dtype-by-destination (zipmap physical-results result-dtypes)
             cast-by-destination (zipmap physical-results casts)
             effects (mapv dialect/scheduled-effect bodies)
-            carried? (dialect/scheduled-effect-carries? effects)
-            generated-cast (partial effect-source/storage-cast carried?)
-            materialize-locals (if carried?
+            strict-effects? (dialect/strict-effect-scalar-policy? effects)
+            generated-cast (partial effect-source/storage-cast strict-effects?)
+            materialize-locals (if strict-effects?
                                  (partial effect-source/typed-locals generated-cast)
                                  materialize-region)
             _ (when-not (and (= (count results) (count physical-results)
@@ -332,7 +332,8 @@
                                         typed-value))]
                       (if (contains? #{true 1} predicate) store (list 'if predicate store))))
             continuation (effect-source/ordered-effects
-                          effects {:emit-store statement :emit-loop loop-statement})
+                          effects {:emit-store statement :emit-loop loop-statement
+                                   :emit-region materialize-locals})
             effect-source
             (with-meta
               (list 'raster.par/map-void! region-index (:extent attributes)

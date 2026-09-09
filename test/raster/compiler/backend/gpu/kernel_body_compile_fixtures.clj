@@ -405,6 +405,8 @@
                                     [:nodes 0 :operation]))
            (write-artifact! directory suffix "scheduled-carried-effect-loop"
                             (carried-fixture/artifact (carried-fixture/scheduled-loop 8) dialect))
+           (write-artifact! directory suffix "scheduled-nested-effect-region"
+                            (carried-fixture/artifact (carried-fixture/scheduled-normalization 3) dialect))
            (write-artifact! directory suffix "typed-carried-effect-loop"
                             (carried-fixture/artifact
                              (first (soac-lower/lower-typed-effect-map

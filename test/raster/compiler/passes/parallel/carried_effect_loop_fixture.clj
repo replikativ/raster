@@ -22,6 +22,21 @@
                {:destination 'totals :dtype :float :conflict :unique
                 :destination-index 'i :predicate true :value 'sum}]}}))
 
+(defn scheduled-normalization [trips]
+  (let [base (update (scheduled-loop trips) :inputs conj 'words)
+        total (get-in base [:scalar-region :effects 1])]
+    (assoc-in base [:scalar-region :effects 1]
+              {:region
+               {:locals [{:id 'inverse :dtype :float
+                          :init (with-meta '(/ 1.0 sum) {:raster.type/tag 'double})}]
+                :effects [{:loop
+                           {:index 'j :lower 0 :extent trips :locals []
+                            :effects [{:destination 'words :dtype :float :conflict :unique
+                                       :destination-index '(+ (* i 8) j) :predicate true
+                                       :value (with-meta '(* (aget words (+ (* i 8) j)) inverse)
+                                                {:raster.type/tag 'double})}]}}
+                          (assoc total :value 'inverse)]}})))
+
 (defn artifact [operation target & {:keys [scalar-types] :or {scalar-types {'rows :long 'seed :float}}}]
   (emit/generate-scheduled-segmap-kernel
    operation :dtype :float :target-dialect target
