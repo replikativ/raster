@@ -352,7 +352,7 @@
              :order [[:loop 0]]}))))))
 
 (defn- carried-store-binding
-  "Recognize exactly one typed result-valued store loop followed by stores using its result.
+  "Recognize a typed result-valued store loop followed by ordered stores or store loops.
    Alpha-normalize the source lexical scope first; the result never enters pre-effect locals."
   [body index]
   (let [[head bindings & _] body
@@ -396,14 +396,18 @@
               (let [region (store-region body index update)
                     continuation (store-region (list* 'do tail) index)]
                 (when (and region continuation (seq (:stores region)) (empty? (:loops region))
-                           (seq (:stores continuation)) (empty? (:locals continuation))
-                           (empty? (:loops continuation)))
+                           (or (seq (:stores continuation)) (seq (:loops continuation)))
+                           (empty? (:locals continuation)))
                   {:locals [] :stores (:stores continuation)
-                   :loops [{:index loop-index :lower lower :extent extent
+                   :loops (into [{:index loop-index :lower lower :extent extent
                             :locals (:locals region) :stores (:stores region)
                             :carry {:parameter parameter :result result :dtype dtype
                                     :init init :update (:result region)}}]
-                   :order (into [[:loop 0]] (region-order continuation))})))))))))
+                                (:loops continuation))
+                   :order (into [[:loop 0]]
+                                (map (fn [[kind ordinal]]
+                                       [kind (if (= :loop kind) (inc ordinal) ordinal)]))
+                                (region-order continuation))})))))))))
 
 (defn- store-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
