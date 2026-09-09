@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.passes.parallel.carried-effect-loop-fixture :as fixture]
+            [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.device-probe :as probe]))
 
 (deftest carried-store-loops-match-the-sequential-oracle-on-opencl
@@ -14,8 +15,11 @@
           launch! (ns-resolve runtime 'launch-registered-bound!)
           read! (ns-resolve runtime 'buffer->array)
           free! (ns-resolve runtime 'free-buffer!)]
-      (doseq [trips [0 1 8]]
-        (let [compiled (fixture/artifact (fixture/scheduled-loop trips) :opencl-portable)
+      (doseq [kind [:scheduled :typed] trips [0 1 8]]
+        (let [operation (if (= kind :typed)
+                          (first (lower/lower-typed-effect-map (fixture/typed-program trips) :ze:0))
+                          (fixture/scheduled-loop trips))
+              compiled (fixture/artifact operation :opencl-portable)
               values (vec (range 16))
               x (buffer-of-array (float-array values) :float)
               words (buffer-of-array (float-array (repeat 19 -77)) :float)
@@ -23,7 +27,10 @@
           (try
             (register! (:kernel-name compiled) compiled)
             (launch! (bind-call (call/make compiled
-                                          [x totals words {:type :long :value 2} {:type :long :value 2}])))
+                                          (mapv {'x x 'totals totals 'words words
+                                                 'rows {:type :long :value 2}
+                                                 'seed {:type :float :value 0.25}}
+                                                (:arguments compiled)))))
             (is (= (vec (concat (map-indexed (fn [i v] (if (< (mod i 8) trips) (float v) -77.0)) values)
                                 (repeat 3 -77.0)))
                    (vec (read! words))) "only the selected row elements are written")
