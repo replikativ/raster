@@ -51,10 +51,6 @@
       (let [{:keys [index region]} (projection/instantiate-effect-region equation)
             {:keys [locals body-results]}
             (dialect/lambda-parts (list 'lambda [] (projection/scalar-folds->source region)))]
-        (when (dialect/scheduled-effect-carries? (mapv dialect/scheduled-effect body-results))
-          (throw (ex-info "carried effects require structured scheduled lowering"
-                          {:reason :typed-soac-production-subset
-                           :missing-rule :carried-effect-realization})))
         {:index index :locals locals :bodies body-results})
 
       :else
@@ -295,6 +291,11 @@
             dtype-by-destination (zipmap physical-results result-dtypes)
             cast-by-destination (zipmap physical-results casts)
             effects (mapv dialect/scheduled-effect bodies)
+            carried? (dialect/scheduled-effect-carries? effects)
+            generated-cast (partial effect-source/storage-cast carried?)
+            materialize-locals (if carried?
+                                 (partial effect-source/typed-locals generated-cast)
+                                 materialize-region)
             _ (when-not (and (= (count results) (count physical-results)
                                 (count result-dtypes) (count casts))
                              (every? some? effects)
@@ -306,12 +307,15 @@
                                  :equation equation-id :results results
                                  :storage storage :effects effects :dtypes result-dtypes})))
             loop-statement
-            (fn [{:keys [index lower extent locals]} ordered-body]
-              (list 'loop* [index lower]
-                    (list 'if (list 'clojure.core/< index extent)
-                          (list 'do (materialize-region locals ordered-body)
-                                (list 'recur (list 'clojure.core/inc index)))
-                          nil)))
+            (fn [{:keys [index lower extent locals carry] :as loop} ordered-body]
+              (if carry
+                (effect-source/counted-loop generated-cast loop ordered-body)
+                ;; Preserve the existing source loop's induction policy when no carry is present.
+                (list 'loop* [index lower]
+                      (list 'if (list 'clojure.core/< index extent)
+                            (list 'do (materialize-locals locals ordered-body)
+                                  (list 'recur (list 'clojure.core/inc index)))
+                            nil))))
             statement
             (fn [{:keys [destination conflict destination-index predicate value]}]
                     (let [cast (get cast-by-destination destination)
@@ -320,7 +324,7 @@
                                         {:raster.type/tag
                                          (dtype/array-tag-for-dtype result-dtype)
                                          :tag (dtype/array-tag-for-dtype result-dtype)})
-                          typed-value (typed-store-value cast value)
+                          typed-value (if cast (list (generated-cast cast) value) value)
                           store (if (dialect/reducing-scatter-conflict? conflict)
                                   (list 'raster.par/atomic-add!
                                         destination destination-index typed-value)
@@ -332,7 +336,7 @@
             effect-source
             (with-meta
               (list 'raster.par/map-void! region-index (:extent attributes)
-                    (materialize-region region-locals continuation))
+                    (materialize-locals region-locals continuation))
               {:raster.type/elem-type (first result-dtypes)})]
         {:equation-id equation-id
          :placement placement
