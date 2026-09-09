@@ -58,8 +58,8 @@
         initial (gensym "effect_carry_init__")]
     (list 'let* (cond-> [limit (list index-tag extent)]
                   carry (conj initial (list tag (strip-binder-tags init))))
-          (list 'loop* (cond-> [index (list index-tag lower)]
-                         carry (conj parameter initial))
+          (list 'loop* (cond-> [(vary-meta index dissoc :tag) (list index-tag lower)]
+                         carry (conj (vary-meta parameter dissoc :tag) initial))
                 (list 'if (list 'clojure.core/< index limit)
                       (typed-locals
                        generated-cast locals
@@ -82,6 +82,6 @@
                  (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]
       (if-let [result (get-in loop [:carry :result])]
-        (list 'let* [result form] continuation)
+        (list 'let* [(vary-meta result dissoc :tag) form] continuation)
         (list 'do form continuation)))
     nil))

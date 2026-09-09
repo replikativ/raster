@@ -223,21 +223,36 @@
         projection-kernels (:kernels projection-pipeline)
         projection-report (report/from-pipeline projection-pipeline)]
     (is (= 2 (count quant-kernels)) "Q8_K remains an ordered two-phase reduction")
+    (is (= 2 (count padded-kernels)))
+    (doseq [kernel (concat quant-kernels padded-kernels)]
+      (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+      (is (nil? (get-in kernel [:attributes :kernel-body-decline])))
+      (is (= :one-work-item-per-element (get-in kernel [:attributes :kernel-body :schedule :strategy])))
+      (is (= [256] (get-in kernel [:launch :workgroup-size]))))
     (doseq [packing [(second quant-kernels) (second padded-kernels)]]
-      (is (re-find #"if \(\(\(long\)\(j\) == \(long\)\(0\)\)\) \{ xs\["
-                   (:source packing))
-          "exactly sub-block zero publishes the shared super-block scale"))
-    (is (= '[[[submax :float] [x :float] [_n_bound :int]]
-             [[bsums :int] [submax :float] [x :float] [xp :int]
-              [xs :float] [in :long] [_n_bound :int]]]
+      (let [body (get-in packing [:attributes :kernel-body])
+            ops (:operations body)
+            branch (first (filter #(some (fn [op] (= 'xs (:buffer op))) (:then-operations %)) ops))
+            condition (first (filter #(= (:condition branch) (get-in % [:result :id])) ops))]
+        (is (= :independent (get-in body [:attributes :effect-iteration-order])))
+        (is (= :eq (get-in condition [:expression :op])))
+        (is (= 0 (get-in condition [:expression :arguments 1 :value]))
+            "only the zero digit publishes the super-block scale")
+        (is (not-any? #(= 'xs (:buffer %))
+                      (tree-seq coll? seq (:else-operations branch))))))
+    (is (= '[[[x :float] [submax :float] [_n_bound :long]]
+             [[submax :float] [x :float] [bsums :int] [xp :int]
+              [xs :float] [in :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) quant-kernels)))
-    (is (= '[[[submax :float] [x :float] [padded-in :long] [width :long] [_n_bound :int]]
-             [[bsums :int] [submax :float] [x :float] [xp :int] [xs :float]
-              [padded-in :long] [width :long] [_n_bound :int]]]
+    (is (= '[[[x :float] [submax :float] [padded-in :long] [width :long] [_n_bound :long]]
+             [[submax :float] [x :float] [bsums :int] [xp :int] [xs :float]
+              [padded-in :long] [width :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) padded-kernels))
         "the adapter changes layout indexing without changing the two-phase Q8_K representation")
-    (is (every? #(re-find #"col\).*<.*width" (:source %)) padded-kernels)
-        "both phases guard dense-row reads and synthesize the padding region")
+    (doseq [kernel padded-kernels]
+      (is (boolean (some #(and (= :lt (:op %)) (some #{'width} (:arguments %)))
+                         (tree-seq coll? seq (get-in kernel [:attributes :kernel-body :operations]))))
+          "both phases retain the width comparison guarding dense-row reads"))
     (is (= 1 (count projection-kernels)))
     (is (= {:backend :opencl
             :source-dialect :typed-soac
