@@ -58,9 +58,8 @@
                                  (vals (group-by :parameter requirements))))
             (decline! :storage-types "scalar staged storage requires one declared dtype per buffer"
                       {:requirements requirements :out-dtype (:out-dtype source)}))
-        _ (when-not (and (or (and integral-inner? (contains? #{:byte :int :long}
-                                                           (dtype/canon (:dtype source))))
-                            (contains? #{:float :double} (dtype/canon (:dtype source))))
+        _ (when-not (and (contains? #{:byte :int :long :float :double}
+                                    (dtype/canon (:dtype source)))
                          (every? #(contains? #{:float :double} (dtype/canon (:dtype %)))
                                  floating-stages)
                          (every? #(contains? scalar-types %) scalars)

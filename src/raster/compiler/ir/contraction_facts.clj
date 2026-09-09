@@ -276,13 +276,12 @@
      :dtype (first (reduction/dtypes (:reduction facts)))}))
 
 ;; ── body shape: what a leaf that DISCARDS the body must first account for ────────────
-(defn explicit-accumulator-stage
-  "Expose an explicitly declared single-axis accumulator as the stage schedule's base case.
+(defn single-axis-accumulator-stage
+  "Expose the canonical single-axis accumulator as the stage schedule's base case.
    Precision, combine and identity come from the canonical reduction, never operand storage.
    Other reductions remain unchanged and retain their existing admission paths."
   [source]
-  (if (and (contains? (:opts source) :acc-dtype)
-           (seq (:free-axes source))
+  (if (and (seq (:free-axes source))
            (empty? (:stages source)) (= 1 (count (:contract-axes source))))
     (let [{:keys [dtype combine neutral]} (scalar-reduction-view source)
           [axis extent] (first (:contract-axes source))

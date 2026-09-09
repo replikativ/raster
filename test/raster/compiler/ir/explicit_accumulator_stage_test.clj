@@ -14,26 +14,25 @@
 
 (deftest explicit-precision-comes-from-the-canonical-reduction
   (let [original (source {:acc-dtype :int})
-        normalized (facts/explicit-accumulator-stage original)]
+        normalized (facts/single-axis-accumulator-stage original)]
     (is (= [{:axis 't :extent 3 :dtype :int :init 0}] (:stages normalized)))
     (is (= :float (:out-dtype normalized)))
     (is (= (select-keys (facts/scalar-reduction-view original) [:dtype :combine :neutral])
            (select-keys (facts/scalar-reduction-view normalized) [:dtype :combine :neutral])))
-    (is (identical? normalized (facts/explicit-accumulator-stage normalized)))))
+    (is (identical? normalized (facts/single-axis-accumulator-stage normalized)))))
 
 (deftest unrelated-reduction-policies-are-not-replaced
-  (doseq [original [(source {})
-                    (source {:acc-dtype :int :combine '* :init 1})
+  (doseq [original [(source {:acc-dtype :int :combine '* :init 1})
                     (source {:stages [{:axis 't :extent 3 :dtype :float :init 0.0}]})
                     (facts/from-components
                      {:out 'out :free-axes [] :contract-axes '[[t 3]]
                       :body '(raster.arrays/aget a t) :dtype :float :opts {:acc-dtype :double}})
                     (assoc (source {:acc-dtype :int}) :contract-axes '[[x 2] [t 3]])]]
-    (is (identical? original (facts/explicit-accumulator-stage original))))
+    (is (identical? original (facts/single-axis-accumulator-stage original))))
   (is (thrown? clojure.lang.ExceptionInfo (source {:acc-dtype :int :init 2})))
   (let [byte-storage (assoc (source {}) :dtype :byte)]
-    (is (identical? byte-storage (facts/explicit-accumulator-stage byte-storage))
-        "byte storage without an accumulator declaration does not synthesize an Int stage")))
+    (is (= :float (get-in (facts/single-axis-accumulator-stage byte-storage) [:stages 0 :dtype]))
+        "storage does not override the canonical accumulator precision")))
 
 (deftest explicit-accumulator-types-the-epilogue-before-output-conversion
   (if-not @probe/opencl-available?
