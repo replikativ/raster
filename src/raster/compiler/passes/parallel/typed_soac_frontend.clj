@@ -1282,8 +1282,7 @@
              (update io :scalars set/union identity-scalars)))
 
     (and (seq? expression) (= 'raster.par/contract (first expression)))
-    (let [facts (contraction-facts/explicit-accumulator-stage
-                (contraction-facts/contraction-facts
+    (let [facts (contraction-facts/contraction-facts
                  expression
                  ;; A contraction's element dtype is the declared dtype of the array it writes.
                  ;; The form's elem-type stamp is the compile's dtype policy, which a hard-typed
@@ -1291,7 +1290,16 @@
                  ;; dtype is only the last resort when nothing declares it.
                  :dtype (or (some-> (get array-types (second expression)) dtype/canon)
                             (:raster.type/elem-type (meta expression))
-                            default-dtype :double)))
+                            default-dtype :double))
+          ;; Select this schedule for explicit precision or mixed storage, without diverting
+          ;; homogeneous matrix contractions from their existing optimized schedule families.
+          mixed-storage? (some (fn [{:keys [sym]}]
+                                 (when-let [declared (get array-types sym)]
+                                   (not= (dtype/canon declared) (dtype/canon (:dtype facts)))))
+                               (:operands facts))
+          facts (if (or (contains? (:opts facts) :acc-dtype) mixed-storage?)
+                  (contraction-facts/single-axis-accumulator-stage facts)
+                  facts)
           {:keys [free-axes contract-axes out opts]} facts
           contraction-dtype (dtype/canon (:dtype facts))
           ;; A result transform that reads the destination reads the storage the contraction

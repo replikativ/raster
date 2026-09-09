@@ -304,6 +304,8 @@
       (:kernels (equation-first/compile
                  #'staged-public/explicit-double-accumulator-epilogue! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'staged-public/byte-products-float-accumulation! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))
