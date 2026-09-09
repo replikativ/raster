@@ -959,10 +959,13 @@
                        (or (:scalar-types opts) (:array-types opts))
                        (vary-meta assoc :scalar-types (:scalar-types opts)
                                   :array-types (:array-types opts)))
-                result (opencl-pass/opencl-pass form
-                                                :device-id target-device
-                                                :dtype (:dtype opts)
-                                                :schedule (:schedule opts))]
+                result (apply opencl-pass/opencl-pass form
+                              (cond-> [:device-id target-device
+                                       :dtype (:dtype opts)
+                                       :schedule (:schedule opts)]
+                                ;; Resident buffers cannot be consumed by a host fallback merely
+                                ;; because specialization made a small extent a literal.
+                                (:resident-gpu? opts) (into [:min-elements 0])))]
             (register-gpu-kernels! (:kernels result) target-device)
             (register-gpu-dispatches! (:dispatches result) target-device)
             {:form (:form result) :stats (:stats result)
@@ -1828,6 +1831,7 @@
         array-params (filterv #(contains? array-param-set %) all-params)
         scalar-params (filterv #(not (contains? array-param-set %)) all-params)
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
+                           :resident-gpu? true
                            :active-params active-params :dtype effective-dtype
                            :schedule resolved-schedule}
                     param-env (assoc :param-env param-env)
