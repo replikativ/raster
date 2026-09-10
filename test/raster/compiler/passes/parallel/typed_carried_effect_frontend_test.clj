@@ -6,6 +6,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (def source
@@ -26,6 +27,18 @@
 (defn attempt [form]
   (route/attempt form :float {'x :float 'packed :float 'scales :float 'sums :float}
                  {:scalar-types {'rows :long 'width :long 'seed :float}}))
+
+(defn continuation-program
+  "Exercise frontend/host projection independently of the production performance-admission gate.
+   This intentionally does not claim the production route accepted the source."
+  [form]
+  (let [options {:dtype :float
+                 :array-types {'x :float 'packed :float 'scales :float 'sums :float}
+                 :scalar-types {'rows :long 'width :long 'seed :float}}
+        form (frontend/normalize-source form options)
+        typed (frontend/form->program form options)
+        {:keys [source realized]} (#'route/realize-source form typed)]
+    (#'route/envelope typed source realized)))
 
 (deftest typed-result-valued-store-loop-is-an-ordered-effect-not-a-pure-local
   (let [result (attempt source)
@@ -143,11 +156,95 @@
     (is (= [6.25 15.25] (vec sums)))
     (is (= (vec (repeat 6 2.5)) (vec packed)))))
 
-(deftest post-carry-local-bindings-still-require-an-ordered-region
-  (let [form (replace-form source '(aset sums row (float sum))
-                           '(let* [^double inverse (/ 1.0 sum)]
-                              (aset sums row (float inverse))))]
-    (is (not= :typed-soac (get-in (attempt form) [:stats :route])))))
+(def normalization-source
+  (replace-form
+   (replace-form source '(+ acc (double v))
+                 (with-meta '(+ acc (double v)) {:raster.type/tag 'double}))
+   '(aset sums row (float sum))
+   '(let* [^double inverse ^{:raster.type/tag double} (/ 1.0 sum)]
+      (do (loop* [j 0]
+            (if (< j width)
+              (do (aset packed (+ (* row width) j)
+                        (float ^{:raster.type/tag double}
+                               (* (double (aget packed (+ (* row width) j))) inverse)))
+                  (recur (inc j))) nil))
+          (aset sums row (float inverse))))))
+
+(deftest post-carry-local-bindings-retain-their-execution-point
+  (let [program (continuation-program normalization-source)
+        algorithm (-> program :equations first :algorithm)
+        equation (first (dialect/equations algorithm))
+        parts (-> equation dialect/operation-parts :lambda dialect/lambda-parts)
+        effects (mapv dialect/effect-parts (:body-results parts))
+        scheduled (:form (segop-lower/segop-lower-pass program {:target-device :ze:0 :dtype :float}))
+        execute (eval (list 'fn '[x packed scales sums rows width seed]
+                            (:form (par-simd/simd-pass scheduled :min-elements 1))))]
+    (is (= :typed-soac (:dialect program)))
+    (is (empty? (:locals parts)))
+    (is (:region (last effects)))
+    (is (= :sequential (-> equation dialect/operation-parts :attributes :iteration-order)))
+    (is (= :read-write (:access (first (filter #(= 'packed (:destination %))
+                                              (dialect/result-storage (dialect/facts algorithm)
+                                                                      (second equation)))))))
+    (doseq [width [0 1 3 8]]
+      (let [n (* 2 width)
+            packed (float-array (repeat (+ n 2) -77))
+            scales (float-array 2) sums (float-array 2)
+            inverses (mapv (fn [row] (/ 1.0 (+ 0.25 (reduce + (range (* row width)
+                                                                      (* (inc row) width))))))
+                           (range 2))]
+        (execute (float-array (range n)) packed scales sums 2 width (float 2.5))
+        (is (= (mapv float inverses) (vec sums)))
+        (is (= (into (vec (mapcat (fn [row inverse]
+                                    (map #(float (* % inverse))
+                                         (range (* row width) (* (inc row) width))))
+                                  (range 2) inverses)) [-77.0 -77.0]) (vec packed)))
+        (is (= [2.5 2.5] (vec scales)))))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (= :kernel-body
+             (get-in (gpu/generate-scheduled-segmap-kernel
+                      (first (soac-lower/lower-typed-effect-map algorithm :ze:0))
+                      :dtype :float :target-dialect target
+                      :array-types {'x :float 'packed :float 'scales :float 'sums :float}
+                      :scalar-types {'rows :long 'width :long 'seed :float})
+                     [:attributes :emission-route]))))))
+
+(deftest production-admission-preserves-parallelism-without-rejecting-the-dialect
+  (let [result (attempt normalization-source)]
+    (is (= :sequential-effect-continuation (get-in result [:declined :reason])))
+    (is (some? (get-in result [:declined :equation])))
+    (is (nil? (:program result))))
+  (let [independent (replace-form
+                     source '(aset sums row (float sum))
+                     '(let* [^double inverse ^{:raster.type/tag double} (/ 1.0 sum)]
+                        (aset sums row (float inverse))))
+        result (attempt independent)
+        equation (-> result :program :equations first :algorithm dialect/equations first)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= :independent (-> equation dialect/operation-parts :attributes :iteration-order)))
+    (is (some :region (map dialect/effect-parts
+                           (-> equation dialect/operation-parts :lambda
+                               dialect/lambda-parts :body-results))))))
+
+(deftest post-carry-local-reads-see-the-preceding-loop-writes
+  (let [form (replace-form normalization-source '(/ 1.0 sum)
+                           '(double (aget packed (* row width))))
+        program (continuation-program form)
+        scheduled (:form (segop-lower/segop-lower-pass program
+                                                      {:target-device :ze:0 :dtype :float}))
+        execute (eval (list 'fn '[x packed scales sums rows width seed]
+                            (:form (par-simd/simd-pass scheduled :min-elements 1))))
+        packed (float-array (repeat 6 -77)) scales (float-array 2) sums (float-array 2)]
+    (is (= :typed-soac (:dialect program)))
+    (execute (float-array [1 2 3 4 5 6]) packed scales sums 2 3 (float 2.5))
+    (is (= [1.0 4.0] (vec sums)))
+    (is (= [1.0 2.0 3.0 16.0 20.0 24.0] (vec packed)))))
+
+(deftest post-carry-locals-still-require-retained-types
+  (let [untyped (walk/postwalk #(if (and (symbol? %) (= 'inverse %))
+                                 (with-meta % nil) %) normalization-source)
+        untyped (replace-form untyped '(/ 1.0 sum) (with-meta '(/ 1.0 sum) nil))]
+    (is (not= :typed-soac (get-in (attempt untyped) [:stats :route])))))
 
 (deftest shadowed-comparison-casts-are-not-erased
   (doseq [test-form ['(< (long k) width) '(< k (long width))]]

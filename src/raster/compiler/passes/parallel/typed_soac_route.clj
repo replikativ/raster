@@ -593,6 +593,27 @@
                 (= (:operands equation) (:inputs (dialect/facts algorithm)))
                 (= (:results equation) (dialect/outputs algorithm))))))))
 
+(defn- sequential-continuation-decline
+  "Temporary production admission boundary, not a dialect restriction. Do not replace parallel
+   source rows with a single-work-item continuation until shared read/write ownership is proved."
+  [program]
+  (letfn [(nested-region? [effects]
+            (some (fn [effect]
+                    (let [{:keys [region loop lambda]} (dialect/effect-parts effect)]
+                      (or region
+                          (and loop (nested-region?
+                                     (:body-results (dialect/lambda-parts lambda)))))))
+                  effects))]
+    (some (fn [equation]
+            (let [{:keys [kind attributes lambda]} (dialect/operation-parts equation)]
+              (when (and (= 'effect-map kind)
+                         (= :sequential (:iteration-order attributes))
+                         (nested-region? (:body-results (dialect/lambda-parts lambda))))
+                {:reason :sequential-effect-continuation
+                 :equation (second equation)
+                 :message "nested continuation requires shared read/write ownership before production admission"})))
+          (dialect/equations program))))
+
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
    no parallel binding is in this closed subset."
@@ -625,11 +646,13 @@
                              (dialect/equations typed-result))
                  {:declined {:reason :no-certified-parallel-equation
                              :stats (merge typed-stats resident-stats)}}
-                 (let [{:keys [source realized]} (realize-source form typed-result)]
-                   {:program (envelope typed-result source realized)
-                    :stats (merge typed-stats resident-stats
-                                  {:route :typed-soac :typed-validated true
-                                   :front-end :analyzed-source})})))))
+                 (if-let [decline (sequential-continuation-decline typed-result)]
+                   {:declined decline}
+                   (let [{:keys [source realized]} (realize-source form typed-result)]
+                     {:program (envelope typed-result source realized)
+                      :stats (merge typed-stats resident-stats
+                                    {:route :typed-soac :typed-validated true
+                                     :front-end :analyzed-source})}))))))
          (catch clojure.lang.ExceptionInfo exception
            (if (frontend/source-decline? exception)
              {:declined {:reason (:reason (ex-data exception))

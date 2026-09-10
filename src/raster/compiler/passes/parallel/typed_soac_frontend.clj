@@ -218,8 +218,8 @@
   (instantiate-store-loop substitutions loop))
 
 (defn- region-order
-  "The source order of a region's effects as `[:store i]` / `[:loop j]` entries into its
-   `:stores` and `:loops` vectors. Regions without loops are their stores in order."
+  "The source order of effects: store/loop ordinals index their inventories; a :region item
+   holds lexical locals and its own ordered continuation. Flat regions default to store order."
   [{:keys [stores loops order]}]
   (when (and (nil? order) (seq loops))
     (throw (ex-info "a region with store loops must carry its source order"
@@ -233,6 +233,25 @@
   [loop fresh]
   (instantiate-store-loop {} loop fresh))
 
+(defn- order-locals [order]
+  (mapcat (fn [[kind region]]
+            (when (= :region kind)
+              (concat (:locals region) (order-locals (:order region))))) order))
+
+(defn- map-region-order
+  "Transform the source effect spine without flattening lexical continuation scopes."
+  [order local-fn store-offset loop-offset]
+  (mapv (fn [[kind value]]
+          [kind (case kind
+                  :region (-> value
+                              (update :locals #(mapv local-fn %))
+                              (update :order #(map-region-order % local-fn store-offset loop-offset)))
+                  :store (+ store-offset value)
+                  :loop (+ loop-offset value))]) order))
+
+(defn- substitute-order [order substitutions]
+  (map-region-order order #(update % :init (partial util/subst-syms substitutions)) 0 0))
+
 (defn- rebase-region-locals
   "Move a recursively recognized region behind `offset` lexical SSA values.
 
@@ -244,15 +263,14 @@
                       (map-indexed
                        (fn [ordinal {:keys [id]}]
                          [id (symbol (str "rstr_local_" (+ offset ordinal)))])
-                       locals))]
-    (cond-> {:locals (mapv (fn [{:keys [id] :as local}]
-                     (-> local
-                         (assoc :id (get renames id))
-                         (update :init #(util/subst-syms renames %))))
-                   locals)
+                       (concat locals (order-locals (region-order region)))))
+        rename-local (fn [{:keys [id] :as local}]
+                       (-> local (assoc :id (get renames id))
+                           (update :init #(util/subst-syms renames %))))]
+    (cond-> {:locals (mapv rename-local locals)
      :stores (mapv #(substitute-store renames %) stores)
      :loops (mapv #(substitute-loop renames %) (or loops []))
-     :order (region-order region)}
+     :order (map-region-order (region-order region) rename-local 0 0)}
       (contains? region :result) (assoc :result (util/subst-syms renames (:result region))))))
 
 (defn- split-trailing-recur
@@ -396,18 +414,18 @@
               (let [region (store-region body index update)
                     continuation (store-region (list* 'do tail) index)]
                 (when (and region continuation (seq (:stores region)) (empty? (:loops region))
-                           (or (seq (:stores continuation)) (seq (:loops continuation)))
-                           (empty? (:locals continuation)))
+                           (or (seq (:stores continuation)) (seq (:loops continuation))))
                   {:locals [] :stores (:stores continuation)
                    :loops (into [{:index loop-index :lower lower :extent extent
                             :locals (:locals region) :stores (:stores region)
                             :carry {:parameter parameter :result result :dtype dtype
                                     :init init :update (:result region)}}]
                                 (:loops continuation))
-                   :order (into [[:loop 0]]
-                                (map (fn [[kind ordinal]]
-                                       [kind (if (= :loop kind) (inc ordinal) ordinal)]))
-                                (region-order continuation))})))))))))
+                   :order (let [order (map-region-order (region-order continuation) identity 0 1)]
+                            (into [[:loop 0]]
+                                  (if (seq (:locals continuation))
+                                    [[:region {:locals (:locals continuation) :order order}]]
+                                    order)))})))))))))
 
 (defn- store-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
@@ -421,7 +439,16 @@
   (let [region
   (cond
     (and (seq? body) (form/let-head? (first body)))
-    (or (when-not (some? result-expression) (carried-store-binding body index))
+    (or (let [[head bindings & tail] body]
+          (when (and (vector? bindings) (> (count bindings) 2) (even? (count bindings))
+                     (some util/effectful? (take-nth 2 (rest bindings))))
+            ;; Source let bindings are sequential. Expose their lexical boundaries without
+            ;; moving a pure prefix/suffix across a result-valued store-loop initializer.
+            (store-region
+             (reduce (fn [tail pair] (list head (vec pair) tail))
+                     (list* 'do tail) (reverse (partition 2 bindings)))
+             index result-expression)))
+        (when-not (some? result-expression) (carried-store-binding body index))
     (let [[_ bindings & nested-body] body]
       (when (and (even? (count bindings))
                  (seq nested-body)
@@ -449,7 +476,7 @@
                  :stores (mapv #(substitute-store substitutions %)
                                (:stores nested))
                  :loops (mapv #(substitute-loop substitutions %) (:loops nested))
-                 :order (region-order nested)}
+                 :order (substitute-order (region-order nested) substitutions)}
                   (contains? nested :result)
                   (assoc :result (util/subst-syms substitutions (:result nested)))))))))))
 
@@ -462,16 +489,13 @@
                      (every? (comp empty? :locals) groups))
             (reduce (fn [{:keys [stores loops order]} group]
                       (let [store-offset (count stores)
-                            loop-offset (count loops)]
+                            loop-offset (count loops)
+                            group (rebase-region-locals group (count (order-locals order)))]
                         {:locals []
                          :stores (into stores (:stores group))
                          :loops (into loops (:loops group))
-                         :order (into order
-                                      (map (fn [[kind ordinal]]
-                                             [kind (+ ordinal (if (= :store kind)
-                                                                store-offset
-                                                                loop-offset))]))
-                                      (region-order group))}))
+                         :order (into order (map-region-order (region-order group) identity
+                                                              store-offset loop-offset))}))
                     {:locals [] :stores [] :loops [] :order []}
                     groups)))))
 
@@ -864,8 +888,8 @@
   "The store effects of a description, descending into store loops."
   [effects]
   (vec (mapcat (fn [effect]
-                 (if-let [loop (:loop effect)]
-                   (effect-leaves (:effects loop))
+                 (if-let [scope (or (:loop effect) (:region effect))]
+                   (effect-leaves (:effects scope))
                    [effect]))
                effects)))
 
@@ -878,7 +902,8 @@
    & {:keys [host-return array-types scalar-types]
       :or {host-return :effect array-types {} scalar-types {}}}]
   (let [order (region-order region)
-        local-types (into scalar-types (map (juxt :id :dtype)) locals)
+        analysis-locals (vec (concat locals (order-locals order)))
+        local-types (into scalar-types (map (juxt :id :dtype)) analysis-locals)
         loops (vec (map-indexed (fn [ordinal loop]
                                   (rename-loop-index
                                    loop (clojure.core/symbol (str "rstr_loop_index_" ordinal))))
@@ -926,14 +951,14 @@
             ;; index through another array, established at runtime by validate-block-indices!),
             ;; and it is an error when the index is in the algebra's reach and the proof fails.
             proven (proven-unique-stores (vec (remove :reduction-op candidate-stores))
-                                         index extent locals loops)
+                                         index extent analysis-locals loops)
             proven? (let [indices (vec (remove :reduction-op candidate-stores))]
                       (fn [store] (contains? proven (.indexOf ^java.util.List indices store))))
             ;; A marker is honoured only for an index outside the algebra's reach: the index
             ;; expression or a local it depends on (transitively) reads an array. Unrelated
             ;; locals may not authorize a claim, so only the index's dependency slice counts.
             data-dependent? (fn [{:keys [index] :as store}]
-                              (let [scope (concat locals
+                               (let [scope (concat analysis-locals
                                                   (:locals (when (:loop store)
                                                              (nth loops (:loop store)))))
                                     inits (into {} (map (juxt :id :init)) scope)
@@ -1007,14 +1032,14 @@
                           (every? (fn [[_ grouped]]
                                     (= 1 (count (set (map :effect-conflict grouped)))))
                                   (group-by :out all-stores)))
-            all-locals (vec (concat locals (mapcat :locals loops)))
+            all-locals (vec (concat analysis-locals (mapcat :locals loops)))
             loop-expressions (mapcat source-loop-expressions loops)
             carry-bindings (set (mapcat #(when-let [carry (:carry %)]
                                           [(:parameter carry) (:result carry)]) loops))
             iteration-order (when ordered?
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
-                                            locals all-stores
+                                            analysis-locals all-stores
                                             loop-expressions)))
                                 :sequential
                                 :independent))
@@ -1024,7 +1049,7 @@
             values (mapv :value all-stores)
             write-indices (mapv :index all-stores)
             predicates (mapv :predicate all-stores)
-            analysis-values (concat (map :init locals) loop-expressions
+            analysis-values (concat (map :init analysis-locals) loop-expressions
                                     write-indices predicates values)
             io (update (extract-io (list* 'do analysis-values) index destinations)
                        :scalars set/difference (set (map :id all-locals))
@@ -1047,11 +1072,13 @@
                                           carry (assoc :carry carry))})
                                (range) loops)
             ;; Effects keep the region's source order across direct stores and loops.
-            ordered-effects (mapv (fn [[kind ordinal]]
-                                    (if (= :store kind)
-                                      (store-effect (nth stores ordinal))
-                                      (nth loop-effects ordinal)))
-                                  order)]
+            ordered-effects ((fn project [order]
+                               (mapv (fn [[kind value]]
+                                       (case kind
+                                         :region {:region {:locals (:locals value)
+                                                           :effects (project (:order value))}}
+                                         :store (store-effect (nth stores value))
+                                         :loop (nth loop-effects value))) order)) order)]
         (when (or pointwise? scatter? (and ordered? (every? some? result-dtypes)))
           (merge {:kind (cond pointwise? :map scatter? :scatter :else :effect-map)
                   :id id :sym symbol :index index :extent extent
@@ -2383,9 +2410,11 @@
 (defn- effect-expressions
   "Every expression an effect evaluates, descending into store loops."
   [effect]
+  (if-let [region (:region effect)]
+    (concat (map :init (:locals region)) (mapcat effect-expressions (:effects region)))
   (if-let [{:keys [effects] :as loop} (:loop effect)]
     (concat (source-loop-expressions loop) (mapcat effect-expressions effects))
-    [(:index effect) (:predicate effect) (:value effect)]))
+    [(:index effect) (:predicate effect) (:value effect)])))
 
 (defn- effect-map-equation
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
@@ -2415,6 +2444,11 @@
                           locals)
         effect-form
         (fn effect-form [{:keys [out index predicate value cast effect-conflict] :as effect}]
+          (if-let [region (:region effect)]
+            (dialect/effect-lambda-region
+             (mapv (fn [{:keys [id dtype init]}]
+                     (dialect/local-value id dtype (transform init))) (:locals region))
+             (mapv effect-form (:effects region)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]
@@ -2430,7 +2464,7 @@
                 (list 'effect-loop attributes (transform extent) lambda)))
             (list 'effect (get destination-substitutions out)
                   effect-conflict (transform index) (transform predicate)
-                  (transform (if cast (list cast value) value)))))
+                  (transform (if cast (list cast value) value))))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map

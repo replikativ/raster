@@ -1,8 +1,10 @@
 (ns raster.compiler.ir.nested-effect-region-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.core.util :as util]))
+            [raster.compiler.core.util :as util]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- program [region access effects]
   (let [tensor (av/tensor {:dtype :float :shape '[n]})
@@ -56,6 +58,18 @@
 (def nested
   '(effect-region [(let-value inv :double (/ 1.0 sum))]
                   [(effect out :unique i 1 inv)]))
+
+(deftest production-continuation-gate-descends-through-ordinary-loops
+  (let [region '(effect-region [] [(effect dst :unique i 1 1.0)])
+        p (program (list 'effect-loop {:index 'k :lower 0} 2
+                         (dialect/effect-lambda-form '[k] [region]))
+                   :write #{:memory/write})
+        sequential (walk/postwalk #(if (and (map? %) (contains? % :iteration-order))
+                                     (assoc % :iteration-order :sequential) %) p)]
+    (is (= sequential (dialect/validate! sequential)))
+    (is (nil? (#'route/sequential-continuation-decline p)))
+    (is (= :sequential-effect-continuation
+           (:reason (#'route/sequential-continuation-decline sequential))))))
 
 (deftest nested-regions-project-and-retain-lexical-scope
   (let [scheduled (dialect/scheduled-effect nested)]
