@@ -2,12 +2,27 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.dl.attention :as attention]
             [raster.gpu.device-probe :as probe]))
 
 (def ^:private compiled
   (delay (pipeline/show-pipeline #'attention/attn-prefill-softmax!
                                  :target-device :ocl:0 :dtype :float)))
+
+(deftest prefill-maximum-is-a-canonical-ordered-fold-before-admission
+  (let [options {:dtype :float :array-types {'sc :float}
+                 :scalar-types {'nrows :long 'n-q :long}}
+        source (frontend/normalize-source (:loop-lifted @compiled) options)
+        program (frontend/form->program source options)
+        nodes (tree-seq coll? seq (dialect/equations program))
+        folds (filter dialect/scalar-fold-form? nodes)]
+    (is (= program (dialect/validate! program)))
+    (is (= 1 (count folds)))
+    (is (= :ordered
+           (get-in (dialect/scalar-fold-parts (first folds)) [:attributes :association])))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %))) nodes))))
 
 (deftest prefill-softmax-keeps-parallel-launch-until-ownership-is-proved
   (let [p @compiled

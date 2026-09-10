@@ -2296,7 +2296,8 @@
   [expression default-dtype]
   (util/postwalk-preserving-meta
    (fn [form]
-     (if (par/par-reduce-form? form)
+     (cond
+       (par/par-reduce-form? form)
        (let [{:keys [acc init idx bound body elem-type]}
              (par/extract-par-reduce-info form)
              fold-dtype (dtype/canon (or elem-type default-dtype :double))
@@ -2314,7 +2315,33 @@
               algebra (assoc :algebra algebra))
             (dialect/lambda-form [acc idx] [body]))
            form))
-       form))
+
+       ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only the
+       ;; closed, zero-origin, unit-step, single-carry grammar proved by the shared ordered-loop
+       ;; matcher. Unlike `raster.par/reduce`, a Clojure recurrence promises source order, so even
+       ;; an algebraically associative update remains `:ordered` here.
+       (and (seq? form) (contains? #{'loop 'loop*} (first form)))
+       (if-let [{:keys [acc-sym acc-init index-sym index-init bound-expr else-expr
+                        scoped-update-expr]}
+                (patterns/match-ordered-reduce-loop form)]
+         (let [fold-dtype (some-> default-dtype dtype/canon)
+               carry-dtype (some-> (retained-local-dtype acc-sym acc-init) dtype/canon)]
+           (if (and fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
+                    (zero? index-init) (= else-expr acc-sym)
+                    (dialect/scalar-literal? acc-init)
+                    (not (util/effectful? acc-init))
+                    (not (util/effectful? bound-expr))
+                    (not (util/effectful? scoped-update-expr)))
+             (util/remake
+              form
+              'fold
+              {:accumulator acc-sym :index index-sym :identity acc-init
+               :dtype fold-dtype :extent bound-expr :association :ordered}
+              (dialect/lambda-form [acc-sym index-sym] [scoped-update-expr]))
+             form))
+         form)
+
+       :else form))
    expression))
 
 (defn- declare-result-conversion
@@ -2439,21 +2466,20 @@
                     (util/subst-syms
                      substitutions
                      (first (elementize [expression] arrays element-parameters index))))
-        local-forms (mapv (fn [{:keys [id dtype init]}]
-                            (dialect/local-value id dtype (transform init)))
-                          locals)
+        typed-local (fn [{:keys [id dtype init]}]
+                      (dialect/local-value id dtype
+                                           (canonicalize-scalar-folds
+                                            (transform init) dtype)))
+        local-forms (mapv typed-local locals)
         effect-form
         (fn effect-form [{:keys [out index predicate value cast effect-conflict] :as effect}]
           (if-let [region (:region effect)]
             (dialect/effect-lambda-region
-             (mapv (fn [{:keys [id dtype init]}]
-                     (dialect/local-value id dtype (transform init))) (:locals region))
+             (mapv typed-local (:locals region))
              (mapv effect-form (:effects region)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
-            (let [local-forms (mapv (fn [{:keys [id dtype init]}]
-                                 (dialect/local-value id dtype (transform init)))
-                               loop-locals)
+            (let [local-forms (mapv typed-local loop-locals)
                   body (cond-> (list 'effect-region local-forms (mapv effect-form loop-effects))
                          carry (concat [(transform (:update carry))]))
                   attributes (cond-> {:index loop-index :lower lower}

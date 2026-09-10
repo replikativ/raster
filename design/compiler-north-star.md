@@ -1433,6 +1433,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
    indirect or neighboring-row accesses must remain sequential. No attention-specific exception,
    scalar hoisting, synthetic one-trip loop, or performance claim is needed for this IR extension.
+   Pure zero-origin, unit-step, single-carry Clojure `loop*` recurrences in typed scalar locals are
+   now canonical ordered `Fold` terms before scheduling; effectful loops remain `effect-loop`.
+   Transformed exits, nonzero origins and other control shapes retain their source spelling until a
+   richer canonical construct exists. This reuses the shared loop matcher and the enclosing retained
+   dtype rather than adding a function/type registry. In particular, prefill maximum reduction no
+   longer reaches KernelBody as raw Clojure control syntax.
    A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
    followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
    FP64 pragma alone does not change the result. Device integration currently bounds normalized
