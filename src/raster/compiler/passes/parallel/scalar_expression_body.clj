@@ -11,6 +11,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as scalar-range]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
 (defn- contains-indexed-load?
@@ -300,6 +301,48 @@
                                   (body/->Yield [(:result else-value)]))
                             [(body/value result result-type)]))
                      :result result :type result-type})
+
+                  (dialect/scalar-fold-form? expression)
+                  (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts expression)
+                        {parameters :parameters fold-locals :locals
+                         body-results :body-results} (dialect/lambda-parts lambda)
+                        [accumulator index] parameters
+                        fold-type (canon-type (:dtype attributes))
+                        _ (when-not (and (= 2 (count parameters)) (empty? fold-locals)
+                                         (= 1 (count body-results)) (= fold-type expected))
+                            (decline! :typed-scalar-fold-shape
+                                      "canonical scalar fold must match its expected typed result"
+                                      {:expression expression :expected expected
+                                       :dtype fold-type :parameters parameters
+                                       :locals fold-locals :results body-results}))
+                        loop-index (fresh "fold-index")
+                        carry (fresh "fold-carry")
+                        result (fresh "fold-result")
+                        initial (lower (:identity attributes) fold-type env)
+                        update-expression
+                        (util/subst-syms {index loop-index accumulator carry}
+                                         (first body-results))
+                        update (lower update-expression fold-type
+                                      (assoc env loop-index :long carry fold-type))
+                        _ (when-not (= fold-type (:type initial) (:type update))
+                            (decline! :typed-scalar-fold-dtype
+                                      "canonical scalar fold carry dtype must remain invariant"
+                                      {:expression expression :initial (:type initial)
+                                       :update (:type update) :dtype fold-type}))
+                        loop-operation
+                        (body/->ForLoop
+                         (body/value loop-index :long)
+                         (body/index-cast 0 :long :exact)
+                         (lower-index (:extent attributes) (set (keys env)))
+                         1
+                         [(body/->LoopArg (body/value carry fold-type) (:result initial))]
+                         (conj (vec (:operations update)) (body/->Yield [(:result update)]))
+                         [(body/value result fold-type)]
+                         (cond-> {:association (:association attributes)
+                                  :source-order (= :ordered (:association attributes))}
+                           (:algebra attributes) (assoc :algebra (:algebra attributes))))]
+                    {:operations (conj (vec (:operations initial)) loop-operation)
+                     :result result :type fold-type})
 
                   (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                   (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
