@@ -897,17 +897,26 @@
                     {parameters :parameters locals :locals results :body-results}
                     (lambda-parts lambda)
                     expected [(:accumulator attributes) (:index attributes)]
+                    upper-bound (:upper-bound attributes :exclusive)
+                    lower-bound (:lower attributes 0)
+                    lower-unbound (util/free-syms lower-bound bound)
                     extent-unbound (util/free-syms (:extent attributes) bound)]
                 (when-not (and (symbol? (:index attributes))
+                               (contains? #{:exclusive :inclusive} upper-bound)
                                (= expected parameters)
                                (= 2 (count (distinct parameters)))
                                (empty? (set/intersection bound (set parameters)))
                                (= 1 (count results))
-                               (empty? extent-unbound))
+                               (empty? lower-unbound)
+                               (empty? extent-unbound)
+                               (not (util/effectful? lower-bound))
+                               (not (util/effectful? (:extent attributes))))
                   (fail! :typed-soac-scalar-fold
                          "scalar folds require a closed ordered [accumulator index] region"
                          {:equation equation-id :fold expression :expected expected
                           :parameters parameters :results results
+                          :upper-bound upper-bound
+                          :lower-bound lower-bound :lower-unbound lower-unbound
                           :extent-unbound extent-unbound}))
                 (let [final-bound
                       (reduce

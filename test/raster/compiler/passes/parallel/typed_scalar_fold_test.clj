@@ -105,8 +105,30 @@
                             [:attributes :association])))
     (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
                   (tree-seq coll? seq fold))))
-  (testing "nonzero origins and transformed exits retain their source spelling"
-    (doseq [form ['(loop* [^{:raster.type/tag long} i 1
+  (testing "an inclusive upper bound is retained without overflow-prone bound arithmetic"
+    (let [form '(loop* [^{:raster.type/tag long} i 0
+                        ^{:raster.type/tag float} acc 0.0]
+                  (if (<= (long i) limit)
+                    (let* [^{:raster.type/tag float} value (clojure.core/aget w i)]
+                      (recur (inc (long i)) (+ acc value)))
+                    acc))
+          fold (#'frontend/canonicalize-scalar-folds form :float)
+          attributes (:attributes (dialect/scalar-fold-parts fold))
+          projected (projection/scalar-folds->source fold)]
+      (is (= :inclusive (:upper-bound attributes)))
+      (is (= 'loop* (first projected)))
+      (is (= 'clojure.core/<= (first (second (nth projected 2)))))))
+  (testing "a dynamic lower bound remains an explicit part of the Fold domain"
+    (let [form '(loop* [^{:raster.type/tag long} i start
+                        ^{:raster.type/tag float} acc 0.0]
+                  (if (< (long i) width)
+                    (recur (inc (long i)) (+ acc (clojure.core/aget w i)))
+                    acc))
+          fold (#'frontend/canonicalize-scalar-folds form :float)]
+      (is (= 'start (get-in (dialect/scalar-fold-parts fold) [:attributes :lower])))
+      (is (= 'start (second (second (projection/scalar-folds->source fold)))))))
+  (testing "non-integral origins and transformed exits retain their source spelling"
+    (doseq [form ['(loop* [^{:raster.type/tag long} i 0.5
                             ^{:raster.type/tag float} acc 0.0]
                      (if (< (long i) width)
                        (recur (inc (long i)) (+ acc (clojure.core/aget w i))) acc))

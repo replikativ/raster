@@ -771,7 +771,9 @@
    signed-edge domains retain the guarded advance; no overflow policy is weakened."
   [operation index-name index-type names depth]
   (let [{:keys [lower upper step]} operation
-        ordinary? (and (every? integer? [lower upper step])
+        inclusive? (= :inclusive (get-in operation [:attributes :upper-bound] :exclusive))
+        ordinary? (and (not inclusive?)
+                       (every? integer? [lower upper step])
                        (every? #(scalar-range/literal % index-type) [lower upper step])
                        (scalar-range/contained-in-dtype?
                         (scalar-range/counted-loop-index-range lower upper step) index-type))
@@ -779,14 +781,16 @@
         step-source (if (integer? step) (str step) (emit-index-expression step names))
         unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* index-type)]
     {:loop-header (str "for (" (target-type index-type) " " index-name " = "
-                       (emit-index-expression lower names) "; " index-name " < " upper-source ";"
+                       (emit-index-expression lower names) "; " index-name
+                       (if inclusive? " <= " " < ") upper-source ";"
                        (when ordinary? (str " " index-name " += " step-source)) ") {")
      :checked-advance
      (when-not ordinary?
        (str (indent-lines
              (inc depth)
              (str "if ((" unsigned-type ")(" upper-source ") - (" unsigned-type ")(" index-name
-                  ") <= (" unsigned-type ")(" step-source ")) break;"))
+                  ") " (if inclusive? "<" "<=") " (" unsigned-type ")(" step-source
+                  ")) break;"))
             (indent-lines (inc depth) (str index-name " += " step-source ";"))))}))
 
 (declare emit-scalar-operations)

@@ -46,7 +46,12 @@
       (is (every? #(<= (:lower entry) % (:upper entry)) (butlast prefixes)))
       (is (every? #(<= (:lower result) % (:upper result)) prefixes))))
   (is (= (bigint "18446744073709551615")
-         (ranges/counted-loop-trips Long/MIN_VALUE Long/MAX_VALUE 1))))
+         (ranges/counted-loop-trips Long/MIN_VALUE Long/MAX_VALUE 1)))
+  (is (= (bigint "18446744073709551616")
+         (ranges/counted-loop-trips Long/MIN_VALUE Long/MAX_VALUE 1 :inclusive)))
+  (is (= 2 (ranges/counted-loop-trips (dec Long/MAX_VALUE) Long/MAX_VALUE
+                                      1 :inclusive)))
+  (is (zero? (ranges/counted-loop-trips 1 0 1 :inclusive))))
 
 (deftest quotient-proof-requires-a-positive-constant-divisor
   (doseq [lo (range -9 10) hi (range lo 10) divisor [1 2 7]]
