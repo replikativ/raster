@@ -79,15 +79,12 @@
                                 (+ acc (clojure.core/aget w i)))
                          acc))
                     {:raster.type/tag 'float})
-        source `(let* [y (raster.par/pmap row rows float ~loop-form)] y)
-        program (frontend/form->program source options)
-        fold (scalar-fold program)]
-    (is (dialect/program-form? (dialect/validate! program)))
+        fold (#'frontend/canonicalize-scalar-folds loop-form :float)]
     (is (dialect/scalar-fold-form? fold))
     (is (= :ordered (get-in (dialect/scalar-fold-parts fold)
                             [:attributes :association])))
     (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
-                  (tree-seq coll? seq (dialect/equations program)))))
+                  (tree-seq coll? seq fold))))
   (testing "nonzero origins and transformed exits retain their source spelling"
     (doseq [form ['(loop* [^{:raster.type/tag long} i 1
                             ^{:raster.type/tag float} acc 0.0]
@@ -98,11 +95,9 @@
                      (if (< (long i) width)
                        (recur (inc (long i)) (+ acc (clojure.core/aget w i)))
                        (float acc)))]]
-      (let [source `(let* [y (raster.par/pmap row rows float ~form)] y)
-            program (frontend/form->program source options)]
-        (is (nil? (scalar-fold program)))
-        (is (some #(and (seq? %) (= 'loop* (first %)))
-                  (tree-seq coll? seq (dialect/equations program))))))))
+      (let [result (#'frontend/canonicalize-scalar-folds form :float)]
+        (is (not (dialect/scalar-fold-form? result)))
+        (is (= form result))))))
 
 (deftest jvm-consumes-the-typed-fold-without-compatibility-relowering
   (let [execute
