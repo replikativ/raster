@@ -1424,21 +1424,27 @@ The immediate continuation after the verified double-buffered weighted-reduction
    continuation: validation, host realization, and KernelBody lowering retain its evaluation point
    and do not export its locals. Source admission preserves sequential multi-binding lets and
    includes continuation initializers in capture/read/conflict analysis without hoisting them.
-   Production admission temporarily declines sequential nested continuations with the explicit
-   `:sequential-effect-continuation` diagnostic. Prefill softmax retains its existing parallel
-   compatibility launch: replacing it with a single-work-item KernelBody would be a performance
-   regression, not convergence. Direct frontend/host/KernelBody tests exercise the new capability
-   independently of this gate. Removing the gate needs a shared ownership proof for
-   reads and repeated writes by the same work item across distinct loop-local coordinates. Proving
-   each loop separately is insufficient: cross-loop accesses may race across rows. Unsupported
-   indirect or neighboring-row accesses must remain sequential. No attention-specific exception,
-   scalar hoisting, synthetic one-trip loop, or performance claim is needed for this IR extension.
-   Pure zero-origin, unit-step, single-carry Clojure `loop*` recurrences in typed scalar locals are
-   now canonical ordered `Fold` terms before scheduling; effectful loops remain `effect-loop`.
+   Production admission declines an unproved sequential nested continuation with the explicit
+   `:sequential-effect-continuation` diagnostic; replacing an existing parallel compatibility
+   launch with a single-work-item KernelBody is a performance regression, not convergence. A
+   canonical ownership pass now removes that gate when every read and write of the single inout
+   destination has the same injective mixed-radix address over the outer map digit and all lexical
+   Fold/effect-loop digits. The proof is recomputed over the exact canonical program, rejects
+   guarded, indirect, carried-address, mismatched-domain and neighboring-row cases, and only then
+   upgrades the outer iteration and its ordered conflicts to independent/unique. Prefill softmax is
+   the first workload: it retains its 256-work-item launch and emits through KernelBody on the same
+   TypedSOAC path as other kernels. Proving each loop separately would be insufficient because
+   cross-loop accesses may race across rows. This is a general effect-domain proof, not an
+   attention-specific exception, scalar hoist, synthetic one-trip loop, or performance claim.
+   Pure zero-origin, unit-step, single-carry Clojure `loop*` recurrences that are complete typed
+   scalar expressions are now canonical ordered `Fold` terms before scheduling; effectful loops
+   remain `effect-loop`.
    Transformed exits, nonzero origins and other control shapes retain their source spelling until a
    richer canonical construct exists. This reuses the shared loop matcher and the enclosing retained
-   dtype rather than adding a function/type registry. In particular, prefill maximum reduction no
-   longer reaches KernelBody as raw Clojure control syntax.
+   dtype rather than adding a function/type registry. KernelBody consumes Fold directly as a typed
+   ordered loop; conversion does not descend through arbitrary lexical bindings and therefore
+   cannot detach a recurrence from its scope. In particular, prefill maximum reduction no longer
+   reaches KernelBody as raw Clojure control syntax.
    A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
    followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
    FP64 pragma alone does not change the result. Device integration currently bounds normalized
