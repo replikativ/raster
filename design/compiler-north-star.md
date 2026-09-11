@@ -1444,7 +1444,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    dtype rather than adding a function/type registry. KernelBody consumes Fold directly as a typed
    ordered loop; conversion does not descend through arbitrary lexical bindings and therefore
    cannot detach a recurrence from its scope. In particular, prefill maximum reduction no longer
-   reaches KernelBody as raw Clojure control syntax.
+   reaches KernelBody as raw Clojure control syntax. A Fold lambda may now carry an ordered typed
+   local-SSA spine, and those local initializers may themselves contain canonical Folds. The shared
+   S-expression scope model, validation, substitution/alpha conversion, host projection and
+   KernelBody lowering all preserve that lexical order. Consequently a nested dot/reduction inside
+   an outer recurrence reaches portable scalar/control emission without a loop-specific backend
+   parser; missing retained local dtypes still decline before canonicalization.
    A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
    followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
    FP64 pragma alone does not change the result. Device integration currently bounds normalized

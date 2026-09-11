@@ -1,12 +1,15 @@
 (ns raster.compiler.passes.parallel.typed-scalar-fold-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.nn :as nn]))
 
 (def ^:private dot-map
@@ -37,6 +40,23 @@
   (first
    (filter dialect/scalar-fold-form?
            (tree-seq coll? seq (dialect/equations program)))))
+
+(defn- nested-loop-source []
+  (let [loop-form
+        '(loop* [^{:raster.type/tag long} j 0
+                 ^{:raster.type/tag float} acc 0.0]
+           (if (< (long j) width)
+             (let* [^{:raster.type/tag long} off (* j depth)
+                    ^{:raster.type/tag float}
+                    dot (loop* [^{:raster.type/tag long} d 0
+                                ^{:raster.type/tag float} inner 0.0]
+                          (if (< (long d) depth)
+                            (recur (inc (long d))
+                                   (+ inner (clojure.core/aget x (+ off d))))
+                            inner))]
+               (recur (inc (long j)) (+ acc dot)))
+             acc))]
+    (list 'let* (vector 'y (list 'raster.par/pmap 'row 'rows 'float loop-form)) 'y)))
 
 (deftest fold-is-a-scoped-functional-term
   (let [fold '(fold {:accumulator acc :index i :identity 0.0 :dtype :float
@@ -98,6 +118,28 @@
       (let [result (#'frontend/canonicalize-scalar-folds form :float)]
         (is (not (dialect/scalar-fold-form? result)))
         (is (= form result))))))
+
+(deftest nested-recurrences-use-lexical-fold-locals-through-kernel-body
+  (let [source (nested-loop-source)
+        options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'rows :long 'width :long 'depth :long}}
+        program (frontend/form->program source options)
+        nodes (tree-seq coll? seq (dialect/equations program))
+        folds (filter dialect/scalar-fold-form? nodes)
+        routed (route/attempt source :float {'x :float} options)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (:program routed) {:dtype :float :target-device :ocl:0}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        kernel (first (:kernels emitted))]
+    (is (= program (dialect/validate! program)))
+    (is (= 2 (count folds)))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %))) nodes))
+    (is (= '[off dot]
+           (mapv :id (:locals (dialect/lambda-parts
+                               (:lambda (dialect/scalar-fold-parts (first folds))))))))
+    (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+    (is (= 2 (count (re-seq #"for \(long [^ ]*fold_index_" (:source kernel)))))))
 
 (deftest jvm-consumes-the-typed-fold-without-compatibility-relowering
   (let [execute

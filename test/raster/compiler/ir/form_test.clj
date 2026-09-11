@@ -273,7 +273,21 @@
   (testing "par/reduce — acc + idx binders, init/bound outer"
     (let [{:keys [scopes outer]} (form/scope-info '(raster.par/reduce acc init i n (+ acc (aget a i))))]
       (is (= '[acc i] (:binders (first scopes))))
-      (is (= '[init n] outer)))))
+      (is (= '[init n] outer))))
+  (testing "Fold — parameters precede its ordered typed local SSA spine"
+    (let [fold '(fold {:accumulator acc :index i :identity 0.0 :dtype :float
+                       :extent n :association :ordered}
+                      (lambda [acc i]
+                        (region [(let-value off :long (+ base i))
+                                 (let-value value :float (clojure.core/aget x off))]
+                                [(+ acc value)])))
+          {:keys [scopes outer sequential?]} (form/scope-info fold)
+          scope (first scopes)]
+      (is (true? sequential?))
+      (is (= '[0.0 n] outer))
+      (is (= '[acc i off value] (:binders scope)))
+      (is (= '[nil nil (+ base i) (clojure.core/aget x off)] (:inits scope)))
+      (is (= '[(+ acc value)] (:body scope))))))
 
 (deftest scope-info-rebuild-identity-test
   (testing "rebuild ∘ scope-info is identity for every closed-core binder form"
@@ -290,6 +304,12 @@
                '(raster.par/map! out i n nil (+ (aget in i) 1.0))
                '(raster.par/map! out i n :offset base nil (aget in i))
                '(raster.par/reduce acc 0.0 i n (+ acc (aget in i)))
+               '(fold {:accumulator acc :index i :identity 0.0 :dtype :float
+                       :extent n :association :ordered}
+                      (lambda [acc i]
+                        (region [(let-value off :long (+ base i))
+                                 (let-value value :float (aget in off))]
+                                [(+ acc value)])))
                '(raster.par/scan res acc 0.0 i n nil (+ acc (aget in i)))]]
       (let [{:keys [scopes outer rebuild]} (form/scope-info f)]
         (is (= f (rebuild scopes outer)) (str "round-trip: " (first f)))))))
