@@ -87,6 +87,8 @@
                                         (map vector destination-parameters destinations)))]
         {:index map-index :region (util/subst-syms substitutions region)}))))
 
+(declare materialize-region)
+
 (defn scalar-folds->source
   "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
   [expression]
@@ -95,13 +97,11 @@
      (if (dialect/scalar-fold-form? form)
        (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
              {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
-             [accumulator index] parameters]
-         (when (seq locals)
-           (throw (ex-info "scalar fold projection does not admit local SSA yet"
-                           {:reason :typed-soac-scalar-fold-projection :fold form})))
+             [accumulator index] parameters
+             update (materialize-region locals (first body-results))]
          (with-meta
            (list 'raster.par/reduce accumulator (:identity attributes)
-                 index (:extent attributes) (first body-results))
+                 index (:extent attributes) update)
            {:raster.type/elem-type (:dtype attributes)}))
        form))
    expression))

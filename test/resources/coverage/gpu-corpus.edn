@@ -2,10 +2,10 @@
  :dtype :float,
  :summary
  {:total 236,
-  :typed-soac 103,
+  :typed-soac 104,
   :error 43,
   :scalar 73,
-  :compatibility 17},
+  :compatibility 16},
  :vars
  [{:var raster.dl.array-ops/argmax-rows!,
    :route :typed-soac,
@@ -202,11 +202,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/attn-prefill-softmax!,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :no-lowering-rule, :kind :segops-declined}
-    {:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.attention/batched-causal-attn-dsum,
    :route :typed-soac,
    :typed-validated true,
