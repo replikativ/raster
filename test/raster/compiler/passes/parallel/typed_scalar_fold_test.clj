@@ -69,6 +69,36 @@
     (is (= :ordered (:association attributes)))
     (is (nil? (:algebra attributes)))))
 
+(deftest source-loop-recurrence-canonicalizes-only-for-the-exact-ordered-grammar
+  (let [loop-form (with-meta
+                    '(loop* [^{:raster.type/tag long} i 0
+                             ^{:raster.type/tag float} acc 0.0]
+                       (if (< (long i) width)
+                         (recur (inc (long i))
+                                ^{:raster.type/tag float}
+                                (+ acc (clojure.core/aget w i)))
+                         acc))
+                    {:raster.type/tag 'float})
+        fold (#'frontend/canonicalize-scalar-folds loop-form :float)]
+    (is (dialect/scalar-fold-form? fold))
+    (is (= :ordered (get-in (dialect/scalar-fold-parts fold)
+                            [:attributes :association])))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
+                  (tree-seq coll? seq fold))))
+  (testing "nonzero origins and transformed exits retain their source spelling"
+    (doseq [form ['(loop* [^{:raster.type/tag long} i 1
+                            ^{:raster.type/tag float} acc 0.0]
+                     (if (< (long i) width)
+                       (recur (inc (long i)) (+ acc (clojure.core/aget w i))) acc))
+                  '(loop* [^{:raster.type/tag long} i 0
+                            ^{:raster.type/tag float} acc 0.0]
+                     (if (< (long i) width)
+                       (recur (inc (long i)) (+ acc (clojure.core/aget w i)))
+                       (float acc)))]]
+      (let [result (#'frontend/canonicalize-scalar-folds form :float)]
+        (is (not (dialect/scalar-fold-form? result)))
+        (is (= form result))))))
+
 (deftest jvm-consumes-the-typed-fold-without-compatibility-relowering
   (let [execute
         (fn [source]
