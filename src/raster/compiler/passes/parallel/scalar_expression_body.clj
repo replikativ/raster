@@ -308,7 +308,7 @@
                          body-results :body-results} (dialect/lambda-parts lambda)
                         [accumulator index] parameters
                         fold-type (canon-type (:dtype attributes))
-                        _ (when-not (and (= 2 (count parameters)) (empty? fold-locals)
+                        _ (when-not (and (= 2 (count parameters))
                                          (= 1 (count body-results)) (= fold-type expected))
                             (decline! :typed-scalar-fold-shape
                                       "canonical scalar fold must match its expected typed result"
@@ -319,11 +319,36 @@
                         carry (fresh "fold-carry")
                         result (fresh "fold-result")
                         initial (lower (:identity attributes) fold-type env)
-                        update-expression
-                        (util/subst-syms {index loop-index accumulator carry}
-                                         (first body-results))
-                        update (lower update-expression fold-type
-                                      (assoc env loop-index :long carry fold-type))
+                        local-state
+                        (reduce
+                         (fn [{:keys [operations substitutions environment]} local]
+                           (let [local-type (canon-type (:dtype local))
+                                 local-expression (util/subst-syms substitutions (:init local))
+                                 lowered (lower local-expression local-type environment)
+                                 local-result (:result lowered)
+                                 tag (:scalar-tag (dtype/info local-type))
+                                 local-result (if (and (symbol? local-result) tag)
+                                                (with-meta local-result
+                                                  (assoc (meta local-result)
+                                                         :raster.type/tag tag))
+                                                local-result)]
+                             (when-not (= local-type (:type lowered))
+                               (decline! :typed-scalar-fold-local-dtype
+                                         "canonical Fold local must preserve its retained dtype"
+                                         {:expression expression :local local
+                                          :actual (:type lowered)}))
+                             {:operations (into operations (:operations lowered))
+                              :substitutions (assoc substitutions (:id local) local-result)
+                              :environment (cond-> environment
+                                             (symbol? local-result)
+                                             (assoc local-result local-type))}))
+                         {:operations []
+                          :substitutions {index loop-index accumulator carry}
+                          :environment (assoc env loop-index :long carry fold-type)}
+                         fold-locals)
+                        update-expression (util/subst-syms (:substitutions local-state)
+                                                           (first body-results))
+                        update (lower update-expression fold-type (:environment local-state))
                         _ (when-not (= fold-type (:type initial) (:type update))
                             (decline! :typed-scalar-fold-dtype
                                       "canonical scalar fold carry dtype must remain invariant"
@@ -336,7 +361,8 @@
                          (lower-index (:extent attributes) (set (keys env)))
                          1
                          [(body/->LoopArg (body/value carry fold-type) (:result initial))]
-                         (conj (vec (:operations update)) (body/->Yield [(:result update)]))
+                         (conj (into (vec (:operations local-state)) (:operations update))
+                               (body/->Yield [(:result update)]))
                          [(body/value result fold-type)]
                          (cond-> {:association (:association attributes)
                                   :source-order (= :ordered (:association attributes))}

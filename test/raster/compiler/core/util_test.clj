@@ -203,6 +203,31 @@
   (testing "quote is opaque to substitution"
     (is (= '(quote (+ a a)) (util/subst-syms '{a A} '(quote (+ a a)))))))
 
+(deftest fold-local-scope-utils-test
+  (let [fold '(fold {:accumulator acc :index i :identity 0.0 :dtype :float
+                     :extent n :association :ordered}
+                    (lambda [acc i]
+                      (region [(let-value off :long (+ base i))
+                               (let-value value :float (aget x off))]
+                              [(+ acc value)])))]
+    (testing "Fold parameters and ordered locals are lexical binders"
+      (is (= #{'base 'n 'x} (util/free-syms fold))))
+    (testing "substitution avoids capture by Fold parameters and rewrites ordered local uses"
+      (let [result (util/subst-syms '{base i} fold)
+            [_ _ [_ [acc index] [_ locals body]]] result
+            [_ off _ off-init] (first locals)
+            [_ _ _ value-init] (second locals)]
+        (is (not= 'i index))
+        (is (= #{'i 'n 'x} (util/free-syms result)))
+        (is (= (list '+ 'i index) off-init))
+        (is (= (list 'aget 'x off) value-init))
+        (is (= (list '+ acc (second (second locals))) (first body)))))
+    (testing "alpha conversion renames the complete Fold-local scope and preserves captures"
+      (let [result (util/alpha-convert fold)
+            atoms (set (flatten result))]
+        (is (= #{'base 'n 'x} (util/free-syms result)))
+        (is (not-any? atoms '[acc i off value]))))))
+
 (deftest ftm-source-body-stays-in-sync
   (testing "subst/alpha rename the ftm :raster.walker/source-body CONSISTENTLY with the walked body"
     ;; Regression: the source-body is opaque to free-syms (raw unqualified payload)

@@ -292,22 +292,39 @@
                                             parsed scopes')]
                           (apply rl form head (concat (when nm [nm]) arities')))))})
 
-        ;; (fold attrs (lambda [acc index] (region [] [step])))
+        ;; (fold attrs (lambda [acc index] (region [(let-value id dtype init) ...] [step])))
+        ;; Synthetic nil initializers let the generic sequential-scope machinery model lambda
+        ;; parameters followed by ordered local SSA definitions without inventing a second,
+        ;; Fold-specific free-variable/substitution implementation.
         :fold
         (let [[_ attributes [_ parameters [_ locals results]]] form]
           (when (and (map? attributes) (vector? parameters)
-                     (vector? locals) (empty? locals) (vector? results))
-            {:sequential? false
-             :scopes [{:binders parameters :inits [] :body results}]
+                     (vector? locals) (vector? results)
+                     (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))
+                                   (symbol? (second %)))
+                             locals))
+            (let [parameter-count (count parameters)
+                  local-dtypes (mapv #(nth % 2) locals)]
+            {:sequential? true
+             :scopes [{:binders (into (vec parameters) (map second locals))
+                       :inits (into (vec (repeat parameter-count nil))
+                                    (map #(nth % 3) locals))
+                       :body results}]
              :outer [(:identity attributes) (:extent attributes)]
              :rebuild
-             (fn [[{:keys [binders body]}] [identity extent]]
-               (let [attributes' (assoc attributes
-                                        :accumulator (first binders)
-                                        :index (second binders)
+             (fn [[{:keys [binders inits body]}] [identity extent]]
+               (let [parameters' (vec (take parameter-count binders))
+                     local-binders (drop parameter-count binders)
+                     local-inits (drop parameter-count inits)
+                     locals' (mapv (fn [id dtype init]
+                                     (list 'let-value id dtype init))
+                                   local-binders local-dtypes local-inits)
+                     attributes' (assoc attributes
+                                        :accumulator (first parameters')
+                                        :index (second parameters')
                                         :identity identity :extent extent)]
                  (rl form 'fold attributes'
-                     (list 'lambda (vec binders) (list 'region [] (vec body))))))}))
+                     (list 'lambda parameters' (list 'region locals' (vec body))))))})))
 
         ;; An effect-region's result binders enter scope only after their loop initializer.
         ;; Nil binder slots retain intervening stores in the same sequential spine.

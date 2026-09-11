@@ -750,6 +750,8 @@
                  (or (:carry loop) (strict-effect-scalar-policy? (:effects loop))))))
          effects)))
 
+(declare fail! validate-scalar-fold-scopes!)
+
 (defn validate-scheduled-effect-carries!
   "Check the lexical contract of optional single-result carries in scheduled effect loops.
 
@@ -761,6 +763,7 @@
   (letfn [(fail [message data]
             (throw (ex-info message (assoc data :reason :scheduled-effect-carry))))
           (closed! [expression bound field]
+            (validate-scalar-fold-scopes! expression bound :scheduled-effect)
             (when-let [unbound (seq (util/free-syms expression bound))]
               (fail "effect carry expression is outside its lexical scope"
                     {:field field :unbound (set unbound) :expression expression})))
@@ -882,12 +885,66 @@
     (let [[_ attributes lambda] value]
       {:attributes attributes :lambda lambda})))
 
-(defn- nested-scalar-folds
-  [expressions]
-  (->> expressions
-       (mapcat #(tree-seq coll? seq %))
-       (filter scalar-fold-form?)
-       vec))
+(defn- validate-scalar-fold-scopes!
+  "Validate nested scalar Folds with their actual lexical environments. A flat tree walk loses
+   the outer Fold parameters and ordered local spine, which would either reject valid nested
+   reductions or accidentally admit a free value as a capture."
+  [expression initial-bound equation-id]
+  (letfn [(walk-expression! [expression bound]
+            (cond
+              (scalar-fold-form? expression)
+              (let [{:keys [attributes lambda]} (scalar-fold-parts expression)
+                    {parameters :parameters locals :locals results :body-results}
+                    (lambda-parts lambda)
+                    expected [(:accumulator attributes) (:index attributes)]
+                    extent-unbound (util/free-syms (:extent attributes) bound)]
+                (when-not (and (symbol? (:index attributes))
+                               (= expected parameters)
+                               (= 2 (count (distinct parameters)))
+                               (empty? (set/intersection bound (set parameters)))
+                               (= 1 (count results))
+                               (empty? extent-unbound))
+                  (fail! :typed-soac-scalar-fold
+                         "scalar folds require a closed ordered [accumulator index] region"
+                         {:equation equation-id :fold expression :expected expected
+                          :parameters parameters :results results
+                          :extent-unbound extent-unbound}))
+                (let [final-bound
+                      (reduce
+                       (fn [local-bound {:keys [id dtype init] :as local}]
+                         (when-not (and (symbol? id) (not (contains? local-bound id))
+                                        (dtype/known? dtype) (= dtype (dtype/canon dtype))
+                                        (:scalar-tag (dtype/info dtype)))
+                           (fail! :typed-soac-scalar-fold-local
+                                  "Fold locals require distinct typed scalar SSA identities"
+                                  {:equation equation-id :fold expression :local local}))
+                         (walk-expression! init local-bound)
+                         (let [unbound (util/free-syms init local-bound)]
+                           (when (seq unbound)
+                             (fail! :typed-soac-scalar-fold-local
+                                    "Fold locals may reference only parameters and earlier locals"
+                                    {:equation equation-id :fold expression :local local
+                                     :unbound unbound})))
+                         (conj local-bound id))
+                       (into bound parameters) locals)
+                      result (first results)
+                      result-unbound (util/free-syms result final-bound)]
+                  (walk-expression! result final-bound)
+                  (when (or (seq result-unbound)
+                            (some write-form? (tree-seq coll? seq result)))
+                    (fail! :typed-soac-scalar-fold
+                           "Fold results must be closed and effect free in their lexical region"
+                           {:equation equation-id :fold expression
+                            :result-unbound result-unbound}))))
+
+              (and (seq? expression) (= 'quote (first expression))) nil
+              (map? expression)
+              (doseq [[key value] expression]
+                (walk-expression! key bound)
+                (walk-expression! value bound))
+              (coll? expression) (doseq [child expression] (walk-expression! child bound))
+              :else nil))]
+    (walk-expression! expression initial-bound)))
 
 (defn emit-locals
   "Return local-value forms for normalized local maps."
@@ -1125,6 +1182,7 @@
                           (into (map first (:segment-axes attributes))))
           final-bound
           (reduce (fn [bound {:keys [id init] :as local}]
+                    (validate-scalar-fold-scopes! init bound equation-id)
                     (let [unbound (util/free-syms init bound)]
                       (when (seq unbound)
                         (fail! :typed-soac-unbound-local
@@ -1132,29 +1190,8 @@
                                {:equation equation-id :local local :unbound unbound}))
                       (conj bound id)))
                   initial-bound locals)]
-      (doseq [fold (nested-scalar-folds
-                    (concat (map :init locals) body-results))]
-        (let [{:keys [attributes lambda]} (scalar-fold-parts fold)
-              {fold-parameters :parameters fold-locals :locals
-               fold-results :body-results} (lambda-parts lambda)
-              expected [(:accumulator attributes) (:index attributes)]
-              extent-unbound (util/free-syms (:extent attributes) final-bound)
-              step-bound (into final-bound fold-parameters)
-              step-unbound (when (= 1 (count fold-results))
-                             (util/free-syms (first fold-results) step-bound))]
-          (when-not (and (symbol? (:index attributes))
-                         (= expected fold-parameters)
-                         (empty? fold-locals)
-                         (= 1 (count fold-results))
-                         (empty? extent-unbound)
-                         (empty? step-unbound)
-                         (not (some write-form? fold-results)))
-            (fail! :typed-soac-scalar-fold
-                   "scalar folds require a closed ordered [accumulator index] region"
-                   {:equation equation-id :fold fold :expected expected
-                    :parameters fold-parameters :locals fold-locals
-                    :results fold-results :extent-unbound extent-unbound
-                    :step-unbound step-unbound}))))
+      (doseq [expression (when-not (= 'effect-map kind) body-results)]
+        (validate-scalar-fold-scopes! expression final-bound equation-id))
       (doseq [expression (concat (map :init locals) body-results)
               form (tree-seq coll? seq expression)
               :when (and (seq? form) (symbol? (first form))

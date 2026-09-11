@@ -2292,6 +2292,31 @@
                   expression (map vector arrays parameters)))
         expressions))
 
+(declare canonicalize-scalar-folds)
+
+(defn- canonical-fold-step-region
+  "Turn the lexical `let*` surrounding a recurrence update into the Fold lambda's typed local
+   spine. Returning nil is an admission decline for this conversion only: source control remains
+   available until every local has an authoritative retained dtype."
+  [expression result-dtype]
+  (if (and (seq? expression) (form/let-head? (first expression)))
+    (let [[_ bindings & results] expression
+          pairs (when (and (vector? bindings) (even? (count bindings)) (= 1 (count results)))
+                  (vec (partition 2 bindings)))
+          typed (when pairs
+                  (mapv (fn [[id init]]
+                          (when-let [local-dtype (some-> (retained-local-dtype id init) dtype/canon)]
+                            {:id id :dtype local-dtype :init init}))
+                        pairs))]
+      (when (and (every? some? typed)
+                 (= (count typed) (count (distinct (map :id typed)))))
+        {:locals (mapv (fn [{:keys [id dtype init]}]
+                         (dialect/local-value id dtype
+                                              (canonicalize-scalar-folds init dtype)))
+                       typed)
+         :result (canonicalize-scalar-folds (first results) result-dtype)}))
+    {:locals [] :result (canonicalize-scalar-folds expression result-dtype)}))
+
 (defn- canonicalize-scalar-folds
   [expression default-dtype]
   (let [expression
@@ -2317,30 +2342,44 @@
                  form))
              form))
          expression)]
-    ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only a complete
-    ;; scalar initializer/result here: descending beneath an enclosing `let*` would detach the
-    ;; Fold from those lexical binders. Unlike `raster.par/reduce`, a Clojure recurrence promises
-    ;; source order, so even an algebraically associative update remains `:ordered`.
-    (if-let [{:keys [acc-sym acc-init index-sym index-init bound-expr else-expr
-                     scoped-update-expr]}
-             (when (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
-               (patterns/match-ordered-reduce-loop expression))]
-      (let [fold-dtype (some-> default-dtype dtype/canon)
-            carry-dtype (some-> (retained-local-dtype acc-sym acc-init) dtype/canon)]
-        (if (and fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
-                 (zero? index-init) (= else-expr acc-sym)
-                 (dialect/scalar-literal? acc-init)
-                 (not (util/effectful? acc-init))
-                 (not (util/effectful? bound-expr))
-                 (not (util/effectful? scoped-update-expr)))
-          (util/remake
-           expression
-           'fold
-           {:accumulator acc-sym :index index-sym :identity acc-init
-            :dtype fold-dtype :extent bound-expr :association :ordered}
-           (dialect/lambda-form [acc-sym index-sym] [scoped-update-expr]))
-          expression))
-      expression)))
+    ;; A result conversion still leaves its operand as the complete scalar expression. Preserve
+    ;; that explicit conversion while canonicalizing the recurrence beneath it; unlike descent
+    ;; through `let*`, this introduces no lexical binders that could be detached.
+    (if (and (seq? expression) (= 2 (count expression))
+             (descriptor/cast-op? (first expression)))
+      (let [target (some-> (descriptor/cast-result-tag (first expression))
+                           dtype/dtype-for-scalar-tag dtype/canon)
+            operand (second expression)
+            canonical (canonicalize-scalar-folds operand (or target default-dtype))]
+        (if (= canonical operand) expression
+            (util/remake expression (first expression) canonical)))
+      ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only a complete
+      ;; scalar initializer/result here: descending beneath an enclosing `let*` would detach the
+      ;; Fold from those lexical binders. Unlike `raster.par/reduce`, a Clojure recurrence promises
+      ;; source order, so even an algebraically associative update remains `:ordered`.
+      (if-let [{:keys [acc-sym acc-init index-sym index-init bound-expr else-expr
+                       scoped-update-expr]}
+               (when (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
+                 (patterns/match-ordered-reduce-loop expression))]
+        (let [fold-dtype (some-> default-dtype dtype/canon)
+              carry-dtype (some-> (retained-local-dtype acc-sym acc-init) dtype/canon)
+              step-region (when fold-dtype
+                            (canonical-fold-step-region scoped-update-expr fold-dtype))]
+          (if (and step-region fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
+                   (zero? index-init) (= else-expr acc-sym)
+                   (dialect/scalar-literal? acc-init)
+                   (not (util/effectful? acc-init))
+                   (not (util/effectful? bound-expr))
+                   (not (util/effectful? scoped-update-expr)))
+            (util/remake
+             expression
+             'fold
+             {:accumulator acc-sym :index index-sym :identity acc-init
+              :dtype fold-dtype :extent bound-expr :association :ordered}
+             (dialect/lambda-form [acc-sym index-sym]
+                                  (:locals step-region) [(:result step-region)]))
+            expression))
+        expression))))
 
 (defn- declare-result-conversion
   "Wrap a map body in the explicit cast to its result element dtype when the body's retained
@@ -2474,15 +2513,20 @@
           (if-let [region (:region effect)]
             (dialect/effect-lambda-region
              (mapv (fn [{:keys [id dtype init]}]
-                     (dialect/local-value id dtype (transform init))) (:locals region))
+                     (dialect/local-value id dtype
+                                          (canonicalize-scalar-folds
+                                           (transform init) dtype))) (:locals region))
              (mapv effect-form (:effects region)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]
-                                      (dialect/local-value id dtype (transform init)))
+                                      (dialect/local-value id dtype
+                                                           (canonicalize-scalar-folds
+                                                            (transform init) dtype)))
                                     loop-locals)
                   body (cond-> (list 'effect-region local-forms (mapv effect-form loop-effects))
-                         carry (concat [(transform (:update carry))]))
+                         carry (concat [(canonicalize-scalar-folds
+                                         (transform (:update carry)) (:dtype carry))]))
                   attributes (cond-> {:index loop-index :lower lower}
                                carry (assoc :carry (select-keys carry [:parameter :result :dtype])))
                   lambda (list 'lambda (cond-> [loop-index] carry (conj (:parameter carry))) body)]
