@@ -13,6 +13,7 @@
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
+            [raster.compiler.passes.parallel.typed-soac-ownership :as ownership]
             [raster.compiler.core.util :as util]))
 
 (def ^:private dtype->allocation
@@ -638,19 +639,20 @@
                    [typed-result resident-stats]
                    (if resident-reductions?
                      (resident/realize typed-result)
-                     [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+                     [typed-result {:resident-reductions 0 :inlined-scalars 0}])
+                   [typed-result ownership-stats] (ownership/prove typed-result)]
                (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
                                            :segmented-reduce :contract :product-reduce
                                            :segmented-fold-map :scan}
                                          (:kind (fusion/equation-info %)))
                              (dialect/equations typed-result))
                  {:declined {:reason :no-certified-parallel-equation
-                             :stats (merge typed-stats resident-stats)}}
+                             :stats (merge typed-stats resident-stats ownership-stats)}}
                  (if-let [decline (sequential-continuation-decline typed-result)]
                    {:declined decline}
                    (let [{:keys [source realized]} (realize-source form typed-result)]
                      {:program (envelope typed-result source realized)
-                      :stats (merge typed-stats resident-stats
+                      :stats (merge typed-stats resident-stats ownership-stats
                                     {:route :typed-soac :typed-validated true
                                      :front-end :analyzed-source})}))))))
          (catch clojure.lang.ExceptionInfo exception
