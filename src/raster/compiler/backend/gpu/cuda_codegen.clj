@@ -2,11 +2,15 @@
   "CUDA-C target lowering for verified matrix KernelBody values.
 
   The first row deliberately covers direct, aligned f16×f16→f32 WMMA bodies. Unsupported body
-  structure fails before source emission; masks, views, slices, epilogues and extra ABI values are
-  never silently discarded. Shared-memory staging and WGMMA are later schedules over the same
+   structure fails before source emission. Coordinate-free FP32 store regions use the shared scalar
+   emitter over fragment elements; indexed epilogues, masks, views and slices are never silently
+   discarded. Shared-memory staging and WGMMA are later schedules over the same
   typed contraction and KernelBody vocabulary."
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-emitter]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
+            [raster.compiler.backend.gpu.matrix-target-names :as target-names]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]))
 
 (defn- decline!
@@ -14,10 +18,6 @@
   (when-not condition
     (throw (ex-info "CUDA matrix lowering does not implement this verified body"
                     (assoc data :reason reason :target :cuda)))))
-
-(defn- identity-store?
-  [store]
-  (nil? (:value-region store)))
 
 (defn- parameter-declarations
   [parameters dimension-parameters]
@@ -39,6 +39,9 @@
               (contains? dimension-name id))
          (str "int " (get dimension-name id))
 
+         (and (= :epilogue role) (= :scalar kind) (= :float dtype))
+         (str "float " (c-emit/c-symbol id))
+
          :else
          (throw (ex-info "CUDA matrix lowering cannot render this ordered ABI parameter"
                          {:reason :cuda-mma-extra-abi-unsupported
@@ -50,7 +53,7 @@
                        mi ni ki subgroup block-m block-n sg-m sg-n
                        block-k lhs-ids rhs-ids stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets index-dtype]}]
+                       buffer-offsets index-dtype]} epilogue]
   (let [[M N K] dimensions
         index-type (c-dialect/type-name (c-dialect/resolve! :cuda) index-dtype)]
     (decline! (= {:family :mma :m 16 :n 16 :k 16 :subgroup 32} instruction)
@@ -70,10 +73,8 @@
               :cuda-mma-views-or-schedule-parameters-unsupported
               {:group-z group-z :schedule-parameters schedule-parameters
                :buffer-offsets buffer-offsets})
-    (decline! (every? identity-store? stores)
-              :cuda-mma-store-region-unsupported {:stores stores})
     (let [declarations (parameter-declarations parameters dimension-parameters)
-          _ (decline! (= 6 (count declarations))
+          _ (decline! (= 6 (count (remove #(= :epilogue (:role %)) parameters)))
                       :cuda-mma-extra-abi-unsupported {:parameters parameters})
           specialized-dimensions
           (mapv dimension-values [(:m dimension-parameters)
@@ -91,7 +92,6 @@
                                           (if (= role "accumulator") "float" (str "half, wmma::" layout))
                                           ">"))]
       (str
-       "#include <mma.h>\n"
        "using namespace nvcuda;\n\n"
        "// Tiled WMMA GEMM (parametric): block " block-m "x" block-n ", warp-tile " sg-m "x" sg-n
        ", K " block-k ", frag " mi "x" ni "x" ki ", warp " subgroup
@@ -130,7 +130,13 @@
                    (apply str (for [m ms n ns] (str "    wmma::mma_sync(acc" m "_" n ", a" m ", b" n ", acc" m "_" n ");\n")))))))
        "  }\n"
        (apply str (for [m ms n ns]
-                    (str "  wmma::store_matrix_sync(C + (m_base + " (* m mi) ") * N + n_base + " (* n ni)
+                    (str (when epilogue
+                           (let [acc (str "acc" m "_" n)
+                                 value (str acc ".x[rstr_epilogue_element]")]
+                             (str "  #pragma unroll\n"
+                                  "  for (int rstr_epilogue_element = 0; rstr_epilogue_element < " acc ".num_elements; ++rstr_epilogue_element) {\n"
+                                  "    " value " = " (epilogue value "" "") ";\n  }\n")))
+                         "  wmma::store_matrix_sync(C + (m_base + " (* m mi) ") * N + n_base + " (* n ni)
                          ", acc" m "_" n ", N, wmma::mem_row_major);\n")))
        "}\n"))))
 
@@ -140,4 +146,14 @@
   This boundary takes no tile, dimension, launch or ABI side channel. The returned source is a
   target spelling of the analyzed body; unsupported verified bodies fail with a structured reason."
   [kernel-name kernel-body]
-  (emit-plan kernel-name (matrix-plan/analyze kernel-body)))
+  (let [plan (matrix-plan/analyze kernel-body)
+        names (target-names/validate! kernel-name kernel-body
+                                      (target-names/parameter-names kernel-body nil))
+        region (scalar-emitter/lower-uniform-store-region kernel-body names :cuda)
+        source (emit-plan kernel-name plan (:epilogue region))
+        helpers (c-emit/intrinsic-helper-module source :cuda {})]
+    (decline! (empty? (:compilation helpers)) :cuda-mma-helper-compilation-unsupported
+              {:compilation (:compilation helpers)})
+    (str "#include <mma.h>\n#include <math.h>\n"
+         (c-dialect/helper-source (c-dialect/resolve! :cuda) (:source helpers))
+         "\n" source)))

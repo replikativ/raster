@@ -7,8 +7,10 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.shell :as sh]
             [clojure.java.io :as io]
+            [clojure.walk :as walk]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (defn- nvcc-available? []
@@ -84,6 +86,49 @@
             (catch clojure.lang.ExceptionInfo exception
               (is (= :cuda-mma-result-dtype-unsupported
                      (:reason (ex-data exception)))))))))))
+
+(deftest cuda-uniform-epilogue-uses-the-existing-store-region
+  (let [tile {:block-m 64 :block-n 64 :sg-m 32 :sg-n 32 :block-k 32
+              :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+        body (schedule/matrix-body
+              {:id :uniform-epilogue :row 'a :col 'b :out 'c
+               :dimensions [64 64 64] :tile tile :result-dtype :float
+               :epilogue {:acc 'acc
+                          :expr '(raster.numeric/max (raster.numeric/* acc alpha) (float 0.0))
+                          :scalars [{:sym 'alpha :dtype :float}]}})
+        source (cuda/emit-matrix-kernel "uniform_epilogue" body)]
+    (is (re-find #"float alpha" source))
+    (is (re-find #"\.x\[rstr_epilogue_element\] = .*alpha" source))
+    (is (re-find #"fmax\(" source))
+    (is (not (re-find #"__shared__" source))
+        "a coordinate-free transform needs no hidden scratch")
+    (doseq [id ['rstr_epilogue_element 'n_base 'warpId]]
+      (try
+        (cuda/emit-matrix-kernel "collision"
+                                (walk/postwalk-replace {'alpha id} body))
+        (is false "direct CUDA emission must reject scalar/generated-name collisions")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :matrix-target-name-collision (:reason (ex-data e)))))))
+    (when (nvcc-available?)
+      (let [{:keys [compiled? sass err]} (compile-cu source)]
+        (is compiled? err)
+        (is (re-find #"HMMA" (or sass "")))))))
+
+(deftest cuda-opaque-fragments-reject-coordinate-dependent-epilogues
+  (let [tile {:block-m 64 :block-n 64 :sg-m 32 :sg-n 32 :block-k 32
+              :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+        body (schedule/matrix-body
+              {:id :coordinate-epilogue :row 'a :col 'b :out 'c
+               :dimensions [64 64 64] :tile tile :result-dtype :float
+               :epilogue {:acc 'acc
+                          :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
+                          :operands [{:sym 'bias :dtype :float
+                                      :map (axis-map/of-axes [['j 64]])}]}})]
+    (try
+      (cuda/emit-matrix-kernel "coordinate_epilogue" body)
+      (is false "logical row identity cannot be recovered from opaque fragment slots")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :matrix-store-region-requires-coordinate-layout (:reason (ex-data e))))))))
 
 (deftest cuda-signature-follows-the-ordered-kernel-body-abi
   (let [matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}

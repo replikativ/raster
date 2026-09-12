@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
+            [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
             [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
@@ -557,6 +558,19 @@
                            (body-fixtures/pipelined-staging-body 32 :preferred)
                            {:target-dialect dialect :target-features descriptor}))]
           (concat
+           (when (= :cuda target)
+             [(write-source!
+               directory suffix "matrix-uniform-epilogue"
+               (cuda-emit/emit-matrix-kernel
+                "matrix_uniform_epilogue"
+                (contraction-schedule/matrix-body
+                 {:id :matrix-uniform-epilogue :row 'a :col 'b :out 'c
+                  :dimensions [64 64 64] :result-dtype :float
+                  :tile {:block-m 64 :block-n 64 :sg-m 32 :sg-n 32 :block-k 32
+                         :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+                  :epilogue {:acc 'acc
+                             :expr '(raster.numeric/max (raster.numeric/* acc alpha) (float 0.0))
+                             :scalars [{:sym 'alpha :dtype :float}]}})))])
            (map-indexed
             (fn [index artifact]
               (write-artifact! directory suffix (str "equation-first-" index) artifact))
