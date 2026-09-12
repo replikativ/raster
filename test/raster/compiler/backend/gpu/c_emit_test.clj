@@ -22,6 +22,20 @@
            (catch clojure.lang.ExceptionInfo e
              (:reason (ex-data e)))))))
 
+(deftest unknown-ir-values-fail-before-producing-target-source
+  (is (= "7" (c-emit/emit-expr '(if :else 7 9) nil #{} "idx"))
+      "a cond :else marker is control syntax and is folded before target emission")
+  (is (= :unsupported-c-family-ir
+         (try
+           (c-emit/emit-expr {:source-shaped :value} nil #{} "idx")
+           (catch clojure.lang.ExceptionInfo e
+             (:reason (ex-data e))))))
+  (is (= :unsupported-c-family-ir
+         (try
+           (c-emit/emit-expr :not-a-numerical-value nil #{} "idx")
+           (catch clojure.lang.ExceptionInfo e
+             (:reason (ex-data e)))))))
+
 (deftest explicit-unchecked-integer-casts-require-integral-evidence
   (doseq [value [4294967295 (with-meta 'word {:raster.type/tag 'long})]]
     (is (.startsWith (c-emit/emit-expr (list 'clojure.core/unchecked-int value) nil #{} "idx")

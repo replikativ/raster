@@ -100,15 +100,6 @@
       (list 'let* [g (:test description)]
             (form/integer-case-conditional description g)))))
 
-(defn- const-if-taken
-  "For an `if` whose condition is a compile-time constant, which branch is statically
-   taken: :then (true / a keyword — e.g. a `cond`'s :else), :else (nil / false), or nil
-   (a real runtime condition). wasm has no keyword/nil truthiness, so these must fold."
-  [c]
-  (cond (or (true? c) (keyword? c)) :then
-        (or (nil? c) (false? c))    :else
-        :else nil))
-
 (defn- sym-vt
   "Valtype from the walker's stamped :raster.type/tag on a binding symbol — the
    single type source (TC-fed). nil when unstamped (pass-introduced bindings)."
@@ -186,7 +177,7 @@
         ;; has no notion of a keyword/nil "condition".
         (= h 'if)
         (let [[c t e] A]
-          (case (const-if-taken c)
+          (case (form/constant-if-branch c)
             :then (emit-val ctx t)
             :else (emit-val ctx e)
             (let [tv (infer-vt ctx t)
@@ -427,7 +418,7 @@
                               (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
           (= 'if h) (let [c (nth node 1)]               ; fold constant-truthy conditions
-                      (case (const-if-taken c)
+                      (case (form/constant-if-branch c)
                         :then (infer-vt ctx (nth node 2))
                         :else (infer-vt ctx (nth node 3))
                         (let [tv (infer-vt ctx (nth node 2))]
@@ -489,7 +480,7 @@
         (into init-bytes (vec (mapcat #(emit-effect ctx' %) body))))
       (= h 'if)                                     ; (if c then [else]) in void position
       (let [[c t e] A]
-        (case (const-if-taken c)
+        (case (form/constant-if-branch c)
           :then (emit-effect ctx t)
           :else (if (some? e) (emit-effect ctx e) [])
           (-> (emit-val ctx c)

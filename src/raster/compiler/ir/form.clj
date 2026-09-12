@@ -70,6 +70,17 @@
            default
            (reverse clauses))))
 
+(defn constant-if-branch
+  "Return the statically selected branch for a closed-core Clojure condition, or nil.
+
+   Keywords are truthy and occur as the final `cond` test (`:else`). Nil and false select the
+   else arm; true and keywords select the then arm. Other values remain runtime conditions."
+  [condition]
+  (cond
+    (or (true? condition) (keyword? condition)) :then
+    (or (nil? condition) (false? condition)) :else
+    :else nil))
+
 (defn form-info
   "Classify a compiler IR form and return its properties.
 
