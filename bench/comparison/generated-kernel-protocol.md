@@ -122,6 +122,37 @@ New probe results explicitly label each replay with `:sampling-phase` (`:validat
 or `:measurement`), per-candidate `:replay-index`, and measured `:sample-index` matching the
 comparison sample's `:round`. Existing raw records above predate those labels and remain unchanged.
 
+### Intel A-fragment conversion oracle (not a benchmark)
+
+Before adding tile-local conversion, run the opt-in physical-layout check:
+
+```clojure
+(require '[raster.perf.dpas-fragment-probe :as fragment])
+(fragment/run!)
+```
+
+This intentionally uses independent test-only OpenCL source, not a production schedule. Four
+8×16 tiles in a 16×32 input exercise both nonzero row and K offsets. Coordinate-tagged inputs
+distinguish every entry. A second corpus covers FP16 ties, signed zero, subnormals, overflow,
+infinities and NaNs. The existing 16-bit block load reads independently host-rounded FP16 input;
+the proposed lane-local construction reads FP32, rounds nearest-even, and packs `short8`.
+Both outputs are checked against host FP16 bits, with NaN payloads compared by class only.
+Output poisoning catches unwritten entries. Unsupported devices/builds throw rather than pass.
+
+The [Arc result](../results/dpas-a-fragment-20260913.edn) checks 2,048 components successfully.
+It validates lane `l`, vector component `r` = tile element `[r,l]` for this exact load. It does
+not validate a new production emitter, arbitrary fragment shapes, masked tails, CUDA/HIP layout,
+or performance. The next production slice must retain typed conversion semantics and physical
+mapping explicitly, with other targets refusing unsupported transformed loads.
+
+Local reference evidence (pinned checkout identities):
+
+- Intel Triton `8812fa969dda77a5e458810f11f7db56e51dd0e3`,
+  `docs/BLOCK_LOADS_LAYOUT.md`, lines 98–136: 8×16 A operand lane/component layout.
+- MLIR `edff73e19e4448541086431b325df75de62817ba`,
+  `mlir/test/Integration/Dialect/XeVM/GPU/xevm_block_dpas.mlir`, lines 18–46:
+  16-bit 8r16 load directly feeding the m8n16k16 A operand.
+
 ### External comparators
 
 | Workload | Comparators to implement | Fairness boundary |
