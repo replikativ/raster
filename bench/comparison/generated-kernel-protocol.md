@@ -153,6 +153,19 @@ Local reference evidence (pinned checkout identities):
   `mlir/test/Integration/Dialect/XeVM/GPU/xevm_block_dpas.mlir`, lines 18–46:
   16-bit 8r16 load directly feeding the m8n16k16 A operand.
 
+The next opt-in correctness check executes the generated typed-input matrix lowering:
+
+```clojure
+(require '[raster.compiler.backend.gpu.tile-input-conversion-test :as converted])
+(converted/run-device!)
+```
+
+The `[13 32 32]` Arc run matches all 416 FP32 outputs exactly against independently rounded
+host inputs, including a partial M tile. It uses no conversion temporary. This is not timed and
+does not change public GEMM candidate selection; the public projection graph still needs its
+explicit eligible conversion-fusion rewrite. The separate fragment oracle supplies rounding
+edge-case coverage that this small dyadic matrix does not establish by itself.
+
 ### External comparators
 
 | Workload | Comparators to implement | Fairness boundary |

@@ -212,9 +212,10 @@
                     {:dimension-parameters dimension-parameters
                      :dimension-values dimension-values
                      :storage-dimensions [m-extent n-extent k-extent]})
-        _ (require! (and (= :half (:dtype lhs-param)) (= :half (:dtype rhs-param))
+        _ (require! (and (every? #(= :half (:dtype %))
+                                (filter #(= :dot-operand (get-in % [:layout :kind])) fragments))
                          (contains? #{:half :float} (:dtype out-param)))
-                    "matrix plan requires f16 inputs and an f16 or f32 result"
+                    "matrix plan requires f16 operand fragments and an f16 or f32 result"
                     {:lhs-dtype (:dtype lhs-param) :rhs-dtype (:dtype rhs-param)
                      :result-dtype (:dtype out-param)})
         fragment-map (into {} (map (juxt :id identity)) fragments)
@@ -246,9 +247,6 @@
         inner-ops (butlast (:operations inner-loop))
         prefetches (vec (filter #(record-kind? "TilePrefetch" %) inner-ops))
         loads (vec (filter #(record-kind? "TileLoad" %) inner-ops))
-        _ (require! (not-any? :value-region loads)
-                    "matrix target has no lowering for a transformed tile input"
-                    {:loads loads})
         mads (vec (filter #(record-kind? "MatrixMad" %) inner-ops))
         unknown-inner (remove #(or (record-kind? "TilePrefetch" %)
                                    (record-kind? "TileLoad" %)
@@ -437,6 +435,10 @@
      :block-m block-m :block-n block-n :block-k block-k :sg-m sg-m :sg-n sg-n
      :ncols ncols :lhs-ids lhs-ids :rhs-ids rhs-ids :mad-by-operands mad-by-operands
      :stores stores :prefetch prefetch-distance :result-dtype (:dtype out-param)
+     :input-regions {:lhs (only! "lhs input value region" (distinct (map :value-region lhs-loads)))
+                     :rhs (only! "rhs input value region" (distinct (map :value-region rhs-loads)))}
+     :input-dtypes {:lhs (:dtype lhs-param) :rhs (:dtype rhs-param)}
+     :prefetches prefetches
      :dimension-parameters dimension-parameters
      :index-dtype (get-in outer-loop [:index :type])
      :dimension-values dimension-values

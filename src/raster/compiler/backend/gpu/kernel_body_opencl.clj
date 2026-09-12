@@ -108,22 +108,45 @@
 
 (defn- intel-matrix-plan
   [kernel-body]
-  (let [{:keys [instruction] :as plan} (matrix-plan/analyze kernel-body)
-        {mi :m ni :n ki :k subgroup :subgroup} instruction]
+  (let [{:keys [instruction input-regions input-dtypes prefetches buffer-offsets group-z] :as plan}
+        (matrix-plan/analyze kernel-body)
+        {mi :m ni :n ki :k subgroup :subgroup} instruction
+        region (:lhs input-regions)
+        operation (first (:operations region))]
     (require! (and (= :dpas (:family instruction))
                    (= 8 mi) (= 16 ki)
                    (= 16 subgroup)
                    (= ni subgroup))
               "Intel OpenCL lowering has no builtin for this matrix instruction"
               {:instruction instruction})
+    (require! (and (nil? (:rhs input-regions)) (= :half (:rhs input-dtypes))
+                   (if region
+                     (and (= :float (:lhs input-dtypes))
+                          (= :float (:accumulator-dtype region)) (= :half (:result-dtype region))
+                          (= 1 (count (:operations region)))
+                          (= (into {} (:expression operation))
+                             (into {} (body/cast-expression (first (:parameters region))
+                                                            :half :nearest-even :ieee)))
+                          (= (:result region) (get-in operation [:result :id]))
+                          (= [0 (get-in plan [:dimension-parameters :k])]
+                             [(:k-lower plan) (:k-upper plan)])
+                          (nil? group-z) (every? nil? (vals buffer-offsets)))
+                     (= :half (:lhs input-dtypes))))
+              "Intel matrix lowering has no implementation for this transformed tile input"
+              {:input-regions input-regions :input-dtypes input-dtypes})
+    (require! (every? #(and (= (:lhs input-dtypes) (get-in % [:layout :dtype]))
+                           (or (nil? region)
+                               (= (layout/row-major [mi ki] :float) (:layout %)))) prefetches)
+              "Intel matrix prefetch layout must describe the input storage dtype"
+              {:input-dtypes input-dtypes :prefetches prefetches})
     plan))
 
 (defn- emit-plan
   [kernel-name {:keys [mi ni ki subgroup block-m block-n block-k sg-m sg-n
                        ncols lhs-ids rhs-ids mad-by-operands stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets index-dtype k-bounds]}
-   {:keys [epilogue epilogue-params parameter-names]}]
+                       buffer-offsets index-dtype k-bounds input-dtypes]}
+   {:keys [epilogue epilogue-params parameter-names input-value]}]
   (let [index-type (dtype/ctype :opencl index-dtype)
         nms (count lhs-ids)
         nns (count rhs-ids)
@@ -135,6 +158,9 @@
         ns (range nns)
         amul (fn [m] (if (zero? m) "m_base" (str "m_base+" (* m mi))))
         c-type (case result-dtype :float "float" :half "half")
+        a-type (dtype/ctype :opencl (:lhs input-dtypes))
+        a-bytes (dtype/bytes-of (:lhs input-dtypes))
+        a-prefetch (str "intel_sub_group_2d_block_prefetch_" (* 8 a-bytes) "b_8r16x1c")
         store-cast (if (= :half result-dtype) "(half)" "")
         parameter-names (merge (zipmap [(:m dimension-parameters)
                                         (:n dimension-parameters)
@@ -170,15 +196,27 @@
                      "          if (pk < " k-end ") {\n"
                      (apply str
                             (for [m ms]
-                              (str "            intel_sub_group_2d_block_prefetch_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(pk, " (amul m) "));\n")))
+                              (str "            " a-prefetch
+                                   "((__global void*)A, a_wb, M, a_pb, (int2)(pk, " (amul m) "));\n")))
                      "          } }\n"
                      (apply str
                             (for [n ns]
                               (str "        bp" n " = as_int8(intel_subgroup_block_read_transform_u16_k16((__global void*)B, b_wb, K, b_pb, (int2)(n_base" n ", " kpos ")));\n")))
-                     (apply str
+                     (if input-value
+                       (apply str
+                              (for [m ms]
+                                (str "        sa" m " = (short8)("
+                                     (str/join ", "
+                                               (for [r (range mi)
+                                                     :let [row (str "(" (amul m) " + " r ")")
+                                                           load (str "A[((long)" row ") * K + " kpos " + sg_lid]")]]
+                                                 (str "as_short(" row " < M ? "
+                                                      (input-value load "" "") " : (half)0)")))
+                                     ");\n")))
+                       (str (apply str
                             (for [m ms]
                               (str "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" kpos ", " (amul m) "), &a" m ");\n")))
-                     (apply str (for [m ms] (str "        sa" m " = as_short8(a" m ");\n")))
+                            (apply str (for [m ms] (str "        sa" m " = as_short8(a" m ");\n")))))
                      (apply str
                             (for [m ms n ns]
                               (do
@@ -193,7 +231,7 @@
      ", K " block-k ", DPAS " mi "x" ni "x" ki ", sg " subgroup "\n"
      "__attribute__((intel_reqd_sub_group_size(" subgroup ")))\n"
      "__kernel void " kernel-name "(\n"
-     "    __global const half* restrict A,\n    __global const half* restrict B,\n"
+     "    __global const " a-type "* restrict A,\n    __global const half* restrict B,\n"
      "    __global " c-type "* restrict C,\n    int M, int N, int K"
      scalar-params
      epilogue-params
@@ -215,7 +253,7 @@
             (for [m ms]
               (str "    float" mi " "
                    (str/join ", " (for [n ns] (str "acc" m n "=0.0f"))) ";\n")))
-     "    int a_wb = K * 2, a_pb = K * 2;\n    int b_wb = N * 2, b_pb = N * 2;\n"
+     "    int a_wb = K * " a-bytes ", a_pb = K * " a-bytes ";\n    int b_wb = N * 2, b_pb = N * 2;\n"
      "    ushort8 " (str/join ", " (for [m ms] (str "a" m))) ";\n"
      "    short8 " (str/join ", " (for [m ms] (str "sa" m))) ";\n"
      "    int8 " (str/join ", " (for [n ns] (str "bp" n))) ";\n"
@@ -229,7 +267,7 @@
               (str "    if (" position " < " k-end ") {\n"
                    (apply str
                           (for [m ms]
-                            (str "        intel_sub_group_2d_block_prefetch_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" position ", " (amul m) "));\n")))
+                            (str "        " a-prefetch "((__global void*)A, a_wb, M, a_pb, (int2)(" position ", " (amul m) "));\n")))
                    "    }\n")))
      "    " index-type " k = " k-begin ";\n"
      "    for (; k + " (dec block-k) " < " k-end "; k += " block-k ") {\n"
@@ -274,9 +312,14 @@
   ([kernel-name kernel-body]
    (emit-matrix-kernel kernel-name kernel-body {}))
   ([kernel-name kernel-body {:keys [parameter-names]}]
-   (let [parameter-names (matrix-parameter-names kernel-body parameter-names)]
-     (emit-plan kernel-name (intel-matrix-plan kernel-body)
+   (let [parameter-names (matrix-parameter-names kernel-body parameter-names)
+         plan (intel-matrix-plan kernel-body)
+         input-region (get-in plan [:input-regions :lhs])
+         input-value (when input-region
+                       (:epilogue (lower-scalar-ssa-region kernel-body input-region parameter-names)))]
+     (emit-plan kernel-name plan
                 (assoc (or (lower-store-region kernel-body parameter-names) {})
+                       :input-value input-value
                        :parameter-names parameter-names)))))
 
 ;; ---------------------------------------------------------------------------
@@ -683,13 +726,13 @@
         row-token (str "__row_" (name (gensym "")))
         col-token (str "__col_" (name (gensym "")))
         initial-context
-        {:names (merge parameter-names
-                       {accumulator accumulator-token row-id row-token col-id col-token})
+        {:names (merge parameter-names {accumulator accumulator-token}
+                       (zipmap (:indices region) [row-token col-token]))
          :types (merge
                  (into {} (map (fn [id] [id (dtype/canon (:dtype (get storage id)))]))
                        (rest (:parameters region)))
-                 {accumulator (dtype/canon (:accumulator-dtype region))
-                  row-id :int col-id :int})}
+                 {accumulator (dtype/canon (:accumulator-dtype region))}
+                 (zipmap (:indices region) [:int :int]))}
         final-context
         (reduce
          (fn [context operation]
