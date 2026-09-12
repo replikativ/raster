@@ -1457,9 +1457,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    Monolithic CPU-C declarations now consume that same retained binding-result dtype before looking
    at a rewritten initializer. Inlining Q6_K's pure integer dot may rebuild its outer `let*`, but its
    typed `dp` binding still declares a `long`; the emitter no longer guesses from the rebuilt helper
-   expression. Untyped compatibility expressions remain instrumented separately. The x8 SIMD lane
-   form is the next measured source-only case and must join typed vector/scalar lowering rather than
-   grow another structural type rule.
+   expression. Untyped compatibility expressions remain instrumented separately. Registered native
+   C helper overrides also share one canonical naming function with calls and generated helpers;
+   selecting the x8 VNNI override no longer translates and discards its scalar reference body merely
+   to discover that name. Target-owned code and portable reference semantics remain separate facts.
    A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
    followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
    FP64 pragma alone does not change the result. Device integration currently bounds normalized

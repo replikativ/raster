@@ -8,11 +8,21 @@
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.quant.kernels :as k]
             [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.cpu.codegen :as cpu]))
 
 (defn- clang-avx2? []
   (try (cpu/compile-source! "#include <immintrin.h>\nint main(){__m256 v=_mm256_setzero_ps();return (int)_mm256_cvtss_f32(v);}\n") true
        (catch Throwable _ false)))
+
+(deftest registered-x8-helper-override-does-not-emit-its-reference-body
+  (when (clang-avx2?)
+    (with-redefs [c-emit/generate-c-helper
+                  (fn [_]
+                    (throw (ex-info "target override emitted the discarded reference body" {})))]
+      (is (re-find #"gpufn_wi8_dot_q4_x8"
+                   (:c-source
+                    (meta (aot/compile-aot-c #'k/qmatmul-q4-x8! :float :simd? true))))))))
 
 (deftest x8-simd-fold-vectorizes-and-matches
   (when (clang-avx2?)

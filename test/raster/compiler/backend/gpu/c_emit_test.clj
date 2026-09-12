@@ -35,6 +35,10 @@
   (is (= "rstr__device__" (c-emit/c-symbol '__device__)))
   (is (c-emit/c-identifier? "ordinary_kernel")))
 
+(deftest helper-naming-is-independent-of-helper-source-emission
+  (is (= "gpufn_wi8_dot_q4_x8"
+         (c-emit/gpu-helper-c-name 'raster.quant.kernels/wi8-dot-q4-x8))))
+
 (deftest retained-scalar-dtypes-are-not-collapsed-to-the-kernel-element-type
   (is (= :long (c-emit/scalar-parameter-dtype 'iteration {'iteration :int64} :float)))
   (is (= :byte (c-emit/scalar-parameter-dtype 'quantized {'quantized :int8} :float)))
