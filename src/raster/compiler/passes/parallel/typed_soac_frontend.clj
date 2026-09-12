@@ -152,33 +152,6 @@
                  (every? :dtype locals))
         locals))))
 
-(defn- integer-case-chain
-  "Project one closed-core integer `case*` into the conditional scalar vocabulary.
-
-   Clojure has already bound the tested expression before producing `case*`, so accepting only a
-   symbolic test preserves its evaluate-once semantics.  The clause map's dispatch hashes are an
-   implementation detail; exact integer test values are retained in its `[test-value result]`
-   entries.  Other case representations decline instead of leaking hash/keyword interpretation
-   into a target emitter."
-  [expression]
-  (when (and (seq? expression) (= 'case* (first expression)))
-    (let [[_ test _shift _mask default clauses _switch-type test-type] expression
-          ordered-clauses (when (and (map? clauses) (every? integer? (keys clauses)))
-                            (->> clauses
-                                 (sort-by key)
-                                 (mapv val)))]
-      (when (and (symbol? test)
-                 (= :int test-type)
-                 (map? clauses)
-                 (every? integer? (keys clauses))
-                 (every? #(and (vector? %) (= 2 (count %))
-                                (integer? (first %)))
-                         ordered-clauses))
-        (reduce (fn [otherwise [test-value result]]
-                  (list 'if (list 'clojure.core/== test test-value)
-                        result otherwise))
-                default (reverse ordered-clauses))))))
-
 (defn- substitute-store
   [substitutions store]
   (reduce (fn [store field]
@@ -573,8 +546,11 @@
                   (:stores else-region)))))}))
 
     (and (seq? body) (= 'case* (first body)))
-    (when-let [conditional (integer-case-chain body)]
-      (store-region conditional index))
+    (when-let [description (form/integer-case-descriptor body)]
+      ;; Closed Clojure core binds a non-trivial case test before constructing case*. Requiring
+      ;; that shape here preserves evaluate-once semantics in this source-to-region projection.
+      (when (symbol? (:test description))
+        (store-region (form/integer-case-conditional description (:test description)) index)))
 
     (and (seq? body) (symbol? (first body))
          (or (form/loop-head? (first body))

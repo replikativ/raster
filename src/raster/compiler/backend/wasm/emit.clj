@@ -89,14 +89,16 @@
    into a let*-bound nested-if chain: the test is bound once and compared against
    each integer testval. The exhaustive-case `default` (a throw) becomes the final
    else and lowers to `unreachable`. Only `:int` test-types occur in numeric
-   kernels (the walker keys cases on integers)."
+  kernels (the walker keys cases on integers)."
   [args]
-  (let [[test _shift _mask default clause-map] args
-        g (gensym "case_g_")
-        clauses (vals clause-map)]                       ; each = [testval result]
-    (list 'let* [g test]
-          (reduce (fn [els [k e]] (list 'if (list 'clojure.core/== g k) e els))
-                  default (reverse clauses)))))
+  (let [expression (cons 'case* args)
+        description (form/integer-case-descriptor expression)]
+    (when-not description
+      (throw (ex-info "WASM cannot lower this closed-core case representation"
+                      {:reason :unsupported-wasm-case :expression expression})))
+    (let [g (gensym "case_g_")]
+      (list 'let* [g (:test description)]
+            (form/integer-case-conditional description g)))))
 
 (defn- const-if-taken
   "For an `if` whose condition is a compile-time constant, which branch is statically
@@ -430,7 +432,7 @@
                         :else (infer-vt ctx (nth node 3))
                         (let [tv (infer-vt ctx (nth node 2))]
                           (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))))
-          (= 'case* h) (infer-vt ctx (second (first (vals (nth node 5))))) ; first clause's result
+          (= 'case* h) (infer-vt ctx (synth-case* (rest node)))
           (and (symbol? h) (#{"zero?" "pos?" "neg?"} (name h))) :i32   ; predicate → bool
           ;; integer steppers (match emit-val's inc/dec) — i32 result, made explicit
           ;; so it's intentional rather than relying on the unknown-head default

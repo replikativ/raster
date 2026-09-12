@@ -244,6 +244,22 @@
     (is (nil? (form/scope-info 'x))
         "a bare symbol is not a binder")))
 
+(deftest closed-core-integer-case-has-one-semantic-projection
+  (let [expression '(case* tag 0 0 99 {20 [7 70] 10 [3 30]} :compact :int)
+        description (form/integer-case-descriptor expression)]
+    (is (= {:test 'tag :default 99 :clauses [[3 30] [7 70]]}
+           description)
+        "dispatch hashes order clauses, but the vector entries carry their semantic values")
+    (is (= '(if (clojure.core/== tag 3)
+              30
+              (if (clojure.core/== tag 7) 70 99))
+           (form/integer-case-conditional description 'tag))))
+  (is (nil? (form/integer-case-descriptor
+             '(case* tag 0 0 nil {1 ["not-an-integer" 2]} :hash-equiv :hash-equiv))))
+  (is (nil? (form/integer-case-descriptor
+             '(case* tag 0 0 nil {1 [4 10] 2 [4 20]} :compact :int)))
+      "ambiguous duplicate semantic values decline"))
+
 (deftest scope-info-decomposition-test
   (testing "let* — one sequential scope, binders+inits paired"
     (let [{:keys [scopes sequential? outer]} (form/scope-info '(let* [a 1 b (+ a 2)] (+ a b)))]
