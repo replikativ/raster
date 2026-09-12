@@ -357,7 +357,7 @@
                    :provenance {:dialect :test} :attributes {}})))))
 
 (deftest ordered-loop-origin-is-retained-without-widening-soac-recognition
-  (doseq [origin [0 1 3 Long/MAX_VALUE]]
+  (doseq [origin [Long/MIN_VALUE -1 0 1 3 Long/MAX_VALUE]]
     (let [form (list 'loop ['r origin 'acc (body/literal 7.0 :float)]
                      '(if (< r n) (recur (inc r) (+ acc (float r))) acc))
           result ((:lower-region (lowerer)) {:bindings [] :results [form]}
@@ -367,10 +367,14 @@
       (is (= (zero? origin) (some? (patterns/match-reduce-loop form))))
       (is (= (body/index-cast origin :long :exact) (:lower loop)))
       (is (= :ordered (get-in loop [:attributes :association])))))
-  (doseq [origin [-1 0.5 'start 9223372036854775808N]]
+  (doseq [origin [0.5 9223372036854775808N]]
     (let [form (list 'loop ['r origin 'acc 0.0]
                      '(if (< r n) (recur (inc r) (+ acc r)) acc))]
-      (is (nil? (patterns/match-ordered-reduce-loop form))))))
+      (is (nil? (patterns/match-ordered-reduce-loop form)))))
+  (doseq [origin ['start '(+ base 1)]]
+    (let [form (list 'loop ['r origin 'acc 0.0]
+                     '(if (< r n) (recur (inc r) (+ acc r)) acc))]
+      (is (= origin (:index-init (patterns/match-ordered-reduce-loop form)))))))
 
 (deftest ordered-loop-admission-does-not-drop-effects-or-swap-recur-slots
   (doseq [form ['(loop [r 1 acc 0.0]

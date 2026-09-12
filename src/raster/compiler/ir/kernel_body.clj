@@ -85,6 +85,15 @@
 (def ^:private async-transfer-widths #{4 8 16})
 (def ^:private pipeline-tail-policies #{:exact :separate-epilogue})
 
+(defn- loop-upper-bound-mode!
+  [operation]
+  (let [upper-bound (get-in operation [:attributes :upper-bound] :exclusive)]
+    (when-not (contains? #{:exclusive :inclusive} upper-bound)
+      (throw (ex-info "kernel loop upper-bound mode must be inclusive or exclusive"
+                      {:reason :kernel-body-loop-upper-bound
+                       :upper-bound upper-bound :loop operation})))
+    upper-bound))
+
 (defn- record-kind? [class-name value]
   (and value (= class-name (.getName (class value)))))
 
@@ -767,6 +776,7 @@
           (value-spec! "loop carried binding" (:binding arg)))
         (let [uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
               bindings (set (map (comp :id :binding) (:iter-args operation)))]
+          (loop-upper-bound-mode! operation)
           (when-not (and (set? uniform-iter-args)
                          (set/subset? uniform-iter-args bindings))
             (throw (ex-info
@@ -816,6 +826,7 @@
           (value-spec! "pipelined loop carried binding" (:binding arg)))
         (let [uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
               bindings (set (map (comp :id :binding) (:iter-args operation)))]
+          (loop-upper-bound-mode! operation)
           (when-not (and (set? uniform-iter-args)
                          (set/subset? uniform-iter-args bindings))
             (throw (ex-info
@@ -1434,7 +1445,9 @@
         type (some-> (get-in args [0 :binding :type]) canonical-type)
         expression (:expression update-op)
         operands (:arguments expression)
-        trips (scalar-range/counted-loop-trips (:lower operation) (:upper operation) (:step operation))]
+        trips (scalar-range/counted-loop-trips
+               (:lower operation) (:upper operation) (:step operation)
+               (get-in operation [:attributes :upper-bound] :exclusive))]
     (when (and (= 1 (count args)) (some? trips) (contains? #{:byte :int :long} type)
                (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" update-op)
                (record-kind? "raster.compiler.ir.kernel_body.Yield" yield-op)
@@ -1590,6 +1603,7 @@
           uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
           results (:results operation)
           initials (mapv #(scalar-value-info! (:initial %) values) iter-args)]
+      (loop-upper-bound-mode! operation)
       (when-not (= index-type (:type lower-info) (:type upper-info))
         (throw (ex-info "kernel for-loop index and bounds must have one integral type"
                         {:reason :kernel-body-loop-index-dtype :index index
@@ -1680,6 +1694,7 @@
           initials (mapv #(scalar-value-info! (:initial %) values) iter-args)
           pipeline-yield (terminal-pipeline-yield!
                           "kernel pipelined-for body" (:operations operation))]
+      (loop-upper-bound-mode! operation)
       (when-not (= index-type (:type lower-info) (:type upper-info))
         (throw (ex-info "kernel pipelined-for index and bounds must have one integral type"
                         {:reason :kernel-body-loop-index-dtype :index index

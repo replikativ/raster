@@ -284,7 +284,7 @@
           {:keys [scopes outer sequential?]} (form/scope-info fold)
           scope (first scopes)]
       (is (true? sequential?))
-      (is (= '[0.0 n] outer))
+      (is (= '[0.0 0 n] outer))
       (is (= '[acc i off value] (:binders scope)))
       (is (= '[nil nil (+ base i) (clojure.core/aget x off)] (:inits scope)))
       (is (= '[(+ acc value)] (:body scope))))))

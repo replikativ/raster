@@ -1436,11 +1436,15 @@ The immediate continuation after the verified double-buffered weighted-reduction
    TypedSOAC path as other kernels. Proving each loop separately would be insufficient because
    cross-loop accesses may race across rows. This is a general effect-domain proof, not an
    attention-specific exception, scalar hoist, synthetic one-trip loop, or performance claim.
-   Pure zero-origin, unit-step, single-carry Clojure `loop*` recurrences that are complete typed
-   scalar expressions are now canonical ordered `Fold` terms before scheduling; effectful loops
-   remain `effect-loop`.
-   Transformed exits, nonzero origins and other control shapes retain their source spelling until a
-   richer canonical construct exists. This reuses the shared loop matcher and the enclosing retained
+   Pure unit-step, single-carry Clojure `loop*` recurrences that are complete typed scalar
+   expressions are now canonical ordered `Fold` terms before scheduling; effectful loops remain
+   `effect-loop`. Fold domains retain an exact typed lower expression and an exclusive or inclusive
+   upper-bound mode. KernelBody emits inclusive termination with a guarded final advance, so a
+   `Long/MAX_VALUE` endpoint never requires constructing or executing an overflowing successor.
+   This removes the last verified-SegMap fallback from the batched causal SDPA dQ/dK/dV kernels:
+   their causal inclusive bound and row-dependent nonzero lower bound now remain ordinary Fold
+   facts. Transformed exits and other control shapes retain their source spelling until a richer
+   canonical construct exists. This reuses the shared loop matcher and the enclosing retained
    dtype rather than adding a function/type registry. KernelBody consumes Fold directly as a typed
    ordered loop; conversion does not descend through arbitrary lexical bindings and therefore
    cannot detach a recurrence from its scope. In particular, prefill maximum reduction no longer

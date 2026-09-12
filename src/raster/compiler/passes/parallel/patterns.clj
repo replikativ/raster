@@ -564,12 +564,16 @@
                     (= test-var sym1) [sym1 init1 sym2 init2]
                     (= test-var sym2) [sym2 init2 sym1 init1]
                     :else nil)]
-              ;; SOAC recognition remains zero-origin. Ordered scalar loops may instead keep
-              ;; an explicit nonnegative literal origin; do not translate it into an extent.
+              ;; SOAC recognition remains zero-origin. Ordered scalar loops retain their exact
+              ;; lower bound; its lexical closure, dtype and purity are proved by the owning
+              ;; TypedSOAC/scalar region rather than guessed by this structural matcher.
               (when (and idx-sym
                          (or (int-zero? idx-init)
-                             (and allow-nonzero-origin? (integer? idx-init)
-                                  (<= 0 idx-init Long/MAX_VALUE))))
+                             (and allow-nonzero-origin?
+                                  (or (and (integer? idx-init)
+                                           (<= Long/MIN_VALUE idx-init Long/MAX_VALUE))
+                                      (symbol? idx-init)
+                                      (seq? idx-init)))))
                 (cond-> {:kind :reduce-loop
                  :index-sym idx-sym
                  :acc-sym acc-sym
@@ -588,7 +592,7 @@
   (normalize-loop* form false))
 
 (defn normalize-ordered-loop
-  "Normalize a scalar counted loop, retaining a nonnegative literal :index-init.
+  "Normalize a scalar counted loop, retaining its exact :index-init expression.
    Unlike SOAC recognition, this boundary does not assume a [0,bound) iteration domain."
   [form]
   (when (and (seq? form) (= 3 (count form))
@@ -598,7 +602,6 @@
           normalized (normalize-loop* form true)
           {:keys [index-sym index-init body-form]} normalized
           test (second body-form)
-          then-branch (nth body-form 2 nil)
           lhs (first (descriptor/call-args test))
           ;; A long loop cannot inherit a narrowing int comparison just because a generic
           ;; SOAC recognizer can strip cast syntax. Only the explicit widening spelling is safe.
@@ -609,11 +612,7 @@
                  (every? symbol? ids) (= 2 (count (set ids)))
                  (= 4 (count body-form))
                  (= 2 (count (descriptor/call-args test)))
-                 (= index-sym lhs)
-                 ;; New nonzero-origin coverage is deliberately direct-recursive. Lexical
-                 ;; wrappers keep their existing zero-origin coverage, not a broader promise.
-                 (or (zero? index-init)
-                     (and (seq? then-branch) (= 'recur (first then-branch)))))
+                 (= index-sym lhs))
         (assoc normalized :index-slot (.indexOf ids index-sym))))))
 
 ;; ================================================================
@@ -732,7 +731,7 @@
 (defn- match-reduce-loop*
   "Generic matcher for reduction loops.
 	Returns a structural descriptor of the loop/update shape or nil."
-  [loop-form normalize]
+  [loop-form normalize comparison-kind bound-mode]
   (when-let [normalized (normalize loop-form)]
     (when (= :reduce-loop (:kind normalized))
       (let [{:keys [acc-sym acc-init index-sym body-form]} normalized
@@ -755,12 +754,13 @@
 
                   :else [nil nil])]
             (when (and update-expr
-                       ;; only (< i n) → contiguous [0,bound) iteration
-                       (descriptor/less-than-op? (descriptor/semantic-op test)))
+                       (= comparison-kind
+                          (descriptor/comparison-kind (descriptor/semantic-op test))))
               (cond-> {:acc-sym acc-sym
                :acc-init acc-init
                :index-sym index-sym
                :bound-expr (second (test-index+bound test))
+               :bound-mode bound-mode
                :test-expr test
                :then-branch then-branch
                :else-expr else-branch
@@ -774,7 +774,7 @@
 (defn match-reduce-loop
   "Match a zero-origin reduction for SOAC recognition."
   [loop-form]
-  (match-reduce-loop* loop-form normalize-loop))
+  (match-reduce-loop* loop-form normalize-loop :lt :exclusive))
 
 (defn ordered-unit-step?
   "A long induction step may widen explicitly, but must not erase a narrowing conversion."
@@ -786,9 +786,12 @@
                  (tree-seq coll? seq expression))))
 
 (defn match-ordered-reduce-loop
-  "Match an ordered scalar reduction and retain its literal induction origin."
+  "Match an ordered scalar reduction and retain its literal induction origin and exact bound mode."
   [loop-form]
-  (when-let [matched (match-reduce-loop* loop-form normalize-ordered-loop)]
+  (when-let [matched (or (match-reduce-loop* loop-form normalize-ordered-loop
+                                             :lt :exclusive)
+                         (match-reduce-loop* loop-form normalize-ordered-loop
+                                             :le :inclusive))]
     (let [normalized (normalize-ordered-loop loop-form)
           recur-args (vec (rest (:recur-form matched)))]
       (when (and (:scoped-update-expr matched)

@@ -58,10 +58,18 @@
         nil))))
 
 (defn counted-loop-trips
-  "Exact trip count for static positive-step exclusive-upper loops; unknown bounds decline."
-  [lower upper step]
-  (when (and (integer? lower) (integer? upper) (integer? step) (pos? step))
-    (quot (+' (max 0 (-' upper lower)) (dec step)) step)))
+  "Exact trip count for static positive-step loops; unknown bounds decline. Proof arithmetic is
+   unbounded, including an inclusive endpoint at the maximum finite-width integer."
+  ([lower upper step]
+   (counted-loop-trips lower upper step :exclusive))
+  ([lower upper step upper-bound]
+   (when (and (integer? lower) (integer? upper) (integer? step) (pos? step)
+              (contains? #{:exclusive :inclusive} upper-bound))
+     (case upper-bound
+       :exclusive (quot (+' (max 0 (-' upper lower)) (dec step)) step)
+       :inclusive (if (> lower upper)
+                    0
+                    (inc (quot (-' upper lower) step)))))))
 
 (defn counted-loop-index-range
   "Static positive-step counted-loop indices, INCLUDING the increment which exits the loop.

@@ -30,34 +30,10 @@
 (defn- match-ordered-loop
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
-  (or
-   (when-let [matched (patterns/match-ordered-reduce-loop expression)]
-     (assoc matched :inclusive? false
-            :update-expr (:scoped-update-expr matched)))
-   (when-let [{:keys [kind index-sym index-init index-slot acc-sym acc-init body-form bound]}
-              (patterns/normalize-ordered-loop expression)]
-     (when (and (= :reduce-loop kind)
-                (= :le (descriptor/comparison-kind
-                        (descriptor/semantic-op (second body-form)))))
-       (let [[_ _test then-branch else-expr] body-form
-             recur-form (patterns/find-recur-form then-branch)
-             recur-args (vec (rest recur-form))
-             index-update? #(= 1 (descriptor/affine-step % index-sym))
-             [update-expr index-update]
-             (cond
-               (and (= 2 (count recur-args)) (index-update? (second recur-args)))
-               [(first recur-args) (second recur-args)]
-
-               (and (= 2 (count recur-args)) (index-update? (first recur-args)))
-               [(second recur-args) (first recur-args)]
-
-               :else [nil nil])]
-         (when (and update-expr index-update
-                    (= 'recur (first then-branch))
-                    (patterns/ordered-unit-step? (nth recur-args index-slot) index-sym))
-           {:acc-sym acc-sym :acc-init acc-init :index-sym index-sym :index-init index-init
-            :bound-expr bound :else-expr else-expr :update-expr update-expr
-            :inclusive? true}))))))
+  (when-let [matched (patterns/match-ordered-reduce-loop expression)]
+    (assoc matched
+           :inclusive? (= :inclusive (:bound-mode matched))
+           :update-expr (:scoped-update-expr matched))))
 
 (defn make-lowerer
   "Build a scalar-expression lowerer.
@@ -357,7 +333,7 @@
                         loop-operation
                         (body/->ForLoop
                          (body/value loop-index :long)
-                         (body/index-cast 0 :long :exact)
+                         (lower-index (:lower attributes 0) (set (keys env)))
                          (lower-index (:extent attributes) (set (keys env)))
                          1
                          [(body/->LoopArg (body/value carry fold-type) (:result initial))]
@@ -366,6 +342,8 @@
                          [(body/value result fold-type)]
                          (cond-> {:association (:association attributes)
                                   :source-order (= :ordered (:association attributes))}
+                           (= :inclusive (:upper-bound attributes))
+                           (assoc :upper-bound :inclusive)
                            (:algebra attributes) (assoc :algebra (:algebra attributes))))]
                     {:operations (conj (vec (:operations initial)) loop-operation)
                      :result result :type fold-type})
@@ -405,10 +383,6 @@
                                           {:expression expression :initial loop-type
                                            :update (:type lowered)}))
                             upper (lower-index bound-expr (set (keys env)))
-                            upper (if inclusive?
-                                    (body/expression :add upper
-                                                     (body/index-cast 1 :long :exact))
-                                    upper)
                             loop (body/->ForLoop
                                   (body/value loop-index :long)
                                   (body/index-cast index-init :long :exact)
@@ -418,7 +392,8 @@
                                   (conj (vec (:operations lowered))
                                         (body/->Yield [(:result lowered)]))
                                   [(body/value result loop-type)]
-                                  {:association :ordered})
+                                  (cond-> {:association :ordered}
+                                    inclusive? (assoc :upper-bound :inclusive)))
                             exit (when exit?
                                    (lower (util/subst-syms {acc-sym result} else-expr)
                                           expected (assoc env result loop-type)))]

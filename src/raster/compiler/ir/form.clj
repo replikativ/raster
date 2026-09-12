@@ -310,19 +310,20 @@
                        :inits (into (vec (repeat parameter-count nil))
                                     (map #(nth % 3) locals))
                        :body results}]
-             :outer [(:identity attributes) (:extent attributes)]
+             :outer [(:identity attributes) (get attributes :lower 0) (:extent attributes)]
              :rebuild
-             (fn [[{:keys [binders inits body]}] [identity extent]]
+             (fn [[{:keys [binders inits body]}] [identity lower extent]]
                (let [parameters' (vec (take parameter-count binders))
                      local-binders (drop parameter-count binders)
                      local-inits (drop parameter-count inits)
                      locals' (mapv (fn [id dtype init]
                                      (list 'let-value id dtype init))
                                    local-binders local-dtypes local-inits)
-                     attributes' (assoc attributes
-                                        :accumulator (first parameters')
-                                        :index (second parameters')
-                                        :identity identity :extent extent)]
+                     attributes' (cond-> (assoc attributes
+                                                :accumulator (first parameters')
+                                                :index (second parameters')
+                                                :identity identity :extent extent)
+                                   (contains? attributes :lower) (assoc :lower lower))]
                  (rl form 'fold attributes'
                      (list 'lambda parameters' (list 'region locals' (vec body))))))})))
 

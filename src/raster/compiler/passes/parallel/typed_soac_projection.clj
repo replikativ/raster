@@ -98,10 +98,28 @@
        (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
              {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
              [accumulator index] parameters
-             update (materialize-region locals (first body-results))]
+             update (materialize-region locals (first body-results))
+             projected
+             (if (or (= :inclusive (:upper-bound attributes))
+                     (not= 0 (:lower attributes 0)))
+               (let [typed-index (with-meta index {:raster.type/tag 'long})
+                     typed-accumulator
+                     (with-meta accumulator
+                       {:raster.type/tag (dtype/scalar-tag-for-dtype (:dtype attributes))})]
+                 (list 'loop*
+                       [typed-index (:lower attributes 0)
+                        typed-accumulator (:identity attributes)]
+                       (list 'if (list (if (= :inclusive (:upper-bound attributes))
+                                        'clojure.core/<= 'clojure.core/<)
+                                      (list 'clojure.core/long index)
+                                      (list 'clojure.core/long (:extent attributes)))
+                             (list 'recur (list 'clojure.core/inc (list 'clojure.core/long index))
+                                   update)
+                             accumulator)))
+               (list 'raster.par/reduce accumulator (:identity attributes)
+                     index (:extent attributes) update))]
          (with-meta
-           (list 'raster.par/reduce accumulator (:identity attributes)
-                 index (:extent attributes) update)
+           projected
            {:raster.type/elem-type (:dtype attributes)}))
        form))
    expression))

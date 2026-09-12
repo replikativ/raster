@@ -2357,7 +2357,7 @@
       ;; scalar initializer/result here: descending beneath an enclosing `let*` would detach the
       ;; Fold from those lexical binders. Unlike `raster.par/reduce`, a Clojure recurrence promises
       ;; source order, so even an algebraically associative update remains `:ordered`.
-      (if-let [{:keys [acc-sym acc-init index-sym index-init bound-expr else-expr
+      (if-let [{:keys [acc-sym acc-init index-sym index-init bound-expr bound-mode else-expr
                        scoped-update-expr]}
                (when (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                  (patterns/match-ordered-reduce-loop expression))]
@@ -2366,16 +2366,19 @@
               step-region (when fold-dtype
                             (canonical-fold-step-region scoped-update-expr fold-dtype))]
           (if (and step-region fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
-                   (zero? index-init) (= else-expr acc-sym)
+                   (= else-expr acc-sym)
                    (dialect/scalar-literal? acc-init)
                    (not (util/effectful? acc-init))
+                   (not (util/effectful? index-init))
                    (not (util/effectful? bound-expr))
                    (not (util/effectful? scoped-update-expr)))
             (util/remake
              expression
              'fold
-             {:accumulator acc-sym :index index-sym :identity acc-init
-              :dtype fold-dtype :extent bound-expr :association :ordered}
+             (cond-> {:accumulator acc-sym :index index-sym :identity acc-init
+                      :lower index-init
+                      :dtype fold-dtype :extent bound-expr :association :ordered}
+               (= :inclusive bound-mode) (assoc :upper-bound :inclusive))
              (dialect/lambda-form [acc-sym index-sym]
                                   (:locals step-region) [(:result step-region)]))
             expression))

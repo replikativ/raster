@@ -288,6 +288,20 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn- inclusive-signed-limit-loop-body []
+  (body/make
+   {:id :inclusive-signed-limit-loop
+    :operations
+    [(body/->ForLoop
+      (body/value 'edge-iteration :long)
+      (body/index-cast (dec Long/MAX_VALUE) :long :exact)
+      (body/index-cast Long/MAX_VALUE :long :exact) 1 []
+      [(body/->Yield [])] []
+      {:association :ordered :upper-bound :inclusive})]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (deftest positive-loop-steps-cannot-overflow-the-signed-induction-variable
   (let [kernel (near-signed-limit-loop-body)
         sources (mapv (fn [target]
@@ -368,6 +382,26 @@
             {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
+
+(deftest inclusive-loop-bound-does-not-require-an-overflowing-successor
+  (let [sources (mapv (fn [target]
+                        (opencl/emit-scalar-kernel
+                         "inclusive_signed_limit" (inclusive-signed-limit-loop-body)
+                         {:target-dialect target}))
+                      [:opencl-portable :cuda :hip])]
+    (doseq [source sources]
+      (is (str/includes? source "rstr_edge_iteration <= "))
+      (is (str/includes? source "9223372036854775807"))
+      (is (str/includes? source ") < "))
+      (is (not (str/includes? source "9223372036854775807 + 1")))))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"upper-bound mode"
+       (body/make
+        {:id :invalid-loop-bound-mode
+         :operations [(body/->ForLoop (body/value 'i :long) 0 1 1 []
+                                      [(body/->Yield [])] [] {:upper-bound :closed})]
+         :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+         :provenance {:dialect :test} :attributes {}}))))
 
 (deftest source-integral-arithmetic-retains-its-overflow-semantics
   (let [decline! (fn [rule message data]
