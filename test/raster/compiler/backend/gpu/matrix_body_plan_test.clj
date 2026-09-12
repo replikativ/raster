@@ -32,6 +32,8 @@
                     (assoc node :value-region region) node))
                 (matrix-body :dpas))]
     (is (= kernel (body/validate! kernel)))
+    (is (nil? (opencl/lower-uniform-store-region kernel {} :cuda))
+        "an input transformation is not a store epilogue")
     (doseq [target [:opencl-intel :cuda :hip]]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"transformed tile input"
                             (matrix-target/emit-matrix-kernel "transformed_input" kernel target))))))

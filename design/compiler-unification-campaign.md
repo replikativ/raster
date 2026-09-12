@@ -980,7 +980,7 @@ a new numerical dialect. It accepts only closed, pure, one-element regions, chec
 and result/fragment dtypes, and runs shared SSA typing with no external initial values. Existing
 loads retain nil regions and strict storage/fragment equality. Matrix targets currently reject
 every nonnil input region explicitly: this contract alone does not enable conversion fusion.
-Production enablement must also separate load-region collection from store epilogues, lower the
+Store-epilogue collection now excludes load regions. Production enablement must lower the
 matching FP32 prefetch, retain Intel byte-pitch/extent constraints, and validate masked zeros.
 
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
