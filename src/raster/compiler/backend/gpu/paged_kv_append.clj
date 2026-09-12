@@ -1,10 +1,13 @@
 (ns raster.compiler.backend.gpu.paged-kv-append
-  "Portable OpenCL-C reference lowering for paged FP32-to-FP16 K/V assignment."
-  (:require [raster.compiler.ir.kernel-abi :as kabi]
+  "C-family target lowering for paged FP32-to-FP16 K/V assignment."
+  (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as emitter]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as graph]
-            [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.paged-kv-append :as append]))
+            [raster.compiler.ir.paged-kv-append :as append]
+            [raster.compiler.passes.parallel.paged-kv-append-body :as append-body]))
 
 (defn- kernel-name
   [problem]
@@ -26,35 +29,6 @@
         maximum (long (or (:max-workgroup-size desc) 256))]
     (long (max 1 (min width subgroup maximum)))))
 
-(defn- source
-  [problem name]
-  (let [{:keys [batch-size key-elements-per-token value-elements-per-token]}
-        (append/validate! problem)
-        slots (append/physical-slots problem)]
-    (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
-         "__kernel void " name "(\n"
-         "    __global const float* key_rows,\n"
-         "    __global const float* value_rows,\n"
-         "    __global const int* slot_mapping,\n"
-         "    __global half* key_pages,\n"
-         "    __global half* value_pages) {\n"
-         "  const int component = (int)get_global_id(0);\n"
-         "  const int lane = (int)get_global_id(1);\n"
-         "  if (lane >= " batch-size ") return;\n"
-         "  const int slot = slot_mapping[lane];\n"
-         "  if (slot < 0 || (long)slot >= " slots "L) return;\n"
-         "  if (component < " key-elements-per-token ") {\n"
-         "    const long src = (long)lane * " key-elements-per-token " + component;\n"
-         "    const long dst = (long)slot * " key-elements-per-token " + component;\n"
-         "    key_pages[dst] = convert_half_rte(key_rows[src]);\n"
-         "  }\n"
-         "  if (component < " value-elements-per-token ") {\n"
-         "    const long src = (long)lane * " value-elements-per-token " + component;\n"
-         "    const long dst = (long)slot * " value-elements-per-token " + component;\n"
-         "    value_pages[dst] = convert_half_rte(value_rows[src]);\n"
-         "  }\n"
-         "}\n")))
-
 (defn- ordered-abi
   [problem]
   (let [{:keys [key-rows value-rows slot-mapping key-pages value-pages]}
@@ -67,32 +41,39 @@
       (kabi/slot value-pages :inout :half :c-name "value_pages" :role :value-pages)])))
 
 (defn emit-fp32-to-fp16-reference
-  "Emit the portable assignment kernel as a verified KernelArtifact."
-  [problem desc]
-  (let [{:keys [id batch-size key-elements-per-token value-elements-per-token]
-         :as problem} (append/validate! problem)
-        name (kernel-name problem)
-        workgroup-x (reference-workgroup-x problem desc)
-        width (max key-elements-per-token value-elements-per-token)
-        inputs (append/ordered-input-buffer-ids problem)
-        outputs (append/ordered-output-buffer-ids problem)]
-    (artifact/make
-     {:kernel-name name
-      :source (source problem name)
-      :abi (ordered-abi problem)
-      :arguments (into inputs outputs)
-      :launch (launch/spec
-               {:workgroup-size [workgroup-x 1]
-                :group-count [(long (quot (+ width (dec workgroup-x)) workgroup-x))
-                              batch-size]})
-      :effects {:kind :paged-kv-append :reads inputs :writes outputs}
-      :provenance {:operation-id id :semantic-op :paged-kv-append
-                   :lowering :fp32-to-fp16-reference}
-      :attributes {:strategy :fp32-to-fp16-reference
-                   :optimization-tier :reference
-                   :assignment :unique-slot
-                   :rounding-mode :round-to-nearest-even
-                   :input-dtype :float :storage-dtype :half}})))
+  "Schedule the portable assignment as KernelBody and emit one C-family artifact."
+  ([problem desc]
+   (emit-fp32-to-fp16-reference problem desc :opencl-intel))
+  ([problem desc target-dialect]
+   (let [{:keys [id] :as problem} (append/validate! problem)
+         name (kernel-name problem)
+         workgroup-x (reference-workgroup-x problem desc)
+         inputs (append/ordered-input-buffer-ids problem)
+         outputs (append/ordered-output-buffer-ids problem)
+         kernel-body (append-body/lower problem workgroup-x)
+         base-abi (ordered-abi problem)
+         abi (body-abi/project-contracts base-abi kernel-body)
+         dialect (c-dialect/resolve! target-dialect)
+         parameter-names (into {} (map (juxt :name :c-name)) base-abi)]
+     (artifact/make
+      {:kernel-name name
+       :target (c-dialect/target dialect)
+       :source (emitter/emit-scalar-kernel
+                name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+       :abi abi
+       :arguments (into inputs outputs)
+       :launch (:launch kernel-body)
+       :effects {:kind :paged-kv-append :reads inputs :writes outputs}
+       :provenance {:operation-id id :semantic-op :paged-kv-append
+                    :lowering :kernel-body-fp32-to-fp16}
+       :attributes {:strategy :fp32-to-fp16-reference
+                    :optimization-tier :reference
+                    :assignment :unique-slot
+                    :rounding-mode :round-to-nearest-even
+                    :input-dtype :float :storage-dtype :half
+                    :kernel-body kernel-body
+                    :target-dialect target-dialect}}))))
 
 (defn kernel-graph
   "Wrap one append artifact in a verified graph with explicit in-place page effects."
