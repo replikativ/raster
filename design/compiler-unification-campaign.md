@@ -952,6 +952,13 @@ post-contraction extent remains a barrier; no speculative motion or inferred ran
 The same comparison probe now retains separate prebound-source identities for single-row and
 multi-row projection observations. Both reach one generated XMX replay entry with exact output;
 external baselines and stationary measurements remain required before a competitiveness claim.
+The next measured boundary alternates activations while retaining constant weights. It validates
+fresh results but reveals a separate generated A-conversion launch before each XMX contraction,
+with substantial inter-kernel event-span gaps on OpenCL. A graph with one semantic contraction is
+not automatically one physical launch. Investigate explicit typed tile-local representation
+conversion and replay submission costs; do not relax TileLoad's dtype equality or conceal an
+unrepresented conversion in a target emitter. This is a workload-driven extension of the existing
+KernelBody/graph pipeline, not a new GEMM semantic API.
 
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
 canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead

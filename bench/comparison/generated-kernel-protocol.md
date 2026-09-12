@@ -88,6 +88,17 @@ execute one generated XMX contraction entry during steady replay. Timings are ob
 shared laptop, not vendor comparisons or a schedule-promotion decision; inspect stationarity in
 each raw record before drawing performance conclusions. These tiny shapes do not establish SOTA.
 
+Those initial records freeze both A and B. For a projection-like workload, add
+`:input-policy :changing-activation`: only B is constant, while A and -A alternate on every replay
+(including prevalidation and warmup), with independently computed references. Refresh uploads and
+output checks remain outside timing; any required activation conversion remains inside the graph.
+The [changing-activation `[8 256 256]` record](../results/public-gemm-20260912-changing-activation.edn)
+passes every exact check. Both candidates now execute an A conversion followed by the generated
+XMX contraction; only B conversion is one-time setup. The event spans are much larger than summed
+kernel durations and both series are nonstationary. This motivates investigating representation
+conversion fusion and graph submission, not attributing the full gap to conversion arithmetic or
+claiming a regression against the different constant-input workload.
+
 ### External comparators
 
 | Workload | Comparators to implement | Fairness boundary |
