@@ -18,6 +18,20 @@
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
 
+(deftest opencl-backend-aliases-share-mixed-matrix-admission
+  (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+              :subgroup-size 16 :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+              :grf-bytes-per-lane 256 :machine-lanes 8192 :shared-local-memory 131072}
+        schedules (mapv #(gemm/mixed-dpas-schedule (assoc desc :backend %) nil)
+                        [:ze :opencl :ocl])]
+    (is (every? some? schedules))
+    (is (apply = schedules))
+    (doseq [unsupported [(assoc desc :backend :cuda)
+                         (assoc desc :backend :hip)
+                         (assoc-in (assoc desc :backend :ocl) [:matrix :family] :mma)
+                         (assoc-in (assoc desc :backend :ocl) [:execution :subgroup-sizes] #{32})]]
+      (is (nil? (gemm/mixed-dpas-schedule unsupported nil))))))
+
 (deftest handwritten-gemm-entry-points-are-test-only
   (is (nil? (ns-resolve 'raster.compiler.backend.gpu.opencl-codegen 'emit-gemm-tiled)))
   (is (nil? (ns-resolve 'raster.compiler.backend.gpu.segop-opencl

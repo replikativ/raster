@@ -985,7 +985,7 @@
   [desc requested-tile]
   (let [{:keys [family m n k subgroup]} (:matrix desc)
         backend (:backend desc)]
-    (when (and (contains? #{:ze :opencl} backend)
+    (when (and (contains? #{:ze :ocl :opencl} backend)
                (= :dpas family) (= [8 16 16] [m n k])
                (= 16 subgroup)
                (contains? (hardware/supported-subgroup-sizes desc) (long subgroup)))

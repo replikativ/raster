@@ -52,6 +52,15 @@
       (is (= :invalid-measurement
              (canary/verdict sample (assoc-in sample [:measurement :median-ns] v)))))))
 
+(deftest compilation-evidence-retains-existing-dispatch-declines
+  (let [diagnostics {:selection :analytic-fixed
+                     :declines [{:reason :symbolic-dims}]
+                     :matrix-graph-decline {:reason :mixed-dpas-target-capability}}
+        prepared {:descriptor {:steps [{:convention :executable
+                                         :dispatch {:alternatives [] :attributes diagnostics}}]}}]
+    (is (= diagnostics
+           (get-in (canary/compilation-evidence prepared) [:steps 0 :dispatch-diagnostics])))))
+
 (deftest cpu-canary-executes-the-public-aot-route
   ;; Real compilation and independent reference; no wall-time assertion in CI.
   (with-redefs [microbench/do-bench once-only]

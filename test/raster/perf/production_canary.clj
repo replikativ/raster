@@ -153,6 +153,10 @@
      :steps
      (mapv (fn [step]
              {:convention (:convention step)
+              :dispatch-diagnostics
+              (when-let [dispatch (:dispatch step)]
+                (select-keys (:attributes dispatch)
+                             [:selection :declines :matrix-graph-decline]))
               :alternatives
               (mapv (fn [candidate]
                       (let [artifacts (executable/artifacts candidate)]

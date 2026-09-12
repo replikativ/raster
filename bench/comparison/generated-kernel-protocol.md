@@ -22,6 +22,51 @@ establishes accelerator competitiveness.
 
 ## Baseline selection
 
+### Public dynamic GEMM/activation probe
+
+In a test or bench REPL, use the same public functions as the existing production canary:
+
+```clojure
+(require '[raster.perf.gemm-comparison :as comparison])
+(comparison/run! {:shape [8 64 64] :target :ocl:0
+                  :gemm-precision :mixed-f16-f32
+                  :compiler-revision "<commit plus any dirty changes>"
+                  :environment-tag "<machine/driver identity>"
+                  :rounds 12 :warmup-rounds 4})
+```
+
+The probe compares ordinary dynamic contraction→map composition with an explicit typed ReLU
+epilogue, compiling and binding each once. It reuses the existing rotating measurement sampler
+with an explicit `:host-synchronized-replay` clock. The public equation-first runner does not yet
+support aggregate device-event profiling; these samples must not be reported as device throughput.
+Every replay starts with NaN output and checks an exact dyadic-input CPU oracle afterward. Uploads
+and validation downloads are outside timing but can influence cache/thermal state. Logical buffer
+and CPU-reference work budgets do not bound compiler/driver RSS. Fixed even rounds balance order;
+they are not a stationarity guarantee. Compile times share the same REPL and compilation order,
+so they are not comparable fresh-process cold compilation measurements.
+
+Initial Arc OpenCL observations (driver `26.05.37020.3-0`, Java 25.0.1, shared laptop):
+[before](../results/public-gemm-20260912-before.edn) and
+[after](../results/public-gemm-20260912-after.edn) the OpenCL backend-alias admission fix.
+Both records retain the base compiler revision, dirty-change label, source/ABI signatures and
+chronological samples. The initial record predates the added dispatch-decline reporting.
+
+| `[8 64 64]`, mixed precision | Composed median ms | Explicit epilogue median ms | Both stationary |
+|---|---:|---:|---|
+| Before alias fix | 2.026 | 1.357 | No |
+| After alias fix | 1.693 | 1.478 | No |
+
+All poisoned-output checks passed. The useful structural finding is that `:ocl` was rejected by
+mixed-DPAS admission, which recognized only `:opencl` and `:ze`. The fix admits the same checked
+schedule for all three spellings, without weakening matrix/subgroup requirements. Matrix
+alternatives now appear in public OpenCL dispatch, but candidate counts are not selected or
+executed launch counts. Composed dynamic source still has two resident steps, explicit source one.
+No timing series passes the CV heuristic; these data establish neither a speedup nor a regression.
+Next: automatic symbolic-extent fusion, selected-executable evidence, aggregate public device-event
+timing, then larger projection shapes and matched external implementations.
+
+### External comparators
+
 | Workload | Comparators to implement | Fairness boundary |
 | --- | --- | --- |
 | Dense GEMM | Device vendor library; tuned Triton where supported | Same dimensions, transpose/layout, multiplication precision, accumulation and epilogue |

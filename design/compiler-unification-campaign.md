@@ -923,3 +923,23 @@ and compiler/architecture identity in artifact compilation and caching, prove ph
 alignment/launch requirements, and preserve those through binding. Then require public-route
 acceptance and AMD numerical validation. No throughput or CUDA/AMD numerical parity claim is
 made from source compilation or disassembly.
+
+### Workload-first continuation: public GEMM and targeted schedule work
+
+The chosen next emphasis is public performance verticals (option B), with schedule/IR work only
+where those workloads expose a need (targeted C). HIP production admission and PTX breadth do not
+displace this work. The bounded composed-versus-explicit GEMM probe in the comparison protocol
+keeps source/ABI evidence, dispatch declines, poisoned-output checks and rotating raw replay samples.
+It labels host-synchronized timing explicitly; aggregate equation-first device profiling remains open.
+
+The first Arc run exposed a real admission bug: the public descriptor's `:ocl` backend was excluded
+from the existing mixed-DPAS schedule's `:opencl`/`:ze` check. Accepting the alias restores matrix
+candidates under unchanged instruction, subgroup, precision and binding requirements. Focused
+tests retain non-DPAS, CUDA/HIP and unsupported-wave declines. Before/after numerical checks pass;
+both short timing runs are nonstationary, so no speedup, regression or tuning winner is asserted.
+
+Next priorities are dynamic GEMM→activation fusion through symbolic extent equivalence and legal
+scalar placement; evidence of selected rather than merely available executables; aggregate
+public replay device timing; then the projection shape ladder and a resident forward/VJP/update.
+Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
+or workload requirements justify them. Existing scientific/distributed acceptance gates remain.
