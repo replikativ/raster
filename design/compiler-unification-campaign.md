@@ -944,5 +944,10 @@ Next priorities are dynamic GEMM→activation fusion through symbolic extent equ
 scalar placement; correlating observed events with executable evidence; then the projection shape
 ladder and a resident forward/VJP/update. The dynamic extent's checked multiplication cannot simply
 be moved across an output write: fusion must preserve failure behavior as well as values.
+The first dynamic slice handles an extent product already computed before the contraction. Shared
+typed index lowering checks retained widths, and shared axis algebra establishes shape equality;
+the fused result transform retains the extent as a dependency. This permits ordinary prebound
+contraction→map source to reach one generated step without an explicit epilogue API. The original
+post-contraction extent remains a barrier; no speculative motion or inferred range is introduced.
 Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
 or workload requirements justify them. Existing scientific/distributed acceptance gates remain.

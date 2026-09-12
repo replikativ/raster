@@ -11,8 +11,10 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.fusion-placement :as placement]))
 
 (def ^:private map-equation-rule
@@ -650,16 +652,51 @@
          (= destination (:destination (first storage)))
          (= allowed-access (:access (first storage))))))
 
+(defn- dominating-product-extent
+  "Prove a consumer extent from an already evaluated scalar product. This is a conditional
+   equality, NOT permission to move checked arithmetic. Only a definition before the producer
+   qualifies; its value remains a capture of the fused result transform so evaluation is retained.
+   The shared typed index projection checks widths/casts before the shared axis algebra compares
+   products. No array reads, locals, opaque calls, narrowing or untyped arithmetic are admitted."
+  [program preceding-infos extent output-extent]
+  (let [facts (dialect/facts program)
+        definition (some #(when (= [extent] (:results %)) %) preceding-infos)
+        {:keys [id kind captures parameters locals body-results]} definition
+        values (:values facts)
+        scalar-type #(when (= [] (:shape (get values %))) (:dtype (get values %)))
+        decline! (fn [& _] (throw (ex-info "unproved extent product" {:reason ::extent-proof-decline})))]
+    (when (and (= :scalar kind) (fusible-equation? program id)
+               (= :long (scalar-type extent))
+               (every? #(contains? #{:int :long} (scalar-type %)) captures)
+               (empty? locals) (= 1 (count body-results)))
+      (try
+        (let [expression (util/subst-syms (zipmap parameters captures) (first body-results))
+              _ (when (> (count (take 129 (tree-seq seq? seq expression))) 128) (decline!))
+              lowered (index-expression/lower-typed expression (set captures) scalar-type :long decline!)
+              product-form (fn product-form [x]
+                             (cond
+                               (or (symbol? x) (integer? x)) x
+                               (launch/index-cast? x) (product-form (:argument x))
+                               (and (launch/index-expr? x) (= :mul (:op x)))
+                               (list* '* (map product-form (:arguments x)))
+                               :else (decline!)))]
+          (when (axis-map/index= output-extent (product-form lowered) []) extent))
+        (catch clojure.lang.ExceptionInfo e
+          (when-not (= ::extent-proof-decline (:reason (ex-data e))) (throw e)))))))
+
 (defn- result-map-transform
   "Translate one pointwise map region into a typed post-reduction scalar region.
 
    Pointwise arrays become full-segment operands. Stable captures retain only an axis map proven
    from their flat map index. Uniform captures become typed scalars. Any ambiguous array read
   declines the candidate rather than guessing an address."
-  [program producer consumer consumed-destination]
+  [program preceding-infos producer consumer consumed-destination]
   (let [segment-axes (get-in producer [:attributes :segment-axes])
         output-map (axis-map/of-axes segment-axes)
         output-extent (axis-map/n-elements output-map)
+        consumer-extent (get-in consumer [:attributes :extent])
+        extent-witness (when-not (= output-extent consumer-extent)
+                         (dominating-product-extent program preceding-infos consumer-extent output-extent))
         flat-index (axis-map/index-expr output-map)
         map-index (get-in consumer [:attributes :index])
         producer-parameters (parameter-parts producer)
@@ -699,6 +736,9 @@
         scalars (mapv (fn [[value _]]
                         {:value value :dtype (value-scalar-dtype program value)})
                       scalar-bindings)
+        scalars (cond-> scalars
+                  (and extent-witness (not-any? #(= extent-witness (:value %)) scalars))
+                  (conj {:value extent-witness :dtype :long}))
         element-substitutions
         (into {}
               (map-indexed
@@ -714,7 +754,7 @@
                         (util/subst-syms (merge element-substitutions
                                                 capture-substitutions
                                                 {map-index flat-index})))]
-    (when (and (= output-extent (get-in consumer [:attributes :extent]))
+    (when (and (or (= output-extent consumer-extent) extent-witness)
                (= 1 (count consumed-indices))
                (every? some? indexed-operands)
                (every? :dtype operands)
@@ -751,7 +791,7 @@
                  (get-in facts [:equations (:id consumer)
                                 :attributes :result-storage 0 :destination])
                  transform (when (and consumed-destination consumer-destination)
-                             (result-map-transform program producer consumer
+                             (result-map-transform program (subvec infos 0 producer-index) producer consumer
                                                    consumed-destination))]
            :when (= 1 (count (:results producer)) (count (:body-results producer))
                     (count (:results consumer)) (count (:body-results consumer)))
