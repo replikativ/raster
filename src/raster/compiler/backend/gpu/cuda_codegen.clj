@@ -11,7 +11,8 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-emitter]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.matrix-target-names :as target-names]
-            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]))
+            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-source]))
 
 (defn- decline!
   [condition reason data]
@@ -50,12 +51,10 @@
 
 (defn- emit-plan
   [kernel-name {:keys [instruction dimensions dimension-values parameters
-                       mi ni ki subgroup block-m block-n sg-m sg-n
-                       block-k lhs-ids rhs-ids stores prefetch result-dtype
+                       block-m block-n block-k result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets index-dtype]} epilogue]
-  (let [[M N K] dimensions
-        index-type (c-dialect/type-name (c-dialect/resolve! :cuda) index-dtype)]
+                       buffer-offsets] :as plan} epilogue]
+  (let [[M N K] dimensions]
     (decline! (= {:family :mma :m 16 :n 16 :k 16 :subgroup 32} instruction)
               :cuda-mma-instruction-unsupported {:instruction instruction})
     (decline! (= :float result-dtype)
@@ -82,63 +81,8 @@
                                   (:k dimension-parameters)])
           _ (decline! (= dimensions specialized-dimensions)
                       :cuda-mma-dimension-specialization-invalid
-                      {:dimensions dimensions :dimension-values dimension-values})
-          nms (count lhs-ids) nns (count rhs-ids)      ;; fragments per warp (M, N)
-          ncols (quot block-n sg-n)                   ;; warp columns
-          ksteps (quot block-k ki)
-          ms (range nms) ns (range nns)
-          warps-per-block (* (quot block-m sg-m) (quot block-n sg-n))
-          frag (fn [role & [layout]] (str "wmma::fragment<wmma::" role ", " mi ", " ni ", " ki ", "
-                                          (if (= role "accumulator") "float" (str "half, wmma::" layout))
-                                          ">"))]
-      (str
-       "using namespace nvcuda;\n\n"
-       "// Tiled WMMA GEMM (parametric): block " block-m "x" block-n ", warp-tile " sg-m "x" sg-n
-       ", K " block-k ", frag " mi "x" ni "x" ki ", warp " subgroup
-       ", warps/block " warps-per-block "\n"
-       "extern \"C\" __global__ void " kernel-name "(\n    "
-       (str/join ",\n    " declarations) ") {\n"
-       "  if (M != " M " || N != " N " || K != " K ") { asm volatile(\"trap;\"); return; }\n"
-       "  int warpId = threadIdx.x / " subgroup ";\n"
-       "  int warp_row = warpId / " ncols ";\n"
-       "  int warp_col = warpId % " ncols ";\n"
-       "  int m_base = blockIdx.y * " block-m " + warp_row * " sg-m ";\n"
-       "  int n_base = blockIdx.x * " block-n " + warp_col * " sg-n ";\n"
-       ;; accumulator fragments
-       (apply str (for [m ms n ns] (str "  " (frag "accumulator") " acc" m "_" n ";\n")))
-       (apply str (for [m ms n ns] (str "  wmma::fill_fragment(acc" m "_" n ", 0.0f);\n")))
-       "  " (frag "matrix_a" "row_major") " " (str/join ", " (for [m ms] (str "a" m))) ";\n"
-       "  " (frag "matrix_b" "row_major") " " (str/join ", " (for [n ns] (str "b" n))) ";\n"
-       "  for (" index-type " k = 0; k < K; k += " block-k ") {\n"
-       (apply str
-              (for [ks (range ksteps)]
-                (let [koff (* ks ki)]
-                  (str
-                   "    { " index-type " pk = k + " (+ koff (* prefetch ki)) ";\n"
-                   "      if (pk < K && ((int)threadIdx.x % " subgroup ") == 0) {\n"
-                   (apply str
-                          (for [m ms]
-                            (str "        #pragma unroll\n"
-                                 "        for (int pr = 0; pr < " mi "; ++pr) {\n"
-                                 "          const half* pp = A + (m_base + " (* m mi)
-                                 " + pr) * K + pk;\n"
-                                 "          asm volatile(\"prefetch.global.L2 [%0];\" :: \"l\"(pp));\n"
-                                 "        }\n")))
-                   "      } }\n"
-                   (apply str (for [m ms] (str "    wmma::load_matrix_sync(a" m ", A + (m_base + " (* m mi) ") * K + k + " koff ", K);\n")))
-                   (apply str (for [n ns] (str "    wmma::load_matrix_sync(b" n ", B + (k + " koff ") * N + n_base + " (* n ni) ", N);\n")))
-                   (apply str (for [m ms n ns] (str "    wmma::mma_sync(acc" m "_" n ", a" m ", b" n ", acc" m "_" n ");\n")))))))
-       "  }\n"
-       (apply str (for [m ms n ns]
-                    (str (when epilogue
-                           (let [acc (str "acc" m "_" n)
-                                 value (str acc ".x[rstr_epilogue_element]")]
-                             (str "  #pragma unroll\n"
-                                  "  for (int rstr_epilogue_element = 0; rstr_epilogue_element < " acc ".num_elements; ++rstr_epilogue_element) {\n"
-                                  "    " value " = " (epilogue value "" "") ";\n  }\n")))
-                         "  wmma::store_matrix_sync(C + (m_base + " (* m mi) ") * N + n_base + " (* n ni)
-                         ", acc" m "_" n ", N, wmma::mem_row_major);\n")))
-       "}\n"))))
+                      {:dimensions dimensions :dimension-values dimension-values})]
+      (fragment-source/emit-direct kernel-name plan declarations epilogue :cuda))))
 
 (defn emit-matrix-kernel
   "Lower the currently supported CUDA WMMA subset of a verified matrix KernelBody.
