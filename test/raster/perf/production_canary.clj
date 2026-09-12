@@ -139,7 +139,8 @@
                                   :constants ['A 'B]}))
   ([target args shape]
    (prepare-gemm target args shape {}))
-  ([target args shape {:keys [variant gemm-precision] :or {variant :plain}}]
+  ([target args shape {:keys [variant gemm-precision constants]
+                      :or {variant :plain constants ['A 'B]}}]
    (let [entry (case variant
                  :plain #'gemm-mnk!
                  :relu #'gemm-relu!
@@ -147,7 +148,7 @@
                  :relu-prebound #'gemm-relu-prebound!
                  (throw (ex-info "unknown GEMM canary variant" {:variant variant})))]
      (compiled/lower entry (into args (map long (checked-shape shape)))
-                     (cond-> {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]}
+                     (cond-> {:target target :dtype :float :on-non-resident :throw :constants constants}
                        gemm-precision (assoc :gemm-precision gemm-precision))))))
 
 (defn compilation-evidence

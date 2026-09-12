@@ -14,33 +14,46 @@
         buffers (atom {})
         args (canary/gemm-arguments (:shape options))
         expected (mapv #(max (float 0) %)
-                       (canary/gemm-reference (first args) (second args) (:shape options)))]
+                       (canary/gemm-reference (first args) (second args) (:shape options)))
+        negative (float-array (map #(float (- %)) (first args)))
+        negative-expected (mapv #(max (float 0) %)
+                                (canary/gemm-reference negative (second args) (:shape options)))
+        result-for (fn [id]
+                     (if (and (not= :stale-activation mode)
+                              (= (vec negative) (get @buffers [id :A])))
+                       negative-expected expected))]
     (with-redefs [hardware/init! (constantly nil)
                   hardware/device-signature (constantly {:fixture true})
                   canary/prepare-gemm
-                  (fn [_ _ _ {:keys [variant]}]
+                  (fn [_ _ _ {:keys [variant constants]}]
                     (swap! events conj [:compile variant])
-                    {:id variant :schedule {:precision :f32-scalar}})
+                    {:id variant :constants constants :schedule {:precision :f32-scalar}})
                   canary/compilation-evidence (fn [p] {:prepared-id (:id p)})
                   compiled/instantiate!
                   (fn [p opts]
                     (swap! events conj [:bind (:id p) opts])
                     (when (and (= mode :bind-failure) (= :relu (:id p)))
                       (throw (ex-info "injected binding failure" {})))
-                    {:executable (:id p) :out-tree [{:sym 'C :node :C}]})
+                    {:executable (:id p) :out-tree [{:sym 'C :node :C}]
+                     :in-tree [{:sym 'A :node :A
+                                :role (if (or (= mode :constant-activation)
+                                              (some #{'A} (:constants p))) :constant :input)}]})
                   compiled/ir (constantly {:fixture true})
                   compiled/close! #(swap! events conj [:close (:executable %)])
-                  link/upload! (fn [id _ values]
-                                 (swap! events conj [:reset id])
-                                 (swap! buffers assoc id (vec values)))
+                  link/upload! (fn [id node values]
+                                 (if (= node :A)
+                                   (do (swap! events conj [:activation id (vec values)])
+                                       (swap! buffers assoc [id :A] (vec values)))
+                                   (do (swap! events conj [:reset id])
+                                       (swap! buffers assoc id (vec values)))))
                   link/run! (fn [id]
                               (swap! events conj [:run id])
                               (when-not (= mode :missing-write)
-                                (swap! buffers assoc id expected)))
+                                (swap! buffers assoc id (result-for id))))
                   link/profile! (fn [id]
                                   (swap! events conj [:profile id])
                                   (when-not (= mode :missing-write)
-                                    (swap! buffers assoc id expected))
+                                    (swap! buffers assoc id (result-for id)))
                                   {:device-wall-ms (if (map? mode) (:duration mode) 0.0125)
                                    :host-wall-ms 99.0 :kernel-total-ms 0.01
                                    :profile [{:kernel-name "observed-entry" :ms 0.01}]})
@@ -104,10 +117,36 @@
                (mapv :candidate (get-in result [:comparison :samples]))))
         (is (= [[:close :relu] [:close :relu-prebound]] (take-last 2 @events)))))))
 
+(deftest changing-activation-is-refreshed-and-validated-on-every-replay
+  (doseq [clock [:device-event :host-synchronized-replay]]
+    (with-fake-runtime :success
+      (fn [events]
+        (let [result (comparison/run! (assoc options :input-policy :changing-activation
+                                                   :timing-source clock))
+              updates (filter #(= :activation (first %)) @events)]
+          (is (= ['B] (get-in result [:scope :constant-operands])))
+          (is (= :alternating-sign (get-in result [:input-recipe :activation-pattern])))
+          (is (= 10 (count updates)))
+          (doseq [id [:relu-composed :relu]]
+            (let [values (mapv #(nth % 2) (filter #(= id (second %)) updates))]
+              (is (= [(first values) (second values) (first values) (second values) (first values)]
+                     values))
+              (is (not= (first values) (second values)))))
+          (is (get-in result [:validation :every-replay?])))))))
+
+(deftest changing-activation-declines-stale-results-and-constant-inputs
+  (doseq [mode [:stale-activation :constant-activation]]
+    (with-fake-runtime mode
+      (fn [events]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (comparison/run! (assoc options :input-policy :changing-activation
+                                                    :timing-source :device-event))))
+        (is (= [[:close :relu] [:close :relu-composed]] (take-last 2 @events)))))))
+
 (deftest probe-budgets-decline-before-runtime-initialization
   (with-redefs [hardware/init! #(throw (AssertionError. "runtime initialized before admission"))]
     (doseq [overrides [{:shape [0 2 2]} {:shape [2048 2048 2048]}
                        {:shape [1 1]} {:rounds 1} {:rounds 121} {:warmup-rounds -1}
                        {:warmup-rounds 1} {:environment-tag ""} {:compiler-revision nil}
-                       {:timing-source :unknown} {:composed-variant :relu}]]
+                       {:timing-source :unknown} {:composed-variant :relu} {:input-policy :unknown}]]
       (is (thrown? clojure.lang.ExceptionInfo (comparison/run! (merge options overrides)))))))
