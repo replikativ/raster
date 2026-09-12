@@ -880,3 +880,23 @@ laptop hot loop. Resident training/model validation, distributed simulation and 
 durable manifests, and numerical PDE/AMR acceptance retain their existing completion gates.
 Fused GEMM plus auxiliary reductions (CK's mean/mean-square example), warp specialization,
 and TMA remain workload-driven follow-ups rather than vocabulary added in anticipation.
+
+### Shared fragment-emitter prerequisite
+
+The CUDA direct-fragment mainloop spelling is separated from target admission. Ordered ABI,
+instruction legality, aligned dimensions, view/slice declines and uniform store-region lowering
+remain checked by the CUDA entry point. The internal renderer consumes the analyzed body plan;
+it does not introduce a second schedule, an allocation, or source-level type inference. CUDA is
+its only admitted dialect in this slice. This prepares HIP without copying the GEMM algorithm.
+
+Hardware-free reference probes with rocWMMA `b5a884dc` (ROCm 5.7.1) and the laptop HIP 5.7 /
+Clang 21 toolchain compiled f16×f16→f32 fragments for both gfx90a and gfx1100. Unbundling the
+code objects and disassembling confirmed `v_mfma_f32_16x16x16f16` and
+`v_wmma_f32_16x16x16_f16`, respectively. These are reference-library feasibility results, not
+Raster-generated kernels, numerical validation or performance evidence. The newer reference
+checkout requires ROCm 6.4 headers; it cannot be assumed compatible with the laptop installation.
+The first Raster HIP matrix row should use the existing CDNA MFMA/wave64 witness, with a
+separate architecture compile gate. RDNA WMMA/wave32 requires its own explicit capability;
+the current gfx1100 scalar compile gate must not be mistaken for MFMA coverage. A pinned
+header/toolchain contract, generated-body compilation, physical ABI requirements and public
+route tests remain prerequisites before enabling either route.
