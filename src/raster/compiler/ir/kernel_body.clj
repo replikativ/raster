@@ -59,7 +59,11 @@
 (defrecord AsyncWait [groups pending-groups semantics participation])
 
 (defrecord FragmentInit [fragment value])
-(defrecord TileLoad [fragment buffer coordinates mask cache])
+;; An optional closed ScalarSSARegion transforms each valid loaded element before it enters
+;; the fragment. Its first parameter is typed by :accumulator-dtype (the shared region input
+;; field); :result-dtype must match the fragment. Masked/inactive elements remain zero-filled,
+;; not transformed padding. Targets must lower this region explicitly or reject the load.
+(defrecord TileLoad [fragment buffer coordinates mask cache value-region])
 (defrecord TilePrefetch [buffer coordinates shape layout mask distance])
 (defrecord MatrixMad [accumulator lhs rhs instruction])
 (defrecord Guard [mask operations])
@@ -579,10 +583,25 @@
           (throw (ex-info "tile-load coordinates must match the buffer rank"
                           {:reason :kernel-body-tile-load-rank
                            :buffer p :coordinates (:coordinates operation)})))
-        (when-not (= (dtype/canon (:dtype p)) (dtype/canon (:dtype f)))
-          (throw (ex-info "tile-load fragment dtype must equal the buffer element dtype"
-                          {:reason :kernel-body-tile-load-dtype
-                           :buffer p :fragment f})))
+        (if-let [region (:value-region operation)]
+          (do
+            ;; The first ScalarSSARegion parameter is the loaded element here, rather than
+            ;; a store accumulator. Input transformations are closed pure per-element regions:
+            ;; no extra memory reads, external captures, coordinates, or effects.
+            (when-not (and (= 1 (count (:parameters region)))
+                           (= [] (:operands region)) (= [] (:indices region))
+                           (every? #(record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" %)
+                                   (:operations region))
+                           (= (dtype/canon (:dtype p)) (dtype/canon (:accumulator-dtype region)))
+                           (= (dtype/canon (:dtype f)) (dtype/canon (:result-dtype region))))
+              (throw (ex-info "tile-load value region must be closed and preserve its typed boundary"
+                              {:reason :kernel-body-tile-load-region :region region
+                               :buffer p :fragment f})))
+            (validate-scalar-ssa-region! region storage masks (set (:parameters region)) []))
+          (when-not (= (dtype/canon (:dtype p)) (dtype/canon (:dtype f)))
+            (throw (ex-info "tile-load fragment dtype must equal the buffer element dtype"
+                            {:reason :kernel-body-tile-load-dtype
+                             :buffer p :fragment f}))))
         (mask (:mask operation))
         (when-not (contains? cache-policies (:cache operation))
           (throw (ex-info "tile load has an unsupported cache policy"
@@ -1865,16 +1884,16 @@
 
     :else []))
 
-(defn- scalar-ssa-store-regions
-  [operations]
+(defn- scalar-ssa-value-regions
+  [operations operation-kind]
   (mapcat
    (fn [operation]
      (concat
-      (when (and (record-kind? "raster.compiler.ir.kernel_body.TileStore" operation)
+      (when (and (record-kind? operation-kind operation)
                  (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion"
                                (:value-region operation)))
         [(:value-region operation)])
-      (mapcat scalar-ssa-store-regions (nested-operation-regions operation))))
+      (mapcat #(scalar-ssa-value-regions % operation-kind) (nested-operation-regions operation))))
    operations))
 
 (defn- validate-scalar-ssa-dataflow!
@@ -2410,8 +2429,10 @@
                      :schedule schedule}]
         (doseq [view views]
           (expression-info! (:element-offset view) initial-values))
-        (doseq [region (scalar-ssa-store-regions operations)]
+        (doseq [region (scalar-ssa-value-regions operations "raster.compiler.ir.kernel_body.TileStore")]
           (validate-scalar-ssa-dataflow! region initial-values context))
+        (doseq [region (scalar-ssa-value-regions operations "raster.compiler.ir.kernel_body.TileLoad")]
+          (validate-scalar-ssa-dataflow! region {} context))
         (validate-dataflow-operations! operations initial-values context))))
   body)
 

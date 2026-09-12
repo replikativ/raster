@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
@@ -18,6 +19,24 @@
       :row 'a :col 'b :out 'c
       :dimensions [64 64 64]
       :tile (assoc (hardware/derive-gemm-tile {}) :matrix matrix)})))
+
+(deftest matrix-targets-cannot-ignore-a-typed-input-transformation
+  (let [region (body/->ScalarSSARegion
+                ['element] [] [] :half
+                [(body/->ScalarCompute (body/value 'twice :half)
+                                       (body/scalar-expression :+ :half ['element 'element]))]
+                'twice :half)
+        kernel (walk/postwalk
+                (fn [node]
+                  (if (instance? raster.compiler.ir.kernel_body.TileLoad node)
+                    (assoc node :value-region region) node))
+                (matrix-body :dpas))]
+    (is (= kernel (body/validate! kernel)))
+    (is (nil? (opencl/lower-uniform-store-region kernel {} :cuda))
+        "an input transformation is not a store epilogue")
+    (doseq [target [:opencl-intel :cuda :hip]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"transformed tile input"
+                            (matrix-target/emit-matrix-kernel "transformed_input" kernel target))))))
 
 (deftest matrix-plan-is-neutral-over-instruction-families
   (let [plan (matrix-plan/analyze (matrix-body :mma))]

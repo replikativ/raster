@@ -748,7 +748,9 @@
   Opaque matrix fragments can apply this region independently to each stored element. Tensor
   reads and logical coordinates require a separately scheduled layout conversion."
   [kernel-body parameter-names target-dialect]
-  (let [regions (keep :value-region (nested-operations (:operations kernel-body)))
+  (let [regions (keep :value-region
+                      (filter #(record-kind? "TileStore" %)
+                              (nested-operations (:operations kernel-body))))
         storage (into {} (map (juxt :id identity)) (:parameters kernel-body))]
     (doseq [region regions]
       (when-not
