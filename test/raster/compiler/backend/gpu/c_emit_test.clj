@@ -59,3 +59,16 @@
          (binding [c-emit/*scalar-var-types* {'iteration "long"}
                    c-emit/*int-vars* #{'iteration}]
            (c-emit/infer-c-type 'iteration)))))
+
+(deftest local-declarations-prefer-the-retained-binding-result-type
+  (let [binding (with-meta 'dot-product {:raster.type/tag 'long})
+        ;; Model an inlined helper whose outer collection lost its result metadata.
+        untyped-rhs '(let* [k 0] k)]
+    (is (= "long"
+           (binding [c-emit/*scalar-type* "double"]
+             (c-emit/decl-type binding untyped-rhs)))))
+  (is (= :unsupported-retained-scalar-type
+         (try
+           (c-emit/decl-type (with-meta 'value {:raster.type/tag 'not-a-scalar}) 0)
+           (catch clojure.lang.ExceptionInfo e
+             (:reason (ex-data e)))))))
