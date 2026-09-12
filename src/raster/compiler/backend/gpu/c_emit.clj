@@ -606,13 +606,26 @@
   (get (:type-remap *emit-config*) ctype ctype))
 
 (defn decl-type
-  "C declaration type for a binding init: the TC-stamped :raster.type/tag (read via
-  infer-c-type's metadata-first path) when present, else the structural fallback —
-  then backend-remapped. The single type-resolution entry point for backends that
-  declare locals (e.g. the CPU-C AOT outer-let* bindings); they must NOT hardcode a
-  type or re-derive one, only read what the walker stamped."
-  [init]
-  (remap-type (infer-c-type init)))
+  "C declaration type for a typed binding.
+
+  The two-argument form first consumes the TC-stamped result type retained on the
+  binding symbol.  This matters after inlining or substitution has rebuilt the RHS
+  expression and no longer retained metadata on its outer collection.  Only an
+  untyped compatibility binding falls back to structural expression inference.
+
+  The one-argument form remains the expression-only compatibility entry point."
+  ([init]
+   (remap-type (infer-c-type init)))
+  ([binding init]
+   (let [tag (when (instance? clojure.lang.IObj binding)
+               (:raster.type/tag (meta binding)))
+         retained (when tag
+                    (or (get tag->ctype tag)
+                        (throw (ex-info "Unsupported retained scalar binding type"
+                                        {:reason :unsupported-retained-scalar-type
+                                         :binding binding
+                                         :tag tag}))))]
+     (remap-type (or retained (infer-c-type init))))))
 
 (defn- supports-stmt-expr?
   "Whether the current backend supports GCC statement expressions ({ ... })."
@@ -749,7 +762,7 @@
                            prev-count (get seen-names base-name 0)
                            c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
                            c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                           c-type (infer-c-type val-subst)]
+                           c-type (decl-type sym val-subst)]
                        {:env (assoc env sym (symbol c-name))
                         :locals (conj locals [c-name c-expr c-type])
                         :loop-stmts loop-stmts
@@ -788,7 +801,7 @@
           pairs (partition 2 bindings)
           var-names (map first pairs)
           var-inits (map second pairs)
-          var-types (map (fn [[_ init]] (remap-type (infer-c-type init))) pairs)
+          var-types (map (fn [[sym init]] (decl-type sym init)) pairs)
           decls (str/join " "
                           (map (fn [sym typ init]
                                  (str typ " " (c-symbol sym) " = "
@@ -939,9 +952,9 @@
                (let [base (c-symbol sym)
                      prev (get seen base 0)
                      c-name (if (> prev 0) (str base "_" prev) base)
-                     c-type (infer-c-type val)]
+                     c-type (decl-type sym val)]
                  {:decl-strs (conj decl-strs
-                                   (str (remap-type c-type) " " c-name " = "
+                                   (str c-type " " c-name " = "
                                         (emit-expr val idx-sym array-syms opencl-idx) ";"))
                   :seen (assoc seen base (inc prev))
                   :ints (if (contains? #{"int" "uint" "long"} c-type)
@@ -1126,7 +1139,7 @@
                                    (str base-name "_" prev-count)
                                    base-name)
                           c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                          c-type (remap-type (infer-c-type val-subst))]
+                          c-type (decl-type sym val-subst)]
                       {:env (assoc env sym (symbol c-name))
                        :locals (conj locals [c-name c-expr c-type])
                        :seen-names (assoc seen-names base-name (inc prev-count))
@@ -1249,7 +1262,7 @@
            pairs (partition 2 bindings)
            var-names (map first pairs)
            var-inits (map second pairs)
-           var-types (map (fn [[_ init]] (remap-type (infer-c-type init))) pairs)
+           var-types (map (fn [[sym init]] (decl-type sym init)) pairs)
            decls (str/join " "
                            (map (fn [sym typ init]
                                   (str typ " " (c-symbol sym) " = "

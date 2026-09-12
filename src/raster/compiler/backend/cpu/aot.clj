@@ -346,7 +346,8 @@
           int-syms (for [[sym init] pairs
                          :when (not (buffer-loop? init))
                          :when (contains? #{"int" "uint" "long"}
-                                          (binding [ce/*scalar-type* ct] (ce/decl-type init)))]
+                                          (binding [ce/*scalar-type* ct]
+                                            (ce/decl-type sym init)))]
                      sym)]
       (binding [ce/*int-vars* (into ce/*int-vars* int-syms)]
         (str (clojure.string/join
@@ -370,11 +371,11 @@
                               (swap! *simd-preamble* conj (str includes helpers)))
                             (str ct " " (ce/c-symbol sym) ";\n  " block)))
                         (let [scalar (par/expand-par-reduce init)]
-                          (str (ce/decl-type scalar) " " (ce/c-symbol sym) " = "
+                          (str (ce/decl-type sym scalar) " " (ce/c-symbol sym) " = "
                                (emit-expr* scalar array-syms) ";")))
                     ;; value binding (scalar or reduction) — declare with its tag type.
                     :else
-                    (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
+                    (str (ce/decl-type sym init) " " (ce/c-symbol sym) " = "
                          (emit-expr* init array-syms) ";")))))
              "\n  "
            ;; body: emit statement forms only. The function is void; the trailing

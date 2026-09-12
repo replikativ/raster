@@ -1454,6 +1454,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    KernelBody lowering all preserve that lexical order. Consequently a nested dot/reduction inside
    an outer recurrence reaches portable scalar/control emission without a loop-specific backend
    parser; missing retained local dtypes still decline before canonicalization.
+   Monolithic CPU-C declarations now consume that same retained binding-result dtype before looking
+   at a rewritten initializer. Inlining Q6_K's pure integer dot may rebuild its outer `let*`, but its
+   typed `dp` binding still declares a `long`; the emitter no longer guesses from the rebuilt helper
+   expression. Untyped compatibility expressions remain instrumented separately. The x8 SIMD lane
+   form is the next measured source-only case and must join typed vector/scalar lowering rather than
+   grow another structural type rule.
    A real Arc normalization probe exposes an unresolved precision boundary: Double SSA division
    followed by nearest-even Float conversion produces an adjacent Float for `1/8.25`. Adding the
    FP64 pragma alone does not change the result. Device integration currently bounds normalized
