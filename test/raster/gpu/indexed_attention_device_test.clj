@@ -65,15 +65,15 @@
     {:plan plan :shape-env shape-env :buffers buffers :expected expected}))
 
 (defn- run-case
-  [device-id]
-  (let [{:keys [plan shape-env buffers expected]} (test-case)
-        graph (:graph (route/route-dynamic!
+  ([device-id] (run-case device-id :subgroup-score-reuse (test-case)))
+  ([device-id strategy {:keys [plan shape-env buffers expected]}]
+  (let [graph (:graph (route/route-dynamic!
                        plan
                        {:device-type :gpu
                         :vendor "Intel"
                         :subgroup-size 16
                         :max-workgroup-size 256
-                        :segmented-weighted-reduction-schedule :subgroup-score-reuse}))
+                        :segmented-weighted-reduction-schedule strategy}))
         output-elements (get-in plan [:output :elements])
         scalar-values
         (assoc (into {} (map (fn [[name value]]
@@ -98,15 +98,33 @@
             (is (= (count expected) (alength actual)))
             (is (every? true?
                         (map (fn [wanted got]
-                               (< (Math/abs (- (double wanted) (double got))) 2.0e-5))
+                               (if (Double/isNaN (double wanted))
+                                 (Double/isNaN (double got))
+                                 (< (Math/abs (- (double wanted) (double got))) 2.0e-5)))
                              expected actual)))
-            (is (= [0.0 0.0 0.0 0.0 0.0]
-                   (subvec (vec actual) 5 10))
-                "a destination with no incoming edges is zero")
-            (is (= 0.0 (double (aget actual 4)))
-                "the non-head tail is explicitly zeroed"))
+            (is (every? #(= 0.0 (double (aget actual %))) [4 9 14])
+                "every unused row tail is zero, including malformed-edge inputs")
+            (when (every? zero? (subvec (vec expected) 5 10))
+              (is (= [0.0 0.0 0.0 0.0 0.0] (subvec (vec actual) 5 10))
+                  "a destination with no incoming edges is zero")))
           (finally
-            (gpu/release-kernel-graph! session handle)))))))
+            (gpu/release-kernel-graph! session handle))))))))
+
+(deftest indexed-schedules-agree-on-malformed-endpoints
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "indexed malformed endpoint agreement" :subgroups)
+    (doseq [strategy [:reference :subgroup-score-reuse]
+            endpoint ['dst 'src]
+            invalid [-1 Long/MAX_VALUE]]
+      (let [case (test-case)
+            indices (aclone ^longs (get-in case [:buffers endpoint]))
+            expected (float-array (for [i (range 15)]
+                                    (if (= 4 (mod i 5)) 0.0 Float/NaN)))]
+        ;; Put the invalid edge last so earlier valid work cannot mask the error.
+        (aset-long indices 3 invalid)
+        (run-case :ocl:0 strategy
+                  (-> case (assoc-in [:buffers endpoint] indices)
+                      (assoc :expected expected)))))))
 
 (deftest level-zero-indexed-attention-matches-independent-plan-oracle
   (if-not @gp/gpu-available?

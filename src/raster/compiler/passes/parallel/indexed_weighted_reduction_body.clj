@@ -22,7 +22,8 @@
 
   One work-item owns one destination/feature. It retains the historical correctness schedule:
   ordered multiset traversal, private numerator/denominator, no edge-sized intermediates, and a
-  NaN result for every output when any edge index is malformed."
+  NaN result for every active head component when any edge index is malformed. Unused row
+  tails remain zero; malformed shapes produce NaN for every launched output."
   [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x dynamic?]
   (let [plan (swr/validate! plan)
         [q k v destination-indices source-indices] (:operands plan)
