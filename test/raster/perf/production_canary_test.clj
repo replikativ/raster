@@ -52,6 +52,29 @@
       (is (= :invalid-measurement
              (canary/verdict sample (assoc-in sample [:measurement :median-ns] v)))))))
 
+(deftest dynamic-prebound-composition-retains-one-generated-step
+  (let [shape [3 4 5]
+        args (canary/gemm-arguments shape)
+        prepared (canary/prepare-gemm :ocl:0 args shape
+                                      {:variant :relu-prebound :gemm-precision :f32-scalar})
+        evidence (canary/compilation-evidence prepared)]
+    (is (= 1 (:resident-step-count evidence)))
+    (is (every? #(= {:kernel-body (:entry-point-count %)} (:emission-routes %))
+                (mapcat :alternatives (:steps evidence))))
+    (if-not @probe/opencl-available?
+      (probe/opencl-skip! "dynamic prebound public GEMM plus map fusion")
+      (let [live (compiled/instantiate! prepared)]
+        (try
+          (let [resident (:executable live)
+                output (some #(when (= 'C (:sym %)) %) (:out-tree live))
+                expected (mapv #(max (float 0.0) %)
+                               (canary/gemm-reference (first args) (second args) shape))]
+            (doseq [_ (range 2)]
+              (link/upload! resident (:node output) (float-array (repeat 12 Float/NaN)))
+              (link/run! resident)
+              (is (= expected (vec (link/download resident (:node output)))))))
+          (finally (compiled/close! live)))))))
+
 (deftest compilation-evidence-retains-existing-dispatch-declines
   (let [diagnostics {:selection :analytic-fixed
                      :declines [{:reason :symbolic-dims}]

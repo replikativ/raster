@@ -371,6 +371,49 @@
     (is (empty? (get-in operation [:attributes :result-transform :operands])))
     (is (= result (dialect/validate! result)))))
 
+(defn- dynamic-result-map-program [extent-expression placement]
+  (let [producer ['contract-step
+                  '(raster.par/contract C [[i m] [j n]] [[p k]]
+                     (* (clojure.core/aget A (+ (* i k) p))
+                        (clojure.core/aget B (+ (* p n) j))))]
+        extent ['size extent-expression]
+        consumer ['map-step '(raster.par/map! C t size nil
+                               (max (float 0.0) (clojure.core/aget C t)))]]
+    (frontend/form->program
+     (list 'let* (vec (concat (if (= :before placement) (concat extent producer)
+                                 (concat producer extent)) consumer)) 'map-step)
+     {:dtype :float :array-types '{A :float B :float C :float}
+      :scalar-types '{m :long n :long k :long size :long}})))
+
+(deftest dominating-typed-product-proves-dynamic-result-fusion
+  (doseq [product ['(clojure.core/* m n) '(clojure.core/* n m)]]
+    (let [expression (with-meta product {:raster.type/tag 'long})
+          program (dynamic-result-map-program expression :before)
+          [result stats] (typed-fusion/fusion-fixpoint program)
+          equations (dialect/equations result)
+          operation (dialect/operation-parts (second equations))]
+      (is (= 1 (:vertical stats)))
+      (is (= 2 (count equations)))
+      (is (= (first (dialect/equations program)) (first equations))
+          "the checked scalar definition remains before the output write")
+      (is (some #{'size} (:captures operation))
+          "the proof witness remains a dependency even though the epilogue need not read it")
+      (is (= ['size] (mapv :value (get-in operation [:attributes :result-transform :scalars]))))
+      (is (= result (dialect/validate! result))))))
+
+(deftest dynamic-result-fusion-does-not-invent-extent-proofs
+  (doseq [[expression placement]
+          [[(with-meta '(clojure.core/* m n) {:raster.type/tag 'long}) :after]
+           ['(clojure.core/* m n) :before]
+           [(with-meta '(clojure.core/* m n) {:raster.type/tag 'int}) :before]
+           [(with-meta '(unchecked-multiply m n) {:raster.type/tag 'long}) :before]
+           [(with-meta '(clojure.core/* m k) {:raster.type/tag 'long}) :before]
+           [(with-meta '(clojure.core/* (clojure.core/int m) n) {:raster.type/tag 'long}) :before]]]
+    (let [program (dynamic-result-map-program expression placement)
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= program result) (pr-str [expression placement]))
+      (is (zero? (:vertical stats))))))
+
 (deftest same-destination-fusion-refuses-neighbor-reads
   (doseq [expression ['(clojure.core/aget C (mod (+ t 1) 32))
                       '(+ (clojure.core/aget C t) (clojure.core/aget C (mod (+ t 1) 32)))]]

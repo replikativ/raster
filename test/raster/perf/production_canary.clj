@@ -41,6 +41,14 @@
                  :init (float 0.0))]
     (raster.par/map! C q (* m n) nil (max (float 0.0) (arrays/aget product q)))))
 
+(deftm gemm-relu-prebound! [A :- (Array float) B :- (Array float) C :- (Array float)
+                           m :- Long n :- Long k :- Long] :- (Array float)
+  (let [size (* m n)
+        product (raster.par/contract C [[i m] [j n]] [[p k]]
+                  (* (arrays/aget A (+ (* i k) p)) (arrays/aget B (+ (* p n) j)))
+                  :init (float 0.0))]
+    (raster.par/map! C q size nil (max (float 0.0) (arrays/aget product q)))))
+
 (deftm gemm-relu! [A :- (Array float) B :- (Array float) C :- (Array float)
                     m :- Long n :- Long k :- Long] :- (Array float)
   (raster.par/contract C [[i m] [j n]] [[p k]]
@@ -136,6 +144,7 @@
                  :plain #'gemm-mnk!
                  :relu #'gemm-relu!
                  :relu-composed #'gemm-relu-composed!
+                 :relu-prebound #'gemm-relu-prebound!
                  (throw (ex-info "unknown GEMM canary variant" {:variant variant})))]
      (compiled/lower entry (into args (map long (checked-shape shape)))
                      (cond-> {:target target :dtype :float :on-non-resident :throw :constants ['A 'B]}
@@ -178,6 +187,7 @@
                    :plain (if parameterized? :gemm-mnk-resident :gemm64-resident)
                    :relu :gemm-relu-resident
                    :relu-composed :gemm-relu-composed-resident
+                   :relu-prebound :gemm-relu-prebound-resident
                    (throw (ex-info "unknown GEMM canary variant" {:variant variant})))
         identity (identity-for workload target :float dimensions
                                :host-synchronized-replay environment-tag)
