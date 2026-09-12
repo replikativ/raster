@@ -99,6 +99,29 @@ kernel durations and both series are nonstationary. This motivates investigating
 conversion fusion and graph submission, not attributing the full gap to conversion arithmetic or
 claiming a regression against the different constant-input workload.
 
+The [Level Zero changing-activation record](../results/public-gemm-20260912-changing-activation-ze.edn)
+uses the same Arc and workload, and also passes every exact check with conversion plus contraction.
+For these records, exclude each candidate's first five profiles (one validation and four warmups).
+The remaining twelve measured replays per candidate give the following medians in microseconds:
+
+| Backend | Source | Event span | Kernel-duration sum | Span minus sum |
+| --- | --- | ---: | ---: | ---: |
+| OpenCL | Prebound composition | 538.332 | 21.145 | 505.729 |
+| OpenCL | Explicit epilogue | 538.333 | 20.728 | 512.292 |
+| Level Zero | Prebound composition | 46.771 | 44.688 | 1.146 |
+| Level Zero | Explicit epilogue | 27.813 | 26.771 | 1.146 |
+
+Each column is summarized independently, so subtracting the medians need not equal the median
+difference. All series are nonstationary. Different runtime/compiler/submission paths make this
+a diagnostic contrast, not causal isolation or a backend recommendation. Event gaps are not
+conversion arithmetic. OpenCL replay enqueues its launches in order and flushes once, with no
+per-launch wait; the selected Arc driver does not advertise `cl_khr_command_buffer`. Investigate
+submission costs separately from tile-local conversion, which can repeat conversion across N tiles.
+
+New probe results explicitly label each replay with `:sampling-phase` (`:validation`, `:warmup`,
+or `:measurement`), per-candidate `:replay-index`, and measured `:sample-index` matching the
+comparison sample's `:round`. Existing raw records above predate those labels and remain unchanged.
+
 ### External comparators
 
 | Workload | Comparators to implement | Fairness boundary |

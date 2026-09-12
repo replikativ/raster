@@ -87,7 +87,13 @@
                  {:id id
                   :sample-fn
                   (fn []
-                    (let [input-index (mod (swap! invocation inc) (count activations))
+                    (let [replay-index (swap! invocation inc)
+                          sampling-phase (cond (zero? replay-index) :validation
+                                               (<= replay-index warmup-rounds) :warmup
+                                               :else :measurement)
+                          sample-index (when (= :measurement sampling-phase)
+                                         (- replay-index warmup-rounds 1))
+                          input-index (mod replay-index (count activations))
                           expected (nth references input-index)]
                       (when changing? (link/upload! resident (:node input) (nth activations input-index)))
                       (link/upload! resident (:node output) poison)
@@ -100,7 +106,10 @@
                                                (not (neg? (double wall-ms))))
                                   (throw (ex-info "comparison requires a finite device event span"
                                                   {:candidate id :profile profile})))
-                                (swap! profiles conj {:candidate id :input-index input-index :profile profile})
+                                (swap! profiles conj {:candidate id :input-index input-index
+                                                      :replay-index replay-index
+                                                      :sampling-phase sampling-phase
+                                                      :sample-index sample-index :profile profile})
                                 (* 1.0e6 (double wall-ms)))
                               (let [start (System/nanoTime)]
                                 (link/run! resident)
