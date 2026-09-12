@@ -10,11 +10,13 @@
 (defn validate-options!
   "Bound reference work and sampling before compilation or allocation. These are probe bounds,
    not estimates of total compiler/driver memory."
-  [{:keys [shape compiler-revision environment-tag rounds warmup-rounds timing-source] :as options}]
+  [{:keys [shape compiler-revision environment-tag rounds warmup-rounds timing-source composed-variant]
+    :as options}]
   (when-not (and (vector? shape) (= 3 (count shape))
                  (every? #(and (integer? %) (pos? %)) shape)
                  (every? #(and (string? %) (seq %)) [compiler-revision environment-tag])
                  (contains? #{:host-synchronized-replay :device-event} timing-source)
+                 (contains? #{:relu-composed :relu-prebound} composed-variant)
                  (integer? rounds) (<= 2 rounds 120) (even? rounds)
                  (integer? warmup-rounds) (<= 0 warmup-rounds 30) (even? warmup-rounds))
     (throw (ex-info "comparison requires positive [m n k], identities and bounded even round counts"
@@ -29,15 +31,18 @@
 
 (defn run!
   "Compare public dynamic GEMM→map composition with an explicit typed epilogue.
-   Defaults to host-synchronized replay; :timing-source :device-event uses the recorded graph
+   :composed-variant selects :relu-composed (extent after contraction, default) or :relu-prebound
+   (extent before contraction). Defaults to host-synchronized replay; :timing-source :device-event uses the recorded graph
    event span, never a host-time fallback. Poisoning and exact dyadic-reference
    validation run outside every timed replay. Both candidates are compiled and retained once."
-  [{:keys [target shape gemm-precision compiler-revision environment-tag rounds warmup-rounds timing-source]
+  [{:keys [target shape gemm-precision compiler-revision environment-tag rounds warmup-rounds timing-source
+           composed-variant]
     :or {target :ocl:0 shape [8 256 256] gemm-precision :f32-scalar
-         rounds 12 warmup-rounds 4 timing-source :host-synchronized-replay}}]
+         rounds 12 warmup-rounds 4 timing-source :host-synchronized-replay
+         composed-variant :relu-composed}}]
   (validate-options! {:shape shape :compiler-revision compiler-revision
                       :environment-tag environment-tag :rounds rounds :warmup-rounds warmup-rounds
-                      :timing-source timing-source})
+                      :timing-source timing-source :composed-variant composed-variant})
   (hardware/init!)
   (let [arguments (canary/gemm-arguments shape)
         expected (mapv #(max (float 0.0) %)
@@ -46,7 +51,7 @@
         live (atom [])
         profiles (atom [])]
     (try
-      (doseq [variant [:relu-composed :relu]]
+      (doseq [variant [composed-variant :relu]]
         (let [start (System/nanoTime)
               prepared (canary/prepare-gemm target arguments shape
                          {:variant variant :gemm-precision gemm-precision})

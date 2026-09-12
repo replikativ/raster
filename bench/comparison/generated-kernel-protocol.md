@@ -75,6 +75,19 @@ earlier host-clock measurements, and no winner is promoted from this shared-lapt
 Next: automatic symbolic-extent fusion, correlating observed events with executable evidence,
 then larger projection shapes and matched external implementations.
 
+The dynamic prebound slice can be measured with the same probe by adding
+`:composed-variant :relu-prebound` and `:timing-source :device-event`. This source computes `m*n`
+before the contraction and then uses an ordinary map; it does not declare an epilogue. The original
+`:relu-composed` source keeps its post-contraction scalar evaluation and remains the default.
+Candidate IDs retain this semantic distinction, rather than silently replacing the old workload.
+
+Raw mixed-precision Arc records for [multi-row `[8 256 256]`](../results/public-gemm-20260912-prebound.edn)
+and [single-row `[1 256 256]`](../results/public-gemm-20260912-prebound-decode.edn) retain exact
+poisoned-output validation and per-replay event evidence. Both source forms in each comparison
+execute one generated XMX contraction entry during steady replay. Timings are observations on a
+shared laptop, not vendor comparisons or a schedule-promotion decision; inspect stationarity in
+each raw record before drawing performance conclusions. These tiny shapes do not establish SOTA.
+
 ### External comparators
 
 | Workload | Comparators to implement | Fairness boundary |

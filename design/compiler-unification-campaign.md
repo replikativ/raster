@@ -949,5 +949,16 @@ typed index lowering checks retained widths, and shared axis algebra establishes
 the fused result transform retains the extent as a dependency. This permits ordinary prebound
 contraction→map source to reach one generated step without an explicit epilogue API. The original
 post-contraction extent remains a barrier; no speculative motion or inferred range is introduced.
+The same comparison probe now retains separate prebound-source identities for single-row and
+multi-row projection observations. Both reach one generated XMX replay entry with exact output;
+external baselines and stationary measurements remain required before a competitiveness claim.
+
+An additional host boundary probe exposed existing JVM AOT overflow debt: `compile-aot` of the
+prebound canary with `m=Long/MAX_VALUE, n=2, k=0` returns an unchanged sentinel buffer instead of
+throwing on the source long product. The JVM bytecode arithmetic emitter directly uses `lmul`;
+the resident descriptor binder evaluates scalar lets through Clojure and checked launch algebra.
+Do not claim cross-target checked-arithmetic parity from the GPU result. Follow up with focused
+source-versus-bytecode boundary tests and a deliberate checked/wrapping policy in the existing
+emitter; this measurement slice does not change integer semantics or expand the fusion proof.
 Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
 or workload requirements justify them. Existing scientific/distributed acceptance gates remain.
