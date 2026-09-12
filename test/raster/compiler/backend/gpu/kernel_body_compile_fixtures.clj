@@ -497,6 +497,9 @@
            (write-artifact! directory suffix "indexed-weighted-reduction-dynamic"
                             (indexed-attention-emit/emit-dynamic-reference
                              (indexed-attention-plan) descriptor))
+           (write-artifact! directory suffix "indexed-weighted-reduction-score-reuse"
+                            (indexed-attention-emit/emit-dynamic-score-reuse
+                             (indexed-attention-plan) descriptor))
            (write-source! directory suffix "split-k-combine"
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel

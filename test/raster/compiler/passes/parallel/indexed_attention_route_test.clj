@@ -178,8 +178,11 @@
     (is (str/includes? source "sub_group_reduce_add"))
     (is (str/includes? source "sub_group_broadcast"))
     (is (str/includes? source "intel_reqd_sub_group_size(16)"))
-    (is (= 1 (count (re-seq #"for \(long x" source)))
-        "one score loop is shared across the component tile")))
+    (let [operations (nested-operations (get-in artifact [:attributes :kernel-body :operations]))]
+      (is (= 1 (count (filter #(= 'partial-dot (get-in % [:results 0 :id])) operations)))
+          "one dot loop is shared across the component tile")
+      (is (= [:reduce :broadcast]
+             (mapv :kind (filter #(= "Collective" (some-> % class .getSimpleName)) operations)))))))
 
 (deftest score-reuse-decline-falls-through-to-reference
   (let [{:keys [leaf strategy]}

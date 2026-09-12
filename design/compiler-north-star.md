@@ -348,6 +348,15 @@ that body unchanged, the same body emits for OpenCL/CUDA/HIP, and the vendor for
 hardware-free compiler gates. This is a reference schedule, not a claim that page assignment has
 been tuned; routing and cache ownership remain outside target emission.
 
+Indexed dense weighted reductions likewise lower both static/dynamic reference schedules and
+the subgroup score-reuse schedule through KernelBody. The subgroup schedule uses a strided
+per-lane dot loop, full-participation reduction/broadcast, and guarded value accumulation; its
+handwritten OpenCL source template is removed. The same body compiles to CUDA and HIP, while
+production selection remains Intel-gated pending cross-vendor execution evidence. Ordered
+edge-list traversal still scans all edges for each destination/head/component tile. Destination
+bounding and measured schedule selection remain performance work, not consequences of emitter
+unification. Invalid endpoints poison active head components; unused row tails remain zero.
+
 The verifier still forbids
 pending asynchronous state and live staged storage from escaping an ordinary structured region,
 but `PipelinedFor` now carries a complete ordered async queue across loop iterations, verifies each
