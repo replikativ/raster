@@ -338,7 +338,17 @@ code object in mandatory hardware-free CI jobs, while real Intel execution remai
 oracle. The compiler fixtures now stage values through both synchronous workgroup memory and the
 verified async issue/commit/wait contract; the exact async body is compiled to CUDA sm_80 PTX and
 an RDNA3 HIP code object in hardware-free CI. CUDA/HIP runtime registration, launch and on-device
-numerical coverage remain deliberately separate from source legality. The verifier still forbids
+numerical coverage remain deliberately separate from source legality.
+
+Paged K/V assignment likewise retains its storage-specific semantic descriptor and unique-slot
+ownership contract, but no longer owns an OpenCL source template. Its one-component-per-work-item
+schedule is a typed scalar/control KernelBody with a two-dimensional launch, guarded routed-page
+stores and explicit nearest-even Float-to-Half conversion. The ordered inout ABI is projected from
+that body unchanged, the same body emits for OpenCL/CUDA/HIP, and the vendor forms join the
+hardware-free compiler gates. This is a reference schedule, not a claim that page assignment has
+been tuned; routing and cache ownership remain outside target emission.
+
+The verifier still forbids
 pending asynchronous state and live staged storage from escaping an ordinary structured region,
 but `PipelinedFor` now carries a complete ordered async queue across loop iterations, verifies each
 rotating stage's layout and lifetime, and requires an explicit exact or separate-epilogue tail

@@ -9,6 +9,7 @@
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.staged-contraction-fixtures :as staged-fixtures]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
+            [raster.compiler.backend.gpu.paged-kv-append :as paged-append-emit]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
@@ -17,6 +18,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.paged-kv-append :as paged-append]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
@@ -454,6 +456,19 @@
                             {:kernel-name "layout_transpose_mixed_width" :input 'in :output 'out
                              :row-extent-dtype :long :column-extent-dtype :int
                              :element-dtype :half :target-dialect dialect})))
+           (write-source! directory suffix "paged-kv-append"
+                          (:source
+                           (paged-append-emit/emit-fp32-to-fp16-reference
+                            (paged-append/make
+                             {:id :compile-fixture-paged-append
+                              :key-rows 'key-rows :value-rows 'value-rows
+                              :slot-mapping 'slot-mapping
+                              :key-pages 'key-pages :value-pages 'value-pages
+                              :batch-size 3 :key-elements-per-token 8
+                              :value-elements-per-token 6
+                              :page-size 4 :physical-pages 5})
+                            {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}
+                            dialect)))
            (write-source! directory suffix "split-k-combine"
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel

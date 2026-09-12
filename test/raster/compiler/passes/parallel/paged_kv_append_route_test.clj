@@ -1,7 +1,9 @@
 (ns raster.compiler.passes.parallel.paged-kv-append-route-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.paged-kv-append :as emit]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.paged-kv-append :as append]
             [raster.compiler.passes.parallel.paged-kv-append-route :as route]))
@@ -45,11 +47,15 @@
 
 (deftest routed-artifact-is-assignment-with-in-place-page-effects
   (let [{:keys [artifact graph strategy]} (route/route! (problem))
-        source (:source artifact)]
+        source (:source artifact)
+        kernel-body (get-in artifact [:attributes :kernel-body])]
     (is (= :fp32-to-fp16-reference strategy))
-    (is (str/includes? source "key_pages[dst] = convert_half_rte(key_rows[src]);"))
-    (is (str/includes? source "value_pages[dst] = convert_half_rte(value_rows[src]);"))
-    (is (str/includes? source "if (slot < 0"))
+    (is (identical? kernel-body (body/validate! kernel-body)))
+    (is (= :kernel-body-fp32-to-fp16 (get-in artifact [:provenance :lowering])))
+    (is (str/includes? source "convert_half_rte"))
+    (is (str/includes? source "rstr_append_slot_nonnegative"))
+    (is (str/includes? source "key_pages["))
+    (is (str/includes? source "value_pages["))
     (is (not (str/includes? source "atomic")))
     (is (= ['key-rows 'value-rows 'slots 'key-pages 'value-pages]
            (:arguments artifact)))
@@ -73,3 +79,13 @@
   (testing "a failed route retains a stable top-level reason"
     (is (= :paged-kv-append-no-kernel-route
            (reason #(route/route! (problem {:value-storage-dtype :double})))))))
+
+(deftest one-kernel-body-emits-for-both-vendor-c-family-targets
+  (doseq [[target emitted-target] [[:cuda :cuda-c] [:hip :hip-cpp]]]
+    (let [artifact (emit/emit-fp32-to-fp16-reference
+                    (problem) {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}
+                    target)]
+      (is (= emitted-target (:target artifact)))
+      (is (= target (get-in artifact [:attributes :target-dialect])))
+      (is (str/includes? (:source artifact) "extern \"C\" __global__ void"))
+      (is (str/includes? (:source artifact) "rstr_append_slot_bounded")))))
