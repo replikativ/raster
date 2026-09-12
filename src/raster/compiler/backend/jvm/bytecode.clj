@@ -1657,11 +1657,16 @@
       :double)))
 
 (defn- emit-arith-op
-  "Emit a single arithmetic instruction for the given type and op string."
+  "Emit ordinary arithmetic for the given type and op string. Plain long add/subtract/multiply
+   preserve Clojure's checked semantics; explicit unchecked forms have separate emitters below."
   [code op type]
   (case type
     (:int :bool) (case op "+" (.iadd code) "-" (.isub code) "*" (.imul code) "/" (.idiv code))
-    :long   (case op "+" (.ladd code) "-" (.lsub code) "*" (.lmul code) "/" (.ldiv code))
+    :long   (if (= op "/")
+              (.ldiv code)
+              (.invokestatic code math-cd
+                             (case op "+" "addExact" "-" "subtractExact" "*" "multiplyExact")
+                             (MethodTypeDesc/of J-cd (into-array ClassDesc [J-cd J-cd]))))
     :float  (case op "+" (.fadd code) "-" (.fsub code) "*" (.fmul code) "/" (.fdiv code))
     :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))
 
@@ -1676,7 +1681,8 @@
     (let [t (emit-form code (first args) locals ctx)]
       (case t
         (:int :bool) (do (.ineg code) :int)
-        :long   (do (.lneg code) :long)
+        :long   (do (.invokestatic code math-cd "negateExact"
+                                  (MethodTypeDesc/of J-cd (into-array ClassDesc [J-cd]))) :long)
         :float  (do (.fneg code) :float)
         :double (do (.dneg code) :double)
         ;; :ref → coerce to double
@@ -2178,14 +2184,19 @@
     ;; IINC should only be used in the recur handler for single-arg cases.
     ("inc" "dec" "unchecked-inc" "unchecked-dec" "unchecked-inc-int" "unchecked-dec-int")
     (let [t    (emit-form code (first args) locals ctx)
-          inc? (contains? #{"inc" "unchecked-inc" "unchecked-inc-int"} head-name)]
+          inc? (contains? #{"inc" "unchecked-inc" "unchecked-inc-int"} head-name)
+          long-step! (fn []
+                       (.ldc code (long 1))
+                       (if (contains? #{"inc" "dec"} head-name)
+                         (emit-arith-op code (if inc? "+" "-") :long)
+                         (if inc? (.ladd code) (.lsub code)))
+                       :long)]
       (case t
         (:int :bool) (do (.ldc code (int 1))  (if inc? (.iadd code) (.isub code)) :int)
-        :long   (do (.ldc code (long 1)) (if inc? (.ladd code) (.lsub code)) :long)
+        :long   (long-step!)
         :double (do (.ldc code 1.0)      (if inc? (.dadd code) (.dsub code)) :double)
         :float  (do (.ldc code (float 1.0)) (if inc? (.fadd code) (.fsub code)) :float)
-        :ref    (do (emit-coerce code :ref :long)
-                    (.ldc code (long 1)) (if inc? (.ladd code) (.lsub code)) :long)))
+        :ref    (do (emit-coerce code :ref :long) (long-step!))))
     ;; Comparisons → int 0/1 — dispatched to emit-comparison helper
     ("<" "<=" ">" ">=" "==" "not=") (emit-comparison code head-name args locals ctx)
     ;; min/max — dispatched to emit-minmax helper

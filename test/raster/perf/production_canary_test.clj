@@ -6,6 +6,7 @@
             [raster.perf.production-canary :as canary]
             [raster.runtime.microbench :as microbench]
             [raster.gpu.compiled :as compiled]
+            [raster.compiler.pipeline :as pipeline]
             [raster.gpu.device-probe :as probe]))
 
 (defn- once-only [f & _]
@@ -74,6 +75,13 @@
               (link/run! resident)
               (is (= expected (vec (link/download resident (:node output)))))))
           (finally (compiled/close! live)))))))
+
+(deftest public-prebound-extent-overflow-precedes-output-mutation
+  (let [f (pipeline/compile-aot #'canary/gemm-relu-prebound! :dtype :float)
+        output (float-array [17])]
+    (is (thrown? ArithmeticException
+                 (f (float-array 0) (float-array 0) output Long/MAX_VALUE 2 0)))
+    (is (= [17.0] (vec output)))))
 
 (deftest compilation-evidence-retains-existing-dispatch-declines
   (let [diagnostics {:selection :analytic-fixed
