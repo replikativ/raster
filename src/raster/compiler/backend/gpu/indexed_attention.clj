@@ -139,14 +139,6 @@
          (Double/toString (double value)))
        (when (= :float dtype) "f")))
 
-(defn- long-expression
-  [value]
-  (if (number? value) (str value "L") (str "(" value ")")))
-
-(defn- fp-expression
-  [dtype value]
-  (if (number? value) (fp-literal dtype value) (str value)))
-
 (defn- kernel-name
   [plan shape]
   (let [identity {:schedule (swr/schedule-key plan) :shape shape}
@@ -155,76 +147,6 @@
                         "ref")]
     (format "raster_indexed_attention_%s_%08x" schedule-name
             (bit-and 0xffffffff (long (hash identity))))))
-
-(defn- source*
-  [plan {:keys [entities edges components total-dim active-width scale bound epsilon
-                scalar-signature invalid-shape]} name]
-  (let [entities (long-expression entities)
-        edges (long-expression edges)
-        components (long-expression components)
-        total-dim (long-expression total-dim)
-        active-width (long-expression active-width)
-        dtype (:accumulator-dtype plan)
-        ctype (c-type dtype)
-        bound (fp-expression dtype bound)
-        epsilon (fp-expression dtype epsilon)
-        scale (fp-expression dtype scale)
-        zero (fp-literal dtype 0.0)]
-    (str (when (= :double dtype)
-           "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
-         "__kernel void " name "(\n"
-         "    __global const " ctype "* q,\n"
-         "    __global const " ctype "* k,\n"
-         "    __global const " ctype "* v,\n"
-         "    __global const long* destination_indices,\n"
-         "    __global const long* source_indices,\n"
-         "    __global " ctype "* output"
-         (when (seq scalar-signature) (str ",\n" scalar-signature))
-         ") {\n"
-         "  const long feature = (long)get_global_id(0);\n"
-         "  const long destination = (long)get_global_id(1);\n"
-         "  if (feature >= " total-dim " || destination >= " entities ") return;\n"
-         "  const long output_index = destination * " total-dim " + feature;\n"
-         (when invalid-shape
-           (str "  if (" invalid-shape ") {\n"
-                "    output[output_index] = (" ctype ")NAN;\n"
-                "    return;\n"
-                "  }\n"))
-         "  if (feature >= " active-width ") {\n"
-         "    output[output_index] = " zero ";\n"
-         "    return;\n"
-         "  }\n"
-         "  const long head = feature / " components ";\n"
-         "  const long component = feature - head * " components ";\n"
-         "  " ctype " numerator = " zero ";\n"
-         "  " ctype " denominator = " zero ";\n"
-         "  for (long edge = 0; edge < " edges "; ++edge) {\n"
-         "    const long edge_destination = destination_indices[edge];\n"
-         "    const long source = source_indices[edge];\n"
-         "    if (edge_destination < 0L || edge_destination >= " entities
-         " || source < 0L || source >= " entities ") {\n"
-         "      output[output_index] = (" ctype ")NAN;\n"
-         "      return;\n"
-         "    }\n"
-         "    if (edge_destination != destination) continue;\n"
-         "    const long q_base = destination * " total-dim " + head * " components ";\n"
-         "    const long kv_base = source * " total-dim " + head * " components ";\n"
-         "    " ctype " dot = " zero ";\n"
-         "    for (long x = 0; x < " components "; ++x)\n"
-         "      dot += q[q_base + x] * k[kv_base + x];\n"
-         "    const " ctype " scaled = dot * (" ctype ")" scale ";\n"
-         ;; Java Math/min and Math/max propagate NaN; OpenCL fmin/fmax select the numeric operand.
-         ;; Preserve the recognized source semantics explicitly instead of inheriting that drift.
-         "    const " ctype " score = isnan(scaled) ? scaled\n"
-         "        : fmin((" ctype ")" bound
-         ", fmax(-(" ctype ")" bound ", scaled));\n"
-         "    const " ctype " weight = exp(score);\n"
-         "    numerator += weight * v[kv_base + component];\n"
-         "    denominator += weight;\n"
-         "  }\n"
-         "  output[output_index] = denominator == " zero " ? " zero
-         " : numerator / (denominator + (" ctype ")" epsilon ");\n"
-         "}\n")))
 
 (defn- ordered-abi
   [plan]
@@ -267,13 +189,18 @@
         fp (:accumulator-dtype plan)]
     (kabi/validate!
      (into
-      [(kabi/slot (:id q) :input fp :c-name "q" :role :query)
-       (kabi/slot (:id k) :input fp :c-name "k" :role :key)
-       (kabi/slot (:id v) :input fp :c-name "v" :role :value)
+      [(kabi/slot (:id q) :input fp :c-name "q" :role :query
+                  :aliasing :no-write-alias)
+       (kabi/slot (:id k) :input fp :c-name "k" :role :key
+                  :aliasing :no-write-alias)
+       (kabi/slot (:id v) :input fp :c-name "v" :role :value
+                  :aliasing :no-write-alias)
        (kabi/slot (:id destination-indices) :input :long
-                  :c-name "destination_indices" :role :destination-indices)
+                  :c-name "destination_indices" :role :destination-indices
+                  :aliasing :no-write-alias)
        (kabi/slot (:id source-indices) :input :long
-                  :c-name "source_indices" :role :source-indices)
+                  :c-name "source_indices" :role :source-indices
+                  :aliasing :no-write-alias)
        (kabi/slot (:id output) :output fp :c-name "output" :role :result)]
       (map (fn [{:keys [name c-name]}]
              (kabi/slot name :scalar :long :c-name c-name :role :shape))
@@ -289,39 +216,29 @@
   (let [plan (indexed-attention-plan! plan)
         fields (dynamic-fields plan)
         values (mapv :value fields)
-        field-code (into {} (map (juxt :name :c-name)) fields)
         [entities _ total-dim _ _ output-elements] values
         workgroup-x (dynamic-workgroup-x desc)
         name (kernel-name plan :dynamic)
         inputs (swr/ordered-input-ids plan)
         output (get-in plan [:output :id])
         dtype (:accumulator-dtype plan)
-        ctype (c-type dtype)
-        scalar-signature
-        (->> fields
-             (map (fn [{:keys [c-name]}] (str "    long " c-name)))
-             (str/join ",\n"))
-        code {:entities (get field-code 'n_entities)
-              :edges (get field-code 'n_edges)
-              :total-dim (get field-code 'total_dim)
-              :heads (get field-code 'n_heads)
-              :components (get field-code 'n_components)
-              :active-width (str (get field-code 'n_heads) " * "
-                                 (get field-code 'n_components))
-              :scale (str "((" ctype ")" (fp-literal dtype 1.0)
-                          " / sqrt((" ctype ")" (get field-code 'n_components) "))")
-              :bound (double (get-in plan [:score :arguments 2 :value]))
-              :epsilon (double (get-in plan [:normalization :epsilon]))
-              :scalar-signature scalar-signature
-              :invalid-shape
-              "n_edges < 0L || n_heads <= 0L || n_components <= 0L || n_heads > total_dim / n_components"}
-        abi (dynamic-abi plan fields)
+        target-dialect (or (gpu-target/kernel-body-c-dialect desc) :opencl-portable)
+        dialect (c-dialect/resolve! target-dialect)
+        kernel-body (indexed-body/lower-dynamic-reference plan workgroup-x)
+        base-abi (dynamic-abi plan fields)
+        parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+        abi (body-abi/project-contracts base-abi kernel-body)
         arguments (into (conj inputs output) values)]
     (kart/make
      {:kernel-name name
-      :source (source* plan code name)
+      :target (c-dialect/target dialect)
+      :source (body-opencl/emit-scalar-kernel
+               name kernel-body
+               {:parameter-names parameter-names :target-dialect target-dialect})
       :abi abi
       :arguments arguments
+      ;; KernelBody names target ABI scalars; the artifact launch resolves the corresponding
+      ;; logical argument expressions at the public call boundary.
       :launch (klaunch/spec
                {:workgroup-size [workgroup-x 1]
                 :group-count [(klaunch/ceil-div total-dim workgroup-x)
@@ -340,6 +257,8 @@
                    :duplicate-policy :multiset
                    :dynamic-shape? true
                    :out-elems output-elements
+                   :kernel-body kernel-body
+                   :target-dialect target-dialect
                    :materialized-intermediates []
                    :complexity :quadratic-in-edges-and-head-components}})))
 
@@ -440,6 +359,10 @@
         arguments (into (conj inputs output) values)]
     (kart/make
      {:kernel-name name
+      ;; This handwritten leaf is still Intel OpenCL-only, but it participates in the same
+      ;; logical dispatch as the portable KernelBody reference.  Kernel artifacts name the
+      ;; source-language target (`:opencl-c`), not the runtime backend (`:opencl`).
+      :target :opencl-c
       :source (score-reuse-source plan fields subgroup-size name)
       :abi abi
       :arguments arguments

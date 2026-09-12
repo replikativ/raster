@@ -494,6 +494,9 @@
                              (indexed-attention-plan)
                              {'n-nodes 3 'n-edges 4 'dk 2 'emb-dim 5 'n-heads 2}
                              descriptor))
+           (write-artifact! directory suffix "indexed-weighted-reduction-dynamic"
+                            (indexed-attention-emit/emit-dynamic-reference
+                             (indexed-attention-plan) descriptor))
            (write-source! directory suffix "split-k-combine"
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel
