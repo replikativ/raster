@@ -94,10 +94,20 @@
         (is (not-any? #(= :run (first %)) @events))
         (is (= [[:close :relu] [:close :relu-composed]] (take-last 2 @events)))))))
 
+(deftest prebound-comparison-retains-the-selected-public-source-identity
+  (with-fake-runtime :success
+    (fn [events]
+      (let [result (comparison/run! (assoc options :composed-variant :relu-prebound
+                                                 :timing-source :device-event))]
+        (is (= [:relu-prebound :relu] (mapv :id (:candidates result))))
+        (is (= [:relu-prebound :relu :relu :relu-prebound]
+               (mapv :candidate (get-in result [:comparison :samples]))))
+        (is (= [[:close :relu] [:close :relu-prebound]] (take-last 2 @events)))))))
+
 (deftest probe-budgets-decline-before-runtime-initialization
   (with-redefs [hardware/init! #(throw (AssertionError. "runtime initialized before admission"))]
     (doseq [overrides [{:shape [0 2 2]} {:shape [2048 2048 2048]}
                        {:shape [1 1]} {:rounds 1} {:rounds 121} {:warmup-rounds -1}
                        {:warmup-rounds 1} {:environment-tag ""} {:compiler-revision nil}
-                       {:timing-source :unknown}]]
+                       {:timing-source :unknown} {:composed-variant :relu}]]
       (is (thrown? clojure.lang.ExceptionInfo (comparison/run! (merge options overrides)))))))
