@@ -27,6 +27,15 @@
 (def ^:private shape-env
   {'n-nodes 3 'n-edges 4 'dk 2 'emb-dim 5 'n-heads 2})
 
+(defn- nested-operations
+  [operations]
+  (mapcat (fn [operation]
+            (cons operation
+                  (concat (nested-operations (or (:operations operation) []))
+                          (nested-operations (or (:then-operations operation) []))
+                          (nested-operations (or (:else-operations operation) [])))))
+          operations))
+
 (defn- plan
   ([] (plan :float))
   ([dtype]
@@ -52,12 +61,15 @@
     (is (= [] (:temporaries graph)))
     (is (= [15 15 15 4 4] (mapv :elements (:inputs graph))))
     (is (= [15] (mapv :elements (:outputs graph))))
-    (let [source (:source artifact)]
-      (is (str/includes? source "for (long edge = 0; edge < 4L; ++edge)"))
-      (is (str/includes? source "fmin((float)5.0f"))
-      (is (str/includes? source "isnan(scaled) ? scaled"))
-      (is (str/includes? source "denominator + (float)1.0E-6f"))
-      (is (str/includes? source "feature >= 4L"))
+    (let [source (:source artifact)
+          kernel-body (get-in artifact [:attributes :kernel-body])
+          operations (nested-operations (:operations kernel-body))
+          scalar-ops (into #{} (keep #(get-in % [:expression :op])) operations)]
+      (is (= :kernel-body (get-in kernel-body [:provenance :dialect])))
+      (is (= :ordered-edge-list (get-in kernel-body [:schedule :membership-traversal])))
+      (is (= 2 (count (filter #(= "ForLoop" (some-> % class .getSimpleName)) operations))))
+      (is (every? scalar-ops [:min :isnan :exp :div]))
+      (is (str/includes? source "rstr_feature_active"))
       (is (not (str/includes? source "raw_scores")))
       (is (not (str/includes? source "weights[")))
       (is (not (str/includes? source "denominator["))))))

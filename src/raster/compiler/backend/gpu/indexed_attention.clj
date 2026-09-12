@@ -6,11 +6,16 @@
    denominator and weighted values remain private scalars and no edge-sized intermediates are
    materialized."
   (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as body-opencl]
+            [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.segmented-weighted-reduction :as swr]))
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]))
 
 (defn- fail
   [message reason data]
@@ -220,16 +225,6 @@
          "  output[output_index] = denominator == " zero " ? " zero
          " : numerator / (denominator + (" ctype ")" epsilon ");\n"
          "}\n")))
-
-(defn- source
-  [plan {:keys [heads components] :as shape} name]
-  (source* plan
-           (assoc shape
-                  :active-width (* heads components)
-                  :scale (/ 1.0 (Math/sqrt (double components)))
-                  :bound (double (get-in plan [:score :arguments 2 :value]))
-                  :epsilon (double (get-in plan [:normalization :epsilon])))
-           name))
 
 (defn- ordered-abi
   [plan]
@@ -480,11 +475,20 @@
         workgroup-x (reference-workgroup-x plan shape-env desc)
         name (kernel-name plan shape)
         inputs (swr/ordered-input-ids plan)
-        output (get-in plan [:output :id])]
+        output (get-in plan [:output :id])
+        target-dialect (or (gpu-target/kernel-body-c-dialect desc) :opencl-portable)
+        dialect (c-dialect/resolve! target-dialect)
+        kernel-body (indexed-body/lower-reference plan shape workgroup-x)
+        base-abi (ordered-abi plan)
+        parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+        abi (body-abi/project-contracts base-abi kernel-body)]
     (kart/make
      {:kernel-name name
-      :source (source plan shape name)
-      :abi (ordered-abi plan)
+      :target (c-dialect/target dialect)
+      :source (body-opencl/emit-scalar-kernel
+               name kernel-body
+               {:parameter-names parameter-names :target-dialect target-dialect})
+      :abi abi
       :arguments (conj inputs output)
       :launch (klaunch/spec
                {:workgroup-size [workgroup-x 1]
@@ -504,6 +508,8 @@
                    :membership :edge-list-by-destination
                    :duplicate-policy :multiset
                    :shape shape
+                   :kernel-body kernel-body
+                   :target-dialect target-dialect
                    :materialized-intermediates []
                    :complexity :quadratic-in-edges-and-head-components}})))
 
