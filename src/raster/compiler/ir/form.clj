@@ -32,6 +32,44 @@
    closed-IR `loop*`."
   #{'loop 'clojure.core/loop 'loop*})
 
+(defn integer-case-descriptor
+  "Decode Clojure's closed-core integer `case*` representation.
+
+   The clause-map keys are compiler dispatch hashes, not source case values.  The exact
+   semantic values live in each `[test-value result]` entry.  Returning one ordered descriptor
+   here keeps that implementation detail out of TypedSOAC and target emitters.  Unsupported
+   case encodings return nil instead of being guessed at by a backend."
+  [expression]
+  (when (and (seq? expression) (= 'case* (first expression)))
+    (let [[_ test _shift _mask default clause-map _switch-type test-type] expression
+          ordered (when (and (= :int test-type)
+                             (map? clause-map)
+                             (every? integer? (keys clause-map)))
+                    (->> clause-map (sort-by key) (mapv val)))
+          semantic-values (mapv first ordered)]
+      (when (and ordered
+                 (every? #(and (vector? %) (= 2 (count %))
+                                (integer? (first %)))
+                         ordered)
+                 (= (count semantic-values) (count (distinct semantic-values))))
+        {:test test
+         :default default
+         :clauses ordered}))))
+
+(defn integer-case-conditional
+  "Project an `integer-case-descriptor` into the shared scalar `if` vocabulary.
+
+   The two-argument form permits a backend to substitute an evaluate-once temporary for the
+   original test expression."
+  ([expression]
+   (when-let [description (integer-case-descriptor expression)]
+     (integer-case-conditional description (:test description))))
+  ([{:keys [clauses default]} test]
+   (reduce (fn [otherwise [test-value result]]
+             (list 'if (list 'clojure.core/== test test-value) result otherwise))
+           default
+           (reverse clauses))))
+
 (defn form-info
   "Classify a compiler IR form and return its properties.
 

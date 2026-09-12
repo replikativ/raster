@@ -7,6 +7,21 @@
     (is (= (c-emit/emit-expr (list cast 'x) 'i #{} "i")
            (c-emit/emit-expr (list (symbol "clojure.core" (name cast)) 'x) 'i #{} "i")))))
 
+(deftest closed-core-integer-case-uses-the-canonical-scalar-projection
+  (let [source (c-emit/emit-expr
+                '(case* tag 0 0 99 {20 [7 70] 10 [3 30]} :compact :int)
+                nil #{} "idx")]
+    (is (not (.contains source "case*")))
+    (is (.contains source "tag == 3"))
+    (is (.contains source "tag == 7")))
+  (is (= :unsupported-c-family-case
+         (try
+           (c-emit/emit-expr
+            '(case* tag 0 0 nil {1 ["not-an-integer" 2]} :hash-equiv :hash-equiv)
+            nil #{} "idx")
+           (catch clojure.lang.ExceptionInfo e
+             (:reason (ex-data e)))))))
+
 (deftest explicit-unchecked-integer-casts-require-integral-evidence
   (doseq [value [4294967295 (with-meta 'word {:raster.type/tag 'long})]]
     (is (.startsWith (c-emit/emit-expr (list 'clojure.core/unchecked-int value) nil #{} "idx")

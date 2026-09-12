@@ -659,6 +659,18 @@
          emit-loop-body emit-loop-expr try-inline-deftm
          resolve-gpu-inlinable-var gpu-helper-c-name)
 
+(defn- closed-integer-case!
+  "Return the canonical scalar projection for a Clojure closed-core integer case.
+
+   Closed source lowering binds a non-trivial test before producing `case*`; accepting only that
+   shape keeps repeated ternary comparisons from duplicating an effectful test."
+  [expression]
+  (let [description (form/integer-case-descriptor expression)]
+    (when-not (and description (symbol? (:test description)))
+      (throw (ex-info "C-family emitter cannot lower this closed-core case representation"
+                      {:reason :unsupported-c-family-case :expression expression})))
+    (form/integer-case-conditional description (:test description))))
+
 (defn emit-stmt
   "Emit an S-expression as a C statement (with trailing semicolon)."
   [expr idx-sym array-syms opencl-idx]
@@ -831,6 +843,11 @@
                           (partition 2 pairs)))
            " }"))
 
+    ;; Closed-core case* has one canonical semantic projection.  Do not interpret its dispatch
+    ;; hash map here; source lowering has already bound a non-trivial test expression once.
+    (and (seq? expr) (= 'case* (first expr)))
+    (emit-stmt (closed-integer-case! expr) idx-sym array-syms opencl-idx)
+
     ;; case in void context -> switch
     (and (seq? expr) (= 'case (first expr)))
     (let [[_ test-expr & clauses] expr
@@ -913,6 +930,11 @@
                                    (str (c-symbol sym) " = _t" i ";"))
                                  indexed))]
       (str temps " " assigns " continue;"))
+
+    ;; Canonical closed-core integer branch in loop control.
+    (and (seq? expr) (= 'case* (first expr)))
+    (emit-loop-expr (closed-integer-case! expr)
+                    var-names var-types idx-sym array-syms opencl-idx)
 
     ;; if in loop body
     (and (seq? expr) (= 'if (first expr)))
@@ -1209,6 +1231,10 @@
                (throw (ex-info "GLSL: do block has non-tail forms with side effects but statement expressions are not supported"
                                {:expr expr}))
                (emit-expr (last stmts) idx-sym array-syms opencl-idx))))))
+
+     ;; Closed-core integer case joins the ordinary scalar branch vocabulary before emission.
+     (and (seq? expr) (= 'case* (first expr)))
+     (emit-expr (closed-integer-case! expr) idx-sym array-syms opencl-idx)
 
      ;; if -> ternary (pure) or compound statement (side-effectful)
      (and (seq? expr) (= 'if (first expr)))
@@ -1548,13 +1574,10 @@
                 ")")))
 
      :else
-     ;; Loud over silently corrupt: an unhandled IR form pr-str'd into the C/OpenCL
-     ;; source produces garbage (a cryptic clang/ocloc error, or a call to a
-     ;; nonexistent function). Surfacing this as a WARNING (was fully silent) flagged
-     ;; two real backend gaps: `case*` branch-maps (abm/firms, blelloch-scan,
-     ;; autotuner) and a SIMD-fold vector `[L 8]` (x8-simd-fold) — both stringified
-     ;; into invalid C. TODO: lower case* → cond and handle the SIMD vector, THEN
-     ;; flip this to `throw` (the true loud form). Tracked in compiler_consolidation.
+     ;; Loud over silently corrupt: an unhandled IR form pr-str'd into C-family source produces
+     ;; garbage (a cryptic compiler error, or a call to a nonexistent function).  Known `case*`
+     ;; and SIMD-fold gaps now lower explicitly; the residual warning remains until corpus
+     ;; coverage proves this compatibility fallback can become a hard error.
      (do (binding [*out* *err*]
            (println (str "WARNING: c-emit unhandled IR form (" (type expr)
                          ") — emitting as text, likely invalid. Lower it upstream. Form: "
