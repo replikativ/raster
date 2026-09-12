@@ -3,14 +3,30 @@
    Target admission stays in the target emitter; this internal renderer introduces no schedules,
    layouts, storage, or precision decisions. The dialect selects instruction spellings only."
   (:require [clojure.string :as str]
-            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]))
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-emitter]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
+            [raster.compiler.backend.gpu.matrix-target-names :as target-names]
+            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]))
 
 (defn- fragment-dialect! [target]
   (case target
-    :cuda {:namespace "wmma" :operand-type "half"
+    :cuda {:diagnostic-prefix "cuda-mma-"
+           :instruction {:family :mma :m 16 :n 16 :k 16 :subgroup 32}
+           :header "#include <mma.h>\n#include <math.h>\n"
+           :namespace "wmma" :operand-type "half"
            :namespace-declaration "using namespace nvcuda;\n\n"
            :dimension-failure "asm volatile(\"trap;\");"
            :prefetch "asm volatile(\"prefetch.global.L2 [%0];\" :: \"l\"(pp));"}
+    :hip {:diagnostic-prefix "hip-mfma-"
+          :instruction {:family :mfma :m 16 :n 16 :k 16 :subgroup 64}
+          :header (str "#include <hip/hip_runtime.h>\n#include <rocwmma/rocwmma.hpp>\n#include <math.h>\n"
+                       "#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx90a__)\n"
+                       "#error Raster MFMA candidate requires gfx90a (wave64)\n#endif\n")
+          :namespace "rocwmma" :operand-type "rocwmma::float16_t"
+          :namespace-declaration ""
+          :dimension-failure "__builtin_trap();"
+          :prefetch "__builtin_prefetch(pp, 0, 3);"}
     (throw (ex-info "matrix fragment dialect is not implemented"
                     {:reason :matrix-fragment-dialect-not-lowered :target target}))))
 
@@ -80,3 +96,91 @@
                          "  " fragment-namespace "::store_matrix_sync(C + (m_base + " (* m mi) ") * N + n_base + " (* n ni)
                          ", acc" m "_" n ", N, " fragment-namespace "::mem_row_major);\n")))
        "}\n")))
+
+(defn- decline!
+  [target condition reason data]
+  (when-not condition
+    (throw (ex-info "matrix fragment lowering does not implement this verified body"
+                    (assoc data :reason (keyword (str (:diagnostic-prefix (fragment-dialect! target))
+                                                     (name reason)))
+                           :target target)))))
+
+(defn- parameter-declarations
+  [parameters dimension-parameters target]
+  (let [dimension-name (into {} (map (fn [[axis id]] [id (str/upper-case (name axis))]))
+                             dimension-parameters)]
+    (mapv
+     (fn [{:keys [id kind dtype role] :as parameter}]
+       (cond
+         (and (= :lhs role) (= :input kind) (= :half dtype))
+         (str "const " (:operand-type (fragment-dialect! target)) "* __restrict__ A")
+
+         (and (= :rhs role) (= :input kind) (= :half dtype))
+         (str "const " (:operand-type (fragment-dialect! target)) "* __restrict__ B")
+
+         (and (= :result role) (= :output kind) (= :float dtype))
+         "float* __restrict__ C"
+
+         (and (= :dimension role) (= :scalar kind) (= :int dtype)
+              (contains? dimension-name id))
+         (str "int " (get dimension-name id))
+
+         (and (= :epilogue role) (= :scalar kind) (= :float dtype))
+         (str "float " (c-emit/c-symbol id))
+
+         :else
+         (decline! target false :extra-abi-unsupported {:parameter parameter})))
+     parameters)))
+
+(defn- emit-admitted-plan
+  [kernel-name {:keys [instruction dimensions dimension-values parameters
+                       block-m block-n block-k result-dtype
+                       dimension-parameters schedule-parameters group-z k-lower k-upper
+                       buffer-offsets] :as plan} epilogue target]
+  (let [[M N K] dimensions]
+    (decline! target (= (:instruction (fragment-dialect! target)) instruction)
+              :instruction-unsupported {:instruction instruction})
+    (decline! target (= :float result-dtype)
+              :result-dtype-unsupported {:result-dtype result-dtype})
+    (decline! target (and (every? #(and (integer? %) (pos? %)) dimensions)
+                   (zero? (mod M block-m))
+                   (zero? (mod N block-n))
+                   (zero? (mod K block-k)))
+              :requires-aligned-static-dimensions
+              {:dimensions dimensions :block [block-m block-n block-k]})
+    (decline! target (= [0 (:k dimension-parameters)] [k-lower k-upper])
+              :k-slice-unsupported {:k-range [k-lower k-upper]})
+    (decline! target (and (nil? group-z) (empty? schedule-parameters)
+                   (every? nil? (vals buffer-offsets)))
+              :views-or-schedule-parameters-unsupported
+              {:group-z group-z :schedule-parameters schedule-parameters
+               :buffer-offsets buffer-offsets})
+    (let [declarations (parameter-declarations parameters dimension-parameters target)
+          _ (decline! target (= 6 (count (remove #(= :epilogue (:role %)) parameters)))
+                      :extra-abi-unsupported {:parameters parameters})
+          specialized-dimensions
+          (mapv dimension-values [(:m dimension-parameters)
+                                  (:n dimension-parameters)
+                                  (:k dimension-parameters)])
+          _ (decline! target (= dimensions specialized-dimensions)
+                      :dimension-specialization-invalid
+                      {:dimensions dimensions :dimension-values dimension-values})]
+      (emit-direct kernel-name plan declarations epilogue target))))
+
+(defn emit-matrix-kernel
+  "Emit the direct fragment subset for a verified body.
+   HIP is a source-only candidate requiring the separately pinned rocWMMA compile environment;
+   it is not admitted by matrix-target or advertised as a runtime-supported artifact."
+  [kernel-name kernel-body target]
+  (let [dialect (fragment-dialect! target)
+        plan (matrix-plan/analyze kernel-body)
+        names (target-names/validate! kernel-name kernel-body
+                                      (target-names/parameter-names kernel-body nil))
+        region (scalar-emitter/lower-uniform-store-region kernel-body names target)
+        source (emit-admitted-plan kernel-name plan (:epilogue region) target)
+        helpers (c-emit/intrinsic-helper-module source target {})]
+    (decline! target (empty? (:compilation helpers)) :helper-compilation-unsupported
+              {:compilation (:compilation helpers)})
+    (str (:header dialect)
+         (c-dialect/helper-source (c-dialect/resolve! target) (:source helpers))
+         "\n" source)))

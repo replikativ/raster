@@ -900,3 +900,26 @@ separate architecture compile gate. RDNA WMMA/wave32 requires its own explicit c
 the current gfx1100 scalar compile gate must not be mistaken for MFMA coverage. A pinned
 header/toolchain contract, generated-body compilation, physical ABI requirements and public
 route tests remain prerequisites before enabling either route.
+
+### HIP MFMA source candidate shares CUDA's admission and fragment lowering
+
+The direct-fragment backend now checks ordered pointer/scalar roles, matrix instruction,
+aligned static dimensions, whole-K traversal and unsupported views once for CUDA and the HIP
+candidate. CUDA's existing entry delegates to it. The HIP candidate consumes a verified
+MFMA 16×16×16 / wave64 body and the same coordinate-free Float store region, including
+scaling/ReLU. It does not copy a rocWMMA GEMM: only fragment load, multiply-accumulate and
+store operations use the pinned library's target spelling. Prefetch remains a compiler hint,
+not an asynchronous-copy or completion guarantee.
+
+Mandatory HIP CI compiles that generated body for gfx90a, requires the expected MFMA in its
+disassembly and rejects gfx1100 compilation. The header archive is pinned by revision and
+SHA-256. The scalar RDNA3 gate stays separate. Local validation can use the same script and
+archive without downloading or accessing a GPU.
+
+This remains deliberately source-only. The common matrix-target boundary still declines HIP:
+the current artifact compilation contract admits OpenCL language/extension requirements, not
+external C++ header dependencies. Before production admission, represent the resolved header
+and compiler/architecture identity in artifact compilation and caching, prove physical pointer
+alignment/launch requirements, and preserve those through binding. Then require public-route
+acceptance and AMD numerical validation. No throughput or CUDA/AMD numerical parity claim is
+made from source compilation or disassembly.

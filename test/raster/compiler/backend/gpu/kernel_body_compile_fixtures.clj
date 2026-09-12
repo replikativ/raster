@@ -5,6 +5,8 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
+            [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-emit]
+            [raster.compiler.backend.gpu.hip-matrix-candidate-test :as hip-matrix-fixture]
             [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
@@ -558,6 +560,12 @@
                            (body-fixtures/pipelined-staging-body 32 :preferred)
                            {:target-dialect dialect :target-features descriptor}))]
           (concat
+           (when (= :hip target)
+             (let [matrix-directory (io/file root "hip-matrix")]
+               (.mkdirs matrix-directory)
+               [(write-source! matrix-directory suffix "mfma-uniform-epilogue"
+                               (fragment-emit/emit-matrix-kernel
+                                "mfma_uniform_epilogue" (hip-matrix-fixture/candidate-body) :hip))]))
            (when (= :cuda target)
              [(write-source!
                directory suffix "matrix-uniform-epilogue"
