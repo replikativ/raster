@@ -855,3 +855,28 @@ separately from Float scale arithmetic. Public Arc execution of 1024 products of
 then two products of 1 by 1, gives ordered Float result16777216 rather than Int-then-Float16777218.
 The public workload enters vendor compile fixtures. This is correctness/generalization work;
 packed replacement of a floating fold still requires an independent equivalence proof.
+
+### CUDA/HIP baseline findings integrated into the existing campaign (2026-09-12)
+
+The reference review used local JAX/Pallas, Triton, CUTLASS `147295a3`, Composable Kernel
+`704ff575`, and rocWMMA `97562d3`. It does not introduce a separate IR-redesign campaign.
+Raster already schedules workgroup reduction/scan trees and typed matrix store epilogues.
+The next portability increments belong to the current emitter-retirement and measurement work:
+
+1. Finish indexed subgroup KernelBody emission and retain its numerical/dispatch tests.
+2. Lower existing coordinate-free FP32 TileStore regions on CUDA WMMA, initially uniform
+   scalar transforms such as scaling and ReLU. Logical row/column indices and tensor operands
+   must decline: WMMA fragment slot mappings are opaque.
+3. Add a direct HIP matrix row from the existing instruction/body contract when its selected
+   instruction and wave geometry can be compiled and validated. rocWMMA is a reference for
+   fragment load/MMA/store, not a mandatory semantic dependency.
+4. Admit staged matrix mainloops and indexed epilogues only with schedule-visible storage,
+   coordinate ownership, barriers, and resource accounting. CuTe's mapped output partitions
+   and rocWMMA's double-buffered LDS GEMM are the concrete references.
+
+Each row needs public compiler-path acceptance before being called a completed vertical;
+target-only compile fixtures are prerequisites. Cold performance comparisons stay outside the
+laptop hot loop. Resident training/model validation, distributed simulation and execution,
+durable manifests, and numerical PDE/AMR acceptance retain their existing completion gates.
+Fused GEMM plus auxiliary reductions (CK's mean/mean-square example), warp specialization,
+and TMA remain workload-driven follow-ups rather than vocabulary added in anticipation.

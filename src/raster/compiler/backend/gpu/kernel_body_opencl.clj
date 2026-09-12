@@ -743,6 +743,35 @@
      :epilogue-params params
      :region region}))
 
+(defn lower-uniform-store-region
+  "Lower a coordinate-free floating matrix epilogue through the shared scalar emitter.
+  Opaque matrix fragments can apply this region independently to each stored element. Tensor
+  reads and logical coordinates require a separately scheduled layout conversion."
+  [kernel-body parameter-names target-dialect]
+  (let [regions (keep :value-region (nested-operations (:operations kernel-body)))
+        storage (into {} (map (juxt :id identity)) (:parameters kernel-body))]
+    (doseq [region regions]
+      (when-not
+       (and (empty? (:operands region))
+            (= :float (:accumulator-dtype region) (:result-dtype region))
+            (every? #(and (= :scalar (:kind (get storage %)))
+                          (= :float (:dtype (get storage %))))
+                    (rest (:parameters region)))
+            (every? #(and (record-kind? "ScalarCompute" %)
+                          (contains? #{:float :predicate} (get-in % [:result :type])))
+                    (:operations region))
+            (every? #(or (not (record-kind? "ScalarExpr" %))
+                        (contains? #{:float :predicate} (:result-type %)))
+                    (tree-seq coll? seq (mapv :expression (:operations region))))
+            (not-any? (set (:indices region))
+                      (tree-seq coll? seq
+                                [(:result region) (mapv :expression (:operations region))])))
+        (throw (ex-info "opaque matrix fragments require a coordinate-free floating store region"
+                        {:reason :matrix-store-region-requires-coordinate-layout
+                         :region region}))))
+    (binding [*scalar-dialect* (c-dialect/resolve! target-dialect)]
+      (lower-store-region kernel-body parameter-names))))
+
 (defn- emit-mask-predicate
   [predicate names]
   (let [arguments (:arguments predicate)]
