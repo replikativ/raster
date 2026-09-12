@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
+            [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
@@ -24,6 +25,7 @@
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.carried-effect-loop-fixture :as carried-fixture]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
@@ -109,6 +111,24 @@
   [input :- (Array float) indices :- (Array int) blocks :- Long stride :- Long] :- (Array float)
   (let [output (float-array (* blocks stride))]
     (raster.par/scatter! output input indices blocks stride)))
+
+(defn- indexed-attention-plan
+  []
+  (first
+   (indexed-recognize/recognize
+    '(let* [raw (raster.dl.array-ops/indexed-dot
+                 Q K dst src n-nodes n-nodes n-edges dk emb-dim n-heads)
+            weights (raster.dl.array-ops/scale-clamp-exp
+                     raw (raster.numeric// 1.0 (raster.numeric/sqrt dk))
+                     5.0 (clojure.core/* n-edges n-heads))
+            denominator (raster.dl.array-ops/scatter-add
+                         weights dst n-nodes n-edges n-heads)
+            weighted (raster.dl.array-ops/scatter-mul-add
+                      weights V dst src n-nodes n-nodes n-edges dk emb-dim n-heads)
+            normalized (raster.dl.array-ops/segment-div
+                        weighted denominator n-nodes emb-dim n-heads 1.0e-6)]
+           normalized)
+    :dtype :float :accumulator-dtype :float)))
 
 (defn- reduction-artifact
   [dialect]
@@ -469,6 +489,11 @@
                               :page-size 4 :physical-pages 5})
                             {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}
                             dialect)))
+           (write-artifact! directory suffix "indexed-weighted-reduction-reference"
+                            (indexed-attention-emit/emit-reference
+                             (indexed-attention-plan)
+                             {'n-nodes 3 'n-edges 4 'dk 2 'emb-dim 5 'n-heads 2}
+                             descriptor))
            (write-source! directory suffix "split-k-combine"
                           (:source
                            (gemm-emit/emit-split-k-combine-kernel
