@@ -968,6 +968,13 @@ measurement. A tile-local conversion candidate must preserve RNE/IEEE semantics,
 physical fragment layout, and public FP32 inputs; CUDA/HIP staging must be represented and charged
 in the schedule, not silently invented by an emitter. Keep the existing global conversion as a
 candidate because conversion/reloads repeated across output-column tiles can be more expensive.
+An opt-in Arc oracle now validates the exact Intel 8r16 A-load mapping: lane `l`/component `r`
+holds `[r,l]`, allowing eight FP32 loads with explicit RNE half conversion to construct `short8`
+without shared staging for that shape. All 2,048 tagged-coordinate/rounding checks pass; test-only
+source and reference identities are retained in the comparison protocol. This is a prerequisite,
+not a production conversion route or performance admission. Next introduce a pure typed input
+value region, preserve it in the structural matrix plan, lower only the proved mapping, and
+test every other emitter's explicit decline before enabling a measured graph-fusion candidate.
 
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
 canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead
