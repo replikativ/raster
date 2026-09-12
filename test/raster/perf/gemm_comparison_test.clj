@@ -23,7 +23,8 @@
                     {:id variant :schedule {:precision :f32-scalar}})
                   canary/compilation-evidence (fn [p] {:prepared-id (:id p)})
                   compiled/instantiate!
-                  (fn [p]
+                  (fn [p opts]
+                    (swap! events conj [:bind (:id p) opts])
                     (when (and (= mode :bind-failure) (= :relu (:id p)))
                       (throw (ex-info "injected binding failure" {})))
                     {:executable (:id p) :out-tree [{:sym 'C :node :C}]})
@@ -36,6 +37,13 @@
                               (swap! events conj [:run id])
                               (when-not (= mode :missing-write)
                                 (swap! buffers assoc id expected)))
+                  link/profile! (fn [id]
+                                  (swap! events conj [:profile id])
+                                  (when-not (= mode :missing-write)
+                                    (swap! buffers assoc id expected))
+                                  {:device-wall-ms (if (map? mode) (:duration mode) 0.0125)
+                                   :host-wall-ms 99.0 :kernel-total-ms 0.01
+                                   :profile [{:kernel-name "observed-entry" :ms 0.01}]})
                   link/download (fn [id _] (get @buffers id))]
       (f events))))
 
@@ -63,9 +71,33 @@
         (is (thrown? clojure.lang.ExceptionInfo (comparison/run! options)))
         (is (= closed (filter #(= :close (first %)) @events)))))))
 
+(deftest device-events-are-not-host-time-or-kernel-sums
+  (with-fake-runtime :success
+    (fn [events]
+      (let [result (comparison/run! (assoc options :timing-source :device-event))]
+        (is (every? #(= 12500.0 (:ns %)) (get-in result [:comparison :samples])))
+        (is (= :device-event (get-in result [:scope :timing-source])))
+        (is (= 10 (count (:replay-profiles result))))
+        (is (every? #(= "observed-entry" (get-in % [:profile :profile 0 :kernel-name]))
+                    (:replay-profiles result)))
+        (is (not-any? #(= :run (first %)) @events))
+        (is (every? #(= {:profile? true} (nth % 2))
+                    (filter #(= :bind (first %)) @events)))))))
+
+(deftest device-profile-failures-never-fall-back-and-release-resources
+  (doseq [mode [{:duration nil} {:duration Double/NaN} {:duration Double/POSITIVE_INFINITY}
+               {:duration -1} :missing-write]]
+    (with-fake-runtime mode
+      (fn [events]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (comparison/run! (assoc options :timing-source :device-event))))
+        (is (not-any? #(= :run (first %)) @events))
+        (is (= [[:close :relu] [:close :relu-composed]] (take-last 2 @events)))))))
+
 (deftest probe-budgets-decline-before-runtime-initialization
   (with-redefs [hardware/init! #(throw (AssertionError. "runtime initialized before admission"))]
     (doseq [overrides [{:shape [0 2 2]} {:shape [2048 2048 2048]}
                        {:shape [1 1]} {:rounds 1} {:rounds 121} {:warmup-rounds -1}
-                       {:warmup-rounds 1} {:environment-tag ""} {:compiler-revision nil}]]
+                       {:warmup-rounds 1} {:environment-tag ""} {:compiler-revision nil}
+                       {:timing-source :unknown}]]
       (is (thrown? clojure.lang.ExceptionInfo (comparison/run! (merge options overrides)))))))
