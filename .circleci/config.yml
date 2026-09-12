@@ -139,6 +139,9 @@ jobs:
             for source in gpu-compile-gates/hip/*.hip; do
               hipcc --offload-arch=gfx1100 --genco -o "${source}.hsaco" "${source}"
             done
+      - run:
+          name: Compile generated MFMA candidate and verify instruction selection without a GPU
+          command: bash scripts/ci-compile-hip-matrix.sh
 
   opencl-cpu-gate:
     # Executes the OpenCL-gated namespaces on a CPU OpenCL implementation so emitted kernels are
