@@ -57,8 +57,8 @@
                   [(body/->FragmentInit :acc 0.0)
                    (body/->ForLoop
                     (body/value 'k :int) 0 16 16 []
-                    [(body/->TileLoad :lhs 'A ['group-x 'k] :in-bounds :cached)
-                     (body/->TileLoad :rhs 'B ['k 'group-x] :in-bounds :cached)
+                    [(body/->TileLoad :lhs 'A ['group-x 'k] :in-bounds :cached nil)
+                     (body/->TileLoad :rhs 'B ['k 'group-x] :in-bounds :cached nil)
                      (body/->MatrixMad :acc :lhs :rhs matrix)
                      (body/->Yield [])] [] {:unroll true})
                    (body/->TileStore 'C :acc ['group-x 0] :in-bounds nil)])]
@@ -66,6 +66,31 @@
     :launch (launch/spec {:workgroup-size [16] :group-count [1]})
     :provenance {:dialect :test}
     :attributes {:kind :matrix-contraction}}))
+
+(deftest tile-input-regions-have-a-closed-typed-element-boundary
+  (let [path [:operations 0 :operations 1 :operations 0 :value-region]
+        region (body/->ScalarSSARegion
+                ['loaded] [] [] :float
+                [(body/->ScalarCompute (body/value 'converted :half)
+                                       (body/cast-expression 'loaded :half :nearest-even :ieee))]
+                'converted :half)
+        kernel (-> (minimal-body)
+                   (assoc-in [:parameters 0 :dtype] :float)
+                   (assoc-in [:parameters 0 :layout] (layout/row-major [16 16] :float))
+                   (assoc-in path region))]
+    (is (= kernel (body/validate! kernel)))
+    (is (thrown? clojure.lang.ExceptionInfo (body/validate! (assoc-in kernel path nil))))
+    (doseq [bad [(assoc region :accumulator-dtype :half)
+                 (assoc region :result-dtype :float)
+                 (assoc region :indices ['group-x])
+                 (assoc region :parameters ['loaded 'capture])
+                 (assoc region :result 'missing)
+                 (assoc-in region [:operations 0 :expression :arguments] ['group-x])
+                 (assoc-in region [:operations 0 :expression :options :rounding] nil)
+                 (assoc region :operations
+                        [(body/->ScalarLoad (body/value 'converted :half) 'B [0 0]
+                                            nil nil :cached)])]]
+      (is (thrown? clojure.lang.ExceptionInfo (body/validate! (assoc-in kernel path bad)))))))
 
 (deftest a-kernel-body-makes-schedule-decisions-explicit
   (let [kernel (minimal-body)

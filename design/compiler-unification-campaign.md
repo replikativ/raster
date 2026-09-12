@@ -975,6 +975,13 @@ source and reference identities are retained in the comparison protocol. This is
 not a production conversion route or performance admission. Next introduce a pure typed input
 value region, preserve it in the structural matrix plan, lower only the proved mapping, and
 test every other emitter's explicit decline before enabling a measured graph-fusion candidate.
+The first contract slice adds `TileLoad.value-region` using the existing `ScalarSSARegion`, not
+a new numerical dialect. It accepts only closed, pure, one-element regions, checks source/storage
+and result/fragment dtypes, and runs shared SSA typing with no external initial values. Existing
+loads retain nil regions and strict storage/fragment equality. Matrix targets currently reject
+every nonnil input region explicitly: this contract alone does not enable conversion fusion.
+Production enablement must also separate load-region collection from store epilogues, lower the
+matching FP32 prefetch, retain Intel byte-pitch/extent constraints, and validate masked zeros.
 
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
 canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead

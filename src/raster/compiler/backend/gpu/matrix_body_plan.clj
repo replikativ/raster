@@ -246,6 +246,9 @@
         inner-ops (butlast (:operations inner-loop))
         prefetches (vec (filter #(record-kind? "TilePrefetch" %) inner-ops))
         loads (vec (filter #(record-kind? "TileLoad" %) inner-ops))
+        _ (require! (not-any? :value-region loads)
+                    "matrix target has no lowering for a transformed tile input"
+                    {:loads loads})
         mads (vec (filter #(record-kind? "MatrixMad" %) inner-ops))
         unknown-inner (remove #(or (record-kind? "TilePrefetch" %)
                                    (record-kind? "TileLoad" %)

@@ -212,10 +212,10 @@
              [matrix-m matrix-k] row-layout :prefetch-active num-stages))
           (for [nn (range n-fragments)]
             (body/->TileLoad (fragment-id "rhs" nn) col-buffer
-                             [k-fragment (n-base nn)] :k-active :cached))
+                             [k-fragment (n-base nn)] :k-active :cached nil))
           (for [mm (range m-fragments)]
             (body/->TileLoad (fragment-id "lhs" mm) row-buffer
-                             [(add m-base (* mm matrix-m)) k-fragment] :k-active :cached))
+                             [(add m-base (* mm matrix-m)) k-fragment] :k-active :cached nil))
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->MatrixMad (fragment-id "acc" mm nn)
                               (fragment-id "lhs" mm)
