@@ -930,7 +930,9 @@ The chosen next emphasis is public performance verticals (option B), with schedu
 where those workloads expose a need (targeted C). HIP production admission and PTX breadth do not
 displace this work. The bounded composed-versus-explicit GEMM probe in the comparison protocol
 keeps source/ABI evidence, dispatch declines, poisoned-output checks and rotating raw replay samples.
-It labels host-synchronized timing explicitly; aggregate equation-first device profiling remains open.
+It labels host-synchronized timing explicitly and optionally uses existing descriptor-backed graph
+device events. The earlier profiling blocker applied to `PreparedParallelProgram`, not this probe.
+Observed replay events are retained separately from available dispatch alternatives.
 
 The first Arc run exposed a real admission bug: the public descriptor's `:ocl` backend was excluded
 from the existing mixed-DPAS schedule's `:opencl`/`:ze` check. Accepting the alias restores matrix
@@ -939,7 +941,8 @@ tests retain non-DPAS, CUDA/HIP and unsupported-wave declines. Before/after nume
 both short timing runs are nonstationary, so no speedup, regression or tuning winner is asserted.
 
 Next priorities are dynamic GEMM→activation fusion through symbolic extent equivalence and legal
-scalar placement; evidence of selected rather than merely available executables; aggregate
-public replay device timing; then the projection shape ladder and a resident forward/VJP/update.
+scalar placement; correlating observed events with executable evidence; then the projection shape
+ladder and a resident forward/VJP/update. The dynamic extent's checked multiplication cannot simply
+be moved across an output write: fusion must preserve failure behavior as well as values.
 Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
 or workload requirements justify them. Existing scientific/distributed acceptance gates remain.

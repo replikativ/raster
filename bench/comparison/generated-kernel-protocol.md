@@ -37,8 +37,13 @@ In a test or bench REPL, use the same public functions as the existing productio
 
 The probe compares ordinary dynamic contraction→map composition with an explicit typed ReLU
 epilogue, compiling and binding each once. It reuses the existing rotating measurement sampler
-with an explicit `:host-synchronized-replay` clock. The public equation-first runner does not yet
-support aggregate device-event profiling; these samples must not be reported as device throughput.
+with a default `:host-synchronized-replay` clock; those samples are not device throughput.
+Set `:timing-source :device-event` to profile this descriptor-backed public graph through
+`link/profile!`. Samples use the device event span, not summed kernel durations or host time;
+missing timestamps fail without fallback. `:replay-profiles` retains observed kernel events in
+execution order, including prevalidation and warmup. One-time conversion prologues are excluded.
+The separate `PreparedParallelProgram` runtime still lacks this aggregate profiling API; it is
+not the runtime used by this probe.
 Every replay starts with NaN output and checks an exact dyadic-input CPU oracle afterward. Uploads
 and validation downloads are outside timing but can influence cache/thermal state. Logical buffer
 and CPU-reference work budgets do not bound compiler/driver RSS. Fixed even rounds balance order;
@@ -62,8 +67,13 @@ schedule for all three spellings, without weakening matrix/subgroup requirements
 alternatives now appear in public OpenCL dispatch, but candidate counts are not selected or
 executed launch counts. Composed dynamic source still has two resident steps, explicit source one.
 No timing series passes the CV heuristic; these data establish neither a speedup nor a regression.
-Next: automatic symbolic-extent fusion, selected-executable evidence, aggregate public device-event
-timing, then larger projection shapes and matched external implementations.
+The subsequent [device-event probe](../results/public-gemm-20260912-device.edn) passes every exact
+output check and records two steady replay entries for composed source versus one for the explicit
+epilogue, including the generated XMX contraction. Both series remain nonstationary. Event span
+includes inter-kernel gaps; kernel-duration sum does not. Neither is interchangeable with the
+earlier host-clock measurements, and no winner is promoted from this shared-laptop probe.
+Next: automatic symbolic-extent fusion, correlating observed events with executable evidence,
+then larger projection shapes and matched external implementations.
 
 ### External comparators
 
