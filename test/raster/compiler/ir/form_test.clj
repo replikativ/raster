@@ -260,6 +260,13 @@
              '(case* tag 0 0 nil {1 [4 10] 2 [4 20]} :compact :int)))
       "ambiguous duplicate semantic values decline"))
 
+(deftest closed-core-constant-conditions-have-one-projection
+  (is (= :then (form/constant-if-branch :else)))
+  (is (= :then (form/constant-if-branch true)))
+  (is (= :else (form/constant-if-branch false)))
+  (is (= :else (form/constant-if-branch nil)))
+  (is (nil? (form/constant-if-branch 'runtime-predicate))))
+
 (deftest scope-info-decomposition-test
   (testing "let* — one sequential scope, binders+inits paired"
     (let [{:keys [scopes sequential? outer]} (form/scope-info '(let* [a 1 b (+ a 2)] (+ a b)))]

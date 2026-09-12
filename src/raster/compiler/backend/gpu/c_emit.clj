@@ -704,17 +704,22 @@
     (let [args (rest expr)
           cond-expr (first args)
           then-expr (second args)
-          else-expr (when (>= (count args) 3) (nth args 2))
-          cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
-      (if else-expr
-        (str "if (" cond-str ") { "
-             (emit-stmt then-expr idx-sym array-syms opencl-idx)
-             " } else { "
-             (emit-stmt else-expr idx-sym array-syms opencl-idx)
-             " }")
-        (str "if (" cond-str ") { "
-             (emit-stmt then-expr idx-sym array-syms opencl-idx)
-             " }")))
+          else-expr (when (>= (count args) 3) (nth args 2))]
+      (case (form/constant-if-branch cond-expr)
+        :then (emit-stmt then-expr idx-sym array-syms opencl-idx)
+        :else (if (some? else-expr)
+                (emit-stmt else-expr idx-sym array-syms opencl-idx)
+                "")
+        (let [cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
+          (if (some? else-expr)
+            (str "if (" cond-str ") { "
+                 (emit-stmt then-expr idx-sym array-syms opencl-idx)
+                 " } else { "
+                 (emit-stmt else-expr idx-sym array-syms opencl-idx)
+                 " }")
+            (str "if (" cond-str ") { "
+                 (emit-stmt then-expr idx-sym array-syms opencl-idx)
+                 " }")))))
 
     ;; do block -> emit all as statements
     (and (seq? expr) (= 'do (first expr)))
@@ -941,17 +946,22 @@
     (let [args (rest expr)
           cond-expr (first args)
           then-expr (second args)
-          else-expr (when (>= (count args) 3) (nth args 2))
-          cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
-      (if else-expr
-        (str "if (" cond-str ") { "
-             (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
-             " } else { "
-             (emit-loop-expr else-expr var-names var-types idx-sym array-syms opencl-idx)
-             " }")
-        (str "if (" cond-str ") { "
-             (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
-             " } else { break; }")))
+          else-expr (when (>= (count args) 3) (nth args 2))]
+      (case (form/constant-if-branch cond-expr)
+        :then (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
+        :else (if (some? else-expr)
+                (emit-loop-expr else-expr var-names var-types idx-sym array-syms opencl-idx)
+                "break;")
+        (let [cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
+          (if (some? else-expr)
+            (str "if (" cond-str ") { "
+                 (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
+                 " } else { "
+                 (emit-loop-expr else-expr var-names var-types idx-sym array-syms opencl-idx)
+                 " }")
+            (str "if (" cond-str ") { "
+                 (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
+                 " } else { break; }")))))
 
     ;; do block
     (and (seq? expr) (= 'do (first expr)))
@@ -1241,33 +1251,38 @@
      (let [args (rest expr)
            cond-expr (first args)
            then-expr (second args)
-           else-expr (when (>= (count args) 3) (nth args 2))
-           cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
-       (if (nil? else-expr)
-         ;; void if — should only appear in statement context, but handle gracefully
-         (if (supports-stmt-expr?)
-           (str "({ if (" cond-str ") { "
-                (emit-stmt then-expr idx-sym array-syms opencl-idx) " } })")
-           ;; GLSL: emit as ternary with 0 fallback
-           (str "((" cond-str ") ? ("
-                (emit-expr then-expr idx-sym array-syms opencl-idx) ") : 0)"))
-         (let [side-effects? (or (util/effectful? then-expr)
-                                 (util/effectful? else-expr))]
-           (if (and side-effects? (supports-stmt-expr?))
-             (str "({ " *scalar-type* " _r; if (" cond-str ") { "
-                  (emit-stmts-with-result then-expr idx-sym array-syms opencl-idx "_r")
-                  " } else { "
-                  (emit-stmts-with-result else-expr idx-sym array-syms opencl-idx "_r")
-                  " } _r; })")
-             (do
-               (when (and side-effects? (not (supports-stmt-expr?)))
-                 (throw (ex-info "GLSL: if branches contain side effects but statement expressions are not supported"
-                                 {:expr expr})))
-               ;; Pure ternary
+           else-expr (when (>= (count args) 3) (nth args 2))]
+       (case (form/constant-if-branch cond-expr)
+         :then (emit-expr then-expr idx-sym array-syms opencl-idx)
+         :else (if (some? else-expr)
+                 (emit-expr else-expr idx-sym array-syms opencl-idx)
+                 "0")
+         (let [cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
+           (if (nil? else-expr)
+             ;; void if — should only appear in statement context, but handle gracefully
+             (if (supports-stmt-expr?)
+               (str "({ if (" cond-str ") { "
+                    (emit-stmt then-expr idx-sym array-syms opencl-idx) " } })")
+               ;; GLSL: emit as ternary with 0 fallback
                (str "((" cond-str ") ? ("
-                    (emit-expr then-expr idx-sym array-syms opencl-idx)
-                    ") : ("
-                    (emit-expr else-expr idx-sym array-syms opencl-idx) "))"))))))
+                    (emit-expr then-expr idx-sym array-syms opencl-idx) ") : 0)"))
+             (let [side-effects? (or (util/effectful? then-expr)
+                                     (util/effectful? else-expr))]
+               (if (and side-effects? (supports-stmt-expr?))
+                 (str "({ " *scalar-type* " _r; if (" cond-str ") { "
+                      (emit-stmts-with-result then-expr idx-sym array-syms opencl-idx "_r")
+                      " } else { "
+                      (emit-stmts-with-result else-expr idx-sym array-syms opencl-idx "_r")
+                      " } _r; })")
+                 (do
+                   (when (and side-effects? (not (supports-stmt-expr?)))
+                     (throw (ex-info "GLSL: if branches contain side effects but statement expressions are not supported"
+                                     {:expr expr})))
+                   ;; Pure ternary
+                   (str "((" cond-str ") ? ("
+                        (emit-expr then-expr idx-sym array-syms opencl-idx)
+                        ") : ("
+                        (emit-expr else-expr idx-sym array-syms opencl-idx) "))"))))))))
 
      ;; when -> void if (only meaningful in statement context)
      (and (seq? expr) (= 'when (first expr)))
@@ -1574,15 +1589,12 @@
                 ")")))
 
      :else
-     ;; Loud over silently corrupt: an unhandled IR form pr-str'd into C-family source produces
-     ;; garbage (a cryptic compiler error, or a call to a nonexistent function).  Known `case*`
-     ;; and SIMD-fold gaps now lower explicitly; the residual warning remains until corpus
-     ;; coverage proves this compatibility fallback can become a hard error.
-     (do (binding [*out* *err*]
-           (println (str "WARNING: c-emit unhandled IR form (" (type expr)
-                         ") — emitting as text, likely invalid. Lower it upstream. Form: "
-                         (pr-str expr))))
-         (str expr)))))
+     ;; Never serialize an unknown Clojure value into target source.  Every reachable scalar form
+     ;; must either enter typed KernelBody earlier or have an explicit compatibility lowering here.
+     (throw (ex-info "C-family emitter encountered an unsupported IR value"
+                      {:reason :unsupported-c-family-ir
+                      :expression expr
+                      :expression-type (type expr)})))))
 
 ;; ================================================================
 ;; deftm inlining support
