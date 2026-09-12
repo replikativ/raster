@@ -86,7 +86,7 @@
         (route/route-dynamic! (plan)
                               {:device-type :gpu :subgroup-size 16
                                :max-workgroup-size 256})
-        runtime-values (vec (concat (repeat 6 (Object.))
+        runtime-values (vec (concat (repeatedly 6 #(Object.))
                                     (map (fn [value] {:type :long :value value})
                                          [3 4 5 2 2 15])))
         call (kcall/make artifact runtime-values)
@@ -98,7 +98,11 @@
                             (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
         graph-call (kgcall/make graph graph-buffers graph-scalars)
         output-elements (launch/product 'n-nodes 'emb-dim)
-        graph-output (first (:outputs graph))]
+        graph-output (first (:outputs graph))
+        kernel-body (get-in artifact [:attributes :kernel-body])
+        operations (nested-operations (:operations kernel-body))
+        scale-value (some #(when (= 'scale-value (get-in % [:result :id])) %) operations)
+        components-cast (some #(when (= 'components-fp (get-in % [:result :id])) %) operations)]
     (is (= '[Q K V dst src normalized
              n_entities n_edges total_dim n_heads n_components output_elements]
            (mapv :name (:abi artifact))))
@@ -127,7 +131,9 @@
                 (filter (comp #{'dst 'src} :id) (:inputs graph))))
     (is (= 15 (kgcall/resolve-integer graph-scalars (:elements graph-output))))
     (is (str/includes? (:source artifact) "long n_entities"))
-    (is (str/includes? (:source artifact) "sqrt((float)n_components)"))))
+    (is (= {:rounding :nearest-even :overflow :exact}
+           (get-in components-cast [:expression :options])))
+    (is (= :sqrt (get-in scale-value [:expression :arguments 1 :op])))))
 
 (deftest leaf-selection-depends-on-plan-descriptors-not-attention-provenance
   (let [generic-plan (-> (plan)
@@ -149,11 +155,11 @@
                        :subgroup-size 16
                        :max-workgroup-size 256
                        :segmented-weighted-reduction-schedule :subgroup-score-reuse})
-        runtime-values (vec (concat (repeat 6 (Object.))
+        runtime-values (vec (concat (repeatedly 6 #(Object.))
                                     (map (fn [value] {:type :long :value value})
                                          [3 4 5 2 2 15])))
         call (kcall/make artifact runtime-values)
-        wide-values (vec (concat (repeat 6 (Object.))
+        wide-values (vec (concat (repeatedly 6 #(Object.))
                                  (map (fn [value] {:type :long :value value})
                                       [3 4 260 2 128 780])))
         wide-call (kcall/make artifact wide-values)

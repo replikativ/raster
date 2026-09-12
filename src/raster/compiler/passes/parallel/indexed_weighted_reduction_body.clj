@@ -17,21 +17,23 @@
   (reduce #(select %1 %2 (lit false :predicate) :predicate)
           (lit true :predicate) predicates))
 
-(defn lower-reference
-  "Lower one static indexed edge-list reduction to KernelBody.
+(defn- lower-reference*
+  "Lower one indexed edge-list reduction to KernelBody.
 
   One work-item owns one destination/feature. It retains the historical correctness schedule:
   ordered multiset traversal, private numerator/denominator, no edge-sized intermediates, and a
   NaN result for every output when any edge index is malformed."
-  [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x]
+  [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x dynamic?]
   (let [plan (swr/validate! plan)
         [q k v destination-indices source-indices] (:operands plan)
         output (:output plan)
         dtype (:accumulator-dtype plan)
-        active-width (* heads components)
+        long-value (fn [value] (if dynamic? value (lit value :long)))
+        active-width (if dynamic? 'active-width (* heads components))
+        final-entity (if dynamic? 'final-entity (lit (dec entities) :long))
         bound (double (get-in plan [:score :arguments 2 :value]))
         epsilon (double (get-in plan [:normalization :epsilon]))
-        scale (/ 1.0 (Math/sqrt (double components)))
+        scale (if dynamic? 'scale-value (/ 1.0 (Math/sqrt (double components))))
         group-x 'indexed-group-x
         group-y 'indexed-group-y
         lane-x 'indexed-lane-x
@@ -44,9 +46,13 @@
          (body/value x :long)
          (body/index-cast 0 :long :exact) (body/index-cast components :long :exact) 1
          [(body/->LoopArg (body/value 'dot-state dtype) (lit 0.0 dtype))]
-          [(compute 'qk-component :long
-                   (bounded-expr :+ :long
-                                 (bounded-expr :* :long 'head (lit components :long)) x))
+         [(compute 'qk-component :long
+                   (body/scalar-expression
+                    :+ :long
+                    [(body/scalar-expression
+                      :* :long ['head (long-value components)]
+                      {:overflow (if dynamic? :wrap :no-overflow)}) x]
+                    {:overflow (if dynamic? :wrap :no-overflow)}))
           (body/->ScalarLoad (body/value 'q-element dtype) (:id q)
                              [destination 'qk-component] nil nil :cached)
           (body/->ScalarLoad (body/value 'k-element dtype) (:id k)
@@ -69,11 +75,11 @@
           (compute 'edge-destination-nonnegative :predicate
                    (expr :le :predicate (lit 0 :long) 'edge-destination))
           (compute 'edge-destination-bounded :predicate
-                   (expr :lt :predicate 'edge-destination (lit entities :long)))
+                   (expr :lt :predicate 'edge-destination (long-value entities)))
           (compute 'edge-source-nonnegative :predicate
                    (expr :le :predicate (lit 0 :long) 'edge-source))
           (compute 'edge-source-bounded :predicate
-                   (expr :lt :predicate 'edge-source (lit entities :long)))
+                   (expr :lt :predicate 'edge-source (long-value entities)))
           (compute 'edge-valid :predicate
                    (conjunction 'edge-destination-nonnegative 'edge-destination-bounded
                                 'edge-source-nonnegative 'edge-source-bounded))
@@ -82,16 +88,16 @@
           (compute 'safe-source :long
                    (expr :min :long
                          (expr :max :long 'edge-source (lit 0 :long))
-                         (lit (dec entities) :long)))
+                         final-entity))
           (compute 'destination-match :predicate
                    (expr :eq :predicate 'edge-destination destination))
           (compute 'member-applies :predicate
                    (conjunction 'edge-valid 'destination-match))
           (body/->IfRegion
            'member-applies
-           [(compute 'head :long (expr :quot :long feature (lit components :long)))
+           [(compute 'head :long (expr :quot :long feature (long-value components)))
             dot-loop
-            (compute 'scaled dtype (expr :* dtype 'dot (lit scale dtype)))
+            (compute 'scaled dtype (expr :* dtype 'dot (if dynamic? scale (lit scale dtype))))
             (compute 'scaled-is-nan :predicate
                      (body/scalar-expression :isnan :predicate ['scaled]))
             (compute 'clamped dtype
@@ -120,21 +126,84 @@
                           (expr :div dtype 'final-numerator
                                 (expr :+ dtype 'final-denominator (lit epsilon dtype))))
         result (compute 'valid-result dtype
-                        (select 'denominator-zero (lit 0.0 dtype) 'normalized-value dtype))]
+                        (select 'denominator-zero (lit 0.0 dtype) 'normalized-value dtype))
+        active-operations
+        [(compute 'feature-active :predicate
+                  (expr :lt :predicate feature (if dynamic? active-width
+                                                    (lit active-width :long))))
+         (body/->IfRegion
+          'feature-active
+          [edge-loop denominator-zero quotient result
+           (compute 'final-result dtype
+                    (select 'final-valid 'valid-result (lit Double/NaN dtype) dtype))
+           (body/->ScalarStore (:id output) [destination feature] 'final-result nil)
+           (body/->Yield [])]
+          [(body/->ScalarStore (:id output) [destination feature] (lit 0.0 dtype) nil)
+           (body/->Yield [])]
+          [])
+         (body/->Yield [])]
+        dynamic-derived
+        (when dynamic?
+          [(compute 'entities-positive :predicate
+                    (expr :lt :predicate (lit 0 :long) entities))
+           (compute 'edges-nonnegative :predicate
+                    (expr :le :predicate (lit 0 :long) edges))
+           (compute 'heads-positive :predicate
+                    (expr :lt :predicate (lit 0 :long) heads))
+           (compute 'components-positive :predicate
+                    (expr :lt :predicate (lit 0 :long) components))
+           (compute 'safe-components :long
+                    (expr :max :long components (lit 1 :long)))
+           (compute 'head-layout-fits :predicate
+                    (expr :le :predicate heads (expr :quot :long total-dim 'safe-components)))
+           (compute 'shape-valid :predicate
+                    (conjunction 'entities-positive 'edges-nonnegative 'heads-positive
+                                 'components-positive 'head-layout-fits))
+           (compute 'active-width :long
+                    (body/scalar-expression :* :long [heads components] {:overflow :wrap}))
+           (compute 'final-entity :long
+                    (body/scalar-expression
+                     :- :long [(expr :max :long entities (lit 1 :long)) (lit 1 :long)]
+                     {:overflow :wrap}))
+           (compute 'components-fp dtype
+                    (body/cast-expression components dtype :nearest-even :exact))
+           (compute 'scale-value dtype
+                    (expr :div dtype (lit 1.0 dtype) (expr :sqrt dtype 'components-fp)))])
+        feature-operations
+        (if dynamic?
+          [(body/->IfRegion
+            'shape-valid active-operations
+            [(body/->ScalarStore (:id output) [destination feature] (lit Double/NaN dtype) nil)
+             (body/->Yield [])]
+            [])
+           (body/->Yield [])]
+          active-operations)
+        scalar-parameters
+        (when dynamic?
+          (mapv #(body/->KernelParameter % :scalar :long [] nil nil :shape)
+                [entities edges total-dim heads components 'output_elements]))]
     (body/make
      {:id [:indexed-weighted-reduction-body (:id plan) shape]
-      :parameters [(body/->KernelParameter (:id q) :input dtype [entities total-dim] :global
-                                           (layout/row-major [entities total-dim] dtype) :query)
-                   (body/->KernelParameter (:id k) :input dtype [entities total-dim] :global
-                                           (layout/row-major [entities total-dim] dtype) :key)
-                   (body/->KernelParameter (:id v) :input dtype [entities total-dim] :global
-                                           (layout/row-major [entities total-dim] dtype) :value)
-                   (body/->KernelParameter (:id destination-indices) :input :long [edges] :global
-                                           (layout/row-major [edges] :long) :destination-indices)
-                   (body/->KernelParameter (:id source-indices) :input :long [edges] :global
-                                           (layout/row-major [edges] :long) :source-indices)
-                   (body/->KernelParameter (:id output) :output dtype [entities total-dim] :global
-                                           (layout/row-major [entities total-dim] dtype) :result)]
+      :parameters (vec (concat
+                        [(body/->KernelParameter
+                          (:id q) :input dtype [entities total-dim] :global
+                          (layout/row-major [entities total-dim] dtype) :query)
+                         (body/->KernelParameter
+                          (:id k) :input dtype [entities total-dim] :global
+                          (layout/row-major [entities total-dim] dtype) :key)
+                         (body/->KernelParameter
+                          (:id v) :input dtype [entities total-dim] :global
+                          (layout/row-major [entities total-dim] dtype) :value)
+                         (body/->KernelParameter
+                          (:id destination-indices) :input :long [edges] :global
+                          (layout/row-major [edges] :long) :destination-indices)
+                         (body/->KernelParameter
+                          (:id source-indices) :input :long [edges] :global
+                          (layout/row-major [edges] :long) :source-indices)
+                         (body/->KernelParameter
+                          (:id output) :output dtype [entities total-dim] :global
+                          (layout/row-major [entities total-dim] dtype) :result)]
+                        scalar-parameters))
       :stable-reads (mapv body/stable-read (swr/ordered-input-ids plan))
       :indices [(body/->IndexBinding group-x :group 0)
                 (body/->IndexBinding lane-x :local 0)
@@ -149,36 +218,42 @@
                                       :long :exact))]
       :masks []
       :operations
-      [(compute 'feature-bounded :predicate
-                (expr :lt :predicate feature (lit total-dim :long)))
+      (vec (concat dynamic-derived
+       [(compute 'feature-bounded :predicate
+                (expr :lt :predicate feature (long-value total-dim)))
        (body/->IfRegion
         'feature-bounded
-        [(compute 'feature-active :predicate
-                  (expr :lt :predicate feature (lit active-width :long)))
-         (body/->IfRegion
-          'feature-active
-          [edge-loop denominator-zero quotient result
-           (compute 'final-result dtype
-                    (select 'final-valid 'valid-result (lit Double/NaN dtype) dtype))
-           (body/->ScalarStore (:id output) [destination feature] 'final-result nil)
-           (body/->Yield [])]
-          [(body/->ScalarStore (:id output) [destination feature] (lit 0.0 dtype) nil)
-           (body/->Yield [])]
-          [])
-         (body/->Yield [])]
+        feature-operations
         [(body/->Yield [])]
-        [])]
+        [])]))
       :schedule {:strategy :indexed-segmented-reduction-reference
                  :membership-traversal :ordered-edge-list
                  :score-reuse :per-output-component}
       :launch (launch/spec
                {:workgroup-size [workgroup-x 1]
-                :group-count [(long (quot (+ total-dim (dec workgroup-x)) workgroup-x))
-                              entities]})
+                :group-count (if dynamic?
+                               [(launch/ceil-div (launch/runtime-value total-dim) workgroup-x)
+                                (launch/runtime-value entities)]
+                               [(long (quot (+ total-dim (dec workgroup-x)) workgroup-x))
+                                entities])})
       :provenance {:dialect :kernel-body
                    :semantic-op :segmented-weighted-reduction
                    :algebra-plan-id (:id plan)
                    :lowering :indexed-reference-kernel-body}
       :attributes {:storage-kind :indexed-dense-values
                    :membership-kind :edge-list-by-destination
-                   :duplicate-policy :multiset}})))
+                   :duplicate-policy :multiset
+                   :dynamic-shape? dynamic?}})))
+
+(defn lower-reference
+  "Lower a statically specialized indexed edge-list correctness schedule."
+  [plan shape workgroup-x]
+  (lower-reference* plan shape workgroup-x false))
+
+(defn lower-dynamic-reference
+  "Lower the same correctness schedule with ordered int64 runtime extents."
+  [plan workgroup-x]
+  (lower-reference* plan
+                    {:entities 'n_entities :edges 'n_edges :heads 'n_heads
+                     :components 'n_components :total-dim 'total_dim}
+                    workgroup-x true))
