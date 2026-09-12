@@ -960,6 +960,15 @@ conversion and replay submission costs; do not relax TileLoad's dtype equality o
 unrepresented conversion in a target emitter. This is a workload-driven extension of the existing
 KernelBody/graph pipeline, not a new GEMM semantic API.
 
+The same changing-activation workload also passes on Arc Level Zero. Its measured event spans
+are much closer to kernel-duration sums than OpenCL's; both runs are nonstationary and retained
+in the comparison protocol. This separates two investigations: runtime replay gaps and explicit
+tile-input conversion. Do not attribute the gap to arithmetic or replace the current graph without
+measurement. A tile-local conversion candidate must preserve RNE/IEEE semantics, masked zeros,
+physical fragment layout, and public FP32 inputs; CUDA/HIP staging must be represented and charged
+in the schedule, not silently invented by an emitter. Keep the existing global conversion as a
+candidate because conversion/reloads repeated across output-column tiles can be more expensive.
+
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
 canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead
 of throwing on the source long product. The bytecode emitter used `lmul`; the resident descriptor

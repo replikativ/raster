@@ -91,11 +91,30 @@
         (is (every? #(= 12500.0 (:ns %)) (get-in result [:comparison :samples])))
         (is (= :device-event (get-in result [:scope :timing-source])))
         (is (= 10 (count (:replay-profiles result))))
+        (is (= {:validation 2 :warmup 4 :measurement 4}
+               (frequencies (map :sampling-phase (:replay-profiles result)))))
+        (is (= (mapv (juxt :candidate :round) (get-in result [:comparison :samples]))
+               (mapv (juxt :candidate :sample-index)
+                     (filter #(= :measurement (:sampling-phase %)) (:replay-profiles result)))))
+        (is (every? #(nil? (:sample-index %))
+                    (remove #(= :measurement (:sampling-phase %)) (:replay-profiles result))))
+        (is (every? #(= (range 5) (map :replay-index %))
+                    (vals (group-by :candidate (:replay-profiles result)))))
         (is (every? #(= "observed-entry" (get-in % [:profile :profile 0 :kernel-name]))
                     (:replay-profiles result)))
         (is (not-any? #(= :run (first %)) @events))
         (is (every? #(= {:profile? true} (nth % 2))
                     (filter #(= :bind (first %)) @events)))))))
+
+(deftest zero-warmup-profiles-still-separate-validation
+  (with-fake-runtime :success
+    (fn [_]
+      (let [result (comparison/run! (assoc options :timing-source :device-event :warmup-rounds 0))
+            profiles (:replay-profiles result)]
+        (is (= {:validation 2 :measurement 4} (frequencies (map :sampling-phase profiles))))
+        (is (= (mapv (juxt :candidate :round) (get-in result [:comparison :samples]))
+               (mapv (juxt :candidate :sample-index)
+                     (filter #(= :measurement (:sampling-phase %)) profiles))))))))
 
 (deftest device-profile-failures-never-fall-back-and-release-resources
   (doseq [mode [{:duration nil} {:duration Double/NaN} {:duration Double/POSITIVE_INFINITY}
