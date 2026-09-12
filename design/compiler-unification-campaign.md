@@ -953,12 +953,14 @@ The same comparison probe now retains separate prebound-source identities for si
 multi-row projection observations. Both reach one generated XMX replay entry with exact output;
 external baselines and stationary measurements remain required before a competitiveness claim.
 
-An additional host boundary probe exposed existing JVM AOT overflow debt: `compile-aot` of the
-prebound canary with `m=Long/MAX_VALUE, n=2, k=0` returns an unchanged sentinel buffer instead of
-throwing on the source long product. The JVM bytecode arithmetic emitter directly uses `lmul`;
-the resident descriptor binder evaluates scalar lets through Clojure and checked launch algebra.
-Do not claim cross-target checked-arithmetic parity from the GPU result. Follow up with focused
-source-versus-bytecode boundary tests and a deliberate checked/wrapping policy in the existing
-emitter; this measurement slice does not change integer semantics or expand the fusion proof.
+An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
+canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead
+of throwing on the source long product. The bytecode emitter used `lmul`; the resident descriptor
+binder evaluates scalar lets through Clojure and checked launch algebra. The focused follow-up
+restores checked long add/subtract/multiply/negate/inc/dec with Math exact operations, preserving
+the separate explicit unchecked emitters. Direct source-versus-bytecode boundary tests and the
+public sentinel test retain the distinction. Int arithmetic, narrowing casts, and other targets
+are not certified by this fix; backend-wide long arithmetic may pay overflow-check costs, so
+cross-target semantic parity and performance remain separate acceptance work.
 Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
 or workload requirements justify them. Existing scientific/distributed acceptance gates remain.
