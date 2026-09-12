@@ -428,13 +428,16 @@
                       ;; generate-c-helper returns {:c-name :source}; its c-name matches
                       ;; the call site exactly (shared invariant). Use that c-name; take
                       ;; the body from the :c-helper override when registered, else its source.
-                      (let [gen (ce/generate-c-helper h)
-                            ;; resolve-op-descriptor strips the _m_ type-mangle so the
-                            ;; override registered under the base op name is found.
-                            ov (:c-helper (first (descriptor/resolve-op-descriptor (:sym h))))]
+                      (let [;; Resolve the override before translating the reference body. A
+                            ;; registered target helper already owns emission; generating and
+                            ;; discarding its scalar deftm body used to trigger source-only
+                            ;; vector/type warnings and wasted compile work merely to obtain a name.
+                            ov (:c-helper (first (descriptor/resolve-op-descriptor (:sym h))))
+                            c-name (ce/gpu-helper-c-name (:sym h))]
                         (if ov
-                          {:inc (:includes ov "") :def ((:gen ov) (:c-name gen))}
-                          {:inc "" :def (:source gen)})))]
+                          {:inc (:includes ov "") :def ((:gen ov) c-name)}
+                          (let [gen (ce/generate-c-helper h)]
+                            {:inc "" :def (:source gen)}))))]
         [(clojure.string/join "" (distinct (keep (comp not-empty :inc) entries)))
          (clojure.string/join "\n" (map :def entries))]))))
 

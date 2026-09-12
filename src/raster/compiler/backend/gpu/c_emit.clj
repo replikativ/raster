@@ -657,7 +657,7 @@
 
 (declare emit-expr emit-stmt emit-stmts-with-result
          emit-loop-body emit-loop-expr try-inline-deftm
-         resolve-gpu-inlinable-var)
+         resolve-gpu-inlinable-var gpu-helper-c-name)
 
 (defn emit-stmt
   "Emit an S-expression as a C statement (with trailing semicolon)."
@@ -1462,7 +1462,7 @@
                           (str "((" ea " % " eb " + " eb ") % " eb ")")))
          ;; Non-arithmetic deftm helper -> C helper invocation. Array-sym args are passed
          ;; as the bare pointer (the helper takes a pointer + offset), not element access.
-         (let [c-name (str "gpufn_" (c-symbol sym))
+         (let [c-name (gpu-helper-c-name sym)
                emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
                                   (c-symbol a)
                                   (emit-expr a idx-sym array-syms opencl-idx)))]
@@ -1506,7 +1506,7 @@
          ;; Non-arithmetic deftm helper -> C helper invocation (array-sym args as bare ptr).
          (let [base-sym (symbol (str (.-ns ^clojure.lang.Var resolved-var))
                                 (str (:name (meta resolved-var))))
-               c-name (str "gpufn_" (c-symbol base-sym))
+               c-name (gpu-helper-c-name base-sym)
                emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
                                   (c-symbol a)
                                   (emit-expr a idx-sym array-syms opencl-idx)))]
@@ -1961,6 +1961,14 @@
      body)
     @result))
 
+(defn gpu-helper-c-name
+  "Return the one canonical C-family symbol for a resolved deftm helper.
+
+  Call sites, generated reference helpers, and registered target overrides must
+  agree on this name without requiring source emission as a naming side effect."
+  [sym]
+  (str "gpufn_" (c-symbol sym)))
+
 (defn intrinsic-helper-module
   "Select intrinsic implementations and their compiler requirements together.
    Selection is explicit target policy, not semantic or type inference."
@@ -2013,7 +2021,7 @@
 (defn generate-c-helper
   "Generate a static C helper function from a GPU-inlinable deftm."
   [{:keys [sym var params tags source-body]}]
-  (let [c-name (str "gpufn_" (c-symbol sym))
+  (let [c-name (gpu-helper-c-name sym)
         ;; Return type from var metadata, not from tags (which are param-only dispatch tags)
         ret-tag (or (:raster.core/return-tag (meta var)) (last tags))
         ret-type (get tag->ctype-helper ret-tag "double")
