@@ -2,7 +2,7 @@
   "Backend-neutral device measurement values and sampling discipline.
 
    This namespace never launches a kernel and never chooses a schedule. A backend-facing caller
-   supplies `sample-fn`, which must return one DEVICE duration in nanoseconds. Keeping sampling,
+   supplies `sample-fn`, which returns one duration in nanoseconds under its explicit clock label. Keeping sampling,
    selection, and execution separate makes autotuning an explicit offline operation and prevents
    compilation from acquiring hidden device side effects.")
 
@@ -41,10 +41,11 @@
     (double (nth sorted-samples (max 0 (min (dec n) index))))))
 
 (defn summarize
-  "Summarize non-empty DEVICE-duration samples (nanoseconds) as a Measurement.
+  "Summarize non-empty duration samples (nanoseconds) as a Measurement.
 
    Options are metadata required to interpret/cache a result. `timing-source` must remain
-   explicit; production autotuning uses `:device-event`, while tests may use `:synthetic`.
+   explicit; production autotuning uses `:device-event`, public replay probes may use
+   `:host-synchronized-replay`, and tests may use `:synthetic`. These are not interchangeable.
    A result is stationary when population coefficient-of-variation is below `cv-threshold`."
   [samples-ns & {:keys [cv-threshold warmup-iterations budget-ms cold-warm timing-source
                         compile-ms hashes]
@@ -97,10 +98,10 @@
                      samples))))
 
 (defn measure-interleaved!
-  "Compare already-prepared device sample functions in rotating round-robin order.
+  "Compare already-prepared sample functions sharing one clock in rotating round-robin order.
 
    Candidates are an ordered vector of {:id keyword :sample-fn fn}. Each callback returns
-   device nanoseconds and owns required restoration/synchronization. Compilation, allocation,
+   nanoseconds under the explicit timing-source and owns restoration/synchronization. Compilation, allocation,
    validation and persistence belong to the caller. Warmup samples are checked but not reported.
    Fixed rounds bound the number of callbacks, not wall time. Raw chronological samples and
    per-candidate Measurement values are returned; no winner or performance admission is inferred.
