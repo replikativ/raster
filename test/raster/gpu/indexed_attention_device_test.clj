@@ -115,16 +115,29 @@
     (device-probe/opencl-skip! "indexed malformed endpoint agreement" :subgroups)
     (doseq [strategy [:reference :subgroup-score-reuse]
             endpoint ['dst 'src]
-            invalid [-1 Long/MAX_VALUE]]
+            invalid [-1 Long/MAX_VALUE]
+            edge [1 3]]
       (let [case (test-case)
             indices (aclone ^longs (get-in case [:buffers endpoint]))
             expected (float-array (for [i (range 15)]
                                     (if (= 4 (mod i 5)) 0.0 Float/NaN)))]
-        ;; Put the invalid edge last so earlier valid work cannot mask the error.
-        (aset-long indices 3 invalid)
+        ;; Exercise both sticky poisoning before subsequent edges and a late error.
+        (aset-long indices edge invalid)
         (run-case :ocl:0 strategy
                   (-> case (assoc-in [:buffers endpoint] indices)
                       (assoc :expected expected)))))))
+
+(deftest indexed-schedules-preserve-nan-scores
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "indexed NaN score propagation" :subgroups)
+    (doseq [strategy [:reference :subgroup-score-reuse]
+            operand ['Q 'K]]
+      (let [{:keys [plan shape-env buffers] :as case} (test-case)
+            values (aclone ^floats (get buffers operand))
+            _ (aset-float values 0 Float/NaN)
+            buffers (assoc buffers operand values)
+            expected (reference/evaluate plan {:buffers buffers :scalars shape-env})]
+        (run-case :ocl:0 strategy (assoc case :buffers buffers :expected expected))))))
 
 (deftest level-zero-indexed-attention-matches-independent-plan-oracle
   (if-not @gp/gpu-available?
@@ -243,7 +256,8 @@
     (let [descriptor (pipeline/compile-gpu-program
                       #'resident-indexed-attention-probe :ocl:0 :dtype :float)
           small (production-case descriptor 4)
-          wide (production-case descriptor 512)]
+          ;; 257 components require a partial seventeenth tile, plus one unused row tail.
+          wide (production-case descriptor 515)]
       (is (= :indexed-segmented-reduction-reference (:selected small)))
       (is (= :indexed-segmented-reduction-subgroup-score-reuse (:selected wide)))
       (is (< (:max-error small) 2.0e-5))
