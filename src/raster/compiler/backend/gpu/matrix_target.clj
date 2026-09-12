@@ -47,6 +47,10 @@
    (let [body (kernel-body/validate! body)
          plan (matrix-plan/analyze body)
          dialect (c-dialect/resolve! target-dialect)
+         _ (when (and (not= :opencl-intel (:id dialect))
+                       (some some? (vals (:input-regions plan))))
+             (throw (ex-info "matrix target has no lowering for a transformed tile input"
+                             {:reason :matrix-input-region-not-lowered :target target-dialect})))
          parameter-names (target-names/validate!
                           kernel-name body
                           (target-names/parameter-names body parameter-names))

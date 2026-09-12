@@ -50,9 +50,9 @@
         base-parameters
         (vec
          (concat
-          [(body/->KernelParameter row :input :half (get buffer-shapes row [M K])
+          [(body/->KernelParameter row :input (:dtype row-layout) (get buffer-shapes row [M K])
                                    :global row-layout :lhs)
-           (body/->KernelParameter col :input :half (get buffer-shapes col [K N])
+           (body/->KernelParameter col :input (:dtype col-layout) (get buffer-shapes col [K N])
                                    :global col-layout :rhs)
            (body/->KernelParameter out :output result-dtype (get buffer-shapes out [M N])
                                    :global out-layout :result)
@@ -82,10 +82,13 @@
   `dimensions` are semantic tensor extents while `dimension-parameters` are the ordered compiler
   identities bound to the emitted M/N/K ABI.  Keeping both makes static contraction facts and
   symbolic resident graphs share one body without renaming caller values.  The current matrix
-  instruction is f16×f16→f32; `result-dtype` controls only the final store representation."
+  instruction is f16×f16→f32; `result-dtype` controls only the final store representation.
+  Optional `input-value-regions` maps operand identities to closed typed ScalarSSARegions.
+  Their declared input dtype describes storage; their result remains the instruction's FP16
+  fragment dtype. Target lowering must explicitly admit the resulting representation change."
   [{:keys [id row col out dimensions dimension-parameters axis-symbols tile bindings epilogue
            result-dtype provenance additional-parameters additional-indices buffer-shapes
-           buffer-views operation-buffers k-range launch-group-count attributes]
+           buffer-views operation-buffers k-range launch-group-count attributes input-value-regions]
     :or {dimension-parameters ['M 'N 'K]
          axis-symbols ['i 'j 'k]
          result-dtype :half
@@ -95,8 +98,17 @@
          buffer-shapes {}
          buffer-views []
          operation-buffers {}
+         input-value-regions {}
          attributes {}}}]
-  (let [tile (assoc tile :num-stages (or (:num-stages tile) 3))
+  (let [_ (when-not (and (map? input-value-regions)
+                         (every? #{row col} (keys input-value-regions)))
+            (throw (ex-info "matrix input regions must name existing operands"
+                            {:reason :matrix-input-region-buffer :regions input-value-regions})))
+        row-region (get input-value-regions row)
+        col-region (get input-value-regions col)
+        row-dtype (if row-region (:accumulator-dtype row-region) :half)
+        col-dtype (if col-region (:accumulator-dtype col-region) :half)
+        tile (assoc tile :num-stages (or (:num-stages tile) 3))
         _ (when-not (and (= 3 (count dimension-parameters))
                          (every? compiler-id? dimension-parameters)
                          (= 3 (count (set dimension-parameters))))
@@ -119,8 +131,8 @@
         k-width (max 1 (quot 32 (layout/dtype-bits :half)))
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
-        row-storage-layout (layout/row-major (get buffer-shapes row [M K]) :half)
-        col-storage-layout (layout/row-major (get buffer-shapes col [K N]) :half)
+        row-storage-layout (layout/row-major (get buffer-shapes row [M K]) row-dtype)
+        col-storage-layout (layout/row-major (get buffer-shapes col [K N]) col-dtype)
         out-layout (layout/row-major (get buffer-shapes out [M N]) result-dtype)
         buffer-layouts {row row-storage-layout col col-storage-layout out out-layout}
         buffer-views (mapv (fn [view]
@@ -209,13 +221,14 @@
             (body/->TilePrefetch
              row-buffer [(add m-base (* mm matrix-m))
                          (k-add k-fragment (* num-stages matrix-k))]
-             [matrix-m matrix-k] row-layout :prefetch-active num-stages))
+             [matrix-m matrix-k] (if row-region (layout/row-major [matrix-m matrix-k] row-dtype)
+                                     row-layout) :prefetch-active num-stages))
           (for [nn (range n-fragments)]
             (body/->TileLoad (fragment-id "rhs" nn) col-buffer
-                             [k-fragment (n-base nn)] :k-active :cached nil))
+                             [k-fragment (n-base nn)] :k-active :cached col-region))
           (for [mm (range m-fragments)]
             (body/->TileLoad (fragment-id "lhs" mm) row-buffer
-                             [(add m-base (* mm matrix-m)) k-fragment] :k-active :cached nil))
+                             [(add m-base (* mm matrix-m)) k-fragment] :k-active :cached row-region))
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->MatrixMad (fragment-id "acc" mm nn)
                               (fragment-id "lhs" mm)

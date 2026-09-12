@@ -174,6 +174,8 @@
   [kernel-name kernel-body target]
   (let [dialect (fragment-dialect! target)
         plan (matrix-plan/analyze kernel-body)
+        _ (decline! target (not-any? some? (vals (:input-regions plan)))
+                    :input-region-not-lowered {:input-regions (:input-regions plan)})
         names (target-names/validate! kernel-name kernel-body
                                       (target-names/parameter-names kernel-body nil))
         region (scalar-emitter/lower-uniform-store-region kernel-body names target)

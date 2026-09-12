@@ -69,8 +69,12 @@
                      (:indices kernel-body))
         strides (for [view (:views kernel-body) :when (contains? inputs (:buffer view))]
                   (walk/postwalk-replace groups (:element-offset view)))]
-    {:preconditions (into (matrix-preconditions m n k strides)
-                          (partition-preconditions kernel-body k))
+    {:preconditions (cond-> (into (matrix-preconditions m n k strides)
+                                  (partition-preconditions kernel-body k))
+                      ;; A transformed FP32 TileLoad still prefetches the physical FP32 surface.
+                      ;; Preserve the existing 16 MiB byte-width limit with four-byte elements.
+                      (some #(and (= :lhs (:role %)) (= :float (:dtype %))) (:parameters kernel-body))
+                      (conj {:expression k :op :<= :value 4194304}))
      :parameter-alignments (zipmap inputs (repeat 64))}))
 
 (defn static-failure

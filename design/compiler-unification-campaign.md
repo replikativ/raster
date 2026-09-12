@@ -983,6 +983,17 @@ every nonnil input region explicitly: this contract alone does not enable conver
 Store-epilogue collection now excludes load regions. Production enablement must lower the
 matching FP32 prefetch, retain Intel byte-pitch/extent constraints, and validate masked zeros.
 
+The narrow Intel lowering now accepts an explicit lhs FP32→FP16 nearest-even/IEEE cast region
+from a scheduled matrix body. Shared scalar lowering spells the conversion, while the tested
+lane/component mapping packs the fragment. Warm-up and steady prefetches both use FP32 storage;
+the physical contract caps K for four-byte surface widths. Row-tail loads are guarded and fill
+zero. RHS transformations, views, partitioned K, and non-Intel targets remain explicit declines.
+A tiny generated `[13 32 32]` Arc kernel matches all 416 outputs exactly with no temporary buffer.
+This is target-lowering validation, not automatic public GEMM graph fusion or a speed claim.
+Next: broaden numerical/schedule cases, add the eligible conversion→matrix graph rewrite as a
+candidate preserving ABI/effects, then compare changing-activation workloads against the existing
+global conversion strategy with stationary measurements and external baselines.
+
 An additional host boundary probe exposed JVM AOT overflow debt: `compile-aot` of the prebound
 canary with `m=Long/MAX_VALUE, n=2, k=0` previously returned an unchanged sentinel buffer instead
 of throwing on the source long product. The bytecode emitter used `lmul`; the resident descriptor
