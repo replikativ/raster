@@ -297,8 +297,9 @@
          "  const int active = component < n_components && feature < total_dim;\n"
          "  " ctype " numerator = " zero ";\n"
          "  " ctype " denominator = " zero ";\n"
-         "  int invalid = n_edges < 0L || n_heads <= 0L || n_components <= 0L\n"
+         "  const int invalid_shape = n_edges < 0L || n_heads <= 0L || n_components <= 0L\n"
          "        || n_heads > total_dim / n_components;\n"
+         "  int invalid = invalid_shape;\n"
          "  for (long edge = 0L; edge < n_edges; ++edge) {\n"
          "    const long edge_destination = destination_indices[edge];\n"
          "    const long source = source_indices[edge];\n"
@@ -336,7 +337,7 @@
          "    const long active_width = n_heads * n_components;\n"
          "    for (long tail = active_width + lane; tail < total_dim; tail += "
          subgroup-size "L)\n"
-         "      output[destination * total_dim + tail] = invalid ? (" ctype ")NAN : " zero ";\n"
+         "      output[destination * total_dim + tail] = invalid_shape ? (" ctype ")NAN : " zero ";\n"
          "  }\n"
          "}\n")))
 
