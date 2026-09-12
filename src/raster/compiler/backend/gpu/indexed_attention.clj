@@ -1,12 +1,9 @@
 (ns raster.compiler.backend.gpu.indexed-attention
-  "Direct correctness lowering for recognized indexed graph attention.
+  "Artifact and ABI construction for indexed weighted-reduction schedules.
 
-   One work-item owns one destination/feature output and scans the edge list. The schedule is
-   intentionally simple, but it is genuinely fused: scores, clamped exponential weights,
-   denominator and weighted values remain private scalars and no edge-sized intermediates are
-   materialized."
-  (:require [clojure.string :as str]
-            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+   Reference and subgroup schedules lower through KernelBody and the common C-family emitter.
+   Scores, weights and reduction state stay private; no edge-sized intermediates are materialized."
+  (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-opencl]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -127,17 +124,6 @@
         subgroup (long (or (:subgroup-size desc) 16))
         maximum (long (or (:max-workgroup-size desc) 256))]
     (long (max 1 (min total-dim subgroup maximum)))))
-
-(defn- c-type
-  [dtype]
-  (case dtype :float "float" :double "double"))
-
-(defn- fp-literal
-  [dtype value]
-  (str (if (= :float dtype)
-         (Float/toString (float value))
-         (Double/toString (double value)))
-       (when (= :float dtype) "f")))
 
 (defn- kernel-name
   [plan shape]
@@ -266,81 +252,6 @@
   [desc]
   (long (or (:subgroup-size desc) 16)))
 
-(defn- score-reuse-source
-  [plan fields subgroup-size name]
-  (let [dtype (:accumulator-dtype plan)
-        ctype (c-type dtype)
-        zero (fp-literal dtype 0.0)
-        one (fp-literal dtype 1.0)
-        bound (fp-literal dtype (double (get-in plan [:score :arguments 2 :value])))
-        epsilon (fp-literal dtype (double (get-in plan [:normalization :epsilon])))
-        scalar-signature (->> fields
-                              (map (fn [{:keys [c-name]}] (str "    long " c-name)))
-                              (str/join ",\n"))]
-    (str (when (= :double dtype)
-           "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
-         "__attribute__((intel_reqd_sub_group_size(" subgroup-size ")))\n"
-         "__kernel void " name "(\n"
-         "    __global const " ctype "* q,\n"
-         "    __global const " ctype "* k,\n"
-         "    __global const " ctype "* v,\n"
-         "    __global const long* destination_indices,\n"
-         "    __global const long* source_indices,\n"
-         "    __global " ctype "* output,\n"
-         scalar-signature ") {\n"
-         "  const long lane = (long)get_sub_group_local_id();\n"
-         "  const long component_tile = (long)get_group_id(0);\n"
-         "  const long head = (long)get_group_id(1);\n"
-         "  const long destination = (long)get_group_id(2);\n"
-         "  const long component = component_tile * " subgroup-size "L + lane;\n"
-         "  const long feature = head * n_components + component;\n"
-         "  const int active = component < n_components && feature < total_dim;\n"
-         "  " ctype " numerator = " zero ";\n"
-         "  " ctype " denominator = " zero ";\n"
-         "  const int invalid_shape = n_edges < 0L || n_heads <= 0L || n_components <= 0L\n"
-         "        || n_heads > total_dim / n_components;\n"
-         "  int invalid = invalid_shape;\n"
-         "  for (long edge = 0L; edge < n_edges; ++edge) {\n"
-         "    const long edge_destination = destination_indices[edge];\n"
-         "    const long source = source_indices[edge];\n"
-         "    if (edge_destination < 0L || edge_destination >= n_entities\n"
-         "        || source < 0L || source >= n_entities) invalid = 1;\n"
-         "    const int visible = !invalid && edge_destination == destination;\n"
-         "    " ctype " partial_dot = " zero ";\n"
-         "    if (visible) {\n"
-         "      const long q_base = destination * total_dim + head * n_components;\n"
-         "      const long k_base = source * total_dim + head * n_components;\n"
-         "      for (long x = lane; x < n_components; x += " subgroup-size "L)\n"
-         "        partial_dot += q[q_base + x] * k[k_base + x];\n"
-         "    }\n"
-         "    const " ctype " dot = sub_group_reduce_add(partial_dot);\n"
-         "    " ctype " weight = " zero ";\n"
-         "    if (lane == 0L && visible) {\n"
-         "        const " ctype " scaled = dot * ((" ctype ")" one
-         " / sqrt((" ctype ")n_components));\n"
-         "        const " ctype " score = isnan(scaled) ? scaled\n"
-         "            : fmin((" ctype ")" bound ", fmax(-(" ctype ")" bound ", scaled));\n"
-         "        weight = exp(score);\n"
-         "    }\n"
-         "    weight = sub_group_broadcast(weight, 0);\n"
-         "    denominator += weight;\n"
-         "    if (active && visible)\n"
-         "      numerator += weight * v[source * total_dim + feature];\n"
-         "  }\n"
-         "  if (active) {\n"
-         "    const long output_index = destination * total_dim + feature;\n"
-         "    output[output_index] = invalid ? (" ctype ")NAN\n"
-         "        : (denominator == " zero " ? " zero
-         " : numerator / (denominator + (" ctype ")" epsilon "));\n"
-         "  }\n"
-         "  if (head == 0L && component_tile == 0L) {\n"
-         "    const long active_width = n_heads * n_components;\n"
-         "    for (long tail = active_width + lane; tail < total_dim; tail += "
-         subgroup-size "L)\n"
-         "      output[destination * total_dim + tail] = invalid_shape ? (" ctype ")NAN : " zero ";\n"
-         "  }\n"
-         "}\n")))
-
 (defn emit-dynamic-score-reuse
   "Emit a 3-D destination/head/component-tile schedule. One hardware subgroup cooperatively
    reduces each edge score and broadcasts its weight across component lanes. This retains the
@@ -356,15 +267,19 @@
         inputs (swr/ordered-input-ids plan)
         output (get-in plan [:output :id])
         dtype (:accumulator-dtype plan)
-        abi (dynamic-abi plan fields)
+        target-dialect (or (gpu-target/kernel-body-c-dialect desc) :opencl-portable)
+        dialect (c-dialect/resolve! target-dialect)
+        kernel-body (indexed-body/lower-dynamic-score-reuse plan subgroup-size)
+        base-abi (dynamic-abi plan fields)
+        parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+        abi (body-abi/project-contracts base-abi kernel-body)
         arguments (into (conj inputs output) values)]
     (kart/make
      {:kernel-name name
-      ;; This handwritten leaf is still Intel OpenCL-only, but it participates in the same
-      ;; logical dispatch as the portable KernelBody reference.  Kernel artifacts name the
-      ;; source-language target (`:opencl-c`), not the runtime backend (`:opencl`).
-      :target :opencl-c
-      :source (score-reuse-source plan fields subgroup-size name)
+      :target (c-dialect/target dialect)
+      :source (body-opencl/emit-scalar-kernel
+               name kernel-body
+               {:parameter-names parameter-names :target-dialect target-dialect})
       :abi abi
       :arguments arguments
       :launch (klaunch/spec
@@ -387,6 +302,8 @@
                    :dynamic-shape? true
                    :out-elems output-elements
                    :score-reuse-width subgroup-size
+                   :kernel-body kernel-body
+                   :target-dialect target-dialect
                    :materialized-intermediates []
                    :complexity :destination-head-edge-dot-plus-value}})))
 
