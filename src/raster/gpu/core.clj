@@ -1643,7 +1643,19 @@
               (vswap! groups conj {:key key :value value :dtype actual-dtype
                                    :elements elements :resident? resident?
                                    :indexes [index] :read? read? :write? write?}))))))
-    (when (= :kernel-graph (kexec/kind executable))
+    (let [groups @groups
+          key-by-index (reduce (fn [result {:keys [key indexes]}]
+                                 (reduce #(assoc %1 %2 key) result indexes))
+                               {} groups)]
+      {:groups groups
+       :arguments (mapv (fn [index [slot value]]
+                          (if (= :scalar (:kind slot)) value (get key-by-index index)))
+                        (range) (map vector (kexec/abi executable) typed-arguments))})))
+
+(defn- validate-staged-graph-capacities!
+  "Check the selected graph's extents, not the unselected default schedule's extents."
+  [executable typed-arguments]
+  (when (= :kernel-graph (kexec/kind executable))
       (let [{:keys [buffers scalar-values]} (kexec/graph-bindings executable typed-arguments)
             capacity-of (fn [value]
                           (if (dtype/dtype-for-jvm-array value)
@@ -1669,15 +1681,7 @@
             (throw (ex-info "staged graph buffer extent exceeds its supplied capacity"
                             {:reason :staged-graph-buffer-capacity
                              :buffer id :elements elements :resolved expected-elements
-                             :capacity actual-elements :graph-buffer graph-buffer}))))))
-    (let [groups @groups
-          key-by-index (reduce (fn [result {:keys [key indexes]}]
-                                 (reduce #(assoc %1 %2 key) result indexes))
-                               {} groups)]
-      {:groups groups
-       :arguments (mapv (fn [index [slot value]]
-                          (if (= :scalar (:kind slot)) value (get key-by-index index)))
-                        (range) (map vector (kexec/abi executable) typed-arguments))})))
+                             :capacity actual-elements :graph-buffer graph-buffer})))))))
 
 (declare run-kernel-graph!)
 
@@ -1703,14 +1707,12 @@
         typed-arguments (kexec/typed-runtime-arguments common runtime-arguments)
         ;; Validate the shared input representation before asking whether any schedule can use
         ;; these bindings. This pass groups identities but does not allocate or open a session.
-        common-plan (staged-pointer-plan device-id common typed-arguments)
+        {:keys [groups arguments]} (staged-pointer-plan device-id common typed-arguments)
         executable (:executable
                     (kdispatch/admit-alternative
                      dispatch typed-arguments
                      #(executable-alias-violations % typed-arguments)))
-        {:keys [groups arguments]} (if (identical? common executable)
-                                    common-plan
-                                    (staged-pointer-plan device-id executable typed-arguments))
+        _ (validate-staged-graph-capacities! executable typed-arguments)
         result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
                               (map vector (kexec/abi executable) typed-arguments))]
     (when (and (= :single result-policy) (> (count result-pairs) 1))

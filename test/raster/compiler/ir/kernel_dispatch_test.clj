@@ -304,6 +304,32 @@
                 (try (gpu/invoke-staged-executable! :probe "strict-only" [input input 3])
                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
 
+(deftest staged-admission-does-not-impose-an-unselected-default-extent
+  (let [choice (update (storage-dispatch) :alternatives
+                       (fn [[snapshot direct]]
+                         [(assoc-in snapshot [:inputs 0 :elements] 4) direct]))
+        input (float-array 3)
+        opened? (atom false)]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly choice)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session*
+       (fn [& _] (reset! opened? true) (throw (ex-info "past preflight" {:reason :past-preflight})))}
+      (fn []
+        (is (= :past-preflight
+               (try (gpu/invoke-staged-executable! :probe "storage-dispatch"
+                                                  [input (float-array 3) 3])
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is @opened?)
+        (reset! opened? false)
+        (is (= :staged-graph-buffer-capacity
+               (try (gpu/invoke-staged-executable! :probe "storage-dispatch" [input input 3])
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (false? @opened?) "the selected fallback must meet its own capacity contract")))))
+
 (deftest resident-storage-admission-precedes-backend-binding
   (let [step {:kernel-name "storage-dispatch" :phase :probe :convention :executable
               :dispatch (storage-dispatch)
