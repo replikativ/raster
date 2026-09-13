@@ -177,6 +177,20 @@
       (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs linked)))))))
 
+(deftest public-dense-input-gradient-retains-shape-only-array-input
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'nn/dense-backward-dx {:target target :dtype :double})
+          linked (equation-first/lower
+                  compilation [(double-array [2.0 -1.0])
+                               (double-array [1.0 2.0 3.0 4.0 5.0 6.0])
+                               (double-array 3)])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (seq (:kernels compilation)))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
+      (is (= 1 (count (:outputs linked)))))))
+
 (deftest public-staged-contraction-preserves-independent-types-on-cuda-and-hip
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
     (let [compilation (equation-first/compile

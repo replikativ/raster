@@ -106,6 +106,24 @@
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
 
+(deftest scalar-metadata-captures-retain-shape-witness-arrays
+  (let [program
+        (frontend/form->program
+         '(let* [^long cols (clojure.core/alength x)
+                 result (raster.par/pmap j cols double (clojure.core/aget y j))]
+            result)
+         {:dtype :double
+          :array-types {'x :double 'y :double}
+          :scalar-types {'cols :long}})
+        values (:values (dialect/facts program))]
+    (is (some? program))
+    (is (= ['scalar 'map] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= #{'x 'y} (set (:inputs (dialect/facts program)))))
+    (is (= :double (get-in values ['x :dtype])))
+    (is (= '[(unknown-dimension x)] (get-in values ['x :shape])))
+    (is (= {:dtype :long :shape []}
+           (select-keys (get values 'cols) [:dtype :shape])))))
+
 (deftest physical-allocation-initialization-survives-host-scaffolding
   (let [contracts
         (fn [allocation]

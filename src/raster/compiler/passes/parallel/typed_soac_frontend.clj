@@ -2987,6 +2987,15 @@
      (if (= 'scalar kind)
        (into {} (keep (fn [id]
                         (when-let [value (or (get known-values id)
+                                             ;; A scalar may read array metadata without reading an
+                                             ;; element, for example `(alength shape-witness)`.  Such
+                                             ;; a capture is still a tensor input.  Its declaration
+                                             ;; proves the element dtype but not its capacity; unlike
+                                             ;; an element operand, the scalar equation has no launch
+                                             ;; extent from which a storage shape could be inferred.
+                                             (when-let [declared (declared-type array-types id)]
+                                               (tensor-value declared
+                                                             [(list 'unknown-dimension id)]))
                                              (when-let [declared (declared-type scalar-types id)]
                                                (tensor-value declared []))
                                              (when-let [declared (and (symbol? id)
