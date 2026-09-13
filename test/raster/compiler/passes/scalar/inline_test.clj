@@ -33,6 +33,16 @@
     (doseq [index [-1 2 'n '(long n) '(int 4294967296) '(float 1)]]
       (is (nil? (#'inline/known-vg-element elements 'vg index))))))
 
+(deftest lifted-arguments-retain-source-types-not-formal-consumer-types
+  (doseq [[argument environment] [['(float 1.0) {}]
+                                 ['(clojure.core/aget a 0) {'a 'floats}]]]
+    (let [bindings (atom [])
+          substitution (#'inline/argument-substitution
+                        ['x] [argument] ['double] environment #(swap! bindings conj %))
+          id (get substitution 'x)]
+      (is (= 'float (:raster.type/tag (meta id))))
+      (is (= [[id argument]] @bindings)))))
+
 (deftest leaf-bodies-are-inlinable
   (doseq [body ['x 'java.lang.Float/NEGATIVE_INFINITY 42 1.5 nil true]]
     (is (#'inline/inlinable-body? body))))

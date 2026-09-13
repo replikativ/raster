@@ -146,7 +146,7 @@
 
 (defn- argument-substitution
   "Build a call-by-value substitution, emitting argument bindings in source order."
-  [params args tags emit!]
+  [params args tags source-env emit!]
   (into {}
         (map-indexed
          (fn [i p]
@@ -155,8 +155,14 @@
                  typed? (and t (not (arg-subst-skip-tags t)) (symbol? a)
                              (not (.contains (str t) "IFn__")))]
              (if (or typed? (needs-arg-lift? a))
-               (let [id (with-meta (gensym (str "arg_" (name p) "_"))
-                                  (if typed? {:tag t} (meta a)))]
+               ;; A new binder must retain the argument's actual source type. The formal
+               ;; parameter may widen it; stamping that consumer type here loses precision
+               ;; boundaries. Use the same metadata/environment authority as call resolution.
+               (let [source-tag (when-not typed? (inf/infer-arg-tag a source-env))
+                     id (with-meta (gensym (str "arg_" (name p) "_"))
+                                   (if typed? {:tag t}
+                                       (cond-> (meta a)
+                                         source-tag (assoc :raster.type/tag source-tag))))]
                  (emit! [id a])
                  [p id])
                [p a])))
@@ -1083,7 +1089,7 @@
                          (when (and (= (count params) (count args))
                                     (or inline? single-use?))
                            (let [subst (argument-substitution
-                                        params args nil #(swap! result-pairs conj %))]
+                                        params args nil @type-env #(swap! result-pairs conj %))]
                              {:body (subst-syms subst body)}))))]
                  (if beta-result
                    (do (swap! result-pairs conj [sym (:body beta-result)])
@@ -1135,7 +1141,7 @@
                  ;;    appears multiple times in the callee body (e.g. inside par/pmap
                  ;;    where CSE can't extract the duplicate afterward)
                                  param-subst
-                                 (argument-substitution callee-params args tags
+                                 (argument-substitution callee-params args tags @type-env
                                                         #(swap! result-pairs conj %))]
                              (if (form/binding-form? body-form)
                                (let [[_ inner-bindings & inner-body] body-form
@@ -1316,7 +1322,7 @@
                    ;; ANF lifting + typed bindings — same logic as inline-one-pass
                    lifted-bindings (atom [])
                    param-subst
-                   (argument-substitution callee-params args tags
+                   (argument-substitution callee-params args tags *param-env*
                                           #(swap! lifted-bindings into %))
                    inlined (subst-syms param-subst body-form)
                    ;; mark this callee as on the inline stack while re-processing its
