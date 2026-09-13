@@ -112,11 +112,12 @@ alias requirements retain the actual requested subview. Declared source initiali
 from caller obligations and are not immutable snapshots or completed uploads. Produced storage
 does not imply retained semantic identity for private temporary values. These are conditional
 local facts; distributed lowering still needs to discharge them and establish freshness.
-The facts are conservative, not minimal across all aliases. The current `gpu.link` runtime also
-maintains `pending-inputs` for every owned, source-less input/constant/state node, including nodes
-that this analysis proves unused or written before reading. An executor must reconcile that gate
-with proven initialization and shared external bindings; it must not simply treat an empty
-`:requires` set as permission to bypass existing `run!` input checks.
+The facts are conservative, not minimal across all aliases. The `gpu.link` runtime now derives
+owned `pending-inputs` from this same `:requires` set, so unused inputs and state fully produced
+before reading do not demand redundant uploads. Pass-through outputs still require initialization.
+Borrowed/external buffers retain their existing caller-initialized contract; importing a buffer
+does not itself prove completion of a distributed producer. A distributed executor must discharge
+those external preconditions through actual completed events, not bypass `run!` input checks.
 
 The proof reuses LinkPlan's ordered instance access facts and its existing
 `produced-views`/`partial-writes` accounting. `value-accesses` deliberately summarizes ABI access

@@ -104,6 +104,7 @@
   ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [plan (link-plan/validate! plan)
+         initialization (link-plan/initialization-contract plan)
          program-instances (filterv link-plan/program-link-instance? (:instances plan))
          _ (when (and (seq program-instances) (not= 1 (count (:instances plan))))
              (throw (ex-info
@@ -234,10 +235,9 @@
            (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
                                @allocation-keys node-views
                                (atom (into #{}
-                                           (keep (fn [[node-id {:keys [role source view]}]]
-                                                   (when (and (contains? #{:input :constant :state}
-                                                                         role)
-                                                              (nil? source)
+                                           (keep (fn [[node-id {:keys [view]}]]
+                                                   (when (and (contains? (:requires initialization)
+                                                                         node-id)
                                                               (= :owned (get-in view
                                                                                 [:allocation
                                                                                  :ownership])))
