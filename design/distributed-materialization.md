@@ -1,7 +1,8 @@
 # Distributed materialization and execution boundary
 
 Status: owned-domain normalization, copy-replica geometry/coverage and exact boundary
-provider bindings are implemented; initialization/freshness, endpoint realization and execution
+provider bindings and contiguous halo endpoint projection are implemented; initialization/freshness,
+runtime allocation/transport realization and execution
 remain a reviewed plan.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
@@ -88,12 +89,29 @@ Resolve transfer endpoints through these placement identities. Avoid a second ha
 of ABI arguments or duplicate source/destination rectangle declarations. If the source owned
 realization cannot be identified uniquely, or the target replica is absent, lowering must refuse
 execution even when the topology-only plan remains useful for simulation.
+`distributed-plan/transfer-bindings` now performs this strict geometric projection for every
+transfer in a plan. It indexes owned sources by device/value/shard and replica destinations by
+device/transfer, derives each source rectangle relative to its owned shard, and returns the existing
+BufferView records with exact shape/dtype/byte agreement. Analytical plans are still accepted by
+the ordinary planner when endpoints are absent; requesting strict projection rejects them.
+The current projector supports only contiguous plain ScheduledHalo copies. Generic transfers,
+combining transfers, and strided faces require additional lowerings and are rejected. This report
+is not an execution certificate: it does not establish source initialization/freshness, actual
+allocation sharing, event completion, or a usable transport implementation.
 Only copy-mode halos create replica placements. Combining halo transfers must use their certified
 reduction over the derived owned target face in global coordinates, not an absent ghost replica;
 they must never be silently implemented as a copy. The initial copy-mode vertical rejects these
 until its runtime can execute the stated reduction.
 
 ## Readiness is separate from geometry
+
+The next proof should reuse LinkPlan's ordered instance access facts and its existing
+`produced-views`/`partial-writes` accounting. `value-accesses` deliberately summarizes ABI access
+only; a `:write` entry is not an initialization postcondition. LinkPlan currently assumes caller
+input/constant/state nodes are initialized when checking the local program. Distributed lowering
+must discharge those caller preconditions using source leases and completed producers/transfers,
+not inherit the assumption as evidence. Expose the shared local pre/postcondition calculation
+from the existing validator rather than adding a second kernel-effect registry.
 
 Before an executable plan can allocate resources, prove:
 

@@ -47,13 +47,13 @@
 (defn- local-link-plan
   ([] (local-link-plan {}))
   ([opts]
-   (let [{:keys [x-shape x-dtype target]
-          :or {x-shape [2 3] x-dtype :float target :gpu-0}} opts
+   (let [{:keys [x-shape x-dtype target elements tail-shape]
+          :or {x-shape [2 3] x-dtype :float target :gpu-0 elements 6 tail-shape [2 3]}} opts
          weights-source (if (contains? opts :weights-source)
                           (:weights-source opts)
-                          (float-array 6))
+                          (float-array elements))
          node (fn [id role source]
-                (link/node {:id id :dtype :float :shape [6] :device target :role role
+                (link/node {:id id :dtype :float :shape [elements] :device target :role role
                             :source source}))
          x (node :x-node :input nil)
          weights (node :weights-node :constant weights-source)
@@ -62,15 +62,15 @@
       {:id :local-copy :target target :nodes [x weights y]
        :values [(link/value {:id :local-x :abstract (local-abstract x-dtype x-shape)
                              :leaves [{:name :value :node :x-node}]})
-                (link/value {:id :local-weights :abstract (local-abstract [2 3])
+                (link/value {:id :local-weights :abstract (local-abstract tail-shape)
                              :leaves [{:name :value :node :weights-node}]})
-                (link/value {:id :local-y :abstract (local-abstract [2 3])
+                (link/value {:id :local-y :abstract (local-abstract tail-shape)
                              :leaves [{:name :value :node :y-node}]})]
        :instances [(link/instance {:id :copy :descriptor copy-descriptor
                                    :bindings {'x :local-x
                                               'weights :local-weights
                                               'y :local-y}
-                                   :scalars {'n 6}})]
+                                   :scalars {'n elements}})]
        :outputs [:y-node]}))))
 
 (defn- topology []
@@ -330,6 +330,98 @@
            (failure-reason #(distributed/plan
                              (assoc-in plan [:device-plans :gpu-0 :entries :boundary :link-plan
                                              :nodes :boundary-node :view :byte-offset] 8)))))))
+
+(defn- fully-bound-periodic-plan []
+  (let [base (periodic-materialization-plan)
+        incoming (filter #(= :gpu-1 (:target %)) (get-in base [:halos 0 :steps]))]
+    (assoc-in base [:device-plans :gpu-1]
+              {:entries {:copy {:link-plan (local-link-plan {:x-shape [6] :target :gpu-1})}}
+               :steps {:analytical-only
+                       {:entry :copy
+                        :bindings {:local-x {:local-shape [3 2]
+                                             :placements (into [{:kind :owned :value :x :shard :x-1
+                                                                 :local-offsets [1 0]}]
+                                                               (map (fn [s] {:kind :replica :transfer (:id s)}) incoming))}
+                                   :local-y {:value :y :shard :y-1}}}}})))
+
+(deftest copy-transfer-endpoints-come-from-owned-and-replica-views
+  (let [plan (distributed/plan (fully-bound-periodic-plan))
+        endpoints (distributed/transfer-bindings plan)]
+    (is (= 4 (count endpoints)))
+    (doseq [[id {:keys [source target bytes]}] endpoints]
+      (is (= 8 bytes))
+      (is (= 8 (get-in source [:view :byte-offset]))
+          "the source is the owned row, not the beginning of its padded allocation")
+      (is (contains? #{0 16} (get-in target [:view :byte-offset])))
+      (is (= id (:replica target)))
+      (is (not= (:device source) (:device target)))
+      (is (= [1 2] (get-in source [:view :shape]) (get-in target [:view :shape]))))
+    (is (= :distributed-transfer-target
+           (failure-reason #(distributed/transfer-bindings
+                             (distributed/plan (periodic-materialization-plan)))))
+        "an analytical plan may lack physical destinations, strict lowering may not")
+    (is (= :distributed-transfer-source
+           (failure-reason #(distributed/transfer-bindings
+                             (assoc-in plan [:device-plans :gpu-0] {})))))
+    (is (= {} (distributed/transfer-bindings (make-plan))))
+    (let [generic (distributed/transfer-step {:id :generic :source :gpu-0 :target :gpu-1
+                                              :route [:forward] :value :x :bytes 8})
+          analytical (distributed/plan (update plan :steps conj generic))]
+      (is (= :distributed-transfer-kind
+             (failure-reason #(distributed/transfer-bindings analytical)))
+          "an analytical transfer is not silently lowered as a halo copy"))))
+
+(deftest unequal-shard-upper-faces-use-owned-relative-coordinates
+  (let [base (fully-bound-periodic-plan)
+        global (assoc (get-in base [:values :x]) :shape [6 2])
+        shards [(assoc (get-in base [:shards :x 0]) :shape [2 2])
+                (assoc (get-in base [:shards :x 1]) :offsets [2 0] :shape [4 2])]
+        old (get-in base [:halos 0])
+        halo (distributed/schedule-halo (:exchange old) global shards (:routes old) [])
+        base (-> base (assoc-in [:values :x] global) (assoc-in [:shards :x] shards)
+                 (assoc :halos [halo] :steps (into (:steps halo) (filter #(= :compute (:kind %)) (:steps base)))))
+        plan (reduce
+              (fn [p [device step rows result]]
+                (let [n (* 2 (+ rows 2))
+                      local (local-link-plan {:x-shape [n] :tail-shape [n] :elements n :target device})
+                      value (assoc (global-value) :shape [n]
+                                   :sharding {:kind :replicated :devices [device]})]
+                  (-> p
+                      (assoc-in [:values result] value)
+                      (assoc-in [:shards result] [(distributed/shard {:id result :value result :device device
+                                                                      :offsets [0] :shape [n] :ownership :replica})])
+                      (assoc-in [:device-plans device :entries :copy :link-plan] local)
+                      (assoc-in [:device-plans device :steps step :bindings :local-y] {:value result :shard result})
+                      (assoc-in [:device-plans device :steps step :bindings :local-x :local-shape] [(+ rows 2) 2]))))
+              base [[:gpu-0 :copy-0 2 :left-result] [:gpu-1 :analytical-only 4 :right-result]])
+        endpoints (distributed/transfer-bindings (distributed/plan plan))]
+    (is (= 16 (get-in endpoints [[:periodic :edge 0 :forward] :source :view :byte-offset]))
+        "left upper face: one padding row plus one owned-relative row")
+    (is (= 8 (get-in endpoints [[:periodic :edge 0 :backward] :source :view :byte-offset]))
+        "right lower face: subtract global row two, then apply one padding row")
+    (is (= 32 (get-in endpoints [[:periodic :edge 1 :forward] :source :view :byte-offset]))
+        "right periodic upper face: padding plus three owned-relative rows")
+    (is (= 24 (get-in endpoints [[:periodic :edge 0 :backward] :target :view :byte-offset])))
+    (is (= 40 (get-in endpoints [[:periodic :edge 1 :backward] :target :view :byte-offset])))))
+
+(deftest strided-faces-require-pack-unpack-not-a-bounding-span-copy
+  (let [base (fully-bound-periodic-plan)
+        global (assoc-in (get-in base [:values :x]) [:sharding :axis] 1)
+        shards (mapv #(assoc % :shape [2 1] :offsets (vec (reverse (:offsets %))))
+                     (get-in base [:shards :x]))
+        old (get-in base [:halos 0])
+        halo (distributed/schedule-halo (assoc (:exchange old) :axis 1) global shards (:routes old) [])
+        plan (-> base (assoc-in [:values :x] global) (assoc-in [:shards :x] shards)
+                 (assoc :halos [halo] :steps (into (:steps halo) (filter #(= :compute (:kind %)) (:steps base)))))
+        plan (reduce (fn [p [device step]]
+                       (-> p
+                           (assoc-in [:device-plans device :steps step :bindings :local-x :local-shape] [2 3])
+                           (assoc-in [:device-plans device :steps step :bindings :local-x :placements 0
+                                      :local-offsets] [0 1])))
+                     plan [[:gpu-0 :copy-0] [:gpu-1 :analytical-only]])]
+    (is (distributed/distributed-plan? (distributed/plan plan)))
+    (is (= :distributed-transfer-layout
+           (failure-reason #(distributed/transfer-bindings (distributed/plan plan)))))))
 
 (deftest compute-bindings-retain-exact-link-values-and-derived-accesses
   (let [plan (make-plan)
