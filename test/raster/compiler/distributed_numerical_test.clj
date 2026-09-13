@@ -3,6 +3,7 @@
    on one GPU; it proves compiled local updates and resident halo copies, not a multi-host runtime."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
             [raster.numeric :as numeric]
             [raster.ode.pde :as pde]
             [raster.compiler.equation-first :as equation]
@@ -36,6 +37,9 @@
 
 (def ^:private compiled-step
   (delay (equation/compile #'heat-step! {:target :ze:0 :dtype :double})))
+
+(def ^:private compiled-copy
+  (delay (equation/compile #'arrays/acopy! {:target :ze:0 :dtype :double})))
 
 (defn- problem []
   (let [shards [(distributed/shard {:id :left :value :u :device :worker-0
@@ -448,6 +452,136 @@
                (try (gpu-distributed/run! executable) nil
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
             "a second run needs new initialization/freshness evidence")))))
+
+(deftest generated-region-copy-keeps-the-whole-destination-and-untouched-regions
+  (let [source (double-array (range 9)) destination (double-array (repeat 13 -1.0))
+        expected (aclone destination)
+        plan (equation/lower @compiled-copy [source 2 destination 4 3])
+        output (first (:outputs plan))]
+    (System/arraycopy source 2 expected 4 3)
+    (is (= 2 (count (:nodes plan))) "an effect alias must not allocate a new result tensor")
+    (is (= [13] (get-in plan [:nodes output :view :shape]))
+        "the mutation result is the destination, not the copied three-element region")
+    (if-not @gp/gpu-available?
+      (gp/gpu-skip! "generated-region-copy-mutation-extent")
+      (with-open [executable (link/instantiate! plan)]
+        (link/run! executable)
+        (is (= (vec expected) (vec (link/download executable output))))))))
+
+(defn- colocated-periodic-heat-plan []
+  (let [p (problem)
+        workers (mapv :device (:shards p))
+        initial (local-inputs p)
+        locals (into {}
+                     (map (fn [{:keys [id device shape]}]
+                            (let [u (initial id) n (alength ^doubles u)
+                                  out (double-array n) rhs (double-array n)
+                                  fields {u :u out :out rhs :rhs}
+                                  place (fn [local]
+                                          (update local :nodes
+                                                  #(update-vals %
+                                                                (fn [node]
+                                                                  (update-in node [:view :allocation :id]
+                                                                             (fn [id] [device (or (fields (:source node)) id)]))))))]
+                              [device {:shape [(+ 2 (first shape)) width]
+                                       :heat (place (equation/lower @compiled-step [out u rhs (+ 2 (first shape)) width dt]))
+                                       :copy (place (equation/lower @compiled-copy [out 0 u 0 n]))
+                                       :fields fields :shard id}]))) (:shards p))
+        state-value (av/tensor {:dtype :double :shape [6 width]
+                                :sharding {:kind :partitioned :axis 0 :devices workers}})
+        globals (into {:u state-value}
+                      (for [[worker local] locals field [:out :rhs]]
+                        [[worker field] (av/tensor {:dtype :double :shape (:shape local)
+                                                   :sharding {:kind :replicated :devices [worker]}})]))
+        shards (into {:u (mapv #(assoc % :value :u) (:shards p))}
+                     (for [[worker local] locals field [:out :rhs]
+                           :let [id [worker field]]]
+                       [id [(distributed/shard {:id id :value id :device worker :offsets [0 0]
+                                                :shape (:shape local) :ownership :replica})]]))
+        routes {(vec workers) [:forward] (vec (reverse workers)) [:backward]}
+        epochs (mapv (fn [epoch]
+                       (let [previous (if (zero? epoch) [] (mapv #(vector :copy (dec epoch) %) workers))
+                             halo (distributed/schedule-halo
+                                    (distributed/halo-exchange {:id [:halo epoch] :value :u :axis 0 :width 1 :boundary :periodic})
+                                    state-value (:u shards) routes previous)]
+                         {:halo halo
+                          :steps (into (:steps halo)
+                                       (concat
+                                        (map (fn [worker] (distributed/compute-step
+                                                          {:id [:heat epoch worker] :device worker :duration-ns 1
+                                                           :dependencies (:completions halo)})) workers)
+                                        (map (fn [worker] (distributed/compute-step
+                                                          {:id [:copy epoch worker] :device worker :duration-ns 1
+                                                           :dependencies (mapv #(vector :heat epoch %) workers)})) workers)))}))
+                     (range iterations))
+        bindings (fn [worker local entry halo]
+                   (into {}
+                         (keep (fn [[id value]]
+                                 (when-let [field ((:fields local) (get-in entry [:nodes (get-in value [:leaves 0 :node]) :source]))]
+                                   [id (if (= :u field)
+                                         {:local-shape (:shape local)
+                                          :placements (into [{:kind :owned :value :u :shard (:shard local) :local-offsets [1 0]}]
+                                                            (map #(hash-map :kind :replica :transfer (:id %)))
+                                                            (filter #(= worker (:target %)) (:steps halo)))}
+                                         {:local-shape (:shape local)
+                                          :placements [{:kind :owned :value [worker field] :shard [worker field]
+                                                        :local-offsets [0 0]}]})]))) (:values entry)))]
+    (distributed/plan
+     {:id :colocated-periodic-heat
+      :mesh (distributed/mesh [{:name :workers :size 2}] workers)
+      :topology (distributed/topology
+                 (mapv #(distributed/device {:id % :memory-capacity-bytes 1048576}) workers)
+                 [(distributed/link {:id :forward :source (first workers) :target (second workers)
+                                     :bandwidth-bytes-s 1.0e9 :latency-ns 100})
+                  (distributed/link {:id :backward :source (second workers) :target (first workers)
+                                     :bandwidth-bytes-s 1.0e9 :latency-ns 100})])
+      :values globals :shards shards :halos (mapv :halo epochs)
+      :device-plans (into {}
+                          (map (fn [[worker local]]
+                                 [worker {:target :ze:0
+                                          :entries {:heat {:link-plan (:heat local)} :copy {:link-plan (:copy local)}}
+                                          :steps (into {} (for [[epoch {:keys [halo]}] (map-indexed vector epochs)
+                                                               kind [:heat :copy]]
+                                                           [[kind epoch worker]
+                                                            {:entry kind :bindings (bindings worker local (get local kind) halo)}]))}])) locals)
+      :steps (vec (mapcat :steps epochs))
+      :outputs (mapv #(vector :copy (dec iterations) %) workers)})))
+
+(deftest two-logical-workers-execute-periodic-halos-through-one-gpu-dag
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "colocated-periodic-heat-dag")
+    (let [plan (colocated-periodic-heat-plan)
+          expected (loop [u (aclone ^doubles (:initial (problem))) epoch 0]
+                     (if (= epoch iterations)
+                       (subvec (vec u) width (* 7 width))
+                       (do (System/arraycopy u (* 6 width) u 0 width)
+                           (System/arraycopy u width u (* 7 width) width)
+                           (recur (heat-step! (double-array 56) u (double-array 56) 8 width dt) (inc epoch)))))
+          copy-range! gpu/copy-range! upload-range! gpu/upload-range!
+          copies (atom 0) uploads (atom 0)]
+      (with-redefs [gpu/make-session (fn [& _] (throw (ex-info "unexpected driver contact" {})))]
+        (is (= :distributed-runtime-physical-budget
+               (try (gpu-distributed/instantiate! plan {:transport :resident-copy}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (with-redefs [gpu/copy-range! (fn [& args] (swap! copies inc) (apply copy-range! args))
+                    gpu/upload-range! (fn [& args] (swap! uploads inc) (apply upload-range! args))]
+       (with-open [executable (gpu-distributed/instantiate!
+                              plan {:transport :resident-copy :device-capacities {:ze:0 1048576}})]
+        (is (= #{:ze:0} (set (keys (:sessions executable)))))
+        (is (= 32 (count (get-in executable [:schedule :operations]))))
+        (is (= 6 @uploads) "each worker's three source buffers initialize exactly once")
+        (gpu-distributed/run! executable)
+        (is (= 16 @copies) "all four halo faces execute in each of four epochs")
+        (is (= 6 @uploads) "resident exchange and generated state copies add no host uploads")
+        (let [outputs (gpu-distributed/output-values executable)
+              actual (vec (mapcat (fn [{:keys [device shape]}]
+                                    (let [resident (first (vals (get outputs [:copy (dec iterations) device])))
+                                          values (double-array (* (+ 2 (first shape)) width))]
+                                      (gpu/download-range! (get (:sessions executable) :ze:0) resident values
+                                                           {:elements (alength values)})
+                                      (subvec (vec values) width (* (inc (first shape)) width))))
+                                  (:shards (problem))))]
+          (is (< (max-error expected actual) 1.0e-10))))))))
 
 (deftest compiled-two-worker-halos-use-resident-copies
   (if-not @gp/gpu-available?

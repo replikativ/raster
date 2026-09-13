@@ -410,6 +410,35 @@
                       (float-array 6)))
           (fully-bound-periodic-plan) [:gpu-0 :gpu-1]))
 
+(deftest explicit-worker-placement-preserves-logical-shards-and-physical-alias-checks
+  (let [base (initialized-periodic-plan)
+        placed (reduce
+                (fn [plan device]
+                  (-> plan
+                      (assoc-in [:device-plans device :target] :ze:0)
+                      (update-in [:device-plans device :entries :copy :link-plan]
+                                 (fn [local]
+                                   (-> local (assoc :target :ze:0)
+                                       (update :nodes
+                                               #(update-vals %
+                                                             (fn [node]
+                                                               (-> node
+                                                                   (assoc-in [:view :allocation :device] :ze:0)
+                                                                   (update-in [:view :allocation :id] (fn [id] [device id])))))))))))
+                base [:gpu-0 :gpu-1])
+        ready (distributed/check-readiness (distributed/plan placed))]
+    (is (= 6 (count (:actions ready))))
+    (is (= #{:ze:0} (into #{} (map #(get-in % [:view :allocation :device])) (:initializers ready))))
+    (is (= #{:gpu-0 :gpu-1} (set (get-in placed [:mesh :devices]))))
+    (is (= :distributed-compute-entry-device
+           (failure-reason #(distributed/plan (update-in placed [:device-plans :gpu-0] dissoc :target)))))
+    (let [aliased (update-in placed [:device-plans :gpu-1 :entries :copy :link-plan :nodes]
+                            #(update-vals % (fn [node]
+                                              (assoc-in node [:view :allocation :id]
+                                                        [:gpu-0 (second (get-in node [:view :allocation :id]))]))))]
+      (is (= :distributed-compute-shard-alias (failure-reason #(distributed/plan aliased)))
+          "different logical workers cannot hide overlapping physical shard storage"))))
+
 (deftest readiness-composes-initializers-transfers-and-local-contracts
   (let [plan (distributed/plan (initialized-periodic-plan))
         ready (distributed/check-readiness plan)]

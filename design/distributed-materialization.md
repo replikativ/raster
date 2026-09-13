@@ -199,9 +199,10 @@ staging (default 1 MiB) and synchronous download/upload chunks. This is not P2P,
 evidence that the topology's modeled link performance was achieved. The pool budget check covers
 the retained LinkPlan allocations, not all backend-private compilation/graph temporary memory.
 Source stability through initialization and constant immutability remain caller obligations.
-The new actual DAG acceptance is a single-device generated heat program. Bounded transfer tails,
+The actual DAG acceptance includes two logical workers on one physical GPU, with unequal owned
+regions and periodic halo copies over four generated heat epochs. Bounded transfer tails,
 allocation conflicts and failure cleanup have hardware-free tests; multi-device runtime execution
-and logical-worker co-location are not yet validated by that acceptance.
+is not yet validated by that acceptance.
 
 `link-plan/borrow-owned-storage` is the checked local ownership projection for an enclosing
 allocation owner. It preserves executable instances, roles, logical shapes and physical views,
@@ -217,11 +218,18 @@ session buffers. Closing the first removes only its borrowed registrations; the 
 resident state without reuploading the original source and matches four CPU reference steps.
 This validates the local storage seam, not DistributedPlan execution or cross-device transport.
 
-The current DistributedPlan enforces one shard of a value per mesh device and requires distinct
-transfer endpoints with nonempty routes. A real co-located two-shard execution therefore needs an
-explicit local-copy lowering or a certified logical-to-runtime placement map. Do not silently map
-invented topology devices to the same `:ze:0` target. Local copies must occupy stated resources and
-have explicit cost/capability evidence; an empty route must not accidentally mean free transport.
+DistributedPlan keeps shard identity on logical mesh workers. Each worker's device-plan may state
+an explicit `:target` shared with other workers; local LinkPlans must agree with that physical
+target. Remapped targets require an explicit aggregate `:device-capacities` runtime budget. Pool
+accounting deduplicates physical allocation identities rather than granting each worker a separate
+copy of the device's capacity. Cross-worker shard aliases are rejected, including immutable weight
+sharing until an explicit sharing relation exists. Ordered private scratch with the same physical
+allocation identity can be reused, subject to allocation-contract and readiness checks.
+
+`:transport :resident-copy` performs actual same-target buffer copies and rejects cross-target
+endpoints before device contact. Logical transfer routes and dependencies remain explicit; this
+synchronous executor does not claim modeled route costs, overlap, or free transport. The periodic
+heat acceptance checks 16 resident halo copies and six startup uploads with no later host uploads.
 
 Land geometry/materialization normalization and validation first, then producer/freshness and
 transfer endpoint checks, then device-scoped allocation and event execution. Extend the existing

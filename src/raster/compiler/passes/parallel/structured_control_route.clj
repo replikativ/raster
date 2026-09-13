@@ -346,6 +346,34 @@
                                       values parameter-values))]
     (update parallel-program :values normalize-values)))
 
+(defn- refine-effect-result-shapes
+  "Refine the invocation boundary from the nested algorithm's storage/alias certificate.
+   The algorithm retains its symbolic values and explicit iteration extent; this does not
+   resize its operation or turn a physical destination capacity into a logical prefix extent."
+  [values equations]
+  (reduce
+   (fn [values equation]
+     (let [algorithm (:algorithm equation)
+           facts (soac/facts algorithm)]
+       (reduce
+        (fn [values inner]
+          (let [id (second inner)
+                aliases (get-in facts [:equations id :aliases])]
+            (reduce
+             (fn [values [result {:keys [destination access host-return]}]]
+               ;; A synthesized effect result represents the mutated destination, not a newly
+               ;; sized tensor. Never expand arbitrary alias/prefix views.
+               (if (and (= :effect host-return) (= :read-write access)
+                        (= destination (get aliases result))
+                        (get values result) (get values destination))
+                 (if-let [refined (av/merge-refinement (get values result) (get values destination))]
+                   (assoc values result refined)
+                   values)
+                 values))
+             values (map vector (nth inner 2) (soac/result-storage facts id)))))
+        values (soac/equations algorithm))))
+   values equations))
+
 (defn promote-soac-program
   "Promote one analyzed, loop-free TypedSOAC ParallelProgram into the common typed program union.
 
@@ -403,7 +431,8 @@
                                         (and (contains? shape-symbols symbol)
                                              (scalar-value? value))))
                            host-values)
-        program-values (merge shape-values program-values)
+        program-values (refine-effect-result-shapes (merge shape-values program-values)
+                                                   (:equations parallel-program))
         parallel-program (assoc parallel-program :values program-values)
         prefix (invocation-prefix parallel-program public-parameters host-values)
         binding-values
