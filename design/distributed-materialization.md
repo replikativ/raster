@@ -139,6 +139,18 @@ Before an executable plan can allocate resources, prove:
 5. Allocation sharing follows device-scoped materialization identities, with release after all
    dependent operations complete. Existing separately instantiated owned LinkPlans do not do this.
 
+Physical interval operations for the initial contiguous readiness proof now live in BufferView:
+`subtract-contiguous` preserves unaffected typed fragments of an initialization fact after a write;
+`covered-contiguous?` checks whether several compatible views jointly cover a required range.
+They use device-scoped allocation identity, reject contradictory allocation contracts, and do not
+mistake strided bounding spans for dense coverage. Invalidation is independent of the writer's dtype
+when the cut is element-aligned; typed initialization coverage requires a matching dtype. A cut
+through part of an element is rejected until a byte-validity or outward-rounded invalidation
+policy exists. These helpers establish geometry only; the DAG checker must retain producer identity
+on each fragment and reject unordered conflicting effects and stale replicas.
+The existing `overlaps?` and `same-range?` predicates use the same device-scoped identity;
+zero-byte views never overlap a nonempty range, including when their offset lies inside it.
+
 Lower dependencies to the existing ExecutionPlan logical queues/events and reuse the LinkPlan
 executable binder. Keep a synchronous executor as an explicit backend capability, not an implicit
 claim of asynchronous transport overlap. MPI/UCX/NCCL and storage/provider completions remain
