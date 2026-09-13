@@ -7,6 +7,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
@@ -16,7 +17,8 @@
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
-            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]))
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.passes.parallel.contract-lower :as contract-lower]))
 
 (deftest opencl-backend-aliases-share-mixed-matrix-admission
   (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
@@ -59,6 +61,19 @@
   [m n k]
   [:a-buffer :b-buffer :c-buffer
    {:type :int :value m} {:type :int :value n} {:type :int :value k}])
+
+(deftest generated-matrix-and-split-k-stages-do-not-roundtrip-through-source
+  (let [forbidden (fn [& _] (throw (ex-info "generated schedule reentered source" {})))]
+    (with-redefs [contraction-facts/contraction-facts forbidden
+                  contraction-facts/surface-form forbidden
+                  contract-lower/contract-form->segred forbidden]
+      (doseq [variant [:nn :nt :tn :tt]]
+        (let [scheduled (emitted variant)]
+          (is (= (cond-> [:f32-scalar :xmx-direct :xmx-split-k]
+                   (contains? #{:nn :nt} variant) (conj :xmx-direct-lhs-tile-cast))
+                 (mapv executable/strategy (:alternatives scheduled))))
+          (doseq [artifact (mapcat executable/artifacts (:alternatives scheduled))]
+            (is (body/kernel-body? (get-in artifact [:attributes :kernel-body])))))))))
 
 (deftest hardware-aware-gemm-selection-is-checked-data
   (let [scheduled (emitted :nn)

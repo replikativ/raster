@@ -2,7 +2,23 @@
   "W1 step 2a: par/contract FORM → segmented SegRed (IR structure, device-free)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.segop :as segop]))
+
+(deftest semantic-projection-preserves-the-canonical-product-reduction
+  (let [facts (facts/from-components
+               {:out 'C :free-axes '[[i mn]] :contract-axes '[[s splits]] :dtype :float
+                :body '(aget partials (+ (* s mn) i))})
+        operation (cl/contraction-facts->segred facts :id :combine)]
+    (is (nil? (:form facts)))
+    (is (= :combine (:id operation)))
+    (is (= :float (:dtype operation)))
+    (is (identical? (:reduction facts) (:reduction operation)))
+    (is (= #{'partials} (:inputs operation)))
+    (is (= #{'C} (:outputs operation)))
+    (is (= #{'mn 'splits} (:scalars operation)))
+    (is (= [{:name 'i :bound 'mn} {:name 's :bound 'splits}]
+           (get-in operation [:space :dims])))))
 
 (deftest contract-form-to-segred-nn
   (testing "matmul :nn form → segmented SegRed with free segments + reduced contract axis"

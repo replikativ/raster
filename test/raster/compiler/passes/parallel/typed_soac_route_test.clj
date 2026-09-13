@@ -1119,7 +1119,12 @@
     (is (zero? (get-in emitted [:stats :typed-contraction-dispatch-declines
                                 :typed-contraction-dispatch-dynamic-scalar] 0)))
     (is (= 1 (count (:dispatches emitted))))
-    (is (= 1 (count (:kernels emitted))))))
+    ;; A machine with matrix instructions can enumerate multi-kernel alternatives. Every
+    ;; entry point must still come from the retained dispatch, with no missing/extra kernels.
+    (is (seq (:kernels emitted)))
+    (is (= (mapv :kernel-name
+                 (mapcat executable/artifacts (mapcat :alternatives (:dispatches emitted))))
+           (mapv :kernel-name (:kernels emitted))))))
 
 (deftest compatibility-contraction-without-source-or-schedule-fails-loud
   (let [source '(raster.par/contract C [[i 8]] [[l 8]]
