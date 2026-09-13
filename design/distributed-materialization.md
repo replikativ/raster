@@ -119,6 +119,13 @@ Borrowed/external buffers retain their existing caller-initialized contract; imp
 does not itself prove completion of a distributed producer. A distributed executor must discharge
 those external preconditions through actual completed events, not bypass `run!` input checks.
 
+Descriptor cacheable transforms can execute during graph recording. Runtime constant-role
+admission therefore also requires captured data (an owned source or caller-ready borrowed/external
+storage) with no overlapping local write. A late-uploaded owned constant is bound as a replay
+input instead: its initialization gate remains active and its transform is not run prematurely.
+Captured weights keep the existing one-time transform path. This does not authorize changing
+captured constant contents after instantiation without rebuilding their derived transforms.
+
 The proof reuses LinkPlan's ordered instance access facts and its existing
 `produced-views`/`partial-writes` accounting. `value-accesses` deliberately summarizes ABI access
 only; a `:write` entry is not an initialization postcondition. LinkPlan currently assumes caller

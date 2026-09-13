@@ -89,6 +89,24 @@
     (doseq [key (reverse allocation-keys)] (attempt! #(gpu/free-buffer! session key)))
     (when-let [error @failure] (throw error))))
 
+(defn- instance-runtime-roles
+  [plan instance initialization]
+  (let [writes (map #(get-in plan [:nodes % :view]) (:writes initialization))
+        captured? (fn [node]
+                    (and node
+                         (or (:source node)
+                             (contains? #{:borrowed :external}
+                                        (get-in node [:view :allocation :ownership])))
+                         (not-any? #(bview/overlaps? (:view node) %) writes)))]
+    (into {}
+          (map (fn [[symbol role]]
+                 (let [leaves (get-in plan [:values (get (:bindings instance) symbol) :leaves])]
+                   [symbol (if (and (= :constant role)
+                                    (not (and (seq leaves)
+                                              (every? #(captured? (get-in plan [:nodes (:node %)])) leaves))))
+                             :input role)])))
+          (link-plan/instance-roles plan instance))))
+
 (defn instantiate!
   "Instantiate a validated LinkPlan as one replayable LinkedExecutable.
 
@@ -227,7 +245,9 @@
                                                error))))))
                     {:schedule (or (:schedule instance)
                                    (get-in instance [:descriptor :schedule]))
-                     :roles (link-plan/instance-roles plan instance)})
+                     ;; Constant transforms may execute while recording, before run!'s input
+                     ;; gate. Only captured, locally unwritten values can enter that prologue.
+                     :roles (instance-runtime-roles plan instance initialization)})
                    (vswap! phases conj phase)))
                (let [gkey (graph-key execution-id)]
                  (gpu/record-graph! session @phases gkey {:profile? profile?})
