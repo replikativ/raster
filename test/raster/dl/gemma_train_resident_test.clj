@@ -36,6 +36,8 @@
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
             [raster.compiler.pipeline :as pl]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.descriptor-fixture :as fixture]))
@@ -317,26 +319,31 @@
 ;; ═════════════════════════════════════════════════════════════════════════════════
 
 (def CFG-MP
-  "Same block, dims above the XMX pitch gate (r=8, nkh=8, nqh=16)."
-  {:seq 8 :d 16 :nq 2 :nkv 1 :hd 8 :dff 32 :r 8 :eps 1.0e-6 :theta 10000.0})
+  "Small block whose projection, LoRA and attention axes reach the current matrix schedules."
+  {:seq 32 :d 64 :nq 2 :nkv 1 :hd 32 :dff 64 :r 32 :eps 1.0e-6 :theta 10000.0})
 
-(defn- matrix-schedule-dims
-  "Runtime dimensions for every typed contraction carrying a mixed matrix graph candidate."
+(defn- matrix-schedule-selections
+  "Observe real scalar dispatch selection, rather than duplicating target pitch predicates.
+   Runtime buffer/alias admission remains separately enforced when the trajectory is bound."
   [prog args]
   (into []
         (keep
          (fn [step]
-           (when-let [{:keys [variant dimensions]}
-                      (get-in step [:dispatch :attributes :candidate-schedules :xmx-direct])]
-             (let [scalar-specs (into {} (keep (fn [{:keys [expression] :as spec}]
-                                                  (when expression [expression spec])))
-                                      (:argument-specs step))
-                   [m n k] (mapv (fn [dimension]
-                                   (if (number? dimension)
-                                     (long dimension)
-                                     (long ((:value-fn (get scalar-specs dimension)) args))))
-                                 dimensions)]
-               {:variant variant :m m :n n :k k}))))
+           (let [schedules (get-in step [:dispatch :attributes :candidate-schedules])]
+             (when (some #(= :matrix (:family %)) (vals schedules))
+               (let [choice (:dispatch step)
+                     runtime-arguments
+                     (mapv (fn [{:keys [kind sym type value-fn]}]
+                             (if (= :scalar kind)
+                               {:type type :value (value-fn args)} sym))
+                           (:argument-specs step))
+                     selected (dispatch/select-alternative choice runtime-arguments)
+                     strategy (executable/strategy selected)
+                     schedule (get schedules strategy)]
+                 {:variant (:variant schedule)
+                  :family (:family schedule)
+                  :strategy strategy
+                  :precision (:precision (executable/attributes selected))})))))
         (:steps prog)))
 
 (defn- run-trajectory!
@@ -381,20 +388,15 @@
       (is (some? p32) "train-step must extract fully resident")
       (is (some? p16) "mixed train-step must extract fully resident")
       (when (and p32 p16)
-        (let [dims (matrix-schedule-dims p16 args)]
-          (testing "every backward GEMM clears the XMX pitch gate (so mixed precision really fires)"
+        (let [dims (matrix-schedule-selections p16 args)]
+          (testing "analytic dispatch selects mixed-precision matrix schedules throughout training"
             (println "  [mixed-precision bwd]" (count dims) "gemm steps, variants:"
                      (frequencies (map :variant dims)))
             (is (seq dims) "the assertion must observe real typed matrix candidates")
-            (is (every? (fn [{:keys [n k]}]
-                          (and (>= n 8) (zero? (mod n 8))
-                               (>= k 16) (zero? (mod k 16))))
-                        dims)
-                (str "unaligned matrix candidates would select the portable schedule: "
-                     (pr-str (remove (fn [{:keys [n k]}]
-                                       (and (>= n 8) (zero? (mod n 8))
-                                            (>= k 16) (zero? (mod k 16))))
-                                     dims)))))
+            (is (every? #(and (= :matrix (:family %))
+                             (= :mixed-f16-f32 (:precision %))) dims)
+                (str "mixed training must analytically select matrix execution, not merely enumerate it: "
+                     (pr-str dims))))
           (let [l32 (run-trajectory! p32 cfg st0 lr n-steps)
                 l16 (run-trajectory! p16 cfg st0 lr n-steps)]
             (println "  [mixed-precision bwd] f32-scalar loss:"
