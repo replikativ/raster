@@ -1115,8 +1115,14 @@ source compilation **and allocation-free LinkPlan lowering**, not emission alone
 checks cover full/partial overwrite, copy/unspecified storage, malformed facts, aliases, source
 placement, generated names, and value remapping. Existing numerical tests are retained.
 
-Separately, the full typed route namespace on an Intel device exposes remaining unification debt:
-`gemm/split-k-combine-plan` still builds a contraction surface form and calls `contraction-facts`
-and `contract-form->segred`. The source-reparse guard fails with initialization disabled as well;
-its input contains no allocation. Preserve that guard and migrate this compiler-generated
-combine algorithm directly to typed IR in the next slice, rather than weakening the test.
+Compiler-generated scalar matrix and split-K combine algorithms now enter through semantic
+contraction facts, without building and reparsing surface contraction forms. The typed-route
+source-reparse guard remains intact; this is independent of initialization scheduling.
+
+Invocation linking also consumes the retained typed functional write domain. A graph output's
+`:write` role is insufficient to discard zero initialization: the domain must exactly cover
+concrete materialized capacity, have plain layout, and have no graph input sharing its physical
+storage token. The current proof admits single-equation algorithms only; multi-equation graphs
+need an ordered first-touch proof. Unavailable dimensions and unsupported shape expressions
+decline elision, while invalid negative dimensions still fail. This shares the functional-domain
+classification with initialization scheduling, rather than introducing a backend operation list.

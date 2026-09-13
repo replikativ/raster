@@ -135,9 +135,20 @@
   (when (emitted-equation/emitted-equation? operation)
     (let [algorithm (:algorithm operation)
           facts (soac/facts algorithm)
+          equations (soac/equations algorithm)
           destination (get-in facts [:values id])]
-      (when (and (= {:kind :plain} (:representation destination))
-                 (nil? (:logical-layout destination)))
+      ;; A graph's external write permission does not prove its internal first touch.
+      ;; Multi-equation algorithms need an ordered coverage proof before admission.
+      (when (and (= 1 (count equations))
+                 (= {:kind :plain} (:representation destination))
+                 (nil? (:logical-layout destination))
+                 (contains? buffers id)
+                 (not-any? (fn [input]
+                             (and (contains? buffers (:id input))
+                                  (= (get buffers id) (get buffers (:id input)))))
+                           (filter #(contains? #{:input :inout} (:role %))
+                                   (concat (get-in operation [:graph :inputs])
+                                           (get-in operation [:graph :outputs])))))
         (some (fn [equation]
                 (some (fn [[result physical contract]]
                         (when (and (= id physical) (= :write (:access contract)))
@@ -148,13 +159,14 @@
                                                               scalars buffers storage)))
                               (catch clojure.lang.ExceptionInfo e
                                 (if (contains? #{:invocation-link-shape-scalar
-                                                 :invocation-link-shape-extent}
+                                                 :invocation-link-shape-extent
+                                                 :invocation-link-shape-expression}
                                                (:reason (ex-data e)))
                                   false
                                   (throw e)))))))
                       (map vector (nth equation 2) (soac/physical-results facts equation)
                            (soac/result-storage facts (second equation)))))
-              (soac/equations algorithm))))))
+              equations)))))
 
 (defn- write-before-read-inputs
   [parallel-program materialized scalars]
