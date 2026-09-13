@@ -66,6 +66,17 @@ still requires a trapping target or an explicit bound proof. Required exceptiona
 have one evaluator in the typed InvocationPlan, with source-order evidence retained across
 non-equation host bindings. These changes are under PR #569 validation, not a green release claim.
 
+The declared result cast of `par/map!` is itself source semantics, distinct from an implicit
+array-store coercion. The integration uncovered a missing boundary when the body contains no
+explicit inner cast. A typed scalar-conversion term is being validated through fusion and target
+projection; it must retain materialization rounding and exceptional ordering, not merely the
+destination dtype. Once-per-element evaluation alone does not justify moving a potentially
+trapping producer across a consumer that writes observable storage. JVM AOT also now threads
+declared scalar/array facts into the shared frontend, and explicit primitive long-to-int bytecode
+uses checked narrowing. Focused JIT/AOT boundary tests pass; the full PR remains unmerged pending
+conversion/fusion and CI regressions. Boxed numeric and native-C exceptional conversions remain
+separate audit gaps, not covered by the primitive JVM result.
+
 Host-only scalar steps currently execute during preparation. Checked scalars after device work
 therefore decline rather than moving a potential failure ahead of preceding writes. General
 interleaved host/device exceptional control remains future work. Portable OpenCL still declines
