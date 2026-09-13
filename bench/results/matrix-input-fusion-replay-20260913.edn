@@ -1,5 +1,6 @@
 {:probe raster.perf.matrix-input-fusion-probe/run!
  :source-revision "8da29fbe72eba542f4fdb824a0c089460e7617a7"
+ :equivalent-rebased-source "61e17b4502ae6e482d3328565f977d7711f9d601"
  :date "2026-09-13"
  :device-name "Intel(R) Arc(TM) Graphics"
  :device :ocl:0
