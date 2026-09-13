@@ -1287,6 +1287,22 @@
           (is false "a source graph with different semantic effects must not validate")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :scheduled-graph-refinement-source (:reason (ex-data exception))))))))
+    (testing "input fusion retains the exact typed source and rewritten stage graph"
+      (let [source-graph (:source direct-refinement)
+            candidate (gpu-gemm/emit-matrix-input-fusion-alternative
+                       {:id :typed-input-fusion :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
+                        :variant :nn :tile (get-in direct-graph [:attributes :tile])
+                        :source-operation operation :source-graph source-graph
+                        :external-interface (select-keys source-graph [:abi :arguments :effects])})
+            refinement (get-in candidate [:attributes :scheduled-graph-refinement])
+            stages (graph-refinement/scheduled-graph refinement)]
+        (is (identical? operation (graph-refinement/source-operation refinement)))
+        (is (= source-graph (:source refinement)))
+        (is (= [:convert-b :contract] (mapv (comp last :id) (:nodes stages))))
+        (is (kernel-graph/dataflow-equivalent? stages candidate))
+        (doseq [[stage-node emitted-node] (map vector (:nodes stages) (:nodes candidate))]
+          (is (identical? (:operation stage-node)
+                          (get-in emitted-node [:operation :attributes :scheduled-kernel-body :source]))))))
     (testing "mixed-precision alternatives refine the exact typed SegRed through stage graphs"
       (doseq [[graph refinement expected-types]
               [[direct-graph direct-refinement

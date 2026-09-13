@@ -41,7 +41,7 @@
         (when (and (= :cast (:operation cast))
                    (= [:float :half] ((juxt :input-dtype :output-dtype) cast))
                    (= {:rounding :nearest-even :overflow :ieee}
-                      (select-keys (:policy cast) [:rounding :overflow]))
+                      (dissoc (:policy cast) :vector-width))
                    (= :half (:operand-dtype stage))
                    (= temporary (:lhs stage))
                    (not= temporary (:rhs stage))

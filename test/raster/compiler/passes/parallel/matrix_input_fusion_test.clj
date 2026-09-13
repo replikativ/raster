@@ -59,6 +59,7 @@
 (deftest changed-policy-shape-storage-or-consumer-declines
   (let [g (stage-graph)]
     (doseq [bad [(assoc-in g [:nodes 0 :operation :policy :rounding] :toward-zero)
+                 (assoc-in g [:nodes 0 :operation :policy :nan-policy] :canonicalize)
                  (-> g (assoc-in [:nodes 0 :operation :input-shape] [448])
                      (assoc-in [:nodes 0 :operation :output-shape] [448]))
                  (assoc-in g [:temporaries 0 :elements] 448)
