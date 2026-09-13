@@ -9,6 +9,31 @@
 ;; Parallel form structure tests
 ;; ================================================================
 
+(deftest map-void-counts-match-dotimes-without-implicit-narrowing
+  (let [stop (ex-info "first iteration" {:probe :counted-domain})
+        run (fn [head bound]
+              (let [evaluations (atom 0)
+                    body '(throw stop)
+                    expression (case head
+                                 :dotimes (list 'dotimes ['i '(do (swap! evaluations inc) bound)] body)
+                                 :macro (list 'raster.par/map-void! 'i
+                                              '(do (swap! evaluations inc) bound) body)
+                                 :ir (ir.par/expand-par-map-void!
+                                      (list 'raster.par/map-void! 'i
+                                            '(do (swap! evaluations inc) bound) body)))
+                    execute (eval (list 'fn '[bound evaluations stop] expression))
+                    result (try (execute bound evaluations stop)
+                                (catch Throwable e
+                                  (if (identical? stop e) :first-iteration (class e))))]
+                [result @evaluations]))]
+    (doseq [bound [0 -1 Long/MIN_VALUE 1 3 2147483648 Long/MAX_VALUE
+                   (inc (bigint Long/MAX_VALUE))]]
+      (let [expected (run :dotimes bound)]
+        (is (= expected (run :macro bound)))
+        (is (= expected (run :ir bound)))
+        (is (= 1 (second expected)))))
+    (is (= :first-iteration (first (run :macro 2147483648))))))
+
 (deftest par-map-form-detection
   (testing "par-map-form? identifies parallel map forms"
     (is (ir.par/par-map-form? '(raster.par/map! out i 10 double (+ (aget a i) 1.0))))

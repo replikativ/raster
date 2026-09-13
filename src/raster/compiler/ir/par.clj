@@ -260,7 +260,7 @@
   [form]
   (let [[_ i-sym bound-expr body-expr] form
         n-sym (gensym "n__")]
-    (list 'let* [n-sym (list 'int bound-expr)]
+    (list 'let* [n-sym (list 'long bound-expr)]
           (list 'dotimes [i-sym n-sym]
                 body-expr)
           nil)))
