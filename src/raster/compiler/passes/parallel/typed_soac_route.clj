@@ -84,16 +84,28 @@
 
 (defn- typed-store-value
   [cast value]
-  (let [target (some-> cast descriptor/cast-result-tag
+  (let [source-operation (when (seq? value) (descriptor/semantic-op value))
+        target (some-> cast descriptor/cast-result-tag
                        dtype/dtype-for-scalar-tag dtype/canon)
         source (when (seq? value)
-                 (some-> (descriptor/semantic-op value) descriptor/cast-result-tag
+                 (some-> source-operation descriptor/cast-result-tag
                          dtype/dtype-for-scalar-tag dtype/canon))]
     ;; The scalar equation's result dtype still owns the host/JVM boundary conversion.  When its
     ;; already-validated body ends in exactly that primitive cast, reusing it preserves the source
     ;; check/rounding point without manufacturing a redundant `(long (long ...))` wrapper.
-    (if (or (nil? cast) (= target source))
-      value
+    (cond
+      (nil? cast) value
+
+      (= target source)
+      ;; This cast is now a compiler-attested result conversion. Preserve its exact operand and
+      ;; metadata, but not a bare operator spelling that a public scalar named `long`/`float`
+      ;; could capture when the materialized source is compiled in its destination scope.
+      (if (and (= 2 (count value)) (descriptor/cast-op? source-operation))
+        (with-meta (list (symbol "clojure.core" (name source-operation)) (second value))
+          (meta value))
+        value)
+
+      :else
       (list (symbol "clojure.core" (name cast)) value))))
 
 (defn- materialize-region

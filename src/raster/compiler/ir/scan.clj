@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.core.util :as util]))
 
@@ -127,3 +128,67 @@
    a distinct schedule and must not be duplicated independently in every block."
   [scan-op dtype]
   (certify* scan-op dtype :scan))
+
+(defn- certify-projected*
+  [{:keys [acc init lambda] :as operation} dtype supplied-projection kind]
+  (let [reason-key (if (= :reduction kind)
+                     :scalar-reduction-certificate-projection
+                     :scan-certificate-projection)
+        projected
+        (try
+          (scalar-conversion/verified-source-projection lambda supplied-projection)
+          (catch clojure.lang.ExceptionInfo exception
+            (throw (ex-info "parallel scalar projection is not structurally attested"
+                            {:reason reason-key :operation operation
+                             :projection-error (ex-data exception)}
+                            exception))))
+        removable-projection?
+        (fn [initializer]
+          (try
+            (effects/removable-expr?
+             (scalar-conversion/project-canonical-to-source initializer))
+            (catch clojure.lang.ExceptionInfo _ false)))
+        normalize
+        (fn [expression]
+          (try
+            (util/inline-pure-lets expression :pure? removable-projection?)
+            (catch clojure.lang.ExceptionInfo exception
+              (throw (ex-info "parallel scalar projection contains a non-removable binding"
+                              {:reason reason-key :operation operation
+                               :normalization-error (ex-data exception)}
+                              exception)))))
+        normalized-lambda (normalize lambda)
+        normalized-projected (normalize projected)
+        certificate (certify* (assoc operation :lambda normalized-projected) dtype kind)
+        arguments (vec (descriptor/call-args normalized-lambda))
+        projected-arguments (vec (descriptor/call-args normalized-projected))
+        element-position (.indexOf ^java.util.List projected-arguments (:element certificate))
+        accumulator-position (when (= 2 (count projected-arguments))
+                               (- 1 element-position))]
+    (when-not (and (= (descriptor/semantic-op normalized-lambda)
+                      (descriptor/semantic-op normalized-projected))
+                   (= (count arguments) (count projected-arguments) 2)
+                   (<= 0 element-position 1)
+                   (acc-ref? (nth arguments accumulator-position) acc dtype)
+                   (acc-ref? (nth projected-arguments accumulator-position) acc dtype))
+      (throw (ex-info "parallel scalar projection changed its recurrence structure"
+                      {:reason reason-key :operation operation :projected normalized-projected
+                       :element-position element-position})))
+    {:certificate certificate
+     :element (nth arguments element-position)
+     :projected-step-result normalized-projected
+     :normalized-step-result normalized-lambda}))
+
+(defn certify-projected-reassociation
+  "Certify a reduction projection while retaining the corresponding typed element."
+  ([operation dtype]
+   (certify-projected* operation dtype nil :reduction))
+  ([operation dtype supplied-projection]
+   (certify-projected* operation dtype supplied-projection :reduction)))
+
+(defn certify-projected-scan
+  "Certify a scan projection while retaining the corresponding typed element."
+  ([operation dtype]
+   (certify-projected* operation dtype nil :scan))
+  ([operation dtype supplied-projection]
+   (certify-projected* operation dtype supplied-projection :scan)))

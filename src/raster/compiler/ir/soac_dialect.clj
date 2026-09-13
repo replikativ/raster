@@ -486,19 +486,7 @@
 
 (defn scalar-convert-attributes?
   [attributes]
-  (let [{:keys [source-dtype target-dtype rounding overflow source-op]} attributes
-        narrowing (descriptor/cast-integral-narrowing source-op)
-        requested (case narrowing :reject :trap :wrap :wrap nil)]
-    (and (map? attributes)
-         (= #{:source-dtype :target-dtype :rounding :overflow :source-op}
-            (set (keys attributes)))
-         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
-                 [source-dtype target-dtype])
-         (descriptor/cast-op? source-op)
-         (= target-dtype
-            (some-> source-op descriptor/cast-result-tag dtype/dtype-for-scalar-tag dtype/canon))
-         (= (scalar-conversion/policy source-dtype target-dtype requested)
-            [rounding overflow]))))
+  (scalar-conversion/canonical-attributes? attributes))
 
 (def-dialect TypedSOAC
   (terminals [id value-id?]
@@ -931,13 +919,7 @@
    Algebra certification uses the shared scalar vocabulary; the typed region itself retains the
    conversion term and its explicit policy."
   [expression]
-  (util/postwalk-preserving-meta
-   (fn [form]
-     (if (scalar-convert-form? form)
-       (let [{:keys [attributes operand]} (scalar-convert-parts form)]
-         (with-meta (list (:source-op attributes) operand) (meta form)))
-       form))
-   expression))
+  (scalar-conversion/project-canonical-to-source expression))
 
 (defn- validate-scalar-fold-scopes!
   "Validate nested scalar Folds with their actual lexical environments. A flat tree walk loses

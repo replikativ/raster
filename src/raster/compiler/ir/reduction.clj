@@ -239,6 +239,20 @@
         (walk/postwalk-replace {element converted} step-result))
       step-result)))
 
+(defn certify-projected-reassociation
+  "Certify a shared-vocabulary projection while retaining its corresponding typed element.
+
+   The optional supplied projection is evidence from an earlier dialect boundary, not an escape
+   hatch: it must equal the projection derived here by replacing only validated canonical scalar
+   conversions with their descriptor-owned source casts. Projection cannot change the recurrence
+   operator, arity, accumulator position, or any operand tree."
+  ([step-result accumulator neutral dtype]
+   (certify-projected-reassociation step-result nil accumulator neutral dtype))
+  ([step-result supplied-projection accumulator neutral dtype]
+   (scan/certify-projected-reassociation
+    {:acc accumulator :init neutral :lambda step-result}
+    dtype supplied-projection)))
+
 (defn scalar
   "Construct the canonical, proof-carrying representation of `raster.par/reduce`.
 
@@ -246,16 +260,21 @@
    single constructor boundary—rather than rediscovered by individual schedules or emitters. An
    element whose retained precision differs from the accumulator's is wrapped in an explicit cast
    at this boundary."
-  [{:keys [accumulator neutral dtype result index step-result algebra attributes]
+  [{:keys [accumulator neutral dtype result index step-result certification-step-result
+           algebra attributes]
     :or {algebra {} attributes {}}}]
-  (let [certified (scan/certify-reassociation
-                   {:acc accumulator :init neutral :lambda step-result} dtype)
-        declared (declare-element-conversion step-result (:element certified) dtype)
+  (let [{certified :certificate original-element :element
+         normalized-step-result :normalized-step-result}
+        (certify-projected-reassociation step-result certification-step-result
+                                         accumulator neutral dtype)
+        step-result normalized-step-result
+        declared (declare-element-conversion step-result original-element dtype)
         converted? (not (identical? declared step-result))
         step-result declared
         derived (if converted?
-                  (scan/certify-reassociation
-                   {:acc accumulator :init neutral :lambda step-result} dtype)
+                  (:certificate
+                   (certify-projected-reassociation
+                    step-result accumulator neutral dtype))
                   certified)
         algebra (if (empty? algebra) derived algebra)]
     (when-not (scan/compatible-certificate? algebra derived)

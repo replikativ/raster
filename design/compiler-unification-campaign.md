@@ -77,6 +77,15 @@ uses checked narrowing. Focused JIT/AOT boundary tests pass; the full PR remains
 conversion/fusion and CI regressions. Boxed numeric and native-C exceptional conversions remain
 separate audit gaps, not covered by the primitive JVM result.
 
+Typed scalar conversions also expose a JVM SIMD capability boundary: an exact float identity
+conversion can disappear only inside a float vector computation. It remains a rounding boundary
+when embedded in a double reduction. The shared typed scalar route preserves mixed-width programs;
+all-float map/reduction cases must still vectorize. General mixed-width Vector API conversion and
+lane-shape handling remain an explicit performance task, with numerical materialization-boundary
+oracles required before admission is broadened. A scalar fallback here is not SIMD parity.
+The historical raw source-cast SIMD path still lacks authoritative operand dtype evidence;
+matching its destination to the vector species alone does not certify arbitrary nested casts.
+
 Host-only scalar steps currently execute during preparation. Checked scalars after device work
 therefore decline rather than moving a potential failure ahead of preceding writes. General
 interleaved host/device exceptional control remains future work. Portable OpenCL still declines

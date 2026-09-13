@@ -441,6 +441,8 @@
                      :result result
                      :index index
                      :step-result step-result
+                     :certification-step-result
+                     (soac-dialect/scalar-converts->source step-result)
                      :algebra (or (first (:algebra attributes)) {})
                      :attributes (cond-> {:source :typed-soac :equation equation-id}
                                    result-region (assoc :result-region result-region))})
@@ -711,14 +713,26 @@
                      (sort-by pr-str (remove (set (:inputs facts)) public-scalar-ids))))
         scan-dtype (or (first (:dtypes attributes)) dtype :double)
         substitutions (assoc substitutions index index)
+        lambda-expression (util/subst-syms substitutions (first body-results))
         algebra (update (first (:algebra attributes)) :element
-                        #(util/subst-syms substitutions %))]
+                        #(util/subst-syms substitutions %))
+        projected-proof
+        (scan/certify-projected-scan
+         {:acc (first accumulators) :init (first (:identities attributes))
+          :lambda lambda-expression}
+         scan-dtype (soac-dialect/scalar-converts->source lambda-expression))
+        _ (when-not (= algebra (:certificate projected-proof))
+            (throw (ex-info "typed scan algebra disagrees with its substituted scalar region"
+                            {:reason :typed-soac-scan-certificate
+                             :equation equation-id :declared algebra
+                             :derived (:certificate projected-proof)})))]
     {:id equation-id
      :sym destination
      :out destination
      :acc (first accumulators)
      :init (first (:identities attributes))
-     :lambda (util/subst-syms substitutions (first body-results))
+     :lambda lambda-expression
+     :element (:element projected-proof)
      :algebra algebra
      :mode (:mode attributes)
      :bound (:extent attributes)
@@ -1060,14 +1074,15 @@
         bound (:bound description)
         idx (:idx description)
         mode (or (:mode description) :inclusive)
-        raw-scan-op (assoc (select-keys description [:acc :init :lambda :out]) :mode mode)
+        raw-scan-op (assoc (select-keys description [:acc :init :lambda :element :out]) :mode mode)
         map-lambda (:map-lambda description)
         _ (when map-lambda
             (throw (ex-info "fused scan/map needs an explicit scheduled scan epilogue"
                             {:reason :scan-fused-map-unimplemented
                              :scan-op raw-scan-op :map-lambda map-lambda})))
         scan-facts (or (:algebra description) (scan/certify raw-scan-op dtype))
-        scan-op (assoc raw-scan-op :algebra scan-facts)
+        scan-op (assoc raw-scan-op :algebra scan-facts
+                       :element (or (:element raw-scan-op) (:element scan-facts)))
         space (segop/make-seg-space idx bound)
         grid-1 (scan-grid device-id bound dtype)
         execution (execution-plan/scan-execution bound grid-1)]

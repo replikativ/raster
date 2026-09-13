@@ -8,6 +8,7 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.par]))
 
@@ -226,3 +227,78 @@
           reduction (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :float
                                        :result 's :index 'i :step-result step})]
       (is (= step (first (:results (reduction/fold-region reduction))))))))
+
+(deftest scalar-reduction-certification-projection-is-structurally-attested
+  (let [failure-reason
+        (fn [step projection]
+          (try
+            (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :double
+                               :result 'sum :index 'i :step-result step
+                               :certification-step-result projection})
+            nil
+            (catch clojure.lang.ExceptionInfo exception
+              (:reason (ex-data exception)))))]
+    (is (= :scalar-reduction-certificate-projection
+           (failure-reason '(- acc x) '(+ acc x)))
+        "a caller cannot certify a different recurrence operator")
+    (is (= :scalar-reduction-certificate-projection
+           (failure-reason '(+ acc x) '(+ x acc)))
+        "a caller cannot move the accumulator while retaining positional element lookup")
+    (is (= :scalar-reduction-certificate-projection
+           (failure-reason '(+ acc (do (println x) x)) '(+ acc x)))
+        "a caller cannot erase effects from the element before certification")))
+
+(deftest scalar-reduction-projects-only-canonical-conversions-and-retains-the-typed-step
+  (let [operand (with-meta '(clojure.core/* scale (clojure.core/aget a i))
+                  {:raster.type/tag 'float})
+        conversion (dialect/scalar-convert
+                    {:source-dtype :float :target-dtype :float
+                     :rounding :exact :overflow :exact
+                     :source-op 'clojure.core/float}
+                    operand)
+        step (list 'clojure.core/+ 'acc conversion)
+        projection (list 'clojure.core/+ 'acc
+                         (with-meta (list 'clojure.core/float operand) (meta conversion)))
+        reduction (reduction/scalar
+                   {:accumulator 'acc :neutral 0.0 :dtype :double
+                    :result 'sum :index 'i :step-result step
+                    :certification-step-result projection})
+        retained-step (first (:results (reduction/fold-region reduction)))
+        retained-element (nth retained-step 2)]
+    (is (= 'clojure.core/double (first retained-element)))
+    (is (= conversion (second retained-element))
+        "carrier adaptation wraps rather than erases the canonical source conversion")
+    (is (= (list 'clojure.core/double (nth projection 2))
+           (:element (:algebra reduction)))
+        "the final adapted typed term is projected and certified as one recurrence")))
+
+(deftest scalar-reduction-normalized-element-still-receives-carrier-conversion
+  (let [conversion (dialect/scalar-convert
+                    {:source-dtype :float :target-dtype :float
+                     :rounding :exact :overflow :exact
+                     :source-op 'clojure.core/float}
+                    '(clojure.core/aget a i))
+        step (list 'let* ['term conversion] '(clojure.core/+ acc term))
+        reduction (reduction/scalar
+                   {:accumulator 'acc :neutral 0.0 :dtype :double
+                    :result 'sum :index 'i :step-result step})
+        retained (first (:results (reduction/fold-region reduction)))]
+    (is (= (list 'clojure.core/+ 'acc (list 'clojure.core/double conversion))
+           retained)
+        "normalizing a let must not make the element invisible to carrier adaptation")))
+
+(deftest scalar-reduction-projection-preserves-devirtualized-operation-metadata
+  (let [conversion (dialect/scalar-convert
+                    {:source-dtype :float :target-dtype :float
+                     :rounding :exact :overflow :exact
+                     :source-op 'clojure.core/float}
+                    '(clojure.core/aget a i))
+        step (with-meta (list '.invk 'numeric-add-impl 'acc conversion)
+               {:raster.op/original 'raster.numeric/+})
+        reduction (reduction/scalar
+                   {:accumulator 'acc :neutral 0.0 :dtype :float
+                    :result 'sum :index 'i :step-result step})]
+    (is (= 'raster.numeric/+ (get-in reduction [:algebra :combine])))
+    (is (= {:raster.op/original 'raster.numeric/+}
+           (meta (first (:results (reduction/fold-region reduction)))))
+        "projection must not erase the walker metadata that gives .invk its semantics")))

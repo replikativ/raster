@@ -908,9 +908,36 @@
                                  [:attributes :overflow]))))
          (tree-seq coll? seq expression))))
 
+(defn- typed-region-scalar-environment
+  "Authoritative lexical scalar dtypes for exceptional-control analysis of one typed lambda."
+  [program info]
+  (let [{:keys [accumulators elements capture-parameters]} (parameter-parts info)
+        values (:values (dialect/facts program))
+        scalar-value-dtype (fn [value]
+                             (let [fact (get values value)]
+                               (when (= [] (:shape fact)) (:dtype fact))))]
+    (into {(:index (:attributes info)) :long}
+          (concat
+           (map (juxt :id :dtype) (:locals info))
+           (map vector accumulators (get-in info [:attributes :dtypes]))
+           (map vector elements (map #(value-scalar-dtype program %) (:arrays info)))
+           (keep (fn [[parameter value]]
+                   (when-let [scalar-dtype (scalar-value-dtype value)]
+                     [parameter scalar-dtype]))
+                 (map vector capture-parameters (:captures info)))))))
+
 (defn- exceptional-conversion-region?
-  [{:keys [locals body-results]}]
-  (let [expressions (concat (map :init locals) body-results)]
+  [program {:keys [locals body-results] :as info}]
+  (let [typed-symbols
+        (into {}
+              (keep (fn [[id scalar-dtype]]
+                      (when-let [tag (and (symbol? id) scalar-dtype
+                                          (some-> scalar-dtype dtype/canon dtype/info
+                                                  :scalar-tag))]
+                          [id (with-meta id {:tag tag :raster.type/tag tag})])))
+              (typed-region-scalar-environment program info))
+        retain-types #(util/subst-syms typed-symbols %)
+        expressions (map retain-types (concat (map :init locals) body-results))]
     (or (contains-trapping-scalar-convert? expressions)
         (some #(contains? (:flags (effects/descriptor %)) :checked-source-cast)
               expressions))))
@@ -932,7 +959,7 @@
            :when (contains? #{:map :reduce :scan} (:kind consumer))
            ;; Per-lane fusion would interleave a trapping producer with later caller-visible
            ;; consumer writes. Preserve the materialized equation-completion boundary.
-           :when (not (exceptional-conversion-region? producer))
+           :when (not (exceptional-conversion-region? program producer))
            ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
            ;; therefore compose vertically into another map; reduction and scan consumers remain
            ;; local-free until their regions admit typed locals.
@@ -1077,8 +1104,8 @@
            :when (= :map (:kind left) (:kind right))
            ;; Horizontal fusion interleaves independent maps lane-by-lane. A trapping conversion
            ;; on either side therefore retains its source equation-completion boundary.
-           :when (not (or (exceptional-conversion-region? left)
-                          (exceptional-conversion-region? right)))
+           :when (not (or (exceptional-conversion-region? program left)
+                          (exceptional-conversion-region? program right)))
            :when left-boundary
            :when right-boundary
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))

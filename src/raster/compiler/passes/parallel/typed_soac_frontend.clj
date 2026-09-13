@@ -166,19 +166,44 @@
       (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
       (when (descriptor/aget-call? expression)
         (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; An ordered reduction loop returns its accumulator on the only exit. The matcher proves
+      ;; that recurrence shape and exact exit identity; the accumulator initializer independently
+      ;; owns the result dtype. Canonical fold construction later validates the update region at
+      ;; that dtype, so this grants no type to an unsupported/mixed recurrence.
+      (when-let [{:keys [acc-sym acc-init else-expr]}
+                 (and (seq? expression)
+                      (contains? #{'loop 'loop*} (first expression))
+                      (patterns/match-ordered-reduce-loop expression))]
+        (when (= acc-sym else-expr)
+          (retained-expression-dtype acc-init array-types scalar-types)))
       ;; Raw compatibility fixtures may lack walker metadata. Reuse the compiler's established
       ;; expression typer with explicit scalar/array facts; never borrow the result target.
       (let [inference-expression
             (util/postwalk-preserving-meta
              (fn [form]
-               (if (and (seq? form) (symbol? (first form))
+               (let [operation (when (seq? form) (descriptor/semantic-op form))]
+                 (cond
+                   ;; infer-expr-tag's primitive-cast contract uses the bare result tag. Preserve
+                   ;; that spelling for both source variants instead of qualifying `(float x)`
+                   ;; into an unrecognized `clojure.core/float` call. The descriptor is the
+                   ;; authority, and lexical operators remain protected by the shadowing set.
+                   (and operation (descriptor/cast-op? operation)
+                        (not (contains? util/*shadowing-locals* operation)))
+                   (with-meta
+                     (apply list (descriptor/cast-result-tag operation)
+                            (descriptor/call-args form))
+                     (meta form))
+
+                   (and (seq? form) (symbol? (first form))
                         (nil? (namespace (first form)))
                         (not (contains? util/*shadowing-locals* (first form)))
                         (descriptor/scalar-op?
                          (symbol "clojure.core" (name (first form)))))
-                 (with-meta (apply list (symbol "clojure.core" (name (first form))) (rest form))
-                   (meta form))
-                 form))
+                   (with-meta
+                     (apply list (symbol "clojure.core" (name (first form))) (rest form))
+                     (meta form))
+
+                   :else form)))
              expression)
             type-env (merge
                       (into {} (keep (fn [[id t]]
@@ -741,7 +766,9 @@
          (vector? locals))))
 
 (defn- binder-array-types
-  "Element dtypes of the arrays a source `let` binds, read from the walker's array tags on the
+  "Element dtypes visible while source descriptions are built. Array reads without a more
+   specific fact inherit the compiler entry's kernel dtype, matching the existing public raw-form
+   contract. Arrays a source `let` binds are read from the walker's array tags on the
    binders (`floats`, `doubles`, …). A use-site symbol carries no metadata, so an internal
    allocation such as an attention output would otherwise have no declared dtype and every map
    writing it would decline. Declared `array-types` take precedence.
@@ -751,12 +778,19 @@
    double-declared allocation inside it is a float buffer of that kernel, not a second precision."
   [pairs array-types dtype]
   (let [kernel-dtype (some-> dtype dtype/canon)
+        default-read-types
+        (when kernel-dtype
+          (into {}
+                (map (fn [array] [array kernel-dtype]))
+                (reduce set/union #{}
+                        (map (comp par/collect-aget-arrays second) pairs))))
         policy (fn [element]
                  (if (and kernel-dtype (dtype/fp-dtype? kernel-dtype)
                           (contains? #{:float :double} element))
                    kernel-dtype
                    element))]
     (merge
+     default-read-types
      (into {}
            (keep (fn [[binder init]]
                    (when (symbol? binder)
@@ -2319,7 +2353,8 @@
                                (symbol? expression)
                                (get scalar-representatives expression expression)
                                (integer? expression) expression
-                               (not= proved-extent expression) proved-extent
+                               (and (not= proved-extent expression)
+                                    (dialect/extent? proved-extent)) proved-extent
                                :else (:sym description))]
           (-> state
               (update :descriptions conj

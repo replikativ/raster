@@ -292,13 +292,28 @@
             (contains? simd-ternary-ops core-sym) [3 core-sym]))
         :else nil))))
 
+(def ^:dynamic *simd-element-type*
+  "Active Vector species element dtype while a scheduled SegOp is admitted."
+  nil)
+
 (defn simd-able?
   "Check if an expression can be fully compiled to SIMD ops."
-  [expr idx-sym]
-  (cond
+  ([expr idx-sym]
+   (simd-able? expr idx-sym nil))
+  ([expr idx-sym elem-type]
+   (binding [*simd-element-type* (or elem-type *simd-element-type*)]
+    (cond
     (number? expr) true
     (symbol? expr) true
     (some? (aget-form? expr idx-sym)) true
+    (soac-dialect/scalar-convert-form? expr)
+    (let [{:keys [attributes operand]} (soac-dialect/scalar-convert-parts expr)]
+      ;; Mixed-width terms need an explicit Vector API convertShape/reinterpret schedule: simply
+      ;; recurring at the destination species would evaluate widened arithmetic at the wrong
+      ;; precision. Keep the typed scalar path until that lane-shape conversion is represented.
+      (and (= *simd-element-type* (:source-dtype attributes) (:target-dtype attributes))
+           (= [:exact :exact] ((juxt :rounding :overflow) attributes))
+           (simd-able? operand idx-sym)))
     ;; Scalar array access: (aget arr non-idx-expr) — loop-invariant, broadcast
     (and (seq? expr) (descriptor/aget-op? (first expr)) (= 3 (count expr))
          (expr-free-of? (nth expr 2) idx-sym))
@@ -306,7 +321,10 @@
     (and (seq? expr)
          (contains? '#{double float long int} (descriptor/cast-result-tag (first expr)))
          (= 2 (count expr)))
-    (simd-able? (second expr) idx-sym)
+    (let [target-dtype (some-> (descriptor/cast-result-tag (first expr))
+                               dtype/dtype-for-scalar-tag dtype/canon)]
+      (and (or (nil? *simd-element-type*) (= *simd-element-type* target-dtype))
+           (simd-able? (second expr) idx-sym)))
     (and (seq? expr) (= 2 (count expr))
          (contains? simd-unary-ops (first expr)))
     (simd-able? (second expr) idx-sym)
@@ -353,7 +371,7 @@
           2 (and (= 2 (count args)) (every? #(simd-able? % idx-sym) args))
           3 (and (= 3 (count args)) (every? #(simd-able? % idx-sym) args))
           false)))
-    :else false))
+    :else false))))
 
 ;; ================================================================
 ;; Body analysis helpers (shared with par_simd stencil/fusion)
@@ -562,6 +580,12 @@
             (get vec-env arr-name)
             (get vec-env arr)))
 
+      (soac-dialect/scalar-convert-form? expr)
+      (let [{:keys [attributes operand]} (soac-dialect/scalar-convert-parts expr)]
+        (when (and (= elem-type (:source-dtype attributes) (:target-dtype attributes))
+                   (= [:exact :exact] ((juxt :rounding :overflow) attributes)))
+          (recur-fn operand)))
+
       ;; Scalar array access: (aget arr non-idx-expr) — broadcast as scalar
       (and (seq? expr) (descriptor/aget-op? (first expr)) (= 3 (count expr))
            (expr-free-of? (nth expr 2) idx-sym))
@@ -569,7 +593,10 @@
 
       (and (seq? expr) (contains? '#{double float long int} (descriptor/cast-result-tag (first expr)))
            (= 2 (count expr)))
-      (recur-fn (second expr))
+      (when (= elem-type
+               (some-> (descriptor/cast-result-tag (first expr))
+                       dtype/dtype-for-scalar-tag dtype/canon))
+        (recur-fn (second expr)))
 
       (and (seq? expr) (= 2 (count expr)) (contains? simd-unary-ops (first expr)))
       (list (simd-unary-ops (first expr)) (recur-fn (second expr)))
@@ -685,8 +712,10 @@
         ;; Scrub dead leaf-alias bindings (from the params pre-flatten) before
         ;; emit, so a bare array symbol never reaches emit-simd's scalar-broadcast.
         raw-body (clean-dead-bindings (:lambda segmap))
-        ;; Desugar .invk for the scalar tail (bytecode compiler needs standard calls)
-        desugared-body (bc/desugar-invk raw-body)
+        ;; The scalar tail executes source operations, not typed IR constructors. Project only
+        ;; validated canonical conversions through the shared descriptor-owned relation before
+        ;; desugaring dispatch; checked conversions therefore retain their source policy.
+        desugared-body (bc/desugar-invk (soac-dialect/scalar-converts->source raw-body))
         body (clojure.walk/postwalk
               (fn [x] (if (and (seq? x) (not (list? x))) (apply list x) x))
               (normalize-invk raw-body))
@@ -696,7 +725,7 @@
                       (throw (ex-info "SegMap missing :dtype — type metadata lost in pipeline"
                                       {:segmap-sym out-sym :cast cast})))
         cast-fn cast]
-    (when (and (simd-able? body idx)
+    (when (and (simd-able? body idx elem-type)
                ;; Soundness backstop: never broadcast an array symbol as a scalar.
                ;; If one survives in value position, bail to the scalar loop.
                (empty? (value-position-arrays body idx))
@@ -1076,7 +1105,7 @@
                     elem-expr (if (and acc-pos (seq let-bindings))
                                 (list 'let* (vec (mapcat identity let-bindings)) elem-raw)
                                 elem-raw)]
-                (when (and acc-pos (simd-able? elem-expr idx)
+                (when (and acc-pos (simd-able? elem-expr idx elem-type)
                            ;; Soundness backstop: bail if an array symbol would
                            ;; be broadcast as a scalar (see value-position-arrays).
                            (empty? (value-position-arrays elem-expr idx)))
@@ -1173,9 +1202,11 @@
                                         (map (fn [k] (nth vacc-syms k)) (range nacc)))
                         scalar-bcasts (vec (mapcat (fn [[s sv]] [sv (list broadcast species-sym (list cf s))])
                                                    scalar-vec-syms))
-                        ;; Scalar tail: desugar .invk for bytecode compiler
+                        ;; Scalar tail: project typed conversions to their validated source casts,
+                        ;; then desugar dispatch for the bytecode compiler.
                         raw-lambda (:lambda (segop/scalar-reduce-op segred))
-                        desugared-lambda (bc/desugar-invk raw-lambda)
+                        desugared-lambda
+                        (bc/desugar-invk (soac-dialect/scalar-converts->source raw-lambda))
                         scalar-body (clojure.walk/postwalk (fn [f] (if (= f idx) j-sym f)) desugared-lambda)
                         lanes-op (condp = op
                                    '+ 'jdk.incubator.vector.VectorOperators/ADD
