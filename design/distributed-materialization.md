@@ -2,8 +2,9 @@
 
 Status: owned-domain normalization, copy-replica geometry/coverage and exact boundary
 provider bindings, contiguous halo endpoint projection and conditional DAG readiness are implemented.
-Source realization, resource ownership/lifetimes, runtime allocation/transport and execution remain
-a reviewed implementation plan.
+A first synchronous, owning GPU executor now realizes sources and runs checked DAGs on actual
+device identities. Co-located logical workers, asynchronous transports and reusable execution
+epochs remain implementation work.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
 placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
@@ -182,6 +183,25 @@ claim of asynchronous transport overlap. MPI/UCX/NCCL and storage/provider compl
 realizations of the scheduling boundary, not native handles inside the semantic IR.
 
 ## Laptop acceptance and landing order
+
+`raster.gpu.distributed/instantiate!` now performs readiness, storage-projection, complete shared
+allocation-contract, resident-pool budget and retained-output checks before device contact. It
+owns one session per actual target, realizes original allocation options, and uploads sources once.
+`run!` interprets the existing ExecutionPlan wait/completion representation synchronously. Each
+borrowed local executable is constructed only after its dependencies complete, run, then closed;
+this also keeps constant prologues behind producer completion. The owner retains storage until
+close. Failed/completed executions cannot replay stale readiness evidence. `output-values` exposes
+retained logical values only after successful completion; later overwrites of retained outputs
+are rejected during preflight.
+
+Cross-device copies currently require explicit `:transport :host-staged`, with bounded native
+staging (default 1 MiB) and synchronous download/upload chunks. This is not P2P, MPI, overlap or
+evidence that the topology's modeled link performance was achieved. The pool budget check covers
+the retained LinkPlan allocations, not all backend-private compilation/graph temporary memory.
+Source stability through initialization and constant immutability remain caller obligations.
+The new actual DAG acceptance is a single-device generated heat program. Bounded transfer tails,
+allocation conflicts and failure cleanup have hardware-free tests; multi-device runtime execution
+and logical-worker co-location are not yet validated by that acceptance.
 
 `link-plan/borrow-owned-storage` is the checked local ownership projection for an enclosing
 allocation owner. It preserves executable instances, roles, logical shapes and physical views,

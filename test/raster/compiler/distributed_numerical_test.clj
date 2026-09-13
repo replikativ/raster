@@ -14,6 +14,7 @@
             [raster.runtime.numerical-content :as content]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.distributed :as gpu-distributed]
             [raster.gpu.link :as link])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.nio ByteBuffer ByteOrder]
@@ -326,8 +327,8 @@
                                               (double-array n) rows width dt])]
         (is (= 0 (get-in plan [:attributes :driver-allocations])))))))
 
-(deftest compiled-flat-heat-values-bind-through-explicit-local-domains
-  (let [plan (equation/lower @compiled-step [(double-array 56) (double-array 56)
+(defn- whole-field-distributed-plan [initial]
+  (let [plan (equation/lower @compiled-step [(double-array 56) initial
                                             (double-array 56) 8 width dt])
         values (update-vals (:values plan)
                             #(assoc (:abstract %) :shape [8 width]
@@ -349,13 +350,104 @@
                       :device-plans {:ze:0 {:entries {:heat {:link-plan plan}}
                                            :steps {:step {:entry :heat :bindings bindings}}}}
                       :steps [(distributed/compute-step {:id :step :device :ze:0 :duration-ns 1})]
-                      :outputs [:step]})
+                      :outputs [:step]})]
+    [plan distributed]))
+
+(deftest compiled-flat-heat-values-bind-through-explicit-local-domains
+  (let [[plan distributed] (whole-field-distributed-plan (double-array 56))
         report (distributed/compute-bindings distributed)]
     (is (every? #(= [56] (:shape (:abstract %))) (vals (:values plan))))
     (is (empty? (:unbound report)))
     (is (= 3 (count (get-in report [:bindings :step :values]))))
     (is (every? #(= [8 width] (get-in % [:domain :shape]))
                 (vals (get-in report [:bindings :step :values]))))))
+
+(deftest distributed-runtime-preflights-and-cleans-up-failed-prefixes
+  (let [[_ plan] (whole-field-distributed-plan (:initial (problem)))
+        calls (atom [])
+        session (atom {:device-id :ze:0})
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (with-redefs [gpu/make-session (fn [_] (swap! calls conj :open) session)
+                  gpu/alloc! (fn [& _] (swap! calls conj :allocate))
+                  gpu/buffer-view (fn [& _] :view)
+                  gpu/buffer (fn [& _] :buffer)
+                  gpu/upload-range! (fn [& _] (swap! calls conj :upload))
+                  gpu/close-session! (fn [_] (swap! calls conj :close))]
+      (is (= :distributed-runtime-memory
+             (reason #(gpu-distributed/instantiate!
+                        (assoc-in plan [:topology :devices :ze:0 :memory-capacity-bytes] 1)))))
+      (is (empty? @calls) "budget failure must precede every driver operation")
+      (is (= :distributed-runtime-output-overwritten
+             (reason #(gpu-distributed/instantiate!
+                        (-> plan
+                            (assoc-in [:device-plans :ze:0 :steps :later]
+                                      (get-in plan [:device-plans :ze:0 :steps :step]))
+                            (update :steps conj (distributed/compute-step
+                                                {:id :later :device :ze:0 :duration-ns 1 :dependencies [:step]})))))))
+      (is (empty? @calls) "retained outputs must still name their values after the whole DAG")
+      (with-redefs [gpu/alloc! (fn [& _] (throw (ex-info "allocation failed" {:reason :test-allocation})))]
+        (is (= :test-allocation (reason #(gpu-distributed/instantiate! plan))))
+        (is (= [:open :close] @calls)))
+      (reset! calls [])
+      (with-redefs [gpu/upload-range! (fn [& _] (throw (ex-info "upload failed" {:reason :test-upload})))]
+        (is (= :test-upload (reason #(gpu-distributed/instantiate! plan))))
+        (is (= [:open :allocate :close] @calls)))
+      (reset! calls [])
+      (let [executable (gpu-distributed/instantiate! plan)]
+        (with-redefs [link/instantiate! (fn [& _] (throw (ex-info "bind failed" {:reason :test-bind})))]
+          (is (= :test-bind (reason #(gpu-distributed/run! executable))))
+          (is (= :failed @(:state executable)))
+          (is (= :distributed-runtime-state (reason #(gpu-distributed/run! executable)))))
+        (gpu-distributed/close! executable)
+        (gpu-distributed/close! executable)
+        (is (= 1 (count (filter #{:close} @calls))))))))
+
+(deftest distributed-owner-rejects-inconsistent-unused-allocation-contracts-before-drivers
+  (let [[local plan] (whole-field-distributed-plan (:initial (problem)))
+        unused (fn [opts]
+                 (-> local
+                     (assoc-in [:nodes :unused]
+                               (link-plan/node (merge {:id :unused :role :internal :device :ze:0
+                                                       :dtype :double :shape [1]} opts)))
+                     (assoc-in [:values :unused]
+                               (link-plan/value {:id :unused :abstract (av/tensor {:dtype :double :shape [1]})
+                                                 :leaves [{:name :value :node :unused}]}))))
+        calls (atom 0)]
+    (with-redefs [gpu/make-session (fn [& _] (swap! calls inc) (throw (ex-info "unexpected driver" {})))]
+      (doseq [opts [{:byte-size 16} {:alignment 8} {:memory-space :shared}]]
+        (let [conflict (-> plan
+                           (assoc-in [:device-plans :ze:0 :entries :heat :link-plan] (unused {}))
+                           (assoc-in [:device-plans :ze:0 :entries :later] {:link-plan (unused opts)})
+                           (assoc-in [:device-plans :ze:0 :steps :later]
+                                     (assoc (get-in plan [:device-plans :ze:0 :steps :step]) :entry :later))
+                           (update :steps conj (distributed/compute-step
+                                               {:id :later :device :ze:0 :duration-ns 1 :dependencies [:step]})))]
+          (is (= :distributed-runtime-storage-contract
+                 (try (gpu-distributed/instantiate! conflict) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+      (is (zero? @calls)))))
+
+(deftest compiled-heat-executes-through-the-distributed-dag-runtime
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "distributed-dag-heat-runtime")
+    (let [initial (:initial (problem))
+          [local plan] (whole-field-distributed-plan initial)
+          expected (heat-step! (double-array 56) initial (double-array 56) 8 width dt)
+          output-id (first (link-plan/output-value-ids local))]
+      (with-open [executable (gpu-distributed/instantiate! plan)]
+        (is (= :ready @(:state executable)))
+        (gpu-distributed/run! executable)
+        (is (= :complete @(:state executable)))
+        (let [session (get (:sessions executable) :ze:0)
+              actual (double-array 56)]
+          (gpu/download-range! session
+                               (get-in (gpu-distributed/output-values executable) [:step output-id])
+                               actual {:elements 56})
+          (is (< (max-error expected actual) 1.0e-10)))
+        (is (= :distributed-runtime-state
+               (try (gpu-distributed/run! executable) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            "a second run needs new initialization/freshness evidence")))))
 
 (deftest compiled-two-worker-halos-use-resident-copies
   (if-not @gp/gpu-available?
