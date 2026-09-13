@@ -19,7 +19,7 @@ single-owned placement. The new spelling describes the full local materializatio
  [{:kind :owned :value :u :shard :left :local-offsets [1 0]}
   {:kind :replica :transfer :receive-right-face}
   {:kind :boundary :region {:offsets [0 0] :shape [1 7]}
-   :producer :initialize-left-boundary}]}
+   :provider {:step :initialize-left-boundary :local-value :boundary-out}}]}
 ```
 
 The example's identifiers are schematic. Replica geometry comes from the referenced scheduled
@@ -48,7 +48,8 @@ For every local materialization:
 
 ## Identity and endpoint resolution
 
-An owned realization remains keyed by `[device global-value shard-id]`. An incoming replica is
+An owned realization remains keyed by `[device global-value shard-id]`, comparing its derived
+owned subviews rather than the entire padded base. An incoming replica is
 keyed by `[target-device transfer-step-id]`, not by its source's owned-shard key. Source and target
 therefore may have different allocations, while repeated references to one materialization must
 agree on its actual views. Transfer identity also distinguishes refreshed replicas across unrolled
@@ -58,6 +59,9 @@ Resolve transfer endpoints through these placement identities. Avoid a second ha
 of ABI arguments or duplicate source/destination rectangle declarations. If the source owned
 realization cannot be identified uniquely, or the target replica is absent, lowering must refuse
 execution even when the topology-only plan remains useful for simulation.
+Combining halo transfers must use their certified reduction over the derived owned target face;
+they must never be silently implemented as a copy. The initial copy-mode vertical rejects these
+until its runtime can execute the stated reduction.
 
 ## Readiness is separate from geometry
 
