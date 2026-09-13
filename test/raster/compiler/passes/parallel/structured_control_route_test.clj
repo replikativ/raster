@@ -148,21 +148,35 @@
 
 (defn- mixed-source
   []
-  '(let* [n (int (clojure.core/alength u0))
-          u (clojure.core/aclone u0)
-          scratch (clojure.core/double-array n)
-          time-loop
-          (dotimes [step steps]
-            (raster.par/map! scratch i n double
-                             (+ (clojure.core/aget u i) 1.0))
-            (let* [next (raster.par/pmap j n double
-                                         (+ (clojure.core/aget u j)
-                                            (clojure.core/aget scratch j)
-                                            (* 0.0 step)))]
-                  (java.lang.System/arraycopy next 0 u 0 n)))
-          after (raster.par/pmap k n double
-                                 (* 2.0 (clojure.core/aget u k)))]
-         after))
+  (let [source
+        '(let* [n (int (clojure.core/alength u0))
+                u (clojure.core/aclone u0)
+                scratch (clojure.core/double-array n)
+                time-loop
+                (dotimes [step steps]
+                  (raster.par/map! scratch i n double
+                                   (+ (clojure.core/aget u i) 1.0))
+                  (let* [next (raster.par/pmap j n double
+                                               (+ (clojure.core/aget u j)
+                                                  (clojure.core/aget scratch j)
+                                                  (* 0.0 step)))]
+                        (java.lang.System/arraycopy next 0 u 0 n)))
+                after (raster.par/pmap k n double
+                                       (* 2.0 (clojure.core/aget u k)))]
+               after)
+        ;; This raw frontend fixture bypasses the walker. State the bodies' actual source result
+        ;; type (double operands and arithmetic), independently of the maps' output cast target.
+        double-bodies
+        '#{(+ (clojure.core/aget u i) 1.0)
+           (+ (clojure.core/aget u j)
+              (clojure.core/aget scratch j)
+              (* 0.0 step))
+           (* 2.0 (clojure.core/aget u k))}]
+    (walk/postwalk
+     #(if (contains? double-bodies %)
+        (with-meta % {:tag 'double :raster.type/tag 'double})
+        %)
+     source)))
 
 (defn- mixed-source-without-induction
   []
@@ -564,6 +578,23 @@
     (is (true? (get-in shape-equation [:attributes :host-only])))
     (is (some #{'size} prefix-symbols)
         "the same pure size is materialized before allocation and retained as graph proof")))
+
+(deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
+  (let [source '(let* [checked (clojure.core/int n)
+                       effect (raster.par/map-void! i n
+                                                    (clojure.core/aset out i 1.0))]
+                      effect)
+        options {:dtype :double :public-parameters '[out n]
+                 :array-types {'out :double} :scalar-types {'n :long}}
+        parallel (:program (typed-route/attempt source :double {'out :double}
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-soac-program parallel options)]
+    (is (= '[scalar map]
+           (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
+                 (:equations promoted))))
+    (is (not-any? #(= 'checked (:symbol %))
+                  (get-in promoted [:attributes :invocation-plan :steps]))
+        "the checked equation remains in program order instead of becoming a prunable prefix")))
 
 (defn- prepared-mixed-call
   ([trip-count]

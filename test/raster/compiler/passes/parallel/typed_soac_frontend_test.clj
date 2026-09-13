@@ -8,6 +8,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -66,6 +67,50 @@
     (is (= normalized (frontend/normalize-source normalized options)))
     (doseq [n [Long/MIN_VALUE -1 0 1 3 2147483648 Long/MAX_VALUE]]
       (is (= (run source n) (run normalized n)) (str "count " n)))))
+
+(deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source
+                    '(let* [result (dotimes [i (int n)] (aset out i 1.0))] result)
+                    options)
+        program (frontend/form->program normalized options)
+        equations (dialect/equations program)]
+    (is (= 'raster.par/map-void! (first (last (second normalized))))
+        "a checked count is retained while the store loop enters the effect dialect")
+    (is (= '[scalar scalar map]
+           (mapv dialect/operation-kind equations))
+        "the converted count and nonnegative launch extent precede the lowered store map")
+    (is (= [:long :long]
+           (mapv #(-> % dialect/operation-parts :attributes :dtypes first)
+                 (take 2 equations)))
+        "both the widened count and clamped extent retain their long ABI")
+    (let [widened-result (-> equations first dialect/operation-parts :lambda
+                             dialect/lambda-parts :body-results first)]
+      (is (= 'clojure.core/long (first widened-result)))
+      (is (= '(int %capture0) (second widened-result))
+          "the outer exact widening does not erase the inner checked narrowing")
+      (is (= 'long (types/sym-type-tag widened-result))
+          "the restored widening carries its result type, not stale operand metadata")))
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        source '(let* [checked (clojure.core/int n)
+                       result (raster.par/map! out i n double 1.0)]
+                      result)
+        equations (some-> source (frontend/form->program options) dialect/equations)]
+    (is (= '[scalar map] (mapv dialect/operation-kind equations))
+        "an otherwise-unused checked prefix remains an ordered scalar equation")
+    (is (= :int (-> equations first dialect/operation-parts :attributes :dtypes first))
+        "the explicit cast descriptor, not the program default, types its result")))
+
+(deftest checked-scalars-after-numerical-work-decline-this-route
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        source '(let* [first-result (raster.par/map! out i n double 1.0)
+                       checked (clojure.core/int n)]
+                      first-result)]
+    (is (nil? (frontend/form->program source options))
+        "host-only staging cannot move a later throw before an independent device write")))
 
 (deftest counted-conflicting-stores-retain-order-and-explicit-buffer-return
   (let [options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}

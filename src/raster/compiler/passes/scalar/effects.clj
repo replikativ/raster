@@ -15,7 +15,11 @@
    as :pure so beichte doesn't need to analyze their source each time."
   (:require [beichte.core :as b]
             [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
@@ -149,13 +153,27 @@
        node))
    expr))
 
+(defn- proven-total-cast?
+  "Use retained operand types or checked constant evidence, never a consumer's expected type."
+  [expression]
+  (when (= 1 (count (descriptor/call-args expression)))
+    (let [operand (first (descriptor/call-args expression))
+          source (some-> (when (instance? clojure.lang.IObj operand)
+                           (types/sym-type-tag operand))
+                         dtype/dtype-for-scalar-tag)
+          target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
+                         dtype/dtype-for-scalar-tag)]
+      (or (some? (numeric-constant/value expression))
+          (and source target
+               (= [:exact :exact] (scalar-conversion/policy source target)))))))
+
 (defn- checked-integral-cast?
   "Whether a semantic expression contains a source cast which may throw.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked casts to integral types remain conservatively non-removable even
-   when a later typed pass can prove a particular conversion exact."
+   checked casts to integral types remain conservatively non-removable. A proven
+   identity/widening or a successful checked constant conversion adds no obligation."
   [expr]
   (boolean
    (some (fn [node]
@@ -164,7 +182,8 @@
                (and (descriptor/cast-op? operation)
                     (= :reject (descriptor/cast-integral-narrowing operation))
                     (contains? '#{byte int long}
-                               (descriptor/cast-result-tag operation))))))
+                               (descriptor/cast-result-tag operation))
+                    (not (proven-total-cast? node))))))
          (tree-seq coll? seq expr))))
 
 (defn descriptor

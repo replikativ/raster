@@ -222,8 +222,10 @@
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
-         (or (shape-projection-source expression)
-             (= :pure (effects/analyze-effect expression))))))
+         ;; Invocation-prefix construction is dependency-pruned and executes before all device
+         ;; equations. Even a shape projection may not cross that boundary when a checked cast
+         ;; still carries exceptional control; retained totality evidence makes it removable.
+         (effects/removable-expr? expression))))
 
 (defn- hoist-host-invocation-equations
   [parallel-program]

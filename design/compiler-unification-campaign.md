@@ -49,6 +49,22 @@ in-repository training evidence must not be substituted for those external gates
 The immediate emphasis returns to unresolved compiler/training workload coverage after the durable
 transfer acceptance; the distributed and scientific work does not replace the emitter agenda.
 
+### Checked scalar conversion checkpoint
+
+#565–#568 landed runtime VJP-cache invalidation, resident scalar composition, shape-only array
+captures, and KernelBody signed narrowing with explicit target trap contracts. Source conversion
+integration keeps checked casts distinct from unchecked wrapping, preserves ordered lexical
+initializers and unused checked prefixes, and separates one-shot extent evaluation from CSE.
+Beichte's external-effect classification remains separate from descriptor-derived exceptional
+control obligations; only retained exact-conversion or checked constant evidence removes them.
+
+Host-only scalar steps currently execute during preparation. Checked scalars after device work
+therefore decline rather than moving a potential failure ahead of preceding writes. General
+interleaved host/device exceptional control remains future work. Portable OpenCL still declines
+unproven trapping device casts; CUDA/HIP/Intel termination is not a JVM exception-delivery promise.
+This work does not certify the scalar simplifier's historical floating-point algebra under all
+NaN/signed-zero cases, nor complete the remaining counted-map migration or compatibility census.
+
 ### External scientific comparisons
 
 The [source-reviewed extension experiments](scientific-extension-validation.md) add Julia/SciML

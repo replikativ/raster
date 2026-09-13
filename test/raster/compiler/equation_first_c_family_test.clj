@@ -489,6 +489,29 @@
           "the input load, not merely a launch-bound scalar, must feed a checked cast")
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
+(deftest unused-checked-prefix-remains-observable-before-device-work
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'checked-casts/checked-prefix-rows!
+                                            {:target target :dtype :long})
+          input (long-array [7 9])
+          output (int-array [-1 -1])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in (equation-first/lower compilation [input output 2 2147483647])
+                       [:attributes :driver-allocations])))
+      (is (thrown? ArithmeticException
+                   (equation-first/lower compilation [input output 2 2147483648])))
+      (is (= [-1 -1] (vec output))))))
+
+(deftest checked-scalars-after-device-work-do-not-become-preparation-checks
+  (doseq [target [cuda-target hip-target]]
+    (is (= :equation-first-coverage
+           (try
+             (equation-first/compile #'checked-casts/checked-after-write!
+                                    {:target target :dtype :int})
+             :accepted
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
+
 (deftest emitted-program-rejects-a-mixed-target-module
   (let [compilation (equation-first/compile
                      #'c-family-dot {:target cuda-target :dtype :float})

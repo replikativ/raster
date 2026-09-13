@@ -25,6 +25,18 @@
     (is (not (effects/cse-safe-expr? allocation))
         "two live allocations may not share mutable identity")))
 
+(deftest total-conversion-evidence-does-not-invent-an-exception
+  (let [int-value (with-meta 'x {:raster.type/tag 'int})
+        long-value (with-meta 'x {:raster.type/tag 'long})]
+    (doseq [expression [(list 'clojure.core/long int-value)
+                        (list 'clojure.core/int int-value)
+                        '(clojure.core/int 2147483647)]]
+      (is (effects/removable-expr? expression)))
+    (doseq [expression [(list 'clojure.core/int long-value)
+                        '(clojure.core/int 2147483648)
+                        '(clojure.core/long x)]]
+      (is (contains? (:flags (effects/descriptor expression)) :checked-source-cast)))))
+
 (deftest checked-source-casts-carry-exceptional-control
   (doseq [expression ['(clojure.core/int x)
                       '(clojure.core/byte x)

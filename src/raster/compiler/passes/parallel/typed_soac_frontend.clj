@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
@@ -1602,6 +1603,21 @@
            (= 1 (count (descriptor/call-args expression)))
            (symbol? (first (descriptor/call-args expression))))))
 
+(defn- ordered-scalar-expression?
+  "Whether a scalar may be retained and evaluated once at its source position.
+
+   This is intentionally weaker than removability: a checked cast is externally pure while its
+   possible exceptional control transfer must remain observable."
+  [expression]
+  (or (= :pure (effects/analyze-effect expression))
+      (and (descriptor/alength-op? (descriptor/semantic-op expression))
+           (= 1 (count (descriptor/call-args expression)))
+           (symbol? (first (descriptor/call-args expression))))))
+
+(defn- requires-ordered-evaluation?
+  [expression]
+  (contains? (:flags (effects/descriptor expression)) :checked-source-cast))
+
 (defn- parallel-extent
   [expression]
   (cond
@@ -1835,6 +1851,12 @@
    (fn [[state expression] [position scalar-dtype]]
      (let [operand (normalize-scalar-casts (nth expression position) (:local-scalar-types state))
            operand-dtype (retained-scalar-dtype operand (:local-scalar-types state))
+           operand (if (and (symbol? operand) operand-dtype)
+                     (let [operand-tag (dtype/scalar-tag-for-dtype operand-dtype)]
+                       (with-meta operand (assoc (meta operand)
+                                                :tag operand-tag
+                                                :raster.type/tag operand-tag)))
+                     operand)
            tag (dtype/scalar-tag-for-dtype scalar-dtype)]
        (if (and (symbol? operand) (= scalar-dtype operand-dtype))
          [state (with-meta (apply list (assoc (vec expression) position operand)) (meta expression))]
@@ -1861,7 +1883,7 @@
            (symbol? (first (second expression))))
     (let [[idx bound] (second expression)
           body (list* 'do (nnext expression))]
-      (if (and (provably-pure-scalar? bound)
+      (if (and (ordered-scalar-expression? bound)
                ;; Reading mutable storage cannot be shared with a later extent equation.
                (empty? (par/collect-aget-arrays bound))
                (store-region body idx))
@@ -2002,6 +2024,20 @@
                                               (resolve-length #{})
                                               (->> (util/subst-syms scalar-aliases))
                                               (normalize-scalar-casts local-scalar-types))
+                     fresh-extent-id
+                     (fn []
+                       (let [extent-dtype (or (retained-scalar-dtype canonical-extent
+                                                                      local-scalar-types)
+                                              :long)
+                             extent-tag (dtype/scalar-tag-for-dtype extent-dtype)
+                             extent-base (str "rstr_extent_" ordinal)]
+                         (with-meta
+                           (first (remove occupied-symbols
+                                          (cons (clojure.core/symbol extent-base)
+                                                (map #(clojure.core/symbol (str extent-base "_" %))
+                                                     (range)))))
+                           {:tag extent-tag :raster.type/tag extent-tag
+                            :raster.compiler/normalized-extent true})))
                      state (if-let [length (allocation-length expression)]
                              (assoc-in state [:allocation-lengths symbol]
                                        (->> (resolve-length length #{})
@@ -2022,6 +2058,16 @@
                    (update state :normalized conj
                            [symbol (replace-extent expression canonical-extent)])
 
+                   ;; A checked extent is evaluated exactly once at this source position. It must
+                   ;; receive an SSA identity, but unlike a removable expression it cannot be
+                   ;; deduplicated with an earlier equal spelling.
+                   (and (ordered-scalar-expression? canonical-extent)
+                        (requires-ordered-evaluation? canonical-extent))
+                   (let [extent-id (fresh-extent-id)]
+                     (update state :normalized into
+                             [[extent-id canonical-extent]
+                              [symbol (replace-extent expression extent-id)]]))
+
                    (provably-pure-scalar? canonical-extent)
                    (if-let [extent-id (get compound-extents canonical-extent)]
                      ;; Equal pure extent expressions are one SSA value. Besides avoiding
@@ -2029,21 +2075,7 @@
                      ;; general horizontal-fusion rule (for example two same-shaped views).
                      (update state :normalized conj
                              [symbol (replace-extent expression extent-id)])
-                     (let [extent-dtype (or (retained-scalar-dtype canonical-extent local-scalar-types)
-                                            :long)
-                           extent-tag (dtype/scalar-tag-for-dtype extent-dtype)
-                           extent-base (str "rstr_extent_" ordinal)
-                           extent-id (with-meta
-                                       (first (remove occupied-symbols
-                                                      (cons (clojure.core/symbol extent-base)
-                                                            (map #(clojure.core/symbol
-                                                                   (str extent-base "_" %))
-                                                                 (range)))))
-                                       {:tag extent-tag :raster.type/tag extent-tag
-                                        ;; This SSA value is introduced by the frontend as the
-                                        ;; canonical identity of compound launch/storage algebra.
-                                        ;; Preserve that provenance without relying on its name.
-                                        :raster.compiler/normalized-extent true})]
+                     (let [extent-id (fresh-extent-id)]
                        (-> state
                            (assoc-in [:compound-extents canonical-extent] extent-id)
                            (update :normalized into
@@ -2072,13 +2104,15 @@
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
   (:descriptions
    (reduce
-    (fn [{:keys [array-types scalar-definitions] :as state} [id [symbol expression]]]
+    (fn [{:keys [array-types scalar-definitions stageable-prefix?] :as state}
+         [id [symbol expression]]]
       (let [description
             (or (binding [*scalar-definitions* scalar-definitions]
                   (operation-description id symbol expression default-dtype array-types scalar-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
+            description (assoc description :source-prefix? stageable-prefix?)
             ;; a pure product/sum of scalars is a definition later index algebra may expand
             scalar-definition
             (when (and (= :scalar (:kind description)) (symbol? symbol)
@@ -2099,9 +2133,13 @@
                                        (some-> operation name symbol)))]
                 (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))]
         (cond-> (update state :descriptions conj description)
+          (or (not= :scalar (:kind description))
+              (and (not (effects/removable-expr? expression))
+                   (not (requires-ordered-evaluation? expression))))
+          (assoc :stageable-prefix? false)
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
-    {:descriptions [] :array-types array-types :scalar-definitions {}}
+    {:descriptions [] :array-types array-types :scalar-definitions {} :stageable-prefix? true}
     (map-indexed vector pairs))))
 
 (defn- canonical-extent
@@ -2209,7 +2247,9 @@
   [physical-outputs description]
   (case (:kind description)
     :scalar (and (not (contains-parallel-form? (:expr description)))
-                 (or (provably-pure-scalar? (:expr description))
+                 (or (and (ordered-scalar-expression? (:expr description))
+                          (or (effects/removable-expr? (:expr description))
+                              (:source-prefix? description)))
                      (generated-scaffolding? description physical-outputs)))
     :map (or (:pure? description)
              (and (seq (:result-storage description))
@@ -2250,8 +2290,9 @@
     ;; Ordinary host scalar bindings are opaque control/dataflow boundaries around TypedSOAC
     ;; islands. Unsupported parallel operations still decline: executing those through a second
     ;; lowering route inside one program would duplicate semantics.
-    (every? #(or (= :scalar (:kind %))
-                 (supported-description? physical-outputs %))
+    (every? #(or (supported-description? physical-outputs %)
+                 (and (= :scalar (:kind %))
+                      (not (requires-ordered-evaluation? (:expr %)))))
             descriptions)))
 
 (defn normalize-source
@@ -2781,30 +2822,47 @@
                  (vec (concat [accumulator] elements capture-parameters))
                  [result])))))
 
-(defn- scalar-dtype
+(defn- scalar-result
   [{:keys [sym expr]} scalar-dtypes scalar-types]
   (let [expression-tag (when (instance? clojure.lang.IObj expr)
-                         (or (:raster.type/tag (meta expr)) (:tag (meta expr))))]
-    (or (get scalar-types sym)
-        (when (symbol? expr) (get scalar-dtypes expr))
-        (dtype/dtype-for-scalar-tag (types/sym-type-tag sym))
-        (dtype/dtype-for-scalar-tag expression-tag))))
+                         (or (:raster.type/tag (meta expr)) (:tag (meta expr))))
+        expression-dtype (or (when (symbol? expr) (get scalar-dtypes expr))
+                             (retained-scalar-dtype expr scalar-types))
+        binder-dtype (some-> (types/sym-type-tag sym) dtype/dtype-for-scalar-tag)]
+    (if (and expression-dtype binder-dtype
+             (not= (dtype/canon expression-dtype) (dtype/canon binder-dtype)))
+      (if (= [:exact :exact] (scalar-conversion/policy expression-dtype binder-dtype))
+        ;; Scalar simplification may erase an exact widening as value algebra, while a generated
+        ;; binder still declares the wider ABI consumed by a launch primitive. Reify that
+        ;; boundary conversion instead of either guessing from the consumer or lying about the
+        ;; lambda result. A narrowing/non-exact disagreement remains a structured contradiction.
+        (let [tag (dtype/scalar-tag-for-dtype binder-dtype)]
+          {:dtype binder-dtype
+           :expression (with-meta (list (symbol "clojure.core" (name tag)) expr)
+                         (assoc (meta expr) :tag tag :raster.type/tag tag))})
+        (fail! :scalar-binding-dtype-conflict
+               "typed scalar binding disagrees with its explicit expression result"
+               {:binding sym :expression expr :binding-dtype binder-dtype
+                :expression-dtype expression-dtype}))
+      {:dtype (or expression-dtype binder-dtype (get scalar-types sym)
+                  (dtype/dtype-for-scalar-tag expression-tag))
+       :expression expr})))
 
 (defn- scalar-equation
   [description scalar-dtypes scalar-types]
   (let [{:keys [id sym expr]} description
         captures (vec (sort-by pr-str (util/free-syms expr)))
         parameters (capture-symbols (count captures))
-        result-dtype (scalar-dtype description scalar-dtypes scalar-types)]
-    (when-not result-dtype
+        {:keys [dtype expression]} (scalar-result description scalar-dtypes scalar-types)]
+    (when-not dtype
       (fail! :unsupported-scalar-binding
              "typed scalar equations require a retained result dtype"
              {:binding id :symbol sym :expression expr}))
     (list '= id [sym]
-          (list 'scalar {:dtypes [result-dtype]} captures
+          (list 'scalar {:dtypes [dtype]} captures
                 (dialect/lambda-form
                  parameters
-                 [(util/subst-syms (zipmap captures parameters) expr)])))))
+                 [(util/subst-syms (zipmap captures parameters) expression)])))))
 
 (defn- physical-read-uses
   "Resolve storage reads to their latest preceding logical writer. Reads precede writes
@@ -2925,8 +2983,13 @@
         ;; The ordinary dependency closure below keeps this independent of allocation spelling.
         allocation-capacity-roots
         (allocation-capacity-scalars descriptions physical-outputs by-symbol)
+        ordered-evaluation-roots
+        (into #{} (keep (fn [[symbol description]]
+                          (when (requires-ordered-evaluation? (:expr description)) symbol)))
+              by-symbol)
         roots (set (concat outputs
                            allocation-capacity-roots
+                           ordered-evaluation-roots
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)
                                            (filter dialect/value-id?
