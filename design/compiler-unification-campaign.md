@@ -1,8 +1,86 @@
 # Compiler unification campaign
 
-Authorized scope: complete the four stages below in order. Each production migration must retain
-its numerical, ABI, ownership and resource contracts; isolated emitter coverage is not a completed
-vertical. The north star remains the architectural specification.
+Authorized scope is the eight-item campaign below. The original four-stage emitter sequence and
+subsequent chronological notes remain the detailed history, not a reduction of that scope. Each
+production migration must retain numerical, ABI, ownership and resource contracts; isolated emitter
+coverage is not a completed vertical. The north star remains the architectural specification.
+
+## Current eight-item checkpoint — 2026-09-13
+
+This section supersedes historical "next" and "still required" statements below where the cited
+implementation now exists. It records evidence, not a declaration that the campaign is complete.
+#562 and #563 landed after all seven final-head gates passed. #563 is on main at `c3678bcd`;
+do not infer a published release from a merge.
+
+| Campaign item | Current evidence | Remaining acceptance |
+|---|---|---|
+| 1. CI feedback and coverage | `.circleci/config.yml` uses four deterministic test shards plus public CUDA/HIP compile and OpenCL CPU gates. Targeted laptop checks use one capped REPL. | Continue measuring shard balance and skip reasons; preserve whole-suite coverage while reducing feedback latency. Green compile jobs alone do not permit merge. |
+| 2. Compatibility-debt ledger | `test/raster/compiler/compatibility_ledger.edn` has executable signature checks; `test/resources/coverage/gpu-corpus.edn` retains every corpus row, including errors. | Refresh through the actual measured compiler entry when migrations land; distinguish public invocation coverage from compatibility-entry census results. Never delete failed rows to improve the count. |
+| 3. Direct TypedSOAC and retirement | Generated matrix/input-fusion, ordinary counted stores, AD/SGD and numerical operators use retained typed programs. #562 shares complete-write evidence across invocation linking and LinkPlan validation. | The recorded 236-var corpus has 132 typed, 47 scalar, 14 compatible and 43 error rows. These are checked-in baseline counts, not a fresh census. Investigate remaining source-admission, type-preservation and compatibility-entry gaps before claiming full unification. |
+| 4. CUDA/HIP public-source verticals | Public numerical, attention and matrix fixtures compile in hardware-free vendor gates; allocation-free LinkPlan lowering is tested separately from source emission. | Vendor compilation is not vendor device correctness or performance. Keep matched execution/benchmark campaigns outside the laptop/CI dependency chain. |
+| 5. Reusable training and external models | Direct equation-first AD/SGD and small resident Gemma/LoRA tests check state progress, numerical trajectories and admitted routes. | External forward/VJP/update adapter migration and real-weight validation in pretrained/finetune remain. The inspected finetune checkout still uses retired `bind-program!`/`run-program!`; do not resurrect them. |
+| 6. Hardware-free distributed simulation | `distributed_plan_test.clj` covers topology, dependency/resource overlap, directed routes, capacity gates, collectives, halos and certificate drift. | Calibrate against real execution and broaden workload projections without presenting analytic costs as measured performance. |
+| 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
+| 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. | Production manifest publication/lineage realization, a numerical PDE evolution using coarse/fine exchange, convergence/conservation oracles, and later subcycling/reflux remain. A fixed transfer roundtrip is not an adaptive simulator. |
+
+External source audit rechecked at this checkpoint: pretrained-rstr `3b13ad4`, finetune-rstr
+`9e9ba5d`. No sibling code or dependency was modified. Finetune's declared released dependency is
+still Raster 0.2.287; its layer forward/backward code still names the retired binder. Existing
+in-repository training evidence must not be substituted for those external gates.
+
+### Execution order from this checkpoint
+
+1. #563 is merged after the reviewed #562 landing, with all seven current-head gates. Complete-write evidence must
+   remain distinct from conditional initialized postconditions; fresh prefix results must remain
+   legal without crediting untouched parent tails. Scalar reductions include their exact one-element
+   resident representation. Invalid shape diagnostics propagate; unsupported proofs may decline.
+2. Select the next compiler migration from a reproduced public workload, using the compatibility
+   ledger to distinguish stale entry-point accounting from an actual semantic/emission gap. Preserve
+   the corresponding JVM path and independent numerical tests while retiring the migrated fallback.
+3. Coordinate the external training adapter boundary using public compiled artifacts/LinkPlans and
+   semantic outputs. Validate chained gradients and real model state before claiming that item done.
+4. Continue matched public GEMM/projection measurements under the protocol in
+   `bench/comparison/generated-kernel-protocol.md`. Current noisy laptop samples do not promote a
+   winner or establish SOTA parity; a cloud accelerator is optional later evidence, never a CI gate.
+5. Extend numerical execution to a conservative PDE evolution with coarse/fine transfers and an
+   uninterrupted-versus-restored oracle. Reuse existing field/lease/plan contracts. Introduce any
+   additional semantic operation only when that workload exposes a concrete missing obligation.
+
+The immediate emphasis returns to unresolved compiler/training workload coverage after the durable
+transfer acceptance; the distributed and scientific work does not replace the emitter agenda.
+
+### External scientific comparisons
+
+The [source-reviewed extension experiments](scientific-extension-validation.md) add Julia/SciML
+and matrix-free references while preserving the existing ODE and iterative-solver library. They
+distinguish library capabilities from verified resident/distributed compilation; do not infer
+missing numerical algorithms from gaps in the new accelerator fixtures.
+
+Use numerical frameworks as well as kernel compilers, with separate kernel and time-to-solution
+measurements. Initial comparisons should match precision, discretization order, boundary conditions,
+mesh, timestep/stability constraints, stopping tolerance and transfers. Also compare time to a fixed
+solution accuracy, rather than treating a cheaper discretization as a compiler speedup.
+
+| Reference | First Raster workload and question |
+|---|---|
+| [Devito](https://www.devitoproject.org/examples/userapi/01_dsl.html) | Heat/acoustic stencils: symbolic numerical programs, fusion, scheduling, bandwidth and halo work. |
+| [AMReX](https://amrex-codes.github.io/amrex/docs_html/) | Block-structured coarse/fine transport: ghost exchange, conservation, refinement interfaces and placement. |
+| [PETSc](https://petsc.org/release/manual/dmbase/) | Poisson/implicit evolution: compose operator application, residuals, preconditioners and convergence control; measure time to the same tolerance. |
+| [MFEM](https://mfem.org/howto/assembly_levels/) | Later matrix-free finite elements: element/face gather, basis/quadrature contractions and assembly/scatter layouts. |
+| [UFL](https://docs.fenicsproject.org/ufl/main/manual/form_language.html) | A semantic reference for domain-aware mathematical expressions and differentiation, not a standalone runtime benchmark. |
+
+Start with Devito, then AMReX and PETSc; use MFEM/UFL to challenge regular-grid assumptions later.
+Keep these comparisons out of the hot test loop. Record dependency revisions, numerical settings,
+hardware and compiler/runtime revisions with each result. No installation, cloud service or sibling
+source modification is implied by listing these baselines.
+
+The architectural test is whether numerical problems lower through the same small functional core:
+for example, gather states → compute face fluxes → signed accumulation → update cells. Mesh entity
+relationships, geometric factors, boundary conditions, solver convergence and numerical error
+contracts belong above that core when needed; scheduling, storage and communication remain explicit
+below it. Changing resolution is a numerical approximation with a projection/error contract, not
+automatically an equivalent compiler rewrite. Current rectangular cell-centred AMR and explicit
+distributed DAGs do not yet establish arbitrary mesh, solver or adaptive-control generality.
 
 ## 1. Close product reduction production lowering — landed for the dense row subset
 
