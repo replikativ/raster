@@ -1092,8 +1092,35 @@ The distributed certificate now retains the optional structural local LinkPlan/E
 contracts instead of only their IDs and operation counts. Equally sized replacements with changed
 operations, scalars, event dependencies, outputs or views invalidate the certificate. Persistent
 compiler values are shared, not serialized or copied; this is not a content hash or snapshot of
-mutable host/device buffers. Explicit compute-step-to-program/shard binding is still required
-before treating the overall plan as an executable numerical workflow.
+mutable host/device buffers. The next structural binding relates named local entries and global
+shards without introducing another ABI or memory representation:
+
+```clojure
+{:device-plans
+ {:gpu-0
+  {:entries {:stencil {:link-plan local-plan}}
+   :steps {:advance-0
+           {:entry :stencil
+            :bindings {:tile-in  {:value :u-now  :shard :tile-0}
+                       :tile-out {:value :u-next :shard :tile-0}}}}}}}
+```
+
+`distributed-plan/compute-bindings` returns validated entries, logical bindings, actual ABI-derived
+accesses and physical leaf views, plus explicit unbound analytical compute steps. Shard identities
+are qualified by their global value; exact local shape and the existing AbstractValue storage
+contract must match. Public inputs/state/results and unsourced constants cannot disappear from
+the binding. Sourced constants and private scratch may remain local. Repeated bindings of the
+same resident shard must agree on allocation identity, range and ordered field packing.
+Distinct shards cannot overlap physical ranges on one device without an explicit relation;
+disjoint subviews remain legal. Declared global memory-space constraints must hold for every
+physical leaf. Entry access facts are derived once per report, not once per invocation.
+
+This is not yet distributed execution: device-scoped allocation sharing, transfer realization,
+submission/completion and ownership still need a numerical vertical. Separately instantiated
+LinkPlans currently namespace their owned allocations per executable. Matching structural views
+does not change that behavior or prove cross-entry zero-copy replay. Whole-shard binding also
+does not stand in for a future explicit halo-subregion mapping. Optional flat ExecutionPlans remain
+analytical; arbitrary event DAGs cannot be asserted as the realization of a named LinkPlan entry.
 
 The next sequence is workload-driven:
 

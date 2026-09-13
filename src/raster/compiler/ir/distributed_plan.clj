@@ -12,6 +12,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.distributed-compute :as compute]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.scan :as scan]
@@ -814,7 +815,7 @@
 
 (declare simulate)
 
-(defn validate!
+(defn- validate-structure!
   "Validate and return a DistributedPlan without realizing any runtime resource."
   [plan]
   (when-not (distributed-plan? plan)
@@ -853,6 +854,19 @@
       (fail! "distributed plan attributes must be a map"
              :distributed-plan-attributes {:attributes attributes})))
   plan)
+
+(defn validate!
+  "Validate distributed structure and local compute bindings without realizing resources."
+  [plan]
+  (compute/bindings (validate-structure! plan))
+  plan)
+
+(defn compute-bindings
+  "Validate and resolve named local compute entries and qualified shard bindings.
+   Returns `{:bindings {step-id ...} :unbound [compute-step-id ...]}`. This is a
+   structural compiler contract, not a runtime executor or allocation/transfer proof."
+  [plan]
+  (compute/bindings (validate-structure! plan)))
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
