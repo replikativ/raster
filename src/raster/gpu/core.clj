@@ -2203,6 +2203,30 @@
   [sess phase-key]
   (get-in @sess [:kernels phase-key]))
 
+(defn- profile-runtime-graph!
+  [device-id graph]
+  (let [replay-fn (rt-resolve device-id "replay-graph!")
+        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")
+        t0 (System/nanoTime)
+        _ (replay-fn graph)
+        t1 (System/nanoTime)
+        prof (read-ts-fn graph)]
+    {:profile (mapv #(select-keys % [:kernel-name :phase :ms :context-ms]) (:kernels prof))
+     :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
+     :device-wall-ms (:wall-ms prof)
+     :host-wall-ms (/ (- t1 t0) 1.0e6)}))
+
+(defn profile-bound-kernel-graph!
+  "Replay one bound profiling graph and consume/reset its device timestamps.
+   Returns the same profile as profile-recorded-graph! without exposing runtime handles.
+   Callers own input restoration and output validation outside this measured replay."
+  [sess handle]
+  (let [{:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)]
+    (when-not profile?
+      (throw (ex-info "bound kernel graph was not recorded with :profile? true"
+                      {:handle handle})))
+    (profile-runtime-graph! (:device-id @sess) runtime-graph)))
+
 (defn profile-recorded-graph!
   "Replay a graph recorded by record-graph! with `{:profile? true}` and return its backend-neutral
    device-event profile. Unlike replay!, this consumes (and resets) the timestamps instead of
@@ -2216,16 +2240,7 @@
     (when-not (and (recorded-graph-entry? entry) (:profile? entry))
       (throw (ex-info "recorded graph was not created with {:profile? true}"
                       {:graph-key graph-key})))
-    (let [replay-fn (rt-resolve device-id "replay-graph!")
-          read-ts-fn (rt-resolve device-id "read-graph-timestamps!")
-          t0 (System/nanoTime)
-          _ (replay-fn graph)
-          t1 (System/nanoTime)
-          prof (read-ts-fn graph)]
-      {:profile (mapv #(select-keys % [:kernel-name :phase :ms :context-ms]) (:kernels prof))
-       :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
-       :device-wall-ms (:wall-ms prof)
-       :host-wall-ms (/ (- t1 t0) 1.0e6)})))
+    (profile-runtime-graph! device-id graph)))
 
 (defn- graph-device-sampler
   [sess graph before-sample!]

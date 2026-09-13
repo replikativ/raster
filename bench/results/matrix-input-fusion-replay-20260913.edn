@@ -1,0 +1,18 @@
+{:probe raster.perf.matrix-input-fusion-probe/run!
+ :source-revision "8da29fbe72eba542f4fdb824a0c089460e7617a7"
+ :equivalent-rebased-source "61e17b4502ae6e482d3328565f977d7711f9d601"
+ :date "2026-09-13"
+ :device-name "Intel(R) Arc(TM) Graphics"
+ :device :ocl:0
+ :shape [13 32 32]
+ :comparison :exact
+ :timing? false
+ :candidates
+ [{:strategy :xmx-direct
+   :passed? true :replays 4 :checked-elements 1664
+   :stages [:convert-a :convert-b :contract]
+   :temporaries [:a16 :b16]}
+  {:strategy :xmx-direct-lhs-tile-cast
+   :passed? true :replays 4 :checked-elements 1664
+   :stages [:convert-b :contract]
+   :temporaries [:b16]}]}

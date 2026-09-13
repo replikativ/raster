@@ -80,6 +80,30 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :before-sample!"
                           (link/measure! executable :budget-ms 1)))))
 
+(deftest bound-graph-profile-preserves-device-span-and-kernel-breakdown
+  (let [calls (atom []) session (atom {:device-id :probe})]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'resolve-kernel-graph-entry)
+       (fn [_ handle] {:profile? (not= :unprofiled handle) :runtime-graph handle})
+       #'raster.gpu.core/rt-resolve
+       (fn [_ name]
+         (case name
+           "replay-graph!" #(swap! calls conj [:replay %])
+           "read-graph-timestamps!"
+           (fn [id] (swap! calls conj [:timestamp id])
+             {:wall-ms (when-not (= :missing-span id) 0.5)
+              :kernels [{:kernel-name "first" :ms 0.1} {:kernel-name "second" :ms 0.2}]})))}
+      (fn []
+        (is (thrown? clojure.lang.ExceptionInfo (gpu/profile-bound-kernel-graph! session :unprofiled)))
+        (is (empty? @calls))
+        (let [profile (gpu/profile-bound-kernel-graph! session :bound)]
+          (is (= [[:replay :bound] [:timestamp :bound]] @calls))
+          (is (= 0.5 (:device-wall-ms profile)))
+          (is (< (Math/abs (- 0.3 (:kernel-total-ms profile))) 1.0e-12))
+          (is (= ["first" "second"] (mapv :kernel-name (:profile profile)))))
+        (is (nil? (:device-wall-ms (gpu/profile-bound-kernel-graph! session :missing-span)))
+            "missing device timestamps are never replaced by host time")))))
+
 (deftest interleaved-bound-graphs-use-device-events-and-restore-before-every-replay
   (let [calls (atom [])
         session (atom {:device-id :probe})
