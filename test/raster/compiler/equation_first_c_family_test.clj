@@ -15,6 +15,7 @@
             [raster.dl.attention :as attention]
             [raster.dl.array-ops :as array-ops]
             [raster.numeric]
+            [raster.nn :as nn]
             [raster.ode.pde :as pde]
             [raster.ode.multilevel :as multilevel]
             [raster.par]
@@ -159,6 +160,22 @@
             "a scalar reduction establishes its complete one-element result")
         (is (= (:emitted compilation)
                (emitted-program/validate! (:emitted compilation))))))))
+
+(deftest public-softmax-backward-keeps-the-reduction-resident
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'nn/softmax-backward {:target target :dtype :double})
+          linked (equation-first/lower
+                  compilation [(double-array [1.0 2.0 3.0])
+                               (double-array [0.2 0.3 0.5])])
+          values (vals (get-in compilation [:semantic :values]))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (filter #(= :resident-scalar-buffer
+                                 (get-in % [:representation :kind])) values))))
+      (is (= 3 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
+      (is (= 1 (count (:outputs linked)))))))
 
 (deftest public-staged-contraction-preserves-independent-types-on-cuda-and-hip
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]

@@ -2,9 +2,12 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.nn :as numerical-nn]
             [raster.dl.nn :as nn]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.device-probe :as opencl-probe]))
 
@@ -16,6 +19,28 @@
       (is (graph/kernel-graph? reduction))
       (is (= 2 (count (:nodes reduction))))
       (is (= 1 (count (:allocs descriptor))) "only the completed scalar crosses stages"))))
+
+(deftest public-softmax-backward-composes-resident-reduction-and-map
+  (if @opencl-probe/opencl-available?
+    (let [compilation (equation-first/compile
+                       #'numerical-nn/softmax-backward {:target :ocl:0 :dtype :double})]
+      (doseq [width [1 17 513]]
+        (let [dy (double-array (map #(/ (- (mod % 11) 5) 7.0) (range width)))
+              weights (mapv #(double (inc (mod % 7))) (range width))
+              denominator (reduce + weights)
+              s (double-array (map #(/ % denominator) weights))
+              dot (reduce + (map * (vec s) (vec dy)))
+              expected (mapv #(* %1 (- %2 dot)) (vec s) (vec dy))
+              plan (equation-first/lower compilation [dy s])]
+          (is (= 0 (get-in plan [:attributes :driver-allocations])))
+          (with-open [live (link/instantiate! plan)]
+            (dotimes [_ 2]
+              (link/run! live)
+              (let [actual (vec (link/download live (first (:outputs plan))))]
+                (is (= width (count actual)))
+                (is (every? #(< (Math/abs (double %)) 1.0e-10)
+                            (map - expected actual)))))))))
+    (opencl-probe/opencl-skip! "public resident softmax backward composition")))
 
 (defn- run-norm! [target]
   (let [descriptor (pipeline/compile-gpu-program #'nn/rms-norm-1row! target :dtype :float)]
