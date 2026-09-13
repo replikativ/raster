@@ -2508,15 +2508,6 @@
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms writes)))))
 
-(defn- effect-expressions
-  "Every expression an effect evaluates, descending into store loops."
-  [effect]
-  (if-let [region (:region effect)]
-    (concat (map :init (:locals region)) (mapcat effect-expressions (:effects region)))
-  (if-let [{:keys [effects] :as loop} (:loop effect)]
-    (concat (source-loop-expressions loop) (mapcat effect-expressions effects))
-    [(:index effect) (:predicate effect) (:value effect)])))
-
 (defn- effect-map-equation
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]

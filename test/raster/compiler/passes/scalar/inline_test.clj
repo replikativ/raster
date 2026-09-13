@@ -33,6 +33,85 @@
     (doseq [index [-1 2 'n '(long n) '(int 4294967296) '(float 1)]]
       (is (nil? (#'inline/known-vg-element elements 'vg index))))))
 
+(deftest leaf-bodies-are-inlinable
+  (doseq [body ['x 'java.lang.Float/NEGATIVE_INFINITY 42 1.5 nil true]]
+    (is (#'inline/inlinable-body? body))))
+
+(deftest inlining-preserves-unused-checked-arguments
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [_] {:params ['x] :tags ['int] :walked-body [42]})}
+    (fn []
+      (let [inlined (#'inline/inline-invk '(.invk example/constant (int 4294967296)))]
+        (is (thrown? ArithmeticException (eval inlined))
+            "an unused checked argument still throws before entering the callee"))
+      (let [inlined (#'inline/inline-invk
+                    '(.invk example/constant (int (do (swap! calls inc) 3))))]
+        (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
+                                 [inlined '(deref calls)]))))))))
+
+(deftest direct-inline-arity-is-checked-before-substitution
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [_] {:params ['x] :tags ['long] :walked-body [42]})}
+    (fn []
+      (doseq [call ['(.invk example/constant)
+                   '(.invk example/constant 1 (swap! calls inc))]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Arity mismatch"
+                             (#'inline/inline-invk call)))))))
+
+(deftest unused-collection-arguments-still-evaluate-their-elements
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [_] {:params ['x] :walked-body [42]})}
+    (fn []
+      (doseq [argument ['[(swap! calls inc)] '{:key (swap! calls inc)}
+                       '#{(swap! calls inc)}]]
+        (let [inlined (#'inline/inline-invk (list '.invk 'example/constant argument))]
+          (is (= [42 1] (eval (list 'let ['calls '(atom 0)]
+                                   [inlined '(deref calls)])))))))))
+
+(deftest local-function-inlining-preserves-call-by-value
+  (doseq [body [nil false 42 '(+ x x)]
+          argument ['(int (do (swap! calls inc) 3))]]
+    (let [source (list 'let* ['f (list 'ftm ['x] body)
+                             'result (list 'f argument)] 'result)
+          inlined (:form (#'inline/inline-one-pass source))
+          ;; The local function declaration remains for later DCE; use a host fn
+          ;; solely to execute this intermediate compiler form.
+          executable (clojure.walk/postwalk
+                      #(if (and (seq? %) (= 'ftm (first %)))
+                         (cons 'fn (rest %)) %) inlined)]
+      (is (= [(if (seq? body) 6 body) 1]
+             (eval (list 'let ['calls '(atom 0)] [executable '(deref calls)])))))))
+
+(deftest binding-inline-accepts-constant-leaves
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [& _] {:params ['x] :tags ['long] :walked-body [42]})}
+    (fn []
+      (let [inlined (:form (#'inline/inline-one-pass
+                           '(let* [result (example/constant (int 4294967296))] result)))]
+        (is (thrown? ArithmeticException (eval inlined)))))))
+
+(deftest nested-argument-calls-are-expanded-before-lifting
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
+    (fn []
+      (let [inlined (#'inline/inline-invk
+                    '(.invk example/identity (.invk example/identity (+ 1 2))))]
+        (is (not-any? #(and (seq? %) (= '.invk (first %)))
+                      (tree-seq coll? seq inlined)))
+        (is (= 3 (eval inlined)))))))
+
+(deftest inlining-visits-loop-initializers-without-changing-binders
+  (with-redefs-fn {#'inline/try-resolve-deftm
+                  (fn [_] {:params ['x] :tags ['long] :walked-body ['x]})}
+    (fn []
+      (let [inlined (#'inline/inline-invk
+                    '(loop* [i 0 acc (.invk example/identity (long (+ i 2)))]
+                       (if (< i 3) (recur (inc i) (+ acc i)) acc)))]
+        (is (= ['i 'acc] (vec (take-nth 2 (second inlined)))))
+        (is (not-any? #(and (seq? %) (= '.invk (first %)))
+                      (tree-seq coll? seq inlined)))
+        (is (= 5 (eval inlined)))))))
+
 ;; Monomorphic callee taking THREE args (mirrors the concrete-float finetune.train/gblock,
 ;; which takes 38 and was called with 37).
 (deftm arity-callee

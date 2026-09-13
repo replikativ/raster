@@ -380,6 +380,15 @@
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
+(deftest counted-softmax-initializers-use-the-public-c-family-boundary
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'attention/softmax-rows!
+                                            {:target target :dtype :float})
+          plan (equation-first/lower compilation [(float-array 6) 2 3])]
+      (is (= 4 (count (:kernels compilation))))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
 (deftest counted-mixed-precision-stores-use-explicit-destination-conversion
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile #'array-ops/reduce-axis-backward

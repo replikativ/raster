@@ -19,6 +19,18 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest static-numeric-constants-use-shared-evidence
+  (let [lower (:lower (lowerer))
+        result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]
+    (is (= :float (:type result)))
+    (is (= Float/NEGATIVE_INFINITY (get-in result [:result :value])))
+    (is (= 'Float/NEGATIVE_INFINITY
+           (:result (lower 'Float/NEGATIVE_INFINITY :float
+                           {'Float/NEGATIVE_INFINITY :float})))
+        "declared locals take precedence over static constant lookup")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared value"
+                         (lower 'Float/UNKNOWN :float {})))))
+
 (deftest java-round-keeps-overload-separate-from-consumer-type
   (let [lower (:lower (lowerer))
         widened (lower '(Math/round (aget x i)) :long {'i :int})

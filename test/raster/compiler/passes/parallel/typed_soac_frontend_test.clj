@@ -51,6 +51,17 @@
     (is (= [[:argument 0]]
            (dialect/physical-results renamed (last (dialect/equations renamed)))))))
 
+(deftest counted-stores-preserve-source-rounding-before-destination-conversion
+  (let [options {:dtype :double :array-types {'out :double 'x :double}
+                 :scalar-types {'n :long}}
+        source '(let* [r (dotimes [i n] (aset out 0 (float (aget x i))))] out)
+        program (frontend/form->program (frontend/normalize-source source options) options)]
+    (is (some? program))
+    (is (some #(and (seq? %) (= 'double (first %))
+                    (seq? (second %)) (= 'float (first (second %))))
+              (tree-seq coll? seq (last (dialect/equations program))))
+        "widen the source-rounded float; do not replace its cast with a double cast")))
+
 (deftest unknown-or-mutable-counts-are-not-normalized
   (doseq [bound ['(next-count!) '(aget counts 0)]]
     (let [source (list 'let* ['r (list 'dotimes ['i bound] '(aset out i 1.0))] 'r)]

@@ -6,6 +6,7 @@
    this pass performs no source-level type or function inference."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -212,9 +213,11 @@
                     (let [type (canon-type actual)]
                       {:operations [] :result expression :type type
                        :range (known-range expression type)})
-                    (decline! :unbound-scalar
-                              "scalar expression references an undeclared value"
-                              {:expression expression :environment (set (keys env))}))
+                    (if-let [constant (numeric-constant/value expression)]
+                      (lower-value (:value constant) expected env)
+                      (decline! :unbound-scalar
+                                "scalar expression references an undeclared value"
+                                {:expression expression :environment (set (keys env))})))
 
                   (descriptor/aget-call? expression)
                   (let [array (descriptor/aget-array-sym expression)
