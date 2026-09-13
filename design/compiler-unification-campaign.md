@@ -1025,3 +1025,11 @@ the public route across the shape ladder against numerically matched external ba
 the global-conversion alternative, and continue the resident forward/VJP/update and scientific
 demonstrators. No source-form restriction should become a permanent semantic primitive merely
 to make a benchmark fuse; safe scalar placement needs a proof or guarded schedule.
+
+Training coverage now checks analytic dispatch selection rather than copying hardware pitch
+predicates. The tiny Gemma LoRA forward/reverse-AD/SGD fixture uses dimensions admitting the
+current matrix schedules: all 56 matrix choices select mixed precision across NN/NT/TN. On Arc,
+the focused 25-update comparison passed 31 assertions; loss went from 2.281172 to 1.261994 for
+FP32 and 1.262058 for mixed precision, within the existing per-step relative tolerance. This
+validates the tiny block and selected preference, not a bound-route trace, stationary throughput,
+or real-weight model convergence. Concrete alias admission remains a separate runtime check.
