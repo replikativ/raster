@@ -1327,16 +1327,6 @@
         (finally (.close arena))))
     (buffer->array ids-buf)))
 
-(defn invoke-registered-scatter-kernel
-  "Invoke a compiled scatter-add kernel. Same interface as ze_runtime."
-  [^String kernel-name output src index n & [stride]]
-  (invoke-registered-map-void-kernel kernel-name
-                                     (if stride [output src index] [output src index])
-                                     (if stride
-                                       [{:type :int :value (int stride)}]
-                                       [])
-                                     n))
-
 (defn invoke-registered-reduce-by-key-kernel
   "Invoke a compiled reduce-by-key kernel. Same interface as ze_runtime."
   [^String kernel-name output keys vals n]

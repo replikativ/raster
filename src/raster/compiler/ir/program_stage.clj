@@ -55,16 +55,9 @@
 (defn step-accesses
   "Return `{compiler-symbol :read|:write|:read-write}` for one descriptor step.
 
-   Access comes from the executable ABI, not parameter spelling conventions. Scatter retains its
-   explicit three-buffer contract until it is represented by an ordinary executable ABI."
+   Access comes from the executable ABI, not parameter spelling conventions."
   [step]
-  (if (= :scatter (:convention step))
-    (let [[output source index :as arrays] (:arrays step)]
-      (when-not (and (= 3 (count arrays)) (every? symbol? arrays))
-        (throw (ex-info "program stage scatter requires output, source and index symbols"
-                        {:reason :program-stage-scatter :phase (:phase step) :arrays arrays})))
-      {output :write source :read index :read})
-    (let [interface (kexec/validate! (step-interface step))
+  (let [interface (kexec/validate! (step-interface step))
           slot-groups (kabi/logical-pointer-slot-groups (kexec/abi interface))
           logical-names (mapv :binding slot-groups)
           pointer-specs (filterv #(not= :scalar (:kind %)) (:argument-specs step))
@@ -86,7 +79,7 @@
                                      :symbol symbol :binding binding})))
                   (update accesses symbol merge-access access)))
               {}
-              (map vector symbols slot-groups)))))
+              (map vector symbols slot-groups))))
 
 (defn descriptor-accesses
   "Return the ordered per-step access maps of a resident descriptor."

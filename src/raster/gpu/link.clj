@@ -714,7 +714,7 @@
 (defn execution-info
   "Return resident phase admission reports without executing the linked program.
    One entry per bound phase, in phase order; :executable is nil for manual/non-executable phases
-   (including legacy scatter) that do not retain compiler admission evidence.
+   that do not retain compiler admission evidence.
    Entry points describe the bound executable, including any prologue, not measured replay events.
    Equation-first prepared programs do not yet retain this evidence and are explicitly declined."
   [executable]

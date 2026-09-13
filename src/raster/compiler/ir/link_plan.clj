@@ -350,6 +350,13 @@
                 (if (contains? array-params parameter) nil (get scalars parameter)))
               (:all-params descriptor)))))
 
+(defn- step-interface [step]
+  (or (:artifact step)
+      (some-> (:dispatch step) kdispatch/default-alternative)
+      (throw (ex-info "a linkable descriptor step has no executable interface"
+                      {:reason :link-step-interface :phase (:phase step)
+                       :convention (:convention step)}))))
+
 (defn descriptor-pointer-symbols
   "Return the exact set of compiler symbols that the resident descriptor binds as pointers.
 
@@ -358,11 +365,10 @@
   [descriptor]
   (into #{}
         (mapcat (fn [step]
-                  (if (= :scatter (:convention step))
-                    (:arrays step)
-                    (keep (fn [{:keys [kind sym]}]
-                            (when (not= :scalar kind) sym))
-                          (:argument-specs step)))))
+                  (step-interface step)
+                  (keep (fn [{:keys [kind sym]}]
+                          (when (not= :scalar kind) sym))
+                        (:argument-specs step))))
         (:steps descriptor)))
 
 (defn descriptor-allocation-leaves
@@ -386,13 +392,6 @@
          (throw (ex-info "descriptor allocation fields must be unique and ordered"
                          {:reason :link-allocation-fields :symbol sym :fields fields}))))
      leaves)))
-
-(defn- step-interface [step]
-  (or (:artifact step)
-      (some-> (:dispatch step) kdispatch/default-alternative)
-      (throw (ex-info "a linkable descriptor step has no executable interface"
-                      {:reason :link-step-interface :phase (:phase step)
-                       :convention (:convention step)}))))
 
 (defn- merge-access [left right]
   (if (= left right) left
@@ -517,69 +516,6 @@
                              :expected expected :capacity capacity})))))
       {:instance id :step step-index :phase (:phase step)
        :facts (vec (mapcat :facts binding-facts))})))
-
-(defn- scatter-step-facts
-  [nodes instance step-index step]
-  (let [{:keys [id bindings]} instance
-        [out-sym src-sym index-sym :as symbols] (:arrays step)
-        args (instance-arguments instance)
-        n (try (long ((:n-fn step) args))
-               (catch Exception e
-                 (throw (ex-info "link scatter bound did not resolve from its scalar environment"
-                                 {:reason :link-scatter-bound :instance id :step step-index
-                                  :phase (:phase step)}
-                                 e))))
-        _ (when-not (= 3 (count symbols))
-            (throw (ex-info "a linked scatter step requires output, source and index buffers"
-                            {:reason :link-scatter-abi :instance id :step step-index
-                             :arrays symbols})))
-        node-for
-        (fn [symbol]
-          (let [node-id (get bindings symbol ::missing)
-                link-node (get nodes node-id)]
-            (when (= ::missing node-id)
-              (throw (ex-info "link instance omits a scatter buffer binding"
-                              {:reason :link-missing-binding :instance id :symbol symbol
-                               :phase (:phase step)})))
-            (when-not link-node
-              (throw (ex-info "link scatter binding names an absent node"
-                              {:reason :link-absent-node :instance id :symbol symbol
-                               :node node-id :phase (:phase step)})))
-            (when-not (bview/contiguous? (:view link-node))
-              (throw (ex-info "linked scatter bindings require contiguous views"
-                              {:reason :link-noncontiguous-binding :instance id :symbol symbol
-                               :node node-id :phase (:phase step)})))
-            [node-id link-node]))
-        [[out-id out] [src-id src] [index-id index]] (mapv node-for symbols)
-        capacity (fn [link-node]
-                   (quot (get-in link-node [:view :byte-length])
-                         (dtype/bytes-of (get-in link-node [:view :dtype]))))]
-    (when-not (= (dtype/canon (get-in out [:view :dtype]))
-                 (dtype/canon (get-in src [:view :dtype])))
-      (throw (ex-info "linked scatter source and output dtypes differ"
-                      {:reason :link-node-dtype :instance id :step step-index
-                       :output out-id :source src-id
-                       :output-dtype (get-in out [:view :dtype])
-                       :source-dtype (get-in src [:view :dtype])})))
-    (when-not (= :int (dtype/canon (get-in index [:view :dtype])))
-      (throw (ex-info "linked scatter index storage must be int32"
-                      {:reason :link-node-dtype :instance id :step step-index
-                       :index index-id :actual (get-in index [:view :dtype])})))
-    (doseq [[node-id link-node] [[src-id src] [index-id index]]]
-      (when (> n (capacity link-node))
-        (throw (ex-info "linked scatter bound exceeds a source view"
-                        {:reason :link-node-range :instance id :step step-index
-                         :node node-id :expected n :capacity (capacity link-node)}))))
-    {:instance id :step step-index :phase (:phase step)
-     :facts [{:symbol out-sym :node out-id :access :write}
-             {:symbol src-sym :node src-id :access :read}
-             {:symbol index-sym :node index-id :access :read}]}))
-
-(defn- instance-step-facts
-  [nodes values instance step-index step]
-  (if (= :scatter (:convention step))
-    (scatter-step-facts nodes instance step-index step)
-    (abi-step-facts nodes values instance step-index step)))
 
 (defn- canonical-alias-pair [pair]
   (let [pair (set pair)]
@@ -803,7 +739,7 @@
                                  :field field :node node :expected-elements expected-elements
                                  :actual-elements actual-elements})))))))
       (mapv (fn [[step-index step]]
-              (instance-step-facts nodes values instance step-index step))
+              (abi-step-facts nodes values instance step-index step))
             (map-indexed vector (:steps descriptor))))))
 
 (defn- program-value-node!
@@ -988,15 +924,6 @@
       (map-indexed vector (:steps call))))))
 
 (defn- validate-effects! [{:keys [target nodes values instances outputs aliases] :as plan}]
-  (when (and (not (let [target-name (name target)]
-                    (or (= "ze" target-name) (.startsWith target-name "ze:"))))
-             (some #(= :scatter (:convention %))
-                   (mapcat (fn [instance]
-                             (when (link-instance? instance)
-                               (get-in instance [:descriptor :steps])))
-                           instances)))
-    (throw (ex-info "linked scatter execution is not available on this target backend"
-                    {:reason :link-target-convention :target target :convention :scatter})))
   (let [step-facts
         (mapcat #(if (link-instance? %)
                    (validate-instance-bindings! nodes values %)

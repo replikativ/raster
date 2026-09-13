@@ -1927,7 +1927,7 @@
    DeviceBuffer. Both whole-program binding and composition call this function; convention-specific
    runtime expansion is confined here."
   [device-id step args resolve-buffer schedule roles]
-  (let [{:keys [kernel-name phase convention artifact argument-specs arrays n-fn scalar-specs]}
+  (let [{:keys [kernel-name phase convention artifact argument-specs]}
         step]
     (case convention
       (:map :reduce :map-void :contract :executable)
@@ -1974,42 +1974,6 @@
                 device-id selected ordered-args phase constant-buffer-ids group-count)
                :execution-info execution-info))
 
-      :scatter
-      (do
-        (when (not= :ze (backend-type device-id))
-          (throw (ex-info "resident scatter steps are Level-Zero-only (no OpenCL implementation yet)"
-                          {:backend (backend-type device-id)
-                           :device-id device-id :step kernel-name})))
-        (when (> (count scalar-specs) 1)
-          (throw (ex-info (str "resident scatter step " kernel-name " has "
-                               (count scalar-specs)
-                               " scalars — only a single stride is modeled")
-                          {:kernel kernel-name :scalar-specs scalar-specs})))
-        (let [[out-sym src-sym idx-sym] arrays
-              out-buf (resolve-buffer out-sym)
-              src-buf (resolve-buffer src-sym)
-              idx-buf (resolve-buffer idx-sym)
-              n (long (n-fn args))
-              stride (when (seq scalar-specs)
-                       (long ((:value-fn (first scalar-specs)) args)))
-              ensure-zero! (rt-resolve device-id "ensure-zero-fill-kernel!")
-              specialized-bind! (rt-resolve device-id "bind-registered-map-void-kernel")
-              scatter-bind! (rt-resolve device-id "bind-registered-scatter-kernel!")
-              zero-kernel (ensure-zero! (:dtype out-buf))
-              prepareds (volatile! [])]
-          (try
-            (vswap! prepareds conj
-                    (assoc (specialized-bind! zero-kernel [out-buf] []
-                                              (long (:n-elements out-buf)))
-                           :phase phase))
-            (vswap! prepareds conj
-                    (assoc (scatter-bind! kernel-name [out-buf src-buf idx-buf] n stride)
-                           :phase phase))
-            (->BoundExecutableStep @prepareds {} [])
-            (catch Exception e
-              (destroy-prepared-entry! device-id (->BoundExecutableStep @prepareds {} []))
-              (throw e)))))
-
       (throw (ex-info (str "resident step binder cannot bind a " convention " step ("
                            kernel-name ")")
                       {:convention convention :kernel kernel-name})))))
@@ -2024,7 +1988,6 @@
      :map/:reduce/:map-void/:contract/:executable
                 Select one ABI-compatible KernelArtifact or KernelGraph schedule. Graph-private
                 conversion/layout/split temporaries remain owned by the bound step.
-     :scatter   Expands to zero-fill + scatter behind the same ordered prepared-step boundary.
 
    Optional opts carry descriptor context needed by composition: {:schedule <resolved schedule>
    :roles {compiler-sym -> :constant|...}}. Captured constants make eligible graph transforms a

@@ -272,7 +272,7 @@
            (:reason (ex-data (try (make-plan #{#{:x :out}})
                                   (catch clojure.lang.ExceptionInfo e e))))))))
 
-(deftest scatter-expansion-retains-a-pure-link-contract
+(deftest retired-scatter-descriptors-require-an-executable-interface
   (let [descriptor {:dtype :float
                     :all-params '[out src index n]
                     :array-params '[out src index]
@@ -291,9 +291,12 @@
         instance (link/instance {:id :scatter :descriptor descriptor
                                  :bindings {'out :out 'src :src 'index :index}
                                  :scalars {'n 16}})]
-    (is (link/link-plan? (link/make {:id :scatter :target :ze:0 :nodes nodes
-                                     :instances [instance] :outputs [:out]})))
-    (is (= :link-target-convention
+    (is (= :link-step-interface
+           (:reason (ex-data
+                     (try (link/make {:id :scatter :target :ze:0 :nodes nodes
+                                     :instances [instance] :outputs [:out]})
+                          (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :link-step-interface
            (:reason (ex-data
                      (try
                        (link/make {:id :scatter-ocl :target :ocl:0

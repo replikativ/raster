@@ -94,6 +94,14 @@
              (link/make {:id :staged-attention :target :ze:0 :nodes nodes
                          :instances instances :outputs [:output]})))))))
 
+(deftest retired-positional-scatter-cannot-manufacture-stage-effects
+  (is (= :program-stage-interface
+         (:reason
+          (ex-data
+           (try (stage/step-accesses {:phase :scatter :convention :scatter
+                                     :arrays '[out source index]})
+                (catch clojure.lang.ExceptionInfo error error)))))))
+
 (deftest staging-fails-loudly-on-ambiguous-or-leaking-effect-contracts
   (let [program (descriptor)]
     (testing "an anchor may not be selected by first/last name-search heuristics"
