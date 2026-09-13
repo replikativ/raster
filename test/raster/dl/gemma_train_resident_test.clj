@@ -40,6 +40,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.descriptor-fixture :as fixture]))
 
 ;; ── the twin block (concrete float, LoRA delta inline) ──────────────────────────
@@ -328,7 +329,7 @@
   [prog args]
   (into []
         (keep
-         (fn [step]
+         (fn [[step-index step]]
            (let [schedules (get-in step [:dispatch :attributes :candidate-schedules])]
              (when (some #(= :matrix (:family %)) (vals schedules))
                (let [choice (:dispatch step)
@@ -340,15 +341,16 @@
                      selected (dispatch/select-alternative choice runtime-arguments)
                      strategy (executable/strategy selected)
                      schedule (get schedules strategy)]
-                 {:variant (:variant schedule)
+                 {:step-index step-index
+                  :variant (:variant schedule)
                   :family (:family schedule)
                   :strategy strategy
                   :precision (:precision (executable/attributes selected))})))))
-        (:steps prog)))
+        (map-indexed vector (:steps prog))))
 
 (defn- run-trajectory!
   "n-steps of the resident train step under `prog`'s GEMM policy in a fresh session.
-   Returns the host loss trajectory [loss(state_0) … loss(state_n)]."
+   Returns host losses [loss(state_0) … loss(state_n)] and the bound phase execution reports."
   [prog cfg st0 lr n-steps]
   (let [st (clone-adapters st0)
         args (train-args cfg st lr)
@@ -363,7 +365,7 @@
                             (repeat :constant))))]
         (loop [k 0 losses [(host-loss cfg st)]]
           (if (= k n-steps)
-            losses
+            {:losses losses :execution-info (link/execution-info (:executable program))}
             (do (fixture/run! program args)
                 (recur (inc k)
                        (conj losses
@@ -397,8 +399,17 @@
                              (= :mixed-f16-f32 (:precision %))) dims)
                 (str "mixed training must analytically select matrix execution, not merely enumerate it: "
                      (pr-str dims))))
-          (let [l32 (run-trajectory! p32 cfg st0 lr n-steps)
-                l16 (run-trajectory! p16 cfg st0 lr n-steps)]
+          (let [{l32 :losses} (run-trajectory! p32 cfg st0 lr n-steps)
+                {l16 :losses bound :execution-info} (run-trajectory! p16 cfg st0 lr n-steps)]
+            (testing "the replayed training program bound every selected mixed matrix schedule"
+              ;; This fixture lowers one descriptor instance. Link reports exactly one entry per
+              ;; descriptor step, in order, including nil evidence for unsupported/manual phases.
+              (is (= (count (:steps p16)) (count bound)))
+              (is (= (mapv #(select-keys % [:strategy :precision]) dims)
+                     (mapv (fn [{:keys [step-index]}]
+                             (select-keys (get-in bound [step-index :executable])
+                                          [:strategy :precision]))
+                           dims))))
             (println "  [mixed-precision bwd] f32-scalar loss:"
                      (mapv #(format "%.6f" %) (take 3 l32)) "…"
                      (mapv #(format "%.6f" %) (take-last 2 l32)))

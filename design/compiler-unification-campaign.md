@@ -1041,3 +1041,17 @@ selector again. The alias-fallback fixture distinguishes preferred and bound str
 public Arc fusion canary confirms bound fused selection separately from its measured replay.
 Entry points include any prologue and must not be interpreted as replay events. Equation-first
 program reporting remains explicitly unsupported; manual bindings without evidence return nil.
+
+The training acceptance also compares the successfully replayed program's bound phase reports
+against each selected matrix step, so runtime fallback cannot silently satisfy mixed coverage.
+The numerical trajectory and tolerances are unchanged.
+
+External training remains a separate acceptance item. A source audit of finetune-rstr
+`9e9ba5d62f3822f056e01c37231d7eaa7c84947c` found that `finetune.train/bind-layer!`,
+`forward-pass!` and `backward-pass!` still depend on the retired `gpu/bind-program!` and
+`gpu/run-program!` APIs. Its released Raster dependency is 0.2.287, with a sibling override for
+development. Migrate shared forward/VJP adapter state and output views onto public compiled
+artifacts/LinkPlans before rerunning the two-layer chained-gradient and real-weight stack gates.
+Do not restore the old binder or use the tiny Raster block as evidence those external gates pass.
+The pretrained-rstr checkout inspected alongside it was `3b13ad42e7bf4c98e348cb779c28096848931ba0`;
+no sibling source or dependency was changed by this audit.
