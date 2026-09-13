@@ -59,7 +59,19 @@
                                      :array-types array-types
                                      :scalar-types scalar-types)
         kernel (first (:kernels gpu))
-        kernel-source (:source kernel)]
+        kernel-source (:source kernel)
+        body (get-in kernel [:attributes :kernel-body])
+        operations (tree-seq coll? seq (:operations body))
+        loads (filter #(= "raster.compiler.ir.kernel_body.ScalarLoad"
+                          (some-> % class .getName)) operations)
+        index-load (first (filter #(= 'idx (:buffer %)) loads))
+        source-load (first (filter #(= 'src (:buffer %)) loads))
+        index-cast (first (filter #(and (= "raster.compiler.ir.kernel_body.ScalarCompute"
+                                           (some-> % class .getName))
+                                        (= :cast (get-in % [:expression :op]))
+                                        (= [(:id (:result index-load))]
+                                           (get-in % [:expression :arguments])))
+                                  operations))]
     (is (instance? raster.compiler.ir.segop.SegMap operation))
     (is (= :typed-soac (:algorithm-dialect operation)))
     (testing "JVM recognizes hardware vgather from the scheduled scalar region"
@@ -72,8 +84,10 @@
       (is (= [:int :float :float :long] (mapv :dtype (:abi kernel))))
       (is (= :kernel-body (get-in kernel [:provenance :dialect])))
       (is (re-find #"int rstr_map_load_[0-9]+ = .*idx\[" kernel-source))
-      (is (re-find #"src\[.*rstr_map_load_[0-9]+" kernel-source)
-          "the index tensor load is explicit SSA feeding the stable source load")
+      (is index-cast)
+      (is (some #{(:id (:result index-cast))}
+                (tree-seq coll? seq (:coordinates source-load)))
+          "the index load and its explicit width conversion feed the stable source load")
       (is (not (str/includes? kernel-source "src[idx[idx]]"))))))
 
 (deftest strided-gather-is-a-flattened-typed-map

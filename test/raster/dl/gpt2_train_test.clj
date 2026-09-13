@@ -3,7 +3,7 @@
 
   Exercises:
     - gpt2-embeddings (templated)
-    - causal-multi-head-attention (refactored to slice-strided-2d / scatter-strided-2d)
+    - causal-multi-head-attention (pack-heads / batched SDPA / unpack-heads)
     - layer-norm, linear, gelu, array-add (all templated)
     - cross-entropy-loss (templated)
     - Adam optimizer step over a Params tree

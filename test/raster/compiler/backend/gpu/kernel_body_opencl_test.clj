@@ -181,6 +181,20 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn- guarded-trapping-integral-cast-kernel-body []
+  (let [kernel (fixtures/trapping-integral-cast-body :long :byte)]
+    (body/make
+     (-> kernel
+         (assoc :id :guarded-trapping-integral-cast
+                :indices [(body/->IndexBinding 'lane :local 0)]
+                :masks [(body/->Mask :active [(body/predicate :lt 'lane 1)])]
+                :operations [(body/->Guard :active (:operations kernel))]
+                :launch (launch/spec {:workgroup-size [256] :group-count [1]}))))))
+
+(defn- exact-integral-narrowing-kernel-body []
+  (assoc-in (fixtures/trapping-integral-cast-body :long :int)
+            [:operations 0 :expression :options :overflow] :exact))
+
 (defn- bounded-byte-add-kernel-body []
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :rule rule))))
@@ -591,6 +605,40 @@
                          "rstr_trap_cast_i32_i8(rstr_trap_cast_i64_i32(rstr_input))"))
       (is (= 2 (count (re-seq #"rstr_trap_cast_i64_i32\(" source))))
       (is (= 2 (count (re-seq #"rstr_trap_cast_i32_i8\(" source)))))))
+
+(deftest proved-exact-integral-narrowing-is-a-plain-c-family-cast
+  (let [kernel (exact-integral-narrowing-kernel-body)]
+    (is (= kernel (body/validate! kernel)))
+    (doseq [target [:opencl-portable :opencl-intel :cuda :hip]]
+      (testing (name target)
+        (let [source (opencl/emit-scalar-kernel "exact_narrowing" kernel
+                                                {:target-dialect target})]
+          (is (str/includes? source "(int)(rstr_input)"))
+          (is (not (str/includes? source "rstr_trap_cast"))
+              "a compiler-proved exact conversion needs neither a guard nor trap helper"))))))
+
+(deftest scalar-guards-dominate-compute-and-memory-effects
+  (doseq [target [:opencl-intel :cuda :hip]]
+    (testing (name target)
+      (let [kernel (guarded-trapping-integral-cast-kernel-body)
+            source (opencl/emit-scalar-kernel "guarded_checked_cast" kernel
+                                              {:target-dialect target})
+            guard-position (str/last-index-of source "if (((rstr_lane < 1))) {")
+            cast-position (str/index-of source "rstr_trap_cast_i64_i8(rstr_input)")
+            store-position (str/index-of source "] = rstr_narrowed;")]
+        (is (= kernel (body/validate! kernel)))
+        (is (and (every? number? [guard-position cast-position store-position])
+                 (< guard-position cast-position store-position))
+            "the lane guard must dominate exceptional scalar computation and its store")
+        (is (= 2 (count (re-seq #"rstr_trap_cast_i64_i8\(" source)))
+            "helper discovery must recurse into guarded scalar regions"))))
+  (testing "a lane-varying scalar guard does not legalize convergent operations"
+    (let [kernel (guarded-trapping-integral-cast-kernel-body)
+          barrier (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                                           (body/full-participation))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"divergent control flow"
+           (body/validate! (assoc kernel :operations [(body/->Guard :active [barrier])])))))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]

@@ -67,6 +67,13 @@
       (is (= 0 (:bindings-removed stats))
           "effectful binding should be preserved"))))
 
+(deftest unused-checked-cast-binding-is-preserved
+  (let [form '(let* [checked (clojure.core/int x) result 0] result)
+        {lowered :form stats :stats} (dce/eliminate-dead-bindings form)]
+    (is (= 0 (:bindings-removed stats)))
+    (is (= '[checked (clojure.core/int x) result 0] (second lowered))
+        "DCE must retain the possible exceptional control transfer")))
+
 (deftest arraycopy-loop-mutation-preservation-test
   (let [emt @#'dce/extract-mutation-targets]
     (testing "System.arraycopy identifies only its destination as mutated"

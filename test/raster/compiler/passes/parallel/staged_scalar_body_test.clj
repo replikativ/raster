@@ -117,12 +117,11 @@
                  (assoc-in (three-stage-facts) [:stages 0 :lift]
                            (list '* 'inner (list 'double addition))))
         addition '(clojure.core/+ gain 1)
-        failure (try (staged/analyze! (source addition) :scalar-types {'gain :long}) nil
-                     (catch clojure.lang.ExceptionInfo e (ex-data e)))
-        implicit-failure (try (staged/analyze!
-                               (assoc-in (three-stage-facts) [:stages 0 :lift] (list '* 'inner addition))
-                               :scalar-types {'gain :long}) nil
-                              (catch clojure.lang.ExceptionInfo e (ex-data e)))
+        inferred (staged/lower (source addition) :scalar-types {'gain :long})
+        implicit-inferred
+        (staged/lower
+         (assoc-in (three-stage-facts) [:stages 0 :lift] (list '* 'inner addition))
+         :scalar-types {'gain :long})
         branch-failure (try (staged/analyze!
                              (assoc-in (three-stage-facts) [:stages 0 :lift]
                                        (list '* 'inner
@@ -136,12 +135,18 @@
                               (assoc-in (three-stage-facts) [:stages 0 :lift]
                                         (list '* 'inner typed-addition))
                               :scalar-types {'gain :long})]
-    (is (= :staged-scalar-body-declined (:reason failure)))
-    (is (= :scalar-source-type (:missing-rule failure)))
-    (is (= :staged-scalar-body-declined (:reason implicit-failure)))
-    (is (= :scalar-source-type (:missing-rule implicit-failure)))
+    (doseq [body [(:body inferred) (:body implicit-inferred)]]
+      (is (some #(and (map? %) (= :+ (:op %)) (= :long (:result-type %))
+                      (= :trap (get-in % [:options :overflow])))
+                (tree-seq coll? seq body))
+          "operand facts establish checked Long source arithmetic before conversion"))
+    (is (some #(and (map? %) (= :cast (:op %)) (= :double (:result-type %)))
+              (tree-seq coll? seq (:body inferred))))
+    (is (some #(and (map? %) (= :cast (:op %)) (= :float (:result-type %)))
+              (tree-seq coll? seq (:body implicit-inferred))))
     (is (= :staged-scalar-body-declined (:reason branch-failure)))
-    (is (= :scalar-source-type (:missing-rule branch-failure)))
+    (is (= :kernel-body-proof (:missing-rule branch-failure))
+        "a trapping branch remains rejected until target control preserves its exception order")
     (is (some #(and (map? %) (= :trap (:overflow %)))
               (tree-seq coll? seq (:body scheduled))))
     (is (some #(and (map? %) (= :trap (:overflow %)))

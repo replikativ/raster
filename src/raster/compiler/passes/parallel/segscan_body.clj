@@ -144,7 +144,15 @@
   [operation context]
   (let [{:keys [result-type pointer-ids scalar-ids scalar-type scan-algebra]} context
         source-index (:name (segop/seg-space-reduced-dim (:space operation)))
-        expression (util/subst-syms {source-index 'scan-index} (:element scan-algebra))
+        ;; Algebra owns reassociation evidence; the scheduled operator owns the concrete typed
+        ;; element. In particular, do not execute a scalar-conversion source projection stored in
+        ;; the certificate in place of its policy-carrying canonical term.
+        typed-element (get-in operation [:scan-op :element])
+        _ (when-not typed-element
+            (decline! :scan-element
+                      "scheduled scan requires its retained typed element expression"
+                      {:operation-id (:id operation) :phase (:phase operation)}))
+        expression (util/subst-syms {source-index 'scan-index} typed-element)
         array-types (into {} (map (fn [id] [id (get-in context [:buffers id :dtype])]))
                           pointer-ids)
         scalar-types (into {} (map (juxt identity scalar-type)) scalar-ids)

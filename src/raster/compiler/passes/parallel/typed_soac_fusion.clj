@@ -15,7 +15,8 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
-            [raster.compiler.passes.parallel.fusion-placement :as placement]))
+            [raster.compiler.passes.parallel.fusion-placement :as placement]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (def ^:private map-equation-rule
   (from-dialect dialect/TypedSOAC
@@ -690,7 +691,7 @@
    Pointwise arrays become full-segment operands. Stable captures retain only an axis map proven
    from their flat map index. Uniform captures become typed scalars. Any ambiguous array read
   declines the candidate rather than guessing an address."
-  [program preceding-infos producer consumer consumed-destination]
+  [program preceding-infos producer consumer consumed-value]
   (let [segment-axes (get-in producer [:attributes :segment-axes])
         output-map (axis-map/of-axes segment-axes)
         output-extent (axis-map/n-elements output-map)
@@ -707,7 +708,7 @@
         captures (:captures consumer)
         capture-parameters (:capture-parameters consumer-parameters)
         stable-values (stable-array-captures consumer)
-        consumed-indices (keep-indexed #(when (= %2 consumed-destination) %1) arrays)
+        consumed-indices (keep-indexed #(when (= %2 consumed-value) %1) arrays)
         consumed-index (first consumed-indices)
         expression (first (:body-results consumer))
         reads (descriptor/aget-reads expression)
@@ -786,13 +787,26 @@
                  consumed-destination
                  (get-in facts [:equations (:id producer)
                                 :attributes :result-storage 0 :destination])
+                 ;; A source binding of an in-place reduction denotes the buffer it returned even
+                 ;; though TypedSOAC keeps logical result identity separate from physical storage.
+                 ;; Only that equation-owned host binding is an admissible alternate spelling;
+                 ;; equal dtype or shape is never alias evidence.
+                 producer-host-binding
+                 (get-in facts [:equations (:id producer) :attributes :host-binding])
+                 attested-consumed-values
+                 (cond-> #{consumed-destination}
+                   (symbol? producer-host-binding) (conj producer-host-binding))
+                 consumed-values
+                 (vec (filter attested-consumed-values (:arrays consumer)))
+                 consumed-value (when (= 1 (count consumed-values))
+                                  (first consumed-values))
                  consumer-result (first (:results consumer))
                  consumer-destination
                  (get-in facts [:equations (:id consumer)
                                 :attributes :result-storage 0 :destination])
-                 transform (when (and consumed-destination consumer-destination)
+                 transform (when (and consumed-destination consumed-value consumer-destination)
                              (result-map-transform program (subvec infos 0 producer-index) producer consumer
-                                                   consumed-destination))]
+                                                   consumed-value))]
            :when (= 1 (count (:results producer)) (count (:body-results producer))
                     (count (:results consumer)) (count (:body-results consumer)))
            :when (= 1 (count (get-in producer [:attributes :accumulators])))
@@ -800,19 +814,20 @@
            :when (= (first (get-in producer [:attributes :dtypes]))
                     (value-scalar-dtype program consumer-result))
            :when (empty? (:locals consumer))
-           :when (= 1 (get uses consumed-destination 0))
+           :when (= 1 (get uses consumed-value 0))
            :when (zero? (get uses produced 0))
            :when (not (contains? (set (dialect/outputs program)) produced))
            :when (not (contains? (set (dialect/outputs program)) consumed-destination))
-           :when (= 1 (count (filter #(= consumed-destination %)
-                                     (:arrays consumer))))
+           :when (not (contains? (set (dialect/outputs program)) consumed-value))
+           :when (= 1 (count (filter #(= consumed-value %) (:arrays consumer))))
            :when (single-write-boundary? facts (:id producer) produced consumed-destination :write)
            :when (single-write-boundary? facts (:id consumer) consumer-result
                                          consumer-destination
-                                         (if (= consumed-destination consumer-destination)
+                                         (if (and (= consumed-destination consumer-destination)
+                                                  (= consumed-value consumed-destination))
                                            :read-write :write))
            :when (empty? (set/intersection
-                          (set [consumed-destination consumer-destination])
+                          (set [consumed-value consumed-destination consumer-destination])
                           (set (map :value (:operands transform)))))
            :when (host-barrier-free? program producer consumer)
            :when transform]
@@ -884,6 +899,49 @@
            :consumers consumer-ids
            :externally-visible? (contains? (set (dialect/outputs program)) produced))))
 
+(defn- contains-trapping-scalar-convert?
+  [expression]
+  (boolean
+   (some (fn [form]
+           (and (dialect/scalar-convert-form? form)
+                (= :trap (get-in (dialect/scalar-convert-parts form)
+                                 [:attributes :overflow]))))
+         (tree-seq coll? seq expression))))
+
+(defn- typed-region-scalar-environment
+  "Authoritative lexical scalar dtypes for exceptional-control analysis of one typed lambda."
+  [program info]
+  (let [{:keys [accumulators elements capture-parameters]} (parameter-parts info)
+        values (:values (dialect/facts program))
+        scalar-value-dtype (fn [value]
+                             (let [fact (get values value)]
+                               (when (= [] (:shape fact)) (:dtype fact))))]
+    (into {(:index (:attributes info)) :long}
+          (concat
+           (map (juxt :id :dtype) (:locals info))
+           (map vector accumulators (get-in info [:attributes :dtypes]))
+           (map vector elements (map #(value-scalar-dtype program %) (:arrays info)))
+           (keep (fn [[parameter value]]
+                   (when-let [scalar-dtype (scalar-value-dtype value)]
+                     [parameter scalar-dtype]))
+                 (map vector capture-parameters (:captures info)))))))
+
+(defn- exceptional-conversion-region?
+  [program {:keys [locals body-results] :as info}]
+  (let [typed-symbols
+        (into {}
+              (keep (fn [[id scalar-dtype]]
+                      (when-let [tag (and (symbol? id) scalar-dtype
+                                          (some-> scalar-dtype dtype/canon dtype/info
+                                                  :scalar-tag))]
+                          [id (with-meta id {:tag tag :raster.type/tag tag})])))
+              (typed-region-scalar-environment program info))
+        retain-types #(util/subst-syms typed-symbols %)
+        expressions (map retain-types (concat (map :init locals) body-results))]
+    (or (contains-trapping-scalar-convert? expressions)
+        (some #(contains? (:flags (effects/descriptor %)) :checked-source-cast)
+              expressions))))
+
 (defn- vertical-candidates
   [program abstract-machine]
   (let [equations (dialect/equations program)
@@ -899,6 +957,9 @@
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
            :when (contains? #{:map :reduce :scan} (:kind consumer))
+           ;; Per-lane fusion would interleave a trapping producer with later caller-visible
+           ;; consumer writes. Preserve the materialized equation-completion boundary.
+           :when (not (exceptional-conversion-region? program producer))
            ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
            ;; therefore compose vertically into another map; reduction and scan consumers remain
            ;; local-free until their regions admit typed locals.
@@ -997,7 +1058,8 @@
                                   ((if (= :scan (:kind updated))
                                      scan/certify
                                      scan/certify-reassociation)
-                                   {:acc accumulator :init identity :lambda result}
+                                   {:acc accumulator :init identity
+                                    :lambda (dialect/scalar-converts->source result)}
                                    component-dtype))
                                 accumulators identities dtypes (:body-results updated))]
               (assoc-in updated [:attributes :algebra] algebra))
@@ -1040,6 +1102,10 @@
                  right-uses (set (concat (:arrays right) (:captures right)
                                          [(:extent (:attributes right))]))]
            :when (= :map (:kind left) (:kind right))
+           ;; Horizontal fusion interleaves independent maps lane-by-lane. A trapping conversion
+           ;; on either side therefore retains its source equation-completion boundary.
+           :when (not (or (exceptional-conversion-region? program left)
+                          (exceptional-conversion-region? program right)))
            :when left-boundary
            :when right-boundary
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))

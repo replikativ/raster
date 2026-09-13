@@ -1,15 +1,25 @@
 (ns raster.compiler.passes.scalar.effects
-  "Effect classification for compiler passes via Beichte.
+  "Effect and exceptional-control classification for scalar compiler passes.
 
-   Beichte is the sole authority for effect analysis. No syntactic fallbacks.
+   Beichte is the sole authority for externally observable effect analysis.
    When beichte cannot analyze an expression, it is conservatively assumed
    effectful (:io). Only expressions beichte proves pure get :pure.
+
+   Source operations may additionally carry semantic obligations which are not
+   external effects. In particular, op-descriptor's checked integral casts can
+   throw. Such expressions retain Beichte's effect level but carry a flag so
+   DCE, CSE and algebraic simplification cannot erase or duplicate the possible
+   exceptional control transfer.
 
    The raster context pre-registers raster.numeric and raster.math vars
    as :pure so beichte doesn't need to analyze their source each time."
   (:require [beichte.core :as b]
             [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
@@ -143,6 +153,39 @@
        node))
    expr))
 
+(defn- proven-total-cast?
+  "Use retained operand types or checked constant evidence, never a consumer's expected type."
+  [expression]
+  (when (= 1 (count (descriptor/call-args expression)))
+    (let [operand (first (descriptor/call-args expression))
+          source (some-> (when (instance? clojure.lang.IObj operand)
+                           (types/sym-type-tag operand))
+                         dtype/dtype-for-scalar-tag)
+          target (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
+                         dtype/dtype-for-scalar-tag)]
+      (or (some? (numeric-constant/value expression))
+          (and source target
+               (= [:exact :exact] (scalar-conversion/policy source target)))))))
+
+(defn- checked-integral-cast?
+  "Whether a semantic expression contains a source cast which may throw.
+
+   This deliberately derives from op-descriptor's closed conversion contract;
+   it is not another function registry. Without retained operand dtypes here,
+   checked casts to integral types remain conservatively non-removable. A proven
+   identity/widening or a successful checked constant conversion adds no obligation."
+  [expr]
+  (boolean
+   (some (fn [node]
+           (when (seq? node)
+             (let [operation (descriptor/semantic-op node)]
+               (and (descriptor/cast-op? operation)
+                    (= :reject (descriptor/cast-integral-narrowing operation))
+                    (contains? '#{byte int long}
+                               (descriptor/cast-result-tag operation))
+                    (not (proven-total-cast? node))))))
+         (tree-seq coll? seq expr))))
+
 (defn descriptor
   "Return the effect descriptor for a compiler IR expression.
 
@@ -157,10 +200,13 @@
     (try
       (let [semantic-expr (semantic-calls expr)
             locals (collect-locals semantic-expr)
-            result (b/analyze-full semantic-expr @raster-context locals)]
-        (if (map? result)
-          (update result :flags #(or % #{}))
-          {:effect (or result :io) :flags #{}}))
+            result (b/analyze-full semantic-expr @raster-context locals)
+            result (if (map? result)
+                     (update result :flags #(or % #{}))
+                     {:effect (or result :io) :flags #{}})]
+        (cond-> result
+          (checked-integral-cast? semantic-expr)
+          (update :flags conj :checked-source-cast)))
       (catch Exception _
         ;; Conservative: unknown = effectful
         {:effect :io :flags #{}})

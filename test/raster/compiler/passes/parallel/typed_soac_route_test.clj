@@ -30,11 +30,23 @@
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.program-tuning :as program-tuning]))
 
+(defn- kernel-body-operations
+  [artifact]
+  (letfn [(walk [operations]
+            (mapcat
+             (fn [operation]
+               (cons operation
+                     (concat (walk (or (:operations operation) []))
+                             (walk (or (:then-operations operation) []))
+                             (walk (or (:else-operations operation) [])))))
+             operations))]
+    (walk (get-in artifact [:attributes :kernel-body :operations]))))
+
 (defn- scalar-stores
   [artifact]
   (filterv #(= "raster.compiler.ir.kernel_body.ScalarStore"
                (.getName (class %)))
-           (get-in artifact [:attributes :kernel-body :operations])))
+           (kernel-body-operations artifact)))
 
 (def ^:private map-map
   '(let* [y (raster.par/pmap i n float
@@ -42,11 +54,30 @@
           z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
          z))
 
+(def ^:private all-f32-map-map
+  '(let* [y (raster.par/pmap i n float
+                             (float (* (clojure.core/aget x i)
+                                       (clojure.core/aget x i))))
+          z (raster.par/pmap j n float
+                             (float (+ (clojure.core/aget y j) (float 1.0))))]
+         z))
+
 (def ^:private map-reduce
   '(let* [y (raster.par/pmap i n float
                              (* (clojure.core/aget x i) (clojure.core/aget x i)))
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
+
+(def ^:private all-f32-map-reduce
+  (list 'let*
+        ['y '(raster.par/pmap i n float
+                              (float (* (clojure.core/aget x i)
+                                        (clojure.core/aget x i))))
+         'total (with-meta
+                  '(raster.par/reduce acc (float 0.0) j n
+                                      (+ acc (clojure.core/aget y j)))
+                  {:raster.type/elem-type :float})]
+        'total))
 
 (def ^:private horizontal-maps
   '(let* [u (raster.par/pmap i n float (* (clojure.core/aget a i) 2.0))
@@ -87,7 +118,7 @@
            (into #{}
                  (keep #(when (= "ScalarCompute" (some-> % class .getSimpleName))
                           (get-in % [:expression :options :overflow])))
-                 (get-in emitted [:attributes :kernel-body :operations])))
+                 (kernel-body-operations emitted)))
         "unchecked SplitMix arithmetic remains explicit after scheduling")
     (is (re-find #"\(ulong\).* \* \(ulong\)" (:source emitted)))
     (is (not (re-find #"par_rng_fill" (:source emitted)))))
@@ -137,12 +168,16 @@
                            '(let* [^float value (float seed)
                                     result (raster.par/map! out i n float value)] result)
                            :float {'out :float} {:scalar-types {'seed :double 'n :int}}))
-        execute (eval (list 'fn '[seed] (get-in program [:equations 0 :source])))]
-    (is (instance? Float (execute 1.00000001)))
+        source (get-in program [:equations 0 :source])
+        execute (eval (list 'fn '[seed float] source))]
+    (is (= 'clojure.core/float (first source)))
+    (is (instance? Float (execute 1.00000001 nil)))
     (is (= (Float/floatToRawIntBits (float 1.00000001))
-           (Float/floatToRawIntBits (execute 1.00000001))))
+           (Float/floatToRawIntBits (execute 1.00000001 nil))))
     (is (= (Float/floatToRawIntBits (float -0.0))
-           (Float/floatToRawIntBits (execute -0.0))))))
+           (Float/floatToRawIntBits (execute -0.0 nil))))
+    (is (instance? Float
+                   (execute 1.0 (fn [& _] (throw (ex-info "shadowed float" {}))))))))
 
 (deftest production-route-retains-hardware-costed-placement-witnesses
   (let [poor (route/attempt expensive-fanout :float {'x :float}
@@ -262,7 +297,8 @@
     (is (= '[target n] (:arguments artifact)))
     (is (re-find #"rstr_map_load_\d+ = .*target\[" (:source artifact))
         "the scalar-region read is projected through the sole typed result parameter")
-    (is (re-find #"target\[.*\] = rstr_map_value_\d+" (:source artifact)))
+    (is (= ['target] (mapv :buffer (scalar-stores artifact)))
+        "the final typed value, including its result conversion, writes the sole inout buffer")
     (is (some #{'raster.gpu.ocl-runtime/invoke-registered-kernel}
               (tree-seq coll? seq (:form emitted))))
     (is (not (some #{'raster.gpu.ze-runtime/invoke-registered-kernel}
@@ -317,6 +353,8 @@
         artifact (first (:kernels emitted))
         pointer-slots (filterv #(not= :scalar (:kind %)) (:abi artifact))]
     (is (= :typed-soac (:source-dialect stats)))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route]))
+        "tuple projection uses its typed result/storage contract, not compatibility emission")
     (is (= [:write :read-write]
            (mapv :access (get-in equation [:attributes :result-storage]))))
     (is (= ['x 'b 'a] (mapv :name pointer-slots)))
@@ -391,7 +429,7 @@
         "KernelBody retains the same typed local instead of duplicating its load")
     (is (= 1 (count (filter #(and (= "ScalarCompute" (some-> % class .getSimpleName))
                                   (= :* (get-in % [:expression :op])))
-                            (get-in portable [:attributes :kernel-body :operations]))))
+                            (kernel-body-operations portable))))
         "the shared square is one scalar SSA definition")
     (is (nil? (execute x a b 4)))
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
@@ -424,7 +462,7 @@
                   :scalar-types {'n :long 'width :long})
         loop-operation
         (some #(when (= "ForLoop" (some-> % class .getSimpleName)) %)
-              (get-in artifact [:attributes :kernel-body :operations]))]
+              (kernel-body-operations artifact))]
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
     (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
     (is loop-operation)
@@ -547,7 +585,7 @@
 (deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
   (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
 
-(deftest nested-compatibility-parallel-work-is-an-opaque-host-barrier
+(deftest nested-compatibility-parallel-work-declines-the-whole-typed-route
   (let [source '(let* [mapped (raster.par/pmap i n double
                                                (* (clojure.core/aget x i) 2.0))
                        mean (let* [total (raster.par/reduce
@@ -555,14 +593,12 @@
                                           (+ acc (clojure.core/aget mapped j)))]
                                   (/ total (double n)))]
                       mean)
-        {:keys [program stats]} (route/attempt source :double {'x :double})]
-    (is (= :typed-soac (:dialect program)))
-    (is (= 1 (count (:equations program))))
-    (is (= '[mapped] (:outputs program))
-        "the typed result consumed by compatibility host work stays materialized")
-    (is (= [1] (get-in program [:attributes :host-binding-ids])))
-    (is (some #{'raster.par/reduce} (flatten (:source program))))
-    (is (:typed-validated stats))))
+        result (route/attempt source :double {'x :double})]
+    (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
+    (is (= [{:id 1 :binding 'mean :kind :scalar :operation 'let*
+             :reason :uncertified-host-scalar}]
+           (get-in result [:declined :bindings]))
+        "a typed prefix must not hide nested parallel work behind a compatibility host barrier")))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
@@ -690,8 +726,8 @@
 
 (deftest typed-map-and-reduction-schedule-without-source-relowering
   (doseq [[label source operation-class stat]
-          [["map" map-map raster.compiler.ir.segop.SegMap :simd-maps]
-           ["reduce" map-reduce raster.compiler.ir.segop.SegRed :simd-reduces]]]
+          [["map" all-f32-map-map raster.compiler.ir.segop.SegMap :simd-maps]
+           ["reduce" all-f32-map-reduce raster.compiler.ir.segop.SegRed :simd-reduces]]]
     (testing label
       (let [typed (:program (route/attempt source :float))
             {:keys [form stats]} (segop-lower/segop-lower-pass typed {:dtype :float})
@@ -704,6 +740,45 @@
         (is (= 1 (get-in simd [:stats :segop-reused])))
         (is (nil? (get-in simd [:stats :segop-relowered])))
         (parallel-program/validate! form segop/segop-node?)))))
+
+(deftest all-f32-map-simd-executes-both-vector-and-tail-elements
+  (let [n 257
+        typed (:program (route/attempt all-f32-map-map :float))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        simd (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x n] (:form simd)))
+        result (execute (float-array (repeat n (float 2.0))) n)]
+    (is (= 1 (get-in simd [:stats :simd-maps])))
+    (is (= n (alength ^floats result)))
+    (is (every? #(= 5.0 (double %)) result)
+        "the vector chunks and final scalar tail retain both float materialization boundaries")))
+
+(deftest mixed-width-map-conversion-retains-the-typed-scalar-rounding-route
+  (let [source '(let* [y (raster.par/pmap i n float
+                                           (* (clojure.core/aget x i)
+                                              (clojure.core/aget x i)))
+                       z (raster.par/pmap j n float
+                                           (+ (clojure.core/aget y j) -16785408.0))]
+                      z)
+        typed (:program (route/attempt source :float {'x :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        simd (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x n] (:form simd)))
+        result (execute (float-array [(float 4097.0)]) 1)]
+    (is (zero? (get-in simd [:stats :simd-maps])))
+    (is (= 1 (get-in simd [:stats :segop-reused])))
+    (is (zero? (double (aget ^floats result 0)))
+        "the producer float rounding occurs before widened consumer arithmetic")))
+
+(deftest mixed-width-reduction-retains-its-producer-rounding
+  (let [typed (:program (route/attempt map-reduce :float {'x :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        simd (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x n] (:form simd)))]
+    (is (zero? (get-in simd [:stats :simd-reduces])))
+    (is (= 1 (get-in simd [:stats :segop-reused])))
+    (is (= 16785408.0 (double (execute (float-array [4097.0]) 1)))
+        "a double accumulator must consume the rounded float producer, not its exact square")))
 
 (deftest typed-inclusive-scan-owns-one-certified-scheduled-graph
   (let [{:keys [program stats]} (route/attempt inclusive-scan :float
@@ -747,6 +822,34 @@
     (is (= [:intra-block :block-scan nil]
            (mapv :phase (:operations equation))))
     (parallel-program/validate! (:form lowered) segop/segop-node?)))
+
+(deftest typed-map-scan-keeps-conversion-in-the-executable-element
+  (let [source '(let* [mapped (raster.par/pmap i n float
+                                               (clojure.core/aget x i))
+                       result (raster.par/scan out acc 0.0 j n float
+                                               (+ acc (clojure.core/aget mapped j)))]
+                      result)
+        typed (:program (route/attempt source :float {'x :double 'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0
+                                 :array-types {'x :double 'out :float}}))
+        equation (first (:equations scheduled))
+        first-scan (first (:operations equation))
+        typed-element (get-in first-scan [:scan-op :element])
+        proof-element (get-in first-scan [:scan-op :algebra :element])
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
+        sources (map :source (:kernels emitted))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out x n] (:form jvm)))
+        result (execute (float-array 2) (double-array [16777217.0 1.0]) 2)]
+    (is (some dialect/scalar-convert-form? (tree-seq coll? seq typed-element))
+        "the scheduled scan executes the canonical narrowing term")
+    (is (not-any? dialect/scalar-convert-form? (tree-seq coll? seq proof-element))
+        "the algebra certificate remains a source-vocabulary proof")
+    (is (some #(re-find #"convert_float_rte\(" %) sources)
+        "portable emission retains the declared IEEE narrowing")
+    (is (= [16777216.0 16777216.0] (mapv double result))
+        "the producer rounds to float before scan accumulation")))
 
 (deftest typed-inclusive-scan-target-lowers-to-one-executable-dispatch
   (let [typed (:program (route/attempt inclusive-scan :float

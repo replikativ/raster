@@ -9,6 +9,15 @@
              :refer [scheduled-normalization artifact typed-program]
              :rename {scheduled-normalization normalization}]))
 
+(defn- active-operations
+  "Inspect the original scalar sequence inside its padded-lane guard, without flattening loops."
+  [compiled]
+  (let [operations (get-in compiled [:attributes :kernel-body :operations])]
+    (if (and (= 1 (count operations))
+             (instance? raster.compiler.ir.kernel_body.Guard (first operations)))
+      (:operations (first operations))
+      operations)))
+
 (deftest nested-locals-execute-after-the-carry-before-the-next-loop
   (doseq [trips [0 1 3]]
     (let [operation (normalization trips)
@@ -26,7 +35,7 @@
              (vec words)))
       (doseq [target [:opencl-portable :cuda :hip]]
         (let [compiled (artifact operation target)
-              operations (get-in compiled [:attributes :kernel-body :operations])
+              operations (active-operations compiled)
               divisions (keep-indexed #(when (= :div (get-in %2 [:expression :op])) %1) operations)
               loops (keep-indexed #(when (:iter-args %2) %1) operations)]
           (is (= :kernel-body (get-in compiled [:attributes :emission-route])))
@@ -102,7 +111,7 @@
     (doseq [target [:opencl-intel :cuda :hip]]
       (let [compiled (artifact operation target :scalar-types {'rows :long 'limit :long})
             checked (filter #(= :+ (get-in % [:expression :op]))
-                            (get-in compiled [:attributes :kernel-body :operations]))]
+                            (active-operations compiled))]
         (is (= 1 (count checked)))
         (is (= :long (get-in (first checked) [:result :type])))
         (is (= :trap (get-in (first checked) [:expression :options :overflow])))))))
@@ -118,7 +127,7 @@
     (execute (float-array 1) (float-array 1) totals 1)
     (is (= Float/POSITIVE_INFINITY (aget totals 0)))
     (doseq [target [:opencl-portable :cuda :hip]]
-      (let [operations (get-in (artifact operation target) [:attributes :kernel-body :operations])]
+      (let [operations (active-operations (artifact operation target))]
         (is (some #(and (= :cast (get-in % [:expression :op]))
                         (= :float (get-in % [:result :type]))
                         (= {:rounding :nearest-even :overflow :ieee}

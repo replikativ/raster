@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.product-reduction-body-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as reference]
@@ -404,14 +405,23 @@
         candidate (product/schedule (:operation node) derived)]
     (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
     (is (= #{:long} (set (map :dtype (:scalar-bindings candidate)))))
-    (doseq [dialect [:opencl-portable :cuda :hip]]
+    (doseq [dialect [:cuda :hip]]
       (let [artifact (target/emit-artifact "long_product" candidate dialect)]
         (is (= [:long :long :long]
-               (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi artifact)))))))
+               (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi artifact)))))
+        (is (str/includes? (:source artifact) "rstr_trap_cast_i64_i32")
+            "a long column retains the checked winning-index conversion")))
+    (is (= :kernel-body-c-trap-unsupported
+           (try
+             (target/emit-artifact "long_product" candidate :opencl-portable)
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception)))))
+        "portable OpenCL cannot silently erase a reachable checked long-to-int conversion")
     (is (= :long (get-in candidate [:body :operations 1 :then-operations 0 :index :type])))
     (is (= :int (get-in candidate [:body :parameters 1 :dtype]))
         "dimension width does not change the winning-index component representation")
-    (let [artifact (target/emit-artifact "long_product_range" candidate :opencl-portable)
+    (let [artifact (target/emit-artifact "long_product_range" candidate :cuda)
           bindings {'values :input 'indices :output
                     'nrows {:type :long :value (+ 2 (long Integer/MAX_VALUE))}
                     'width {:type :long :value 1}}]
@@ -426,9 +436,24 @@
     (let [{:keys [algorithm body graph node]}
           (graph-context true nil nil {'nrows row-type 'width width-type})
           candidate (product/schedule (:operation node)
-                                      (product/graph-options node graph algorithm body))
-          artifact (target/emit-artifact "mixed_dimension_product" candidate :opencl-portable)]
+                                      (product/graph-options node graph algorithm body))]
       (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
-      (is (= {'nrows row-type 'width width-type '_n_bound row-type}
-             (into {} (map (juxt :name :kernel-dtype))
-                   (filter #(= :scalar (:kind %)) (:abi artifact))))))))
+      (if (= :long width-type)
+        (do
+          (is (= :kernel-body-c-trap-unsupported
+                 (try
+                   (target/emit-artifact "mixed_dimension_product" candidate :opencl-portable)
+                   nil
+                   (catch clojure.lang.ExceptionInfo exception
+                     (:reason (ex-data exception))))))
+          (doseq [dialect [:cuda :hip]]
+            (let [artifact (target/emit-artifact "mixed_dimension_product" candidate dialect)]
+              (is (= {'nrows row-type 'width width-type '_n_bound row-type}
+                     (into {} (map (juxt :name :kernel-dtype))
+                           (filter #(= :scalar (:kind %)) (:abi artifact)))))
+              (is (str/includes? (:source artifact) "rstr_trap_cast_i64_i32")))))
+        (let [artifact (target/emit-artifact "mixed_dimension_product"
+                                             candidate :opencl-portable)]
+          (is (= {'nrows row-type 'width width-type '_n_bound row-type}
+                 (into {} (map (juxt :name :kernel-dtype))
+                       (filter #(= :scalar (:kind %)) (:abi artifact))))))))))

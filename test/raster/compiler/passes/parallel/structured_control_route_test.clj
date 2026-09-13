@@ -148,21 +148,35 @@
 
 (defn- mixed-source
   []
-  '(let* [n (int (clojure.core/alength u0))
-          u (clojure.core/aclone u0)
-          scratch (clojure.core/double-array n)
-          time-loop
-          (dotimes [step steps]
-            (raster.par/map! scratch i n double
-                             (+ (clojure.core/aget u i) 1.0))
-            (let* [next (raster.par/pmap j n double
-                                         (+ (clojure.core/aget u j)
-                                            (clojure.core/aget scratch j)
-                                            (* 0.0 step)))]
-                  (java.lang.System/arraycopy next 0 u 0 n)))
-          after (raster.par/pmap k n double
-                                 (* 2.0 (clojure.core/aget u k)))]
-         after))
+  (let [source
+        '(let* [n (int (clojure.core/alength u0))
+                u (clojure.core/aclone u0)
+                scratch (clojure.core/double-array n)
+                time-loop
+                (dotimes [step steps]
+                  (raster.par/map! scratch i n double
+                                   (+ (clojure.core/aget u i) 1.0))
+                  (let* [next (raster.par/pmap j n double
+                                               (+ (clojure.core/aget u j)
+                                                  (clojure.core/aget scratch j)
+                                                  (* 0.0 step)))]
+                        (java.lang.System/arraycopy next 0 u 0 n)))
+                after (raster.par/pmap k n double
+                                       (* 2.0 (clojure.core/aget u k)))]
+               after)
+        ;; This raw frontend fixture bypasses the walker. State the bodies' actual source result
+        ;; type (double operands and arithmetic), independently of the maps' output cast target.
+        double-bodies
+        '#{(+ (clojure.core/aget u i) 1.0)
+           (+ (clojure.core/aget u j)
+              (clojure.core/aget scratch j)
+              (* 0.0 step))
+           (* 2.0 (clojure.core/aget u k))}]
+    (walk/postwalk
+     #(if (contains? double-bodies %)
+        (with-meta % {:tag 'double :raster.type/tag 'double})
+        %)
+     source)))
 
 (defn- mixed-source-without-induction
   []
@@ -564,6 +578,86 @@
     (is (true? (get-in shape-equation [:attributes :host-only])))
     (is (some #{'size} prefix-symbols)
         "the same pure size is materialized before allocation and retained as graph proof")))
+
+(deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
+  (let [source '(let* [checked (clojure.core/int n)
+                       effect (raster.par/map-void! i n
+                                                    (clojure.core/aset out i 1.0))]
+                      effect)
+        options {:dtype :double :public-parameters '[out n]
+                 :array-types {'out :double} :scalar-types {'n :long}}
+        parallel (:program (typed-route/attempt source :double {'out :double}
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-soac-program parallel options)]
+    (is (= '[scalar map]
+           (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
+                 (:equations promoted))))
+    (is (not-any? #(= 'checked (:symbol %))
+                  (get-in promoted [:attributes :invocation-plan :steps]))
+        "the checked equation remains in program order instead of becoming a prunable prefix")))
+
+(deftest checked-source-prefix-shapes-are-materialized-once-before-launch
+  (let [source '(let* [checked (clojure.core/int n)
+                       result (raster.par/map! out i checked double 1.0)]
+                      result)
+        options {:dtype :double :public-parameters '[out n]
+                 :array-types {'out :double} :scalar-types {'n :long}}
+        parallel (:program (typed-route/attempt source :double {'out :double}
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-soac-program parallel options)
+        plan (get-in promoted [:attributes :invocation-plan])
+        prefix-steps (:steps plan)
+        checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))]
+    (is (= '[map]
+           (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
+                 (:equations promoted))))
+    (is (invocation/scalar-compute? checked-step))
+    (is (= 1 (count (filter #(= 'checked (:symbol %)) prefix-steps))))
+    (is (some #{'checked} (:inputs promoted))
+        "the attested invocation result is the map's explicit typed scalar input")
+    (let [evaluations (atom 0)
+          evaluator (fn [step _]
+                      (swap! evaluations inc)
+                      {:type (get-in step [:value :dtype]) :value 1})]
+      (materialization/materialize plan [(double-array 1) 1] evaluator)
+      (is (= 1 @evaluations)
+          "the checked shape is owned by one invocation ScalarCompute, not a host equation too"))
+    (let [out (double-array [0.0])
+          evaluations (atom 0)
+          checked-int (fn [step operands]
+                        (swap! evaluations inc)
+                        {:type (get-in step [:value :dtype])
+                         :value (int (:value (get operands 'n)))})]
+      (is (thrown? ArithmeticException
+                   (materialization/materialize plan [out 2147483648] checked-int)))
+      (is (= 1 @evaluations))
+      (is (= [0.0] (vec out))
+          "the invalid extent traps during invocation, before any device write")))
+  (testing "a prior exceptional scalar remains an ordering barrier"
+    (let [source '(let* [first-check (clojure.core/int limit)
+                         checked (clojure.core/int n)
+                         result (raster.par/map! out i checked double 1.0)]
+                        result)
+          options {:dtype :double :public-parameters '[out limit n]
+                   :array-types {'out :double}
+                   :scalar-types {'limit :long 'n :long}}
+          parallel (:program (typed-route/attempt source :double {'out :double}
+                                                  {:scalar-types (:scalar-types options)}))]
+      (is (= :structured-control-invocation-prefix
+             (reason-of #(route/promote-soac-program parallel options))))))
+  (testing "an omitted host effect ends the authoritative source prefix"
+    (let [source '(let* [host-write (clojure.core/aset scratch 0 2.0)
+                         checked (clojure.core/int n)
+                         result (raster.par/map! out i checked double 1.0)]
+                        result)
+          options {:dtype :double :public-parameters '[out scratch n]
+                   :array-types {'out :double 'scratch :double}
+                   :scalar-types {'n :long}}
+          attempt (typed-route/attempt source :double {'out :double 'scratch :double}
+                                       {:scalar-types (:scalar-types options)})]
+      (is (nil? (:program attempt)))
+      (is (= :typed-soac-source-coverage (get-in attempt [:declined :reason]))
+          "the frontend rejects moving the checked shape across an earlier host write"))))
 
 (defn- prepared-mixed-call
   ([trip-count]

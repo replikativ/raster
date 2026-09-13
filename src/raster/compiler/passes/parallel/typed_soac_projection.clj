@@ -90,11 +90,15 @@
 (declare materialize-region)
 
 (defn scalar-folds->source
-  "Project explicit scalar Fold terms to Raster's interpreted host vocabulary."
+  "Project explicit scalar Fold/conversion terms to Raster's interpreted host vocabulary."
   [expression]
   (walk/postwalk
    (fn [form]
-     (if (dialect/scalar-fold-form? form)
+     (cond
+       (dialect/scalar-convert-form? form)
+       (dialect/scalar-converts->source form)
+
+       (dialect/scalar-fold-form? form)
        (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
              {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
              [accumulator index] parameters
@@ -121,7 +125,8 @@
          (with-meta
            projected
            {:raster.type/elem-type (:dtype attributes)}))
-       form))
+
+       :else form))
    expression))
 
 (defn- materialize-region

@@ -329,7 +329,7 @@
 (def ^:private scalar-operation-kinds
   #{"IndexCompute" "ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
     "PipelineYield" "PipelinedFor"
-    "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
+    "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait" "Guard"})
 
 (defn- scalar-body-operations
   [operations]
@@ -340,7 +340,8 @@
                (concat (scalar-body-operations (:then-operations operation))
                        (scalar-body-operations (:else-operations operation))))
              (when (or (record-kind? "ForLoop" operation)
-                       (record-kind? "PipelinedFor" operation))
+                       (record-kind? "PipelinedFor" operation)
+                       (record-kind? "Guard" operation))
                (scalar-body-operations (:operations operation)))))
    operations))
 
@@ -418,6 +419,9 @@
                (map (comp :id :binding) (:iter-args operation))
                (map :id (:results operation))
                (scalar-defined-ids (:operations operation)))
+
+       (record-kind? "Guard" operation)
+       (scalar-defined-ids (:operations operation))
 
        :else []))
    operations))
@@ -566,10 +570,10 @@
                          :source-type source-type :result-type result-type
                          :rounding rounding :overflow overflow}))))
 
-      ;; Integral widening is exact. Narrowing/exact and trapping conversions need a proof or
-      ;; runtime check that this target layer does not currently carry.
-      (and (not source-fp?) (not result-fp?) (= [:exact :exact] [rounding overflow])
-           (<= (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
+      ;; `:exact/:exact` is the KernelBody owner's proof that every runtime value is representable
+      ;; by the result type. That proof makes both widening and narrowing ordinary value-
+      ;; preserving C conversions; only `:trap` narrowing requires a checked helper.
+      (and (not source-fp?) (not result-fp?) (= [:exact :exact] [rounding overflow]))
       (str "(" (target-type result-type) ")(" argument-source ")")
 
       ;; Every signed 32-bit integer is exactly representable as IEEE f64.
@@ -1001,6 +1005,17 @@
               (indent-lines (inc depth) statement)
               (indent-lines depth "}"))
          (indent-lines depth statement))
+       context])
+
+    (record-kind? "Guard" operation)
+    (let [predicate (emit-mask (:mask operation) context)
+          [guarded-source _]
+          (emit-scalar-operations (:operations operation) context (inc depth))]
+      [(str (indent-lines depth (str "if (" predicate ") {"))
+            guarded-source
+            (indent-lines depth "}"))
+       ;; Guard-local SSA definitions cannot escape; KernelBody dataflow validation enforces the
+       ;; same lexical boundary and rejects divergent collectives/barriers before target lowering.
        context])
 
     (record-kind? "IfRegion" operation)

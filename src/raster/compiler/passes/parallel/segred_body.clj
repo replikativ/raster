@@ -22,6 +22,7 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
@@ -234,27 +235,30 @@
   [segred]
   (let [{:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         expression (inline-scalar-bindings lambda)
+        certification-expression (dialect/scalar-converts->source expression)
         component (first (get-in segred [:reduction :components]))
         dtype (:dtype component)
         declared-algebra (get-in segred [:reduction :algebra])
         declared (if (scan/associative-scan? declared-algebra)
                    declared-algebra
                    (first (:components declared-algebra)))
-        derived (try
-                  (scan/certify-reassociation
-                   {:acc acc :init init :lambda expression} dtype)
+        projected-proof (try
+                  (reduction/certify-projected-reassociation
+                   expression certification-expression acc init dtype)
                   (catch clojure.lang.ExceptionInfo exception
                     (decline! :certified-monoid
                               "KernelBody reduction requires a certified typed monoid"
                               {:segred-id (:id segred) :certificate-error (ex-data exception)})))
-        operator (intrinsics/canonical (:combine derived))]
+        derived (:certificate projected-proof)
+        operator (intrinsics/canonical (:combine derived))
+        element (:element projected-proof)]
     (when-not (scan/compatible-certificate? declared derived)
       (decline! :certified-monoid
                 "scheduled reduction algebra disagrees with its concrete scalar region"
                 {:segred-id (:id segred) :declared declared :derived derived}))
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
-    {:operator operator :identity (constant/literal-or-original init) :element (:element derived)
+    {:operator operator :identity (constant/literal-or-original init) :element element
      :accumulator acc}))
 
 (defn capped-group-count
@@ -419,6 +423,31 @@
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
                     (append! ((:load lowerer) array [lowered-coordinate])))
+
+                  (dialect/scalar-convert-form? expression)
+                  (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)
+                        {:keys [source-dtype target-dtype rounding overflow]} attributes
+                        source (dtype/canon source-dtype)
+                        target (dtype/canon target-dtype)
+                        _ (when-not (dialect/scalar-convert-attributes? attributes)
+                            (decline! :typed-scalar-convert
+                                      "KernelBody reduction requires a valid typed conversion"
+                                      {:expression expression :attributes attributes}))
+                        lowered (lower operand source)
+                        _ (when-not (= source (:dtype lowered))
+                            (decline! :typed-scalar-convert-source
+                                      "typed reduction conversion disagrees with its operand"
+                                      {:expression expression :expected source
+                                       :actual (:dtype lowered)}))
+                        declared-policy (when-not (= source target)
+                                          (cast-policy source target))]
+                    (when-not (or (= source target)
+                                  (= [rounding overflow] declared-policy))
+                      (decline! :typed-scalar-convert-policy
+                                "typed reduction conversion disagrees with the portable policy"
+                                {:expression expression :declared [rounding overflow]
+                                 :portable declared-policy}))
+                    (cast! lowered target))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))

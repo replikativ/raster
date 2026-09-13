@@ -39,8 +39,11 @@
           local (target/emit-artifact "candidate_product_local_address"
                                      (product/schedule (fixtures/typed-local-address-segred)
                                                        retained-options) :opencl-portable)
-          long-types {'nrows :long 'width :long}
-          wide (target/emit-artifact "candidate_product_long_dimensions"
+          ;; Keep the row ABI wide. The int reduction bound proves that the source's checked
+          ;; int(column) cannot trap. An unrestricted long width needs a trapping target (or
+          ;; upstream checked host validation); its portable refusal is covered in body-test.
+          long-types {'nrows :long 'width :int}
+          wide (target/emit-artifact "candidate_product_long_rows"
                                     (product/schedule (fixtures/typed-local-address-segred long-types)
                                                       (assoc retained-options :scalar-types long-types))
                                     :opencl-portable)]

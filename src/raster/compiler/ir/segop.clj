@@ -123,7 +123,8 @@
            [id          ;; int
             space       ;; SegSpace
             level       ;; SegLevel
-            scan-op     ;; {:acc sym :init expr :lambda expr :out sym}
+            scan-op     ;; {:acc sym :init expr :lambda expr :element typed-expr :out sym
+                        ;;  :algebra AssociativeScan}; :element is executable, :algebra is proof.
             lambda      ;; expr — map body before scan (or nil)
             inputs      ;; #{sym}
             outputs     ;; #{sym}

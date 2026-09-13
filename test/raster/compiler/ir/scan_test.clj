@@ -1,7 +1,8 @@
 (ns raster.compiler.ir.scan-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.ir.scan :as scan]))
+            [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.soac-dialect :as dialect]))
 
 (deftest rounded-or-failing-casts-do-not-prove-integer-identities
   (doseq [[dtype init] [[:int '(float 2147483647)]
@@ -115,3 +116,43 @@
     (is false "unknown/effectful element calls must not be reordered")
     (catch clojure.lang.ExceptionInfo e
       (is (= :scan-element-impure-or-unknown (:reason (ex-data e)))))))
+
+(deftest scan-certification-retains-the-element-behind-an-attested-projection
+  (let [conversion (dialect/scalar-convert
+                    {:source-dtype :float :target-dtype :float
+                     :rounding :exact :overflow :exact
+                     :source-op 'clojure.core/float}
+                    '(clojure.core/aget values i))
+        step (list 'clojure.core/+ 'acc conversion)
+        projection (dialect/scalar-converts->source step)
+        proof (scan/certify-projected-scan
+               {:acc 'acc :init 0.0 :lambda step} :float projection)]
+    (is (= conversion (:element proof))
+        "the executable element retains its typed conversion policy")
+    (is (= (nth projection 2) (:element (:certificate proof)))
+        "the algebra certificate retains only the shared source vocabulary"))
+  (try
+    (scan/certify-projected-scan
+     {:acc 'acc :init 0.0 :lambda '(- acc x)} :double '(+ acc x))
+    (is false "a scan cannot certify a different projected operator")
+    (catch clojure.lang.ExceptionInfo exception
+      (is (= :scan-certificate-projection (:reason (ex-data exception)))))))
+
+(deftest projected-certification-normalizes-only-removable-let-bindings
+  (let [step '(let* [term (* (clojure.core/aget values i)
+                             (clojure.core/aget values i))]
+                     (+ acc term))
+        proof (scan/certify-projected-scan {:acc 'acc :init 0.0 :lambda step} :double)]
+    (is (= '(+ acc (* (clojure.core/aget values i)
+                      (clojure.core/aget values i)))
+           (:normalized-step-result proof)))
+    (is (= '(* (clojure.core/aget values i) (clojure.core/aget values i))
+           (:element proof))))
+  (try
+    (scan/certify-projected-scan
+     {:acc 'acc :init 0 :lambda '(let* [term (int x)] (+ acc term))} :int)
+    (is false "a checked let initializer cannot be duplicated or delayed by certification")
+    (catch clojure.lang.ExceptionInfo exception
+      (is (= :scan-certificate-projection (:reason (ex-data exception))))
+      (is (= :impure-binding
+             (get-in (ex-data exception) [:normalization-error :reason]))))))

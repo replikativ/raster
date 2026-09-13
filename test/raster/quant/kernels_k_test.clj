@@ -207,11 +207,21 @@
 (deftest i8-activation-packing-uses-typed-kernel-body
   (let [compiled (pipeline/show-pipeline #'qk/quant-act-i8-rows-gpu!
                                          :target-device :ocl:0 :dtype :float)
-        report (report/from-pipeline compiled)]
+        report (report/from-pipeline compiled)
+        kernel (first (:kernels compiled))
+        nodes (tree-seq coll? seq (get-in kernel [:attributes :kernel-body :operations]))]
     (is (= :typed-soac (get-in report [:route :source-dialect])))
     (is (true? (get-in report [:route :typed-validated])))
     (is (= {:kernel-body 1} (get-in report [:emission :routes])))
-    (is (empty? (get-in report [:emission :declines])))))
+    (is (empty? (get-in report [:emission :declines])))
+    (is (some #(and (map? %)
+                    (= :cast (:op %))
+                    (= :int (:result-type %))
+                    (= :wrap (get-in % [:options :overflow])))
+              nodes)
+        "packed int8 lanes retain explicit bit-pattern narrowing")
+    (is (not (re-find #"rstr_trap_cast_i64_i32" (:source kernel)))
+        "packing must not emit a checked narrowing that traps when bit 31 is set")))
 
 (deftest row-capable-q4k-path-lowers-through-the-shared-gpu-pipeline
   (let [quant-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-rows-gpu!
@@ -231,8 +241,11 @@
       (is (= [256] (get-in kernel [:launch :workgroup-size]))))
     (doseq [packing [(second quant-kernels) (second padded-kernels)]]
       (let [body (get-in packing [:attributes :kernel-body])
-            ops (:operations body)
-            branch (first (filter #(some (fn [op] (= 'xs (:buffer op))) (:then-operations %)) ops))
+            ops (tree-seq coll? seq (:operations body))
+            branch (first (filter #(and (= "raster.compiler.ir.kernel_body.IfRegion"
+                                           (some-> % class .getName))
+                                        (some (fn [op] (= 'xs (:buffer op)))
+                                              (:then-operations %))) ops))
             condition (first (filter #(= (:condition branch) (get-in % [:result :id])) ops))]
         (is (= :independent (get-in body [:attributes :effect-iteration-order])))
         (is (= :eq (get-in condition [:expression :op])))

@@ -49,6 +49,50 @@ in-repository training evidence must not be substituted for those external gates
 The immediate emphasis returns to unresolved compiler/training workload coverage after the durable
 transfer acceptance; the distributed and scientific work does not replace the emitter agenda.
 
+### Checked scalar conversion checkpoint
+
+#565–#568 landed runtime VJP-cache invalidation, resident scalar composition, shape-only array
+captures, and KernelBody signed narrowing with explicit target trap contracts. Source conversion
+integration keeps checked casts distinct from unchecked wrapping, preserves ordered lexical
+initializers and unused checked prefixes, and separates one-shot extent evaluation from CSE.
+Beichte's external-effect classification remains separate from descriptor-derived exceptional
+control obligations; only retained exact-conversion or checked constant evidence removes them.
+
+The integration follow-up keeps implicit result/storage conversions out of the source-cast tree,
+so explicit casts inside maps and stores retain their original checking and rounding behavior.
+Padded map lanes guard the complete scalar region, not just memory operations. Retained branch
+and loop-entry intervals may prove an integral narrowing exact; an unrestricted long-width argmax
+still requires a trapping target or an explicit bound proof. Required exceptional prefix shapes
+have one evaluator in the typed InvocationPlan, with source-order evidence retained across
+non-equation host bindings. These changes are under PR #569 validation, not a green release claim.
+
+The declared result cast of `par/map!` is itself source semantics, distinct from an implicit
+array-store coercion. The integration uncovered a missing boundary when the body contains no
+explicit inner cast. A typed scalar-conversion term is being validated through fusion and target
+projection; it must retain materialization rounding and exceptional ordering, not merely the
+destination dtype. Once-per-element evaluation alone does not justify moving a potentially
+trapping producer across a consumer that writes observable storage. JVM AOT also now threads
+declared scalar/array facts into the shared frontend, and explicit primitive long-to-int bytecode
+uses checked narrowing. Focused JIT/AOT boundary tests pass; the full PR remains unmerged pending
+conversion/fusion and CI regressions. Boxed numeric and native-C exceptional conversions remain
+separate audit gaps, not covered by the primitive JVM result.
+
+Typed scalar conversions also expose a JVM SIMD capability boundary: an exact float identity
+conversion can disappear only inside a float vector computation. It remains a rounding boundary
+when embedded in a double reduction. The shared typed scalar route preserves mixed-width programs;
+all-float map/reduction cases must still vectorize. General mixed-width Vector API conversion and
+lane-shape handling remain an explicit performance task, with numerical materialization-boundary
+oracles required before admission is broadened. A scalar fallback here is not SIMD parity.
+The historical raw source-cast SIMD path still lacks authoritative operand dtype evidence;
+matching its destination to the vector species alone does not certify arbitrary nested casts.
+
+Host-only scalar steps currently execute during preparation. Checked scalars after device work
+therefore decline rather than moving a potential failure ahead of preceding writes. General
+interleaved host/device exceptional control remains future work. Portable OpenCL still declines
+unproven trapping device casts; CUDA/HIP/Intel termination is not a JVM exception-delivery promise.
+This work does not certify the scalar simplifier's historical floating-point algebra under all
+NaN/signed-zero cases, nor complete the remaining counted-map migration or compatibility census.
+
 ### External scientific comparisons
 
 The [source-reviewed extension experiments](scientific-extension-validation.md) add Julia/SciML

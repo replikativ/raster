@@ -2172,7 +2172,16 @@
     "float"  (let [t (emit-form code (first args) locals ctx)]
                (if (= t :float) t (do (emit-coerce code t :float) :float)))
     "int"    (let [t (emit-form code (first args) locals ctx)]
-               (if (= t :int) t (do (emit-coerce code t :int) :int)))
+               (case t
+                 :int :int
+                 ;; `int` is a checked source conversion. Keep this distinct from the raw JVM
+                 ;; coercions used to satisfy array-store and method descriptors, and from the
+                 ;; explicitly wrapping `clojure.core/unchecked-int` operation.
+                 :long (do (.invokestatic code math-cd "toIntExact"
+                                          (MethodTypeDesc/of I-cd
+                                                             (into-array ClassDesc [J-cd])))
+                           :int)
+                 (do (emit-coerce code t :int) :int)))
     "long"   (let [t (emit-form code (first args) locals ctx)]
                (if (= t :long) t (do (emit-coerce code t :long) :long)))
     ;; Arithmetic — dispatched to emit-arithmetic helper

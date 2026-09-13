@@ -104,9 +104,18 @@
           (is (= :trap (get-in (first checked) [:expression :options :overflow])))))
       (let [untyped (assoc-in operation [:scalar-region :effects 0 :loop :carry field]
                               (with-meta expression nil))]
-        (is (= :scalar-source-type
-               (try (artifact untyped :opencl-portable) :accepted
-                    (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e))))))))))
+        (let [all (operations
+                   (get-in (artifact untyped :cuda)
+                           [:attributes :kernel-body :operations]))
+              checked (filter #(and (= :+ (get-in % [:expression :op]))
+                                     (= :long (get-in % [:result :type]))) all)]
+          (is (= 1 (count checked)))
+          (is (= :trap (get-in (first checked) [:expression :options :overflow]))
+              "declared carry/local facts recover the source width without expression metadata")
+          (is (= :kernel-body-c-trap-unsupported
+                 (try (artifact untyped :opencl-portable) :accepted
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+              "portable OpenCL declines only because it cannot implement the retained trap"))))))
 
 (deftest carry-conversions-do-not-inherit-device-integer-wrapping
   (let [operation (-> (scheduled-loop 0)

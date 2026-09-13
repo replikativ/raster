@@ -7,6 +7,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.materialize :as materialize]))
 
@@ -33,6 +34,27 @@
     (is (segop-simd/simd-able? 42.0 'i))
     (is (segop-simd/simd-able? 'dt 'i))
     (is (segop-simd/simd-able? '(double dt) 'i))))
+
+(deftest typed-conversion-simd-admission-preserves-precision-boundaries
+  (let [conversion (fn [source target rounding overflow operand]
+                     (dialect/scalar-convert
+                      {:source-dtype source :target-dtype target
+                       :rounding rounding :overflow overflow
+                       :source-op 'clojure.core/float}
+                      operand))]
+    (is (segop-simd/simd-able?
+         (conversion :float :float :exact :exact '(+ (aget a i) (float 1.0))) 'i :float)
+        "an all-f32 materialization boundary remains vectorizable")
+    (is (not (segop-simd/simd-able?
+              (conversion :float :float :exact :exact '(+ (aget a i) (float 1.0))) 'i :double))
+        "a float materialization boundary cannot be erased inside a double Vector species")
+    (is (not (segop-simd/simd-able?
+              (conversion :double :float :nearest-even :ieee '(+ (aget a i) 1.0)) 'i :float))
+        "mixed-width vector conversion declines until lane-shape conversion is explicit")
+    (is (segop-simd/simd-able? '(float (+ (aget a i) (float 1.0))) 'i :float))
+    (is (not (segop-simd/simd-able?
+              '(float (+ (aget a i) (float 1.0))) 'i :double))
+        "a source float cast is not erased under a wider active species")))
 
 (deftest not-simd-able
   (testing "Non-SIMD operations return false"

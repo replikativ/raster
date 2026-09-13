@@ -396,7 +396,11 @@
           (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm (csimd/active-isa) array-syms)]
             (when *simd-preamble* (swap! *simd-preamble* conj includes))
             block))
-        (ce/emit-stmt (par/expand-par-map! form) nil array-syms "idx"))
+        ;; The expansion is a buffer-writing counted loop whose exit value is the destination
+        ;; buffer.  Keep it in the host-statement projection: the generic scalar loop emitter
+        ;; models value-carrying loops and would otherwise assign that buffer exit to the integer
+        ;; induction variable.
+        (emit-host-stmt (par/expand-par-map! form) array-syms ct))
 
     :else (ce/emit-stmt form nil array-syms "idx")))
 

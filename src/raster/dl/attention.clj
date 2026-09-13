@@ -990,40 +990,37 @@
 ;; x:[seq_len, d_model], W{q,k,v,o}:[d_model, d_model], b{q,k,v,o}:[d_model]
 ;; ================================================================
 
+(declare batched-causal-sdpa)
+
 (deftm causal-multi-head-attention
-  "Causal multi-head self-attention. Composed via slice-strided-2d /
-  scatter-strided-2d over a loop fold so each step is a templated AD primitive
-  — no nested-dotimes shuffles for AD to walk through. The output projection
-  lives in the loop's result branch so AD sees the canonical
-  (let* bindings (loop … result)) shape that gen-reverse-loop-with-let handles."
-  [x :- (Array double) Wq :- (Array double) bq :- (Array double)
-   Wk :- (Array double) bk :- (Array double)
-   Wv :- (Array double) bv :- (Array double)
-   Wo :- (Array double) bo :- (Array double)
-   seq-len :- Long d-model :- Long n-heads :- Long]
-  :- (Array double)
+  "Causal multi-head self-attention. Head packing is an ordinary index permutation and all heads
+  enter one batched SDPA equation; unpacking is its inverse permutation. This keeps the program in
+  the common functional SOAC algebra and exposes batch/head parallelism without a host loop."
+  (All [T]
+   [x :- (Array T) Wq :- (Array T) bq :- (Array T)
+    Wk :- (Array T) bk :- (Array T)
+    Wv :- (Array T) bv :- (Array T)
+    Wo :- (Array T) bo :- (Array T)
+    seq-len :- Long d-model :- Long n-heads :- Long]
+   :- (Array T)
   (let [dk (quot d-model n-heads)
-        n  (* seq-len d-model)
+        used-width (* n-heads dk)
         Q  (nn/linear x Wq bq seq-len d-model d-model)
         K  (nn/linear x Wk bk seq-len d-model d-model)
         V  (nn/linear x Wv bv seq-len d-model d-model)]
-    ;; Fold over heads: at each step, slice the head's QKV slabs out of
-    ;; the full projections, run causal single-head attention, scatter
-    ;; the result into a [seq_len × d_model] zeros-padded slab, and add
-    ;; into the running accumulator. The result branch projects the
-    ;; concatenated heads through Wo/bo.
-    (loop [h 0 acc (double-array n)]
-      (if (< h n-heads)
-        (let [col-off (* h (int dk))
-              Qh (ops/slice-strided-2d Q seq-len d-model col-off dk)
-              Kh (ops/slice-strided-2d K seq-len d-model col-off dk)
-              Vh (ops/slice-strided-2d V seq-len d-model col-off dk)
-              head-out (causal-scaled-dot-product-attn
-                        Qh Kh Vh seq-len dk dk)
-              out-h (ops/scatter-strided-2d
-                     head-out seq-len d-model col-off dk)]
-          (recur (inc h) (ops/array-add acc out-h n)))
-        (nn/linear acc Wo bo seq-len d-model d-model)))))
+    (let [Q-compact (ops/slice-strided-2d Q seq-len d-model 0 used-width)
+          K-compact (ops/slice-strided-2d K seq-len d-model 0 used-width)
+          V-compact (ops/slice-strided-2d V seq-len d-model 0 used-width)
+          Qh (ops/pack-heads Q-compact seq-len n-heads dk)
+          Kh (ops/pack-heads K-compact seq-len n-heads dk)
+          Vh (ops/pack-heads V-compact seq-len n-heads dk)
+          head-out (batched-causal-sdpa Qh Kh Vh n-heads seq-len dk)
+          compact-out (ops/unpack-heads head-out seq-len n-heads dk)
+          ;; Preserve the historical full-width contract when d-model is not divisible by the
+          ;; head count. Head slabs cover the first `used-width` columns and the remainder is
+          ;; zero; the final projection may therefore always read exactly seq-len*d-model values.
+          concat-out (ops/pad-strided-2d compact-out seq-len d-model 0 used-width)]
+      (nn/linear concat-out Wo bo seq-len d-model d-model)))))
 
 ;; ================================================================
 ;; Differentiable GQA/MQA causal attention (Llama/Qwen/Gemma decoders)

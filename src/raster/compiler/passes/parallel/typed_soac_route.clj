@@ -6,6 +6,7 @@
    control expression and retained as first-class algorithms in a ParallelProgram."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
@@ -83,7 +84,29 @@
 
 (defn- typed-store-value
   [cast value]
-  (if cast (list (symbol "clojure.core" (name cast)) value) value))
+  (let [source-operation (when (seq? value) (descriptor/semantic-op value))
+        target (some-> cast descriptor/cast-result-tag
+                       dtype/dtype-for-scalar-tag dtype/canon)
+        source (when (seq? value)
+                 (some-> source-operation descriptor/cast-result-tag
+                         dtype/dtype-for-scalar-tag dtype/canon))]
+    ;; The scalar equation's result dtype still owns the host/JVM boundary conversion.  When its
+    ;; already-validated body ends in exactly that primitive cast, reusing it preserves the source
+    ;; check/rounding point without manufacturing a redundant `(long (long ...))` wrapper.
+    (cond
+      (nil? cast) value
+
+      (= target source)
+      ;; This cast is now a compiler-attested result conversion. Preserve its exact operand and
+      ;; metadata, but not a bare operator spelling that a public scalar named `long`/`float`
+      ;; could capture when the materialized source is compiled in its destination scope.
+      (if (and (= 2 (count value)) (descriptor/cast-op? source-operation))
+        (with-meta (list (symbol "clojure.core" (name source-operation)) (second value))
+          (meta value))
+        value)
+
+      :else
+      (list (symbol "clojure.core" (name cast)) value))))
 
 (defn- materialize-region
   [locals body]
@@ -151,6 +174,20 @@
         (let [result (first results)
               result-dtypes (mapv #(:dtype (get values %)) results)
               casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+              projected-source-casts
+              (mapv (fn [body result-dtype]
+                      (when (and (seq? body) (= 2 (count body))
+                                 (descriptor/cast-op? (descriptor/semantic-op body))
+                                 (= result-dtype
+                                    (some-> (descriptor/semantic-op body)
+                                            descriptor/cast-result-tag
+                                            dtype/dtype-for-scalar-tag dtype/canon)))
+                        (descriptor/semantic-op body)))
+                    bodies result-dtypes)
+              casts (mapv #(or %1 %2) projected-source-casts casts)
+              bodies (mapv (fn [body source-cast]
+                             (if source-cast (second body) body))
+                           bodies projected-source-casts)
               ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
               ;; results are stored bit-exactly, so only dtypes with a scalar need one.
               _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))

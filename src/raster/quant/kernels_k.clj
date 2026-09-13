@@ -399,7 +399,10 @@
                                                   (bit-shift-left (bit-and q1 0xFF) 8))
                                           (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
                                                   (bit-shift-left (bit-and q3 0xFF) 24)))]
-                         (ra/aset xp (+ (* rb 8) w) (int word))
+                         ;; `word` is assembled in a long but denotes an arbitrary int32 bit
+                         ;; pattern. High lanes may set bit 31, so this is intentional modulo-2^32
+                         ;; narrowing rather than a checked numeric conversion.
+                         (ra/aset xp (+ (* rb 8) w) (unchecked-int word))
                          (recur (inc w)))
                        nil)))))
 

@@ -51,6 +51,16 @@
     (is (= 0.0 (simp/simplify-1 '(/ 0 x))))
     (is (= 0.0 (simp/simplify-1 '(/ 0.0 x))))))
 
+(deftest checked-casts-are-not-erased-or-duplicated
+  (doseq [form ['(* (clojure.core/int x) 0)
+                '(* 0 (clojure.core/int x))
+                '(- (clojure.core/int x) (clojure.core/int x))
+                '(/ 0 (clojure.core/int x))
+                '(Math/pow (clojure.core/int x) 0)
+                '(Math/pow (clojure.core/int x) 2)]]
+    (is (= form (simp/simplify-1 form))
+        "algebraic cleanup must retain a potentially trapping source conversion")))
+
 ;; ================================================================
 ;; Constant folding
 ;; ================================================================

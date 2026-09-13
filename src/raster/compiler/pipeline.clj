@@ -1285,21 +1285,21 @@
                                                (mapv (fn [t] (if (= t 'Object) nil t)) tags)))]
                                 (when (and ps anns (= (count ps) (count anns)))
                                   (zipmap (map #(if (symbol? %) % (symbol (name %))) ps) anns)))
-            ;; Declared GPU param types from the SAME shared derivation Path A uses, so the
-            ;; pipeline's opencl backend gets the deftm's declared scalar/array types (not the
-            ;; emitter's name-regex guess). ONE type source across both compile entries.
-            gpu-param-types (when target-device
-                              (opencl-pass/derive-param-types
-                               (:raster.core/deftm-params (meta resolved-var))
-                               (:raster.core/deftm-tags (meta resolved-var))
-                               effective-dtype))
+            ;; Declared parameter types from the SAME shared derivation Path A uses. These are
+            ;; source ABI facts, not GPU-only emitter hints: the TypedSOAC frontend needs them on
+            ;; JVM AOT as well so an integral array read cannot inherit the ambient floating dtype
+            ;; before a checked source conversion is projected back to bytecode.
+            parameter-types (opencl-pass/derive-param-types
+                             (:raster.core/deftm-params (meta resolved-var))
+                             (:raster.core/deftm-tags (meta resolved-var))
+                             effective-dtype)
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
                           :active-params active-params :dtype effective-dtype}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns)
                    param-annotations (assoc :param-annotations param-annotations)
-                   gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
-                                          :array-types (:array-types gpu-param-types)))
+                   parameter-types (assoc :scalar-types (:scalar-types parameter-types)
+                                          :array-types (:array-types parameter-types)))
             compile! (fn []
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)

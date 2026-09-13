@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
@@ -464,6 +465,85 @@
       (is (every? #(= module-target (:target %)) (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
+(deftest declared-map-result-cast-preserves-jvm-source-semantics
+  (let [output (int-array 2)]
+    (checked-casts/declared-narrow-rows!
+     (long-array [Integer/MIN_VALUE Integer/MAX_VALUE]) output 2)
+    (is (= [Integer/MIN_VALUE Integer/MAX_VALUE] (vec output))))
+  (doseq [value [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]]
+    (let [input (long-array [value]) output (int-array [-7])]
+      (is (thrown? ArithmeticException
+                   (raster.par/map! output index 1 int (aget input index))))
+      (is (= [-7] (vec output)))
+      (is (thrown? ArithmeticException
+                   (checked-casts/declared-narrow-rows! input output 1)))
+      (is (= [-7] (vec output))))))
+
+(deftest checked-source-narrowing-reaches-public-c-family-kernels
+  (doseq [target [cuda-target hip-target]
+          operation [#'checked-casts/narrow-rows!
+                     #'checked-casts/declared-narrow-rows!
+                     #'checked-casts/narrow-stores!
+                     #'checked-casts/unused-narrow-rows!
+                     #'checked-casts/annihilated-narrow-rows!]]
+    (let [compilation (equation-first/compile operation
+                                            {:target target :dtype :long})
+          plan (equation-first/lower compilation [(long-array [-2147483648 2147483647])
+                                                 (int-array 2) 2])
+          nodes (mapcat #(tree-seq coll? seq (get-in % [:attributes :kernel-body :operations]))
+                        (:kernels compilation))
+          input-loads (set (keep #(when (and (map? %) (= 'input (:buffer %))
+                                             (= :long (get-in % [:result :type])))
+                                    (get-in % [:result :id])) nodes))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (some #(str/includes? (:source %) "rstr_trap_cast_i64_i32")
+                (:kernels compilation)))
+      (is (some #(and (map? %) (= :cast (:op %)) (= :int (:result-type %))
+                       (= {:rounding :exact :overflow :trap} (:options %))
+                       (contains? input-loads (first (:arguments %)))) nodes)
+          "the input load, not merely a launch-bound scalar, must feed a checked cast")
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
+(deftest unused-checked-prefix-remains-observable-before-device-work
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'checked-casts/checked-prefix-rows!
+                                            {:target target :dtype :long})
+          input (long-array [7 9])
+          output (int-array [-1 -1])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in (equation-first/lower compilation [input output 2 2147483647])
+                       [:attributes :driver-allocations])))
+      (is (thrown? ArithmeticException
+                   (equation-first/lower compilation [input output 2 2147483648])))
+      (is (= [-1 -1] (vec output))))))
+
+(deftest checked-scalars-after-device-work-do-not-become-preparation-checks
+  (doseq [target [cuda-target hip-target]]
+    (is (= :equation-first-coverage
+           (try
+             (equation-first/compile #'checked-casts/checked-after-write!
+                                    {:target target :dtype :int})
+             :accepted
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
+
+(deftest padded-map-lanes-do-not-evaluate-checked-conversions
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'checked-casts/narrow-index!
+                                            {:target target :dtype :byte})
+          kernel (first (:kernels compilation))
+          operations (get-in kernel [:attributes :kernel-body :operations])
+          guarded (first operations)
+          nodes (tree-seq coll? seq (:operations guarded))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count operations)))
+      (is (= :map-active (:mask guarded))
+          "the complete per-element region is inactive for padded work-items")
+      (is (some #(and (map? %) (= :cast (:op %)) (= :byte (:result-type %))
+                       (= :trap (get-in % [:options :overflow]))) nodes))
+      (is (= 0 (get-in (equation-first/lower compilation [(byte-array 1) 1])
+                       [:attributes :driver-allocations]))))))
 
 (deftest emitted-program-rejects-a-mixed-target-module
   (let [compilation (equation-first/compile

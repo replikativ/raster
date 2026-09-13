@@ -8,10 +8,13 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (deftest generated-row-major-coordinates-carry-their-domain-type
@@ -67,6 +70,75 @@
     (doseq [n [Long/MIN_VALUE -1 0 1 3 2147483648 Long/MAX_VALUE]]
       (is (= (run source n) (run normalized n)) (str "count " n)))))
 
+(deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source
+                    '(let* [result (dotimes [i (int n)] (aset out i 1.0))] result)
+                    options)
+        program (frontend/form->program normalized options)
+        equations (dialect/equations program)]
+    (is (= 'raster.par/map-void! (first (last (second normalized))))
+        "a checked count is retained while the store loop enters the effect dialect")
+    (is (= '[scalar scalar map]
+           (mapv dialect/operation-kind equations))
+        "the converted count and nonnegative launch extent precede the lowered store map")
+    (is (= [:long :long]
+           (mapv #(-> % dialect/operation-parts :attributes :dtypes first)
+                 (take 2 equations)))
+        "both the widened count and clamped extent retain their long ABI")
+    (is (= [true true true]
+           (mapv #(get-in (dialect/facts program)
+                          [:equations (second %) :attributes :source-prefix?])
+                 equations))
+        "equation facts retain the frontend's source-order prefix proof")
+    (let [widened-result (-> equations first dialect/operation-parts :lambda
+                             dialect/lambda-parts :body-results first)]
+      (is (= 'clojure.core/long (first widened-result)))
+      (is (= '(int %capture0) (second widened-result))
+          "the outer exact widening does not erase the inner checked narrowing")
+      (is (= 'long
+             (or (types/sym-type-tag widened-result)
+                 (some-> widened-result first
+                         descriptor/cast-result-tag)))
+          "the scalar result owns long through retained metadata or its authoritative cast")))
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        source '(let* [checked (clojure.core/int n)
+                       result (raster.par/map! out i n double 1.0)]
+                      result)
+        equations (some-> source (frontend/form->program options) dialect/equations)]
+    (is (= '[scalar map] (mapv dialect/operation-kind equations))
+        "an otherwise-unused checked prefix remains an ordered scalar equation")
+    (is (= :int (-> equations first dialect/operation-parts :attributes :dtypes first))
+        "the explicit cast descriptor, not the program default, types its result")))
+
+(deftest checked-scalars-after-numerical-work-decline-this-route
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'n :long}}
+        source '(let* [first-result (raster.par/map! out i n double 1.0)
+                       checked (clojure.core/int n)]
+                      first-result)]
+    (is (nil? (frontend/form->program source options))
+        "host-only staging cannot move a later throw before an independent device write")))
+
+(deftest retained-local-types-prove-generated-identity-casts-after-a-map
+  (let [source '(let* [first-result (raster.par/map! tmp i n long 1)
+                       ^long rows (* n n)
+                       ^long capacity (* (long rows) (long n))
+                       result (raster.par/map! out j n long capacity)]
+                      result)
+        options {:dtype :long :array-types {'tmp :long 'out :long}
+                 :scalar-types {'n :long}}
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        capacity-equation (some #(when (= 'capacity (first (nth % 2))) %)
+                                (dialect/equations program))]
+    (is (some? program))
+    (is (= 'scalar (dialect/operation-kind capacity-equation)))
+    (is (false? (get-in (dialect/facts program)
+                        [:equations (second capacity-equation) :attributes :source-prefix?]))
+        "generated long identity casts do not become a false late checked-scalar obligation")))
+
 (deftest counted-conflicting-stores-retain-order-and-explicit-buffer-return
   (let [options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}
         source '(let* [r (dotimes [i n] (aset out 0 (double i)))] out)
@@ -87,12 +159,15 @@
   (let [options {:dtype :double :array-types {'out :double 'x :double}
                  :scalar-types {'n :long}}
         source '(let* [r (dotimes [i n] (aset out 0 (float (aget x i))))] out)
-        program (frontend/form->program (frontend/normalize-source source options) options)]
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        equation (last (dialect/equations program))
+        operation (dialect/operation-parts equation)]
     (is (some? program))
-    (is (some #(and (seq? %) (= 'double (first %))
-                    (seq? (second %)) (= 'float (first (second %))))
-              (tree-seq coll? seq (last (dialect/equations program))))
-        "widen the source-rounded float; do not replace its cast with a double cast")))
+    (is (= [:double] (get-in operation [:attributes :dtypes]))
+        "the typed destination boundary still owns the final double conversion")
+    (is (some #(and (seq? %) (= 'float (first %)))
+              (tree-seq coll? seq equation))
+        "the source-rounded float remains before the typed destination conversion")))
 
 (deftest unknown-or-mutable-counts-are-not-normalized
   (doseq [bound ['(next-count!) '(aget counts 0)]]
@@ -297,6 +372,29 @@
            (get-in (route/attempt source :float {'x :float 'target :float}
                                   {:scalar-types {'nrows :long 'width :long}})
                    [:stats :front-end])))))
+
+(deftest named-checked-products-remain-scalar-extents-after-cast-normalization
+  (let [source '(let* [^long size (clojure.core/* (clojure.core/long nrows)
+                                                  (clojure.core/long width))
+                       step (raster.par/map! target i size float
+                                             (clojure.core/aget x i))]
+                      step)
+        options {:dtype :float
+                 :array-types {'x :float 'target :float}
+                 :scalar-types {'nrows :long 'width :long}}
+        normalized (frontend/normalize-source source options)
+        program (frontend/form->program normalized options)
+        equations (dialect/equations program)
+        size-equation (first equations)
+        size-body (-> size-equation dialect/operation-parts :lambda
+                      dialect/lambda-parts :body-results first)]
+    (is (= '[size step] (mapv (comp first #(nth % 2)) equations)))
+    (is (= ['scalar 'map] (mapv dialect/operation-kind equations)))
+    (is (= 'size (dialect/operation-extent (second equations)))
+        "normalizing identity long casts must not inline a compound expression into an extent")
+    (is (= 'clojure.core/* (first size-body)))
+    (is (= 2 (count (filter #{'clojure.core/long} (flatten size-body))))
+        "the checked product remains one source-ordered scalar computation")))
 
 (deftest retained-array-shapes-prove-compound-parallel-extents
   (let [program
@@ -778,22 +876,26 @@
     (is (= 2 (count (dialect/equations program))))))
 
 (deftest effect-only-pointwise-writes-have-logical-results-and-physical-storage
-  (doseq [[label expression]
+  (doseq [[label expression canonical-storage-conversion?]
           [["map2"
             '(raster.par/map2! a b i n float
                                (+ (clojure.core/aget x i) 1.0)
-                               (* (clojure.core/aget y i) 2.0))]
+                               (* (clojure.core/aget y i) 2.0))
+            true]
            ["independent multi-store map-void"
             '(raster.par/map-void!
               i n
               (do (clojure.core/aset a i (float (+ (clojure.core/aget x i) 1.0)))
-                  (clojure.core/aset b i (float (* (clojure.core/aget y i) 2.0)))))]]]
+                  (clojure.core/aset b i (float (* (clojure.core/aget y i) 2.0)))))
+            false]]]
     (testing label
       (let [program (frontend/form->program
                      (list 'let* ['effect expression] 'effect)
                      {:dtype :float
                       :array-types {'x :float 'y :float 'a :float 'b :float}})
             equation (first (dialect/equations program))
+            body-results (-> equation dialect/operation-parts :lambda
+                             dialect/lambda-parts :body-results)
             facts (dialect/facts program)
             results (vec (nth equation 2))]
         (is (= [[:effect-map 0 0] [:effect-map 0 1]] results))
@@ -801,6 +903,17 @@
         (is (= [:write :write]
                (mapv :access (dialect/result-storage program 0))))
         (is (= #{:memory/write} (:effects facts)))
+        (if canonical-storage-conversion?
+          (is (= [[:double :float] [:double :float]]
+                 (mapv (fn [result]
+                         (let [attributes (:attributes (dialect/scalar-convert-parts result))]
+                           [(:source-dtype attributes) (:target-dtype attributes)]))
+                       body-results))
+              "every map2 result retains its complete source-to-storage conversion")
+          (is (every? #(= 'float
+                          (some-> % descriptor/semantic-op descriptor/cast-result-tag))
+                      body-results)
+              "explicit user store casts remain source operations rather than implicit storage terms"))
         (is (= [] (dialect/outputs program))
             "the host nil result is not mislabeled as a tensor result")))))
 
@@ -811,8 +924,14 @@
                                          (+ (clojure.core/aget x i) 1.0))]
                 out)
          {:dtype :float :array-types {'x :float 'out :float}})
-        equation (first (dialect/equations program))]
+        equation (first (dialect/equations program))
+        body (-> equation dialect/operation-parts :lambda
+                 dialect/lambda-parts :body-results first)]
     (is (= ['out] (dialect/physical-results program equation)))
+    (is (dialect/scalar-convert-form? body)
+        "the source map result conversion remains an explicit typed boundary")
+    (is (= '(clojure.core/float (+ %element0 1.0))
+           (projection/scalar-folds->source body)))
     (is (= (vec (nth equation 2)) (dialect/outputs program))
         "a returned destination denotes the fresh logical result, not an undeclared buffer")))
 
@@ -861,6 +980,133 @@
            locals))
     (is (= '[(float rstr_local_1)] body-results))))
 
+(deftest pointwise-effect-map-retains-a-source-written-checked-cast
+  (let [program (frontend/form->program
+                 '(let* [effect
+                          (raster.par/map-void!
+                           i n (clojure.core/aset out i
+                                                 (clojure.core/int
+                                                  (clojure.core/aget input i))))]
+                         effect)
+                 {:dtype :int :array-types {'input :long 'out :int}
+                  :scalar-types {'n :long}})
+        equation (first (dialect/equations program))
+        result (-> equation dialect/operation-parts :lambda
+                   dialect/lambda-parts :body-results first)]
+    (is (= 'map (dialect/operation-kind equation)))
+    (is (= 'clojure.core/int (first result))
+        "the source cast stays in the scalar region; result storage owns no source policy")))
+
+(deftest functional-map-result-casts-become-typed-conversion-terms
+  (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
+    (let [source (list 'let*
+                       ['result (list 'raster.par/map! 'out 'i 'n cast
+                                     '(clojure.core/aget input i))]
+                       'result)
+          program (frontend/form->program
+                   source {:dtype :int :array-types {'input :long 'out :int}
+                           :scalar-types {'n :long}})
+          expression (-> program dialect/equations first dialect/operation-parts :lambda
+                         dialect/lambda-parts :body-results first)
+          {:keys [attributes operand]} (dialect/scalar-convert-parts expression)]
+      (is (= 'raster.compiler.ir.soac-dialect/scalar-convert (first expression)))
+      (is (= {:source-dtype :long :target-dtype :int
+              :rounding :exact :overflow overflow
+              :source-op (symbol "clojure.core" (name cast))}
+             attributes))
+      (is (= '%element0 operand)))))
+
+(deftest raw-array-inputs-receive-the-entry-dtype-before-conversion-elaboration
+  (let [program
+        (frontend/form->program
+         '(let* [y (raster.par/pmap i n float
+                                    (* (clojure.core/aget x i)
+                                       (clojure.core/aget x i)))
+                 z (raster.par/pmap j n float
+                                    (+ (clojure.core/aget y j) 1.0))]
+                z)
+         {:dtype :float})
+        conversions
+        (mapv #(-> % dialect/operation-parts :lambda dialect/lambda-parts
+                   :body-results first dialect/scalar-convert-parts)
+              (dialect/equations program))]
+    (is program)
+    (is (= 2 (count (dialect/equations program))))
+    (is (= [[:float :float] [:double :float]]
+           (mapv (fn [conversion]
+                   ((juxt :source-dtype :target-dtype) (:attributes conversion)))
+                 conversions))
+        "the first map materializes its float result; the double-literal consumer narrows once")
+    (is (= :float (get-in (dialect/facts program) [:values 'x :dtype])))))
+
+(deftest primitive-cast-operands-retain-their-dtype-during-source-inference
+  (let [program
+        (frontend/form->program
+         '(let* [result (raster.par/pmap i n float
+                                         (raster.numeric/+ (clojure.core/aget x i)
+                                                           (clojure.core/float 1.0)))]
+                result)
+         {:dtype :float :array-types {'x :float}})
+        conversion (some-> program dialect/equations first dialect/operation-parts :lambda
+                           dialect/lambda-parts :body-results first
+                           dialect/scalar-convert-parts)]
+    (is program)
+    (is (= [:float :float]
+           ((juxt :source-dtype :target-dtype) (:attributes conversion))))))
+
+(deftest ordered-loop-map-result-takes-its-source-dtype-from-the-carry
+  (let [source
+        '(let* [result
+                (raster.par/map! out i n float
+                                 (loop* [j 0 acc (float 0.0)]
+                                        (if (< (long j) (long width))
+                                          (let* [value
+                                                 (clojure.core/aget
+                                                  x (+ (* (long i) (long width)) (long j)))]
+                                                (recur (inc (long j))
+                                                       (+ (float acc) (float value))))
+                                          acc)))]
+               result)
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'x :float 'out :float}
+                         :scalar-types {'n :long 'width :long}})
+        body (some-> program dialect/equations first dialect/operation-parts :lambda
+                     dialect/lambda-parts :body-results first)
+        conversion (dialect/scalar-convert-parts body)
+        loop-expression (:operand conversion)
+        matched (patterns/match-ordered-reduce-loop loop-expression)]
+    (is program)
+    (is (= 'loop* (first loop-expression))
+        "this frontend checkpoint retains source control before scalar-region canonicalization")
+    (is matched)
+    (is (= '(float 0.0) (:acc-init matched)))
+    (is (= (:acc-sym matched) (:else-expr matched))
+        "the sole loop exit is the float accumulator whose type owns the map result")
+    (is (= [:float :float]
+           ((juxt :source-dtype :target-dtype) (:attributes conversion))))))
+
+(deftest agreeing-conditional-branches-own-the-map-source-dtype
+  (let [source '(let* [y (raster.par/pmap i n float
+                                           (if (> (clojure.core/aget x i) threshold)
+                                             (clojure.core/aget x i)
+                                             (* alpha (clojure.core/aget x i))))]
+                         y)
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'x :float}
+                         :scalar-types {'n :long 'threshold :float 'alpha :float}})
+        conversion (-> program dialect/equations first dialect/operation-parts :lambda
+                       dialect/lambda-parts :body-results first dialect/scalar-convert-parts)]
+    (is program)
+    (is (= [:float :float]
+           ((juxt :source-dtype :target-dtype) (:attributes conversion))))
+    (is (nil? (frontend/form->program
+               '(let* [y (raster.par/pmap i n float
+                                           (if flag (clojure.core/aget x i) 0.0))]
+                  y)
+               {:dtype :float :array-types {'x :float}
+                :scalar-types {'n :long 'flag :int}}))
+        "a consumer cast cannot invent one source dtype for mixed conditional exits")))
+
 (deftest closed-core-integer-case-becomes-a-typed-conditional-map
   (let [expression
         '(raster.par/map-void!
@@ -882,6 +1128,30 @@
     (is (not-any? #{'case* :compact :int} (flatten result)))
     (is (some #{'clojure.core/==} (flatten result)))
     (is (some #{10.0 20.0} (flatten result)))))
+
+(deftest aligned-conditional-store-retains-its-agreeing-value-type
+  (let [rounded (with-meta '(float 10.0)
+                  {:tag 'double :raster.type/tag 'double})
+        source (list 'let*
+                     ['effect
+                      (list 'raster.par/map-void! 'i 'n
+                            (list 'if '(clojure.core/== i 0)
+                                  (list 'clojure.core/aset 'out 'i rounded)
+                                  '(clojure.core/aset out i (float 20.0))))]
+                     'effect)
+        program (frontend/form->program
+                 source
+                 {:dtype :float :array-types {'out :float} :scalar-types {'n :long}})
+        equation (first (dialect/equations program))
+        result (-> equation dialect/operation-parts :lambda
+                   dialect/lambda-parts :body-results first)
+        conditional (some #(when (and (seq? %) (= 'if (first %))
+                                      (= 'float (types/sym-type-tag %)))
+                             %)
+                          (tree-seq coll? seq result))]
+    (is (= 'if (first conditional)))
+    (is (= 'float (types/sym-type-tag conditional))
+        "the explicit cast descriptor, not stale metadata, types the merged value-if")))
 
 (deftest noninteger-case-representation-declines-the-typed-route
   (let [expression
@@ -1139,6 +1409,27 @@
     (is (= '(int n) (second (second normalized))))
     (is (= 'int (:tag (meta extent))))
     (is (= '[scalar map] (mapv dialect/operation-kind equations)))))
+
+(deftest identical-checked-extents-reuse-only-dominating-immutable-values
+  (let [source (fn [extent]
+                 (list 'let*
+                       ['a (list 'raster.par/map! 'out-a 'i extent 'float 1.0)
+                        'b (list 'raster.par/map! 'out-b 'j extent 'float 2.0)]
+                       'b))
+        checked-casts (fn [form]
+                        (filter #(and (seq? %) (= 'int (first %)))
+                                (tree-seq coll? seq form)))
+        immutable (frontend/normalize-source
+                   (source '(int n))
+                   {:scalar-types {'n :long}
+                    :array-types {'out-a :float 'out-b :float}})
+        array-backed (frontend/normalize-source
+                      (source '(int (aget counts 0)))
+                      {:array-types {'counts :long 'out-a :float 'out-b :float}})]
+    (is (= 1 (count (checked-casts immutable)))
+        "the first immutable checked extent dominates and proves the repeated conversion")
+    (is (= 2 (count (checked-casts array-backed)))
+        "array-backed checked extents remain distinct evaluations")))
 
 (deftest fixed-rng-inputs-keep-their-ordered-checked-conversions
   (let [options {:dtype :long :array-types {'seeds :long}
@@ -1434,3 +1725,18 @@
     (is (= :unique
            (effect-map-order source {:dtype :float :array-types {'sc :float 'q :float}
                                      :scalar-types {'nrows :long 'n-q :long}})))))
+
+(deftest host-control-cannot-hide-an-unequated-parallel-leaf
+  (let [source
+        '(let* [seed (raster.par/map! initial i n float (aget x i))]
+           (loop* [h 0 acc seed]
+             (if (< h heads)
+               (let* [next (raster.par/map! scratch i n float
+                                             (+ (aget acc i) (aget x i)))]
+                 (recur (inc h) next))
+               acc)))]
+    (is (nil? (frontend/form->program
+               source {:dtype :float
+                       :array-types {'initial :float 'scratch :float 'x :float}
+                       :scalar-types {'heads :long 'n :long}}))
+        "a validated TypedSOAC program must own every parallel leaf as an equation")))

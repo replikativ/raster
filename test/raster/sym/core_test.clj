@@ -545,12 +545,11 @@
   (testing "d/dy of (x * y) = 0*y + x*1"
     (is (= '(+ (* 0 y) (* x 1)) (diff '(* x y) 'y))))
 
-  (testing "d/dx of pure y expression applies chain rule (unsimplified)"
-    ;; diff doesn't simplify — chain rule yields (* (cos y) 0)
-    (is (= '(* (cos y) 0) (diff '(sin y) 'x))))
+  (testing "a variable-independent symbolic subtree is constant before applying chain rules"
+    (is (= 0 (diff '(sin y) 'x))))
 
   (testing "d/dy of x^2 = 0"
-    (is (= '(* (* 2 (pow x (- 2 1))) 0) (diff '(pow x 2) 'y)))))
+    (is (= 0 (diff '(pow x 2) 'y)))))
 
 ;; ================================================================
 ;; sym_diff.clj — Higher-order differentiation

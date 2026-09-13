@@ -8,6 +8,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
@@ -36,11 +37,22 @@
         {column :name width :bound} (segop/seg-space-reduced-dim (:space segred))
         types (mapv :dtype (:components operator))
         index-types (assoc scalar-types row :int column :long)
+        width-type (launch/typed-expression-dtype width scalar-types)
+        width-range (if (integer? width)
+                      (scalar-range/literal width width-type)
+                      (scalar-range/for-dtype width-type))
+        ;; The element executes only at entries of `column = product-lane; column < width;
+        ;; column += workgroup-size`. This owner proof is intentionally absent for a full-width
+        ;; long bound: the exiting increment may wrap and a checked `(int column)` may really trap.
+        column-range (scalar-range/exclusive-positive-loop-entry-range
+                      (scalar-range/for-dtype :int) width-range
+                      (get-in segred [:schedule :workgroup-size]) :long)
         lower-index (fn [expression locals]
                       (index/lower-typed expression (set/union (set (keys index-types)) locals)
                                          index-types :long decline!))
         lowerer (scalar/make-lowerer
-                 {:arrays (set (:inputs segred)) :array-types array-types :scalar-types scalar-types
+                 {:arrays (set (:inputs segred)) :array-types array-types :scalar-types index-types
+                  :scalar-ranges (cond-> {} column-range (assoc column column-range))
                   :lower-index lower-index :id-prefix "product" :decline! decline!})
         element-region (reduction/element-region operator)
         combine-region (reduction/combine-region operator)
