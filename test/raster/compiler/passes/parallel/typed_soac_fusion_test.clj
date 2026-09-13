@@ -458,6 +458,45 @@
      {:dtype :float :array-types '{A :float B :float C :float}
       :scalar-types '{m :long n :long k :long size :long}})))
 
+(defn- dynamic-aliased-result-map-program
+  [read-value]
+  (frontend/form->program
+   (list 'let*
+         ['size (with-meta '(clojure.core/* m n) {:raster.type/tag 'long})
+          'product '(raster.par/contract C [[i m] [j n]] [[p k]]
+                      (* (clojure.core/aget A (+ (* i k) p))
+                         (clojure.core/aget B (+ (* p n) j))))
+          'map-step (list 'raster.par/map! 'C 't 'size nil
+                          (list 'max '(float 0.0)
+                                (list 'clojure.core/aget read-value 't)))]
+         'map-step)
+   {:dtype :float
+    ;; The production walker retains the local contraction binding's array element type. State
+    ;; that same source fact explicitly in this raw frontend fixture; it is type evidence only,
+    ;; not alias evidence.
+    :array-types '{A :float B :float C :float product :float unattested :float}
+    :scalar-types '{m :long n :long k :long size :long}}))
+
+(deftest result-map-fusion-accepts-only-the-producers-attested-host-binding
+  (let [program (dynamic-aliased-result-map-program 'product)
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equations (dialect/equations result)
+        equation (second equations)
+        operation (dialect/operation-parts equation)]
+    (is (= 1 (:vertical stats)))
+    (is (= 2 (count equations))
+        "the checked size equation remains and the product map becomes the contraction epilogue")
+    (is (= 'C (get-in (dialect/facts result)
+                      [:equations (second equation) :attributes :result-storage 0 :destination])))
+    (is (empty? (get-in operation [:attributes :result-transform :operands])))
+    (is (= result (dialect/validate! result))))
+  (let [program (dynamic-aliased-result-map-program 'unattested)
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (zero? (:vertical stats)))
+    (is (= program result))
+    (is (= 3 (count (dialect/equations result)))
+        "an unrelated same-typed array is not inferred to alias the producer destination")))
+
 (deftest dominating-typed-product-proves-dynamic-result-fusion
   (doseq [product ['(clojure.core/* m n) '(clojure.core/* n m)]]
     (let [expression (with-meta product {:raster.type/tag 'long})

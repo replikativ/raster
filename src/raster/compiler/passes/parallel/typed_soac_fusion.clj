@@ -691,7 +691,7 @@
    Pointwise arrays become full-segment operands. Stable captures retain only an axis map proven
    from their flat map index. Uniform captures become typed scalars. Any ambiguous array read
   declines the candidate rather than guessing an address."
-  [program preceding-infos producer consumer consumed-destination]
+  [program preceding-infos producer consumer consumed-value]
   (let [segment-axes (get-in producer [:attributes :segment-axes])
         output-map (axis-map/of-axes segment-axes)
         output-extent (axis-map/n-elements output-map)
@@ -708,7 +708,7 @@
         captures (:captures consumer)
         capture-parameters (:capture-parameters consumer-parameters)
         stable-values (stable-array-captures consumer)
-        consumed-indices (keep-indexed #(when (= %2 consumed-destination) %1) arrays)
+        consumed-indices (keep-indexed #(when (= %2 consumed-value) %1) arrays)
         consumed-index (first consumed-indices)
         expression (first (:body-results consumer))
         reads (descriptor/aget-reads expression)
@@ -787,13 +787,26 @@
                  consumed-destination
                  (get-in facts [:equations (:id producer)
                                 :attributes :result-storage 0 :destination])
+                 ;; A source binding of an in-place reduction denotes the buffer it returned even
+                 ;; though TypedSOAC keeps logical result identity separate from physical storage.
+                 ;; Only that equation-owned host binding is an admissible alternate spelling;
+                 ;; equal dtype or shape is never alias evidence.
+                 producer-host-binding
+                 (get-in facts [:equations (:id producer) :attributes :host-binding])
+                 attested-consumed-values
+                 (cond-> #{consumed-destination}
+                   (symbol? producer-host-binding) (conj producer-host-binding))
+                 consumed-values
+                 (vec (filter attested-consumed-values (:arrays consumer)))
+                 consumed-value (when (= 1 (count consumed-values))
+                                  (first consumed-values))
                  consumer-result (first (:results consumer))
                  consumer-destination
                  (get-in facts [:equations (:id consumer)
                                 :attributes :result-storage 0 :destination])
-                 transform (when (and consumed-destination consumer-destination)
+                 transform (when (and consumed-destination consumed-value consumer-destination)
                              (result-map-transform program (subvec infos 0 producer-index) producer consumer
-                                                   consumed-destination))]
+                                                   consumed-value))]
            :when (= 1 (count (:results producer)) (count (:body-results producer))
                     (count (:results consumer)) (count (:body-results consumer)))
            :when (= 1 (count (get-in producer [:attributes :accumulators])))
@@ -801,19 +814,20 @@
            :when (= (first (get-in producer [:attributes :dtypes]))
                     (value-scalar-dtype program consumer-result))
            :when (empty? (:locals consumer))
-           :when (= 1 (get uses consumed-destination 0))
+           :when (= 1 (get uses consumed-value 0))
            :when (zero? (get uses produced 0))
            :when (not (contains? (set (dialect/outputs program)) produced))
            :when (not (contains? (set (dialect/outputs program)) consumed-destination))
-           :when (= 1 (count (filter #(= consumed-destination %)
-                                     (:arrays consumer))))
+           :when (not (contains? (set (dialect/outputs program)) consumed-value))
+           :when (= 1 (count (filter #(= consumed-value %) (:arrays consumer))))
            :when (single-write-boundary? facts (:id producer) produced consumed-destination :write)
            :when (single-write-boundary? facts (:id consumer) consumer-result
                                          consumer-destination
-                                         (if (= consumed-destination consumer-destination)
+                                         (if (and (= consumed-destination consumer-destination)
+                                                  (= consumed-value consumed-destination))
                                            :read-write :write))
            :when (empty? (set/intersection
-                          (set [consumed-destination consumer-destination])
+                          (set [consumed-value consumed-destination consumer-destination])
                           (set (map :value (:operands transform)))))
            :when (host-barrier-free? program producer consumer)
            :when transform]
