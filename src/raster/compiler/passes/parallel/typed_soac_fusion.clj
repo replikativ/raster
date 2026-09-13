@@ -15,7 +15,8 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.index-expression :as index-expression]
-            [raster.compiler.passes.parallel.fusion-placement :as placement]))
+            [raster.compiler.passes.parallel.fusion-placement :as placement]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (def ^:private map-equation-rule
   (from-dialect dialect/TypedSOAC
@@ -884,6 +885,22 @@
            :consumers consumer-ids
            :externally-visible? (contains? (set (dialect/outputs program)) produced))))
 
+(defn- contains-trapping-scalar-convert?
+  [expression]
+  (boolean
+   (some (fn [form]
+           (and (dialect/scalar-convert-form? form)
+                (= :trap (get-in (dialect/scalar-convert-parts form)
+                                 [:attributes :overflow]))))
+         (tree-seq coll? seq expression))))
+
+(defn- exceptional-conversion-region?
+  [{:keys [locals body-results]}]
+  (let [expressions (concat (map :init locals) body-results)]
+    (or (contains-trapping-scalar-convert? expressions)
+        (some #(contains? (:flags (effects/descriptor %)) :checked-source-cast)
+              expressions))))
+
 (defn- vertical-candidates
   [program abstract-machine]
   (let [equations (dialect/equations program)
@@ -899,6 +916,9 @@
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
            :when (contains? #{:map :reduce :scan} (:kind consumer))
+           ;; Per-lane fusion would interleave a trapping producer with later caller-visible
+           ;; consumer writes. Preserve the materialized equation-completion boundary.
+           :when (not (exceptional-conversion-region? producer))
            ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
            ;; therefore compose vertically into another map; reduction and scan consumers remain
            ;; local-free until their regions admit typed locals.
@@ -997,7 +1017,8 @@
                                   ((if (= :scan (:kind updated))
                                      scan/certify
                                      scan/certify-reassociation)
-                                   {:acc accumulator :init identity :lambda result}
+                                   {:acc accumulator :init identity
+                                    :lambda (dialect/scalar-converts->source result)}
                                    component-dtype))
                                 accumulators identities dtypes (:body-results updated))]
               (assoc-in updated [:attributes :algebra] algebra))
@@ -1040,6 +1061,10 @@
                  right-uses (set (concat (:arrays right) (:captures right)
                                          [(:extent (:attributes right))]))]
            :when (= :map (:kind left) (:kind right))
+           ;; Horizontal fusion interleaves independent maps lane-by-lane. A trapping conversion
+           ;; on either side therefore retains its source equation-completion boundary.
+           :when (not (or (exceptional-conversion-region? left)
+                          (exceptional-conversion-region? right)))
            :when left-boundary
            :when right-boundary
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))

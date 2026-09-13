@@ -162,6 +162,20 @@
         (let [result (first results)
               result-dtypes (mapv #(:dtype (get values %)) results)
               casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+              projected-source-casts
+              (mapv (fn [body result-dtype]
+                      (when (and (seq? body) (= 2 (count body))
+                                 (descriptor/cast-op? (descriptor/semantic-op body))
+                                 (= result-dtype
+                                    (some-> (descriptor/semantic-op body)
+                                            descriptor/cast-result-tag
+                                            dtype/dtype-for-scalar-tag dtype/canon)))
+                        (descriptor/semantic-op body)))
+                    bodies result-dtypes)
+              casts (mapv #(or %1 %2) projected-source-casts casts)
+              bodies (mapv (fn [body source-cast]
+                             (if source-cast (second body) body))
+                           bodies projected-source-casts)
               ;; A storage-only dtype (`:half` in `short[]`) has no JVM scalar cast; its map
               ;; results are stored bit-exactly, so only dtypes with a scalar need one.
               _ (when (some (fn [[cast dtype]] (and (nil? cast) (not (storage-only-dtype? dtype))))

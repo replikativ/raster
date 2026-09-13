@@ -13,6 +13,7 @@
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (deftest generated-row-major-coordinates-carry-their-domain-type
@@ -881,12 +882,14 @@
                                          (+ (clojure.core/aget x i) 1.0))]
                 out)
          {:dtype :float :array-types {'x :float 'out :float}})
-        equation (first (dialect/equations program))]
+        equation (first (dialect/equations program))
+        body (-> equation dialect/operation-parts :lambda
+                 dialect/lambda-parts :body-results first)]
     (is (= ['out] (dialect/physical-results program equation)))
-    (is (= '[(+ %element0 1.0)]
-           (:body-results (dialect/lambda-parts
-                           (:lambda (dialect/operation-parts equation)))))
-        "the typed result/storage contract does not become a synthetic source cast")
+    (is (dialect/scalar-convert-form? body)
+        "the source map result conversion remains an explicit typed boundary")
+    (is (= '(clojure.core/float (+ %element0 1.0))
+           (projection/scalar-folds->source body)))
     (is (= (vec (nth equation 2)) (dialect/outputs program))
         "a returned destination denotes the fresh logical result, not an undeclared buffer")))
 
@@ -951,6 +954,25 @@
     (is (= 'map (dialect/operation-kind equation)))
     (is (= 'clojure.core/int (first result))
         "the source cast stays in the scalar region; result storage owns no source policy")))
+
+(deftest functional-map-result-casts-become-typed-conversion-terms
+  (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
+    (let [source (list 'let*
+                       ['result (list 'raster.par/map! 'out 'i 'n cast
+                                     '(clojure.core/aget input i))]
+                       'result)
+          program (frontend/form->program
+                   source {:dtype :int :array-types {'input :long 'out :int}
+                           :scalar-types {'n :long}})
+          expression (-> program dialect/equations first dialect/operation-parts :lambda
+                         dialect/lambda-parts :body-results first)
+          {:keys [attributes operand]} (dialect/scalar-convert-parts expression)]
+      (is (= 'raster.compiler.ir.soac-dialect/scalar-convert (first expression)))
+      (is (= {:source-dtype :long :target-dtype :int
+              :rounding :exact :overflow overflow
+              :source-op (symbol "clojure.core" (name cast))}
+             attributes))
+      (is (= '%element0 operand)))))
 
 (deftest closed-core-integer-case-becomes-a-typed-conditional-map
   (let [expression

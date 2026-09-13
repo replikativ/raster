@@ -79,6 +79,7 @@
              :refer [def-dialect]]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -483,6 +484,22 @@
        (map? (:provenance value))
        (map? (:attributes value))))
 
+(defn scalar-convert-attributes?
+  [attributes]
+  (let [{:keys [source-dtype target-dtype rounding overflow source-op]} attributes
+        narrowing (descriptor/cast-integral-narrowing source-op)
+        requested (case narrowing :reject :trap :wrap :wrap nil)]
+    (and (map? attributes)
+         (= #{:source-dtype :target-dtype :rounding :overflow :source-op}
+            (set (keys attributes)))
+         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
+                 [source-dtype target-dtype])
+         (descriptor/cast-op? source-op)
+         (= target-dtype
+            (some-> source-op descriptor/cast-result-tag dtype/dtype-for-scalar-tag dtype/canon))
+         (= (scalar-conversion/policy source-dtype target-dtype requested)
+            [rounding overflow]))))
+
 (def-dialect TypedSOAC
   (terminals [id value-id?]
              [eid equation-id?]
@@ -502,6 +519,7 @@
              [fa fold-attributes?]
              [sfma segmented-fold-map-attributes?]
              [ca scan-attributes?]
+             [sca scalar-convert-attributes?]
              [dt keyword?]
              [facts program-facts?])
 
@@ -511,6 +529,7 @@
           (if ?s:test ?s:then ?s:else)
           (do (?:+ s))
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
+          (raster.compiler.ir.soac-dialect/scalar-convert ?sca ?s:operand)
           (write ?s:destination-index ?s:predicate ?s:value)
           [(?:* s)]
           (.invk ?sym:impl (?:* s:args))
@@ -885,6 +904,41 @@
     (let [[_ attributes lambda] value]
       {:attributes attributes :lambda lambda})))
 
+(defn scalar-convert-form?
+  "True for a typed source conversion embedded in a scalar region."
+  [value]
+  (and (seq? value)
+       (= 'raster.compiler.ir.soac-dialect/scalar-convert (first value))
+       (= 3 (count value))))
+
+(defn scalar-convert-parts
+  "Project a typed scalar conversion without recovering policy from source syntax."
+  [value]
+  (when (scalar-convert-form? value)
+    (let [[_ attributes operand] value]
+      {:attributes attributes :operand operand})))
+
+(defn scalar-convert
+  "Construct a typed scalar conversion term whose policy was resolved from source facts."
+  [attributes operand]
+  (let [target-tag (dtype/scalar-tag-for-dtype (:target-dtype attributes))]
+    (with-meta (list 'raster.compiler.ir.soac-dialect/scalar-convert attributes operand)
+      {:tag target-tag :raster.type/tag target-tag})))
+
+(defn scalar-converts->source
+  "Project canonical scalar conversions to their descriptor-owned source operations.
+
+   Algebra certification uses the shared scalar vocabulary; the typed region itself retains the
+   conversion term and its explicit policy."
+  [expression]
+  (util/postwalk-preserving-meta
+   (fn [form]
+     (if (scalar-convert-form? form)
+       (let [{:keys [attributes operand]} (scalar-convert-parts form)]
+         (with-meta (list (:source-op attributes) operand) (meta form)))
+       form))
+   expression))
+
 (defn- validate-scalar-fold-scopes!
   "Validate nested scalar Folds with their actual lexical environments. A flat tree walk loses
    the outer Fold parameters and ordered local spine, which would either reject valid nested
@@ -892,6 +946,14 @@
   [expression initial-bound equation-id]
   (letfn [(walk-expression! [expression bound]
             (cond
+              (scalar-convert-form? expression)
+              (let [{:keys [attributes operand]} (scalar-convert-parts expression)]
+                (when-not (scalar-convert-attributes? attributes)
+                  (fail! :typed-soac-scalar-convert
+                         "scalar conversion requires one descriptor-derived typed policy"
+                         {:equation equation-id :expression expression}))
+                (walk-expression! operand bound))
+
               (scalar-fold-form? expression)
               (let [{:keys [attributes lambda]} (scalar-fold-parts expression)
                     {parameters :parameters locals :locals results :body-results}
@@ -1375,7 +1437,8 @@
                 (map vector accumulators (:identities attributes) (:dtypes attributes)
                      (:algebra attributes) body-results)]
           (let [derived (scan-ir/certify-reassociation
-                         {:acc accumulator :init identity :lambda result} dtype)]
+                         {:acc accumulator :init identity
+                          :lambda (scalar-converts->source result)} dtype)]
             (when-not (scan-ir/compatible-certificate? certificate derived)
               (fail! :typed-soac-reduction-certificate
                      "reduction algebra certificate disagrees with its scalar region"
@@ -1419,7 +1482,8 @@
                 (map vector accumulators (:identities attributes) (:dtypes attributes)
                      (:algebra attributes) body-results)]
           (let [derived (scan-ir/certify-reassociation
-                         {:acc accumulator :init identity :lambda result} dtype)]
+                         {:acc accumulator :init identity
+                          :lambda (scalar-converts->source result)} dtype)]
             (when-not (scan-ir/compatible-certificate? certificate derived)
               (fail! :typed-soac-reduction-certificate
                      "segmented-reduction algebra certificate disagrees with its scalar region"
@@ -1605,7 +1669,9 @@
         (doseq [[accumulator identity dtype certificate result]
                 (map vector accumulators (:identities attributes) (:dtypes attributes)
                      (:algebra attributes) body-results)]
-          (let [derived (scan-ir/certify {:acc accumulator :init identity :lambda result} dtype)]
+          (let [derived (scan-ir/certify
+                         {:acc accumulator :init identity
+                          :lambda (scalar-converts->source result)} dtype)]
             (when-not (= certificate derived)
               (fail! :typed-soac-scan-certificate
                      "scan algebra certificate disagrees with its scalar region"

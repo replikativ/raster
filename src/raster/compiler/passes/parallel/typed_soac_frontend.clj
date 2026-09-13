@@ -8,6 +8,7 @@
    fusion or scheduling sees it."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -157,6 +158,63 @@
     (if (and then-tag (= then-tag else-tag))
       (with-meta form {:tag then-tag :raster.type/tag then-tag})
       form)))
+
+(defn- retained-expression-dtype
+  "The source dtype owned by an expression before a result consumer conversion."
+  [expression array-types scalar-types]
+  (or (some-> (retained-expression-tag expression) dtype/dtype-for-scalar-tag dtype/canon)
+      (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
+      (when (descriptor/aget-call? expression)
+        (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; Raw compatibility fixtures may lack walker metadata. Reuse the compiler's established
+      ;; expression typer with explicit scalar/array facts; never borrow the result target.
+      (let [inference-expression
+            (util/postwalk-preserving-meta
+             (fn [form]
+               (if (and (seq? form) (symbol? (first form))
+                        (nil? (namespace (first form)))
+                        (not (contains? util/*shadowing-locals* (first form)))
+                        (descriptor/scalar-op?
+                         (symbol "clojure.core" (name (first form)))))
+                 (with-meta (apply list (symbol "clojure.core" (name (first form))) (rest form))
+                   (meta form))
+                 form))
+             expression)
+            type-env (merge
+                      (into {} (keep (fn [[id t]]
+                                       (when (and (keyword? t) (dtype/known? t))
+                                         [id {:tag (:scalar-tag (dtype/info (dtype/canon t)))}])))
+                            scalar-types)
+                      (into {} (keep (fn [[id t]]
+                                       (when (and (keyword? t) (dtype/known? t))
+                                         (let [facets (dtype/info (dtype/canon t))]
+                                           [id {:tag (:array-tag facets)
+                                                :element (:scalar-tag facets)}]))))
+                            array-types))]
+        (some-> (inference/infer-expr-tag inference-expression type-env *ns*)
+                dtype/dtype-for-scalar-tag dtype/canon))))
+
+(defn- typed-source-conversion
+  [cast expression source-dtype target-dtype]
+  (when cast
+    (let [source-dtype (some-> source-dtype dtype/canon)
+          target-dtype (some-> target-dtype dtype/canon)
+          source-op (descriptor/semantic-op (list cast expression))
+          source-op (when source-op (symbol "clojure.core" (name source-op)))
+          narrowing (descriptor/cast-integral-narrowing source-op)
+          requested (case narrowing :reject :trap :wrap :wrap nil)
+          policy (when (and source-dtype target-dtype requested)
+                   (scalar-conversion/policy source-dtype target-dtype requested))]
+      (when (and policy
+                 (= target-dtype
+                    (some-> source-op descriptor/cast-result-tag
+                            dtype/dtype-for-scalar-tag dtype/canon)))
+        ;; The surface map cast is a materialization boundary even when its declared source and
+        ;; target dtypes agree: Float arithmetic may otherwise stay widened after fusion.
+        (dialect/scalar-convert
+         {:source-dtype source-dtype :target-dtype target-dtype
+          :rounding (first policy) :overflow (second policy) :source-op source-op}
+         expression)))))
 
 (defn- typed-region-locals
   "Translate a flat source binding vector into explicit typed lexical SSA.
@@ -770,8 +828,10 @@
   (let [typed-references
         (into {}
               (keep (fn [[id scalar-dtype]]
-                      (when (and (symbol? id) scalar-dtype)
-                        (let [tag (dtype/scalar-tag-for-dtype scalar-dtype)]
+                      (when (and (symbol? id) (keyword? scalar-dtype)
+                                 (dtype/known? scalar-dtype)
+                                 (:scalar-tag (dtype/info (dtype/canon scalar-dtype))))
+                        (let [tag (:scalar-tag (dtype/info (dtype/canon scalar-dtype)))]
                           [id (with-meta id (assoc (meta id)
                                                   :tag tag :raster.type/tag tag))]))))
               scalar-types)]
@@ -1264,11 +1324,14 @@
                                      (dtype/dtype-for-scalar-tag cast)
                                      default-dtype))
           io (extract-io body idx [symbol])
-          region (typed-map-region body)]
+          region (typed-map-region body)
+          region-types (into scalar-types (map (juxt :id :dtype)) (:locals region))]
       (when region
         (merge {:kind :map :id id :sym symbol :results [symbol]
                 :index idx :extent bound :locals (:locals region)
                 :casts [cast] :bodies [(:body region)]
+                :body-dtypes [(retained-expression-dtype (:body region)
+                                                         array-types region-types)]
                 :pure? true :elem-type elem-type}
                io)))
 
@@ -1285,7 +1348,8 @@
                                      default-dtype))
           write-index (when offset (list 'clojure.core/+ offset idx))
           io (extract-io (if offset (list 'do write-index body) body) idx [out])
-          region (typed-map-region body)]
+          region (typed-map-region body)
+          region-types (into scalar-types (map (juxt :id :dtype)) (:locals region))]
       ;; A binder with the same spelling as the caller-owned destination needs distinct value/view
       ;; identity before it can be SSA. Every other offset map is an injective partial write:
       ;; destination[base+i] is a typed unique scatter, not a map carrying an emitter-only offset.
@@ -1295,6 +1359,8 @@
           (merge {:kind :scatter :id id :sym symbol :results [symbol]
                   :index idx :extent bound :locals (:locals region)
                   :casts [cast] :bodies [(:body region)]
+                  :body-dtypes [(retained-expression-dtype (:body region)
+                                                           array-types region-types)]
                   :write-indices [write-index] :predicates [1] :conflict :unique
                   :result-storage [{:destination out :access :read-write
                                     :host-return :buffer}]
@@ -1304,6 +1370,8 @@
           (merge {:kind :map :id id :sym symbol :results [symbol]
                   :index idx :extent bound :locals (:locals region)
                   :casts [cast] :bodies [(:body region)]
+                  :body-dtypes [(retained-expression-dtype (:body region)
+                                                           array-types region-types)]
                   :result-storage [{:destination out
                                     :access (if (contains? (:inputs io) out) :read-write :write)
                                     :host-return :buffer}]
@@ -2189,7 +2257,13 @@
                     array-tag (or (get descriptor/alloc-sym->array-tag operation)
                                   (get descriptor/alloc-sym->array-tag
                                        (some-> operation name symbol)))]
-                (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))]
+                (some-> array-tag dtype/dtype-for-array-tag dtype/canon)))
+            logical-array-dtype
+            ;; A functional map result is a typed array value available to later source
+            ;; descriptions. This is the map's declared element contract, not a consumer guess;
+            ;; a resident map binding may name a different caller-owned physical destination.
+            (when (contains? #{:map :scatter} (:kind description))
+              (some-> (:elem-type description) dtype/canon))]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
               (and (not (effects/removable-expr? expression))
@@ -2197,6 +2271,7 @@
           (assoc :stageable-prefix? false)
           scalar-dtype (assoc-in [:local-scalar-types symbol] scalar-dtype)
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
+          logical-array-dtype (assoc-in [:array-types symbol] logical-array-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
     {:descriptions [] :array-types array-types :scalar-definitions {}
      :local-scalar-types scalar-types :stageable-prefix? true}
@@ -2311,9 +2386,18 @@
                           (or (effects/removable-expr? (:expr description))
                               (:source-prefix? description)))
                      (generated-scaffolding? description physical-outputs)))
-    :map (or (:pure? description)
-             (and (seq (:result-storage description))
-                  (every? (comp symbol? :destination) (:result-storage description))))
+    :map (let [target-dtype (or (:elem-type description)
+                                (:result-dtype description) :double)]
+           (and (every? (fn [[cast body source-dtype]]
+                          (or (nil? cast)
+                              (some? (typed-source-conversion
+                                      cast body source-dtype target-dtype))))
+                        (map vector (:casts description) (:bodies description)
+                             (:body-dtypes description)))
+                (or (:pure? description)
+                    (and (seq (:result-storage description))
+                         (every? (comp symbol? :destination)
+                                 (:result-storage description))))))
     :scatter (and (seq (:result-storage description))
                   (or (= :unique (:conflict description))
                       (dialect/reducing-scatter-conflict? (:conflict description)))
@@ -2538,12 +2622,17 @@
 
 (defn- map-equation
   [description]
-  (let [{:keys [id index extent locals bodies inputs results elem-type]} description
+  (let [{:keys [id index extent locals casts bodies body-dtypes inputs results elem-type]} description
         fold-dtype (or elem-type (:result-dtype description) :double)
+        body-dtypes (or body-dtypes (repeat (count bodies) nil))
         ;; The map result dtype is already an explicit TypedSOAC/storage contract. Keep it out of
         ;; the scalar expression tree so it cannot masquerade as a user source cast. Casts written
         ;; inside `body` remain intact and retain their checked/unchecked source semantics.
-        expressions (vec bodies)
+        expressions (mapv (fn [cast body source-dtype]
+                            (if cast
+                              (typed-source-conversion cast body source-dtype fold-dtype)
+                              body))
+                          casts bodies body-dtypes)
         all-expressions (into (mapv :init locals) expressions)
         [pointwise stable] ((juxt filter remove)
                             #(and (not (contains? (:storage-inputs description) %))

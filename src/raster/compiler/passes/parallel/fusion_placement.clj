@@ -6,7 +6,8 @@
    its consumers, or should its intermediate stay materialized?  It reads only Raster's Abstract
    Machine and typed scalar expressions; vendor/device identities never cross this boundary."
   (:require [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.core.op-descriptor :as descriptor]))
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.soac-dialect :as dialect]))
 
 (def policy-version
   "Stable identifier recorded with every placement witness."
@@ -28,13 +29,19 @@
         unknown (volatile! #{})]
     (letfn [(visit [form]
               (when (seq? form)
-                (when-let [operation (descriptor/semantic-op form)]
-                  (if-let [cost (descriptor/cost-facet operation)]
-                    (vswap! total + (long (:flops cost 0)))
-                    (when-not (or (descriptor/aget-op? operation)
-                                  (descriptor/cast-op? operation))
-                      (vswap! unknown conj operation))))
-                (run! visit form)))]
+                (if (dialect/scalar-convert-form? form)
+                  ;; Conversion policy is explicit in TypedSOAC. Like a source primitive cast it
+                  ;; adds no registered floating-point work; visit only its scalar operand, not
+                  ;; the attribute map or canonical term head.
+                  (visit (:operand (dialect/scalar-convert-parts form)))
+                  (do
+                    (when-let [operation (descriptor/semantic-op form)]
+                      (if-let [cost (descriptor/cost-facet operation)]
+                        (vswap! total + (long (:flops cost 0)))
+                        (when-not (or (descriptor/aget-op? operation)
+                                      (descriptor/cast-op? operation))
+                          (vswap! unknown conj operation))))
+                    (run! visit form)))))]
       (run! visit expressions))
     {:flops @total
      :complete? (empty? @unknown)

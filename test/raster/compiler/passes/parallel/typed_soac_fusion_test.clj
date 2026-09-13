@@ -4,7 +4,8 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
-            [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]))
+            [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
 (def ^:private map-map-source
   '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
@@ -31,10 +32,73 @@
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
     (is (= 1 (count (dialect/equations typed-result))))
     (is (= 'map (:kind operation)))
-    (is (= '[(float (+ (float (* %element0 %element0)) 1.0))]
-           (:body-results (dialect/lambda-parts (:lambda operation)))))
+    (is (= '[(clojure.core/float
+              (+ (clojure.core/float (* %element0 %element0)) 1.0))]
+           (mapv projection/scalar-folds->source
+                 (:body-results (dialect/lambda-parts (:lambda operation))))))
     (is (= '[n x] (:inputs (dialect/facts typed-result))))
     (is (not (contains? (:values (dialect/facts typed-result)) 'y)))))
+
+(deftest vertical-fusion-preserves-a-checked-producer-completion-boundary
+  (let [source '(let* [y (raster.par/map! tmp i n int (clojure.core/aget input i))
+                       z (raster.par/map! out j n int (clojure.core/aget y j))]
+                      z)
+        program (frontend/form->program
+                 source {:dtype :int
+                         :array-types {'input :long 'tmp :int 'out :int}
+                         :scalar-types {'n :long}})
+        [fused stats] (typed-fusion/fusion-fixpoint program)
+        conversions (filter dialect/scalar-convert-form?
+                            (tree-seq coll? seq (dialect/equations fused)))]
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= 2 (count (dialect/equations fused))))
+    (is (= 1 (count (filter #(= :trap
+                                (get-in (dialect/scalar-convert-parts %)
+                                        [:attributes :overflow]))
+                           conversions)))
+        "the producer check remains in its materialized equation")))
+
+(deftest horizontal-fusion-preserves-checked-map-completion-order
+  (let [source '(let* [u (raster.par/map! left i n int
+                                           (clojure.core/aget long-input i))
+                       v (raster.par/map! right j n int 1)]
+                      [u v])
+        program (frontend/form->program
+                 source {:dtype :int
+                         :array-types {'long-input :long 'left :int 'right :int}
+                         :scalar-types {'n :long}})
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        execute (eval (list 'fn '[long-input left right n] source))
+        long-input (long-array [(inc (long Integer/MAX_VALUE))])
+        left (int-array [17])
+        right (int-array [23])]
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= 2 (count (dialect/equations result))))
+    (is (try (execute long-input left right 1) false
+             (catch ArithmeticException _ true)))
+    (is (= [17] (vec left)))
+    (is (= [23] (vec right))
+        "the later independent destination is unchanged when the first map conversion traps")))
+
+(deftest fused-float-map-retains-its-materialization-rounding
+  (let [source '(let* [y (raster.par/pmap i n float
+                                           (* (clojure.core/aget x i)
+                                              (clojure.core/aget x i)))
+                       z (raster.par/pmap j n float
+                                           (+ (clojure.core/aget y j) -16785408.0))]
+                      z)
+        program (frontend/form->program source {:dtype :float
+                                                :array-types {'x :float}
+                                                :scalar-types {'n :long}})
+        [fused stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations fused))
+        {:keys [lambda]} (dialect/operation-parts equation)
+        {:keys [parameters body-results]} (dialect/lambda-parts lambda)
+        projected (projection/scalar-folds->source (first body-results))
+        execute (eval (list 'fn [(first parameters)] projected))]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (zero? (double (execute (float 4097.0))))
+        "the producer float cast rounds 16785409 to 16785408 before consumer arithmetic")))
 
 (deftest map-reduce-fusion-has-the-certified-functional-result
   (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
@@ -104,8 +168,9 @@
     (is (= {:vertical 0 :horizontal 1 :iterations 2} typed-stats))
     (is (= '[u v] (nth equation 2)))
     (is (= '[%element0 %element1] (second lambda)))
-    (is (= '[(float (* %element0 2.0)) (float (+ %element1 1.0))]
-           (:body-results region)))))
+    (is (= '[(clojure.core/float (* %element0 2.0))
+             (clojure.core/float (+ %element1 1.0))]
+           (mapv projection/scalar-folds->source (:body-results region))))))
 
 (deftest captured-map-fusion-has-the-certified-functional-result
   (let [source '(let* [y (raster.par/pmap i n float (* (aget x i) scale))
@@ -121,8 +186,9 @@
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
     (is (= '[bias scale] (nth operation 3)))
     (is (= '[%element0 %capture0 %capture1] (second lambda)))
-    (is (= '[(float (+ (float (* %element0 %capture1)) %capture0))]
-           (:body-results region)))))
+    (is (= '[(clojure.core/float
+              (+ (clojure.core/float (* %element0 %capture1)) %capture0))]
+           (mapv projection/scalar-folds->source (:body-results region))))))
 
 (deftest typed-multi-consumer-placement-is-hardware-costed
   (let [source '(let* [a (raster.par/pmap i n float
@@ -157,11 +223,17 @@
                       sum)
         program (source-program source {'x :float})
         [fused _] (typed-fusion/fusion-fixpoint program)
-        reconstructed (dialect/equations fused)]
+        reconstructed (dialect/equations fused)
+        conversions (filter dialect/scalar-convert-form?
+                            (tree-seq coll? seq reconstructed))]
     (is (not-any? #{'tmp} (flatten reconstructed))
         "the eliminated map result cannot survive in ProductReduction")
-    (is (some #{'float} (flatten reconstructed))
-        "the materialized map cast is part of the inlined value semantics")))
+    (is (some #(= {:source-dtype :double :target-dtype :float
+                   :rounding :nearest-even :overflow :ieee
+                   :source-op 'clojure.core/float}
+                  (:attributes (dialect/scalar-convert-parts %)))
+              conversions)
+        "the materialized map conversion is part of the inlined value semantics")))
 
 (deftest scalar-bound-dense-result-fuses-with-its-elementwise-consumer
   (let [source '(let* [rows (clojure.core/alength b)
@@ -264,11 +336,11 @@
     (is (= 1 (count (dialect/equations result))))
     (is (= [{:id 'rstr_producer_local_0
              :dtype :float
-             :init '(float (* %element0 %element0))}
+             :init '(clojure.core/float (* %element0 %element0))}
             {:id 'rstr_consumer_local_0
              :dtype :float
-             :init '(float (+ rstr_producer_local_0 1.0))}]
-           locals))
+             :init '(clojure.core/float (+ rstr_producer_local_0 1.0))}]
+           (mapv #(update % :init projection/scalar-folds->source) locals)))
     (is (= '[rstr_consumer_local_0] body-results))
     (is (= result (dialect/validate! result)))))
 
@@ -294,8 +366,9 @@
         (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
     (is (= {:vertical 0 :horizontal 1 :iterations 2} stats))
     (is (= ['rstr_left_local_0 'rstr_right_local_0] (mapv :id locals)))
-    (is (= '[(float (* %element0 2.0)) (float (+ %element1 1.0))]
-           (mapv :init locals)))
+    (is (= '[(clojure.core/float (* %element0 2.0))
+             (clojure.core/float (+ %element1 1.0))]
+           (mapv (comp projection/scalar-folds->source :init) locals)))
     (is (= '[rstr_left_local_0 rstr_right_local_0] body-results))
     (is (= result (dialect/validate! result)))))
 

@@ -6,6 +6,7 @@
    this pass performs no source-level type or function inference."
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -131,6 +132,80 @@
                 (dialect/scalar-fold-form? expression)
                 (some-> expression dialect/scalar-fold-parts :attributes :dtype canon-type)
 
+                (dialect/scalar-convert-form? expression)
+                (some-> expression dialect/scalar-convert-parts
+                        :attributes :target-dtype canon-type)
+
+                ;; The canonical ordered-loop matcher supplies the only source loop shape this
+                ;; lowerer accepts. Prove its carry from the initializer, then type the update in
+                ;; the lexical accumulator/index scope and require an invariant dtype before the
+                ;; exit can establish the loop result. No arbitrary loop inference is admitted.
+                (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
+                (when-let [{:keys [acc-sym acc-init index-sym update-expr else-expr]}
+                           (match-ordered-loop expression)]
+                  (when-let [initial-type (authoritative-source-type acc-init env)]
+                    (let [loop-env (assoc env index-sym :long acc-sym (canon-type initial-type))
+                          update-type (authoritative-source-type update-expr loop-env)]
+                      (when (and update-type
+                                 (= (canon-type initial-type) (canon-type update-type)))
+                        (if (= else-expr acc-sym)
+                          (canon-type initial-type)
+                          (authoritative-source-type else-expr loop-env))))))
+
+                ;; A lexical result is authoritative when every preceding binder obtains its
+                ;; dtype from its own annotation or initializer and the final expression can be
+                ;; typed in that extended environment. This is a type-only ordered walk: it must
+                ;; not call `lower-let`, evaluate an initializer, or duplicate emitted effects.
+                (and (seq? expression)
+                     (contains? #{'let 'let* 'clojure.core/let} (first expression)))
+                (let [[_ bindings & body-expressions] expression]
+                  (when (and (vector? bindings) (even? (count bindings))
+                             (= 1 (count body-expressions)))
+                    (when-let [extended
+                               (reduce
+                                (fn [environment [id init]]
+                                  (when environment
+                                    (when-let [binding-type
+                                               (or (retained-type id)
+                                                   (authoritative-source-type init environment))]
+                                      (assoc environment id (canon-type binding-type)))))
+                                env (partition 2 bindings))]
+                      (authoritative-source-type (first body-expressions) extended))))
+
+                ;; The shared inference layer owns scalar promotion/result contracts. Invoke it
+                ;; only after every operand has an independent type; its legacy partial-operand
+                ;; fallback must never turn an unknown expression into evidence for a cast.
+                (and (seq? expression)
+                     (let [intrinsic (some-> expression descriptor/semantic-op
+                                              intrinsics/canonical intrinsics/descriptor)]
+                       (and intrinsic (not= :cmp (:kind intrinsic)))))
+                (let [arguments (vec (descriptor/call-args expression))
+                      argument-types (mapv #(authoritative-source-type % env) arguments)]
+                  (when (and (seq arguments) (every? some? argument-types))
+                    (let [source-operation (descriptor/semantic-op expression)
+                          qualified-operation (when (and (symbol? source-operation)
+                                                         (nil? (namespace source-operation)))
+                                                (symbol "clojure.core"
+                                                        (name source-operation)))
+                          inference-operation
+                          (if (and qualified-operation
+                                   (not (contains? util/*shadowing-locals* source-operation))
+                                   (descriptor/scalar-op? qualified-operation))
+                            qualified-operation source-operation)
+                          inference-parameters
+                          (mapv #(symbol (str "%source-operand" %))
+                                (range (count argument-types)))
+                          type-env
+                          (into {}
+                                (map (fn [id type]
+                                       [id {:tag (:scalar-tag (dtype/info
+                                                               (canon-type type)))}])
+                                     inference-parameters argument-types))
+                          inference-expression (apply list inference-operation
+                                                      inference-parameters)]
+                      (some-> (inference/infer-expr-tag inference-expression type-env *ns*)
+                              dtype/dtype-for-scalar-tag canon-type))))
+
                 ;; A value conditional owns a result type when both alternatives independently
                 ;; prove the same type. The enclosing cast target contributes no evidence.
                 (and (seq? expression) (= 'if (first expression)) (= 4 (count expression)))
@@ -173,7 +248,8 @@
                :else (if (and require-source-types? (seq? expression))
                        (decline! :scalar-source-type
                                  "scalar conversion requires the retained source expression dtype"
-                                 {:expression expression :consumer-dtype expected})
+                                 {:expression expression :consumer-dtype expected
+                                  :environment env :scalar-types scalar-types})
                        expected))))]
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
@@ -316,7 +392,9 @@
                     lowered (if lexical-let?
                               (lower-let expression operation-type env)
                               (lower-value expression operation-type env))]
-                (if (not= operation-type expected)
+                ;; Loads and explicit source conversions retain their own result dtype. The
+                ;; consumer boundary must convert that actual result, not the requested hint.
+                (if (not= (:type lowered) expected)
                   (cast-lowered lowered expected expression)
                   lowered)))
 
@@ -390,6 +468,38 @@
                         lowered (lower (second expression) source-expected env)]
                     (cast-lowered lowered target expression
                                   (descriptor/cast-integral-narrowing (first expression))))
+
+                  (dialect/scalar-convert-form? expression)
+                  (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)
+                        {:keys [source-dtype target-dtype rounding overflow]} attributes
+                        _ (when-not (and (dialect/scalar-convert-attributes? attributes)
+                                         (= (canon-type target-dtype) expected))
+                            (decline! :typed-scalar-convert
+                                      "typed scalar conversion must match its consumer dtype"
+                                      {:expression expression :expected expected
+                                       :attributes attributes}))
+                        lowered (lower operand (canon-type source-dtype) env)
+                        _ (when-not (= (canon-type source-dtype) (:type lowered))
+                            (decline! :typed-scalar-convert-source
+                                      "typed scalar conversion operand disagrees with its source dtype"
+                                      {:expression expression :expected source-dtype
+                                       :actual (:type lowered)}))]
+                    (if (= (canon-type source-dtype) (canon-type target-dtype))
+                      lowered
+                      (let [range (when (scalar-range/contained-in-dtype?
+                                         (:range lowered) target-dtype)
+                                    (:range lowered))
+                            overflow (if (and (= :trap overflow) range) :exact overflow)
+                            id (fresh "convert")]
+                        (remember-range! id (or range (scalar-range/for-dtype target-dtype)))
+                        {:operations
+                         (conj (:operations lowered)
+                               (body/->ScalarCompute
+                                (body/value id target-dtype)
+                                (body/cast-expression (:result lowered) target-dtype
+                                                      rounding overflow)))
+                         :result id :type target-dtype
+                         :range (or range (scalar-range/for-dtype target-dtype))})))
 
                   (and (seq? expression)
                        (= 'raster.numeric/oftype (descriptor/semantic-op expression))
@@ -514,8 +624,16 @@
                             ;; the step's own dtype so the exit's cast (e.g. `(double s)`) is an
                             ;; explicit conversion rather than a silent widening of the fold.
                             exit? (not= else-expr acc-sym)
+                            initial-source-type (authoritative-source-type acc-init env)
+                            carry-source-env (cond-> (assoc env index-sym :long)
+                                               initial-source-type
+                                               (assoc acc-sym (canon-type initial-source-type)))
                             carry-type (if exit?
-                                         (canon-type (source-type update-expr expected env))
+                                         (canon-type
+                                          (or (authoritative-source-type
+                                               update-expr carry-source-env)
+                                              (source-type update-expr expected
+                                                           carry-source-env)))
                                          expected)
                             initial (lower acc-init carry-type env)
                             loop-type (:type initial)
