@@ -296,3 +296,49 @@
                           (:strategy range)
                           (reduced strategy)))
                       below ranges)))))))))
+
+(defn admit-alternative
+  "Admit a preferred executable against concrete binding facts, without allocating resources.
+
+   `violations` is a pure preflight callback of one executable returning a vector of maps with
+   keyword :reason values; [] means applicable. It must check all binding-dependent obligations
+   relevant to the caller. Callback exceptions propagate, never masquerading as inapplicability.
+   Only automatic selection may fall back, and only to the declared default. Explicit overrides
+   fail if inapplicable. Returns the executable and the attempted strategies for diagnostics.
+   The callback and binding facts are not stored in the serializable dispatch/selector IR."
+  ([dispatch runtime-arguments violations]
+   (admit-alternative dispatch runtime-arguments nil violations))
+  ([dispatch runtime-arguments override violations]
+   (when-not (ifn? violations)
+     (throw (ex-info "kernel dispatch admission requires a preflight callback"
+                     {:reason :kernel-dispatch-admission-callback})))
+   (let [preferred (select-alternative dispatch runtime-arguments override)
+         explicit? (and override (not= :auto override))
+         check (fn [executable]
+                 (let [result (violations executable)]
+                   (when-not (and (vector? result)
+                                  (every? #(and (map? %) (keyword? (:reason %))) result))
+                     (throw (ex-info "kernel dispatch preflight returned malformed violations"
+                                     {:reason :kernel-dispatch-admission-result
+                                      :id (:id dispatch)
+                                      :strategy (alternative-strategy executable)
+                                      :violations result})))
+                   {:strategy (alternative-strategy executable) :violations result}))
+         first-attempt (check preferred)
+         accept (fn [executable attempts]
+                  {:executable executable :attempts attempts})
+         reject (fn [attempts]
+                  (throw (ex-info "kernel dispatch has no applicable selected alternative"
+                                  {:reason :kernel-dispatch-inapplicable
+                                   :id (:id dispatch) :override override
+                                   :attempts attempts})))]
+     (if (empty? (:violations first-attempt))
+       (accept preferred [first-attempt])
+       (if (or explicit? (= (:strategy first-attempt) (:default-strategy dispatch)))
+         (reject [first-attempt])
+         (let [fallback (default-alternative dispatch)
+               fallback-attempt (check fallback)
+               attempts [first-attempt fallback-attempt]]
+           (if (empty? (:violations fallback-attempt))
+             (accept fallback attempts)
+             (reject attempts))))))))

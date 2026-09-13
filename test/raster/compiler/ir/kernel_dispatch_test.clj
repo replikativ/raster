@@ -71,6 +71,98 @@
                :at-least :subgroup-score-reuse
                :otherwise :reference}}))
 
+(deftest binding-admission-separates-preference-from-applicability
+  (let [arguments [:x :out 512]
+        hazard [{:reason :kernel-graph-writable-alias :left 'x :right 'out}]
+        calls (atom [])
+        preflight (fn [executable]
+                    (swap! calls conj (kexec/strategy executable))
+                    (if (= executable subgroup) hazard []))
+        admission (kdispatch/admit-alternative dispatch arguments preflight)]
+    (is (= reference (:executable admission)))
+    (is (= [:subgroup-score-reuse :reference] @calls))
+    (is (= [{:strategy :subgroup-score-reuse :violations hazard}
+            {:strategy :reference :violations []}]
+           (:attempts admission)))
+    (testing "a cached fixed preference is still subject to admission"
+      (is (= reference
+             (:executable (kdispatch/admit-alternative
+                           (kdispatch/with-selector dispatch
+                             {:kind :fixed-strategy :strategy :subgroup-score-reuse})
+                           arguments :auto preflight)))))
+    (testing "disjoint inputs retain the preferred executable"
+      (is (= subgroup (:executable (kdispatch/admit-alternative
+                                   dispatch arguments (constantly []))))))
+    (testing "an explicit request never silently falls back"
+      (reset! calls [])
+      (let [error (try (kdispatch/admit-alternative dispatch arguments
+                                                   :subgroup-score-reuse preflight)
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :kernel-dispatch-inapplicable (:reason error)))
+        (is (= [:subgroup-score-reuse] @calls))))
+    (testing "a rejected default is checked only once"
+      (let [calls (atom 0)
+            error (try (kdispatch/admit-alternative
+                        dispatch [:x :out 32]
+                        (fn [_] (swap! calls inc) hazard))
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= 1 @calls))
+        (is (= [{:strategy :reference :violations hazard}] (:attempts error)))))
+    (testing "both rejections remain available to diagnostics"
+      (let [error (try (kdispatch/admit-alternative dispatch arguments (constantly hazard))
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= [:subgroup-score-reuse :reference] (mapv :strategy (:attempts error))))
+        (is (= [hazard hazard] (mapv :violations (:attempts error))))))
+    (testing "preflight failures are not treated as a reason to select another kernel"
+      (let [failure (ex-info "broken preflight" {:reason :unexpected})]
+        (is (identical? failure
+                        (try (kdispatch/admit-alternative dispatch arguments
+                                                        (fn [_] (throw failure)))
+                             (catch Exception e e))))))
+    (testing "a malformed preflight cannot accidentally admit a kernel"
+      (doseq [result [nil false {} [nil] [{}] [{:reason "not-a-keyword"}]]]
+        (is (= :kernel-dispatch-admission-result
+               (try (kdispatch/admit-alternative dispatch arguments (constantly result))
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest admission-reuses-abi-alias-contract-authority
+  (let [leaf (assoc-in subgroup [:abi 0 :aliasing] :no-write-alias)
+        strict (kgraph/make
+                {:inputs [(kgraph/buffer 'x :float 'width :device :input)]
+                 :outputs [(kgraph/buffer 'out :float 'width :device :output)]
+                 :temporaries [] :abi abi :arguments '[x out width]
+                 :scalars [(kgraph/scalar 'width :long)]
+                 :nodes [(kgraph/->ScheduledKernel
+                          :compute leaf
+                          [(kgraph/->ValueUse 'x :read) (kgraph/->ValueUse 'out :write)]
+                          #{'width} [])]
+                 :effects (:effects reference)
+                 :attributes {:strategy :subgroup-score-reuse}})
+        choice (assoc dispatch :alternatives [reference strict])
+        admit (fn [arguments override]
+                (kdispatch/admit-alternative
+                 choice arguments override
+                 #(kabi/alias-contract-violations
+                   (if (= % strict) (:abi leaf) (kexec/abi %)) arguments =)))
+        overlapping [:same :same 512]
+        violations (kabi/alias-contract-violations (:abi leaf) overlapping =)]
+    (is (= reference (:executable (admit overlapping :auto))))
+    (is (= strict (:executable (admit [:left :right 512] :auto))))
+    (is (= 1 (count violations)))
+    (is (= :kernel-abi-no-write-alias (:reason (first violations))))
+    (is (= (first violations)
+           (try (kabi/validate-alias-contracts! (:abi leaf) overlapping =)
+                (catch clojure.lang.ExceptionInfo e (ex-data e)))))
+    (is (= violations
+           (try (admit overlapping :subgroup-score-reuse)
+                (catch clojure.lang.ExceptionInfo e
+                  (get-in (ex-data e) [:attempts 0 :violations])))))
+    (testing "all forbidden pairs are reported, rather than just the first"
+      (let [abi [(kabi/slot 'a :input :float :aliasing :no-write-alias)
+                 (kabi/slot 'b :input :float :aliasing :no-write-alias)
+                 (kabi/slot 'c :output :float)]]
+        (is (= 2 (count (kabi/alias-contract-violations abi [:same :same :same] =))))))))
+
 (deftest forced-and-cached-choices-still-enforce-binding-preconditions
   (let [guarded (assoc subgroup :preconditions [{:expression 'width :op :>= :value 256}])
         choice (assoc dispatch :alternatives [reference guarded])
