@@ -21,6 +21,62 @@
                           (view/view allocation {:id :other-name :dtype :float
                                                  :shape [1024]})))))
 
+(deftest physical-range-identity-is-device-scoped-and-empty-views-do-not-overlap
+  (let [base (view/view allocation {:dtype :float :shape [8]})
+        remote (assoc-in base [:allocation :device] :cuda:0)
+        empty (view/view allocation {:dtype :float :byte-offset 8 :shape [0]})]
+    (is (not (view/overlaps? base remote)))
+    (is (not (view/same-range? base remote)))
+    (is (not (view/covered-contiguous? base [remote])))
+    (is (not (view/overlaps? base empty)))
+    (is (not (view/overlaps? empty base)))
+    (is (view/disjoint? base empty))))
+
+(deftest regional-writes-preserve-untouched-initialization
+  (let [base (view/view allocation {:dtype :double :shape [8]})
+        cut (view/view allocation {:dtype :double :byte-offset 16 :shape [2]})
+        remaining (view/subtract-contiguous base cut)]
+    (is (= [[0 16] [32 32]] (mapv (juxt :byte-offset :byte-length) remaining)))
+    (is (every? view/buffer-view? remaining))
+    (is (every? #(= allocation (:allocation %)) remaining))
+    (is (not (view/covered-contiguous? base remaining)))
+    (is (view/covered-contiguous? base (conj remaining cut)))
+    (is (view/covered-contiguous? base (reverse (conj remaining cut))))
+    (is (= [] (view/subtract-contiguous base base)))
+    (is (= [base] (view/subtract-contiguous base (assoc-in cut [:allocation :device] :cuda:0))))
+    (is (= remaining
+           (view/subtract-contiguous base (view/view allocation {:dtype :byte :byte-offset 16 :shape [16]}))))
+    (is (not (view/covered-contiguous? base [(view/view allocation {:dtype :byte :shape [64]})])))
+    (is (view/covered-contiguous? (view/view allocation {:dtype :double :shape [0]}) []))
+    (is (= :buffer-view-region-alignment
+           (:reason (ex-data (try (view/subtract-contiguous base
+                                                           (view/view allocation {:dtype :byte :byte-offset 1 :shape [1]}))
+                                 (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest region-coverage-does-not-hide-layout-or-allocation-conflicts
+  (let [base (view/view allocation {:dtype :float :shape [8]})
+        strided (view/view allocation {:dtype :float :shape [4] :strides [2]})
+        changed (assoc-in base [:allocation :ownership] :borrowed)
+        reason (fn [f] (:reason (ex-data (try (f) (catch clojure.lang.ExceptionInfo e e)))))]
+    (is (= :buffer-view-region-layout (reason #(view/subtract-contiguous base strided))))
+    (is (= :buffer-view-region-layout (reason #(view/covered-contiguous? base [base strided]))))
+    (is (view/covered-contiguous? base [base (assoc strided :byte-offset 128)])
+        "a disjoint strided view supplies no evidence and does not prevent valid coverage")
+    (doseq [covers [[base changed] [changed base]]]
+      (is (= :buffer-view-region-allocation (reason #(view/covered-contiguous? base covers)))))
+    (is (= :buffer-view-region-allocation (reason #(view/subtract-contiguous base changed))))))
+
+(deftest contiguous-subtraction-agrees-with-an-element-set-model
+  (let [base (view/view allocation {:dtype :float :byte-offset 8 :shape [8]})
+        cells (fn [v] (set (range (quot (:byte-offset v) 4)
+                                 (quot (+ (:byte-offset v) (:byte-length v)) 4))))]
+    (doseq [start (range 13) end (range start 13)]
+      (let [cut (view/view allocation {:dtype :float :byte-offset (* 4 start) :shape [(- end start)]})
+            remaining (view/subtract-contiguous base cut)
+            expected (into #{} (remove (cells cut)) (cells base))]
+        (is (= expected (into #{} (mapcat cells) remaining)))
+        (is (view/covered-contiguous? base (conj remaining cut)))))))
+
 (deftest prefix-views-require-the-same-allocation-and-typed-range
   (let [base (view/view allocation {:dtype :float :shape [16]})
         prefix (view/subview base {:shape [8]})
