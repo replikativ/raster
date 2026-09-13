@@ -34,6 +34,10 @@ flat `[n]` arrays: do not infer a two-dimensional domain from scalar parameter n
 confuse the acceptance test's separately constructed rectangular view with the compiled ABI view.
 Composite/packed layouts keep their existing whole-shard route until their physical layout has a
 certified region projection. Do not add per-quantization addressing knowledge to memory planning.
+Enforce this restriction in validation: one plain dense injective leaf, equal element volume, and
+no unresolved logical layout. Coordinate-disjoint regions are not physically disjoint for arbitrary
+zero/overlapping strides. A boundary provider must resolve an exact local value and producing
+region, with ABI-derived write evidence and physical subview correspondence, not merely a step ID.
 
 For every local materialization:
 
@@ -59,7 +63,8 @@ Resolve transfer endpoints through these placement identities. Avoid a second ha
 of ABI arguments or duplicate source/destination rectangle declarations. If the source owned
 realization cannot be identified uniquely, or the target replica is absent, lowering must refuse
 execution even when the topology-only plan remains useful for simulation.
-Combining halo transfers must use their certified reduction over the derived owned target face;
+Only copy-mode halos create replica placements. Combining halo transfers must use their certified
+reduction over the derived owned target face in global coordinates, not an absent ghost replica;
 they must never be silently implemented as a copy. The initial copy-mode vertical rejects these
 until its runtime can execute the stated reduction.
 
@@ -69,7 +74,9 @@ Before an executable plan can allocate resources, prove:
 
 1. Every compute step has a local executable binding, and every transfer has exact projected views.
 2. Every read has an initialized owned region, completed incoming transfer, or completed boundary
-   producer. Initial host data is evidence only until an intervening write invalidates it.
+   producer. Initial host data is evidence only until an overlapping physical write invalidates it;
+   disjoint regional writes do not invalidate one another. Whole-buffer ABI effects remain
+   conservative unless a narrower physical write region is actually proven.
 3. Producers precede consumers through the DAG's actual dependencies/events. Vector order and
    analytical duration estimates alone are not completion events.
 4. Writes and overlapping transfer ranges cannot race; refreshed replicas invalidate old readiness.
