@@ -1111,6 +1111,13 @@ The next sequence is workload-driven:
 This keeps cloud hardware, native fabrics and object storage out of the development hot loop.
 It does not replace the external training acceptance or measured kernel-comparison work.
 
+The first loop-admission prerequisite fixes an existing unsound dense-map match: a multi-form
+`dotimes` body beginning with `do` could select that `do`'s last store and drop its earlier stores
+and all sibling forms. Dense matching now requires one accounted-for body; unproved ordered
+effects remain intact. The numerical regression checks every destination. This closes an effect
+preservation bug, not the broader 2-D heat admission gap; that still needs a complete typed
+iteration-domain and cross-iteration write/read proof.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

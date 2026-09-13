@@ -162,11 +162,9 @@
       (let [[_ bindings & body-forms] form]
         (when (and (vector? bindings) (= 2 (count bindings)))
           (let [[idx-sym bound-expr] bindings
-                raw-body (if (= 1 (count body-forms))
-                           (first body-forms)
-                           (when (and (seq? (first body-forms))
-                                      (= 'do (first (first body-forms))))
-                             (last (rest (first body-forms)))))
+                ;; A dense-map witness accounts for one store, not an arbitrary suffix of
+                ;; an effect sequence. Multi-form bodies need the ordered effect-map route.
+                raw-body (when (= 1 (count body-forms)) (first body-forms))
                 aset-result (when raw-body
                               (or (when-let [info (match-aset-write raw-body idx-sym)]
                                     {:info info})

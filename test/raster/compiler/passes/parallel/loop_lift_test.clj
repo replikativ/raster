@@ -36,6 +36,22 @@
           {:keys [stats]} (loop-lift/lift-parallel-forms form)]
       (is (= 1 (:maps-detected stats))))))
 
+(deftest dense-map-matching-does-not-discard-sibling-effects
+  (let [loop '(dotimes [i n]
+                (do (aset scratch i 7.0) (aset out i 1.0))
+                (aset tail i 9.0))
+        source (list 'let* ['written loop] 'written)
+        lifted (loop-lift/lift-parallel-forms source)
+        execute (eval (list 'fn '[scratch out tail n] (:form lifted)))
+        scratch (double-array 3) out (double-array 3) tail (double-array 3)]
+    (is (nil? (patterns/match-dotimes-map-loop loop)))
+    (is (zero? (get-in lifted [:stats :maps-detected])))
+    (is (= source (:form lifted)))
+    (execute scratch out tail 3)
+    (is (= [7.0 7.0 7.0] (vec scratch)))
+    (is (= [1.0 1.0 1.0] (vec out)))
+    (is (= [9.0 9.0 9.0] (vec tail)))))
+
 (deftest detect-let-wrapped-dotimes
   (testing "let-wrapped dotimes (with int bound) is detected"
     (let [form '(let* [x (let [n_ (int bound)]
