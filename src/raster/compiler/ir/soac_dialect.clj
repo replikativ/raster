@@ -968,9 +968,13 @@
   (let [f (if (program-form? program-or-facts) (facts program-or-facts) program-or-facts)
         value (get-in f [:values result])]
     (when (and (some #{result} (nth equation 2))
-               (contains? '#{map stencil contract segmented-reduce product-reduce
+               (contains? '#{map stencil contract reduce segmented-reduce product-reduce
                              segmented-fold-map scan} (operation-kind equation))
-               (= {:kind :plain} (:representation value)) (nil? (:logical-layout value)))
+               (or (= {:kind :plain} (:representation value))
+                   (and (= 'reduce (operation-kind equation)) (= [] (:shape value))
+                        (= {:kind :resident-scalar-buffer :elements 1} (:representation value))
+                        (= :device (:memory-space value))))
+               (nil? (:logical-layout value)))
       (:shape value))))
 
 (defn result-storage

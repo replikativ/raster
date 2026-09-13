@@ -12,11 +12,9 @@
   [algorithm result capacity resolve-dimension]
   (when-let [equation (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm))]
     (when-let [shape (soac/dense-functional-result-shape algorithm equation result)]
-      (try
-        (let [dimensions (mapv resolve-dimension shape)]
-          (and (every? #(and (integer? %) (<= 0 %)) dimensions)
-               (= capacity (reduce *' 1 dimensions))))
-        (catch clojure.lang.ExceptionInfo _ false)))))
+      (let [dimensions (mapv resolve-dimension shape)]
+        (and (every? #(and (integer? %) (<= 0 %)) dimensions)
+             (= capacity (reduce *' 1 dimensions)))))))
 
 (defn- expression-range [expression types intervals]
   (let [typed (index-expression/lower-typed

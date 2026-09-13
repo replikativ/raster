@@ -155,7 +155,14 @@
                         (when (and (= id physical) (= :write (:access contract)))
                           (or (coverage/dense-result-covers?
                                 algorithm result capacity
-                                #(first (concrete-shape result {:shape [%]} scalars buffers storage)))
+                                #(try (first (concrete-shape result {:shape [%]} scalars buffers storage))
+                                      (catch clojure.lang.ExceptionInfo error
+                                        (if (contains? #{:invocation-link-shape-scalar
+                                                         :invocation-link-shape-extent
+                                                         :invocation-link-shape-expression}
+                                                       (:reason (ex-data error)))
+                                          nil
+                                          (throw error)))))
                               (coverage/rectangular-effect-covers? algorithm result capacity scalars))))
                       (map vector (nth equation 2) (soac/physical-results facts equation)
                            (soac/result-storage facts (second equation)))))

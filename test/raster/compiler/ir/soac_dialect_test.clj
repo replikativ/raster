@@ -30,6 +30,18 @@
                  (dialect/lambda-form '[x-element] [body])))]
     '[y])))
 
+(deftest scalar-reduction-coverage-includes-exact-resident-scalar-storage
+  (let [equation '(= reduction [sum] (reduce {} [] [] (lambda [] (region [] [0.0]))))
+        scalar (av/tensor {:dtype :float :shape []})
+        resident (assoc scalar :representation {:kind :resident-scalar-buffer :elements 1}
+                               :memory-space :device)
+        shape #(dialect/dense-functional-result-shape {:values {'sum %}} equation 'sum)]
+    (is (= [] (shape scalar)))
+    (is (= [] (shape resident)))
+    (is (nil? (shape (assoc-in resident [:representation :elements] 2))))
+    (is (nil? (shape (assoc resident :shape [1]))))
+    (is (nil? (shape (assoc resident :logical-layout {:kind :strided}))))))
+
 (deftest typed-soac-is-a-pattern-declared-recursive-dialect
   (let [program (map-program)]
     (is (pattern-dialect/valid? dialect/TypedSOAC program))
