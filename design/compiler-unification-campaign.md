@@ -1112,6 +1112,14 @@ the distributed compute/transfer DAG with device-scoped allocation and ownership
 local checkpoint acceptance through distributed publication and restore. The two-worker acceptance
 must not be counted as evidence those cross-entry and multi-device runtime obligations are done.
 
+`BufferView/rectangular-subview` now provides the checked physical region operation used by the
+halo acceptance. It preserves dtype, allocation and element strides, proves per-axis containment,
+and handles empty regions without extending the backing range. Global/ghost coordinates must be
+translated explicitly to the base-local frame; fitting an allocation's byte span is not a proof
+of logical rectangle containment. The next binding contract must distinguish owned cells, local
+replicas of neighbor cells, and boundary-initialized ghost cells. Merely assigning the padded
+buffer to the owned shard would hide the kernel's halo reads and would not prove transfer ordering.
+
 Items 6–8 have checked planning components, but not yet multi-device numerical execution:
 `distributed-plan` simulates topology, dependencies, collective/halo schedules and analytic costs;
 `numerical-state` certifies chunk coverage and durable field identity; `numerical-content` tests
