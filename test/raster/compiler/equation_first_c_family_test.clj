@@ -466,9 +466,24 @@
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
+(deftest declared-map-result-cast-preserves-jvm-source-semantics
+  (let [output (int-array 2)]
+    (checked-casts/declared-narrow-rows!
+     (long-array [Integer/MIN_VALUE Integer/MAX_VALUE]) output 2)
+    (is (= [Integer/MIN_VALUE Integer/MAX_VALUE] (vec output))))
+  (doseq [value [(inc (long Integer/MAX_VALUE)) (dec (long Integer/MIN_VALUE))]]
+    (let [input (long-array [value]) output (int-array [-7])]
+      (is (thrown? ArithmeticException
+                   (raster.par/map! output index 1 int (aget input index))))
+      (is (= [-7] (vec output)))
+      (is (thrown? ArithmeticException
+                   (checked-casts/declared-narrow-rows! input output 1)))
+      (is (= [-7] (vec output))))))
+
 (deftest checked-source-narrowing-reaches-public-c-family-kernels
   (doseq [target [cuda-target hip-target]
           operation [#'checked-casts/narrow-rows!
+                     #'checked-casts/declared-narrow-rows!
                      #'checked-casts/narrow-stores!
                      #'checked-casts/unused-narrow-rows!
                      #'checked-casts/annihilated-narrow-rows!]]
