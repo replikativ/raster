@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
@@ -114,6 +115,26 @@
         (is (= :program-link-value-contract (:reason failure)))
         (is (= 8 (:physical-elements failure)))
         (is (= 9 (:logical-elements failure)))))))
+
+(deftest linker-overwrite-proof-uses-typed-domain-not-only-write-permission
+  (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target :cuda:0 :dtype :float})
+        emitted (last (get-in compiled [:emitted :equations]))
+        algorithm (:algorithm (first (:operations emitted)))
+        equation (last (dialect/equations algorithm))
+        destination (first (dialect/physical-results algorithm equation))
+        domain (first (dialect/dense-functional-result-shape algorithm equation
+                                                           (first (nth equation 2))))]
+    (doseq [[capacity extent expected] [[8 4 #{}] [8 8 #{destination}]
+                                       [8 9 #{}] [16 8 #{}] [4 4 #{destination}]]]
+      (is (= expected
+             (#'invocation-link/write-before-read-inputs
+              {:equations [emitted]}
+              {:program-buffers {destination {:id :storage :shape [capacity]}}}
+              {domain {:type :long :value extent}}))))
+    (is (empty? (#'invocation-link/write-before-read-inputs
+                 {:equations [emitted]}
+                 {:program-buffers {destination {:id :storage :shape [8]}}} {}))
+        "an unavailable extent cannot prove complete coverage")))
 
 (deftest allocation-extent-definition-must-dominate-the-allocation
   (let [options {:dtype :float :array-types {'input :float 'output :float}

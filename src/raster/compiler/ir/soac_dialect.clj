@@ -960,6 +960,19 @@
   [locals]
   (mapv (fn [{:keys [id dtype init]}] (local-value id dtype init)) locals))
 
+(defn dense-functional-result-shape
+  "Complete logical write domain of a validated functional result, or nil for indexed/effect
+   operations. This is not a physical-capacity or alias proof; callers must establish those
+   separately. Target emission retains this algorithm, so linking can use the same rule."
+  [program-or-facts equation result]
+  (let [f (if (program-form? program-or-facts) (facts program-or-facts) program-or-facts)
+        value (get-in f [:values result])]
+    (when (and (some #{result} (nth equation 2))
+               (contains? '#{map stencil contract segmented-reduce product-reduce
+                             segmented-fold-map scan} (operation-kind equation))
+               (= {:kind :plain} (:representation value)) (nil? (:logical-layout value)))
+      (:shape value))))
+
 (defn result-storage
   "Ordered physical storage contracts for an equation's functional results.
 

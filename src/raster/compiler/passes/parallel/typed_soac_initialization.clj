@@ -36,16 +36,13 @@
 (defn- full-overwrite? [facts extent-environment {:keys [destination extent]} equation]
   ;; These functional operations produce their entire validated logical result shape.
   ;; Indexed/guarded effect maps and scatter do not have that guarantee.
-  (and (contains? '#{map stencil contract segmented-reduce product-reduce
-                     segmented-fold-map scan} (dialect/operation-kind equation))
-       (not (contains? (physical-inputs facts equation) destination))
+  (and (not (contains? (physical-inputs facts equation) destination))
        (some (fn [[result storage]]
                (and (= destination (physical-id facts (:destination storage)))
                     (= :write (:access storage))
-                    (plain-storage? (get-in facts [:values result]))
                     (plain-storage? (get-in facts [:values destination]))
                     (extent-proof/same-volume? extent-environment extent
-                                              (get-in facts [:values result :shape]))))
+                                              (dialect/dense-functional-result-shape facts equation result))))
              (map vector (nth equation 2) (dialect/result-storage facts (second equation))))))
 
 (defn- fresh-symbol [used prefix]

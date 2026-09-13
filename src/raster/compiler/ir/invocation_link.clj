@@ -130,17 +130,50 @@
       (contains? roles :output) :write
       :else nil)))
 
+(defn- complete-write?
+  [operation id capacity scalars buffers storage]
+  (when (emitted-equation/emitted-equation? operation)
+    (let [algorithm (:algorithm operation)
+          facts (soac/facts algorithm)
+          destination (get-in facts [:values id])]
+      (when (and (= {:kind :plain} (:representation destination))
+                 (nil? (:logical-layout destination)))
+        (some (fn [equation]
+                (some (fn [[result physical contract]]
+                        (when (and (= id physical) (= :write (:access contract)))
+                          (when-let [shape (soac/dense-functional-result-shape facts equation result)]
+                            (try
+                              (= capacity
+                                 (reduce *' 1 (concrete-shape result {:shape shape}
+                                                              scalars buffers storage)))
+                              (catch clojure.lang.ExceptionInfo e
+                                (if (contains? #{:invocation-link-shape-scalar
+                                                 :invocation-link-shape-extent}
+                                               (:reason (ex-data e)))
+                                  false
+                                  (throw e)))))))
+                      (map vector (nth equation 2) (soac/physical-results facts equation)
+                           (soac/result-storage facts (second equation)))))
+              (soac/equations algorithm))))))
+
 (defn- write-before-read-inputs
-  [parallel-program compiler-values]
+  [parallel-program materialized scalars]
+  (let [program-buffers (:program-buffers materialized)
+        buffers (into {} (map (fn [[id buffer]] [id (:id buffer)])) program-buffers)
+        storage (into {} (map (fn [[_ buffer]] [(:id buffer) buffer])) program-buffers)]
   (into #{}
         (keep (fn [id]
-                (let [first-access
+                (let [[access operation]
                       (some (fn [equation]
                               (when-let [operation (first (:operations equation))]
-                                (graph-buffer-access (:graph operation) id)))
+                                (when-let [access (graph-buffer-access (:graph operation) id)]
+                                  [access operation])))
                             (:equations parallel-program))]
-                  (when (= :write first-access) id))))
-        compiler-values))
+                  (when (and (= :write access)
+                             (complete-write? operation id
+                                              (reduce *' 1 (:shape (get program-buffers id)))
+                                              scalars buffers storage)) id))))
+        (keys program-buffers))))
 
 (defn- add-materialized-inputs
   [state materialized program-values overwrite-inputs]
@@ -258,7 +291,7 @@
         scalars (:program-scalars materialized)
         shape-scalars (merge (invocation-shape-scalars materialized) scalars)
         overwrite-inputs (write-before-read-inputs parallel-program
-                                                   (keys (:program-buffers materialized)))
+                                                   materialized shape-scalars)
         initial (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
                                          materialized (:values parallel-program)
                                          overwrite-inputs)
