@@ -524,6 +524,21 @@
                           (body-emit/emit-scalar-kernel
                            "trapping_arithmetic" (body-fixtures/trapping-arithmetic-body)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "checked-cast-i64-i32"
+                          (body-emit/emit-scalar-kernel
+                           "checked_cast_i64_i32"
+                           (body-fixtures/trapping-integral-cast-body :long :int)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "checked-cast-i64-i8"
+                          (body-emit/emit-scalar-kernel
+                           "checked_cast_i64_i8"
+                           (body-fixtures/trapping-integral-cast-body :long :byte)
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "checked-cast-i32-i8"
+                          (body-emit/emit-scalar-kernel
+                           "checked_cast_i32_i8"
+                           (body-fixtures/trapping-integral-cast-body :int :byte)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "java-round-f32"
                           (body-emit/emit-scalar-kernel
                            "java_round_f32" (body-fixtures/java-round-body :float :int 1)

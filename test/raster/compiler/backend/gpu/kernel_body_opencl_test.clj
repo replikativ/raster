@@ -165,6 +165,22 @@
 (defn- wrapping-arithmetic-kernel-body []
   (integer-arithmetic-kernel-body :wrap))
 
+(defn- nested-trapping-integral-cast-kernel-body []
+  (body/make
+   {:id :nested-trapping-integral-cast
+    :parameters [(body/->KernelParameter 'input :scalar :long [] nil nil :input)
+                 (body/->KernelParameter 'out :output :byte [1] :global
+                                         (layout/row-major [1] :byte) :result)]
+    :operations [(body/->ScalarStore
+                  'out [0]
+                  (body/cast-expression
+                   (body/cast-expression 'input :int :exact :trap)
+                   :byte :exact :trap)
+                  nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn- bounded-byte-add-kernel-body []
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :rule rule))))
@@ -532,6 +548,49 @@
                       {:target-dialect target})
               {:keys [exit err]} (compile-c-family-source target source)]
           (is (zero? exit) err))))))
+
+(deftest checked-integral-narrowing-reaches-capable-c-family-targets
+  (testing "portable OpenCL declines because it has no standard terminating trap"
+    (try
+      (opencl/emit-scalar-kernel
+       "checked_cast" (fixtures/trapping-integral-cast-body :long :int)
+       {:target-dialect :opencl-portable})
+      (is false "checked narrowing must not become a wrapping target cast")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :kernel-body-c-trap-unsupported (:reason (ex-data exception)))))))
+  (testing "the bounded emitter addition does not reinterpret non-narrowing trap policies"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"cannot preserve this KernelBody cast policy"
+         (opencl/emit-scalar-kernel
+          "non_narrowing_checked_cast" (fixtures/trapping-integral-cast-body :int :long)
+          {:target-dialect :cuda}))))
+  (doseq [[target trap-spelling]
+          [[:opencl-intel "__builtin_trap();"]
+           [:cuda "asm volatile(\"trap;\");"]
+           [:hip "__builtin_trap();"]]
+          [source-type result-type helper bounds]
+          [[:long :int "rstr_trap_cast_i64_i32" ["-2147483648" "2147483647"]]
+           [:long :byte "rstr_trap_cast_i64_i8" ["-128" "127"]]
+           [:int :byte "rstr_trap_cast_i32_i8" ["-128" "127"]]]]
+    (testing (str (name target) " " (name source-type) " to " (name result-type))
+      (let [kernel (fixtures/trapping-integral-cast-body source-type result-type)
+            source (opencl/emit-scalar-kernel "checked_cast" kernel
+                                              {:target-dialect target})]
+        (is (= kernel (body/validate! kernel)))
+        (is (= 2 (count (re-seq (re-pattern (str helper "\\(")) source)))
+            "one checked helper definition accompanies one cast call")
+        (is (every? #(str/includes? source %) bounds))
+        (is (str/includes? source trap-spelling))
+        (is (str/includes? source (str helper "(rstr_input)"))))))
+  (testing "nested casts discover and emit every required checked helper"
+    (let [source (opencl/emit-scalar-kernel
+                  "nested_checked_cast" (nested-trapping-integral-cast-kernel-body)
+                  {:target-dialect :cuda})]
+      (is (str/includes? source "rstr_trap_cast_i64_i32(rstr_input)"))
+      (is (str/includes? source
+                         "rstr_trap_cast_i32_i8(rstr_trap_cast_i64_i32(rstr_input))"))
+      (is (= 2 (count (re-seq #"rstr_trap_cast_i64_i32\(" source))))
+      (is (= 2 (count (re-seq #"rstr_trap_cast_i32_i8\(" source)))))))
 
 (deftest registry-intrinsic-helpers-follow-the-c-family-target
   (doseq [[target qualifier physical-op compiler]
