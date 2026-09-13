@@ -1018,7 +1018,7 @@
   (-> plan validate-plan-structure! validate-allocations-and-aliases! validate-effects!))
 
 (defn initialization-contract
-  "Validate and derive node-level initialization pre/postconditions from ordered ABI facts.
+  "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.
    :requires names caller-initialized nodes needed by reads or pass-through outputs;
    :initializers names nodes with declared host sources (not a content snapshot or upload event).
    :produces names nodes fully established by ordered writes, including certified produced
@@ -1026,7 +1026,8 @@
    retention or semantic-value preservation of private temporaries. :reads/:writes retain conservative
    effect scopes, and :outputs is the public output-node set. All sets contain LinkNode IDs.
    Postconditions assume caller requirements and initializers are realized and execution succeeds;
-   this is not proof of distributed readiness, source immutability, or runtime completion."
+   this is not proof of distributed readiness, source immutability, or runtime completion.
+   Requirements need not be minimal across aliases and do not replace a runtime's input gates."
   [plan]
   (analyze-effects! (-> plan validate-plan-structure! validate-allocations-and-aliases!)))
 
