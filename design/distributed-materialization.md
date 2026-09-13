@@ -303,6 +303,17 @@ It supports dense dyadic FP64 whole patches on one logical worker. Field-qualifi
 identities allow successive entries to share the enclosing runtime pool. There is no method
 registry in the compiler, new runtime ABI, or copied kernel source.
 
+The mapped multilevel continuation acceptance captures both generated resident fields into real
+local files and replaces the structural fixture's synthetic content addresses with hashes of those
+bytes. After closing the producing execution, fresh field plans initialize directly from verified
+read-only mapping leases. The leases close after synchronous initialization, before kernel execution.
+Continuation runs both operation orders in separate fresh executions: prolongation-first consumes
+restored coarse, and restriction-first consumes restored fine. Neither restore can hide behind an
+overwrite. Both resulting fields match the numerical reference in each execution.
+This validates a fixed coarse/fine transfer cycle and explicit state realization; it does not add
+adaptive timestepping, production manifest publication, a distributed storage provider, or an
+asynchronous ownership claim. Heat and multilevel acceptance share the same file/lease fixture.
+
 Restriction carries a conditional per-output forward-error model: gamma_3 times one quarter of
 the sum of the four input magnitudes, with gamma_3 = 3u/(1-3u), u = 2^-53. The producer explicitly
 assumes finite inputs, no intermediate overflow or underflow, nearest-even IEEE arithmetic and

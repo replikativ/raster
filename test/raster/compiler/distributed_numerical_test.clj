@@ -13,6 +13,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-state :as state]
             [raster.runtime.numerical-content :as content]
+            [raster.test-support.numerical-checkpoint :as checkpoint]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.distributed :as gpu-distributed]
@@ -21,9 +22,7 @@
            [java.nio ByteBuffer ByteOrder]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.file Files OpenOption StandardOpenOption]
-           [java.nio.file.attribute FileAttribute]
-           [java.security MessageDigest]
-           [java.util HexFormat]))
+           [java.nio.file.attribute FileAttribute]))
 
 (deftm heat-step!
   [out :- (Array double), u :- (Array double), rhs :- (Array double),
@@ -112,10 +111,7 @@
                     {:expected (count expected) :actual (count actual)})))
   (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2))) expected actual)))
 
-(defn- payload-address [^ByteBuffer bytes]
-  (let [digest (MessageDigest/getInstance "SHA-256")]
-    (.update digest (.duplicate bytes))
-    (state/content-address :sha-256 (.formatHex (HexFormat/of) (.digest digest)))))
+(def ^:private payload-address checkpoint/payload-address)
 
 (defn- checkpoint-manifest [address byte-count]
   (state/certify
@@ -134,28 +130,7 @@
      :provenance {:program-fingerprint "raster-numerical-acceptance/heat-step-v1"}})))
 
 (defn- open-checkpoint-lease [path certified]
-  ;; A real local-file realization fixture, not a production store/provider implementation.
-  ;; Verify actual bytes against the certified identity before numerical code consumes them.
-  (let [certified (state/verify! certified)
-        chunk (get-in certified [:manifest :fields 0 :chunks 0])
-        address (:content chunk)
-        arena (Arena/ofConfined)]
-    (try
-      (with-open [channel (FileChannel/open path (into-array OpenOption [StandardOpenOption/READ]))]
-        (when-not (= (:stored-byte-length chunk) (.size channel))
-          (throw (ex-info "checkpoint payload extent differs" {:reason :checkpoint-size})))
-        (let [segment (.map channel FileChannel$MapMode/READ_ONLY 0 (.size channel) arena)]
-          (when-not (= address (payload-address (.asByteBuffer segment)))
-            (throw (ex-info "checkpoint payload does not match its content address"
-                            {:reason :checkpoint-digest})))
-          (content/local-content-lease
-           {:content address
-            :placement (content/content-placement {:provider-id :local-test :tier-id :file
-                                                    :content address})
-            :segment segment :byte-length (.byteSize segment) :release-fn #(.close arena)})))
-      (catch Throwable error
-        (.close arena)
-        (throw error)))))
+  (checkpoint/open-chunk-lease path (get-in (state/verify! certified) [:manifest :fields 0 :chunks 0])))
 
 (deftest real-mapped-checkpoint-resumes-the-same-numerical-evolution
   (let [initial (:initial (problem))

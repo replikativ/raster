@@ -14,10 +14,13 @@
             [raster.compiler.ir.amr-execution :as amr-execution]
             [raster.compiler.ir.numerical-state :as numerical-state]
             [raster.compiler.ir.distributed-plan :as distributed]
+            [raster.runtime.numerical-content :as content]
+            [raster.test-support.numerical-checkpoint :as checkpoint]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.distributed :as gpu-distributed]
-            [raster.gpu.link :as link]))
+            [raster.gpu.link :as link])
+  (:import [java.nio.file Files]))
 
 (deftm transfer-cycle!
   [out :- (Array double), fine :- (Array double), coarse :- (Array double),
@@ -394,6 +397,85 @@
               actual (double-array 15)]
           (gpu/download-range! (get (:sessions executable) :ze:0) result actual {:elements 15})
           (is (= (vec coarse) (vec actual))))))))
+
+(deftest mapped-coarse-fine-state-resumes-in-a-new-execution
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "mapped-coarse-fine-continuation")
+    (let [coarse (double-array (map #(- (* 0.25 %) 1.0) (range 15)))
+          fine (double-array 60)
+          expected-fine (multilevel/prolong-constant-2d! (double-array 60) coarse 3 5)
+          paths (checkpoint/temp-files [:coarse :fine])
+          retain-fields #(assoc % :outputs [[:prolongation :apply] [:restriction :apply]])
+          plan (retain-fields (scheduled-transfer-cycle coarse fine))
+          workload (certified-transfer-workload plan)
+          steps {:coarse [:restriction :apply] :fine [:prolongation :apply]}]
+      (try
+        (let [captured
+              (with-open [executable (gpu-distributed/instantiate! plan)]
+                (gpu-distributed/run! executable)
+                (into {} (for [[field step] steps
+                               :let [resident (first (vals (get (gpu-distributed/output-values executable) step)))]]
+                           [field (checkpoint/capture-f64! (get (:sessions executable) :ze:0)
+                                                          resident (paths field) (if (= :coarse field) 15 60))])))
+              snapshot
+              (numerical-state/certify
+               (assoc (get-in workload [:plan :state :manifest])
+                      :id :multilevel/checkpoint-1 :logical-coordinate {:step 1}
+                      :provenance {:program-fingerprint "compiled-coarse-fine-f64-v1"}
+                      :fields (mapv (fn [field]
+                                      (assoc-in field [:chunks 0 :content] (get-in captured [(:id field) :content])))
+                                    (get-in workload [:plan :state :manifest :fields]))))
+              chunks (into {} (map (fn [field] [(:id field) (first (:chunks field))]))
+                           (:fields (:manifest snapshot)))
+              fresh (retain-fields (scheduled-transfer-cycle (double-array 15) (double-array 60)))
+              schedule-order (fn [operations]
+                               (reduce (fn [acc previous]
+                                  (conj acc (amr/schedule-coarse-fine
+                                             (get-in workload [:plan :hierarchy]) (:values fresh)
+                                             (:operation previous)
+                                             {:duration-ns 1 :dependencies (if (seq acc)
+                                                                            [(:completion (peek acc))] [])})))
+                                       [] operations))]
+          (is (= snapshot (numerical-state/verify! snapshot)))
+          ;; The producing execution and its write mappings are already closed. Restore only
+          ;; required initializers using semantic allocation IDs, never compiler ABI names.
+          ;; Exercise BOTH orders: prolongation-first consumes restored coarse;
+          ;; restriction-first consumes restored fine. Neither restore can hide behind a write.
+          (doseq [operations [(get-in workload [:plan :coarse-fine])
+                              (reverse (get-in workload [:plan :coarse-fine]))]
+                  :let [scheduled (schedule-order operations)
+                        fresh (assoc fresh :steps (vec (mapcat :steps scheduled)))]]
+           (with-open [coarse-lease (checkpoint/open-chunk-lease (paths :coarse) (chunks :coarse))
+                      fine-lease (checkpoint/open-chunk-lease (paths :fine) (chunks :fine))]
+            (let [segments {:coarse (content/lease-segment coarse-lease)
+                            :fine (content/lease-segment fine-lease)}
+                  restored (update-in fresh [:device-plans :ze:0 :entries]
+                                      #(update-vals %
+                                         (fn [entry]
+                                           (update-in entry [:link-plan :nodes]
+                                                      (fn [nodes]
+                                                        (update-vals nodes
+                                                          (fn [node]
+                                                            (if (:source node)
+                                                              (assoc node :source (segments (get-in node [:view :allocation :id])))
+                                                              node))))))))
+                  resumed (amr/certify (amr/plan (assoc (:plan workload) :state snapshot :coarse-fine scheduled
+                                                      :distributed-plan (distributed/certify restored))))]
+              (is (= resumed (amr/verify! resumed)))
+              (with-open [executable (gpu-distributed/instantiate! restored)]
+                ;; Initialization is synchronous. Subsequent kernels must not depend on either
+                ;; mapped arena; asynchronous lifetime semantics have separate acceptance tests.
+                (.close coarse-lease)
+                (.close fine-lease)
+                (is (and (content/lease-closed? coarse-lease) (content/lease-closed? fine-lease)))
+                (gpu-distributed/run! executable)
+                (doseq [[field expected] [[:coarse coarse] [:fine expected-fine]]
+                        :let [resident (first (vals (get (gpu-distributed/output-values executable) (steps field))))
+                              actual (double-array (alength ^doubles expected))]]
+                  (gpu/download-range! (get (:sessions executable) :ze:0) resident actual
+                                       {:elements (alength ^doubles actual)})
+                  (is (= (vec expected) (vec actual)))))))))
+        (finally (doseq [path (vals paths)] (Files/deleteIfExists path)))))))
 
 (deftest coarse-fine-schedule-executes-its-generated-local-entries
   (let [coarse (double-array (map #(* 0.25 %) (range 15)))
