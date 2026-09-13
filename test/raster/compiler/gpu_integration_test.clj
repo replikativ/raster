@@ -130,6 +130,26 @@
                     (finally
                       (gpu-link/close! executable))))))))
 
+(deftest heat-2d-counted-stores-execute-through-the-direct-vertical
+  (when-gpu "heat-2d-counted-store-execution"
+    (doseq [[nx ny] [[2 3] [5 7]]]
+      (let [n (* nx ny)
+            input (double-array (map #(Math/sin (double %)) (range n)))
+            expected (double-array (repeat n -99.0))
+            output (double-array (repeat n -99.0))
+            _ (pde/heat-rhs-2d! expected input nx ny 0.25 4.0 9.0)
+            compilation (equation-first/compile #'pde/heat-rhs-2d!
+                                                {:target :ze:0 :dtype :double})
+            plan (equation-first/lower compilation [output input nx ny 0.25 4.0 9.0])
+            executable (gpu-link/instantiate! plan)]
+        (try
+          (gpu-link/run! executable)
+          (let [actual (gpu-link/download executable (first (:outputs plan)))]
+            (doseq [i (range n)]
+              (is (< (Math/abs (- (aget expected i) (aget ^doubles actual i))) 1.0e-10)
+                  (str [nx ny] " cell " i))))
+          (finally (gpu-link/close! executable)))))))
+
 (deftest symbolic-dense-contraction-uses-one-correct-kernel-body-test
   (let [left (float-array [1 2 3 4 5 6])
         right (float-array [7 8 9 10 11 12])

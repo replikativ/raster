@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.par]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -11,6 +12,50 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest counted-store-loops-use-the-existing-effect-dialect
+  (let [source '(let* [result (dotimes [i n]
+                               (aset out i 1.0)
+                               (aset scratch i 2.0))] result)
+        options {:dtype :double :array-types {'out :double 'scratch :double}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        bindings (second normalized)
+        program (frontend/form->program normalized options)
+        run (fn [form n]
+              (let [out (double-array 3) scratch (double-array 3)
+                    f (eval (list 'fn '[n out scratch] form))]
+                (try
+                  [(f n out scratch) (vec out) (vec scratch)]
+                  (catch Exception e [(class e) (vec out) (vec scratch)]))))]
+    (is (some? program))
+    (is (= 'long (:tag (meta (first bindings)))))
+    (is (= 'raster.par/map-void! (first (last bindings))))
+    (is (= normalized (frontend/normalize-source normalized options)))
+    (doseq [n [Long/MIN_VALUE -1 0 1 3 2147483648 Long/MAX_VALUE]]
+      (is (= (run source n) (run normalized n)) (str "count " n)))))
+
+(deftest counted-conflicting-stores-retain-order-and-explicit-buffer-return
+  (let [options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}
+        source '(let* [r (dotimes [i n] (aset out 0 (double i)))] out)
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        equation (last (dialect/equations program))
+        result (first (nth equation 2))
+        renamed (dialect/remap-values program {'out [:argument 0] result [:result 0]})]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= :sequential (:iteration-order (:attributes (dialect/operation-parts equation)))))
+    (is (= [result] (dialect/outputs program)))
+    (is (= '[(extent out)] (get-in (dialect/facts program) [:values result :shape])))
+    (is (= '[(extent [:argument 0])]
+           (get-in (dialect/facts renamed) [:values [:result 0] :shape])))
+    (is (= [[:argument 0]]
+           (dialect/physical-results renamed (last (dialect/equations renamed)))))))
+
+(deftest unknown-or-mutable-counts-are-not-normalized
+  (doseq [bound ['(next-count!) '(aget counts 0)]]
+    (let [source (list 'let* ['r (list 'dotimes ['i bound] '(aset out i 1.0))] 'r)]
+      (is (= source (frontend/normalize-source source
+                                              {:array-types {'out :double 'counts :long}}))))))
 
 (def ^:private source
   '(let* [^long n (clojure.core/alength x)

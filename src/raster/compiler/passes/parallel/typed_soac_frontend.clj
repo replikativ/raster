@@ -1831,6 +1831,31 @@
             (with-meta (apply list (assoc (vec expression) position id)) (meta expression))]))))
    [state expression] inputs))
 
+(defn- normalize-counted-store-loop
+  "Express a closed source store loop through the existing effect-map boundary.
+   This spelling grants no parallelism: write-region analysis still proves its order.
+   Preserve dotimes' single Long conversion and empty nonpositive domain."
+  [expression]
+  (if (and (seq? expression)
+           (contains? '#{dotimes clojure.core/dotimes} (first expression))
+           (not (contains? util/*shadowing-locals* (first expression)))
+           (vector? (second expression))
+           (= 2 (count (second expression)))
+           (symbol? (first (second expression))))
+    (let [[idx bound] (second expression)
+          body (list* 'do (nnext expression))]
+      (if (and (provably-pure-scalar? bound)
+               ;; Reading mutable storage cannot be shared with a later extent equation.
+               (empty? (par/collect-aget-arrays bound))
+               (store-region body idx))
+        (with-meta
+          (list 'raster.par/map-void! idx
+                (list 'clojure.core/long bound)
+                body)
+          (meta expression))
+        expression))
+    expression))
+
 (defn- normalize-source*
   [source scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
@@ -1866,6 +1891,19 @@
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
                                           [state expression])
+                     counted-expression (normalize-counted-store-loop expression)
+                     [state expression] (if (= expression counted-expression)
+                                          [state expression]
+                                          (let [[state counted] (normalize-fixed-scalar-inputs
+                                                                 state counted-expression [[2 :long]])
+                                                count-id (nth counted 2)
+                                                extent (with-meta
+                                                         (list 'if (list 'clojure.core/< count-id 0)
+                                                               0 count-id)
+                                                         {:tag 'long :raster.type/tag 'long})]
+                                            (normalize-fixed-scalar-inputs
+                                             state (apply list (assoc (vec counted) 2 extent))
+                                             [[2 :long]])))
                      local-scalar-types (:local-scalar-types state)
                      expression (->> expression
                                      (canonicalize-strided-indexed-operation ordinal)
@@ -2824,13 +2862,11 @@
         destination-results
         (into {}
               (mapcat (fn [description]
-                        (keep (fn [[result {:keys [destination host-return]}]]
-                                ;; Effect-only operations expose their destinations through the
-                                ;; reconstructed host form, not as numerical TypedSOAC results.
-                                ;; Only value-returning storage contracts may rewrite a terminal
-                                ;; physical destination to its logical SSA result.
-                                (when (= :buffer host-return)
-                                  [destination result]))
+                        (map (fn [[result {:keys [destination]}]]
+                               ;; The operation itself may return nil, but an explicit later
+                               ;; read/return of its destination observes the latest stored value.
+                               ;; Do not confuse the loop's host return with the buffer's identity.
+                               [destination result])
                               (map vector (:results description)
                                    (:result-storage description)))))
               descriptions)
@@ -2901,7 +2937,8 @@
 (defn- ordinary-equation-values
   [equation default-dtype array-types scalar-types known-values]
   (let [[_ _ results] equation
-        {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
+        {:keys [kind attributes arrays captures destinations]} (dialect/operation-parts equation)
+        result-destinations (zipmap results destinations)
         extent (:extent attributes)
         dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
         dimension-value
@@ -2969,7 +3006,10 @@
                                          segmented-fold-map
                                          (dialect/segmented-fold-map-result-shape attributes)
                                          scan (dialect/scan-result-shape attributes)
-                                         (scatter effect-map) [(list 'unknown-dimension id)]
+                                         scatter [(list 'unknown-dimension id)]
+                                         ;; An effect updates existing storage, not a dense
+                                         ;; tensor whose length is the iteration count.
+                                         effect-map [(list 'extent (get result-destinations id))]
                                          (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 

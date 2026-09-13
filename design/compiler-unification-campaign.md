@@ -1127,6 +1127,21 @@ must still fail target checks rather than narrow. Raw store-loop normalization c
 use one typed Long scalar extent `max(0, long(bound))` and the existing effect-region analysis,
 with sequential order retained until a dependence proof permits parallel scheduling.
 
+The source normalization now uses that existing effect-map boundary: a closed raw `dotimes`
+store region keeps every body form, performs the Long conversion at its original site, and
+clamps negative counts through an ordinary typed scalar conditional. Unknown/effectful or
+mutable-array-derived bounds remain outside this normalization. No new operation registry or
+semantic loop dialect is introduced. An explicit returned destination observes its latest write
+even when the loop itself returns nil. Effect result shapes project the physical destination's
+extent, and that projection participates in ordinary SSA remapping.
+
+The existing `heat-rhs-2d!` now compiles and links through the direct CUDA/HIP boundary without
+driver allocation. A local Level Zero numerical regression compares all cells against the CPU
+for 2×3 (empty interior) and 5×7 grids with nonzero initial destination contents. This establishes
+local execution correctness, not a competitive parallel stencil schedule, distributed execution,
+or a performance result. The next distributed seam remains exact local-program/shard binding,
+followed by numerical halo execution and real-byte durable restore.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

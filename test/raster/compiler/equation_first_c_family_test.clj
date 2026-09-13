@@ -14,6 +14,7 @@
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
             [raster.numeric]
+            [raster.ode.pde :as pde]
             [raster.par]
             [raster.runtime.hardware :as hardware]))
 
@@ -377,6 +378,18 @@
       (is (= [module-target] (mapv :target (:kernels compilation))))
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest heat-2d-counted-stores-use-the-public-c-family-boundary
+  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile #'pde/heat-rhs-2d!
+                                            {:target target :dtype :double})
+          plan (equation-first/lower compilation
+                                     [(double-array 35) (double-array 35)
+                                      5 7 0.25 4.0 9.0])]
+      (is (seq (:kernels compilation)))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
 (deftest emitted-program-rejects-a-mixed-target-module
   (let [compilation (equation-first/compile
