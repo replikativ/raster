@@ -1104,6 +1104,8 @@ closes the lease after synchronous transfer, and advances two more steps to the 
 reference. Temporary payloads are 448 bytes and deleted in `finally`. This is a local-file provider
 fixture, not a production storage adapter, serialized manifest migration test, crash-consistent
 publication protocol, asynchronous restore, or distributed checkpoint.
+A read-only mapping is not an immutable snapshot against another process writing the backing file;
+a production provider must pin an immutable version or hold an appropriate storage snapshot lease.
 
 Still required: bind padded ghost storage explicitly to the global owned-shard contract, realize
 the distributed compute/transfer DAG with device-scoped allocation and ownership, then carry the
