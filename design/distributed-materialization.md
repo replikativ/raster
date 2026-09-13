@@ -260,3 +260,25 @@ rectangular resolutions. Averaging down recovers the coarse cell averages and bo
 preserve the analytic domain integral. The nonzero volume-weighted RMS error of constant
 prolongation decreases at first order. This measures transfer approximation, not PDE convergence
 or a general certified error bound; conservation alone must not be mistaken for accuracy.
+
+### Next executable binding boundary (design, not implemented)
+
+An AMR operation needs an implementation witness, not a registry that recognizes function names.
+The witness should identify the existing distributed worker, scheduled completion and local entry,
+and name its source/target LinkValues. Validation can reuse `compute-bindings` and LinkPlan access
+facts to check shard identity, source reads, target writes, dtype, region coverage and placement.
+The semantic contract is derived from the hierarchy and operation (kind, method, ratio, centering
+and regions), not independently restated as another authority. The structural distributed
+certificate already retains the exact local plan and its compiler artifacts; a separate source
+hash or duplicated ABI is unnecessary for detecting a changed implementation.
+
+The mathematical association remains an explicit trusted producer obligation: this exact typed
+program implements that semantic operation and establishes the required invariants under a stated
+numerical policy. `numerical-contract` is producer attestation, not an inferred proof. Tests may
+challenge that producer, but neither a method keyword, matching dimensions nor a passing numerical
+example establishes general equivalence. A future proof object can strengthen this boundary.
+
+Acceptance must reject swapped entries, mismatched roles/regions and missing producer evidence,
+then execute a certified hierarchy/state workload. The current full-patch scheduling witness must
+not be relabeled as that stronger acceptance. Partial regions need actual logical-domain and
+physical-view checks, not whole-buffer byte-span containment.

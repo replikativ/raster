@@ -5,6 +5,8 @@
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.amr-plan :as amr]
+            [raster.compiler.ir.amr-execution :as amr-execution]
+            [raster.compiler.ir.numerical-state :as numerical-state]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
@@ -152,7 +154,7 @@
                                           [id {:local-shape (shapes field)
                                                :placements [{:kind :owned :value field :shard field
                                                              :local-offsets [0 0]}]}]))}]))]
-    (distributed/plan
+    (with-meta (distributed/plan
      {:id :generated-multilevel-cycle
       :mesh (distributed/mesh [{:name :worker :size 1}] [:ze:0])
       :topology (distributed/topology [(distributed/device {:id :ze:0 :memory-capacity-bytes 1048576})] [])
@@ -161,7 +163,86 @@
                         [field [(distributed/shard {:id field :value field :device :ze:0
                                                     :offsets [0 0] :shape shape})]]))
       :device-plans {:ze:0 {:entries entries :steps calls}}
-      :steps (vec (mapcat :steps scheduled)) :outputs [(:completion (peek scheduled))]})))
+      :steps (vec (mapcat :steps scheduled)) :outputs [(:completion (peek scheduled))]})
+      {:hierarchy hierarchy :scheduled scheduled})))
+
+(defn- certified-transfer-workload [plan]
+  (let [{:keys [hierarchy scheduled]} (meta plan)
+        fields (mapv
+                (fn [patch]
+                  (let [field (:field patch) shape (:shape patch) n (reduce * shape)]
+                    (numerical-state/field
+                     {:id field :value (get-in plan [:values field]) :chunk-shape shape
+                      :coordinate-space {:hierarchy (:id hierarchy) :level (:level patch) :patch (:id patch)
+                                         :axes [{:name :x :centering :cell} {:name :y :centering :cell}]}
+                      ;; Structural manifest fixture only: no durable publication is claimed.
+                      :chunks [(numerical-state/chunk
+                                {:id field :offsets [0 0] :shape shape
+                                 :logical-byte-length (* 8 n) :stored-byte-length (* 8 n)
+                                 :content (numerical-state/content-address :sha-256 (format "%064x" n))
+                                 :storage {:format :raw-array :byte-order :little-endian}})]})))
+                (mapcat :patches (:levels hierarchy)))
+        state (numerical-state/certify
+               (numerical-state/manifest
+                {:id :transfer-state :parents [] :logical-coordinate {:step 0}
+                 :fields fields :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
+                                                    :compatibility-id "multilevel-f64"}
+                 :provenance {:program-fingerprint "multilevel-structural-fixture"}}))]
+    (amr/certify (amr/plan {:id :transfer-workload :mode :transfer-cycle
+                           :hierarchy hierarchy :state state :distributed-plan (distributed/certify plan)
+                           :coarse-fine scheduled}))))
+
+(deftest implementation-witnesses-bind-exact-plans-and-field-effects
+  (let [coarse (double-array (map #(* 0.25 %) (range 15)))
+        plan (scheduled-transfer-cycle coarse (double-array 60))
+        workload (certified-transfer-workload plan)
+        bindings (:bindings (distributed/compute-bindings plan))
+        implementations
+        (into {} (for [[kind source-field target-field]
+                       [[:prolongation :coarse :fine] [:restriction :fine :coarse]]
+                       :let [binding (bindings [kind :apply])
+                             local-id (fn [field] (some (fn [[id value]] (when (= field (:value value)) id))
+                                                       (:values binding)))]]
+                   [kind (amr-execution/attest-implementation
+                          workload kind (:link-plan binding)
+                          {:source (local-id source-field) :target (local-id target-field)
+                           :producer :test/multilevel-compiler-provider :invariants #{:constant-preserving}
+                           :numerical {:mode :exact :policy :typed-fp64-evaluation-order}})]))
+        execution (amr-execution/certify workload implementations)
+        failure (fn [changed]
+                  (try (amr-execution/certify workload changed) nil
+                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= execution (amr-execution/verify! execution)))
+    (is (= :amr-execution-implementation
+           (failure (assoc-in implementations [:prolongation :link-plan]
+                              (get-in implementations [:restriction :link-plan])))))
+    (is (= :amr-execution-effects
+           (failure (assoc-in implementations [:prolongation :source]
+                              (get-in implementations [:prolongation :target])))))
+    (is (= :amr-execution-invariants
+           (failure (assoc-in implementations [:restriction :invariants] #{}))))
+    (is (= :amr-execution-implementations (failure (dissoc implementations :restriction))))
+    (is (= :amr-execution-invariants (failure (assoc-in implementations [:restriction :producer] false))))
+    (is (= :numerical-contract (failure (assoc-in implementations [:restriction :numerical] {}))))
+    (is (= :amr-execution-implementation
+           (failure (assoc-in implementations [:restriction :contract :ratio] [4 4]))))
+    (let [compute-bindings distributed/compute-bindings]
+      (with-redefs [distributed/compute-bindings
+                    (fn [p] (assoc-in (compute-bindings p)
+                                      [:bindings [:prolongation :apply] :boundary-outputs :extra]
+                                      {:access :write}))]
+        (is (= :amr-execution-effects (failure implementations))
+            "boundary-output effects cannot bypass the exact external field set")))
+    (if-not @gp/gpu-available?
+      (gp/gpu-skip! "certified-amr-execution-binding")
+      (with-open [executable (gpu-distributed/instantiate!
+                             (get-in (amr-execution/verify! execution)
+                                     [:workload :plan :distributed-plan :plan]))]
+        (gpu-distributed/run! executable)
+        (let [result (first (vals (get (gpu-distributed/output-values executable) [:restriction :apply])))
+              actual (double-array 15)]
+          (gpu/download-range! (get (:sessions executable) :ze:0) result actual {:elements 15})
+          (is (= (vec coarse) (vec actual))))))))
 
 (deftest coarse-fine-schedule-executes-its-generated-local-entries
   (let [coarse (double-array (map #(* 0.25 %) (range 15)))
