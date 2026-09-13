@@ -1842,6 +1842,7 @@
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
+            occupied-symbols (set (filter symbol? (tree-seq coll? seq source)))
             {:keys [normalized]}
             (reduce
              (fn [{:keys [compound-extents allocation-lengths scalar-aliases pure-scalar-ids
@@ -1976,8 +1977,13 @@
                      (let [extent-dtype (or (retained-scalar-dtype canonical-extent local-scalar-types)
                                             :long)
                            extent-tag (dtype/scalar-tag-for-dtype extent-dtype)
+                           extent-base (str "rstr_extent_" ordinal)
                            extent-id (with-meta
-                                       (clojure.core/symbol (str "rstr_extent_" ordinal))
+                                       (first (remove occupied-symbols
+                                                      (cons (clojure.core/symbol extent-base)
+                                                            (map #(clojure.core/symbol
+                                                                   (str extent-base "_" %))
+                                                                 (range)))))
                                        {:tag extent-tag :raster.type/tag extent-tag
                                         ;; This SSA value is introduced by the frontend as the
                                         ;; canonical identity of compound launch/storage algebra.

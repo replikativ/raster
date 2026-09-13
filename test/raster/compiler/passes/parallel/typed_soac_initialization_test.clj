@@ -120,3 +120,23 @@
     (is (= #{'storage} (get-in (dialect/facts scheduled) [:attributes :host-read-sites 0 :values])))
     (is (= '[output written] (get-in (dialect/facts scheduled) [:attributes :source-bindings])))
     (is (= 1 (:initialization-full-overwrites stats)))))
+
+(deftest allocation-extent-normalization-is-hygienic-and-precedes-allocation
+  (let [source '(let* [output (float-array (* n width))
+                       written (raster.par/map! output i (* n width) nil
+                                               (+ (aget input i) rstr_extent_0))]
+                 written)
+        normalized (frontend/normalize-source
+                    source {:array-types {'input :float 'output :float}
+                            :scalar-types {'n :long 'width :long 'rstr_extent_0 :long}})
+        [[extent expression] [output allocation] [_ consumer]]
+        (partition 2 (second normalized))]
+    (is (not= 'rstr_extent_0 extent))
+    (is (= '(* n width) expression))
+    (is (= 'output output))
+    (is (= (list 'float-array extent) allocation))
+    (is (= extent (nth consumer 3)))
+    (is (= '(+ (aget input i) rstr_extent_0) (last consumer)))
+    (is (= normalized (frontend/normalize-source
+                      normalized {:array-types {'input :float 'output :float}
+                                  :scalar-types {'n :long 'width :long 'rstr_extent_0 :long}})))))
