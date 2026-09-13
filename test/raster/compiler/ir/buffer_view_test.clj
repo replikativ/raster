@@ -27,6 +27,8 @@
         empty (view/view allocation {:dtype :float :byte-offset 8 :shape [0]})]
     (is (not (view/overlaps? base remote)))
     (is (not (view/same-range? base remote)))
+    (is (not (view/same-range? base (assoc-in base [:allocation :device] nil)))
+        "nil placement is not a wildcard for a concrete device")
     (is (not (view/covered-contiguous? base [remote])))
     (is (not (view/overlaps? base empty)))
     (is (not (view/overlaps? empty base)))

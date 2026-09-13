@@ -131,7 +131,9 @@
 (defn byte-end [view]
   (+ (:byte-offset (validate-view! view)) (:byte-length view)))
 
-(defn- allocation-key [allocation]
+(defn- allocation-key
+  "A nil device is its own identity scope, never a wildcard for concrete devices."
+  [allocation]
   [(:device allocation) (:id allocation)])
 
 (defn overlaps?
