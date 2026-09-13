@@ -1,13 +1,18 @@
 # Distributed materialization and execution boundary
 
-Status: owned-domain normalization is implemented; replica/boundary coverage and execution below
-remain a reviewed implementation plan, not an implemented execution contract.
+Status: owned-domain normalization and copy-replica geometry/coverage are implemented;
+boundary producers, freshness, endpoint realization and execution remain a reviewed plan.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
-placement that covers the entire local domain. Its report retains the original ABI leaf views and
+placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
 adds a checked `:domain` with the reshaped view and owned placement. A flat `[6]` leaf can explicitly
-realize a `[2 3]` shard. Padding, replica placements, and boundary placements remain rejected until
-the corresponding coverage/provenance checks land; this is not yet the padded example below.
+realize a `[2 3]` shard. Copy replicas can now complete a padded domain: their destination rectangles
+are derived from validated ScheduledHalo steps, anchored at the owned region, and checked for exact
+coordinate-disjoint coverage. Each transfer must precede its consumer through the DAG, and repeated
+consumers must agree on its physical destination. Periodic halos have a complete structural example;
+boundary placements remain rejected, so the nonperiodic example below is not yet admitted.
+These checks do not prove initialization, freshness across intervening writes, or source endpoint
+availability. The report is still structural and must not be treated as execution authorization.
 Repeated owned realizations compare ordered physical regions: a contiguous ABI reshape preserves
 identity when allocation, dtype, byte range, and field packing agree. Explicit domains use their
 derived owned view; noncontiguous leaves retain their shape/stride mapping. Original ABI views
