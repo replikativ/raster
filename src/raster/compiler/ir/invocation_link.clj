@@ -337,7 +337,12 @@
               storage)
         values
         (mapv (fn [[token {:keys [abstract]}]]
-                (link/value {:id token :abstract abstract
+                ;; The invocation already carries all shape scalars and extent bindings.
+                ;; Retain their resolved logical shape at the public LinkPlan boundary,
+                ;; rather than forcing composition to rediscover symbolic dimensions.
+                (link/value {:id token :abstract (assoc abstract :shape
+                                                       (concrete-shape token abstract shape-scalars
+                                                                       (:buffers realized) storage))
                              :leaves [{:name :value :node token}]}))
               storage)
         instance (link/program-instance
