@@ -386,6 +386,8 @@
                                             {:target target :dtype :float})
           plan (equation-first/lower compilation [(float-array 6) 2 3])]
       (is (= 4 (count (:kernels compilation))))
+      (is (every? #(< (count (:source %)) 32768) (:kernels compilation))
+          "the polynomial's shared scalar spine must not expand into megabytes of source")
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 

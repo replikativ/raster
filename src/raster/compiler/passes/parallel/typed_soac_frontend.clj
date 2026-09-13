@@ -152,6 +152,17 @@
                  (every? :dtype locals))
         locals))))
 
+(defn- typed-map-region
+  "Preserve a map's typed lexical spine instead of expanding shared expressions."
+  [expression]
+  (if (and (seq? expression) (form/let-head? (first expression)))
+    (let [[_ bindings & results] expression
+          locals (typed-region-locals bindings)]
+      (when (and (= 1 (count results)) (some? locals)
+                 (every? (comp simple-symbol? :id) locals))
+        {:locals locals :body (first results)}))
+    {:locals [] :body expression}))
+
 (defn- substitute-store
   [substitutions store]
   (reduce (fn [store field]
@@ -1213,11 +1224,14 @@
           elem-type (dtype/canon (or elem-type
                                      (dtype/dtype-for-scalar-tag cast)
                                      default-dtype))
-          io (extract-io body idx [symbol])]
-      (merge {:kind :map :id id :sym symbol :results [symbol]
-              :index idx :extent bound :locals [] :casts [cast] :bodies [body]
-              :pure? true :elem-type elem-type}
-             io))
+          io (extract-io body idx [symbol])
+          region (typed-map-region body)]
+      (when region
+        (merge {:kind :map :id id :sym symbol :results [symbol]
+                :index idx :extent bound :locals (:locals region)
+                :casts [cast] :bodies [(:body region)]
+                :pure? true :elem-type elem-type}
+               io)))
 
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
@@ -1231,15 +1245,17 @@
                                      (when (symbol? out) (get array-types out))
                                      default-dtype))
           write-index (when offset (list 'clojure.core/+ offset idx))
-          io (extract-io (if offset (list 'do write-index body) body) idx [out])]
+          io (extract-io (if offset (list 'do write-index body) body) idx [out])
+          region (typed-map-region body)]
       ;; A binder with the same spelling as the caller-owned destination needs distinct value/view
       ;; identity before it can be SSA. Every other offset map is an injective partial write:
       ;; destination[base+i] is a typed unique scatter, not a map carrying an emitter-only offset.
       ;; The destination is read/write because elements outside the slice remain observable.
-      (when-not (= symbol out)
+      (when (and region (not= symbol out))
         (if offset
           (merge {:kind :scatter :id id :sym symbol :results [symbol]
-                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :index idx :extent bound :locals (:locals region)
+                  :casts [cast] :bodies [(:body region)]
                   :write-indices [write-index] :predicates [1] :conflict :unique
                   :result-storage [{:destination out :access :read-write
                                     :host-return :buffer}]
@@ -1247,7 +1263,8 @@
                   :source-operation :raster.par/map-offset}
                  io)
           (merge {:kind :map :id id :sym symbol :results [symbol]
-                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :index idx :extent bound :locals (:locals region)
+                  :casts [cast] :bodies [(:body region)]
                   :result-storage [{:destination out
                                     :access (if (contains? (:inputs io) out) :read-write :write)
                                     :host-return :buffer}]

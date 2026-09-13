@@ -13,6 +13,27 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest map-let-spines-become-typed-locals
+  (let [body '(let* [^float p1 (* (aget x i) (aget x i))
+                    ^float p2 (* p1 p1)
+                    ^float p3 (* p2 p2)] p3)
+        source (list 'let* ['y (list 'raster.par/pmap 'i 'n 'float body)] 'y)
+        program (frontend/form->program source
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'n :long}})
+        parts (dialect/operation-parts (first (dialect/equations program)))
+        region (dialect/lambda-parts (:lambda parts))]
+    (is (some? program))
+    (is (= 3 (count (:locals region))))
+    (is (= '[p1 p2 p3] (mapv :id (:locals region))))))
+
+(deftest map-let-spines-require-complete-scalar-type-evidence
+  (doseq [body ['(let* [p (* x x)] p)
+                '(let* [^float p (* x x) ^float p (* p p)] p)
+                '(let* [^float p (* x x)] (observe! p) p)
+                '(let* [^floats p x] p)]]
+    (is (nil? (#'frontend/typed-map-region body)))))
+
 (deftest counted-store-loops-use-the-existing-effect-dialect
   (let [source '(let* [result (dotimes [i n]
                                (aset out i 1.0)
