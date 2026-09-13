@@ -45,21 +45,41 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires one argument"
                          (lower '(Math/round (aget x i) (aget x i)) :long {'i :int})))))
 
-(deftest explicit-integer-wrapping-does-not-relax-the-owner-policy
-  (let [lower (:lower (scalar/make-lowerer
-                      {:array-types {} :arrays #{} :scalar-types {'x :long 'f :double}
-                       :lower-index (fn [expression _] expression)
-                       :conversion-policy conversion/policy
-                       :decline! (fn [rule message data]
-                                   (throw (ex-info message (assoc data :rule rule))))}))
-        result (lower '(clojure.core/unchecked-int x) :int {'x :long})]
-    (is (= :int (:type result)))
+(deftest explicit-integer-casts-preserve-checked-versus-unchecked-source-contracts
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        strict (scalar/make-lowerer
+                {:array-types {} :arrays #{} :scalar-types {'x :long 'i :int 'f :double}
+                 :lower-index (fn [expression _] expression)
+                 :conversion-policy conversion/policy :decline! decline!})
+        legacy (scalar/make-lowerer
+                {:array-types {} :arrays #{} :scalar-types {'x :long}
+                 :lower-index (fn [expression _] expression) :decline! decline!})
+        lower (:lower strict)
+        checked (lower '(clojure.core/int x) :int {'x :long})
+        unchecked (lower '(clojure.core/unchecked-int x) :int {'x :long})]
+    (is (= {:rounding :exact :overflow :trap}
+           (get-in (last (:operations checked)) [:expression :options])))
     (is (= {:rounding :exact :overflow :wrap}
-           (get-in (last (:operations result)) [:expression :options])))
+           (get-in (last (:operations unchecked)) [:expression :options])))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                         (lower '(clojure.core/int x) :int {'x :long})))
+                          ((:cast strict) {:operations [] :result 'x :type :long} :int 'x))
+        "an implicit narrowing still respects a strict owner's default rejection")
+    (is (= {:rounding :exact :overflow :wrap}
+           (get-in (last (:operations
+                          ((:cast legacy) {:operations [] :result 'x :type :long} :int 'x)))
+                   [:expression :options]))
+        "an implicit conversion without a strict owner retains the legacy wrap policy")
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                         (lower '(clojure.core/unchecked-int f) :int {'f :double})))))
+                          (lower '(clojure.core/int f) :int {'f :double})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
+                          (lower '(clojure.core/unchecked-int f) :int {'f :double})))
+    (let [widened (lower '(clojure.core/long i) :long {'i :int})
+          identity-cast (lower '(clojure.core/int i) :int {'i :int})]
+      (is (= {:rounding :exact :overflow :exact}
+             (get-in (last (:operations widened)) [:expression :options])))
+      (is (empty? (:operations identity-cast)))
+      (is (= 'i (:result identity-cast))))))
 
 (defn- mixed-region [lowerer]
   ((:lower-region lowerer)
@@ -192,6 +212,7 @@
         rounded [:nearest-even :exact]
         ieee [:nearest-even :ieee]
         wrap [:exact :wrap]
+        trap [:exact :trap]
         ;; Independent complete matrix: rows are source types, columns target types.
         expected [[exact exact exact ieee rounded exact]
                   [wrap exact exact ieee rounded exact]
@@ -205,7 +226,9 @@
       (let [policy (get-in expected [row column])]
         (is (= policy (conversion/policy source target :wrap)) (str source " → " target))
         (is (= (when-not (= wrap policy) policy) (conversion/policy source target))
-            (str "checked owner: " source " → " target))))
+            (str "default rejecting owner: " source " → " target))
+        (is (= (if (= wrap policy) trap policy) (conversion/policy source target :trap))
+            (str "explicit checked source cast: " source " → " target))))
     (is (= exact (conversion/policy :i32 :f64)))
     (is (= ieee (conversion/policy :f64 :f16)))
     (is (thrown? clojure.lang.ExceptionInfo (conversion/policy :missing :float)))
@@ -316,7 +339,7 @@
 
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]
-          [['byte :byte :long :wrap] ['int :int :long :wrap]
+          [['byte :byte :long :trap] ['int :int :long :trap]
            ['long :long :int :exact] ['float :float :double :ieee]
            ['double :double :float :exact]]
           qualified? [false true]]
@@ -328,8 +351,72 @@
       (is (= overflow (get-in expression [:options :overflow])))))
   (let [result ((:lower (lowerer)) '(double (int value)) :double {'value :long})]
     (is (= [:int :double] (mapv #(get-in % [:result :type]) (:operations result))))
-    (is (= [:wrap :exact] (mapv #(get-in % [:expression :options :overflow])
+    (is (= [:trap :exact] (mapv #(get-in % [:expression :options :overflow])
                               (:operations result))))))
+
+(deftest lexical-lets-retain-checked-initializers-before-control-flow
+  (let [lower (:lower (lowerer))
+        unused (lower '(let* [n (int x)] 7) :long {'x :long})
+        branch (lower '(let* [n (int x)] (if flag n 0))
+                      :int {'x :long 'flag :predicate})
+        zero-trip (lower '(let* [n (int x)]
+                            (loop [i 0 acc 0]
+                              (if (< i bound) (recur (inc i) (+ acc n)) acc)))
+                         :int {'x :long 'bound :long})]
+    (is (= [:trap] (mapv #(get-in % [:expression :options :overflow])
+                          (:operations unused)))
+        "an unused checked initializer is still evaluated")
+    (is (= ["ScalarCompute" "IfRegion"]
+           (mapv #(some-> % class .getSimpleName) (:operations branch))))
+    (is (= :trap (get-in branch [:operations 0 :expression :options :overflow])))
+    (is (= ["ScalarCompute" "ForLoop"]
+           (mapv #(some-> % class .getSimpleName) (:operations zero-trip))))
+    (is (= :trap (get-in zero-trip [:operations 0 :expression :options :overflow]))))
+  (let [strict (scalar/make-lowerer
+                {:array-types {} :arrays #{} :scalar-types {'x :long}
+                 :lower-index (fn [expression _] expression)
+                 :require-source-types? true :conversion-policy conversion/policy
+                 :decline! (fn [rule message data]
+                             (throw (ex-info message (assoc data :rule rule))))})]
+    (is (= :scalar-let-binding-dtype
+           (try
+             ((:lower strict) '(let* [n (+ x 1)] n) :long {'x :long})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:rule (ex-data exception)))))
+        "compound binders without retained dtype evidence decline instead of using the consumer")))
+
+(deftest checked-integral-literals-start-from-their-source-width
+  (let [lower (:lower (lowerer))]
+    (doseq [value [Integer/MIN_VALUE Integer/MAX_VALUE
+                   (dec Integer/MIN_VALUE) (inc Integer/MAX_VALUE)]]
+      (let [result (lower (list 'int value) :int {})
+            cast (last (:operations result))]
+        (is (= (body/literal value :long) (first (get-in cast [:expression :arguments]))))
+        (is (= {:rounding :exact :overflow :trap}
+               (get-in cast [:expression :options])))))
+    (is (empty? (:operations (lower '(long 7) :long {})))
+        "an identity checked literal remains an exact source-width literal")))
+
+(deftest explicit-casts-require-authoritative-compound-operand-dtypes
+  (let [lower (:lower (lowerer))
+        typed-let (with-meta '(let* [n x] n) {:raster.type/tag 'long})
+        lowered (lower (list 'int typed-let) :int {'x :long})]
+    (is (= :trap (get-in (last (:operations lowered)) [:expression :options :overflow])))
+    (is (= :scalar-source-type
+           (try
+             (lower '(int (let* [n x] n)) :int {'x :long})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:rule (ex-data exception)))))
+        "an outer cast target may not context-type an unretained lexical result")
+    (is (= :scalar-source-type
+           (try
+             (lower '(int (+ x 1)) :int {'x :long})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:rule (ex-data exception)))))
+        "an outer cast target may not context-type an unknown compound operand")))
 
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]
@@ -488,8 +575,8 @@
   (let [lower (:lower-region (lowerer))
         result (lower '{:bindings [a 3]
                         :results [(let* [a 9] a) a]}
-                      [:int :int] {'a :int} {})]
-    (is (= [(body/literal 9 :int) (body/literal 3 :int)] (:results result)))))
+                      [:long :int] {'a :int} {})]
+    (is (= [(body/literal 9 :long) (body/literal 3 :int)] (:results result)))))
 
 (deftest typed-index-lowering-consumes-local-ssa-facts
   (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))

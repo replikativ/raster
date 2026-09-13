@@ -9,6 +9,7 @@
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as scalar-range]
@@ -18,15 +19,6 @@
 (defn- contains-indexed-load?
   [expression]
   (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
-
-(defn inline-lets
-  "Inline a top-level scalar let region while preserving its already-typed expression tree."
-  [expression]
-  (if (and (seq? expression) (contains? #{'let 'let* 'clojure.core/let} (first expression)))
-    (let [[_ bindings result] expression]
-      (reduce (fn [result [id init]] (util/subst-syms {id init} result))
-              result (reverse (partition 2 bindings))))
-    expression))
 
 (defn- match-ordered-loop
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
@@ -89,12 +81,44 @@
                         (some-> (or (:raster.type/tag (meta expression))
                                     (:tag (meta expression)))
                                 dtype/dtype-for-scalar-tag))
+        authoritative-source-type
+        (fn [expression env]
+          (or (retained-type expression)
+              (cond
+                (instance? raster.compiler.ir.kernel_body.Literal expression)
+                (canon-type (:type expression))
+
+                (number? expression)
+                (some-> expression types/literal-tag dtype/dtype-for-scalar-tag)
+
+                (boolean? expression) :predicate
+
+                (symbol? expression)
+                (some-> (or (get env expression) (get scalar-types expression)) canon-type)
+
+                (descriptor/aget-call? expression)
+                (some-> (get array-types (descriptor/aget-array-sym expression)) canon-type)
+
+                (and (seq? expression) (descriptor/cast-op? (first expression)))
+                (some-> (descriptor/cast-result-tag (first expression))
+                        dtype/dtype-for-scalar-tag)
+
+                (and (seq? expression)
+                     (= :cmp (:kind (intrinsics/descriptor
+                                     (intrinsics/canonical
+                                      (descriptor/semantic-op expression))))))
+                :predicate)))
         source-type
         (fn source-type [expression expected env]
-          (let [expression (inline-lets expression)]
-            (or
-             (retained-type expression)
-             (cond
+          (or
+           (retained-type expression)
+           (cond
+               (and (seq? expression)
+                    (contains? #{'let 'let* 'clojure.core/let} (first expression)))
+               (decline! :scalar-source-type
+                         "scalar let used at a conversion boundary requires a retained result dtype"
+                         {:expression expression :consumer-dtype expected})
+
                (instance? raster.compiler.ir.kernel_body.Literal expression) (:type expression)
                (symbol? expression) (or (get env expression) (get scalar-types expression) expected)
                (number? expression) expected
@@ -111,7 +135,7 @@
                        (decline! :scalar-source-type
                                  "scalar conversion requires the retained source expression dtype"
                                  {:expression expression :consumer-dtype expected})
-                       expected)))))]
+                       expected))))]
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
                       {:reason :raster/bug :lower-index lower-index :decline decline!})))
@@ -146,13 +170,15 @@
                   lowered
                   (let [source (dtype/canon (:type lowered))
                         [rounding overflow]
-                        ;; Map/fold retain their existing device-wrap default. A stricter owner
-                        ;; supplies its conversion contract rather than inheriting that policy.
-                        (or (if (= :wrap explicit-narrowing)
-                              (scalar-conversion/policy source target :wrap)
-                              (if conversion-policy
-                                (conversion-policy source target)
-                                (scalar-conversion/policy source target :wrap)))
+                        ;; An explicit source cast owns its checked-versus-unchecked narrowing
+                        ;; contract. Implicit conversions continue to use the owner's policy, or
+                        ;; the legacy map/fold wrap default when the owner supplies none.
+                        (or (case explicit-narrowing
+                              :wrap (scalar-conversion/policy source target :wrap)
+                              :reject (scalar-conversion/policy source target :trap)
+                              nil (if conversion-policy
+                                    (conversion-policy source target)
+                                    (scalar-conversion/policy source target :wrap)))
                             (decline! :cast-policy
                                       "scalar cast has no portable rounding and overflow policy"
                                       {:expression expression :source source :target target}))
@@ -167,12 +193,69 @@
                                                               rounding overflow)))
                        :result id :type target :range (or range (scalar-range/for-dtype target))})))))
 
+            (lower-ordered-bindings
+              [bindings env resolve-binding-type mismatch-rule mismatch-message]
+              (reduce
+               (fn [{:keys [operations substitutions environment]} [id init]]
+                 (let [init (util/subst-syms substitutions init)
+                       binding-type (canon-type (resolve-binding-type id init environment))
+                       lowered (lower init binding-type environment)
+                       _ (when-not (= binding-type (:type lowered))
+                           (decline! mismatch-rule mismatch-message
+                                     {:binding id :initializer init
+                                      :expected binding-type :actual (:type lowered)}))
+                       result (:result lowered)
+                       ;; Substituted SSA references retain their definition dtype for subsequent
+                       ;; source expressions and storage-coordinate lowering.
+                       tag (when-not (= :predicate binding-type)
+                             (:scalar-tag (dtype/info binding-type)))
+                       result (if (and (symbol? result) tag)
+                                (with-meta result
+                                  (assoc (meta result) :raster.type/tag tag))
+                                result)]
+                   {:operations (into operations (:operations lowered))
+                    :substitutions (assoc substitutions id result)
+                    :environment (cond-> environment
+                                   (symbol? result) (assoc result binding-type))}))
+               {:operations [] :substitutions {} :environment env}
+               (partition 2 bindings)))
+
+            (lower-let [expression expected env]
+              (let [[_ bindings & body-expressions] expression
+                    ids (when (vector? bindings) (take-nth 2 bindings))]
+                (when-not (and (vector? bindings) (even? (count bindings))
+                               (every? symbol? ids) (= (count ids) (count (set ids)))
+                               (= 1 (count body-expressions)))
+                  (decline! :scalar-let-shape
+                            "scalar let requires distinct ordered bindings and one result"
+                            {:expression expression :bindings bindings
+                             :body-count (count body-expressions)}))
+                (let [{:keys [operations substitutions environment]}
+                      (lower-ordered-bindings
+                       bindings env
+                       (fn [id init environment]
+                         (or (retained-type id)
+                             (authoritative-source-type init environment)
+                             (decline! :scalar-let-binding-dtype
+                                       "scalar let binding lacks an authoritative source dtype"
+                                       {:binding id :initializer init
+                                        :environment (set (keys environment))})))
+                       :scalar-let-binding-dtype
+                       "scalar let initializer disagrees with its retained dtype")
+                      result-expression (util/subst-syms substitutions (first body-expressions))
+                      result (lower result-expression expected environment)
+                      result (if (= expected (:type result))
+                               result
+                               (cast-lowered result expected expression))]
+                  (update result :operations #(into operations %)))))
+
             (lower [expression expected env]
-              (let [expression (inline-lets expression)
+              (let [lexical-let? (and (seq? expression)
+                                      (contains? #{'let 'let* 'clojure.core/let} (first expression)))
                     ;; Strict typed owners preserve operation width before any consumer cast.
                     ;; Older packed owners retain their explicit widened-integer policy.
                     expected (canon-type expected)
-                    _ (when (and require-source-types? (seq? expression))
+                    _ (when (and require-source-types? (seq? expression) (not lexical-let?))
                         (source-type expression expected env))
                     retained (when (seq? expression) (retained-type expression))
                     operation-type (if (and retained
@@ -180,7 +263,9 @@
                                                 (and (dtype/fp-dtype? expected)
                                                      (dtype/fp-dtype? retained))))
                                      retained expected)
-                    lowered (lower-value expression operation-type env)]
+                    lowered (if lexical-let?
+                              (lower-let expression operation-type env)
+                              (lower-value expression operation-type env))]
                 (if (not= operation-type expected)
                   (cast-lowered lowered expected expression)
                   lowered)))
@@ -245,7 +330,13 @@
                        (= 2 (count expression)))
                   (let [target (dtype/dtype-for-scalar-tag
                                 (descriptor/cast-result-tag (first expression)))
-                        source-expected (dtype/canon (source-type (second expression) target env))
+                        source-expected (dtype/canon
+                                         (or (authoritative-source-type (second expression) env)
+                                             (decline! :scalar-source-type
+                                                       "explicit scalar cast requires the retained operand dtype"
+                                                       {:expression expression
+                                                        :operand (second expression)
+                                                        :target target})))
                         lowered (lower (second expression) source-expected env)]
                     (cast-lowered lowered target expression
                                   (descriptor/cast-integral-narrowing (first expression))))
@@ -580,32 +671,15 @@
                                 :actual (:type lowered)}))
                    lowered))
                {:keys [operations substitutions environment]}
-               (reduce
-                (fn [{:keys [operations substitutions environment]} [id expression]]
-                  (when-not (get binding-types id)
-                    (decline! :scalar-region-binding-dtype
-                              "scalar region binding lacks a retained dtype"
-                              {:binding id :expression expression}))
-                  (let [lowered (checked-lower (util/subst-syms substitutions expression)
-                                               (get binding-types id) environment)
-                        result (:result lowered)
-                        ;; References to fresh SSA locals must carry the same retained type as
-                        ;; their definition, including when they become storage coordinates.
-                        ;; Index lowering must not rediscover this from an enclosing result.
-                        ;; Half and internal predicate values have no JVM scalar tag. Their
-                        ;; dtype stays in the existing typed SSA environment, not a guessed tag.
-                        tag (when-not (= :predicate (:type lowered))
-                              (:scalar-tag (dtype/info (:type lowered))))
-                        result (if (and (symbol? result) tag)
-                                 (with-meta result
-                                   (assoc (meta result) :raster.type/tag tag))
-                                 result)]
-                    {:operations (into operations (:operations lowered))
-                     :substitutions (assoc substitutions id result)
-                     :environment (cond-> environment
-                                    (symbol? result) (assoc result (:type lowered)))}))
-                {:operations [] :substitutions {} :environment env}
-                (partition 2 bindings))
+               (lower-ordered-bindings
+                bindings env
+                (fn [id expression _]
+                  (or (get binding-types id)
+                      (decline! :scalar-region-binding-dtype
+                                "scalar region binding lacks a retained dtype"
+                                {:binding id :expression expression})))
+                :scalar-region-dtype
+                "scalar region value disagrees with its retained dtype")
                lowered-results
                (mapv (fn [expression expected]
                        (checked-lower (util/subst-syms substitutions expression)

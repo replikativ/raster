@@ -17,6 +17,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -337,6 +338,8 @@
                  #'public-c-family-dot {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'checked-casts/narrow-rows! {:target device-id :dtype :long}))
       (:kernels (equation-first/compile
                  #'public-c-family-checked-rng {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

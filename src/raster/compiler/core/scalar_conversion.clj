@@ -6,13 +6,13 @@
 (defn policy
   "Return [rounding overflow], or nil when this policy cannot represent the conversion.
 
-   Integral narrowing is rejected unless the owner explicitly requests :wrap. That opt-in
-   preserves an existing device representation policy; it does not prove equivalence to a
-   checked Clojure cast. Floating-to-integral conversions remain unsupported. Identity callers
-   may elide the returned exact conversion. Unknown dtypes or policy options fail loudly."
+   Integral narrowing is rejected unless the caller explicitly requests :wrap or :trap. Those
+   options distinguish representation wrapping from a checked source conversion; the default
+   remains rejection. Floating-to-integral conversions remain unsupported. Identity callers may
+   elide the returned exact conversion. Unknown dtypes or policy options fail loudly."
   ([source target] (policy source target :reject))
   ([source target integral-narrowing]
-   (when-not (contains? #{:reject :wrap} integral-narrowing)
+   (when-not (contains? #{:reject :wrap :trap} integral-narrowing)
      (throw (ex-info "unsupported integral narrowing policy"
                      {:reason :unsupported-scalar-conversion-policy
                       :integral-narrowing integral-narrowing})))
@@ -28,7 +28,8 @@
 
        (and (not fp-source?) (not fp-target?))
        (cond widening? [:exact :exact]
-             (= :wrap integral-narrowing) [:exact :wrap])
+             (= :wrap integral-narrowing) [:exact :wrap]
+             (= :trap integral-narrowing) [:exact :trap])
 
        (and (not fp-source?) fp-target?)
        (if (and (= :double target) (<= (dtype/bytes-of source) 4))

@@ -8,6 +8,7 @@
             [pattern.nanopass.dialect :refer [=> dialects]]
             [raster.compiler.ir.dialects]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.normalize :as normalize]))
 
 ;; ================================================================
@@ -42,16 +43,16 @@
    (rule '((? op ~minus-op?) ?x (? _ ~numeric-zero?))
          x)
    (rule '((? op ~minus-op?) ?x ?x)
-         0.0)
+         (when (effects/removable-expr? x) 0.0))
    (rule '((? op ~minus-op?) (? _ ~numeric-zero?))
          0.0)
    (rule '((? op ~minus-op?) (? a number?) (? b number?))
          (- a b))
 
    (rule '((? op ~mul-op?) ?x (? _ ~numeric-zero?))
-         0.0)
+         (when (effects/removable-expr? x) 0.0))
    (rule '((? op ~mul-op?) (? _ ~numeric-zero?) ?x)
-         0.0)
+         (when (effects/removable-expr? x) 0.0))
    (rule '((? op ~mul-op?) ?x (? _ ~numeric-one?))
          x)
    (rule '((? op ~mul-op?) (? _ ~numeric-one?) ?x)
@@ -64,7 +65,7 @@
    (rule '((? op ~div-op?) ?x (? _ ~numeric-one?))
          x)
    (rule '((? op ~div-op?) (? _ ~numeric-zero?) ?x)
-         0.0)
+         (when (effects/removable-expr? x) 0.0))
    (rule '((? op ~div-op?) (? a number?) (? b number?))
          (when (not (zero? b))
            (/ (double a) (double b))))))
@@ -76,11 +77,12 @@
 (def math-rules
   (rule-list
    (rule '((? op ~pow-op?) ?x (? _ ~numeric-zero?))
-         1.0)
+         (when (effects/removable-expr? x) 1.0))
    (rule '((? op ~pow-op?) ?x (? _ ~numeric-one?))
          x)
    (rule '((? op ~pow-op?) ?x (? e number?))
-         (when (== (double e) 2.0)
+         (when (and (== (double e) 2.0)
+                    (or (not (coll? x)) (effects/cse-safe-expr? x)))
            (list 'raster.numeric/* x x)))
    (rule '((? op ~pow-op?) ?x (? e number?))
          (when (== (double e) 0.5)

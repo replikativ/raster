@@ -24,3 +24,16 @@
         "an unused local allocation may be eliminated")
     (is (not (effects/cse-safe-expr? allocation))
         "two live allocations may not share mutable identity")))
+
+(deftest checked-source-casts-carry-exceptional-control
+  (doseq [expression ['(clojure.core/int x)
+                      '(clojure.core/byte x)
+                      '(clojure.core/long x)
+                      '(clojure.core/* (clojure.core/int x) 0)]]
+    (is (= :pure (:effect (effects/descriptor expression)))
+        "a possible throw is distinct from an external mutation or IO effect")
+    (is (contains? (:flags (effects/descriptor expression)) :checked-source-cast))
+    (is (not (effects/removable-expr? expression))))
+  (is (not (contains? (:flags (effects/descriptor '(clojure.core/unchecked-int x)))
+                      :checked-source-cast))
+      "the op descriptor's explicit wrapping cast has no checked exception obligation"))

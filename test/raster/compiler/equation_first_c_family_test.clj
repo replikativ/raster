@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
@@ -463,6 +464,29 @@
       (is (seq (:kernels compilation)))
       (is (every? #(= module-target (:target %)) (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
+(deftest checked-source-narrowing-reaches-public-c-family-kernels
+  (doseq [target [cuda-target hip-target]
+          operation [#'checked-casts/narrow-rows!
+                     #'checked-casts/unused-narrow-rows!
+                     #'checked-casts/annihilated-narrow-rows!]]
+    (let [compilation (equation-first/compile operation
+                                            {:target target :dtype :long})
+          plan (equation-first/lower compilation [(long-array [-2147483648 2147483647])
+                                                 (int-array 2) 2])
+          nodes (mapcat #(tree-seq coll? seq (get-in % [:attributes :kernel-body :operations]))
+                        (:kernels compilation))
+          input-loads (set (keep #(when (and (map? %) (= 'input (:buffer %))
+                                             (= :long (get-in % [:result :type])))
+                                    (get-in % [:result :id])) nodes))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (some #(str/includes? (:source %) "rstr_trap_cast_i64_i32")
+                (:kernels compilation)))
+      (is (some #(and (map? %) (= :cast (:op %)) (= :int (:result-type %))
+                       (= {:rounding :exact :overflow :trap} (:options %))
+                       (contains? input-loads (first (:arguments %)))) nodes)
+          "the input load, not merely a launch-bound scalar, must feed a checked cast")
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
 (deftest emitted-program-rejects-a-mixed-target-module
