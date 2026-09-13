@@ -6,7 +6,8 @@
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.ir.link-plan :as link]))
+            [raster.compiler.ir.link-plan :as link]
+            [raster.compiler.ir.scan :as scan]))
 
 (def ^:private copy-kernel
   (artifact/make
@@ -246,6 +247,24 @@
                                (assoc-in plan [:device-plans :gpu-0 :steps :copy-0 :bindings
                                                :local-x :placements 1 :transfer]
                                          [:periodic :edge 0 :forward]))))))))
+
+(deftest replica-transfers-are-transitive-predecessors-not-combining-writes
+  (let [plan (periodic-materialization-plan)
+        halo (first (:halos plan))
+        compute (filterv #(= :compute (:kind %)) (:steps plan))
+        relay (distributed/compute-step {:id :relay :device :gpu-0 :duration-ns 1
+                                         :dependencies (:completions halo)})
+        transitive (assoc plan :steps (into (conj (:steps halo) relay)
+                                            (assoc-in compute [0 :dependencies] [:relay])))]
+    (is (distributed/distributed-plan? (distributed/plan transitive)))
+    (let [combine (scan/certify {:acc 'acc :init 0.0 :lambda '(+ acc element)} :float)
+          combining (distributed/schedule-halo
+                     (assoc (:exchange halo) :combine combine)
+                     (get-in plan [:values :x]) (get-in plan [:shards :x]) (:routes halo) [])
+          changed (assoc plan :halos [combining] :steps (into (:steps combining) compute))]
+      (is (= :distributed-compute-replica-transfer
+             (failure-reason #(distributed/plan changed)))
+          "even a certified reduction cannot be silently implemented as a copy replica"))))
 
 (deftest compute-bindings-retain-exact-link-values-and-derived-accesses
   (let [plan (make-plan)
