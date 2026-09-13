@@ -35,6 +35,49 @@
   (filterv (fn [[slot _]] (= :scalar (:kind slot)))
            (mapv vector (:abi graph) (:arguments graph))))
 
+(defn external-alias-violations
+  "Return graph access/dependency hazards for complete public physical bindings, without driver
+   work. overlaps? must conservatively compare physical values/ranges. Private allocations are
+   not supplied. Dtype, capacity, scalar preconditions and node ABI checks remain separate.
+   Incomplete bindings throw: missing information is not proof of disjointness."
+  [graph bindings overlaps?]
+  (let [graph (kgraph/validate! graph)
+        ids (set (map :id (concat (:inputs graph) (:outputs graph))))]
+    (when-not (and (map? bindings) (= ids (set (keys bindings))) (every? some? (vals bindings)))
+      (throw (ex-info "graph alias preflight requires exactly every public physical binding"
+                      {:reason :kernel-graph-alias-bindings :expected ids
+                       :bound (when (map? bindings) (set (keys bindings)))})))
+    (when-not (ifn? overlaps?)
+      (throw (ex-info "graph alias preflight requires an overlap predicate"
+                      {:reason :kernel-graph-alias-predicate})))
+    (let [writes? #(contains? #{:write :read-write} (:access %))
+          hazard? (fn [left right]
+                    (and (contains? ids (:buffer left)) (contains? ids (:buffer right))
+                         (overlaps? (get bindings (:buffer left)) (get bindings (:buffer right)))
+                         (or (writes? left) (writes? right))))
+          nodes (:nodes graph)]
+      (into
+       (vec (for [node nodes [index left] (map-indexed vector (:uses node))
+                  right (drop (inc index) (:uses node)) :when (hazard? left right)]
+              {:reason :kernel-graph-writable-alias :node (:id node)
+               :left (:buffer left) :right (:buffer right)}))
+       (for [[index later] (map-indexed vector nodes) earlier (take index nodes)
+             :when (some (fn [left] (some #(hazard? left %) (:uses later))) (:uses earlier))
+             :when (not (contains? (set (:dependencies later)) (:id earlier)))]
+         {:reason :kernel-graph-alias-dependency :node (:id later) :missing (:id earlier)})))))
+
+(defn validate-external-aliases!
+  "Enforce graph access/dependency preflight and return the complete physical bindings."
+  [graph bindings overlaps?]
+  (when-let [violation (first (external-alias-violations graph bindings overlaps?))]
+    (throw (ex-info (case (:reason violation)
+                     :kernel-graph-writable-alias
+                     "one kernel cannot bind overlapping writable graph buffer views"
+                     :kernel-graph-alias-dependency
+                     "kernel graph omits a dependency introduced by overlapping resident views")
+                    violation)))
+  bindings)
+
 (defn direct-scalar-range-preconditions
   "Project physical integer ranges for direct public scalar bindings into selector conditions.
   This is deliberately partial: computed node arguments, allocation products and artifact

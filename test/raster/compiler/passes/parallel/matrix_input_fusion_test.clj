@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.layout-stage :as layout]
@@ -106,6 +107,13 @@
                                                  {:type (:dtype slot) :value (launch/resolve-expression {} value)}
                                                  (get buffers value)))
                                              (:abi a) (:arguments a)))) (:nodes g))))]
+    (is (= [] (graph-call/external-alias-violations
+               ordinary {'A :shared-ac 'B :weights 'C :shared-ac} =)))
+    (is (= [:kernel-graph-writable-alias]
+           (mapv :reason (graph-call/external-alias-violations
+                          fused {'A :shared-ac 'B :weights 'C :shared-ac} =))))
+    (is (= [] (graph-call/external-alias-violations
+               fused {'A :activation 'B :weights 'C :result} =)))
     (is (= 3 (count (calls ordinary true))) "global conversion snapshots A before C is written")
     (is (= 2 (count (calls fused false))))
     (is (= :kernel-abi-no-write-alias

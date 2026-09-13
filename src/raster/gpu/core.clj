@@ -1178,10 +1178,6 @@
   [graph]
   (set (map :id (concat (:inputs graph) (:outputs graph)))))
 
-(defn- write-access?
-  [access]
-  (contains? #{:write :read-write} access))
-
 (defn- resolve-graph-elements
   [scalar-values expression]
   (let [bound (get scalar-values expression ::not-bound)
@@ -1224,42 +1220,6 @@
                        :shape (:shape view) :strides (:strides view)})))
     view))
 
-(defn- node-physical-hazard?
-  [external-bindings earlier later]
-  (boolean
-   (some (fn [earlier-use]
-           (some (fn [later-use]
-                   (let [earlier-view (get-in external-bindings [(:buffer earlier-use) :view])
-                         later-view (get-in external-bindings [(:buffer later-use) :view])]
-                     (and earlier-view later-view
-                          (bview/overlaps? earlier-view later-view)
-                          (or (write-access? (:access earlier-use))
-                              (write-access? (:access later-use))))))
-                 (:uses later)))
-         (:uses earlier))))
-
-(defn- validate-physical-aliases!
-  "Prove hazards introduced when distinct graph identities are bound to overlapping views. The
-   symbolic graph validator cannot see these aliases, so binding must reject same-kernel writable
-   aliases and require the same explicit dependency rule across kernels."
-  [graph external-bindings]
-  (doseq [node (:nodes graph)
-          [index left] (map-indexed vector (:uses node))
-          right (drop (inc index) (:uses node))]
-    (let [left-view (get-in external-bindings [(:buffer left) :view])
-          right-view (get-in external-bindings [(:buffer right) :view])]
-      (when (and left-view right-view
-                 (bview/overlaps? left-view right-view)
-                 (or (write-access? (:access left)) (write-access? (:access right))))
-        (throw (ex-info "one kernel cannot bind overlapping writable graph buffer views"
-                        {:node (:id node) :left (:buffer left) :right (:buffer right)})))))
-  (doseq [[later-index later] (map-indexed vector (:nodes graph))
-          earlier (take later-index (:nodes graph))
-          :when (node-physical-hazard? external-bindings earlier later)
-          :when (not (contains? (set (:dependencies later)) (:id earlier)))]
-    (throw (ex-info "kernel graph omits a dependency introduced by overlapping resident views"
-                    {:node (:id later) :missing (:id earlier)})))
-  external-bindings)
 
 (defn- runtime-buffer-for-view
   [device-id buffer view]
@@ -1465,7 +1425,7 @@
                                    buffer-keys)
            _ (doseq [[id {:keys [view]}] external-bindings]
                (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
-           _ (validate-physical-aliases! graph external-bindings)
+           _ (kgcall/validate-external-aliases! graph (update-vals external-bindings :view) bview/overlaps?)
            _ (release-graph-events! sess graph-key)
            temporary-specs (kgcall/temporary-specs graph scalar-values)
            temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
