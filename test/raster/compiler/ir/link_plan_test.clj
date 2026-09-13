@@ -77,6 +77,25 @@
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
 
+(deftest borrowing-storage-preserves-code-and-extracts-owner-obligations
+  (let [original (valid-plan)
+        {:keys [plan allocations initializers initialization]} (link/borrow-owned-storage original)]
+    (is (= #{:x :w0 :w1 :hidden :out} (set (keys allocations))))
+    (is (every? #(= :owned (:ownership %)) (vals allocations)))
+    (is (= #{:x :w0 :w1} (set (keys initializers))))
+    (is (identical? (get-in original [:nodes :x :source]) (get-in initializers [:x :source])))
+    (is (= (link/initialization-contract original) initialization))
+    (is (every? #(and (nil? (:source %))
+                     (= :borrowed (get-in % [:view :allocation :ownership]))) (vals (:nodes plan))))
+    (is (every? #(= :borrowed (get-in % [:abstract :ownership])) (vals (:values plan))))
+    (is (= (:instances original) (:instances plan)))
+    (is (= (:outputs original) (:outputs plan)))
+    (is (= (get-in original [:nodes :x :view]) (get-in initializers [:x :view])))
+    (let [again (link/borrow-owned-storage plan)]
+      (is (= plan (:plan again)))
+      (is (empty? (:allocations again)))
+      (is (empty? (:initializers again))))))
+
 (deftest initialization-contract-separates-caller-data-from-ordered-producers
   (let [initialized (valid-plan)
         caller (update initialized :nodes

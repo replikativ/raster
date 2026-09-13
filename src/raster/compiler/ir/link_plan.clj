@@ -1062,6 +1062,39 @@
     (validate! (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases
                            attributes))))
 
+(defn borrow-owned-storage
+  "Project a local plan's owned allocations into storage borrowed from an enclosing execution.
+   Returns the validated :plan plus original :allocations and :initializers to realize once in
+   the owner. Initialization requirements refer to the original plan, before sources are removed.
+   No allocation, upload, ownership transfer or initialization proof occurs here. The owner must
+   keep every supplied buffer alive through all local execution and release borrowed registrations
+   before freeing storage. Already external/borrowed allocations retain their original contracts."
+  [plan]
+  (let [plan (validate! plan)
+        initialization (initialization-contract plan)
+        owned? (fn [node] (= :owned (get-in node [:view :allocation :ownership])))
+        allocations (into {} (keep (fn [[_ node]]
+                                     (when (owned? node)
+                                       (let [a (get-in node [:view :allocation])]
+                                         [(:id a) a])))) (:nodes plan))
+        initializers (into {} (keep (fn [[id node]]
+                                     (when (:source node) [id {:view (:view node) :source (:source node)}])))
+                           (:nodes plan))
+        nodes (update-vals (:nodes plan)
+                           (fn [node]
+                             (if (owned? node)
+                               (-> node (assoc :source nil)
+                                   (assoc-in [:view :allocation :ownership] :borrowed))
+                               node)))
+        values (update-vals (:values plan)
+                            (fn [value]
+                              (if (owned? (get-in plan [:nodes (get-in value [:leaves 0 :node])]))
+                                (assoc-in value [:abstract :ownership] :borrowed)
+                                value)))]
+    {:plan (validate! (assoc plan :nodes nodes :values values))
+     :allocations allocations :initializers initializers
+     :initialization initialization}))
+
 (defn instance-roles
   "Resolve compiler-symbol roles for the runtime binder. Only `:constant` affects executable
    prologue hoisting today; the complete role map remains data for residency/lifetime policy."
