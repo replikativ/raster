@@ -2,14 +2,17 @@
   "Exact target-neutral operations introduced by matrix-contraction graph scheduling.
 
    A MatrixStage is later than a semantic SegRed and earlier than KernelBody. It records the
-   representation, batching, reduction partition and result transform chosen for one graph node;
+   representation, batching, reduction partition and input/result transforms chosen for one graph node;
    distinct direct, split-K and batched stages therefore cannot share a fabricated source
-   identity in refinement certificates."
-  (:require [raster.compiler.core.dtype :as dtype]))
+   identity in refinement certificates. Input value regions map physical operand elements to
+   operand-dtype fragments; the closed typed SSA region retains the conversion policy without
+   introducing a second scalar language or assuming target support."
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.kernel-body :as kernel-body]))
 
 (defrecord MatrixStage
            [id lhs rhs result dimensions batching reduction result-shape epilogue
-            operand-dtype accumulator-dtype result-dtype schedule])
+            operand-dtype accumulator-dtype result-dtype schedule input-value-regions])
 
 (defn matrix-stage?
   [value]
@@ -22,7 +25,7 @@
     (throw (ex-info "expected a MatrixStage"
                     {:reason :matrix-stage-type :actual (type stage)})))
   (let [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
-                operand-dtype accumulator-dtype result-dtype schedule]} stage]
+                operand-dtype accumulator-dtype result-dtype schedule input-value-regions]} stage]
     (doseq [[field value] [[:id id] [:lhs lhs] [:rhs rhs] [:result result]]]
       (when (nil? value)
         (throw (ex-info "matrix stage is missing an identity"
@@ -61,13 +64,24 @@
       (when-not (and (dtype/known? value) (= value (dtype/canon value)))
         (throw (ex-info "matrix stage requires canonical numerical dtypes"
                         {:reason :matrix-stage-dtype :field field :dtype value}))))
+    (when-not (and (map? input-value-regions)
+                   (every? (set [lhs rhs]) (keys input-value-regions)))
+      (throw (ex-info "matrix input regions must name current operands"
+                      {:reason :matrix-stage-input-regions :regions input-value-regions})))
+    (doseq [[input region] input-value-regions
+            :let [physical-dtype (:accumulator-dtype region)]]
+      (when-not (and (dtype/known? physical-dtype)
+                     (= physical-dtype (dtype/canon physical-dtype)))
+        (throw (ex-info "matrix input region requires a canonical physical input dtype"
+                        {:reason :matrix-stage-input-dtype :input input :dtype physical-dtype})))
+      (kernel-body/validate-input-value-region! region physical-dtype operand-dtype))
     stage))
 
 (defn make
   [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
-           operand-dtype accumulator-dtype result-dtype schedule]
-    :or {operand-dtype :half accumulator-dtype :float result-dtype :float}}]
+           operand-dtype accumulator-dtype result-dtype schedule input-value-regions]
+    :or {operand-dtype :half accumulator-dtype :float result-dtype :float input-value-regions {}}}]
   (validate!
    (->MatrixStage id lhs rhs result (vec dimensions) batching reduction (vec result-shape)
                   epilogue (dtype/canon operand-dtype) (dtype/canon accumulator-dtype)
-                  (dtype/canon result-dtype) schedule)))
+                  (dtype/canon result-dtype) schedule input-value-regions)))
