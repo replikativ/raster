@@ -8,18 +8,21 @@
    what makes gradient computation run on device.
 
    The full mse∘linear-nb train step returning updated weights is checked for resident
-   compilation and, on a device, numerical agreement with the CPU update.
+   compilation and, through the direct equation-first LinkPlan, repeated numerical agreement
+   with CPU updates over resident mutable weights.
 
    Device checks use Level Zero. Schedule selection retains precision and index-width legality;
    residency is not a claim that an XMX candidate was selected. Skips visibly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
+            [raster.compiler.equation-first :as equation-first]
             [raster.dl.array-ops :as ops]
             [raster.dl.attention :as attn]
             [raster.arrays :as ra]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.gpu.descriptor-fixture :as fixture]))
 
 ;; Availability + skip routing use the shared HONEST probe (raster.dl.gpu-grad-parity):
@@ -353,21 +356,35 @@
             "mse∘linear train step must extract fully resident (matmuls + fused loss + SGD)")
         (when p
           (is (seq (:steps p)) "resident descriptor carries kernel steps"))))
-    (testing "a small AD/SGD update executes numerically, not only as a resident descriptor"
-      (if-not @gp/gpu-available?
-        (gp/gpu-skip! "gpu-ad-full-train-step-execution")
-        (let [batch 2 in-f 3 out-f 2 lr 0.01
-              weights (rnd (* in-f out-f) 31)
-              initial-weights (vec weights)
-              input (rnd (* batch in-f) 32)
-              target (rnd (* batch out-f) 33)
-              expected (@train (aclone weights) input target batch in-f out-f lr)
-              {:keys [out]} (run-resident train
-                                         [weights input target batch in-f out-f lr])]
-          (is (= (* in-f out-f) (count out) (count expected)))
-          (is (< (rel-err out expected) 1e-3)
-              "the GPU update matches the complete CPU AD and SGD composition")
-          (is (not= initial-weights (vec expected))
-              "the fixture performs a nontrivial weight update")
-          (is (not= initial-weights (vec out))
-              "the GPU cannot satisfy the check by returning unchanged weights"))))))
+    (let [compilation (equation-first/compile train {:target :ze:0 :dtype :float})
+          batch 2 in-f 3 out-f 2 lr 0.01
+          weights (rnd (* in-f out-f) 31)
+          initial-weights (vec weights)
+          input (rnd (* batch in-f) 32)
+          target (rnd (* batch out-f) 33)
+          plan (equation-first/lower compilation
+                                     [weights input target batch in-f out-f lr])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations])))
+      (testing "direct AD/SGD updates replay over resident weights without host reupload"
+        (if-not @gp/gpu-available?
+          (gp/gpu-skip! "gpu-ad-full-train-step-execution")
+          (let [expected (aclone weights)
+                previous (volatile! initial-weights)
+                live (gpu-link/instantiate! plan)]
+            (try
+              (dotimes [_ 2]
+                (@train expected input target batch in-f out-f lr)
+                (gpu-link/run! live)
+                (let [out (gpu-link/download live (first (:outputs plan)))]
+                  (is (= (* in-f out-f) (count out) (count expected)))
+                  (is (< (rel-err out expected) 1e-3)
+                      "each resident replay matches the complete CPU AD and SGD composition")
+                  (is (not= initial-weights (vec expected))
+                      "the fixture performs a nontrivial weight update")
+                  (is (not= @previous (vec out))
+                      "each GPU replay advances weights rather than returning the prior update")
+                  (vreset! previous (vec out))))
+              (is (= initial-weights (vec weights))
+                  "the host initialization array is not the evolving resident state")
+              (finally (gpu-link/close! live)))))))))
