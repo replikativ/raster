@@ -21,6 +21,7 @@
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [clojure.string :as str]
             [clojure.walk :as walk]))
 
@@ -229,7 +230,11 @@
   [segmap isa array-syms]
   (let [idx    (ss/seg-idx segmap)
         bound  (ss/seg-bound segmap)
-        raw    (:lambda segmap)
+        ;; Canonical TypedSOAC conversions are semantic middle-end terms, not target intrinsics.
+        ;; Project them through their retained source spelling at this emitter boundary.  The
+        ;; conversion attributes have already been certified, and both the vector expression and
+        ;; scalar tail must see the same projection.
+        raw    (some-> (:lambda segmap) soac-dialect/scalar-converts->source)
         ;; inline pure value-lets so a let*-bodied map (composed kernels: folded/scale
         ;; bindings) is a single lane expression — no manual source inlining needed.
         lambda (when raw (inline-lets (ss/normalize-invk (ss/clean-dead-bindings raw))))

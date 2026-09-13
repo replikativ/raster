@@ -25,10 +25,19 @@
           [[:nonzero-init (assoc-in (source-components 4) [:opts :stages 2 :init] 1)]
            [:wrong-map (assoc-in (source-components 4) [:opts :operands 0 :map]
                                 (am/of-axes '[[sb 2] [i 2] [blk 2] [t 4]]))]
-           [:extra-factor (update (source-components 4) :body #(list '* % 2))]
            [:escaped-axis (assoc-in (source-components 4) [:opts :stages 0 :lift] '(* inner t))]]]
     (is (thrown? clojure.lang.ExceptionInfo (staged/lower (facts/from-components components)))
-        (name case-id))))
+        (name case-id)))
+  (let [scheduled (staged/lower
+                   (facts/from-components
+                    (update (source-components 4) :body #(list '* % 2))))
+        integer-products (filter #(and (map? %) (= :* (:op %))
+                                       (contains? #{:long :int} (:result-type %)))
+                                 (tree-seq coll? seq (:body scheduled)))]
+    (is (= 2 (count integer-products)))
+    (is (every? #(= :typed-scalar-range (get-in % [:options :proof :kind]))
+                integer-products)
+        "the generalized scalar schedule admits the factor only with checked range proofs")))
 
 (deftest nonpacked-integer-stages-use-the-same-recursive-schedule
   (doseq [components [(assoc-in (source-components 4) [:opts :stages 2 :dtype] :long)

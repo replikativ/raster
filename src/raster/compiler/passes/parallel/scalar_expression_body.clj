@@ -754,15 +754,22 @@
                                      :expected (:arity intrinsic)
                                      :actual (count arguments)}))
                         (let [comparison? (= :cmp (:kind intrinsic))
+                              ;; An enclosing consumer dtype is not the source arithmetic dtype.
+                              ;; When operand facts determine a checked Long addition feeding a
+                              ;; Float stage, compute the addition as Long and convert its result;
+                              ;; converting operands first changes both overflow and rounding.
+                              source-result-type
+                              (when-not comparison?
+                                (dtype/canon (source-type expression expected env)))
                               operand-type (if comparison?
                                              (dtype/canon
                                               (or (source-type (first arguments) :int env) :int))
-                                             expected)
+                                             source-result-type)
                               lowered (mapv #(cast-lowered
                                               (lower % operand-type env)
                                               operand-type expression)
                                             arguments)
-                              result-type (if comparison? :predicate operand-type)
+                              result-type (if comparison? :predicate source-result-type)
                               ;; Typed source arithmetic has a semantic overflow contract: normal
                               ;; Clojure integral arithmetic is checked, while the explicitly
                               ;; `unchecked-*` forms wrap.  Retain that distinction in KernelBody
@@ -793,8 +800,13 @@
                               computed (compute-ssa operator result-type (mapv :result lowered)
                                                     options (when (scalar-range/contained-in-dtype?
                                                                     result-range result-type)
-                                                              result-range))]
-                          (update computed :operations #(into (vec (mapcat :operations lowered)) %))))))
+                                                              result-range))
+                              computed (update computed :operations
+                                               #(into (vec (mapcat :operations lowered)) %))]
+                          (if (or comparison? (nil? expected)
+                                  (= result-type (dtype/canon expected)))
+                            computed
+                            (cast-lowered computed expected expression))))))
 
                   :else
                   (decline! :scalar-expression

@@ -19,16 +19,79 @@
       (when (and (integer? bound) (<= 1 bound Integer/MAX_VALUE))
         (try
           (let [lowered (map-body/lower operation options)
+                operations (tree-seq coll? seq (get-in lowered [:kernel-body :operations]))
                 loads (filter #(= "raster.compiler.ir.kernel_body.ScalarLoad"
-                                  (some-> % class .getName))
-                              (tree-seq coll? seq (get-in lowered [:kernel-body :operations])))
+                                  (some-> % class .getName)) operations)
+                ;; A lexical map local may be retained as typed SSA rather than beta-expanded
+                ;; into the load coordinate.  Reuse only the range certificates carried by its
+                ;; validated ScalarCompute; otherwise a harmless `(let* [k (+ i j)] (aget a k))`
+                ;; loses the same capacity proof as its inlined spelling.
+                computed-ranges
+                (reduce
+                 (fn [known node]
+                   (if (= "raster.compiler.ir.kernel_body.ScalarCompute"
+                          (some-> node class .getName))
+                     (let [id (get-in node [:result :id])
+                           type (get-in node [:result :type])
+                           expression (:expression node)
+                           proof (get-in expression [:options :proof])
+                           argument-range
+                           (fn [argument]
+                             (cond
+                               (symbol? argument) (get-in known [argument :range])
+                               (and (integer? (:value argument)) (:type argument))
+                               (ranges/literal (:value argument) (:type argument))
+                               :else nil))
+                           arguments (mapv argument-range (:arguments expression))
+                           derived
+                           (or (when (and (= :typed-scalar-range (:kind proof))
+                                          (ranges/contained-in-dtype? proof type))
+                                 (select-keys proof [:lower :upper]))
+                               (when (every? some? arguments)
+                                 (case (:op expression)
+                                   (:+ :- :*)
+                                   (let [range (ranges/arithmetic (:op expression) arguments)]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :quot
+                                   (let [[numerator divisor] arguments
+                                         range (when (and (<= 0 (:lower numerator))
+                                                          (= (:lower divisor) (:upper divisor))
+                                                          (pos? (:lower divisor)))
+                                                 (ranges/quotient arguments))]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :rem
+                                   (let [[numerator divisor] arguments
+                                         d (:lower divisor)
+                                         range (when (and (<= 0 (:lower numerator))
+                                                          (= d (:upper divisor)) (pos? d))
+                                                 {:lower 0
+                                                  :upper (min (:upper numerator) (dec d))})]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :cast
+                                   (let [range (first arguments)]
+                                     (when (and (= :exact (get-in expression [:options :overflow]))
+                                                (ranges/contained-in-dtype? range type))
+                                       range))
+                                   nil)))]
+                       (if (and (symbol? id) derived)
+                         (assoc known id {:type type :range derived})
+                         known))
+                     known))
+                 {index {:type :long :range {:lower 0 :upper (dec bound)}}}
+                 operations)
+                leaf-types (merge (:scalar-types options)
+                                  {index :long}
+                                  (into {} (map (fn [[id fact]] [id (:type fact)]))
+                                        computed-ranges))
+                leaf-ranges (merge {index {:lower 0 :upper (dec bound)}}
+                                   (into {} (map (fn [[id fact]] [id (:range fact)]))
+                                         computed-ranges))
                 requirements
                 (mapv (fn [{:keys [buffer coordinates predicate]}]
                         (when (and (= :map-active predicate) (= 1 (count coordinates)))
                           (when-let [range (ranges/typed-index-range
                                            (first coordinates)
-                                           (assoc (:scalar-types options) index :long)
-                                           {index {:lower 0 :upper (dec bound)}})]
+                                           leaf-types leaf-ranges)]
                             (when (<= 0 (:lower range))
                               [buffer (inc' (:upper range))]))))
                       loads)]

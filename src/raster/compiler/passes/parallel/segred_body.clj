@@ -424,6 +424,31 @@
                                  :index index :arrays arrays}))
                     (append! ((:load lowerer) array [lowered-coordinate])))
 
+                  (dialect/scalar-convert-form? expression)
+                  (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)
+                        {:keys [source-dtype target-dtype rounding overflow]} attributes
+                        source (dtype/canon source-dtype)
+                        target (dtype/canon target-dtype)
+                        _ (when-not (dialect/scalar-convert-attributes? attributes)
+                            (decline! :typed-scalar-convert
+                                      "KernelBody reduction requires a valid typed conversion"
+                                      {:expression expression :attributes attributes}))
+                        lowered (lower operand source)
+                        _ (when-not (= source (:dtype lowered))
+                            (decline! :typed-scalar-convert-source
+                                      "typed reduction conversion disagrees with its operand"
+                                      {:expression expression :expected source
+                                       :actual (:dtype lowered)}))
+                        declared-policy (when-not (= source target)
+                                          (cast-policy source target))]
+                    (when-not (or (= source target)
+                                  (= [rounding overflow] declared-policy))
+                      (decline! :typed-scalar-convert-policy
+                                "typed reduction conversion disagrees with the portable policy"
+                                {:expression expression :declared [rounding overflow]
+                                 :portable declared-policy}))
+                    (cast! lowered target))
+
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
                   (let [target (dtype/dtype-for-scalar-tag

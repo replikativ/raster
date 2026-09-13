@@ -896,7 +896,11 @@
             j-sym (gensym "j__")
             body (clojure.walk/postwalk
                   (fn [form] (if (= form idx) j-sym form))
-                  (bc/desugar-invk body))
+                  ;; Fold scheduling removes the typed Fold terms, but result conversions around
+                  ;; them remain typed IR.  The JVM scalar loop executes descriptor-owned source
+                  ;; operations, just like the vector-map scalar tail; never evaluate the
+                  ;; canonical constructor as ordinary Clojure data.
+                  (bc/desugar-invk (soac-dialect/scalar-converts->source body)))
             store-index (if store-offset (ix+ store-offset j-sym) j-sym)
             value (if cast (list cast body) body)]
         (list 'let* [n-sym (list 'int bound)]

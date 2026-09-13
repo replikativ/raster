@@ -166,6 +166,15 @@
       (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
       (when (descriptor/aget-call? expression)
         (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; A source reduction returns its accumulator.  Its explicit element annotation wins when
+      ;; present; otherwise the accumulator binder/identity owns the result type.  The reduction
+      ;; constructor independently certifies the recurrence at this dtype, so this does not infer
+      ;; a type from the consumer map or manufacture a second operator registry.
+      (when (par/par-reduce-form? expression)
+        (let [{:keys [acc init elem-type]} (par/extract-par-reduce-info expression)]
+          (or (some-> elem-type dtype/canon)
+              (some-> (retained-local-dtype acc init) dtype/canon)
+              (retained-expression-dtype init array-types scalar-types))))
       ;; An ordered reduction loop returns its accumulator on the only exit. The matcher proves
       ;; that recurrence shape and exact exit identity; the accumulator initializer independently
       ;; owns the result dtype. Canonical fold construction later validates the update region at
@@ -175,7 +184,12 @@
                       (contains? #{'loop 'loop*} (first expression))
                       (patterns/match-ordered-reduce-loop expression))]
         (when (= acc-sym else-expr)
-          (retained-expression-dtype acc-init array-types scalar-types)))
+          ;; The loop carry declaration is the recurrence's invariant type. Its literal
+          ;; initializer may have a wider host spelling (`0.0` for a float accumulator), so the
+          ;; retained binder fact outranks that spelling; the initializer remains the fallback
+          ;; when the source did not declare a carry dtype.
+          (or (some-> (retained-local-dtype acc-sym acc-init) dtype/canon)
+              (retained-expression-dtype acc-init array-types scalar-types))))
       ;; Raw compatibility fixtures may lack walker metadata. Reuse the compiler's established
       ;; expression typer with explicit scalar/array facts; never borrow the result target.
       (let [inference-expression
@@ -1167,6 +1181,7 @@
                            (vec (distinct (map :out all-stores)))
                            (mapv :out stores))
             values (mapv :value all-stores)
+            body-dtypes (mapv #(retained-expression-dtype % array-types local-types) values)
             write-indices (mapv :index all-stores)
             predicates (mapv :predicate all-stores)
             analysis-values (concat (map :init analysis-locals) loop-expressions
@@ -1203,6 +1218,7 @@
           (merge {:kind (cond pointwise? :map scatter? :scatter :else :effect-map)
                   :id id :sym symbol :index index :extent extent
                   :results results :locals locals :bodies values :casts (mapv :cast all-stores)
+                  :body-dtypes body-dtypes
                   :write-indices write-indices :predicates predicates
                   :conflict (when scatter? uniform-conflict)
                   :effects (when ordered? ordered-effects)
@@ -1253,8 +1269,14 @@
       (let [operands (or (get-in source [:opts :operands])
                          (mapv #(assoc % :map (contraction-facts/operand-axis-map source %))
                                (:operands source)))
+            body-dtype (retained-expression-dtype (:body source) array-types scalar-types)
+            body (if-let [tag (some-> body-dtype dtype/info :scalar-tag)]
+                   (with-meta (:body source)
+                     (assoc (meta (:body source)) :tag tag :raster.type/tag tag))
+                   (:body source))
             facts (contraction-facts/from-components
                    (-> (select-keys source [:out :free-axes :contract-axes :body :opts])
+                       (assoc :body body)
                        (assoc :dtype (first core-types))
                        (assoc-in [:opts :operands] operands)))
             {:keys [reads scalars]} (contraction-facts/dependencies facts)
@@ -1317,6 +1339,7 @@
                    :init (list 'bit-xor s4 (list 'unsigned-bit-shift-right s4 31))}]]
       {:kind :map :id id :sym symbol :results [symbol]
        :index index :extent extent :locals locals :casts [nil] :bodies [s5]
+       :body-dtypes [:long]
        :inputs #{} :outputs #{seeds} :scalars (set (filter symbol? [base]))
        :result-storage [{:destination seeds :access :write :host-return :buffer}]
        :host-binding symbol :elem-type :long :source-operation :raster.par/rng-fill!})
@@ -1346,6 +1369,7 @@
               io (extract-io body idx [out])]
           (merge {:kind :map :id id :sym symbol :results [symbol]
                   :index idx :extent n :locals [] :casts [nil] :bodies [body]
+                  :body-dtypes [(retained-expression-dtype body array-types scalar-types)]
                   :result-storage [{:destination out :access :write
                                     :host-return :buffer}]
                   :host-binding symbol :elem-type elem-type
@@ -1638,6 +1662,7 @@
                 io (extract-io body index [out])]
             (merge {:kind :map :id id :sym symbol :results [symbol]
                     :index index :extent extent :locals [] :casts [nil] :bodies [body]
+                    :body-dtypes [(retained-expression-dtype body array-types scalar-types)]
                     :result-storage [{:destination out :access :write :host-return :buffer}]
                     :host-binding symbol :elem-type contraction-dtype
                     :source-operation :raster.par/contract}
@@ -2423,10 +2448,17 @@
                      (generated-scaffolding? description physical-outputs)))
     :map (let [target-dtype (or (:elem-type description)
                                 (:result-dtype description) :double)]
-           (and (every? (fn [[cast body source-dtype]]
+           (and (= (count (:casts description))
+                   (count (:bodies description))
+                   (count (:body-dtypes description)))
+                (every? (fn [[cast body source-dtype]]
                           (or (nil? cast)
-                              (some? (typed-source-conversion
-                                      cast body source-dtype target-dtype))))
+                              (let [declared-target
+                                    (or (some-> cast descriptor/cast-result-tag
+                                                dtype/dtype-for-scalar-tag dtype/canon)
+                                        target-dtype)]
+                                (some? (typed-source-conversion
+                                        cast body source-dtype declared-target)))))
                         (map vector (:casts description) (:bodies description)
                              (:body-dtypes description)))
                 (or (:pure? description)
@@ -2590,7 +2622,22 @@
 
 (defn- canonicalize-scalar-folds
   [expression default-dtype]
-  (let [expression
+  (let [;; A canonical conversion owns distinct source and target dtypes. Protect every such
+        ;; subtree before the generic bottom-up reduce walk reaches its operand using the outer
+        ;; storage dtype; this also covers conversions nested under arithmetic or lexical locals.
+        expression
+        (util/postwalk-preserving-meta
+         (fn [form]
+           (if (dialect/scalar-convert-form? form)
+             (let [{:keys [attributes operand]} (dialect/scalar-convert-parts form)
+                   canonical (canonicalize-scalar-folds operand (:source-dtype attributes))]
+               (if (= canonical operand)
+                 form
+                 (let [converted (dialect/scalar-convert attributes canonical)]
+                   (with-meta converted (merge (meta converted) (meta form))))))
+             form))
+         expression)
+        expression
         (util/postwalk-preserving-meta
          (fn [form]
            (if (par/par-reduce-form? form)
@@ -2665,7 +2712,12 @@
         ;; inside `body` remain intact and retain their checked/unchecked source semantics.
         expressions (mapv (fn [cast body source-dtype]
                             (if cast
-                              (typed-source-conversion cast body source-dtype fold-dtype)
+                              (let [declared-target
+                                    (or (some-> cast descriptor/cast-result-tag
+                                                dtype/dtype-for-scalar-tag dtype/canon)
+                                        fold-dtype)]
+                                (typed-source-conversion
+                                 cast body source-dtype declared-target))
                               body))
                           casts bodies body-dtypes)
         all-expressions (into (mapv :init locals) expressions)

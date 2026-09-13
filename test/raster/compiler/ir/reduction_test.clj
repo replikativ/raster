@@ -287,6 +287,21 @@
            retained)
         "normalizing a let must not make the element invisible to carrier adaptation")))
 
+(deftest scalar-reduction-certification-uses-its-declared-parameter-types
+  (let [step '(let* [diff (clojure.core/-
+                           (clojure.core/aget values (clojure.core/long i))
+                           (clojure.core/aget target (clojure.core/long i)))]
+                     (clojure.core/+ (clojure.core/double acc)
+                                     (clojure.core/* (clojure.core/double diff)
+                                                     (clojure.core/double diff))))
+        product (reduction/scalar
+                 {:accumulator 'acc :neutral 0.0 :dtype :double
+                  :result 'sum :index 'i :step-result step})
+        retained (first (:results (reduction/fold-region product)))]
+    (is (= 'clojure.core/+ (first retained)))
+    (is (not-any? #{'let*} (tree-seq coll? seq retained))
+        "a long reduction index makes its identity casts total during safe let normalization")))
+
 (deftest scalar-reduction-projection-preserves-devirtualized-operation-metadata
   (let [conversion (dialect/scalar-convert
                     {:source-dtype :float :target-dtype :float

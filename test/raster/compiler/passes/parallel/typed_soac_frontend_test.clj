@@ -876,22 +876,26 @@
     (is (= 2 (count (dialect/equations program))))))
 
 (deftest effect-only-pointwise-writes-have-logical-results-and-physical-storage
-  (doseq [[label expression]
+  (doseq [[label expression canonical-storage-conversion?]
           [["map2"
             '(raster.par/map2! a b i n float
                                (+ (clojure.core/aget x i) 1.0)
-                               (* (clojure.core/aget y i) 2.0))]
+                               (* (clojure.core/aget y i) 2.0))
+            true]
            ["independent multi-store map-void"
             '(raster.par/map-void!
               i n
               (do (clojure.core/aset a i (float (+ (clojure.core/aget x i) 1.0)))
-                  (clojure.core/aset b i (float (* (clojure.core/aget y i) 2.0)))))]]]
+                  (clojure.core/aset b i (float (* (clojure.core/aget y i) 2.0)))))
+            false]]]
     (testing label
       (let [program (frontend/form->program
                      (list 'let* ['effect expression] 'effect)
                      {:dtype :float
                       :array-types {'x :float 'y :float 'a :float 'b :float}})
             equation (first (dialect/equations program))
+            body-results (-> equation dialect/operation-parts :lambda
+                             dialect/lambda-parts :body-results)
             facts (dialect/facts program)
             results (vec (nth equation 2))]
         (is (= [[:effect-map 0 0] [:effect-map 0 1]] results))
@@ -899,6 +903,17 @@
         (is (= [:write :write]
                (mapv :access (dialect/result-storage program 0))))
         (is (= #{:memory/write} (:effects facts)))
+        (if canonical-storage-conversion?
+          (is (= [[:double :float] [:double :float]]
+                 (mapv (fn [result]
+                         (let [attributes (:attributes (dialect/scalar-convert-parts result))]
+                           [(:source-dtype attributes) (:target-dtype attributes)]))
+                       body-results))
+              "every map2 result retains its complete source-to-storage conversion")
+          (is (every? #(= 'float
+                          (some-> % descriptor/semantic-op descriptor/cast-result-tag))
+                      body-results)
+              "explicit user store casts remain source operations rather than implicit storage terms"))
         (is (= [] (dialect/outputs program))
             "the host nil result is not mislabeled as a tensor result")))))
 

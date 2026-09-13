@@ -241,8 +241,11 @@
       (is (= [256] (get-in kernel [:launch :workgroup-size]))))
     (doseq [packing [(second quant-kernels) (second padded-kernels)]]
       (let [body (get-in packing [:attributes :kernel-body])
-            ops (:operations body)
-            branch (first (filter #(some (fn [op] (= 'xs (:buffer op))) (:then-operations %)) ops))
+            ops (tree-seq coll? seq (:operations body))
+            branch (first (filter #(and (= "raster.compiler.ir.kernel_body.IfRegion"
+                                           (some-> % class .getName))
+                                        (some (fn [op] (= 'xs (:buffer op)))
+                                              (:then-operations %))) ops))
             condition (first (filter #(= (:condition branch) (get-in % [:result :id])) ops))]
         (is (= :independent (get-in body [:attributes :effect-iteration-order])))
         (is (= :eq (get-in condition [:expression :op])))

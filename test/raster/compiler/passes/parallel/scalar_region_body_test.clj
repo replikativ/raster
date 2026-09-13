@@ -199,8 +199,8 @@
         "Absent retained metadata still uses the owner's contextual dtype")))
 
 (deftest floating-precision-change-does-not-retarget-integral-loop-carries
-  ;; Reduced from the public Q4 projection fixture. This freezes existing behavior, not a
-  ;; proof that widened source carries and the narrower target intrinsic are equivalent.
+  ;; Reduced from the public Q4 projection fixture. The intrinsic owns Int32 arithmetic; the
+  ;; wider loop carry is a distinct exact result conversion, never evidence to retarget dp4a.
   (let [update (with-meta '(raster.par/dp4a a b acc) {:raster.type/tag 'int})
         expression (list 'loop '[j 0 acc 0]
                          (list 'if '(< j n) (list 'recur '(inc j) update) 'acc))
@@ -208,7 +208,15 @@
         loop (last (:operations result))]
     (is (= :long (:type result)))
     (is (= :long (get-in loop [:results 0 :type])))
-    (is (= :long (get-in loop [:operations 0 :result :type])))))
+    (let [dp4a (first (filter #(= :dp4a (get-in % [:expression :op]))
+                               (:operations loop)))
+          widening (first (filter #(and (= :cast (get-in % [:expression :op]))
+                                        (= :long (get-in % [:result :type])))
+                                  (:operations loop)))]
+      (is (= :int (get-in dp4a [:result :type])))
+      (is (= [(:id (:result dp4a))] (get-in widening [:expression :arguments])))
+      (is (= {:rounding :exact :overflow :exact}
+             (get-in widening [:expression :options]))))))
 
 (deftest retained-wide-arithmetic-converts-before-a-narrow-loop-yield
   (let [update (with-meta '(+ acc x) {:raster.type/tag 'double})

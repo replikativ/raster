@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.staged-contraction-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as emitter]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -82,15 +83,15 @@
     (let [mixed (-> source
                     (assoc-in [:stages 1 :dtype] :float)
                     (assoc-in [:opts :stages 1 :dtype] :float))
-          _ (is (nil? (frontend/form->program (form-for mixed) options))
-                "raw compound arithmetic cannot borrow its width from Byte storage")
-          mixed (update mixed :body vary-meta assoc :raster.type/tag 'long)
           p (frontend/form->program (form-for mixed) options)
           retained (get-in (soac/operation-parts (first (soac/equations p)))
                            [:attributes :contraction])]
       (is (= p (soac/validate! p)))
       (is (= :byte (:dtype retained)))
-      (is (= :float (get-in retained [:stages 1 :dtype]))))
+      (is (= :float (get-in retained [:stages 1 :dtype])))
+      (is (= :long (some-> retained :body meta :raster.type/tag
+                           dtype/dtype-for-scalar-tag))
+          "the closure retains the source product width derived from its Byte operands"))
     (let [with-capture (-> source
                            (assoc-in [:stages 0 :lift] '(* inner scale))
                            (assoc-in [:opts :stages 0 :lift] '(* inner scale)))

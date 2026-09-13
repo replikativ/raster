@@ -73,15 +73,47 @@
   (let [program (frontend/form->program dot-map options)
         fold (scalar-fold program)
         {:keys [attributes lambda]} (dialect/scalar-fold-parts fold)
+        conversion (first
+                    (filter dialect/scalar-convert-form?
+                            (tree-seq coll? seq (dialect/equations program))))
         {:keys [parameters locals body-results]} (dialect/lambda-parts lambda)]
     (is (dialect/program-form? (dialect/validate! program)))
-    (is (= :float (:dtype attributes))
-        "the enclosing typed map supplies the reduction dtype")
+    (is (= [:double :float]
+           ((juxt :source-dtype :target-dtype)
+            (:attributes (dialect/scalar-convert-parts conversion))))
+        "the map result conversion retains the source recurrence and float storage dtypes")
+    (is (= :double (:dtype attributes))
+        "the Fold executes at the conversion's source dtype, before float materialization")
     (is (= :implementation-defined (:association attributes)))
     (is (scan/associative-scan? (:algebra attributes)))
     (is (= '[acc col] parameters))
     (is (empty? locals))
     (is (= 1 (count body-results)))))
+
+(deftest canonical-result-conversion-canonicalizes-its-fold-at-the-source-dtype
+  (let [attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :ieee
+                    :source-op 'clojure.core/float}
+        conversion (dialect/scalar-convert
+                    attributes '(raster.par/reduce acc 0.0 i n
+                                                    (+ acc (clojure.core/aget x i))))
+        result (#'frontend/canonicalize-scalar-folds conversion :float)
+        nested (#'frontend/canonicalize-scalar-folds (list '+ 1.0 conversion) :float)
+        {:keys [attributes operand]} (dialect/scalar-convert-parts result)
+        nested-conversion (first (filter dialect/scalar-convert-form?
+                                         (tree-seq coll? seq nested)))
+        nested-fold (:operand (dialect/scalar-convert-parts nested-conversion))]
+    (is (= {:source-dtype :double :target-dtype :float
+            :rounding :nearest-even :overflow :ieee
+            :source-op 'clojure.core/float}
+           attributes))
+    (is (dialect/scalar-fold-form? operand))
+    (is (= :double (get-in (dialect/scalar-fold-parts operand) [:attributes :dtype])))
+    (is (dialect/scalar-fold-form? nested-fold)
+        "a conversion nested under arithmetic protects its recurrence from the outer dtype")
+    (is (= :double (get-in (dialect/scalar-fold-parts nested-fold) [:attributes :dtype])))
+    (is (= :float
+           (get-in (dialect/scalar-convert-parts result) [:attributes :target-dtype])))))
 
 (deftest general-nested-recurrence-remains-ordered
   (let [program (frontend/form->program ordered-map options)
