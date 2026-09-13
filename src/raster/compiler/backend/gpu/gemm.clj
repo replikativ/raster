@@ -164,28 +164,22 @@
      (c-emit/c-symbol kernel-name) scheduled target-dialect
      {:parameter-names parameter-names})))
 
-(defn- scalar-contraction-form
+(defn- scalar-contraction-facts
   [variant]
-  (case variant
-    :nn '(raster.par/contract C [[i m] [j n]] [[l k]]
-                               (* (aget A (+ (* i k) l))
-                                  (aget B (+ (* l n) j))))
-    :nt '(raster.par/contract C [[i m] [j n]] [[l k]]
-                               (* (aget A (+ (* i k) l))
-                                  (aget B (+ (* j k) l))))
-    :tn '(raster.par/contract C [[i m] [j n]] [[l k]]
-                               (* (aget A (+ (* l m) i))
-                                  (aget B (+ (* l n) j))))
-    :tt '(raster.par/contract C [[i m] [j n]] [[l k]]
-                               (* (aget A (+ (* l m) i))
-                                  (aget B (+ (* j k) l))))))
+  (let [[a-index b-index]
+        (case variant
+          :nn ['(+ (* i k) l) '(+ (* l n) j)]
+          :nt ['(+ (* i k) l) '(+ (* j k) l)]
+          :tn ['(+ (* l m) i) '(+ (* l n) j)]
+          :tt ['(+ (* l m) i) '(+ (* j k) l)])]
+    (contraction-facts/from-components
+     {:out 'C :free-axes '[[i m] [j n]] :contract-axes '[[l k]] :dtype :float
+      :body (list '* (list 'aget 'A a-index) (list 'aget 'B b-index))})))
 
 (defn- portable-scalar-matrix-plan
   [variant stage-id]
-  (let [form (scalar-contraction-form variant)
-        facts (contraction-facts/contraction-facts form :dtype :float)
-        operation (contract-lower/contract-form->segred
-                   form :id stage-id :dtype :float :facts facts)
+  (let [facts (scalar-contraction-facts variant)
+        operation (contract-lower/contraction-facts->segred facts :id stage-id)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'A :float 'B :float 'C :float}
@@ -585,12 +579,11 @@
 (defn- split-k-combine-plan
   ([stage-id] (split-k-combine-plan stage-id {'mn :int 'splits :int}))
   ([stage-id scalar-types]
-  (let [form '(raster.par/contract C [[i mn]] [[s splits]]
-                                   (clojure.core/aget
-                                    partials (clojure.core/+ (clojure.core/* s mn) i)))
-        facts (contraction-facts/contraction-facts form :dtype :float)
-        operation (contract-lower/contract-form->segred
-                   form :id stage-id :dtype :float :facts facts)
+  (let [facts (contraction-facts/from-components
+               {:out 'C :free-axes '[[i mn]] :contract-axes '[[s splits]] :dtype :float
+                :body '(clojure.core/aget
+                        partials (clojure.core/+ (clojure.core/* s mn) i))})
+        operation (contract-lower/contraction-facts->segred facts :id stage-id)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'partials :float 'C :float}

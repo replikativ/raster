@@ -26,20 +26,15 @@
   [contract-axes body]
   (contraction-facts/flatten-contract-axes contract-axes body))
 
-(defn contract-form->segred
-  "Parse `(raster.par/contract out [[i mi] …] [[k mk]] body & opts)` → a segmented SegRed.
-   opts: :init (combine init, default 0.0), :combine (default +). :id/:dtype/:grid via
-   kwargs. Supports one or more contracted axes. Pure + device-free (grid stays the passed value,
-   default nil — the device-aware pass fills it)."
-  [form & {:keys [id dtype grid facts] :or {id 0 dtype :double grid nil}}]
-  (let [[_ out free-axes contract-axes] form
-        facts (or facts (contraction-facts/contraction-facts form :dtype dtype))
-        _ (when-not (and (contraction-facts/facts? facts)
-                         (= form (:form facts))
-                         (= dtype (:dtype facts)))
-            (throw (ex-info "contract lowering requires facts derived from the same form"
-                            {:reason :contraction-facts-mismatch
-                             :form form :dtype dtype :facts facts})))
+(defn contraction-facts->segred
+  "Project verified contraction semantics into a segmented schedule without a surface form.
+   The canonical ProductReduction, iteration axes, storage operands and dtype are retained.
+   Pure and device-free; target planning supplies a grid later."
+  [facts & {:keys [id grid] :or {id 0 grid nil}}]
+  (let [_ (when-not (contraction-facts/facts? facts)
+            (throw (ex-info "contract lowering requires verified contraction facts"
+                            {:reason :contraction-facts-mismatch :facts facts})))
+        {:keys [out free-axes contract-axes dtype]} facts
         ;; ZERO free axes is legal: the SegSpace then has only the reduced dim, i.e. exactly the
         ;; 1-D shape (segop/seg-space-1d?) that the full-reduction emitter consumes.
         _ (assert (vector? free-axes) "contract-lower: free-axes must be a vector")
@@ -74,6 +69,16 @@
                     :segmented
                     nil
                     dtype)))
+
+(defn contract-form->segred
+  "Source compatibility entry: parse once, then use the source-free semantic projection."
+  [form & {:keys [id dtype grid facts] :or {id 0 dtype :double grid nil}}]
+  (let [facts (or facts (contraction-facts/contraction-facts form :dtype dtype))]
+    (when-not (and (contraction-facts/facts? facts)
+                   (= form (:form facts)) (= dtype (:dtype facts)))
+      (throw (ex-info "contract lowering requires facts derived from the same form"
+                      {:reason :contraction-facts-mismatch :form form :dtype dtype :facts facts})))
+    (contraction-facts->segred facts :id id :grid grid)))
 
 (defn contraction-facts->segmap
   "Project a zero-reduction contraction's verified facts into its semantic map space.
