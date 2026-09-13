@@ -32,3 +32,15 @@
     (is (= true (:allocates? (descriptor/get-buffer-semantics 'test.descriptor/op))))
     (is (= true (descriptor/mutating-op? 'test.descriptor/op)))
     (is (fn? (descriptor/get-device-rule 'test.descriptor/op)))))
+
+(deftest relational-comparisons-own-their-boolean-result-test
+  (testing "all surface spellings share comparison semantics and a fixed Boolean result"
+    (doseq [[op kind] [['< :lt] ['clojure.core/< :lt] ['raster.numeric/< :lt]
+                       ['<= :le] ['clojure.core/<= :le] ['raster.numeric/<= :le]
+                       ['> :gt] ['clojure.core/> :gt] ['raster.numeric/> :gt]
+                       ['>= :ge] ['clojure.core/>= :ge] ['raster.numeric/>= :ge]
+                       ['== :eq] ['clojure.core/== :eq] ['raster.numeric/== :eq]
+                       ['not= :ne] ['clojure.core/not= :ne] ['raster.numeric/not= :ne]]]
+      (is (= kind (descriptor/comparison-kind op)) (str op " comparison kind"))
+      (is (= 'boolean (descriptor/result-tag op ['long 'long]))
+          (str op " result tag")))))

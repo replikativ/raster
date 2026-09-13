@@ -64,6 +64,35 @@
     (is (mex/core-skip-head? 'raster.par/reduce))
     (is (not (mex/core-skip-head? 'raster.params/defmodel)))))
 
+(deftest macroexpand-core-carries-types-to-generated-let-binders
+  (testing "and/or generated single-evaluation binders retain their initializer type"
+    (doseq [head '[and or]]
+      (let [comparison (with-meta '(clojure.core/>= i 0)
+                         {:raster.type/tag 'boolean})
+            out (mex/macroexpand-core (list head comparison 'tail))
+            [_ bindings] out
+            [binder init] bindings]
+        (is (= 'let* (first out)))
+        (is (= comparison init))
+        (is (= 'boolean (:raster.type/tag (meta binder))))
+        (is (nil? (:tag (meta binder))) "does not invent a JVM primitive local hint"))))
+  (testing "the propagation is value-preserving, not an `and`-is-Boolean rule"
+    (let [value (with-meta '(identity x) {:raster.type/tag 'floats
+                                          :raster.type/element 'float})
+          [_ bindings] (mex/macroexpand-core (list 'and value 'tail))
+          binder (first bindings)]
+      (is (= 'floats (:raster.type/tag (meta binder))))
+      (is (= 'float (:raster.type/element (meta binder))))))
+  (testing "unknown initializers remain unknown and loop carries are not typed from their init"
+    (let [[_ and-bindings] (mex/macroexpand-core '(and (unknown x) tail))
+          [_ loop-bindings] (mex/macroexpand-core
+                             (list 'loop [(with-meta 'carry {})
+                                          (with-meta '(identity x)
+                                            {:raster.type/tag 'long})]
+                                   'carry))]
+      (is (nil? (:raster.type/tag (meta (first and-bindings)))))
+      (is (nil? (:raster.type/tag (meta (first loop-bindings))))))))
+
 (deftest resugar-interop-restores-method-sugar
   (testing "canonical (. obj method args) → (.method obj args)"
     (is (= '(.invk impl a b) (mex/resugar-interop '(. impl invk a b))))

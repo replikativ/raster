@@ -873,14 +873,20 @@
 
 (defn register-comparison!
   "Register the relational kind of a binary comparison operator as the
-   :comparison facet: {:kind :lt|:le|:gt|:ge|:eq|:ne}. Like register-algebra!,
-   this lives in the unified registry — one entry per op, extensible by other
-   namespaces — rather than a bespoke set.
+   :comparison facet: {:kind :lt|:le|:gt|:ge|:eq|:ne}, together with its fixed
+   Boolean result type. Like register-algebra!, this lives in the unified
+   registry — one entry per op, extensible by other namespaces — rather than a
+   bespoke set.
 
    (This is distinct from comparison-op?, which is the broader AD notion of a
    non-differentiable boolean op, including unary predicates like zero?/pos?.)"
   [op-sym kind]
-  (register-op-descriptor! op-sym {:comparison {:kind kind}}))
+  ;; This registration runs before register-result-type! is defined below, so
+  ;; merge both facets directly.  It is still one descriptor row and one source
+  ;; of truth: comparison kind drives scalar lowering, while result type lets
+  ;; the walker carry the source Boolean through closed-core macro expansion.
+  (register-op-descriptor! op-sym {:comparison {:kind kind}
+                                   :result-type {:rule 'boolean}}))
 
 (defn comparison-kind
   "The relational :kind of op-sym (:lt/:le/:gt/:ge/:eq/:ne), or nil."
