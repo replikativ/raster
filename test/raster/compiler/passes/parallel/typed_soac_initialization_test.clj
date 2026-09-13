@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-initialization-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -74,6 +75,36 @@
 (defn- reason [program]
   (try (initialization/materialize program) nil
        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+
+(deftest logical-prefix-shape-is-not-the-allocation-capacity
+  (doseq [domain [4 'm]]
+    (let [p (frontend/form->program (source '(float-array 8) domain)
+                                   {:dtype :float :array-types {'input :float 'output :float}
+                                    :scalar-types {'m :long}})
+          p (with-facts p #(assoc-in % [:values 'output :shape] [domain]))
+          [scheduled stats] (initialization/materialize p)]
+      (is (= 1 (:initialization-fills stats)))
+      (is (= 8 (get-in (dialect/operation-parts (first (dialect/equations scheduled)))
+                       [:attributes :extent])))
+      (is (= [domain] (get-in (dialect/facts scheduled) [:values 'output :shape]))))))
+
+(deftm fixed-capacity-prefix
+  [input :- (Array float) domain :- Long] :- (Array float)
+  (let [output (float-array 8)]
+    (raster.par/map! output i domain float (raster.arrays/aget input i))))
+
+(deftest symbolic-logical-demand-is-checked-against-concrete-capacity
+  (doseq [target [:cuda:0 :hip:0]]
+    (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target target :dtype :float})]
+      (doseq [n [4 8]]
+        (let [plan (equation-first/lower compiled [(float-array n) n])]
+          (is (link-plan/link-plan? plan))
+          (is (= 0 (get-in plan [:attributes :driver-allocations])))))
+      (let [failure (try (equation-first/lower compiled [(float-array 9) 9]) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :program-link-value-contract (:reason failure)))
+        (is (= 8 (:physical-elements failure)))
+        (is (= 9 (:logical-elements failure)))))))
 
 (deftest initialization-contracts-fail-closed
   (let [program (program (source '(float-array 8) 4))]

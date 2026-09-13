@@ -1090,6 +1090,13 @@ The shared extent proof follows retained integral scalar SSA and checked Long pr
 equal dimensions with reordered factors without erasing narrowing, floating, or wrapping
 arithmetic. Allocation size must equal result volume: padding still requires initialization.
 Write-only permission alone proves nothing for conditional effect stores or sparse updates.
+Allocation cardinality is separate from a destination AbstractValue's logical consumer shape.
+For example, an AD gradient may be allocated with `in*out` elements and later consumed over
+`alength(weights)`. These remain independent symbolic identities: the initializer covers the
+constructor extent, while concrete invocation/LinkPlan validation checks logical demand against
+capacity. Known undersized allocations fail statically; neither symbolic equality nor extra
+capacity is a license to elide a fill. Plain representation and absent logical layout remain
+mandatory for this initialization route.
 Unsupported extent, dtype, placement, alias, and observable-host-use contracts fail closed.
 General effect-map dense-image proofs remain work; this does not change the matrix selector.
 Storage first consumed by retained host bindings keeps the native allocation provider and host

@@ -118,7 +118,7 @@
                 (assoc-in [:equations id] equation-facts)
                 (update :effects conj :memory/write))}))
 
-(defn- allocation-contracts! [facts extent-environment]
+(defn- allocation-contracts! [facts]
   (let [allocations (get-in facts [:attributes :allocations] [])]
     (when-not (and (vector? allocations)
                    (every? #(and (map? %) (dialect/value-id? (:destination %))
@@ -143,11 +143,17 @@
         (fail! "zero allocation requires a canonical integral scalar extent"
                {:allocation allocation}))
       (when (and (= :zero (:initialization allocation))
-                 (not (and (plain-storage? value)
-                           (or (= [(list 'unknown-dimension destination)] (:shape value))
-                               (extent-proof/same-volume? extent-environment
-                                                         (:extent allocation) (:shape value))))))
-        (fail! "fresh zero allocation requires matching plain dense storage"
+                 (not (plain-storage? value)))
+        (fail! "fresh zero allocation requires plain dense storage"
+               {:allocation allocation :value value}))
+      ;; AbstractValue shape can be a consumer's logical access domain, not the allocator's
+      ;; physical capacity (e.g. an AD gradient consumed over alength(weights)). The constructor
+      ;; extent is authoritative for initialization. Never guess a symbolic equality here;
+      ;; concrete graph/LinkPlan binding checks access capacity. Reject a known short allocation.
+      (when (and (= :zero (:initialization allocation))
+                 (integer? (:extent allocation)) (every? integer? (:shape value))
+                 (> (reduce *' 1 (:shape value)) (:extent allocation)))
+        (fail! "fresh zero allocation is smaller than its logical access domain"
                {:allocation allocation :value value})))
     allocations))
 
@@ -161,7 +167,7 @@
         extent-environment (extent-proof/environment program)
         allocations (filter #(and (= :zero (:initialization %))
                                   (contains? (:values original-facts) (:destination %)))
-                            (allocation-contracts! original-facts extent-environment))
+                            (allocation-contracts! original-facts))
         {:keys [facts equations pending fills elided native]}
         (reduce
          (fn [{:keys [facts pending] :as state} equation]
