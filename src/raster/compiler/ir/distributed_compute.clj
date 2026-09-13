@@ -3,6 +3,7 @@
    This namespace creates no runtime resources or distributed executor."
   (:require [clojure.set :as set]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.validate :refer [fail!]]))
@@ -29,11 +30,54 @@
              :distributed-compute-entry-device {:device device :entry id}))
     {:link-plan plan :accesses accesses :required (required-values plan accesses)}))
 
+(defn- normalize-reference [reference]
+  (cond
+    (and (map? reference) (= #{:value :shard} (set (keys reference)))) reference
+
+    (and (map? reference) (= #{:local-shape :placements} (set (keys reference))))
+    (let [placements (:placements reference)
+          owned (when (vector? placements) (first placements))]
+      (when-not (and (vector? placements) (= 1 (count placements))
+                     (map? owned) (= :owned (:kind owned))
+                     (= #{:kind :value :shard :local-offsets} (set (keys owned))))
+        (fail! "this materialization requires one owned placement; replica/boundary proofs are not yet implemented"
+               :distributed-compute-placement-coverage {:reference reference}))
+      (assoc (select-keys owned [:value :shard])
+             :local-shape (:local-shape reference) :local-offsets (:local-offsets owned)
+             :explicit-domain? true))
+
+    :else
+    (fail! "binding must name a qualified shard or an explicit local materialization"
+           :distributed-compute-shard-reference {:reference reference})))
+
+(defn- project-domain [local leaves shape]
+  (let [abstract (:abstract local)
+        logical-shape (:shape abstract)
+        layout (:logical-layout abstract)
+        base (:view (first leaves))
+        concrete? #(and (vector? %) (seq %) (every? pos-int? %))]
+    (when-not (and (= :tensor (:kind abstract)) (concrete? shape) (concrete? logical-shape)
+                   (= 1 (count leaves))
+                   (= {:kind :plain} (:representation abstract))
+                   (= {:kind :dense} (:physical-layout local))
+                   (or (nil? layout) (= {:order :row-major} layout)
+                       (= {:strides (view/dense-strides logical-shape)} layout))
+                   (view/contiguous? base)
+                   (= (dtype/canon (:dtype abstract)) (:dtype base))
+                   (= (reduce *' 1 shape) (reduce *' 1 logical-shape)
+                      (reduce *' 1 (:shape base))))
+      (fail! "local coordinates require one plain dense leaf with a proven equal-volume layout"
+             :distributed-compute-local-domain
+             {:value (:id local) :local-shape shape :abstract abstract
+              :physical-layout (:physical-layout local)}))
+    (view/subview base {:shape shape})))
+
 (defn- bind-values [{plan :link-plan :keys [accesses required]} device globals shards bindings]
   (when-not (map? bindings)
     (fail! "compute bindings must map local values to qualified shard references"
            :distributed-compute-bindings {:bindings bindings}))
-  (let [supplied (set (keys bindings))
+  (let [bindings (update-vals bindings normalize-reference)
+        supplied (set (keys bindings))
         available (set/union (set (keys accesses)) (set (link/output-value-ids plan)))]
     (when-not (set/subset? required supplied)
       (fail! "compute binding omits a public local value"
@@ -41,7 +85,8 @@
     (when-not (set/subset? supplied available)
       (fail! "compute binding names an absent or unused local value"
              :distributed-compute-local-value {:unknown (set/difference supplied available)}))
-    (when-not (= (count bindings) (count (distinct (vals bindings))))
+    (when-not (= (count bindings)
+                 (count (distinct (map #(select-keys % [:value :shard]) (vals bindings)))))
       (fail! "one compute call gives one shard distinct local identities"
              :distributed-compute-duplicate-shard {:bindings bindings}))
     ;; LinkPlan validates declared aliases locally, but logical ABI access facts do not
@@ -57,9 +102,6 @@
                  {:bound-node bound-node :private-node private-node}))))
     (into {}
           (map (fn [[id reference]]
-                 (when-not (and (map? reference) (= #{:value :shard} (set (keys reference))))
-                   (fail! "shard identity must be qualified by its global value"
-                          :distributed-compute-shard-reference {:reference reference}))
                  (let [{:keys [value shard]} reference
                        global (get globals value)
                        candidate (first (filter #(= shard (:id %)) (get shards value)))
@@ -73,7 +115,9 @@
                    (when-not (= device (:device candidate))
                      (fail! "compute binding names a shard on another device"
                             :distributed-compute-shard-device {:device device :shard candidate}))
-                   (when-not (and (= (:shape candidate) (get-in local [:abstract :shape]))
+                   (when-not (and (= (:shape candidate) (if (:explicit-domain? reference)
+                                                        (:local-shape reference)
+                                                        (get-in local [:abstract :shape])))
                                   (av/storage-contract-compatible? global (:abstract local)))
                      (fail! "local value does not realize the shard's logical storage contract"
                             :distributed-compute-value-contract
@@ -84,9 +128,17 @@
                                               (get-in % [:view :allocation :memory-space])) leaves))
                      (fail! "local storage violates the global value's memory-space constraint"
                             :distributed-compute-memory-space {:reference reference}))
-                   [id {:value value :shard shard :access (get accesses id)
-                        :physical-layout (:physical-layout local)
-                        :leaves leaves}]))
+                   (let [domain (when (:explicit-domain? reference)
+                                  (project-domain local leaves (:local-shape reference)))
+                         owned (when domain
+                                 (view/rectangular-subview domain
+                                                          {:offsets (:local-offsets reference)
+                                                           :shape (:shape candidate)}))]
+                     [id (cond-> {:value value :shard shard :access (get accesses id)
+                                  :physical-layout (:physical-layout local) :leaves leaves}
+                           domain (assoc :domain {:shape (:local-shape reference) :view domain
+                                                  :placements [{:kind :owned :value value :shard shard
+                                                                :view owned}]}))])))
                bindings))))
 
 (defn bindings

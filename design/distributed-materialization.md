@@ -1,6 +1,13 @@
 # Distributed materialization and execution boundary
 
-Status: reviewed implementation plan, not an implemented execution contract.
+Status: owned-domain normalization is implemented; replica/boundary coverage and execution below
+remain a reviewed implementation plan, not an implemented execution contract.
+
+The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
+placement that covers the entire local domain. Its report retains the original ABI leaf views and
+adds a checked `:domain` with the reshaped view and owned placement. A flat `[6]` leaf can explicitly
+realize a `[2 3]` shard. Padding, replica placements, and boundary placements remain rejected until
+the corresponding coverage/provenance checks land; this is not yet the padded example below.
 
 The current whole-shard binding deliberately requires one local LinkValue to realize one exact
 owned shard. A halo-padded field cannot satisfy that contract by selecting only its owned cells:

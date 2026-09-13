@@ -864,7 +864,11 @@
 (defn compute-bindings
   "Validate and resolve named local compute entries and qualified shard bindings.
    Returns `{:bindings {step-id ...} :unbound [compute-step-id ...]}`. This is a
-   structural compiler contract, not a runtime executor or allocation/transfer proof."
+   structural compiler contract, not a runtime executor or allocation/transfer proof.
+   A binding is either `{:value id :shard id}` or an explicit `{:local-shape [...]
+   :placements [{:kind :owned :value id :shard id :local-offsets [...]}]}`. The latter
+   proves a dense equal-volume local coordinate domain and reports it under `:domain`.
+   Only complete owned-domain coverage is currently admitted, not padding/replicas."
   [plan]
   (compute/bindings (validate-structure! plan)))
 

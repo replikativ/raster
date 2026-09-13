@@ -132,6 +132,55 @@
 (defn- failure-reason [thunk]
   (:reason (ex-data (try (thunk) (catch clojure.lang.ExceptionInfo error error)))))
 
+(defn- explicit-domain [shape]
+  {:local-shape shape
+   :placements [{:kind :owned :value :x :shard :x-0 :local-offsets [0 0]}]})
+
+(deftest flat-local-storage-has-an-explicit-multidimensional-domain
+  (let [local (local-link-plan {:x-shape [6]})
+        plans (device-plans local {:local-x (explicit-domain [2 3])})
+        bound (get-in (distributed/compute-bindings (make-plan {:device-plans plans}))
+                      [:bindings :copy-0 :values :local-x])]
+    (is (= :read (:access bound)))
+    (is (= [6] (get-in bound [:leaves 0 :view :shape]))
+        "the compiled ABI leaf is retained, not silently rewritten")
+    (is (= [2 3] (get-in bound [:domain :view :shape])))
+    (is (= [3 1] (get-in bound [:domain :view :strides])))
+    (is (= (get-in bound [:leaves 0 :view :allocation])
+           (get-in bound [:domain :view :allocation])))
+    (is (= (get-in bound [:domain :view :byte-length])
+           (get-in bound [:domain :placements 0 :view :byte-length])))
+    (is (= :distributed-compute-value-contract
+           (failure-reason #(make-plan {:link-plan local})))
+        "without explicit coordinates the old exact-shape contract is unchanged")))
+
+(deftest local-domain-does-not-admit-unproven-layouts-or-padding
+  (let [local (local-link-plan {:x-shape [6]})
+        check (fn [plan reference]
+                (failure-reason #(make-plan {:device-plans
+                                            (device-plans plan {:local-x reference})})))]
+    (is (= :distributed-compute-value-contract (check local (explicit-domain [3 3])))))
+  (let [local (local-link-plan {:x-shape [6]})
+        plans (device-plans local {:local-x (explicit-domain [2 3])})]
+    (doseq [[changed expected]
+            [[(assoc-in local [:values :local-x :physical-layout] {:kind :packed})
+              :distributed-compute-local-domain]
+             [(-> local
+                  (assoc-in [:nodes :x-node :view :strides] [0])
+                  (assoc-in [:nodes :x-node :view :byte-length] 4))
+              :link-noncontiguous-binding]]]
+      (is (= expected
+             (failure-reason #(make-plan {:device-plans
+                                         (assoc-in plans [:gpu-0 :entries :copy :link-plan] changed)})))))
+    (is (= :buffer-view-region
+           (failure-reason #(make-plan {:device-plans
+                                       (assoc-in plans [:gpu-0 :steps :copy-0 :bindings :local-x
+                                                        :placements 0 :local-offsets] [1 0])}))))
+    (is (= :distributed-compute-placement-coverage
+           (failure-reason #(make-plan {:device-plans
+                                       (assoc-in plans [:gpu-0 :steps :copy-0 :bindings :local-x
+                                                        :placements] [{:kind :replica :transfer :missing}])}))))))
+
 (deftest compute-bindings-retain-exact-link-values-and-derived-accesses
   (let [plan (make-plan)
         report (distributed/compute-bindings plan)

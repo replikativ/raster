@@ -293,6 +293,37 @@
                                               (double-array n) rows width dt])]
         (is (= 0 (get-in plan [:attributes :driver-allocations])))))))
 
+(deftest compiled-flat-heat-values-bind-through-explicit-local-domains
+  (let [plan (equation/lower @compiled-step [(double-array 56) (double-array 56)
+                                            (double-array 56) 8 width dt])
+        values (update-vals (:values plan)
+                            #(assoc (:abstract %) :shape [8 width]
+                                    :sharding {:kind :partitioned :axis 0 :devices [:ze:0]}))
+        shards (into {} (map (fn [id]
+                              [id [(distributed/shard {:id id :value id :device :ze:0
+                                                       :offsets [0 0] :shape [8 width]})]])
+                            (keys values)))
+        bindings (into {} (map (fn [id]
+                                [id {:local-shape [8 width]
+                                     :placements [{:kind :owned :value id :shard id
+                                                   :local-offsets [0 0]}]}]) (keys values)))
+        distributed (distributed/plan
+                     {:id :compiled-local-domains
+                      :mesh (distributed/mesh [{:name :local :size 1}] [:ze:0])
+                      :topology (distributed/topology
+                                 [(distributed/device {:id :ze:0 :memory-capacity-bytes 1048576})] [])
+                      :values values :shards shards
+                      :device-plans {:ze:0 {:entries {:heat {:link-plan plan}}
+                                           :steps {:step {:entry :heat :bindings bindings}}}}
+                      :steps [(distributed/compute-step {:id :step :device :ze:0 :duration-ns 1})]
+                      :outputs [:step]})
+        report (distributed/compute-bindings distributed)]
+    (is (every? #(= [56] (:shape (:abstract %))) (vals (:values plan))))
+    (is (empty? (:unbound report)))
+    (is (= 3 (count (get-in report [:bindings :step :values]))))
+    (is (every? #(= [8 width] (get-in % [:domain :shape]))
+                (vals (get-in report [:bindings :step :values]))))))
+
 (deftest compiled-two-worker-halos-use-resident-copies
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "compiled-two-worker-resident-halos")
