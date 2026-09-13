@@ -923,12 +923,14 @@
                 (range (min 3 (:trip-count step))))))
       (map-indexed vector (:steps call))))))
 
+(defn- instance-access-facts [{:keys [nodes values instances]}]
+  (mapcat #(if (link-instance? %)
+             (validate-instance-bindings! nodes values %)
+             (validate-program-instance-bindings! nodes values %))
+          instances))
+
 (defn- validate-effects! [{:keys [target nodes values instances outputs aliases] :as plan}]
-  (let [step-facts
-        (mapcat #(if (link-instance? %)
-                   (validate-instance-bindings! nodes values %)
-                   (validate-program-instance-bindings! nodes values %))
-                instances)
+  (let [step-facts (instance-access-facts plan)
         initialized (volatile! (into #{}
                                      (keep (fn [[id {:keys [role source]}]]
                                              ;; Ownership answers who releases storage, not whether
@@ -992,6 +994,22 @@
   "Validate a LinkPlan without allocating storage, registering kernels, or contacting a driver."
   [plan]
   (-> plan validate-plan-structure! validate-allocations-and-aliases! validate-effects!))
+
+(defn value-accesses
+  "Return conservative logical-value accesses from the validated executable ABI.
+
+   Uses the same bound step facts as ownership validation, not node role guesses. Ordered
+   physical fields are joined into their owning LinkValue, independently of packing/dtype.
+   This summarizes reads/writes; it does not prove full initialization, disjoint ranges,
+   external ownership or completion. Unused values are absent."
+  [plan]
+  (let [plan (validate! plan)
+        node-values (into {} (mapcat (fn [[id value]]
+                                      (map (fn [leaf] [(:node leaf) id]) (:leaves value)))
+                                    (:values plan)))]
+    (reduce (fn [accesses {:keys [node access]}]
+              (update accesses (get node-values node) merge-access access))
+            {} (mapcat :facts (instance-access-facts plan)))))
 
 (defn make
   "Construct and purely validate a LinkPlan.
