@@ -52,7 +52,7 @@
     (is (= [] (get-in candidate [:nodes 0 :dependencies])))
     (is (= 'A (:lhs stage)))
     (is (= :float (get-in stage [:input-value-regions 'A :accumulator-dtype])))
-    (is (= :explicit-only (get-in candidate [:attributes :input-fusion :selection])))
+    (is (= :binding-admission-required (get-in candidate [:attributes :input-fusion :selection])))
     (is (identical? (get-in original [:nodes 1 :operation])
                     (get-in candidate [:attributes :input-fusion :consumer])))
     (is (= :no-write-alias (get-in artifact [:abi 0 :aliasing])))
@@ -86,12 +86,34 @@
     (is (= [:convert-b :contract] (mapv (comp last :id) (:nodes candidate))))
     (is (= [:b16] (mapv (comp last :id) (:temporaries candidate))))
     (is (= :xmx-direct (get-in ordinary [:selector :default])))
-    (is (not-any? #(= :xmx-direct-lhs-tile-cast (get-in % [:attributes :strategy]))
-                  (:alternatives ordinary)))
+    (is (contains? (set (map executable/strategy (:alternatives ordinary)))
+                   :xmx-direct-lhs-tile-cast))
     (doseq [override [{:variant :tn} {:variant :tt} {:target-dialect :cuda}
                      {:target-dialect :hip}]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (gemm/emit-matrix-input-fusion-alternative (merge spec override)))))))
+
+(deftest normal-enumeration-retains-checked-input-fusion-without-changing-selection
+  (let [spec {:id :enumeration-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32
+              :fill-workgroups 16
+              :tile (get-in (stage-graph) [:nodes 1 :operation :schedule :tile])}]
+    (doseq [variant [:nn :nt :tn :tt]]
+      (let [result (gemm/emit-matrix-alternatives (assoc spec :variant variant))
+            strategies (set (map executable/strategy (:alternatives result)))]
+        (is (= (contains? #{:nn :nt} variant)
+               (contains? strategies :xmx-direct-lhs-tile-cast)))
+        (is (= :xmx-direct (get-in result [:selector :default])))))
+    (with-redefs [fusion/fuse-lhs-cast (constantly nil)]
+      (is (not (some #(= :xmx-direct-lhs-tile-cast (executable/strategy %))
+                     (:alternatives (gemm/emit-matrix-alternatives (assoc spec :variant :nn))))))
+      (is (= :matrix-input-fusion-ineligible
+             (try (gemm/emit-matrix-input-fusion-alternative (assoc spec :variant :nn))
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (let [failure (ex-info "broken fusion pass" {})]
+      (with-redefs [fusion/fuse-lhs-cast (fn [& _] (throw failure))]
+        (is (identical? failure
+                        (try (gemm/emit-matrix-alternatives (assoc spec :variant :nn))
+                             (catch clojure.lang.ExceptionInfo e e))))))))
 
 (deftest fused-leaf-requires-disjoint-physical-input-and-output
   (let [spec {:id :alias-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32 :variant :nn

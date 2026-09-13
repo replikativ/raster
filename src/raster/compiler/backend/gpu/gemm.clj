@@ -854,29 +854,37 @@
                          :tile tile :vector-width vector-width
                          :requested-splits requested-splits}})
           stage-graph (if (:fuse-lhs-cast? spec)
-                        (or (input-fusion/fuse-lhs-cast stage-graph convert-a-id contract-id)
-                            (throw (ex-info "matrix input cast fusion obligations are not satisfied"
-                                            {:reason :matrix-input-fusion-ineligible :id id})))
-                        stage-graph)
-          emit-spec (assoc spec :strategy strategy)
-          refinement (make-refinement stage-graph source-operation source-graph emit-spec)]
-      (emit-scheduled-stage-graph
-       stage-graph {:target-dialect (get spec :target-dialect :opencl-intel)
-                    :prefix prefix :refinement refinement}))))
+                        (input-fusion/fuse-lhs-cast stage-graph convert-a-id contract-id)
+                        stage-graph)]
+      (when stage-graph
+        (let [emit-spec (assoc spec :strategy strategy)
+              refinement (make-refinement stage-graph source-operation source-graph emit-spec)]
+          (emit-scheduled-stage-graph
+           stage-graph {:target-dialect (get spec :target-dialect :opencl-intel)
+                        :prefix prefix :refinement refinement}))))))
+
+(defn- matrix-input-fusion-target? [{:keys [variant target-dialect]}]
+  (and (contains? #{:nn :nt} variant)
+       (= :opencl-intel (or target-dialect :opencl-intel))))
+
+(defn- matrix-input-fusion-alternative [spec]
+  (when (matrix-input-fusion-target? spec)
+    (xmx-graph (assoc spec :split-k? false :fuse-lhs-cast? true
+                     :vector-width (get spec :vector-width 4)
+                     :strategy :xmx-direct-lhs-tile-cast))))
 
 (defn emit-matrix-input-fusion-alternative
   "Emit an explicit Intel direct-matrix candidate with an inlined lhs FP32→FP16 cast.
-   Not included in automatic dispatch: binding requires physical A/C disjointness, which a
-   shape-only selector cannot prove. Retains the ordinary public ABI and original semantic
+   Binding requires physical A/C disjointness; runtime admission checks the concrete ranges.
+   Retains the ordinary public ABI and original semantic
    refinement source. Unsupported layouts/targets fail closed; no implicit fallback."
   [{:keys [variant target-dialect] :as spec}]
-  (when-not (and (contains? #{:nn :nt} variant)
-                 (= :opencl-intel (or target-dialect :opencl-intel)))
+  (when-not (matrix-input-fusion-target? spec)
     (throw (ex-info "matrix input fusion requires Intel direct NN/NT storage"
                     {:reason :matrix-input-fusion-target :variant variant :target target-dialect})))
-  (xmx-graph (assoc spec :split-k? false :fuse-lhs-cast? true
-                   :vector-width (get spec :vector-width 4)
-                   :strategy :xmx-direct-lhs-tile-cast)))
+  (or (matrix-input-fusion-alternative spec)
+      (throw (ex-info "matrix input cast fusion obligations are not satisfied"
+                      {:reason :matrix-input-fusion-ineligible :id (:id spec)}))))
 
 (defn emit-batched-matrix-alternative
   "Emit one compiler-owned matrix schedule for a leading batch of dense NN contractions.
@@ -1052,6 +1060,7 @@
         split-expression (requested-splits spec)
         xmx-spec (assoc spec :requested-splits split-expression)
         direct (xmx-graph (assoc xmx-spec :split-k? false))
+        fused-input (matrix-input-fusion-alternative xmx-spec)
         split? (not (seq epilogue))
         split (when split? (xmx-graph (assoc xmx-spec :split-k? true)))
         explicit-splits
@@ -1071,7 +1080,8 @@
                   :default :xmx-direct}]
     {:alternatives (cond-> [direct]
                      split (conj split)
-                     (seq explicit-splits) (into explicit-splits))
+                     (seq explicit-splits) (into explicit-splits)
+                     fused-input (conj fused-input))
      :selector selector
      :split-factor-schedules
      (into {} (map (fn [factor] [(split-factor-strategy factor) factor]))
