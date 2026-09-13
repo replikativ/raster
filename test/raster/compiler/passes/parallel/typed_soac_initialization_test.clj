@@ -56,6 +56,15 @@
       (is (= fills (:initialization-fills stats)))
       (is (= (- 1 fills) (:initialization-full-overwrites stats))))))
 
+(deftest allocation-only-public-extent-is-available-before-the-fill
+  (let [p (frontend/form->program (source '(float-array n) 4)
+                                 {:dtype :float :array-types {'input :float 'output :float}
+                                  :scalar-types {'n :long}})
+        [scheduled stats] (initialization/materialize p)]
+    (is (not (some #{'n} (:inputs (dialect/facts p)))))
+    (is (= 1 (:initialization-fills stats)))
+    (is (some #{'n} (:inputs (dialect/facts scheduled))))))
+
 (deftest total-functional-domains-include-boundaries-and-scan-results
   (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float
                                       (+ accumulator (aget input i)))

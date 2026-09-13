@@ -40,10 +40,15 @@
 (defn initial-environment
   "Only incoming scalar values are available before the first equation."
   [program]
-  (let [facts (dialect/facts program)]
+  (let [facts (dialect/facts program)
+        definitions (set (mapcat #(nth % 2) (dialect/equations program)))
+        host-definitions (set (get-in facts [:attributes :source-bindings]))
+        inputs (set (:inputs facts))]
     (into {} (keep (fn [id]
-                     (when-let [proof (opaque-value id (get-in facts [:values id]))]
-                       [id proof]))) (:inputs facts))))
+                     (when (and (not (contains? definitions id))
+                                (or (contains? inputs id) (not (contains? host-definitions id))))
+                       (when-let [proof (opaque-value id (get-in facts [:values id]))]
+                         [id proof])))) (keys (:values facts)))))
 
 (defn advance
   "Extend witnesses after one equation executes. Results become available only here; unknown
