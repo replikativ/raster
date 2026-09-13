@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
@@ -114,6 +115,53 @@
         (is (= :program-link-value-contract (:reason failure)))
         (is (= 8 (:physical-elements failure)))
         (is (= 9 (:logical-elements failure)))))))
+
+(deftest linker-overwrite-proof-uses-typed-domain-not-only-write-permission
+  (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target :cuda:0 :dtype :float})
+        emitted (last (get-in compiled [:emitted :equations]))
+        algorithm (:algorithm (first (:operations emitted)))
+        equation (last (dialect/equations algorithm))
+        destination (first (dialect/physical-results algorithm equation))
+        domain (first (dialect/dense-functional-result-shape algorithm equation
+                                                           (first (nth equation 2))))]
+    (doseq [[capacity extent expected] [[8 4 #{}] [8 8 #{destination}]
+                                       [8 9 #{}] [16 8 #{}] [4 4 #{destination}]]]
+      (is (= expected
+             (#'invocation-link/write-before-read-inputs
+              {:equations [emitted]}
+              {:program-buffers {destination {:id :storage :shape [capacity]}}}
+              {domain {:type :long :value extent}}))))
+    (is (empty? (#'invocation-link/write-before-read-inputs
+                 {:equations [emitted]}
+                 {:program-buffers {destination {:id :storage :shape [8]}}} {}))
+        "an unavailable extent cannot prove complete coverage")
+    (let [operation (first (:operations emitted))
+          prove (fn [op buffers]
+                  (#'invocation-link/complete-write?
+                   op destination 8 {domain {:type :long :value 8}}
+                   buffers {}))]
+      (is (prove operation {destination :storage}))
+      (is (not (prove (update-in operation [:graph :inputs] conj
+                                {:id 'aliased-input :role :input})
+                      {destination :storage 'aliased-input :storage}))
+          "different compiler IDs do not establish physical independence")
+      (is (prove (update-in operation [:graph :inputs] conj
+                            {:id 'independent-input :role :input})
+                 {destination :storage 'independent-input :other-storage}))
+      ;; Exercise the consumer's conservative boundary independently of producer conventions:
+      ;; the emitted IR permits algorithms with more than one equation.
+      (let [equations dialect/equations]
+        (with-redefs [dialect/equations (fn [p] (concat (equations p) (equations p)))]
+          (is (not (prove operation {destination :storage}))
+              "a later dense writer is not an ordered first-touch proof")))
+      (with-redefs [dialect/dense-functional-result-shape (fn [& _] ['(inc n)])]
+        (is (not (prove operation {destination :storage}))
+            "valid but unsupported shape algebra declines the optimization"))
+      (with-redefs [dialect/dense-functional-result-shape (fn [& _] [-1])]
+        (is (= :invocation-link-shape-negative
+               (try (prove operation {destination :storage}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            "invalid extents still fail, rather than becoming an optimization decline")))))
 
 (deftest allocation-extent-definition-must-dominate-the-allocation
   (let [options {:dtype :float :array-types {'input :float 'output :float}
