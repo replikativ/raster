@@ -15,7 +15,9 @@ fi
 cli_work=$(mktemp -d -t raster-clojure-install.XXXXXX)
 trap 'rm -rf -- "$cli_work"' EXIT
 cli_archive="$cli_work/clojure-tools.tar.gz"
-curl --fail --show-error --location --retry 3 --retry-delay 2 \
+# A TLS EOF (curl exit 56) is not retried by --retry alone. The download is idempotent,
+# goes to an isolated file, and still must pass the pinned digest before extraction.
+curl --fail --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
   --connect-timeout 20 --max-time 180 \
   "https://download.clojure.org/install/clojure-tools-${cli_version}.tar.gz" \
   --output "$cli_archive"
