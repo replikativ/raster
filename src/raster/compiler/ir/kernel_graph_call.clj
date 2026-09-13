@@ -4,7 +4,8 @@
    KernelGraph owns stable buffers, node uses and dependencies. KernelGraphCall supplies one
    resident value for every graph buffer and turns each emitted node into a checked KernelCall.
    Driver allocation, registration, recording and events remain runtime concerns."
-  (:require [raster.compiler.ir.kernel-artifact :as kart]
+  (:require [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -76,6 +77,52 @@
                      :kernel-graph-alias-dependency
                      "kernel graph omits a dependency introduced by overlapping resident views")
                     violation)))
+  bindings)
+
+(defn binding-alias-violations
+  "Check graph hazards and public/node ABI alias contracts before private allocation.
+   Requires complete public bindings. Each private graph buffer denotes a fresh disjoint
+   allocation; repeated references to that same private buffer still alias. The supplied overlap
+   predicate compares only real public pointer values. Scalar, extent and alignment checks are
+   separate obligations, not inferred from an empty alias result."
+  [graph bindings overlaps?]
+  (let [graph (executable/validate! graph)
+        hazards (external-alias-violations graph bindings overlaps?)
+        public (set (keys bindings))
+        private (set (map :id (:temporaries graph)))
+        ;; Compare graph identities, resolving only public identities to physical values. This
+        ;; avoids inventing fake resident pointers or conflating unknown storage with disjointness.
+        alias? (fn [left right]
+                 (cond
+                   (and (contains? public left) (contains? public right))
+                   (overlaps? (get bindings left) (get bindings right))
+                   (and (contains? private left) (contains? private right)) (= left right)
+                   (or (and (contains? public left) (contains? private right))
+                       (and (contains? private left) (contains? public right))) false
+                   :else (throw (ex-info "alias contract names an undeclared graph buffer"
+                                         {:reason :kernel-graph-alias-buffer
+                                          :left left :right right}))))
+        contracts (fn [abi arguments]
+                    (kabi/alias-contract-violations abi arguments alias?))]
+    (into (into hazards (contracts (:abi graph) (:arguments graph)))
+          (mapcat (fn [{:keys [id operation]}]
+                    (map #(assoc % :node id)
+                         (contracts (:abi operation) (:arguments operation)))))
+          (:nodes graph))))
+
+(defn validate-binding-aliases!
+  "Enforce graph and node ABI alias contracts before graph-private allocation."
+  [graph bindings overlaps?]
+  (when-let [violation (first (binding-alias-violations graph bindings overlaps?))]
+    (throw (ex-info
+            (case (:reason violation)
+              :kernel-graph-writable-alias
+              "one kernel cannot bind overlapping writable graph buffer views"
+              :kernel-graph-alias-dependency
+              "kernel graph omits a dependency introduced by overlapping resident views"
+              :kernel-abi-no-write-alias
+              "kernel stable input overlaps a writable output")
+            violation)))
   bindings)
 
 (defn direct-scalar-range-preconditions

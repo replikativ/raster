@@ -8,6 +8,7 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-tuning :as tuning]
@@ -231,6 +232,136 @@
                 (kgraph/->ValueUse 'out :write)] #{'width} [:stage-one])]
       :effects (:effects reference)
       :attributes {:strategy :two-stage}})))
+
+(defn- direct-graph []
+  (kgraph/make
+   {:inputs [(kgraph/buffer 'x :float 'width :device :input)]
+    :outputs [(kgraph/buffer 'out :float 'width :device :output)]
+    :temporaries [] :abi abi :arguments '[x out width]
+    :scalars [(kgraph/scalar 'width :long)]
+    :nodes [(kgraph/->ScheduledKernel
+             :direct (assoc-in subgroup [:abi 0 :aliasing] :no-write-alias)
+             [(kgraph/->ValueUse 'x :read) (kgraph/->ValueUse 'out :write)] #{'width} [])]
+    :effects (:effects reference) :attributes {:strategy :direct}}))
+
+(defn- storage-dispatch []
+  (kdispatch/make
+   {:id "storage-dispatch" :alternatives [(staged-graph) (direct-graph)]
+    :default-strategy :two-stage
+    :selector {:kind :fixed-strategy :strategy :direct}}))
+
+(deftest graph-storage-admission-includes-internal-abi-and-physical-ranges
+  (let [allocation (bview/allocation {:id :admission :byte-size 64 :memory-space :device
+                                     :ownership :borrowed})
+        left (bview/view allocation {:id :left :dtype :float :shape [8]})
+        overlap (bview/view allocation {:id :overlap :byte-offset 16 :dtype :float :shape [8]})
+        right (bview/view allocation {:id :right :byte-offset 32 :dtype :float :shape [8]})
+        check #(kgcall/binding-alias-violations %1 {'x left 'out %2} kcall/pointer-overlaps?)]
+    (is (empty? (check (staged-graph) overlap))
+        "the ordered copy stage snapshots the overlapping source")
+    (is (empty? (check (direct-graph) right)))
+    (let [violations (check (direct-graph) overlap)]
+      (is (= #{:kernel-graph-writable-alias :kernel-abi-no-write-alias}
+             (set (map :reason violations))))
+      (is (every? #(= :direct (:node %)) violations)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exactly every public"
+                         (kgcall/binding-alias-violations (direct-graph) {'x left}
+                                                         kcall/pointer-overlaps?)))))
+
+(deftest staged-storage-admission-precedes-session-and-preserves-snapshot-fallback
+  (let [selected (atom [])
+        input (float-array 3)
+        separate (float-array 3)]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly (storage-dispatch))
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session* (fn [_ body] (body (atom {:device-id :probe})))
+       #'gpu/alloc! (fn [& _])
+       #'gpu/bind-kernel-executable!
+       (fn [_ _ executable _] (swap! selected conj (kexec/strategy executable)) :handle)
+       #'gpu/run-kernel-graph! (fn [& _])
+       #'gpu/download-range! (fn [& _])}
+      (fn []
+        (gpu/invoke-staged-executable! :probe "storage-dispatch" [input input 3])
+        (gpu/invoke-staged-executable! :probe "storage-dispatch" [input separate 3])
+        (is (= [:two-stage :direct] @selected))))
+    (testing "a rejected sole default cannot open a session"
+      (with-redefs-fn
+        {#'raster.gpu.core/rt-resolve
+         (fn [_ function-name]
+           (case function-name
+             "kernel-dispatch-registry-entry"
+             (constantly (kdispatch/make
+                          {:id "strict-only" :alternatives [(direct-graph)]
+                           :default-strategy :direct
+                           :selector {:kind :fixed-strategy :strategy :direct}}))
+             "device-buffer?" (constantly false)))
+         #'gpu/with-gpu-session* (fn [& _] (throw (AssertionError. "opened session")))}
+        #(is (= :kernel-dispatch-inapplicable
+                (try (gpu/invoke-staged-executable! :probe "strict-only" [input input 3])
+                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest staged-admission-does-not-impose-an-unselected-default-extent
+  (let [choice (update (storage-dispatch) :alternatives
+                       (fn [[snapshot direct]]
+                         [(assoc-in snapshot [:inputs 0 :elements] 4) direct]))
+        input (float-array 3)
+        opened? (atom false)]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly choice)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session*
+       (fn [& _] (reset! opened? true) (throw (ex-info "past preflight" {:reason :past-preflight})))}
+      (fn []
+        (is (= :past-preflight
+               (try (gpu/invoke-staged-executable! :probe "storage-dispatch"
+                                                  [input (float-array 3) 3])
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is @opened?)
+        (reset! opened? false)
+        (is (= :staged-graph-buffer-capacity
+               (try (gpu/invoke-staged-executable! :probe "storage-dispatch" [input input 3])
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (false? @opened?) "the selected fallback must meet its own capacity contract")))))
+
+(deftest resident-storage-admission-precedes-backend-binding
+  (let [step {:kernel-name "storage-dispatch" :phase :probe :convention :executable
+              :dispatch (storage-dispatch)
+              :strategy-selection {:path [:strategy] :mapping {:direct :direct} :default :auto}
+              :argument-specs [{:kind :input :sym 'x} {:kind :output :sym 'out}
+                               {:kind :scalar :type :long :value-fn (constantly 3)}]}
+        selected (atom [])
+        bind! (fn [input output schedule]
+                (gpu/bind-step! (atom {:device-id :probe :buffers {'x input 'out output}})
+                                step {} identity {:schedule schedule}))]
+    (with-redefs-fn
+      {#'raster.gpu.core/bind-selected-executable
+       (fn [_ executable & _]
+         (swap! selected conj (kexec/strategy executable))
+         (gpu/->BoundExecutableStep [] {} []))}
+      (fn []
+        (bind! :same :same {})
+        (bind! :same :separate {})
+        (is (= [:two-stage :direct] @selected))
+        (is (= :kernel-dispatch-inapplicable
+               (try (bind! :same :same {:strategy :direct})
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (= [:two-stage :direct] @selected)
+            "explicit rejection did not enter the backend binder")
+        (testing "distinct resident wrappers retain their physical range facts"
+          (let [segment (java.lang.foreign.MemorySegment/ofArray (float-array 16))
+                buffer (fn [offset] {:segment (.asSlice segment offset 32)
+                                     :dtype :float :n-elements 8 :byte-size 32})]
+            (reset! selected [])
+            (bind! (buffer 0) (buffer 16) {})
+            (bind! (buffer 0) (buffer 32) {})
+            (is (= [:two-stage :direct] @selected))))))))
 
 (deftest graph-node-compilation-requirements-invalidate-tuning
   (let [graph (staged-graph)
