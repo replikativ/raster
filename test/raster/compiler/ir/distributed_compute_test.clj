@@ -266,6 +266,71 @@
              (failure-reason #(distributed/plan changed)))
           "even a certified reduction cannot be silently implemented as a copy replica"))))
 
+(defn- boundary-fill-plan [physical-view]
+  (let [kernel (artifact/make
+                {:kernel-name "fill_boundary" :source "__kernel void fill_boundary(__global float* y) { y[get_global_id(0)] = 0; }"
+                 :abi [(abi/slot 'y :output :float)] :arguments '[y]
+                 :launch (launch/spec {:workgroup-size [1] :group-count [2]})
+                 :effects {:kind :map :reads [] :writes '[y]}})
+        descriptor {:dtype :float :all-params [] :array-params [] :scalar-params []
+                    :allocs [{:sym 'y :dtype :float :size-fn (fn [_] 2)}]
+                    :steps [{:phase :fill :kernel-name "fill_boundary" :convention :map
+                             :artifact kernel :argument-specs [{:kind :output :sym 'y}]}]
+                    :result-sym 'y}]
+    (link/make {:id :boundary-fill :target :gpu-0
+                :nodes [(link/node {:id :boundary-node :role :output :view physical-view})]
+                :values [(link/value {:id :boundary-output :abstract (local-abstract [2])
+                                      :leaves [{:name :value :node :boundary-node}]})]
+                :instances [(link/instance {:id :fill :descriptor descriptor
+                                            :bindings {'y :boundary-output} :scalars {}})]
+                :outputs [:boundary-node]})))
+
+(defn- boundary-materialization-plan []
+  (let [base (periodic-materialization-plan)
+        old (first (:halos base))
+        halo (distributed/schedule-halo (assoc (:exchange old) :boundary :nonperiodic)
+                                        (get-in base [:values :x]) (get-in base [:shards :x])
+                                        (:routes old) [])
+        consumer (get-in base [:device-plans :gpu-0 :entries :copy :link-plan])
+        boundary-view (view/subview (get-in consumer [:nodes :x-node :view]) {:shape [2]})
+        init (distributed/compute-step {:id :boundary-init :device :gpu-0 :duration-ns 1})
+        computes (filterv #(= :compute (:kind %)) (:steps base))]
+    (-> base
+        (assoc :halos [halo] :steps (into (into [init] (:steps halo))
+                                         (assoc-in computes [0 :dependencies]
+                                                   (conj (:completions halo) :boundary-init))))
+        (assoc-in [:device-plans :gpu-0 :entries :boundary] {:link-plan (boundary-fill-plan boundary-view)})
+        (assoc-in [:device-plans :gpu-0 :steps :boundary-init] {:entry :boundary :bindings {}})
+        (assoc-in [:device-plans :gpu-0 :steps :copy-0 :bindings :local-x :placements 2]
+                  {:kind :boundary :region {:offsets [0 0] :shape [1 2]}
+                   :provider {:step :boundary-init :local-value :boundary-output}}))))
+
+(deftest nonperiodic-boundary-has-an-exact-executable-producer
+  (let [plan (boundary-materialization-plan)
+        report (distributed/compute-bindings (distributed/plan plan))]
+    (is (= :write (get-in report [:bindings :boundary-init :boundary-outputs :boundary-output :access])))
+    (is (empty? (get-in report [:bindings :boundary-init :values]))
+        "a private boundary result is not a synthetic globally partitioned ValueShard")
+    (is (= [:analytical-only] (:unbound report)))
+    (is (= :distributed-compute-boundary-output
+           (failure-reason #(distributed/plan
+                             (assoc-in plan [:device-plans :gpu-0 :entries :boundary :link-plan
+                                             :outputs] []))))
+        "an internally written value is not a retained boundary output")
+    (is (= :distributed-compute-boundary-write
+           (failure-reason #(distributed/plan
+                             (assoc-in plan [:device-plans :gpu-0 :steps :copy-0 :bindings :local-x
+                                             :placements 2 :provider :local-value] :not-written)))))
+    (is (= :distributed-compute-boundary-provider
+           (failure-reason #(distributed/plan
+                             (update plan :steps (fn [steps]
+                                                   (mapv (fn [s] (if (= :copy-0 (:id s))
+                                                                   (update s :dependencies pop) s)) steps)))))))
+    (is (= :distributed-compute-boundary-storage
+           (failure-reason #(distributed/plan
+                             (assoc-in plan [:device-plans :gpu-0 :entries :boundary :link-plan
+                                             :nodes :boundary-node :view :byte-offset] 8)))))))
+
 (deftest compute-bindings-retain-exact-link-values-and-derived-accesses
   (let [plan (make-plan)
         report (distributed/compute-bindings plan)

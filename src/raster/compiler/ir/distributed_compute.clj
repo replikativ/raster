@@ -43,8 +43,12 @@
                      (= #{:kind :value :shard :local-offsets} (set (keys owned)))
                      (every? #(or (= % owned)
                                   (and (map? %) (= :replica (:kind %))
-                                       (= #{:kind :transfer} (set (keys %))))) placements))
-        (fail! "materialization requires one owned placement and scheduled copy replicas; boundaries need producer proofs"
+                                       (= #{:kind :transfer} (set (keys %))))
+                                  (and (map? %) (= :boundary (:kind %))
+                                       (= #{:kind :region :provider} (set (keys %)))
+                                       (map? (:provider %))
+                                       (= #{:step :local-value} (set (keys (:provider %)))))) placements))
+        (fail! "materialization requires one owned placement and explicit replica/boundary evidence"
                :distributed-compute-placement-coverage {:reference reference}))
       (assoc (select-keys owned [:value :shard])
              :local-shape (:local-shape reference) :local-offsets (:local-offsets owned)
@@ -53,6 +57,10 @@
     :else
     (fail! "binding must name a qualified shard or an explicit local materialization"
            :distributed-compute-shard-reference {:reference reference})))
+
+(defn- local-leaves [plan local]
+  (mapv (fn [{:keys [name node]}]
+          {:name name :view (get-in plan [:nodes node :view])}) (:leaves local)))
 
 (defn- project-domain [local leaves shape]
   (let [abstract (:abstract local)
@@ -76,6 +84,23 @@
               :physical-layout (:physical-layout local)}))
     (view/subview base {:shape shape})))
 
+(defn- boundary-output-facts [{plan :link-plan :keys [accesses]} step local-ids]
+  (into {}
+        (map (fn [id]
+               (let [local (get-in plan [:values id])
+                     access (get accesses id)]
+                 (when-not (contains? #{:write :read-write} access)
+                   (fail! "boundary provider must name an ABI-written local value"
+                          :distributed-compute-boundary-write
+                          {:step step :local-value id :access access}))
+                 (when-not (contains? (set (link/output-value-ids plan)) id)
+                   (fail! "boundary provider must retain a public LinkPlan output"
+                          :distributed-compute-boundary-output {:step step :local-value id}))
+                 [id {:access access
+                      :view (project-domain local (local-leaves plan local)
+                                            (get-in local [:abstract :shape]))}]))
+             local-ids)))
+
 (defn- predecessor-ids [step-by-id id]
   (loop [pending (seq (:dependencies (get step-by-id id))) seen #{}]
     (if-let [id (first pending)]
@@ -91,8 +116,17 @@
         (mapv
          (fn [placement]
            (let [region
-                 (if (= :owned (:kind placement))
-                   {:offsets anchor :shape (:shape candidate)}
+                 (case (:kind placement)
+                   :owned {:offsets anchor :shape (:shape candidate)}
+                   :boundary (let [region (:region placement)]
+                               (when-not (and (map? region)
+                                              (= #{:offsets :shape} (set (keys region)))
+                                              (vector? (:shape region))
+                                              (every? pos-int? (:shape region)))
+                                 (fail! "boundary requires a positive exact local rectangle"
+                                        :distributed-compute-boundary-region {:placement placement}))
+                               region)
+                   :replica
                    (let [transfer (get halo-steps (:transfer placement))
                          attrs (:attributes transfer)
                          destination (:destination-region attrs)]
@@ -126,16 +160,17 @@
     placements))
 
 (defn- bind-values [{plan :link-plan :keys [accesses required]} device globals shards bindings
-                   halo-steps predecessors]
+                   halo-steps predecessors boundary-outputs]
   (when-not (map? bindings)
     (fail! "compute bindings must map local values to qualified shard references"
            :distributed-compute-bindings {:bindings bindings}))
   (let [bindings (update-vals bindings normalize-reference)
         supplied (set (keys bindings))
         available (set/union (set (keys accesses)) (set (link/output-value-ids plan)))]
-    (when-not (set/subset? required supplied)
+    (when-not (set/subset? required (set/union supplied boundary-outputs))
       (fail! "compute binding omits a public local value"
-             :distributed-compute-missing-values {:missing (set/difference required supplied)}))
+             :distributed-compute-missing-values
+             {:missing (set/difference required supplied boundary-outputs)}))
     (when-not (set/subset? supplied available)
       (fail! "compute binding names an absent or unused local value"
              :distributed-compute-local-value {:unknown (set/difference supplied available)}))
@@ -160,9 +195,7 @@
                        global (get globals value)
                        candidate (first (filter #(= shard (:id %)) (get shards value)))
                        local (get-in plan [:values id])
-                       leaves (mapv (fn [{:keys [name node]}]
-                                      {:name name :view (get-in plan [:nodes node :view])})
-                                    (:leaves local))]
+                       leaves (local-leaves plan local)]
                    (when-not (and global candidate)
                      (fail! "compute binding names an absent value shard"
                             :distributed-compute-shard {:reference reference}))
@@ -211,11 +244,22 @@
    Unbound analytical compute is explicit. Fully bound compute is not a distributed executor:
    device-scoped allocation, transfer realization, events and arena ownership remain runtime
    obligations. Explicit dense domains require exact owned/copy-replica coverage and
-   replica DAG predecessors. Initialization, intervening-write freshness, boundary providers,
-   and executable transfer endpoints remain additional execution-proof obligations."
+   replica DAG predecessors. Boundaries require an exact ABI-written provider view on a
+   preceding same-device compute step. Initialization, intervening-write freshness, and
+   executable transfer endpoints remain additional execution-proof obligations."
   [{:keys [device-plans steps values shards halos]}]
   (let [step-by-id (into {} (map (juxt :id identity)) steps)
         halo-steps (into {} (map (juxt :id identity)) (mapcat :steps halos))
+        ;; A boundary is local storage, not an extra globally partitioned value. Its
+        ;; exact producing LinkValue may be retained by this explicit use instead.
+        boundary-uses (for [[_ local] device-plans
+                            [_ call] (:steps local)
+                            [_ reference] (:bindings call)
+                            placement (:placements reference)
+                            :when (= :boundary (:kind placement))]
+                        (:provider placement))
+        boundary-outputs (reduce (fn [m {:keys [step local-value]}]
+                                   (update m step (fnil conj #{}) local-value)) {} boundary-uses)
         bound
         (reduce-kv
          (fn [bound device local]
@@ -247,9 +291,12 @@
                     (fail! "compute call names an absent local entry"
                            :distributed-compute-entry {:device device :entry entry}))
                   (assoc bound id {:entry entry :link-plan plan
+                                   :boundary-outputs
+                                   (boundary-output-facts (get entries entry) id (get boundary-outputs id))
                                    :values (bind-values (get entries entry) device values shards
                                                         (:bindings call) halo-steps
-                                                        (predecessor-ids step-by-id id))})))
+                                                        (predecessor-ids step-by-id id)
+                                                        (get boundary-outputs id #{}))})))
               bound calls))))
          {} device-plans)
         realized (volatile! {})
@@ -271,6 +318,22 @@
             (fail! "distinct distributed shards cannot alias physical storage without a relation"
                    :distributed-compute-shard-alias {:shard key :other other-key})))
         (vswap! realized assoc key {:realization realization :leaves leaves})))
+    (doseq [[id entry] bound
+            [_ binding] (:values entry)
+            placement (get-in binding [:domain :placements])
+            :when (= :boundary (:kind placement))]
+      (let [{producer :step local-value :local-value} (:provider placement)
+            source (get-in bound [producer :boundary-outputs local-value :view])
+            target (:view placement)
+            predecessors (predecessor-ids step-by-id id)]
+        (when-not (and source (= (:device (get step-by-id producer)) (:device (get step-by-id id)))
+                       (contains? predecessors producer))
+          (fail! "boundary must name a bound producer on this device preceding its consumer"
+                 :distributed-compute-boundary-provider {:step id :provider (:provider placement)}))
+        (when-not (and (view/contiguous? target) (view/contiguous? source)
+                       (= (dissoc source :id :shape :strides) (dissoc target :id :shape :strides)))
+          (fail! "boundary producer's complete public output view must equal the boundary region"
+                 :distributed-compute-boundary-storage {:step id :provider (:provider placement)}))))
     (doseq [[id entry] bound
             [_ binding] (:values entry)
             placement (get-in binding [:domain :placements])

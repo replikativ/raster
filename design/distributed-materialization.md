@@ -1,7 +1,8 @@
 # Distributed materialization and execution boundary
 
-Status: owned-domain normalization and copy-replica geometry/coverage are implemented;
-boundary producers, freshness, endpoint realization and execution remain a reviewed plan.
+Status: owned-domain normalization, copy-replica geometry/coverage and exact boundary
+provider bindings are implemented; initialization/freshness, endpoint realization and execution
+remain a reviewed plan.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
 placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
@@ -9,8 +10,16 @@ adds a checked `:domain` with the reshaped view and owned placement. A flat `[6]
 realize a `[2 3]` shard. Copy replicas can now complete a padded domain: their destination rectangles
 are derived from validated ScheduledHalo steps, anchored at the owned region, and checked for exact
 coordinate-disjoint coverage. Each transfer must precede its consumer through the DAG, and repeated
-consumers must agree on its physical destination. Periodic halos have a complete structural example;
-boundary placements remain rejected, so the nonperiodic example below is not yet admitted.
+consumers must agree on its physical destination. Periodic and nonperiodic halos now have structural
+examples. A nonperiodic boundary names a bound preceding compute step and its ABI-written local
+value declared as a public LinkPlan output; an internal/scratch write is not retained-output
+evidence. The complete plain dense physical view must match the boundary region exactly. No implicit
+fill is inferred from the boundary mode. Strided boundary outputs and selecting only part of a
+producer's larger value remain refused until their write-region projection is certified.
+An explicitly referenced boundary output is retained in the producing entry's `:boundary-outputs`
+report rather than requiring a synthetic global ValueShard. Other required public values still
+need global bindings. The boundary report records ABI write scope, not definite initialization of
+every cell; that stronger obligation belongs to the execution-readiness proof below.
 These checks do not prove initialization, freshness across intervening writes, or source endpoint
 availability. The report is still structural and must not be treated as execution authorization.
 Repeated owned realizations compare ordered physical regions: a contiguous ABI reshape preserves
