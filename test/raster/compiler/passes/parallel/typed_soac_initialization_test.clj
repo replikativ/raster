@@ -6,6 +6,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
+            [raster.compiler.passes.parallel.structured-control-route :as structured]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- source [allocation extent]
@@ -152,6 +153,22 @@
                                 {0 {} 2 {}}))))
         "a host observation between fused constituents cannot become native-first")))
 
+(deftest write-permission-cannot-drop-a-native-provider-during-promotion
+  (let [source '(let* [output (float-array 8)
+                       seeded (do (aset output 7 (float 7.0)) nil)
+                       written (raster.par/map! output i 4 nil (aget input i))] written)
+        [scheduled] (initialization/materialize (program source))
+        equation (last (dialect/equations scheduled))]
+    (is (= :write (:access (first (dialect/result-storage scheduled (second equation))))))
+    (is (= ['output] (get-in (dialect/facts scheduled)
+                            [:attributes :native-initialization-providers])))
+    (is (= scheduled (first (initialization/materialize scheduled))))
+    (is (= ['renamed] (get-in (dialect/facts (dialect/remap-values scheduled {'output 'renamed}))
+                             [:attributes :native-initialization-providers])))
+    (is (= :structured-control-native-initialization
+           (try (structured/promote-soac-program (route/program-envelope scheduled) {}) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest public-initialization-cross-compiles-without-a-device
   (doseq [target [:cuda:0 :hip:0]
           [function arguments] [[#'fixtures/public-c-family-scatter
@@ -163,6 +180,12 @@
       (is (= [:kernel-body :kernel-body]
              (mapv #(get-in % [:attributes :emission-route]) (:kernels compilation))))
       (is (link-plan/link-plan? plan))
+      (is (= :invocation-link-native-initialization
+             (try (equation-first/lower
+                   (assoc-in compilation [:emitted :attributes :native-initialization-providers]
+                             ['native-storage]) arguments)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
       (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
 (deftest allocation-facts-compose-with-value-remapping

@@ -171,7 +171,10 @@
                           (let [{:keys [placement native?]}
                                 (initialization-site! facts allocation equation)]
                             (cond
-                              native? (update state :native inc)
+                              native? (-> state (update :native inc)
+                                          (update-in [:facts :attributes :native-initialization-providers]
+                                                     #(vec (distinct (conj (or % [])
+                                                                          (:destination allocation))))))
                               (full-overwrite? facts extent-environment allocation equation)
                               (update state :elided inc)
                               :else

@@ -2086,6 +2086,9 @@
                  (seq (get-in source-facts [:attributes :host-read-values]))
                  (update-in [:attributes :host-read-values]
                             #(vec (distinct (map rename %))))
+                 (seq (get-in source-facts [:attributes :native-initialization-providers]))
+                 (update-in [:attributes :native-initialization-providers]
+                            #(vec (distinct (map rename %))))
                  (seq (get-in source-facts [:attributes :allocations]))
                  (update-in [:attributes :allocations]
                             #(mapv (fn [allocation]

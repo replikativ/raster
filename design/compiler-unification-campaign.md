@@ -1095,6 +1095,9 @@ General effect-map dense-image proofs remain work; this does not change the matr
 Storage first consumed by retained host bindings keeps the native allocation provider and host
 writes; GPU staging uploads that state. Such host buffer accesses still disqualify straight-line
 resident extraction. Observations between fused constituents cannot use this exemption.
+The native-provider obligation is retained as semantic data and survives value remapping.
+Source-independent SOAC promotion and invocation linking reject it until an explicit content
+provider exists; an ABI `:write` role cannot silently discharge that obligation.
 
 Validation covers ordinary and strided public scatter, holes, collisions, changed inputs, and
 two replays on Arc; both stages are ordinary KernelBody kernels. CUDA/HIP checks cover public
