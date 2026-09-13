@@ -3223,6 +3223,15 @@
                                       equations)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)
+              allocations (allocation-contracts descriptions array-types scalar-types values
+                                                shape-equalities)
+              ;; An allocation-only public dimension need not appear in a numerical equation.
+              ;; Retain its declared type now; inserting the initializer later makes it an
+              ;; ordinary operation input. Do not infer a missing declaration from its name.
+              values (reduce (fn [values {:keys [extent]}]
+                               (if-let [declared (and (symbol? extent) (get scalar-types extent))]
+                                 (merge-value values extent (tensor-value declared []) shape-equalities)
+                                 values)) values allocations)
               equation-facts
               (into {}
                     (map (fn [description]
@@ -3276,7 +3285,5 @@
                                             :values (set (filter #(contains? values %)
                                                                  (util/free-syms expr)))})
                                          host-descriptions)
-                                   :allocations (allocation-contracts descriptions array-types
-                                                                      scalar-types values
-                                                                      shape-equalities)}})]
+                                   :allocations allocations}})]
           (dialect/make facts equations outputs))))))

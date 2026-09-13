@@ -32,15 +32,35 @@
         (try {:dtype :long :product (apply algebra/product (map :product operands))}
              (catch ArithmeticException _ nil))))))
 
-(defn environment
-  "Build product witnesses from typed scalar equations. Unknown integral values are opaque
-   factors; an unproved definition keeps its own SSA identity, never its guessed arithmetic."
+(defn- opaque-value [id value]
+  (when (and (= :tensor (:kind value)) (= [] (:shape value))
+             (integral? (:dtype value)))
+    {:dtype (:dtype value) :product (algebra/monomial id)}))
+
+(defn initial-environment
+  "Only incoming scalar values are available before the first equation."
   [program]
-  (reduce
-   (fn [environment equation]
+  (let [facts (dialect/facts program)
+        definitions (set (mapcat #(nth % 2) (dialect/equations program)))
+        host-definitions (set (get-in facts [:attributes :source-bindings]))
+        inputs (set (:inputs facts))]
+    (into {} (keep (fn [id]
+                     (when (and (not (contains? definitions id))
+                                (or (contains? inputs id) (not (contains? host-definitions id))))
+                       (when-let [proof (opaque-value id (get-in facts [:values id]))]
+                         [id proof])))) (keys (:values facts)))))
+
+(defn advance
+  "Extend witnesses after one equation executes. Results become available only here; unknown
+   integral results retain opaque SSA identity, never guessed arithmetic."
+  [environment facts equation]
+  (let [results (into {} (keep (fn [id]
+                                (when-let [proof (opaque-value id (get-in facts [:values id]))]
+                                  [id proof]))) (nth equation 2))
+        after (merge environment results)]
      (let [{:keys [kind captures lambda]} (dialect/operation-parts equation)]
        (if (not= 'scalar kind)
-         environment
+         after
          (let [{:keys [parameters locals body-results]} (dialect/lambda-parts lambda)
                local-env (merge environment (zipmap parameters (map environment captures)))
                local-env (reduce (fn [env {:keys [id dtype init]}]
@@ -52,22 +72,22 @@
                      (let [proof (expression local-env form)]
                        (if (and proof (= (:dtype (get env id)) (:dtype proof)))
                          (assoc env id proof) env)))
-                   environment (map vector (nth equation 2) body-results))))))
-   (into {} (keep (fn [[id value]]
-                    (when (and (= :tensor (:kind value)) (= [] (:shape value))
-                               (integral? (:dtype value)))
-                      [id {:dtype (:dtype value) :product (algebra/monomial id)}])))
-         (:values (dialect/facts program)))
-   (dialect/equations program)))
+                   after (map vector (nth equation 2) body-results)))))))
+
+(defn environment
+  "Witnesses available after the complete program. For a consumer, use initial-environment
+   and advance only through its predecessors instead."
+  [program]
+  (reduce #(advance %1 (dialect/facts program) %2)
+          (initial-environment program) (dialect/equations program)))
 
 (defn same-volume?
   "Whether allocation extent equals the entire dense result shape. No capacity inequalities."
   [environment extent shape]
   (and (vector? shape)
-   (or (= [extent] shape)
       (try
         (let [allocation (:product (expression environment extent))
               dimensions (map #(-> (expression environment %) :product) shape)]
           (boolean (and allocation (every? some? dimensions)
                         (= allocation (apply algebra/product dimensions)))))
-        (catch ArithmeticException _ false)))))
+        (catch ArithmeticException _ false))))

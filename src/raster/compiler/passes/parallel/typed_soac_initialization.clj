@@ -118,8 +118,13 @@
                 (assoc-in [:equations id] equation-facts)
                 (update :effects conj :memory/write))}))
 
-(defn- allocation-contracts! [facts]
-  (let [allocations (get-in facts [:attributes :allocations] [])]
+(defn- allocation-contracts! [program]
+  (let [facts (dialect/facts program)
+        definitions (into {} (for [equation (dialect/equations program)
+                                   result (nth equation 2)]
+                               [result (get-in facts [:equations (second equation)
+                                                      :provenance :source-binding-id])]))
+        allocations (get-in facts [:attributes :allocations] [])]
     (when-not (and (vector? allocations)
                    (every? #(and (map? %) (dialect/value-id? (:destination %))
                                  (integer? (:source-binding-id %))
@@ -133,6 +138,11 @@
     (doseq [{:keys [destination dtype] :as allocation} allocations
             :let [value (get-in facts [:values destination])]
             :when value]
+      (when (contains? definitions (:extent allocation))
+        (let [definition (get definitions (:extent allocation))]
+          (when-not (and (integer? definition) (< definition (:source-binding-id allocation)))
+            (fail! "allocation extent definition must precede allocation"
+                   {:allocation allocation :definition-site definition}))))
       (when-not (and (= :tensor (:kind value)) (seq (:shape value))
                      (dtype/known? dtype) (= dtype (dtype/canon dtype))
                      (= dtype (:dtype value)))
@@ -164,16 +174,20 @@
   [program]
   (dialect/validate! program)
   (let [original-facts (dialect/facts program)
-        extent-environment (extent-proof/environment program)
         allocations (filter #(and (= :zero (:initialization %))
                                   (contains? (:values original-facts) (:destination %)))
-                            (allocation-contracts! original-facts))
+                            (allocation-contracts! program))
         {:keys [facts equations pending fills elided native]}
         (reduce
-         (fn [{:keys [facts pending] :as state} equation]
+         (fn [{:keys [facts pending available-extents] :as state} equation]
            (let [active (filterv #(touches? facts (:destination %) equation) pending)
                  state (reduce
                         (fn [{:keys [facts] :as state} allocation]
+                          (when-not (extent-proof/same-volume? available-extents
+                                                              (:extent allocation)
+                                                              [(:extent allocation)])
+                            (fail! "initialization extent must be available before its consumer"
+                                   {:allocation allocation :consumer (second equation)}))
                           (let [{:keys [placement native?]}
                                 (initialization-site! facts allocation equation)]
                             (cond
@@ -181,7 +195,7 @@
                                           (update-in [:facts :attributes :native-initialization-providers]
                                                      #(vec (distinct (conj (or % [])
                                                                           (:destination allocation))))))
-                              (full-overwrite? facts extent-environment allocation equation)
+                              (full-overwrite? facts available-extents allocation equation)
                               (update state :elided inc)
                               :else
                               (let [{:keys [equations facts]} (initializer facts allocation placement)]
@@ -190,8 +204,10 @@
                         state active)]
              (-> state
                  (assoc :pending (vec (remove (set active) pending)))
+                 (assoc :available-extents (extent-proof/advance available-extents facts equation))
                  (update :equations conj equation))))
-         {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0 :native 0}
+         {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0 :native 0
+          :available-extents (extent-proof/initial-environment program)}
          (dialect/equations program))
         _ (when (seq pending)
             (fail! "live zero storage has no typed initialization site"

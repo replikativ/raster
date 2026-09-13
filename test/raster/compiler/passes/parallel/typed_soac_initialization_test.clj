@@ -56,6 +56,15 @@
       (is (= fills (:initialization-fills stats)))
       (is (= (- 1 fills) (:initialization-full-overwrites stats))))))
 
+(deftest allocation-only-public-extent-is-available-before-the-fill
+  (let [p (frontend/form->program (source '(float-array n) 4)
+                                 {:dtype :float :array-types {'input :float 'output :float}
+                                  :scalar-types {'n :long}})
+        [scheduled stats] (initialization/materialize p)]
+    (is (not (some #{'n} (:inputs (dialect/facts p)))))
+    (is (= 1 (:initialization-fills stats)))
+    (is (some #{'n} (:inputs (dialect/facts scheduled))))))
+
 (deftest total-functional-domains-include-boundaries-and-scan-results
   (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float
                                       (+ accumulator (aget input i)))
@@ -105,6 +114,20 @@
         (is (= :program-link-value-contract (:reason failure)))
         (is (= 8 (:physical-elements failure)))
         (is (= 9 (:logical-elements failure)))))))
+
+(deftest allocation-extent-definition-must-dominate-the-allocation
+  (let [options {:dtype :float :array-types {'input :float 'output :float}
+                 :scalar-types {'n :long 'width :long}}
+        p (frontend/form->program
+           (frontend/normalize-source (source '(float-array (* n width)) '(* width n)) options)
+           options)
+        allocation (first (get-in (dialect/facts p) [:attributes :allocations]))
+        definition (first (filter #(some #{(:extent allocation)} (nth % 2))
+                                  (dialect/equations p)))]
+    (doseq [site [nil (:source-binding-id allocation) (inc (:source-binding-id allocation))]]
+      (is (= :typed-soac-initialization-contract
+             (reason (with-facts p #(assoc-in % [:equations (second definition)
+                                                 :provenance :source-binding-id] site))))))))
 
 (deftest initialization-contracts-fail-closed
   (let [program (program (source '(float-array 8) 4))]
