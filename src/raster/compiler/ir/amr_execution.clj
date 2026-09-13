@@ -15,7 +15,9 @@
 (defn- producer-identity? [x]
   (and (or (keyword? x) (symbol? x)) (some? (namespace x))))
 
-(defn- operation-contract [workload operation-id]
+(defn operation-contract
+  "Derive the whole-patch semantic contract a numerical provider must implement."
+  [workload operation-id]
   (let [plan (:plan (amr/verify! workload))
         hierarchy (:hierarchy plan)
         patches (into {} (map (juxt :id identity)) (mapcat :patches (:levels hierarchy)))
@@ -81,8 +83,10 @@
                                  (empty? (:boundary-outputs binding))
                                  (= (set [source-id target-id]) (set (keys (:values binding))))
                                  (= :read (:access source))
-                                 (contains? #{:write :read-write} (:access target))
-                                 (contains? (set (link/output-value-ids (:link-plan binding))) target-id)
+                                 (= :write (:access target))
+                                 (= #{target-id} (set (link/output-value-ids (:link-plan binding))))
+                                 (set/subset? (set (link/value-node-ids (:link-plan binding) target-id))
+                                              (:produces (link/initialization-contract (:link-plan binding))))
                                  (= (:value source) (get-in contract [:source :field]))
                                  (= (:value target) (get-in contract [:target :field])))
                     (fail! "AMR implementation must read only its source field and write/export its target field"
@@ -94,10 +98,10 @@
                     (when-not (and (= (:device patch) (:device shard))
                                    (= (:shape patch) (:shape shard))
                                    (every? zero? (:offsets shard))
-                                   (or (nil? (:domain value))
-                                       (and (= (:shape patch) (get-in value [:domain :shape]))
-                                            (= 1 (count (get-in value [:domain :placements])))
-                                            (= :owned (get-in value [:domain :placements 0 :kind])))))
+                                   (some? (:domain value))
+                                   (= (:shape patch) (get-in value [:domain :shape]))
+                                   (= 1 (count (get-in value [:domain :placements])))
+                                   (= :owned (get-in value [:domain :placements 0 :kind])))
                       (fail! "AMR role must realize the whole declared patch field"
                              :amr-execution-shard {:operation id :role role})))
                   (when-not (and (producer-identity? (:producer implementation))

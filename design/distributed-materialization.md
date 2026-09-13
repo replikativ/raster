@@ -261,11 +261,11 @@ preserve the analytic domain integral. The nonzero volume-weighted RMS error of 
 prolongation decreases at first order. This measures transfer approximation, not PDE convergence
 or a general certified error bound; conservation alone must not be mistaken for accuracy.
 
-### Next executable binding boundary (design, not implemented)
+### Producer-attested executable binding boundary
 
-An AMR operation needs an implementation witness, not a registry that recognizes function names.
-The witness should identify the existing distributed worker, scheduled completion and local entry,
-and name its source/target LinkValues. Validation can reuse `compute-bindings` and LinkPlan access
+`amr-execution` adds an implementation witness, not a registry that recognizes function names.
+Its execution binding derives the existing distributed worker, scheduled completion and local entry,
+and names its source/target LinkValues. Validation reuses `compute-bindings` and LinkPlan access
 facts to check shard identity, source reads, target writes, dtype, region coverage and placement.
 The semantic contract is derived from the hierarchy and operation (kind, method, ratio, centering
 and regions), not independently restated as another authority. The structural distributed
@@ -278,7 +278,22 @@ numerical policy. `numerical-contract` is producer attestation, not an inferred 
 challenge that producer, but neither a method keyword, matching dimensions nor a passing numerical
 example establishes general equivalence. A future proof object can strengthen this boundary.
 
-Acceptance must reject swapped entries, mismatched roles/regions and missing producer evidence,
-then execute a certified hierarchy/state workload. The current full-patch scheduling witness must
-not be relabeled as that stronger acceptance. Partial regions need actual logical-domain and
-physical-view checks, not whole-buffer byte-span containment.
+The acceptance rejects swapped plans, mismatched roles, hidden boundary writes, target read-write
+effects, stale semantic contracts and missing producer evidence, then executes through the checked
+binding. Only the target may be exported, and the exact external field set is source-read and
+target-write. Full-patch domains cannot contain extra padded boundary or replica regions. Partial
+regions still need actual logical-domain and physical-view checks, not byte-span containment.
+
+`raster.ode.multilevel-compiler` is the implementation-local provider: it compiles its known
+ordinary numerical function, retains its exact LinkPlan, and exposes semantic source/target IDs.
+It supports dense dyadic FP64 whole patches on one logical worker. Field-qualified allocation
+identities allow successive entries to share the enclosing runtime pool. There is no method
+registry in the compiler, new runtime ABI, or copied kernel source.
+
+Restriction carries a conditional per-output forward-error model: gamma_3 times one quarter of
+the sum of the four input magnitudes, with gamma_3 = 3u/(1-3u), u = 2^-53. The producer explicitly
+assumes finite inputs, no intermediate overflow or underflow, nearest-even IEEE arithmetic and
+preserved expression order. Invariant attestations are subject to that model; they do not claim
+exact real-arithmetic conservation for arbitrary FP values. Callers must establish assumptions
+again after resident producers update input values; the structural certificate does not inspect
+device contents. Structural manifest fixtures in this acceptance are not durable publication tests.
