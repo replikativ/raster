@@ -10,7 +10,9 @@
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gpu-probe]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
+            [raster.perf.production-canary :as canary]))
 
 (def ^:private source
   '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
@@ -187,6 +189,45 @@
            :expected (reference a b m n k)}
           (finally
             (gpu/release-kernel-graph! session handle))))))))
+
+(deftest public-composed-matrix-selects-input-fusion-and-hoists-constant-weights
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "public composed GEMM input fusion")
+    (let [shape [13 32 32]
+          [^floats a b :as arrays] (canary/gemm-arguments shape)
+          ordinary (canary/prepare-gemm :ze:0 arrays shape
+                                       {:variant :relu-prebound :gemm-precision :mixed-f16-f32
+                                        :constants ['B]})
+          choice (get-in ordinary [:descriptor :steps 0 :dispatch])
+          ;; Exercise the public recompilation schedule seam, without manufacturing a measured
+          ;; winner or replacing a Prepared descriptor after its certificate was constructed.
+          selected (compiled/lower
+                    #'canary/gemm-relu-prebound! (into arrays shape)
+                    {:target :ze:0 :dtype :float :gemm-precision :mixed-f16-f32
+                     :constants ['B] :on-non-resident :throw
+                     :schedule {:typed-contraction
+                                {:measured-selectors
+                                 {(:id choice) {:kind :fixed-strategy
+                                                :strategy :xmx-direct-lhs-tile-cast}}}}})]
+      (is (= 1 (count (get-in selected [:descriptor :steps]))))
+      (is (empty? (get-in selected [:descriptor :allocs])))
+      (is (some #{:xmx-direct-lhs-tile-cast}
+                (map executable/strategy (:alternatives choice))))
+      (let [live (compiled/instantiate! selected {:profile? true})]
+        (try
+          (dotimes [replay 2]
+            (when (pos? replay)
+              (dotimes [i (alength a)] (aset a i (- (aget a i)))))
+            (let [result (compiled/profile live)
+                  actual (vec (first (vals (:result result))))
+                  expected (mapv #(max (float 0.0) %)
+                                 (canary/gemm-reference a b shape))
+                  profile (:profile result)]
+              (is (= expected actual) (str "public input-fused replay " replay))
+              (is (= 1 (count profile)) "weight conversion stays in the one-time prologue")
+              (is (= [:xmx-direct-lhs-tile-cast :contract]
+                     (take-last 2 (:phase (first profile)))))))
+          (finally (compiled/close! live)))))))
 
 (deftest long-graph-interface-executes-layout-matrix-and-combine
   (if-not @gpu-probe/gpu-available?
