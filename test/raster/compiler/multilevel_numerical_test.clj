@@ -58,6 +58,36 @@
           (link/run! executable)
           (is (= (vec expected) (vec (link/download executable (first (:outputs plan)))))))))))
 
+(defn- bilinear-cell-averages [nx ny]
+  ;; Exact unit-square cell averages of 1 + x + 2y + xy, not point samples of a
+  ;; general function. Its domain integral is 11/4 on every resolution.
+  (double-array (for [i (range nx) j (range ny)
+                      :let [x (/ (+ i 0.5) nx) y (/ (+ j 0.5) ny)]]
+                  (+ 1.0 x (* 2.0 y) (* x y)))))
+
+(deftest smooth-cell-averages-preserve-integrals-and-expose-transfer-error
+  (let [errors
+        (mapv (fn [nx]
+                (let [ny (* 2 nx)
+                      coarse (bilinear-cell-averages nx ny)
+                      exact-fine (bilinear-cell-averages (* 2 nx) (* 2 ny))
+                      prolonged (double-array (* 4 nx ny))
+                      restricted (double-array (* nx ny))]
+                  (multilevel/prolong-constant-2d! prolonged coarse nx ny)
+                  (multilevel/restrict-average-2d! restricted exact-fine nx ny)
+                  (is (< (reduce max 0.0 (map #(Math/abs (- %1 %2)) coarse restricted)) 1.0e-12))
+                  (is (< (Math/abs (- 2.75 (/ (reduce + (vec prolonged)) (* 4 nx ny)))) 1.0e-12))
+                  (is (< (Math/abs (- 2.75 (/ (reduce + (vec restricted)) (* nx ny)))) 1.0e-12))
+                  (Math/sqrt (/ (reduce + (map (fn [a b] (let [d (- a b)] (* d d)))
+                                              prolonged exact-fine))
+                                (* 4 nx ny)))))
+              [8 16 32])]
+    ;; Piecewise-constant prolongation is conservative, not an exact smooth-field
+    ;; refinement: its volume-weighted RMS discrepancy must decrease at first order.
+    (is (every? pos? errors))
+    (doseq [[coarser finer] (partition 2 1 errors)]
+      (is (< 1.95 (/ coarser finer) 2.05)))))
+
 (deftest composed-transfer-cycle-keeps-intermediate-resident
   (let [coarse (double-array (map #(- (* 0.125 %) 1.0) (range 15)))
         fine (double-array 60) out (double-array 15)

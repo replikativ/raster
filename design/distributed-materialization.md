@@ -254,3 +254,9 @@ executes their ordered DistributedPlan on one GPU. This full-domain cycle is an 
 not a general proof that a supplied local program implements a declared coarse/fine operator.
 Partial patch-region binding, executable numerical certification, refinement decisions, and
 coarse/fine PDE evolution with convergence and interface-flux oracles remain required.
+
+A separate smooth-field oracle uses exact cell averages of a bilinear polynomial on three
+rectangular resolutions. Averaging down recovers the coarse cell averages and both transfers
+preserve the analytic domain integral. The nonzero volume-weighted RMS error of constant
+prolongation decreases at first order. This measures transfer approximation, not PDE convergence
+or a general certified error bound; conservation alone must not be mistaken for accuracy.
