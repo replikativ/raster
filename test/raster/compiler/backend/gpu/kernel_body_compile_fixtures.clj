@@ -39,6 +39,7 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.core :refer [deftm]]
+            [raster.ode.multilevel :as multilevel]
             [raster.dl.attention :as dl-attention]
             [raster.dl.array-ops :as dl-arrays]
             [raster.linalg.contract :as contract]
@@ -346,6 +347,10 @@
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-map {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'multilevel/prolong-constant-2d! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'multilevel/restrict-average-2d! {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
                  #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

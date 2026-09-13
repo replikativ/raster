@@ -31,6 +31,11 @@
       ;; Non-piecewise-constant fine data tests averaging independently of prolongation.
       (let [fine (double-array (map #(* 0.125 %) (range (* 4 nx ny))))]
         (multilevel/restrict-average-2d! restored fine nx ny)
+        (is (= (vec (for [i (range nx) j (range ny)]
+                      (/ (reduce + (for [di [0 1] dj [0 1]]
+                                     (aget fine (+ (* (+ (* 2 i) di) (* 2 ny))
+                                                   (* 2 j) dj)))) 4.0)))
+               (vec restored)))
         (is (= (* 0.25 (reduce + (vec fine))) (reduce + (vec restored))))))
     (let [constant (double-array (repeat (* 4 nx ny) 3.25))
           coarse (double-array (* nx ny))]

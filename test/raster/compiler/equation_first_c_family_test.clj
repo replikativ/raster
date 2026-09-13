@@ -16,6 +16,7 @@
             [raster.dl.array-ops :as array-ops]
             [raster.numeric]
             [raster.ode.pde :as pde]
+            [raster.ode.multilevel :as multilevel]
             [raster.par]
             [raster.runtime.hardware :as hardware]))
 
@@ -412,6 +413,19 @@
           plan (equation-first/lower compilation
                                      [(double-array 35) (double-array 35)
                                       5 7 0.25 4.0 9.0])]
+      (is (seq (:kernels compilation)))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
+(deftest coarse-fine-operators-use-the-public-c-family-boundary
+  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]
+          operator [#'multilevel/prolong-constant-2d! #'multilevel/restrict-average-2d!]]
+    (let [prolong? (= operator #'multilevel/prolong-constant-2d!)
+          compilation (equation-first/compile operator {:target target :dtype :double})
+          plan (equation-first/lower compilation
+                                     [(double-array (if prolong? 60 15))
+                                      (double-array (if prolong? 15 60)) 3 5])]
       (is (seq (:kernels compilation)))
       (is (every? #(= module-target (:target %)) (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback])))
