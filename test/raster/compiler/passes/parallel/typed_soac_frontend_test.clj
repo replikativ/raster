@@ -145,6 +145,11 @@
               (:reason (ex-data exception)))))]
     (is (= exact (get-in (dialect/facts program) [:values 'x]))
         "compatible exact shape and representation facts survive unchanged")
+    (let [multidimensional (av/tensor {:dtype :double :shape [1 3]})
+          result (frontend/form->program source
+                                         (assoc options :values {'x multidimensional}))]
+      (is (some? result) "a source array may back a multidimensional logical tensor")
+      (is (= multidimensional (get-in (dialect/facts result) [:values 'x]))))
     (is (= :source-value-conflict
            (conflict-reason (av/tensor {:dtype :float :shape [3]})))
         "an explicit value may not override the declared element dtype")

@@ -2952,8 +2952,9 @@
 
    This check precedes extent normalization: an exact supplied shape may replace `(alength x)`
    with its dimension and thereby remove x from every equation.  The declaration still constrains
-   that supplied fact.  Array declarations prove only tensor rank and element dtype, so preserve
-   compatible shape, representation, placement, and ownership facts verbatim."
+   that supplied fact. Array declarations distinguish arrays from scalars and prove element dtype,
+   not the logical tensor rank: a flat array can back a multidimensional tensor. Preserve compatible
+   shape, representation, placement, and ownership facts verbatim."
   [array-types values]
   (doseq [[id declared-dtype] array-types]
     (when-let [value (declared-type values id)]
@@ -2961,11 +2962,11 @@
             value-dtype (cond-> (:dtype value) (keyword? (:dtype value)) dtype/canon)]
         (when-not (and (= :tensor (:kind value))
                        (= declared-dtype value-dtype)
-                       (= 1 (count (:shape value))))
+                       (seq (:shape value)))
           (fail! :source-value-conflict
                  "an explicit AbstractValue contradicts its declared source array type"
                  {:id id :first value
-                  :second {:kind :tensor :dtype declared-dtype :rank 1}})))))
+                  :second {:kind :tensor :dtype declared-dtype :non-scalar? true}})))))
   values)
 
 (defn- ordinary-equation-values
