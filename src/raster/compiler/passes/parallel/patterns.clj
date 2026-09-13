@@ -41,7 +41,7 @@
   [form idx-sym]
   (when (and (seq? form)
              (contains? aset-syms (first form))
-             (>= (count form) 4))
+             (= (count form) 4))
     (let [[_ out idx-expr val-expr] form]
       (when (and (symbol? out)
                  (idx-matches? idx-expr idx-sym))
@@ -152,8 +152,8 @@
 
 (defn match-dotimes-map-loop
   "Match a dotimes loop that writes one element with aset.
-	Handles direct dotimes, do wrappers, and outer let wrappers that only bind
-	temporary bound expressions.
+	Handles direct dotimes and output-returning do wrappers. Outer let wrappers
+	are handled by loop-lift's structural recursion, preserving all bindings and effects.
 	Returns {:out-sym :index-sym :bound-expr :cast-fn :value-expr} or nil."
   [form]
   (when (seq? form)
@@ -192,24 +192,7 @@
           (= 1 (count non-string-forms))
           (match-dotimes-map-loop (first non-string-forms))))
 
-      (form/binding-form? form)
-      (let [[_ bindings-vec & body-exprs] form
-            binding-pairs (partition 2 bindings-vec)]
-        (when (<= 1 (count body-exprs) 2)
-          (let [inner (first body-exprs)
-                subst-map (into {}
-                                (map (fn [[sym val-expr]]
-                                       (if (and (seq? val-expr)
-                                                (contains? #{'int 'long 'clojure.core/int 'clojure.core/long}
-                                                           (first val-expr))
-                                                (= 2 (count val-expr)))
-                                         [sym (second val-expr)]
-                                         [sym val-expr]))
-                                     binding-pairs))]
-            (when-let [info (match-dotimes-map-loop inner)]
-              (let [bound (:bound-expr info)
-                    resolved-bound (get subst-map bound bound)]
-                (assoc info :bound-expr resolved-bound)))))))))
+      :else nil)))
 
 (defn match-nested-dotimes-row-major-map
   "Match a nested dotimes row-major write that can be flattened to 1D.
@@ -237,7 +220,7 @@
                                         {:aset-form candidate :let-bindings []}))]
                   (when aset-result
                     (let [{:keys [aset-form let-bindings]} aset-result]
-                      (when (and (seq? aset-form) (>= (count aset-form) 4))
+                      (when (and (seq? aset-form) (= (count aset-form) 4))
                         (let [[_ out-sym idx-expr val-expr] aset-form]
                           (when (and (symbol? out-sym)
                                      (row-major-linear-index? idx-expr i-sym j-sym cols-expr))
@@ -452,7 +435,7 @@
                                                    (contains? aset-syms (first candidate)))
                                           {:aset-form candidate :let-bindings []}))]
                     (when-let [{:keys [aset-form]} aset-result]
-                      (when (and (seq? aset-form) (>= (count aset-form) 4))
+                      (when (and (seq? aset-form) (= (count aset-form) 4))
                         (let [[_ out-sym write-idx read-expr] aset-form]
                           (when (and (symbol? out-sym)
                                      (column-major-linear-index? write-idx i-sym j-sym rows-expr)
