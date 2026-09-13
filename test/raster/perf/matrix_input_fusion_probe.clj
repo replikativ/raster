@@ -6,32 +6,54 @@
             [raster.gpu.measurement :as measurement]
             [raster.perf.production-canary :as canary]))
 
+(def ^:private tiles
+  {:single-fragment {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
+                     :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}
+   :multi-fragment {:block-m 32 :block-n 64 :sg-m 16 :sg-n 32 :block-k 32 :num-stages 2
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}})
+
+(defn rounded-inputs
+  "Independent Java binary16 round-to-nearest-even oracle, not compiler scalar lowering."
+  [values]
+  (float-array (map #(Float/float16ToFloat (Float/floatToFloat16 (float %))) values)))
+
 (defn run!
   "Check both generated schedules with changing activations and poisoned output on one device.
-   Tiny fixed geometry includes a partial M tile. Failures propagate; unavailable hardware is
+   Bounded geometry defaults to a partial M tile. Failures propagate; unavailable hardware is
    not reported as a passing or skipped benchmark. Device allocations are session-owned."
   ([] (run! :ocl:0))
   ([device] (run! device {}))
-  ([device {:keys [timing? rounds warmup-rounds]
-            :or {timing? false rounds 12 warmup-rounds 4}}]
+  ([device {:keys [timing? rounds warmup-rounds shape tile-policy input-policy variant]
+            :or {timing? false rounds 12 warmup-rounds 4 shape [13 32 32]
+                 tile-policy :single-fragment input-policy :dyadic variant :nn}}]
    (when-not (and (boolean? timing?) (integer? rounds) (<= 2 rounds 120) (even? rounds)
                   (integer? warmup-rounds) (<= 0 warmup-rounds 120))
      (throw (ex-info "probe requires bounded even rounds and nonnegative warmup rounds"
                      {:rounds rounds :warmup-rounds warmup-rounds :timing? timing?})))
-   (let [shape [13 32 32] [m n k] shape
+   (when-not (and (vector? shape) (= 3 (count shape))
+                  (every? #(and (integer? %) (<= 1 % 4096)) shape)
+                  (<= (apply *' shape) 8388608)
+                  (contains? tiles tile-policy) (contains? #{:dyadic :half-rounding-ties} input-policy)
+                  (contains? #{:nn :nt} variant))
+     (throw (ex-info "probe geometry, work budget, tile or input policy is unsupported"
+                     {:shape shape :tile-policy tile-policy :input-policy input-policy :variant variant})))
+   (let [[m n k] shape
          [a b] (canary/gemm-arguments shape)
+         a (if (= :half-rounding-ties input-policy)
+             (float-array (map #(+ (double %) (/ 1.0 4096.0)) a)) a)
+         resident-b (if (= :nt variant)
+                      (float-array (for [j (range n) p (range k)] (aget ^floats b (+ (* p n) j)))) b)
          activations [a (float-array (map - a))]
-         expected (mapv #(vec (canary/gemm-reference % b shape)) activations)
+         expected (mapv #(vec (canary/gemm-reference (rounded-inputs %) (rounded-inputs b) shape)) activations)
          poison (float-array (* m n) Float/NaN)
-         spec {:id :input-fusion-replay :a 'A :b 'B :c 'C :m m :n n :k k :variant :nn
+         spec {:id :input-fusion-replay :a 'A :b 'B :c 'C :m m :n n :k k :variant variant
                :fill-workgroups 16
-               :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
-                      :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}}
+               :tile (get tiles tile-policy)}
          candidates [(first (:alternatives (gemm/emit-matrix-alternatives spec)))
                      (gemm/emit-matrix-input-fusion-alternative spec)]
          live (atom []) profiles (atom [])]
      (gpu/with-gpu-session [sess device]
-       (gpu/alloc! sess {:a [:float (* m k) a] :b [:float (* k n) b]
+       (gpu/alloc! sess {:a [:float (* m k) a] :b [:float (* k n) resident-b]
                          :c [:float (* m n) poison]})
        (try
          (let [samplers
@@ -79,6 +101,8 @@
                replays (+ 4 (if timing? (+ rounds warmup-rounds) 0))]
            (cond->
             {:device device :shape shape :comparison :exact :timing? timing?
+             :variant variant :tile-policy tile-policy :tile (:tile spec) :input-policy input-policy
+             :oracle :java-rne-binary16-inputs-host-double-dot-float-output
              :candidates (mapv (fn [g]
                                 {:strategy (get-in g [:attributes :strategy])
                                  :passed? true :replays replays :checked-elements (* replays m n)
