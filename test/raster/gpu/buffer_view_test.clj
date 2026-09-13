@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.gpu.core :as gpu]))
 
 (defn- allocation [id bytes ownership]
@@ -65,19 +66,30 @@
         overlap (bview/view allocation {:id :overlap :byte-offset 16 :dtype :float :shape [8]})
         use (fn [id access] (kgraph/->ValueUse id access))
         node (fn [id uses deps] (kgraph/->ScheduledKernel id :mock uses nil deps))
-        validate! (ns-resolve 'raster.gpu.core 'validate-physical-aliases!)]
+        graph (fn [nodes]
+                (kgraph/make {:inputs [(kgraph/buffer :a :float 8 :shared :inout)
+                                      (kgraph/buffer :b :float 8 :shared :inout)]
+                              :nodes nodes}))
+        validate! (fn [g bindings] (graph-call/validate-external-aliases! g bindings bview/overlaps?))]
     (testing "disjoint views of one allocation are legal"
-      (is (map? (validate! {:nodes [(node :one [(use :a :read) (use :b :write)] [])]}
-                           {:a {:view left} :b {:view right}}))))
+      (is (map? (validate! (graph [(node :one [(use :a :read) (use :b :write)] [])])
+                           {:a left :b right}))))
     (testing "one kernel cannot receive contradictory overlapping writable identities"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"overlapping writable"
-                            (validate! {:nodes [(node :one [(use :a :read) (use :b :write)] [])]}
-                                       {:a {:view left} :b {:view overlap}}))))
+                            (validate! (graph [(node :one [(use :a :read) (use :b :write)] [])])
+                                       {:a left :b overlap}))))
+    (testing "missing, excess and nil bindings are not alias proofs"
+      (let [g (graph [(node :one [(use :a :read) (use :b :write)] [])])]
+        (doseq [bindings [{:a left} {:a left :b right :extra left} {:a left :b nil}]]
+          (is (= :kernel-graph-alias-bindings
+                 (try (validate! g bindings) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+        (is (= [{:reason :kernel-graph-writable-alias :node :one :left :a :right :b}]
+               (graph-call/external-alias-violations g {:a left :b overlap} bview/overlaps?)))))
     (testing "an alias-induced cross-kernel hazard needs an edge"
       (let [first-node (node :first [(use :a :write)] [])
             unsafe (node :second [(use :b :read)] [])
             safe (assoc unsafe :dependencies [:first])
-            bindings {:a {:view left} :b {:view overlap}}]
+            bindings {:a left :b overlap}]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"omits a dependency"
-                              (validate! {:nodes [first-node unsafe]} bindings)))
-        (is (map? (validate! {:nodes [first-node safe]} bindings)))))))
+                              (validate! (graph [first-node unsafe]) bindings)))
+        (is (map? (validate! (graph [first-node safe]) bindings)))))))
