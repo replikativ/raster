@@ -237,3 +237,26 @@ unequal-shard heat and mapped-checkpoint acceptance to exercise that actual DAG.
 integration should numerical coarse/fine operators be counted as an AMR execution vertical.
 The full campaign still includes external model training validation and numerical AMR; none of
 these structural design requirements substitutes for those numerical workload gates.
+
+## Generated coarse/fine numerical acceptance
+
+`raster.ode.multilevel` expresses dyadic, dense, cell-centred 2-D piecewise-constant prolongation
+and cell-average restriction as ordinary `deftm` programs. The existing TypedSOAC pipeline emits
+their kernels; there is no AMR emitter or privileged numerical operator lowering. Sources and
+destinations must be disjoint, and callers provide the stated coarse and doubled fine extents.
+Restriction uses FP64 arithmetic with the written summation order. These are first-order transfer
+operators, not higher-order interpolation, a PDE time integrator, subcycling or conservative reflux.
+
+The numerical acceptance checks rectangular CPU oracles, constant preservation and cell-volume
+weighted sum preservation, individual generated GPU execution, and a composed resident cycle.
+It also binds the two steps produced by `schedule-coarse-fine` to generated local LinkPlans and
+executes their ordered DistributedPlan on one GPU. This full-domain cycle is an executable witness,
+not a general proof that a supplied local program implements a declared coarse/fine operator.
+Partial patch-region binding, executable numerical certification, refinement decisions, and
+coarse/fine PDE evolution with convergence and interface-flux oracles remain required.
+
+A separate smooth-field oracle uses exact cell averages of a bilinear polynomial on three
+rectangular resolutions. Averaging down recovers the coarse cell averages and both transfers
+preserve the analytic domain integral. The nonzero volume-weighted RMS error of constant
+prolongation decreases at first order. This measures transfer approximation, not PDE convergence
+or a general certified error bound; conservation alone must not be mistaken for accuracy.
