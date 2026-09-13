@@ -868,7 +868,10 @@
    A binding is either `{:value id :shard id}` or an explicit `{:local-shape [...]
    :placements [{:kind :owned :value id :shard id :local-offsets [...]}]}`. The latter
    proves a dense equal-volume local coordinate domain and reports it under `:domain`.
-   Only complete owned-domain coverage is currently admitted, not padding/replicas."
+   Copy-halo replicas may complete the domain with `{:kind :replica :transfer step-id}`;
+   their geometry is derived from ScheduledHalo and their steps must precede the consumer.
+   Exact disjoint coverage is checked. This is not freshness/initialization or execution proof;
+   explicit boundary producers and combining transfers are not yet admitted as placements."
   [plan]
   (compute/bindings (validate-structure! plan)))
 

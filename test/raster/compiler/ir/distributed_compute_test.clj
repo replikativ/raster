@@ -160,7 +160,7 @@
         check (fn [plan reference]
                 (failure-reason #(make-plan {:device-plans
                                             (device-plans plan {:local-x reference})})))]
-    (is (= :distributed-compute-value-contract (check local (explicit-domain [3 3])))))
+    (is (= :distributed-compute-local-domain (check local (explicit-domain [3 3])))))
   (let [local (local-link-plan {:x-shape [6]})
         plans (device-plans local {:local-x (explicit-domain [2 3])})]
     (doseq [[changed expected]
@@ -181,6 +181,71 @@
            (failure-reason #(make-plan {:device-plans
                                        (assoc-in plans [:gpu-0 :steps :copy-0 :bindings :local-x
                                                         :placements] [{:kind :replica :transfer :missing}])}))))))
+
+(defn- periodic-materialization-plan []
+  (let [global (assoc (global-value) :shape [2 2]
+                      :sharding {:kind :partitioned :axis 0 :devices [:gpu-0 :gpu-1]})
+        shards (mapv (fn [i]
+                       (distributed/shard {:id (keyword (str "x-" i)) :value :x
+                                           :device (keyword (str "gpu-" i))
+                                           :offsets [i 0] :shape [1 2] :ownership :owned}))
+                     (range 2))
+        halo (distributed/schedule-halo
+              (distributed/halo-exchange {:id :periodic :value :x :axis 0 :width 1
+                                          :boundary :periodic})
+              global shards {[:gpu-0 :gpu-1] [:forward] [:gpu-1 :gpu-0] [:backward]} [])
+        replicas (mapv (fn [step] {:kind :replica :transfer (:id step)})
+                       (filter #(= :gpu-0 (:target %)) (:steps halo)))
+        reference {:local-shape [3 2]
+                   :placements (into [{:kind :owned :value :x :shard :x-0 :local-offsets [1 0]}]
+                                     replicas)}
+        base (plan-map {:device-plans (device-plans (local-link-plan {:x-shape [6]})
+                                                    {:local-x reference})})]
+    (-> base
+        (assoc :halos [halo]
+               :topology (distributed/topology
+                           (vals (:devices (topology)))
+                           [(distributed/link {:id :forward :source :gpu-0 :target :gpu-1
+                                               :bandwidth-bytes-s 1.0e9 :latency-ns 100})
+                            (distributed/link {:id :backward :source :gpu-1 :target :gpu-0
+                                               :bandwidth-bytes-s 1.0e9 :latency-ns 100})]))
+        (assoc-in [:values :x] global)
+        (assoc-in [:shards :x] shards)
+        (update :steps (fn [steps]
+                         (into (:steps halo)
+                               (assoc-in steps [0 :dependencies] (:completions halo))))))))
+
+(deftest periodic-replicas-project-from-the-scheduled-halo
+  (let [plan (periodic-materialization-plan)
+        report (distributed/compute-bindings (distributed/plan plan))
+        placements (get-in report [:bindings :copy-0 :values :local-x :domain :placements])]
+    (is (= #{[0 0] [1 0] [2 0]} (set (map #(get-in % [:region :offsets]) placements))))
+    (is (= [[1 2] [1 2] [1 2]] (mapv #(get-in % [:view :shape]) placements)))
+    (is (= #{0 8 16} (set (map #(get-in % [:view :byte-offset]) placements))))
+    (is (= [:analytical-only] (:unbound report)))
+    (testing "a gap cannot be treated as an initialized boundary"
+      (is (= :distributed-compute-placement-coverage
+             (failure-reason #(distributed/plan
+                               (update-in plan [:device-plans :gpu-0 :steps :copy-0
+                                                :bindings :local-x :placements] pop))))))
+    (testing "repeated replicas do not prove coverage"
+      (is (= :distributed-compute-placement-coverage
+             (failure-reason #(distributed/plan
+                               (update-in plan [:device-plans :gpu-0 :steps :copy-0
+                                                :bindings :local-x :placements]
+                                          (fn [p] (assoc p 2 (nth p 1)))))))))
+    (testing "vector order is not a producer dependency"
+      (is (= :distributed-compute-replica-dependency
+             (failure-reason #(distributed/plan
+                               (update plan :steps
+                                       (fn [steps] (mapv (fn [s] (if (= :copy-0 (:id s))
+                                                                 (assoc s :dependencies []) s)) steps))))))))
+    (testing "a transfer to the other shard is not a local replica"
+      (is (= :distributed-compute-replica-transfer
+             (failure-reason #(distributed/plan
+                               (assoc-in plan [:device-plans :gpu-0 :steps :copy-0 :bindings
+                                               :local-x :placements 1 :transfer]
+                                         [:periodic :edge 0 :forward]))))))))
 
 (deftest compute-bindings-retain-exact-link-values-and-derived-accesses
   (let [plan (make-plan)

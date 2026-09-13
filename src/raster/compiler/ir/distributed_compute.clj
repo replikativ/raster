@@ -36,15 +36,19 @@
 
     (and (map? reference) (= #{:local-shape :placements} (set (keys reference))))
     (let [placements (:placements reference)
-          owned (when (vector? placements) (first placements))]
-      (when-not (and (vector? placements) (= 1 (count placements))
+          owners (when (vector? placements) (filter #(= :owned (:kind %)) placements))
+          owned (first owners)]
+      (when-not (and (vector? placements) (= 1 (count owners))
                      (map? owned) (= :owned (:kind owned))
-                     (= #{:kind :value :shard :local-offsets} (set (keys owned))))
-        (fail! "this materialization requires one owned placement; replica/boundary proofs are not yet implemented"
+                     (= #{:kind :value :shard :local-offsets} (set (keys owned)))
+                     (every? #(or (= % owned)
+                                  (and (map? %) (= :replica (:kind %))
+                                       (= #{:kind :transfer} (set (keys %))))) placements))
+        (fail! "materialization requires one owned placement and scheduled copy replicas; boundaries need producer proofs"
                :distributed-compute-placement-coverage {:reference reference}))
       (assoc (select-keys owned [:value :shard])
              :local-shape (:local-shape reference) :local-offsets (:local-offsets owned)
-             :explicit-domain? true))
+             :placements placements :explicit-domain? true))
 
     :else
     (fail! "binding must name a qualified shard or an explicit local materialization"
@@ -72,7 +76,57 @@
               :physical-layout (:physical-layout local)}))
     (view/subview base {:shape shape})))
 
-(defn- bind-values [{plan :link-plan :keys [accesses required]} device globals shards bindings]
+(defn- predecessor-ids [step-by-id id]
+  (loop [pending (seq (:dependencies (get step-by-id id))) seen #{}]
+    (if-let [id (first pending)]
+      (if (contains? seen id)
+        (recur (next pending) seen)
+        (recur (concat (next pending) (:dependencies (get step-by-id id))) (conj seen id)))
+      seen)))
+
+(defn- domain-placements [domain reference candidate device halo-steps predecessors]
+  (let [anchor (:local-offsets reference)
+        _ (view/rectangular-subview domain {:offsets anchor :shape (:shape candidate)})
+        placements
+        (mapv
+         (fn [placement]
+           (let [region
+                 (if (= :owned (:kind placement))
+                   {:offsets anchor :shape (:shape candidate)}
+                   (let [transfer (get halo-steps (:transfer placement))
+                         attrs (:attributes transfer)
+                         destination (:destination-region attrs)]
+                     (when-not (and transfer (= device (:target transfer))
+                                    (= (:value reference) (:value transfer))
+                                    (= (:shard reference) (:target-shard attrs))
+                                    (= :copy (:destination-mode attrs))
+                                    (= :target-local (:frame destination)))
+                       (fail! "replica must name a scheduled copy halo into this owned shard"
+                              :distributed-compute-replica-transfer {:placement placement}))
+                     (when-not (contains? predecessors (:id transfer))
+                       (fail! "replica transfer must precede its consumer through DAG dependencies"
+                              :distributed-compute-replica-dependency {:placement placement}))
+                     {:offsets (mapv +' anchor (:offsets destination))
+                      :shape (:shape destination)}))]
+             (assoc placement :region region :view (view/rectangular-subview domain region))))
+         (:placements reference))
+        regions (mapv :region placements)]
+    ;; Rectangular projection proves containment. Pairwise coordinate disjointness plus
+    ;; equal volume proves exact coverage, without confusing strided byte bounding spans.
+    (doseq [i (range (count regions)) j (range (inc i) (count regions))]
+      (let [a (nth regions i) b (nth regions j)]
+        (when (every? true? (map (fn [a n b m] (and (< a (+' b m)) (< b (+' a n))))
+                                 (:offsets a) (:shape a) (:offsets b) (:shape b)))
+          (fail! "local placements overlap in logical coordinates"
+                 :distributed-compute-placement-coverage {:left a :right b}))))
+    (when-not (= (reduce *' 1 (:shape domain))
+                 (reduce +' 0 (map #(reduce *' 1 (:shape %)) regions)))
+      (fail! "local placements do not cover the complete ABI domain"
+             :distributed-compute-placement-coverage {:shape (:shape domain) :regions regions}))
+    placements))
+
+(defn- bind-values [{plan :link-plan :keys [accesses required]} device globals shards bindings
+                   halo-steps predecessors]
   (when-not (map? bindings)
     (fail! "compute bindings must map local values to qualified shard references"
            :distributed-compute-bindings {:bindings bindings}))
@@ -115,9 +169,8 @@
                    (when-not (= device (:device candidate))
                      (fail! "compute binding names a shard on another device"
                             :distributed-compute-shard-device {:device device :shard candidate}))
-                   (when-not (and (= (:shape candidate) (if (:explicit-domain? reference)
-                                                        (:local-shape reference)
-                                                        (get-in local [:abstract :shape])))
+                   (when-not (and (or (:explicit-domain? reference)
+                                      (= (:shape candidate) (get-in local [:abstract :shape])))
                                   (av/storage-contract-compatible? global (:abstract local)))
                      (fail! "local value does not realize the shard's logical storage contract"
                             :distributed-compute-value-contract
@@ -130,15 +183,13 @@
                             :distributed-compute-memory-space {:reference reference}))
                    (let [domain (when (:explicit-domain? reference)
                                   (project-domain local leaves (:local-shape reference)))
-                         owned (when domain
-                                 (view/rectangular-subview domain
-                                                          {:offsets (:local-offsets reference)
-                                                           :shape (:shape candidate)}))]
+                         placements (when domain
+                                      (domain-placements domain reference candidate device
+                                                         halo-steps predecessors))]
                      [id (cond-> {:value value :shard shard :access (get accesses id)
                                   :physical-layout (:physical-layout local) :leaves leaves}
                            domain (assoc :domain {:shape (:local-shape reference) :view domain
-                                                  :placements [{:kind :owned :value value :shard shard
-                                                                :view owned}]}))])))
+                                                  :placements placements}))])))
                bindings))))
 
 (defn- owned-realization [{:keys [physical-layout leaves domain]}]
@@ -159,10 +210,12 @@
   "Derive bindings after the enclosing DistributedPlan validates its DAG and shards.
    Unbound analytical compute is explicit. Fully bound compute is not a distributed executor:
    device-scoped allocation, transfer realization, events and arena ownership remain runtime
-   obligations. Full owned-domain coverage is required, with optional explicit dense
-   reinterpretation; halo subregions still require coverage and provenance proofs."
-  [{:keys [device-plans steps values shards]}]
+   obligations. Explicit dense domains require exact owned/copy-replica coverage and
+   replica DAG predecessors. Initialization, intervening-write freshness, boundary providers,
+   and executable transfer endpoints remain additional execution-proof obligations."
+  [{:keys [device-plans steps values shards halos]}]
   (let [step-by-id (into {} (map (juxt :id identity)) steps)
+        halo-steps (into {} (map (juxt :id identity)) (mapcat :steps halos))
         bound
         (reduce-kv
          (fn [bound device local]
@@ -195,10 +248,12 @@
                            :distributed-compute-entry {:device device :entry entry}))
                   (assoc bound id {:entry entry :link-plan plan
                                    :values (bind-values (get entries entry) device values shards
-                                                        (:bindings call))})))
+                                                        (:bindings call) halo-steps
+                                                        (predecessor-ids step-by-id id))})))
               bound calls))))
          {} device-plans)
-        realized (volatile! {})]
+        realized (volatile! {})
+        replicas (volatile! {})]
     ;; Distinct entry points cannot silently assign one resident shard different storage.
     ;; IDs of views may differ; allocation identity, ranges and ordered field packing may not.
     (doseq [[id entry] bound
@@ -216,6 +271,16 @@
             (fail! "distinct distributed shards cannot alias physical storage without a relation"
                    :distributed-compute-shard-alias {:shard key :other other-key})))
         (vswap! realized assoc key {:realization realization :leaves leaves})))
+    (doseq [[id entry] bound
+            [_ binding] (:values entry)
+            placement (get-in binding [:domain :placements])
+            :when (= :replica (:kind placement))]
+      (let [key [(:device (get step-by-id id)) (:transfer placement)]
+            region (dissoc (:view placement) :id)]
+        (when (and (contains? @replicas key) (not= (get @replicas key) region))
+          (fail! "consumers disagree on a transfer's physical replica destination"
+                 :distributed-compute-replica-storage {:step id :replica key}))
+        (vswap! replicas assoc key region)))
     {:bindings bound
      :unbound (mapv :id (filter #(and (= :compute (:kind %))
                                      (not (contains? bound (:id %)))) steps))}))
