@@ -1065,3 +1065,10 @@ conflict algebra, scheduled KernelBody and ordinary executable binder. Existing 
 (128 assertions), pass with retired vars unmapped from the REPL. In particular, collision updates
 preserve nonzero destination contents rather than inheriting the old binder's implicit zero-fill.
 This retires an orphan route, not scatter semantics or an independently exercised source oracle.
+The retirement includes LinkPlan/ProgramStage certification: old positional descriptors are
+rejected for lacking an executable interface, rather than being certified for a missing binder.
+All retained descriptor effects use the executable ABI; the dead generic extraction tail and its
+emitter-side scalar-type inference import are removed. The focused LinkPlan and ProgramStage
+namespaces pass 9 tests/41 assertions, including rejection on both ZE and OpenCL. A follow-up must
+validate internal scatter accumulator initialization end to end through ordinary typed fill IR;
+do not reintroduce implicit zeroing in a special runtime convention.

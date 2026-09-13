@@ -44,7 +44,6 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
-            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-opencl :as parallel-program-opencl]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
@@ -2092,29 +2091,10 @@
                            :phase (keyword (str "gpu-step-" i))})
 
                         :else
-                        (let [{:keys [kernel-name arrays scalars n-expr convention output]} step]
-                          {:kernel-name kernel-name
-                           :arrays arrays
-                           ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
-                           ;; LinkPlan instantiation wires it like a map output (it lives in :allocs as scratch).
-                           :output (when output (keyword (name output)))
-                           :n-fn (expr->arg-fn all-params scalar-lets n-expr)
-                           ;; Type each scalar arg with the SAME canonical scalar dtype the kernel
-                           ;; DECLARATION uses (par_opencl), so the host arg encoding always matches
-                           ;; the kernel's C param type — single source of truth. A deftm PARAM is in
-                           ;; scalar-types; a HOISTED LOCAL scalar (e.g. `nb (quot in 32)`, not a
-                           ;; param) is typed from its `:raster.type/tag` stamp. The old code only
-                           ;; consulted the param map and DEFAULTED locals to :float — so an int local
-                           ;; like `nb` was declared `int` in the kernel but encoded `:float` on the
-                           ;; host → float-bits into an int slot → garbage index → OOB → device-lost.
-                           :scalar-specs (mapv (fn [s]
-                                                 {:type (c-emit/scalar-parameter-dtype
-                                                         s (:scalar-types gpu-param-types)
-                                                         effective-dtype)
-                                                  :value-fn (expr->arg-fn all-params scalar-lets s)})
-                                               scalars)
-                           :convention convention
-                           :phase (keyword (str "gpu-step-" i))})))
+                        (throw (ex-info "resident extraction has no executable convention"
+                                        {:reason :resident-unsupported-convention
+                                         :convention (:convention step)
+                                         :kernel-name (:kernel-name step)}))))
                     (range) (:steps prog))
        :result-sym (:result prog)
        :compiler-report

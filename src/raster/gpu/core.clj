@@ -1988,7 +1988,6 @@
      :map/:reduce/:map-void/:contract/:executable
                 Select one ABI-compatible KernelArtifact or KernelGraph schedule. Graph-private
                 conversion/layout/split temporaries remain owned by the bound step.
-     :scatter   Expands to zero-fill + scatter behind the same ordered prepared-step boundary.
 
    Optional opts carry descriptor context needed by composition: {:schedule <resolved schedule>
    :roles {compiler-sym -> :constant|...}}. Captured constants make eligible graph transforms a
