@@ -795,6 +795,7 @@
       (let [typed (typed-soac-route/attempt
                    source (:dtype opts) (:array-types opts)
                    {:resident-reductions? (true? (:resident-reductions? opts))
+                    :resident-initialization? (device/gpu-target? (:target-device opts))
                     :scalar-types (:scalar-types opts)
                     :values (:values opts)
                     :abstract-machine abstract-machine})]

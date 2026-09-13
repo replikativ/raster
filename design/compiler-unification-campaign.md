@@ -1072,3 +1072,33 @@ emitter-side scalar-type inference import are removed. The focused LinkPlan and 
 namespaces pass 9 tests/41 assertions, including rejection on both ZE and OpenCL. A follow-up must
 validate internal scatter accumulator initialization end to end through ordinary typed fill IR;
 do not reintroduce implicit zeroing in a special runtime convention.
+
+## Fresh-storage initialization through the typed vertical
+
+Resident allocation does not itself implement Clojure's fresh-array zero semantics, and allocating
+once is not enough for repeated execution. The frontend now retains allocation initialization,
+element type, extent, and source order in TypedSOAC facts using the shared allocator descriptor.
+GPU scheduling materializes required zeros as ordinary typed maps after fusion and before
+ownership certification. Native fresh-array execution keeps its native initialization provider.
+Explicit compound allocation lengths use the same scalar SSA normalization as launch extents,
+at the original allocation site; the public invocation plan therefore sees a scalar dimension,
+not a reconstructed arithmetic expression. Value remapping preserves the allocation contracts.
+
+The first overwrite-elision proof is deliberately narrow: an unconditional dense map over exactly
+the allocated extent, with no aliased destination read. Write-only permission is not a full-domain
+coverage proof for conditional stores, padded contractions, or sparse updates. Unsupported extent,
+dtype, placement, alias, and observable-host-use contracts fail closed. Broader coverage proofs
+for contractions/effect maps remain performance work; this change does not claim optimal fill
+elision or improve the matrix schedule selector.
+
+Validation covers ordinary and strided public scatter, holes, collisions, changed inputs, and
+two replays on Arc; both stages are ordinary KernelBody kernels. CUDA/HIP checks cover public
+source compilation **and allocation-free LinkPlan lowering**, not emission alone. Focused pure
+checks cover full/partial overwrite, copy/unspecified storage, malformed facts, aliases, source
+placement, generated names, and value remapping. Existing numerical tests are retained.
+
+Separately, the full typed route namespace on an Intel device exposes remaining unification debt:
+`gemm/split-k-combine-plan` still builds a contraction surface form and calls `contraction-facts`
+and `contract-form->segred`. The source-reparse guard fails with initialization disabled as well;
+its input contains no allocation. Preserve that guard and migrate this compiler-generated
+combine algorithm directly to typed IR in the next slice, rather than weakening the test.

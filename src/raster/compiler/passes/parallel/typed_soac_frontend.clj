@@ -1918,7 +1918,21 @@
                              (assoc-in state [:local-scalar-types symbol] scalar-dtype)
                              state)
                      scalar-aliases (:scalar-aliases state)
-                     extent (parallel-extent expression)
+                     parallel-extent (parallel-extent expression)
+                     allocation-extent (allocation-length expression)
+                     ;; Normalize explicit allocation lengths at their original evaluation site,
+                     ;; using the same scalar SSA mechanism as launch extents. Source-shaped
+                     ;; one-argument allocators retain their exemplar (not a substituted size).
+                     explicit-allocation-extent
+                     (when (and allocation-extent
+                                (= allocation-extent (last (descriptor/call-args expression))))
+                       allocation-extent)
+                     extent (or parallel-extent explicit-allocation-extent)
+                     replace-extent (fn [expression extent]
+                                      (if parallel-extent
+                                        (replace-parallel-extent expression extent)
+                                        (with-meta (apply list (concat (butlast expression) [extent]))
+                                          (meta expression))))
                      ;; `(alength y)` over a local allocation is the allocation's declared
                      ;; length; follow renamed allocations to their length as well.
                      resolve-length (fn resolve-length [extent seen]
@@ -1950,7 +1964,7 @@
                    ;; count remains an executable scalar equation with a distinct dimension id.
                    (dialect/extent? canonical-extent)
                    (update state :normalized conj
-                           [symbol (replace-parallel-extent expression canonical-extent)])
+                           [symbol (replace-extent expression canonical-extent)])
 
                    (provably-pure-scalar? canonical-extent)
                    (if-let [extent-id (get compound-extents canonical-extent)]
@@ -1958,7 +1972,7 @@
                      ;; redundant scalar work, this exposes equal launch geometry to the
                      ;; general horizontal-fusion rule (for example two same-shaped views).
                      (update state :normalized conj
-                             [symbol (replace-parallel-extent expression extent-id)])
+                             [symbol (replace-extent expression extent-id)])
                      (let [extent-dtype (or (retained-scalar-dtype canonical-extent local-scalar-types)
                                             :long)
                            extent-tag (dtype/scalar-tag-for-dtype extent-dtype)
@@ -1973,7 +1987,7 @@
                            (assoc-in [:compound-extents canonical-extent] extent-id)
                            (update :normalized into
                                    [[extent-id canonical-extent]
-                                    [symbol (replace-parallel-extent expression extent-id)]]))))
+                                    [symbol (replace-extent expression extent-id)]]))))
 
                    :else
                    (update state :normalized conj [symbol expression]))))
@@ -3056,6 +3070,27 @@
                                                              values)]
     (form->program* source options)))
 
+(defn- allocation-contracts
+  "Allocation leaves the equation spine as host scaffolding, but initialization is semantic.
+   Supported constructor arity and positive scalar-kind evidence distinguish a length from a
+   copy input; (float-array n 7), for example, must never become a zero-initialization fact."
+  [descriptions array-types scalar-types values shape-equalities]
+  (binding [*declared-kinds*
+            {:arrays (set (keys array-types))
+             :scalars (into (set (keys scalar-types))
+                            (keep (fn [[id value]] (when (= [] (:shape value)) id)))
+                            values)}]
+    (into []
+          (keep (fn [{:keys [kind id sym expr]}]
+                  (when (= :scalar kind)
+                    (when-let [extent (allocation-length expr)]
+                      {:destination sym :source-binding-id id
+                       :extent (canonical-extent shape-equalities values extent)
+                       :initialization (descriptor/allocation-initialization
+                                        (descriptor/semantic-op expr))
+                       :dtype (:dtype (get values sym))}))))
+          descriptions)))
+
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
@@ -3226,6 +3261,16 @@
                       :effects total-effects
                       :provenance {:front-end :analyzed-source}
                       :attributes {:source-dialect :closed-clojure
+                                   :source-bindings (mapv first pairs)
                                    :host-binding-ids host-binding-ids
-                                   :host-read-values host-read-values}})]
+                                   :host-read-values host-read-values
+                                   :host-read-sites
+                                   (mapv (fn [{:keys [id expr]}]
+                                           {:source-binding-id id
+                                            :values (set (filter #(contains? values %)
+                                                                 (util/free-syms expr)))})
+                                         host-descriptions)
+                                   :allocations (allocation-contracts descriptions array-types
+                                                                      scalar-types values
+                                                                      shape-equalities)}})]
           (dialect/make facts equations outputs))))))
