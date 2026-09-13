@@ -230,6 +230,44 @@
       (is (empty? (:unbound (distributed/compute-bindings plan))))
       (is (= 1 @calls)))))
 
+(deftest bound-shards-cannot-hide-private-aliases
+  (let [local (local-link-plan)
+        scratch (-> (get-in local [:nodes :x-node])
+                    (assoc :id :private-node :role :scratch)
+                    (assoc-in [:view :id] :private-node))
+        local (-> local
+                  (assoc-in [:nodes :private-node] scratch)
+                  (assoc-in [:values :private]
+                            (link/value {:id :private :abstract (local-abstract [2 3])
+                                         :leaves [{:name :value :node :private-node}]}))
+                  (assoc :aliases #{#{:x-node :private-node}})
+                  (update :instances conj
+                          (link/instance {:id :private-write :descriptor copy-descriptor
+                                          :bindings {'x :local-y 'weights :local-weights
+                                                     'y :private}
+                                          :scalars {'n 6}})))]
+    (is (link/link-plan? (link/validate! local)))
+    (is (= {:local-x :read :local-weights :read :local-y :read-write :private :write}
+           (link/value-accesses local)))
+    (is (= :distributed-compute-private-alias
+           (failure-reason #(make-plan {:link-plan local}))))
+    (testing "private scratch can occupy a disjoint range in the same allocation"
+      (is (distributed/distributed-plan?
+           (make-plan {:link-plan
+                       (-> local
+                           (assoc :aliases #{})
+                           (assoc-in [:nodes :x-node :view :allocation :byte-size] 48)
+                           (assoc-in [:nodes :private-node :view :allocation :byte-size] 48)
+                           (assoc-in [:nodes :private-node :view :byte-offset] 24))}))))))
+
+(deftest misspelled-local-contract-keys-do-not-silently-declare-analytical-compute
+  (let [base (device-plans (local-link-plan))
+        misspelled (-> base
+                       (assoc-in [:gpu-0 :step] (get-in base [:gpu-0 :steps]))
+                       (update :gpu-0 dissoc :steps))]
+    (is (= :distributed-compute-device-keys
+           (failure-reason #(make-plan {:device-plans misspelled}))))))
+
 (deftest entry-step-value-and-shard-references-fail-closed
   (let [base (device-plans (local-link-plan))]
     (doseq [[label plans]

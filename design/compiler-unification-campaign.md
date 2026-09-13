@@ -1114,6 +1114,9 @@ same resident shard must agree on allocation identity, range and ordered field p
 Distinct shards cannot overlap physical ranges on one device without an explicit relation;
 disjoint subviews remain legal. Declared global memory-space constraints must hold for every
 physical leaf. Entry access facts are derived once per report, not once per invocation.
+Bound leaves cannot alias private entry storage until an alias-aware access proof exists.
+Private-private storage and unused entries remain entry-scoped; only bound shard storage gains
+device-scoped identity. Unknown device-local keys are rejected rather than silently ignored.
 
 This is not yet distributed execution: device-scoped allocation sharing, transfer realization,
 submission/completion and ownership still need a numerical vertical. Separately instantiated

@@ -44,6 +44,17 @@
     (when-not (= (count bindings) (count (distinct (vals bindings))))
       (fail! "one compute call gives one shard distinct local identities"
              :distributed-compute-duplicate-shard {:bindings bindings}))
+    ;; LinkPlan validates declared aliases locally, but logical ABI access facts do not
+    ;; propagate through them. Do not hide private mutations behind a bound read-only value.
+    (let [bound-nodes (into #{} (mapcat #(map :node (:leaves (get-in plan [:values %]))))
+                            supplied)]
+      (doseq [bound-node bound-nodes
+              [private-node node] (:nodes plan)
+              :when (not (contains? bound-nodes private-node))]
+        (when (view/overlaps? (get-in plan [:nodes bound-node :view]) (:view node))
+          (fail! "bound shard storage cannot alias private entry storage without an access proof"
+                 :distributed-compute-private-alias
+                 {:bound-node bound-node :private-node private-node}))))
     (into {}
           (map (fn [[id reference]]
                  (when-not (and (map? reference) (= #{:value :shard} (set (keys reference))))
@@ -88,6 +99,10 @@
         bound
         (reduce-kv
          (fn [bound device local]
+           (when-not (set/subset? (set (keys local))
+                                  #{:entries :steps :link-plan :execution-plan :attributes})
+             (fail! "unknown device-local compute contract keys"
+                    :distributed-compute-device-keys {:device device :keys (set (keys local))}))
            (let [entries (get local :entries {}) calls (get local :steps {})]
              (when-not (and (map? entries) (map? calls))
                (fail! "device compute entries and calls must be maps"
