@@ -57,3 +57,29 @@
             executable (runtime/instantiate! plan {:session session})]
         (is (= #{:x :unused} @(:pending-inputs executable))
             "an exported pass-through input remains a real initialization requirement")))))
+
+(deftest constant-prologues-only-capture-initialized-locally-unwritten-values
+  (let [roles (atom [])
+        session (atom {:device-id :ze:0})
+        original (assoc-in (copy-plan) [:nodes :x :role] :constant)]
+    (with-redefs [gpu/alloc! (fn [& _])
+                  gpu/buffer-view (fn [_ key opts] (assoc opts :buffer-key key))
+                  gpu/bind-step! (fn [_ _ _ _ opts] (swap! roles conj (:roles opts)))
+                  gpu/record-graph! (fn [& _])
+                  gpu/upload-range! (fn [& _])]
+      (let [executable (runtime/instantiate! original {:session session})]
+        (is (= :input (get (first @roles) 'x))
+            "a late-upload constant must not be read by an instantiation-time prologue")
+        (is (= #{:x} @(:pending-inputs executable))))
+      (reset! roles [])
+      (runtime/instantiate! (assoc-in original [:nodes :x :source] (float-array [1 2])) {:session session})
+      (is (= :constant (get (first @roles) 'x))
+          "captured weights retain their one-time transform optimization")
+      (reset! roles [])
+      (is (= :link-role-mismatch
+             (try (runtime/instantiate! (assoc-in original [:instances 1 :roles 'x] :constant)
+                                        {:session session})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+          "the existing validator rejects relabeling writable state as a constant")
+      (is (empty? @roles)))))

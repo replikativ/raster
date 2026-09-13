@@ -1068,7 +1068,9 @@
    the owner. Initialization requirements refer to the original plan, before sources are removed.
    No allocation, upload, ownership transfer or initialization proof occurs here. The owner must
    keep every supplied buffer alive through all local execution and release borrowed registrations
-   before freeing storage. Already external/borrowed allocations retain their original contracts."
+   before freeing storage. Already external/borrowed allocations retain their original contracts.
+   Projection fails closed if removing a source leaves an internal/output value without a valid
+   caller-input role or local producer; borrowed ownership alone is not initialization evidence."
   [plan]
   (let [plan (validate! plan)
         initialization (initialization-contract plan)
