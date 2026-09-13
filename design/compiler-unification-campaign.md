@@ -1100,7 +1100,7 @@ the distributed compute/transfer DAG with device-scoped allocation and ownership
 real bytes and continue the same numerical evolution after reopening. The two-worker acceptance
 must not be counted as evidence those cross-entry and multi-device runtime obligations are done.
 
-Items 6–8 have checked planning components, not yet one executable numerical acceptance:
+Items 6–8 have checked planning components, but not yet multi-device numerical execution:
 `distributed-plan` simulates topology, dependencies, collective/halo schedules and analytic costs;
 `numerical-state` certifies chunk coverage and durable field identity; `numerical-content` tests
 scoped leases and transfer ownership using fake providers; `amr-plan` composes hierarchy, fields,
