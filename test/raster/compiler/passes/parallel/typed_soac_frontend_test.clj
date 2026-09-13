@@ -9,9 +9,20 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.util :as util]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest generated-row-major-coordinates-carry-their-domain-type
+  (let [matched (patterns/match-nested-dotimes-row-major-map
+                 '(dotimes [i rows]
+                    (dotimes [j cols]
+                      (aset out (+ (* i cols) j) 1.0))))
+        locals (take-nth 2 (second (:value-expr matched)))]
+    (is (some? matched))
+    (is (= ['long 'long] (mapv #(get (meta %) :raster.type/tag) locals)))
+    (is (some? (#'frontend/typed-map-region (:value-expr matched))))))
 
 (deftest map-let-spines-become-typed-locals
   (let [body '(let* [^float p1 (* (aget x i) (aget x i))

@@ -133,7 +133,7 @@
 
 (deftest softmax-counted-initializers-execute-through-the-direct-vertical
   (when-gpu "softmax-counted-initializers"
-    (let [values [1000.0 1001.0 999.0 -1000.0 -999.0 -1001.0]
+    (let [values [1000.0 1001.0 999.0 -1000.0 -998.0 -1001.0]
           expected (float-array values)
           _ (attention/softmax-rows! expected 2 3)
           compilation (equation-first/compile #'attention/softmax-rows!

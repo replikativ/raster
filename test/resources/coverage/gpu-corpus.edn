@@ -2,10 +2,10 @@
  :dtype :float,
  :summary
  {:total 236,
-  :typed-soac 104,
+  :typed-soac 132,
   :error 43,
-  :scalar 73,
-  :compatibility 16},
+  :scalar 47,
+  :compatibility 14},
  :vars
  [{:var raster.dl.array-ops/argmax-rows!,
    :route :typed-soac,
@@ -23,20 +23,22 @@
    :route :error,
    :error :kernel-body-store-dtype}
   {:var raster.dl.array-ops/blit-slab!,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/broadcast-add,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/broadcast-add-dh,
    :route :error,
    :error :kernel-body-store-dtype}
   {:var raster.dl.array-ops/broadcast-add-dt,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/broadcast-kv-heads,
    :route :typed-soac,
    :typed-validated true,
@@ -48,23 +50,27 @@
   {:var raster.dl.array-ops/dot-rows-dW,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/dot-rows-dbias,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_273037 = (loop*"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_2695334 = (loop"}
   {:var raster.dl.array-ops/dot-rows-dh,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/flat-embed-d-space-emb,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/flat-embed-d-state-emb,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/flat-embed-d-values,
    :route :scalar,
    :typed-validated false,
@@ -72,15 +78,18 @@
   {:var raster.dl.array-ops/flat-embed-dWe,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/flat-embed-dbe,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/flat-embed-op,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/gather,
    :route :typed-soac,
    :typed-validated true,
@@ -112,7 +121,7 @@
   {:var raster.dl.array-ops/masked-mse-loss-backward,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_277628 = (if (cloj"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_2701741 = (if (clo"}
   {:var raster.dl.array-ops/pack-heads,
    :route :typed-soac,
    :typed-validated true,
@@ -120,11 +129,13 @@
   {:var raster.dl.array-ops/reduce-axis,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/reduce-axis-backward,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/scale-clamp-exp,
    :route :typed-soac,
    :typed-validated true,
@@ -154,9 +165,10 @@
    :typed-validated false,
    :declines []}
   {:var raster.dl.array-ops/scatter-strided-2d,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.array-ops/segment-div,
    :route :scalar,
    :typed-validated false,
@@ -174,9 +186,10 @@
    :typed-validated false,
    :declines []}
   {:var raster.dl.array-ops/slice-strided-2d,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/sum-kv-heads,
    :route :typed-soac,
    :typed-validated true,
@@ -237,13 +250,12 @@
   {:var raster.dl.attention/causal-attn-with-cache!,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
   {:var raster.dl.attention/causal-multi-head-attention,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.attention/causal-multi-head-attention-cached!,
    :route :scalar,
    :typed-validated false,
@@ -275,7 +287,8 @@
    :route :scalar,
    :typed-validated false,
    :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   [{:reason :sequential-effect-continuation,
+     :kind :typed-soac-declined}]}
   {:var raster.dl.attention/causal-single-head-attention,
    :route :error,
    :error
@@ -350,9 +363,10 @@
    :typed-validated false,
    :declines []}
   {:var raster.dl.attention/rope-pos-partial!,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.attention/rope-pos-rows-buf!,
    :route :typed-soac,
    :typed-validated true,
@@ -391,18 +405,19 @@
    :declines
    [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.attention/sinusoidal-embedding,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.attention/softmax-rows!,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 2}}
   {:var raster.dl.diffusion/compute-alphas-cumprod,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_290419 = (loop*"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(_eff_2716216 = (loop"}
   {:var raster.dl.diffusion/cosine-beta-schedule,
    :route :error,
    :error
@@ -416,8 +431,8 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.diffusion/forward-noise-backward,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.diffusion/linear-beta-schedule,
    :route :typed-soac,
@@ -434,17 +449,19 @@
   {:var raster.dl.loss/cross-entropy-loss-backward,
    :route :scalar,
    :typed-validated false,
-   :declines []}
+   :declines
+   [{:reason :sequential-effect-continuation,
+     :kind :typed-soac-declined}]}
   {:var raster.dl.loss/huber-loss,
    :route :error,
-   :error :illegal-op-remains}
+   :error :scalar-reduction-requires-typed-graph}
   {:var raster.dl.loss/huber-loss-backward,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
   {:var raster.dl.loss/l1-loss,
    :route :error,
-   :error :illegal-op-remains}
+   :error :scalar-reduction-requires-typed-graph}
   {:var raster.dl.loss/l1-loss-backward,
    :route :error,
    :error :kernel-body-opencl-intrinsic}
@@ -454,7 +471,7 @@
    :declines []}
   {:var raster.dl.loss/mse-loss,
    :route :error,
-   :error :illegal-op-remains}
+   :error :scalar-reduction-requires-typed-graph}
   {:var raster.dl.nn/add-bias-rows!,
    :route :typed-soac,
    :typed-validated true,
@@ -462,23 +479,27 @@
   {:var raster.dl.nn/batch-norm,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_129649 = (if (cloj"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_2532423 = (if (clo"}
   {:var raster.dl.nn/batch-norm-backward-dbeta,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/batch-norm-backward-dgamma,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/batch-norm-backward-dx,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/batch-norm-jvp-dx,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/col2im-1d,
    :route :error,
    :error
@@ -540,19 +561,19 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/embedding,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/embedding-backward,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/geglu,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/gelu,
    :route :typed-soac,
    :typed-validated true,
@@ -634,30 +655,34 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/layer-norm,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/layer-norm!,
    :route :typed-soac,
    :typed-validated true,
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.nn/layer-norm-backward-dbeta,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/layer-norm-backward-dgamma,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/layer-norm-backward-dx,
    :route :error,
    :error
    "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {loop* 1} e.g. [\"(sums = (loop* [i 0 s"}
   {:var raster.dl.nn/layer-norm-jvp-dx,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/leaky-relu,
    :route :typed-soac,
    :typed-validated true,
@@ -673,73 +698,52 @@
   {:var raster.dl.nn/linear,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/linear!,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/linear-dW,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
-  {:var raster.dl.nn/linear-db,
-   :route :scalar,
-   :typed-validated false,
    :declines []}
+  {:var raster.dl.nn/linear-db,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/linear-dx,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/linear-nb,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul!,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul-dA,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul-dA!,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul-dB,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/matmul-dB!,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/maxpool2d,
    :route :scalar,
    :typed-validated false,
@@ -751,11 +755,13 @@
   {:var raster.dl.nn/maxpool2d-bwd!,
    :route :typed-soac,
    :typed-validated true,
-   :declines []}
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/mean-pool,
    :route :typed-soac,
    :typed-validated true,
-   :declines []}
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/residual-add,
    :route :typed-soac,
    :typed-validated true,
@@ -800,9 +806,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/rms-norm-jvp-dx,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/sigmoid,
    :route :typed-soac,
    :typed-validated true,
@@ -828,9 +835,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/skip-layer-norm,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/softmax-1d,
    :route :compatibility,
    :typed-validated false,
@@ -843,9 +851,7 @@
   {:var raster.dl.nn/swiglu,
    :route :typed-soac,
    :typed-validated true,
-   :declines
-   [{:reason :typed-contraction-dispatch-dynamic-scalar,
-     :kind :typed-contraction-dispatch-declines}]}
+   :declines []}
   {:var raster.dl.nn/tanh-act,
    :route :typed-soac,
    :typed-validated true,
@@ -855,13 +861,15 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/transpose-2d,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/transpose-2d!,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.dl.nn/xavier-init,
    :route :error,
    :error
@@ -877,7 +885,7 @@
   {:var raster.dl.optim/clip-grad-norm!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_287811 = (if (.inv"}
+   "fixpoint edge typedness violation on GPU target: 1 non-exempt untagged binding(s) {if 1} e.g. [\"(_eff_2714668 = (if (.in"}
   {:var raster.dl.optim/cosine-lr,
    :route :error,
    :error
@@ -942,16 +950,16 @@
   {:var raster.nn/dense-into!,
    :route :typed-soac,
    :typed-validated true,
-   :declines []}
+   :declines [],
+   :effect-orders {:sequential 1}}
   {:var raster.nn/kaiming-init!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_301217 = \\\"Kaim"}
+   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_2725484 = \\\"Kai"}
   {:var raster.nn/loss-fn,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.nn/predict-fn,
    :route :typed-soac,
    :typed-validated true,
@@ -968,7 +976,7 @@
    :route :compatibility,
    :typed-validated false,
    :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   [{:reason :typed-soac-unknown-value, :kind :typed-soac-declined}]}
   {:var raster.nn/softmax-backward,
    :route :error,
    :error :parallel-program-parameter-role-conflict}
@@ -976,7 +984,7 @@
    :route :compatibility,
    :typed-validated false,
    :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   [{:reason :typed-soac-unknown-value, :kind :typed-soac-declined}]}
   {:var raster.nn/softmax-cross-entropy-backward,
    :route :typed-soac,
    :typed-validated true,
@@ -984,7 +992,7 @@
   {:var raster.nn/xavier-init!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_308082 = \\\"Xavi"}
+   "fixpoint edge typedness violation on GPU target: 3 non-exempt untagged binding(s) {:atom 3} e.g. [\"(_eff_2732733 = \\\"Xav"}
   {:var raster.ode.pde/heat-loss-rk4,
    :route :error,
    :error :emitted-parallel-program-call-required}
@@ -993,9 +1001,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.ode.pde/heat-rhs-2d!,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:sequential 3}}
   {:var raster.ode.pde/solve-fixed-step,
    :route :error,
    :error
@@ -1003,4 +1012,4 @@
   {:var raster.ode.pde/wave-rhs-1d!,
    :route :error,
    :error
-   "fixpoint edge typedness violation on GPU target: 2 non-exempt untagged binding(s) #:clojure.core{aset 2} e.g. [\"(_eff_32"}]}
+   "fixpoint edge typedness violation on GPU target: 2 non-exempt untagged binding(s) #:clojure.core{aset 2} e.g. [\"(_eff_27"}]}
