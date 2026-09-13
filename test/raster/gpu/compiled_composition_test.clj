@@ -9,6 +9,22 @@
 
 (defn component [_x _w _n])
 
+(deftest execution-info-observes-linked-binding-and-rejects-unavailable-evidence
+  (let [info {:strategy :chosen :entry-points ["chosen_kernel"]}
+        session (atom {:prepared {:phase {:execution-info info}}})
+        live (gpu-link/map->LinkedExecutable
+              {:session session :phases [:phase] :closed? (atom false)})
+        compiled (compiled/map->Compiled {:executable live})]
+    (is (= [{:phase :phase :executable info}] (compiled/execution-info compiled)))
+    (is (= :compiled-execution-info-unbound
+           (try (compiled/execution-info (compiled/map->Prepared {}))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :link-program-execution-info-unsupported
+           (try (gpu-link/execution-info (assoc live :prepared-program :equation-first))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (reset! (:closed? live) true)
+    (is (thrown? clojure.lang.ExceptionInfo (compiled/execution-info compiled)))))
+
 (def ^:private kernel
   (artifact/make
    {:kernel-name "compiled_composition_axpy"

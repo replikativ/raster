@@ -1033,3 +1033,11 @@ the focused 25-update comparison passed 31 assertions; loss went from 2.281172 t
 FP32 and 1.262058 for mixed precision, within the existing per-step relative tolerance. This
 validates the tiny block and selected preference, not a bound-route trace, stationary throughput,
 or real-weight model convergence. Concrete alias admission remains a separate runtime check.
+
+Resident binding now retains a compact admitted-executable report: strategy, precision, entry
+points and admission attempt reason codes, without retaining live arguments or executable source.
+The public compiled/linked `execution-info` query reads that evidence rather than running the
+selector again. The alias-fallback fixture distinguishes preferred and bound strategies; the
+public Arc fusion canary confirms bound fused selection separately from its measured replay.
+Entry points include any prologue and must not be interpreted as replay events. Equation-first
+program reporting remains explicitly unsupported; manual bindings without evidence return nil.
