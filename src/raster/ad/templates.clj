@@ -29,7 +29,32 @@
 ;; Template registry
 ;; ================================================================
 
-(defonce ^:private template-registry (atom {}))
+(def ^:private registry-revision-key ::registry-revision)
+
+(defonce ^:private template-registry
+  ;; Keep the revision on the registry value itself: callers that observe a
+  ;; changed registry must observe its changed revision in the same atomic
+  ;; transition.  Map metadata preserves the registry's existing public shape.
+  (atom (with-meta {} {registry-revision-key 0})))
+
+(defn registry-revision
+  "Monotonic revision of the AD template registry.
+
+  Consumers that compile template-dependent artifacts may use this as a
+  conservative dependency token. Every successful public registry mutation
+  advances it, including merges; no selective per-op invalidation is implied."
+  []
+  (or (registry-revision-key (meta @template-registry)) 0))
+
+(defn- mutate-registry!
+  "Apply f and advance the registry revision in one atomic state transition."
+  [f]
+  (swap! template-registry
+         (fn [registry]
+           (let [revision (or (registry-revision-key (meta registry)) 0)
+                 updated (f registry)]
+             (with-meta updated
+               (assoc (meta updated) registry-revision-key (inc revision)))))))
 
 (declare ^:private compile-grads-to-fn)
 
@@ -58,7 +83,7 @@
   (let [template (if (and (:grads template) (not (:grads-fn template)))
                    (assoc template :grads-fn (compile-grads-to-fn template))
                    template)]
-    (swap! template-registry assoc op template))
+    (mutate-registry! #(assoc % op template)))
   nil)
 
 (defn get-template
@@ -97,8 +122,8 @@
               (println (str "WARNING: AD template for " op " declares " expected
                             " params " (vec declared-params) " but function has arities "
                             actual-arities ". Template params may be stale."))))))))
-  (swap! template-registry update op
-         (fn [existing] (merge (or existing {}) kvs)))
+  (mutate-registry! #(update % op
+                             (fn [existing] (merge (or existing {}) kvs))))
   nil)
 
 (defn has-ad-rule?

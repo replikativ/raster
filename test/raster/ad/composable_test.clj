@@ -7,7 +7,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :as r]
             [raster.numeric]
-            [raster.ad.reverse :as rev]))
+            [raster.ad.reverse :as rev]
+            [raster.ad.templates :as tmpl]))
 
 ;; ================================================================
 ;; Test functions
@@ -23,6 +24,26 @@
 (r/deftm nested-let-fn [x :- Double, y :- Double] :- Double
   (raster.numeric/+ (let [a (raster.numeric/* x x)] a)
                     (let [b (raster.numeric/* y y)] b)))
+
+;; The wrapper makes its VJP depend on a nested, registry-provided rule rather
+;; than only on rules named directly by the VJP target's own body.
+(r/deftm cache-rule-inner [x :- Double] :- Double
+  (raster.numeric/* x x))
+
+(r/deftm cache-rule-outer [x :- Double] :- Double
+  (cache-rule-inner x))
+
+(defn- cache-rule-template [factor]
+  {:params '[x]
+   :result nil
+   :adjoint 'dy
+   :grads-fn
+   (fn [ctx [x] _result adjoint gensym-fn]
+     (let [g (gensym-fn "cache_rule_grad")]
+       [(update ctx :bindings into
+                [g (list 'raster.numeric/* adjoint
+                         (list 'raster.numeric/* factor x))])
+        [g]]))})
 
 ;; ================================================================
 ;; value+grad runtime
@@ -42,6 +63,56 @@
           [val dx] (vg 2.0)]
       (is (= 8.0 val) "f(2) = 8")
       (is (= 12.0 dx) "df/dx = 3x^2 = 12"))))
+
+(deftest vjp-cache-observes-nested-rule-replacement-test
+  (testing "fresh VJP acquisition recompiles after merge; acquired pullbacks remain snapshots"
+    (let [op 'raster.ad.composable-test/cache-rule-inner]
+      (tmpl/register-template! op (cache-rule-template 2.0))
+      (try
+        (let [[value-before pullback-before] (rev/vjp #'cache-rule-outer 2.0)]
+          (is (= 4.0 value-before))
+          (is (= [4.0] (pullback-before 1.0)))
+
+          ;; Exercise merge-into-template! specifically: replacing the generator
+          ;; must invalidate transforms whose dependency is this nested rule.
+          (tmpl/merge-into-template! op
+                                     {:grads-fn (:grads-fn (cache-rule-template 3.0))})
+          (let [[value-after-merge pullback-after-merge]
+                (rev/vjp #'cache-rule-outer 2.0)]
+            (is (= 4.0 value-after-merge))
+            (is (= [6.0] (pullback-after-merge 1.0))
+                "new acquisition uses the merged nested rule")
+            (is (= [4.0] (pullback-before 1.0))
+                "a previously acquired pullback retains snapshot semantics"))
+
+          ;; Full replacement is the other public registry mutation path.
+          (tmpl/register-template! op (cache-rule-template 4.0))
+          (let [[_ pullback-after-register] (rev/vjp #'cache-rule-outer 2.0)]
+            (is (= [8.0] (pullback-after-register 1.0))
+                "register-template! also invalidates the nested transform")))
+        (finally
+          (tmpl/register-template! op (cache-rule-template 2.0)))))))
+
+(deftest vjp-cache-retries-a-registry-mutation-during-transform-test
+  (testing "a transform spanning two registry revisions is discarded and retried"
+    (let [op 'raster.ad.composable-test/cache-rule-inner
+          original-transform rev/transform-body
+          mutated? (atom false)]
+      (tmpl/register-template! op (cache-rule-template 4.0))
+      (try
+        (with-redefs [rev/transform-body
+                      (fn [& args]
+                        (let [transformed (apply original-transform args)]
+                          (when (compare-and-set! mutated? false true)
+                            (tmpl/merge-into-template!
+                             op {:grads-fn (:grads-fn (cache-rule-template 5.0))}))
+                          transformed))]
+          (let [[_ pullback] (rev/vjp #'cache-rule-outer 2.0)]
+            (is @mutated?)
+            (is (= [10.0] (pullback 1.0))
+                "the pre-mutation transform was not returned or cached")))
+        (finally
+          (tmpl/register-template! op (cache-rule-template 2.0)))))))
 
 (deftest value+grad-metadata-test
   (testing "value+grad result carries deftm metadata"

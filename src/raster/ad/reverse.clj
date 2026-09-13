@@ -2577,27 +2577,37 @@
                      :else (pr-str f-var)))
               {:var f-var}))))
 
-(def ^:private vjp-cache (atom {}))
+(def ^:private vjp-cache
+  ;; A compiled VJP is a snapshot of every (including nested) template rule
+  ;; consulted by transform-body. Retain only the current registry generation;
+  ;; a caller already holding a closure may continue to use that snapshot.
+  (atom {:registry-revision nil :entries {}}))
 
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
-  Cached by [var-identity walked-body] to avoid recompiling on every call.
+  Cached by [template-registry revision, var-identity, walked-body] to avoid
+  recompiling on every call. A registry mutation conservatively starts a new
+  cache generation because transforms can depend on nested template rules.
 
   Filters active params by tag (same rule as build-grad-walked-body): only
   doubles/floats are seeded as active. The pullback's output vector still has
   one slot per ORIGINAL param (with nil for non-differentiable slots) so
   positional consumers don't shift."
   [resolved]
-  (let [m (meta resolved)
-        params (or (:raster.core/deftm-params m)
-                   (throw (ex-info "vjp requires a deftm var"
-                                   {:var resolved})))
-        walked-body (or (rcore/ensure-walked-body! resolved)
-                        (throw (ex-info "No walked body on var" {:var resolved})))
-        cache-key [resolved walked-body]
-        cached (get @vjp-cache cache-key)]
-    (or cached
-        (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+  (loop []
+    (let [m (meta resolved)
+          params (or (:raster.core/deftm-params m)
+                     (throw (ex-info "vjp requires a deftm var"
+                                     {:var resolved})))
+          walked-body (or (rcore/ensure-walked-body! resolved)
+                          (throw (ex-info "No walked body on var" {:var resolved})))
+          registry-revision (tmpl/registry-revision)
+          cache-key [resolved walked-body]
+          cache @vjp-cache
+          cached (when (= registry-revision (:registry-revision cache))
+                   (get-in cache [:entries cache-key]))]
+      (or cached
+          (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
               tags (or (:raster.core/deftm-tags m)
                        (vec (repeat (count params) 'double)))
               diff-active-params (vec (keep-indexed
@@ -2635,9 +2645,30 @@
                                       (list 'let* [raw-grads-sym
                                                    (list pullback-sym dy-sym)]
                                             padded-grads-form)))))
-              compiled-fn (eval fn-form)]
-          (swap! vjp-cache assoc cache-key compiled-fn)
-          compiled-fn))))
+                compiled-fn (eval fn-form)]
+            ;; A mutation during transformation may otherwise produce a closure
+            ;; assembled from more than one registry snapshot. Do not publish or
+            ;; return it: retry against the new monotonic revision instead.
+            (if (not= registry-revision (tmpl/registry-revision))
+              (recur)
+              (do
+                (swap! vjp-cache
+                       (fn [cache]
+                         (let [cached-revision (:registry-revision cache)]
+                           (cond
+                             (= registry-revision cached-revision)
+                             (assoc-in cache [:entries cache-key] compiled-fn)
+
+                             ;; A compiler from an older generation must not
+                             ;; evict entries already published by a newer one.
+                             (and cached-revision
+                                  (> cached-revision registry-revision))
+                             cache
+
+                             :else
+                             {:registry-revision registry-revision
+                              :entries {cache-key compiled-fn}}))))
+                compiled-fn)))))))
 
 (defn vjp
   "Value-and-pullback for a deftm function.
