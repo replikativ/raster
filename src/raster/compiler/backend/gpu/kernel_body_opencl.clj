@@ -365,9 +365,28 @@
   (->> operations
        (mapcat scalar-expressions)
        (keep (fn [expression]
-               (when (= :trap (get-in expression [:options :overflow]))
+               (when (and (= :trap (get-in expression [:options :overflow]))
+                          (contains? #{:+ :- :*} (intrinsics/canonical (:op expression))))
                  [(intrinsics/canonical (:op expression))
                   (dtype/canon (:result-type expression))])))
+       distinct
+       (sort-by pr-str)))
+
+(declare scalar-value-type)
+
+(defn- trapping-cast-requirements
+  [operations types]
+  (->> operations
+       (mapcat scalar-expressions)
+       (keep (fn [expression]
+               (when (and (= :cast (:op expression))
+                          (= :trap (get-in expression [:options :overflow])))
+                 (let [source-type (scalar-value-type (first (:arguments expression)) types)
+                       result-type (dtype/canon (:result-type expression))]
+                   (when (and (contains? #{:byte :int :long} source-type)
+                              (contains? #{:byte :int :long} result-type)
+                              (> (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
+                     [source-type result-type])))))
        distinct
        (sort-by pr-str)))
 
@@ -511,6 +530,12 @@
         (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
              "(" argument-source ")")
         (str "(" (target-type result-type) ")(" argument-source ")"))
+
+      (and (not source-fp?) (not result-fp?) (= :trap overflow)
+           (> (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
+      (str (c-dialect/trapping-integral-cast-name
+            *scalar-dialect* source-type result-type)
+           "(" argument-source ")")
 
       ;; Guard the C cast: out-of-range/NaN FP-to-integer conversion is undefined in C++.
       ;; The upper comparison uses the exact power-of-two boundary, not rounded MAX_VALUE.
@@ -1448,6 +1473,13 @@
                       1 (str (target-type (get types (:id index))) " " name " = "
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
+        value-types
+        (into types
+              (keep (fn [value]
+                      (when (record-kind? "ValueSpec" value)
+                        [(:id value) (if (= :predicate (:type value))
+                                       :predicate (dtype/canon (:type value)))])))
+              (tree-seq coll? seq kernel-body))
         intrinsic-module (ce/intrinsic-helper-module
                           operation-source (:id *scalar-dialect*)
                           (:intrinsic-implementations target-features))
@@ -1459,6 +1491,11 @@
                             (c-dialect/trapping-arithmetic-helper-source
                              *scalar-dialect* operation type))
                           (trapping-arithmetic-requirements operations)))
+              (apply str
+                     (map (fn [[source-type result-type]]
+                            (c-dialect/trapping-integral-cast-helper-source
+                             *scalar-dialect* source-type result-type))
+                          (trapping-cast-requirements operations value-types)))
               (when (and (c-dialect/opencl? *scalar-dialect*)
                          (str/includes? operation-source "atomic_add_float("))
                 ce/opencl-atomic-add-float-helper)

@@ -162,6 +162,14 @@
     source
     (str/replace source #"(?m)^inline " "__device__ __forceinline__ ")))
 
+(defn- require-trap-support!
+  [dialect operation details]
+  (when (= :opencl-portable (:id dialect))
+    (throw (ex-info (str "OpenCL C has no portable trapping-" (name operation) " primitive")
+                    (merge {:reason :kernel-body-c-trap-unsupported
+                            :dialect (:id dialect) :operation operation}
+                           details)))))
+
 (defn trapping-arithmetic-name
   "Name a checked signed-integer operation only when the target can terminate the invocation.
 
@@ -169,14 +177,55 @@
   builtin contract used by Raster's production OpenCL row; portable OpenCL must still decline
   rather than quietly depending on it or turning the operation into undefined signed arithmetic."
   [dialect operation type]
-  (when (= :opencl-portable (:id dialect))
-    (throw (ex-info "OpenCL C has no portable trapping-arithmetic primitive"
-                    {:reason :kernel-body-c-trap-unsupported
-                     :dialect (:id dialect) :operation operation :type (dtype/canon type)})))
+  (require-trap-support! dialect :arithmetic
+                         {:operation operation :type (dtype/canon type)})
   (str "rstr_trap_"
        ({:+ "add" :- "sub" :* "mul"} operation)
        "_"
        ({:byte "i8" :int "i32" :long "i64"} (dtype/canon type))))
+
+(defn trapping-integral-cast-name
+  "Name a checked signed integral narrowing only when the target can terminate the invocation."
+  [dialect source-type result-type]
+  (require-trap-support! dialect :cast
+                         {:source-type (dtype/canon source-type)
+                          :result-type (dtype/canon result-type)})
+  (str "rstr_trap_cast_"
+       ({:byte "i8" :int "i32" :long "i64"} (dtype/canon source-type)) "_"
+       ({:byte "i8" :int "i32" :long "i64"} (dtype/canon result-type))))
+
+(defn- trap-statement
+  [dialect]
+  (case (:id dialect)
+    :opencl-intel "__builtin_trap();"
+    :cuda "asm volatile(\"trap;\");"
+    :hip "__builtin_trap();"))
+
+(defn trapping-integral-cast-helper-source
+  "Emit a checked signed narrowing whose range guard executes before the target cast."
+  [dialect source-type result-type]
+  (let [source-type (dtype/canon source-type)
+        result-type (dtype/canon result-type)
+        integral? #(contains? #{:byte :int :long} %)
+        _ (when-not (and (integral? source-type) (integral? result-type)
+                         (> (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
+            (throw (ex-info "trapping integral cast helper requires signed integral narrowing"
+                            {:reason :kernel-body-c-trap-cast-types
+                             :dialect (:id dialect) :source-type source-type
+                             :result-type result-type})))
+        helper-name (trapping-integral-cast-name dialect source-type result-type)
+        source-name (type-name dialect source-type)
+        result-name (type-name dialect result-type)
+        [minimum maximum] ({:byte [-128 127]
+                            :int [-2147483648 2147483647]} result-type)]
+    (str "inline " result-name " " helper-name "(" source-name " value) {\n"
+         "  if ((value < (" source-name ")(" minimum ")) || "
+         "(value > (" source-name ")(" maximum "))) {\n"
+         "    " (trap-statement dialect) "\n"
+         "    return (" result-name ")0;\n"
+         "  }\n"
+         "  return (" result-name ")value;\n"
+         "}\n")))
 
 (defn trapping-arithmetic-helper-source
   "Emit one checked signed operation without first evaluating an overflowing signed expression.
@@ -190,13 +239,9 @@
         unsigned-type (unsigned-type-name dialect type)
         helper-name (trapping-arithmetic-name dialect operation type)
         sign-bit (str "((" unsigned-type ")1 << " (dec (* 8 (dtype/bytes-of type))) ")")
-        trap-source (case (:id dialect)
-                      ;; Intel's OpenCL frontend accepts this Clang builtin and lowers it to a
-                      ;; terminating device trap.  It is intentionally unavailable to the
-                      ;; portable dialect above.
-                      :opencl-intel "__builtin_trap();"
-                      :cuda "asm volatile(\"trap;\");"
-                      :hip "__builtin_trap();")
+        ;; Intel's OpenCL frontend accepts this Clang builtin and lowers it to a terminating
+        ;; device trap. It is intentionally unavailable to the portable dialect above.
+        trap-source (trap-statement dialect)
         arithmetic ({:+ "+" :- "-" :* "*"} operation)]
     (when-not arithmetic
       (throw (ex-info "trapping arithmetic helper has no operation"

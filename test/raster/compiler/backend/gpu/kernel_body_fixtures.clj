@@ -6,6 +6,22 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
+(defn trapping-integral-cast-body
+  "Checked signed narrowing fixture shared by emitter tests and hardware-free target CI."
+  [source-type result-type]
+  (body/make
+   {:id [:trapping-integral-cast source-type result-type]
+    :parameters [(body/->KernelParameter 'input :scalar source-type [] nil nil :input)
+                 (body/->KernelParameter 'out :output result-type [1] :global
+                                         (layout/row-major [1] result-type) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'narrowed result-type)
+                  (body/cast-expression 'input result-type :exact :trap))
+                 (body/->ScalarStore 'out [0] 'narrowed nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn- unary-scalar-body [id expression input-type output-type width]
   (let [builder (scalar/make-lowerer
                  {:array-types {'x input-type} :arrays #{'x} :scalar-types {'lane :int}
