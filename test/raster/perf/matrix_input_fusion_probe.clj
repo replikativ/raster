@@ -2,7 +2,9 @@
   "Opt-in device replay oracle and paired timing for staged versus fused matrix input conversion."
   (:refer-clojure :exclude [run!])
   (:require [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
             [raster.perf.production-canary :as canary]))
 
@@ -17,15 +19,35 @@
   [values]
   (float-array (map #(Float/float16ToFloat (Float/floatToFloat16 (float %))) values)))
 
+(defn constant-weight-plan
+  "Use ordinary LinkPlan roles and initialization to hoist weight-only representation stages."
+  [g device [m n k] variant a b]
+  (let [descriptor {:dtype :float :all-params '[A B C] :array-params '[A B C]
+                    :array-roles {'A :input 'B :constant 'C :output}
+                    :scalar-params [] :allocs [] :result-sym 'C
+                    :steps [{:convention :executable :artifact g :abi (:abi g)
+                             :argument-specs (mapv (fn [slot arg] {:kind (:kind slot) :sym arg})
+                                                   (:abi g) (:arguments g))
+                             :output 'C :phase :matrix}]}]
+    (link-plan/make
+     {:id :matrix-input-constant-weights :target device
+      :nodes [(link-plan/node {:id :a :dtype :float :shape [m k] :device device :role :input :source a})
+              (link-plan/node {:id :b :dtype :float :shape (if (= :nt variant) [n k] [k n])
+                               :device device :role :constant :source b})
+              (link-plan/node {:id :c :dtype :float :shape [m n] :device device :role :output})]
+      :instances [(link-plan/instance {:id :matrix :descriptor descriptor
+                                      :bindings {'A :a 'B :b 'C :c} :scalars {}})]
+      :outputs [:c]})))
+
 (defn run!
   "Check both generated schedules with changing activations and poisoned output on one device.
    Bounded geometry defaults to a partial M tile. Failures propagate; unavailable hardware is
    not reported as a passing or skipped benchmark. Device allocations are session-owned."
   ([] (run! :ocl:0))
   ([device] (run! device {}))
-  ([device {:keys [timing? rounds warmup-rounds shape tile-policy input-policy variant]
+  ([device {:keys [timing? rounds warmup-rounds shape tile-policy input-policy variant residency]
             :or {timing? false rounds 12 warmup-rounds 4 shape [13 32 32]
-                 tile-policy :single-fragment input-policy :dyadic variant :nn}}]
+                 tile-policy :single-fragment input-policy :dyadic variant :nn residency :all-stages}}]
    (when-not (and (boolean? timing?) (integer? rounds) (<= 2 rounds 120) (even? rounds)
                   (integer? warmup-rounds) (<= 0 warmup-rounds 120))
      (throw (ex-info "probe requires bounded even rounds and nonnegative warmup rounds"
@@ -34,9 +56,11 @@
                   (every? #(and (integer? %) (<= 1 % 4096)) shape)
                   (<= (apply *' shape) 8388608)
                   (contains? tiles tile-policy) (contains? #{:dyadic :half-rounding-ties} input-policy)
-                  (contains? #{:nn :nt} variant))
+                  (contains? #{:nn :nt} variant)
+                  (contains? #{:all-stages :constant-weights} residency))
      (throw (ex-info "probe geometry, work budget, tile or input policy is unsupported"
-                     {:shape shape :tile-policy tile-policy :input-policy input-policy :variant variant})))
+                     {:shape shape :tile-policy tile-policy :input-policy input-policy :variant variant
+                      :residency residency})))
    (let [[m n k] shape
          [a b] (canary/gemm-arguments shape)
          a (if (= :half-rounding-ties input-policy)
@@ -53,25 +77,34 @@
                      (gemm/emit-matrix-input-fusion-alternative spec)]
          live (atom []) profiles (atom [])]
      (gpu/with-gpu-session [sess device]
-       (gpu/alloc! sess {:a [:float (* m k) a] :b [:float (* k n) resident-b]
-                         :c [:float (* m n) poison]})
+       (when (= :all-stages residency)
+         (gpu/alloc! sess {:a [:float (* m k) a] :b [:float (* k n) resident-b]
+                           :c [:float (* m n) poison]}))
        (try
          (let [samplers
                (mapv (fn [g]
                 (let [strategy (get-in g [:attributes :strategy])
-                      handle (gpu/bind-kernel-graph! sess strategy g {'A :a 'B :b 'C :c} {}
-                                                     {:profile? timing?})
+                      linked? (= :constant-weights residency)
+                      handle (if linked?
+                               (link/instantiate! (constant-weight-plan g device shape variant a resident-b)
+                                                  {:session sess :profile? timing?})
+                               (gpu/bind-kernel-graph! sess strategy g {'A :a 'B :b 'C :c} {}
+                                                      {:profile? timing?}))
+                      upload! (if linked? #(link/upload! handle %1 %2) #(gpu/upload! sess %1 %2))
+                      download! (if linked? #(link/download handle %) #(gpu/download sess %))
+                      profile! (if linked? #(link/profile! handle) #(gpu/profile-bound-kernel-graph! sess handle))
+                      replay! (if linked? #(link/run! handle) #(gpu/run-kernel-graph! sess handle))
                       counter (atom -1)]
-                  (swap! live conj handle)
+                  (swap! live conj (if linked? #(link/close! handle) #(gpu/release-kernel-graph! sess handle)))
                   {:id strategy
                    :sample-fn
                    (fn []
                     (let [iteration (swap! counter inc) input-index (mod iteration 2)]
-                      (gpu/upload! sess :a (nth activations input-index))
-                      (gpu/upload! sess :c poison)
+                      (upload! :a (nth activations input-index))
+                      (upload! :c poison)
                       (let [duration
                             (if timing?
-                              (let [profile (gpu/profile-bound-kernel-graph! sess handle)
+                              (let [profile (profile!)
                                     span (:device-wall-ms profile)
                                     phase (cond (< iteration 4) :validation
                                                 (< iteration (+ 4 warmup-rounds)) :warmup
@@ -85,8 +118,8 @@
                                                                       (- iteration 4 warmup-rounds))
                                                       :profile profile})
                                 (* 1.0e6 span))
-                              (do (gpu/run-kernel-graph! sess handle) 0.0))
-                            actual (vec (gpu/download sess :c))]
+                              (do (replay!) 0.0))
+                            actual (vec (download! :c))]
                         (when-not (= (nth expected input-index) actual)
                           (throw (ex-info "matrix input fusion replay differs from independent host reference"
                                           {:strategy strategy :iteration iteration
@@ -102,16 +135,26 @@
            (cond->
             {:device device :shape shape :comparison :exact :timing? timing?
              :variant variant :tile-policy tile-policy :tile (:tile spec) :input-policy input-policy
+             :residency residency
              :oracle :java-rne-binary16-inputs-host-double-dot-float-output
              :candidates (mapv (fn [g]
                                 {:strategy (get-in g [:attributes :strategy])
                                  :passed? true :replays replays :checked-elements (* replays m n)
+                                 :stage-scope :compiled-graph
                                  :stages (mapv (comp last :id) (:nodes g))
+                                 :profiled-replay-kernels
+                                 (when timing?
+                                   (mapv :kernel-name
+                                         (get-in (first (filter #(= (get-in g [:attributes :strategy])
+                                                                    (:candidate %)) @profiles))
+                                                 [:profile :profile])))
                                  :temporaries (mapv (comp last :id) (:temporaries g))}) candidates)}
              timing? (assoc :replay-profiles @profiles
                             :scope {:timing-source :device-event :public-deftm-path? false
-                                    :weight-conversion-included? true :transfers-included? false
+                                    :weight-conversion-included? (= :all-stages residency)
+                                    :one-time-initialization-included? false
+                                    :transfers-included? false
                                     :validation-included? false :promotion? false}
                             :measurement (update comparison :measurements
                                                  #(update-vals % (fn [m] (into {} m)))))))
-         (finally (doseq [handle (reverse @live)] (gpu/release-kernel-graph! sess handle))))))))
+         (finally (doseq [close! (reverse @live)] (close!))))))))
