@@ -1259,13 +1259,15 @@ steps, parallel legs cannot claim the same directed link, and the certificate re
 semantic operation and its schedule. This makes ring/tree/native implementations replaceable while
 the dependency DAG and topology simulator account for their actual bytes and routes.
 
-Axis-partitioned scientific values now use the same machinery for nonperiodic halo exchange. A
+Axis-partitioned scientific values now use the same machinery for halo exchange. A
 semantic `HaloExchange` names the value, partition axis, halo width, and boundary policy. Scheduling
 derives adjacent owned shard faces, exact source rectangles, dtype-sized byte counts, and both
 directed routes; those facts are retained on transfer steps and in the distributed certificate.
-The first contract intentionally supports nonperiodic one-axis partitions. Periodic boundaries,
-multidimensional decomposition, and overlap lifetimes still need explicit semantics rather than
-being smuggled through generic transfer attributes.
+The contract supports nonperiodic and periodic one-axis partitions, including wrap-edge schedules
+and target-local ghost rectangles. Combining destinations retain a certified associative algebra
+and owned-face rectangles. General multidimensional decomposition and overlap lifetimes still need
+explicit semantics rather than being smuggled through generic transfer attributes. Region and cost
+certification alone does not establish numerical pack/transport/unpack or stencil execution.
 
 Block-structured adaptive meshes now have an explicit outer `AMRWorkloadPlan`. A certified
 `RefinementHierarchy` retains rectangular patch identity, level coordinates, per-axis ratios,

@@ -1081,6 +1081,36 @@ namespaces pass 9 tests/41 assertions, including rejection on both ZE and OpenCL
 validate internal scatter accumulator initialization end to end through ordinary typed fill IR;
 do not reintroduce implicit zeroing in a special runtime convention.
 
+## Distributed numerical acceptance checkpoint (2026-09-13)
+
+Items 6–8 have checked planning components, not yet one executable numerical acceptance:
+`distributed-plan` simulates topology, dependencies, collective/halo schedules and analytic costs;
+`numerical-state` certifies chunk coverage and durable field identity; `numerical-content` tests
+scoped leases and transfer ownership using fake providers; `amr-plan` composes hierarchy, fields,
+regions and routes, but its coarse/fine operator requirements are declarations rather than bodies.
+The distributed certificate currently summarizes optional local plans by ID/operation count, not
+their exact numerical program. Do not treat that summary as a program-equivalence witness.
+
+The next sequence is workload-driven:
+
+1. Admit the existing `raster.ode.pde/heat-rhs-2d!` through direct TypedSOAC scheduling and emission,
+   preserving its multi-store boundaries and offset interior domain. A direct CUDA probe rejects
+   it with `:equation-first-coverage`; the ZE diagnostic reports a scalar route with no SegOps.
+   Existing 1-D RK4 and the direct AD/SGD probe succeed. Do not rewrite the PDE merely to satisfy
+   a narrower matcher, or assume its source comment proves nested-loop lifting already works.
+2. Bind distributed compute to exact local program entries and shard/view contracts; make numerical
+   program drift load-bearing in certification rather than comparing only IDs and counts.
+3. Execute a hardware-free two-shard halo step and compare stitched values with the monolithic
+   numerical oracle, alongside the certified region/byte/cost checks.
+4. Checkpoint actual addressed bytes through a local immutable file/mmap provider, close/reopen,
+   restore, continue, and compare with uninterrupted execution; test branch reuse of unchanged chunks.
+5. Grow that seam into conservative 2-D shallow water and typed prolongation/restriction, then
+   subcycling/reflux. Existing Dirichlet heat decay tests are not mass conservation, lake-at-rest,
+   convergence-rate oracles, or numerical AMR acceptance.
+
+This keeps cloud hardware, native fabrics and object storage out of the development hot loop.
+It does not replace the external training acceptance or measured kernel-comparison work.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
