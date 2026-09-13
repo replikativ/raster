@@ -570,10 +570,10 @@
                          :source-type source-type :result-type result-type
                          :rounding rounding :overflow overflow}))))
 
-      ;; Integral widening is exact. Narrowing/exact and trapping conversions need a proof or
-      ;; runtime check that this target layer does not currently carry.
-      (and (not source-fp?) (not result-fp?) (= [:exact :exact] [rounding overflow])
-           (<= (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
+      ;; `:exact/:exact` is the KernelBody owner's proof that every runtime value is representable
+      ;; by the result type. That proof makes both widening and narrowing ordinary value-
+      ;; preserving C conversions; only `:trap` narrowing requires a checked helper.
+      (and (not source-fp?) (not result-fp?) (= [:exact :exact] [rounding overflow]))
       (str "(" (target-type result-type) ")(" argument-source ")")
 
       ;; Every signed 32-bit integer is exactly representable as IEEE f64.

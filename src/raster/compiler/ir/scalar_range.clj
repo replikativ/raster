@@ -80,6 +80,23 @@
   (when-let [trips (counted-loop-trips lower upper step)]
     {:lower lower :upper (+' lower (*' trips step))}))
 
+(defn exclusive-positive-loop-entry-range
+  "Enclose the index on entry to a dynamic exclusive-upper-bound loop body.
+
+   `lower` and `upper` are independently proved operand intervals and `step` is a static positive
+   integer.  The proof also requires the largest possible exiting increment to fit `index-type`;
+   otherwise finite-width wrap could re-enter the loop below `upper` and invalidate the lower
+   bound. Empty-for-all-inputs and unknown cases return nil. This describes body entries only,
+   unlike `counted-loop-index-range`, which includes the exiting increment of a static loop."
+  [lower upper step index-type]
+  (when (and lower upper (integer? step) (pos? step)
+             (< (:lower lower) (:upper upper)))
+    (let [entry {:lower (:lower lower) :upper (dec (:upper upper))}
+          through-exit (assoc entry :upper (+' (:upper entry) step))]
+      (when (and (contained-in-dtype? entry index-type)
+                 (contained-in-dtype? through-exit index-type))
+        entry))))
+
 (defn accumulation-prefixes
   "Enclose every prefix of up to `count` additions of values in `term`, starting at `initial`.
    Unknown or nonintegral counts decline; proof arithmetic remains unbounded."

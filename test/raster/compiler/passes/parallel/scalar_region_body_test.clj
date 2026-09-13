@@ -6,6 +6,7 @@
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segred-body :as segred]
@@ -44,6 +45,22 @@
                          (lower '(Math/round missing) :long {})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires one argument"
                          (lower '(Math/round (aget x i) (aget x i)) :long {'i :int})))))
+
+(deftest java-round-honors-retained-compound-types-for-non-strict-owners
+  (let [lower (:lower (lowerer))
+        product (with-meta '(clojure.core/* left right) {:raster.type/tag 'double})
+        lowered (lower (list 'Math/round product) :long {'left :double 'right :double})]
+    (is (= :long (:type lowered)))
+    (is (= :double (get-in lowered [:operations 0 :result :type]))
+        "direct walker metadata selects the Java overload even for a legacy owner")
+    (is (= :scalar-source-type
+           (try
+             (lower '(Math/round (clojure.core/* left right))
+                    :long {'left :double 'right :double})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:rule (ex-data exception)))))
+        "an untagged compound is not inferred from its consumer or operands")))
 
 (deftest explicit-integer-casts-preserve-checked-versus-unchecked-source-contracts
   (let [decline! (fn [rule message data]
@@ -393,7 +410,9 @@
       (let [result (lower (list 'int value) :int {})
             cast (last (:operations result))]
         (is (= (body/literal value :long) (first (get-in cast [:expression :arguments]))))
-        (is (= {:rounding :exact :overflow :trap}
+        (is (= {:rounding :exact
+                :overflow (if (<= Integer/MIN_VALUE value Integer/MAX_VALUE)
+                            :exact :trap)}
                (get-in cast [:expression :options])))))
     (is (empty? (:operations (lower '(long 7) :long {})))
         "an identity checked literal remains an exact source-width literal")))
@@ -417,6 +436,60 @@
              (catch clojure.lang.ExceptionInfo exception
                (:rule (ex-data exception)))))
         "an outer cast target may not context-type an unknown compound operand")))
+
+(deftest typed-control-operands-own-their-result-dtype-before-an-outer-cast
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :rule rule))))
+        lower (:lower (scalar/make-lowerer
+                       {:array-types {} :arrays #{} :scalar-types {'x :long 'n :long}
+                        :lower-index (fn [expression _] expression)
+                        :require-source-types? true :conversion-policy conversion/policy
+                        :decline! decline!}))
+        selected (lower '(int (if (== x x) 0 1)) :int {'x :long})
+        outside (lower '(byte (if (== x x) 0 128)) :byte {'x :long})
+        fold (list 'fold
+                   {:accumulator 'acc :index 'j :identity 0.0 :dtype :float
+                    :extent 'n :association :ordered}
+                   (dialect/lambda-form ['acc 'j] ['acc]))
+        folded (lower (list 'float fold) :float {'n :long})]
+    (is (= {:rounding :exact :overflow :exact}
+           (get-in (last (:operations selected)) [:expression :options]))
+        "the agreeing literal branch ranges prove the checked narrowing total")
+    (is (= {:rounding :exact :overflow :trap}
+           (get-in (last (:operations outside)) [:expression :options]))
+        "a branch outside the destination range preserves the checked trap")
+    (is (= :float (:type folded)))
+    (is (some #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+              (:operations folded))
+        "a Fold's explicit dialect dtype types the operand of a surrounding result cast")))
+
+(deftest owner-proved-scalar-ranges-feed-checked-conversion-proofs
+  (let [options {:array-types {} :arrays #{} :scalar-types {'column :long}
+                 :scalar-ranges {'column {:lower 0 :upper 31}}
+                 :lower-index (fn [expression _] expression)
+                 :conversion-policy conversion/policy
+                 :decline! (fn [rule message data]
+                             (throw (ex-info message (assoc data :rule rule))))}
+        lowered ((:lower (scalar/make-lowerer options))
+                 '(int column) :int {'column :long})]
+    (is (= {:lower 0 :upper 31} (:range lowered)))
+    (is (= {:rounding :exact :overflow :exact}
+           (get-in (last (:operations lowered)) [:expression :options])))
+    (is (= :invalid-scalar-range-proof
+           (try
+             (scalar/make-lowerer
+              (assoc options :scalar-ranges
+                     {'column {:lower 0 :upper (inc (bigint Long/MAX_VALUE))}}))
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))
+    (is (= :invalid-scalar-range-proof
+           (try
+             (scalar/make-lowerer
+              (assoc options :scalar-ranges {'missing {:lower 0 :upper 1}}))
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
 
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]

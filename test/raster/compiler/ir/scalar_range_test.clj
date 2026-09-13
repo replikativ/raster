@@ -18,6 +18,23 @@
           terminal (if (seq indices) (+ (peek indices) step) lower)]
       (is (= {:lower lower :upper terminal} (ranges/counted-loop-index-range lower upper step))))))
 
+(deftest dynamic-exclusive-loop-entry-proof-requires-a-safe-positive-backedge
+  (is (= {:lower Integer/MIN_VALUE :upper (dec Integer/MAX_VALUE)}
+         (ranges/exclusive-positive-loop-entry-range
+          (ranges/for-dtype :int) (ranges/for-dtype :int) 32 :long)))
+  (is (= {:lower 3 :upper 19}
+         (ranges/exclusive-positive-loop-entry-range
+          {:lower 3 :upper 7} {:lower 11 :upper 20} 4 :int)))
+  (is (nil? (ranges/exclusive-positive-loop-entry-range
+             {:lower 10 :upper 20} {:lower 0 :upper 10} 1 :long))
+      "a loop that is empty for every admitted pair has no body-entry range")
+  (doseq [step [0 -1]]
+    (is (nil? (ranges/exclusive-positive-loop-entry-range
+               {:lower 0 :upper 0} {:lower 1 :upper 1} step :long))))
+  (is (nil? (ranges/exclusive-positive-loop-entry-range
+             {:lower 0 :upper 0} (ranges/for-dtype :long) 2 :long))
+      "an exiting increment that can overflow cannot establish a finite-width entry bound"))
+
 (deftest accumulation-proof-includes-intermediate-prefixes
   (let [term (ranges/arithmetic :* (repeat 2 (ranges/for-dtype :byte)))
         prove #(ranges/accumulation-prefixes (ranges/literal 0 :long) term %)]
