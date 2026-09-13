@@ -43,6 +43,29 @@
       (is (= program scheduled))
       (is (zero? (:initialization-fills stats))))))
 
+(deftest full-domain-proof-follows-scalar-ssa-products
+  (doseq [[allocation fills] [['(* (long n) width) 0] ['(* n width 2) 1]]]
+    (let [options {:dtype :float :array-types {'input :float 'output :float}
+                   :scalar-types {'n :long 'width :long}}
+          source (source (list 'float-array allocation) '(* width n))
+          normalized (frontend/normalize-source source options)
+          p (frontend/form->program normalized options)
+          [_ stats] (initialization/materialize p)]
+      (is (= fills (:initialization-fills stats)))
+      (is (= (- 1 fills) (:initialization-full-overwrites stats))))))
+
+(deftest total-functional-domains-include-boundaries-and-scan-results
+  (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float
+                                      (+ accumulator (aget input i)))
+                     '(raster.par/stencil! output [input] 1 :dirichlet float i 8
+                                          (+ (aget input (- i 1)) (aget input (+ i 1))))]
+          allocation [8 9]]
+    (let [p (frontend/form->program
+             (list 'let* ['output (list 'float-array allocation) 'written operation] 'written)
+             {:dtype :float :array-types {'input :float 'output :float}})
+          [_ stats] (initialization/materialize p)]
+      (is (= (if (= allocation 8) 0 1) (:initialization-fills stats))))))
+
 (defn- with-facts [program f]
   (dialect/make (f (dialect/facts program))
                 (dialect/equations program) (dialect/outputs program)))
@@ -91,6 +114,30 @@
                          (assoc-in [:attributes :host-read-sites]
                                    [{:source-binding-id 1 :values #{'output}}])))]
       (is (= :typed-soac-initialization-contract (reason program))))))
+
+(deftest host-first-storage-keeps-native-initialization-and-host-writes
+  (let [source '(let* [output (float-array 8)
+                       seeded (do (aset output 0 (float 7.0)) nil)
+                       written (raster.par/map! output i 8 nil
+                                               (+ (aget output i) (aget input i)))] written)
+        p (program source)
+        [scheduled stats] (initialization/materialize p)
+        realized (:source (#'route/realize-source source scheduled))
+        run (eval (list 'fn ['input] realized))]
+    (is (= 1 (:initialization-native-providers stats)))
+    (is (zero? (:initialization-fills stats)))
+    (is (zero? (:initialization-full-overwrites stats)))
+    (is (= (take 4 (second source)) (take 4 (second realized)))
+        "native allocation and host mutation precede the GPU stage unchanged")
+    (is (= [7.0 1.0 2.0 3.0 4.0 5.0 6.0 7.0]
+           (vec (run (float-array (range 8))))))
+    (is (= [7.0 -1.0 -2.0 -3.0 -4.0 -5.0 -6.0 -7.0]
+           (vec (run (float-array (map - (range 8)))))))
+    (is (= :typed-soac-initialization-contract
+           (reason (with-facts p
+                     #(assoc-in % [:equations 2 :attributes :fusion/constituents]
+                                {0 {} 2 {}}))))
+        "a host observation between fused constituents cannot become native-first")))
 
 (deftest public-initialization-cross-compiles-without-a-device
   (doseq [target [:cuda:0 :hip:0]

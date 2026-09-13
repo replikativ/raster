@@ -7,6 +7,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn- fail! [message data]
@@ -29,14 +30,18 @@
       (some #(= destination (physical-id facts (:destination %)))
             (dialect/result-storage facts (second equation)))))
 
-(defn- full-overwrite? [facts {:keys [destination extent]} equation]
-  ;; Only an unconditional dense map with the exact allocation domain is a coverage proof.
-  ;; A write-only effect map or contraction can leave holes or padding untouched.
-  (and (= 'map (dialect/operation-kind equation))
-       (= extent (get-in (dialect/operation-parts equation) [:attributes :extent]))
+(defn- full-overwrite? [facts extent-environment {:keys [destination extent]} equation]
+  ;; These functional operations produce their entire validated logical result shape.
+  ;; Indexed/guarded effect maps and scatter do not have that guarantee.
+  (and (contains? '#{map stencil contract segmented-reduce product-reduce
+                     segmented-fold-map scan} (dialect/operation-kind equation))
        (not (contains? (physical-inputs facts equation) destination))
-       (some #(and (= destination (physical-id facts (:destination %))) (= :write (:access %)))
-             (dialect/result-storage facts (second equation)))))
+       (some (fn [[result storage]]
+               (and (= destination (physical-id facts (:destination storage)))
+                    (= :write (:access storage))
+                    (extent-proof/same-volume? extent-environment extent
+                                              (get-in facts [:values result :shape]))))
+             (map vector (nth equation 2) (dialect/result-storage facts (second equation))))))
 
 (defn- fresh-symbol [used prefix]
   (first (remove used (map #(symbol (str prefix %)) (range)))))
@@ -48,16 +53,26 @@
     (when-not (every? integer? placements)
       (fail! "initialization requires an ordered analyzed-source consumer"
              {:allocation allocation :consumer (second consumer) :placements placements}))
-    (let [placement (apply max placements)]
+    (let [placement (apply max placements)
+          reads (filter #(and (some (fn [value] (= destination (physical-id facts value)))
+                                   (:values %))
+                              (< source-binding-id (:source-binding-id %) placement))
+                        (get-in facts [:attributes :host-read-sites]))
+          host-sites (set (get-in facts [:attributes :host-binding-ids]))
+          native? (and (seq reads)
+                       (every? #(and (contains? host-sites (:source-binding-id %))
+                                     (< (:source-binding-id %) (apply min placements))) reads))]
       (when-not (< source-binding-id placement)
         (fail! "initialization consumer must follow allocation"
                {:allocation allocation :consumer (second consumer) :placement placement}))
-      (doseq [read (get-in facts [:attributes :host-read-sites])
-              :when (and (contains? (:values read) destination)
-                         (< source-binding-id (:source-binding-id read) placement))]
+      (doseq [read reads :when (not native?)]
         (fail! "a host observation precedes the first resident initialization site"
                {:allocation allocation :host-read read :placement placement}))
-      placement)))
+      ;; Host-controlled consumers retain the native allocator and its initial contents.
+      ;; Resident extraction rejects these buffer-reading host bindings; staging uploads the
+      ;; resulting host array. A later fill would erase the host's writes. An observation
+      ;; between fused constituents is not a native-first use and still fails closed.
+      {:placement placement :native? (boolean native?)})))
 
 (defn- integral-extent? [facts extent]
   (or (and (integer? extent) (not (neg? extent)))
@@ -131,18 +146,23 @@
   [program]
   (dialect/validate! program)
   (let [original-facts (dialect/facts program)
+        extent-environment (extent-proof/environment program)
         allocations (filter #(and (= :zero (:initialization %))
                                   (contains? (:values original-facts) (:destination %)))
                             (allocation-contracts! original-facts))
-        {:keys [facts equations pending fills elided]}
+        {:keys [facts equations pending fills elided native]}
         (reduce
          (fn [{:keys [facts pending] :as state} equation]
            (let [active (filterv #(touches? facts (:destination %) equation) pending)
                  state (reduce
                         (fn [{:keys [facts] :as state} allocation]
-                          (let [placement (initialization-site! facts allocation equation)]
-                            (if (full-overwrite? facts allocation equation)
+                          (let [{:keys [placement native?]}
+                                (initialization-site! facts allocation equation)]
+                            (cond
+                              native? (update state :native inc)
+                              (full-overwrite? facts extent-environment allocation equation)
                               (update state :elided inc)
+                              :else
                               (let [{:keys [equations facts]} (initializer facts allocation placement)]
                                 (-> state (assoc :facts facts)
                                     (update :equations into equations) (update :fills inc))))))
@@ -150,7 +170,7 @@
              (-> state
                  (assoc :pending (vec (remove (set active) pending)))
                  (update :equations conj equation))))
-         {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0}
+         {:facts original-facts :equations [] :pending (vec allocations) :fills 0 :elided 0 :native 0}
          (dialect/equations program))
         _ (when (seq pending)
             (fail! "live zero storage has no typed initialization site"
@@ -161,4 +181,5 @@
                                equations))
         facts (assoc facts :inputs (vec (sort-by pr-str (set/difference references definitions))))]
     [(dialect/make facts equations (dialect/outputs program))
-     {:initialization-fills fills :initialization-full-overwrites elided}]))
+     {:initialization-fills fills :initialization-full-overwrites elided
+      :initialization-native-providers native}]))

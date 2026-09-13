@@ -1084,12 +1084,17 @@ Explicit compound allocation lengths use the same scalar SSA normalization as la
 at the original allocation site; the public invocation plan therefore sees a scalar dimension,
 not a reconstructed arithmetic expression. Value remapping preserves the allocation contracts.
 
-The first overwrite-elision proof is deliberately narrow: an unconditional dense map over exactly
-the allocated extent, with no aliased destination read. Write-only permission is not a full-domain
-coverage proof for conditional stores, padded contractions, or sparse updates. Unsupported extent,
-dtype, placement, alias, and observable-host-use contracts fail closed. Broader coverage proofs
-for contractions/effect maps remain performance work; this change does not claim optimal fill
-elision or improve the matrix schedule selector.
+Overwrite elision uses complete logical result shapes for functional maps, stencils, contractions,
+segmented/product reductions, segmented fold-maps, and scans, with no aliased destination read.
+The shared extent proof follows retained integral scalar SSA and checked Long products, allowing
+equal dimensions with reordered factors without erasing narrowing, floating, or wrapping
+arithmetic. Allocation size must equal result volume: padding still requires initialization.
+Write-only permission alone proves nothing for conditional effect stores or sparse updates.
+Unsupported extent, dtype, placement, alias, and observable-host-use contracts fail closed.
+General effect-map dense-image proofs remain work; this does not change the matrix selector.
+Storage first consumed by retained host bindings keeps the native allocation provider and host
+writes; GPU staging uploads that state. Such host buffer accesses still disqualify straight-line
+resident extraction. Observations between fused constituents cannot use this exemption.
 
 Validation covers ordinary and strided public scatter, holes, collisions, changed inputs, and
 two replays on Arc; both stages are ordinary KernelBody kernels. CUDA/HIP checks cover public
