@@ -9,8 +9,8 @@ coverage is not a completed vertical. The north star remains the architectural s
 
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
-#562 landed after all seven final-head gates passed. #563 still requires its final-head CI gates
-and merge; do not infer a release from presence on the working branch.
+#562 and #563 landed after all seven final-head gates passed. #563 is on main at `c3678bcd`;
+do not infer a published release from a merge.
 
 | Campaign item | Current evidence | Remaining acceptance |
 |---|---|---|
@@ -30,7 +30,7 @@ in-repository training evidence must not be substituted for those external gates
 
 ### Execution order from this checkpoint
 
-1. Finish #563 after the reviewed #562 landing, with all seven current-head gates. Complete-write evidence must
+1. #563 is merged after the reviewed #562 landing, with all seven current-head gates. Complete-write evidence must
    remain distinct from conditional initialized postconditions; fresh prefix results must remain
    legal without crediting untouched parent tails. Scalar reductions include their exact one-element
    resident representation. Invalid shape diagnostics propagate; unsupported proofs may decline.
@@ -50,6 +50,11 @@ The immediate emphasis returns to unresolved compiler/training workload coverage
 transfer acceptance; the distributed and scientific work does not replace the emitter agenda.
 
 ### External scientific comparisons
+
+The [source-reviewed extension experiments](scientific-extension-validation.md) add Julia/SciML
+and matrix-free references while preserving the existing ODE and iterative-solver library. They
+distinguish library capabilities from verified resident/distributed compilation; do not infer
+missing numerical algorithms from gaps in the new accelerator fixtures.
 
 Use numerical frameworks as well as kernel compilers, with separate kernel and time-to-solution
 measurements. Initial comparisons should match precision, discretization order, boundary conditions,
