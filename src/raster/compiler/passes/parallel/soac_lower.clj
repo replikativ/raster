@@ -109,11 +109,11 @@
           values (:values facts)
           physical-results (soac-dialect/physical-results facts equation)
           secondary-stores
-          (mapv (fn [logical-result secondary-result secondary-body]
-                  (let [secondary-dtype (:dtype (get values logical-result))
-                        cast (dtype/scalar-tag-for-dtype secondary-dtype)]
-                    (list 'clojure.core/aset secondary-result index
-                          (list cast secondary-body))))
+          (mapv (fn [_logical-result secondary-result secondary-body]
+                  ;; The logical result and its physical storage already own the destination
+                  ;; dtype. Keep that implicit store conversion out of the scalar expression;
+                  ;; any cast explicitly written inside secondary-body remains intact.
+                  (list 'clojure.core/aset secondary-result index secondary-body))
                 (rest results) (rest physical-results) (rest bodies))
           scalar-result (if (seq secondary-stores)
                           (list* 'do (concat secondary-stores [(first bodies)]))

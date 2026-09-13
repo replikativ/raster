@@ -469,6 +469,7 @@
 (deftest checked-source-narrowing-reaches-public-c-family-kernels
   (doseq [target [cuda-target hip-target]
           operation [#'checked-casts/narrow-rows!
+                     #'checked-casts/narrow-stores!
                      #'checked-casts/unused-narrow-rows!
                      #'checked-casts/annihilated-narrow-rows!]]
     (let [compilation (equation-first/compile operation

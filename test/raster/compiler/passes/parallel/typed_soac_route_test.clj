@@ -30,11 +30,23 @@
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.program-tuning :as program-tuning]))
 
+(defn- kernel-body-operations
+  [artifact]
+  (letfn [(walk [operations]
+            (mapcat
+             (fn [operation]
+               (cons operation
+                     (concat (walk (or (:operations operation) []))
+                             (walk (or (:then-operations operation) []))
+                             (walk (or (:else-operations operation) [])))))
+             operations))]
+    (walk (get-in artifact [:attributes :kernel-body :operations]))))
+
 (defn- scalar-stores
   [artifact]
   (filterv #(= "raster.compiler.ir.kernel_body.ScalarStore"
                (.getName (class %)))
-           (get-in artifact [:attributes :kernel-body :operations])))
+           (kernel-body-operations artifact)))
 
 (def ^:private map-map
   '(let* [y (raster.par/pmap i n float
@@ -87,7 +99,7 @@
            (into #{}
                  (keep #(when (= "ScalarCompute" (some-> % class .getSimpleName))
                           (get-in % [:expression :options :overflow])))
-                 (get-in emitted [:attributes :kernel-body :operations])))
+                 (kernel-body-operations emitted)))
         "unchecked SplitMix arithmetic remains explicit after scheduling")
     (is (re-find #"\(ulong\).* \* \(ulong\)" (:source emitted)))
     (is (not (re-find #"par_rng_fill" (:source emitted)))))
@@ -317,6 +329,8 @@
         artifact (first (:kernels emitted))
         pointer-slots (filterv #(not= :scalar (:kind %)) (:abi artifact))]
     (is (= :typed-soac (:source-dialect stats)))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route]))
+        "tuple projection uses its typed result/storage contract, not compatibility emission")
     (is (= [:write :read-write]
            (mapv :access (get-in equation [:attributes :result-storage]))))
     (is (= ['x 'b 'a] (mapv :name pointer-slots)))
@@ -391,7 +405,7 @@
         "KernelBody retains the same typed local instead of duplicating its load")
     (is (= 1 (count (filter #(and (= "ScalarCompute" (some-> % class .getSimpleName))
                                   (= :* (get-in % [:expression :op])))
-                            (get-in portable [:attributes :kernel-body :operations]))))
+                            (kernel-body-operations portable))))
         "the shared square is one scalar SSA definition")
     (is (nil? (execute x a b 4)))
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
@@ -424,7 +438,7 @@
                   :scalar-types {'n :long 'width :long})
         loop-operation
         (some #(when (= "ForLoop" (some-> % class .getSimpleName)) %)
-              (get-in artifact [:attributes :kernel-body :operations]))]
+              (kernel-body-operations artifact))]
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
     (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
     (is loop-operation)
