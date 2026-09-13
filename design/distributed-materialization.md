@@ -105,13 +105,21 @@ until its runtime can execute the stated reduction.
 
 ## Readiness is separate from geometry
 
-The next proof should reuse LinkPlan's ordered instance access facts and its existing
+`link-plan/initialization-contract` now exposes the shared effect validator's node-level
+`:requires`, `:initializers`, `:produces`, `:reads`, `:writes`, and public `:outputs` sets.
+Caller requirements arise from reads or pass-through outputs before a proven local writer;
+alias requirements retain the actual requested subview. Declared source initializers are separate
+from caller obligations and are not immutable snapshots or completed uploads. Produced storage
+does not imply retained semantic identity for private temporary values. These are conditional
+local facts; distributed lowering still needs to discharge them and establish freshness.
+
+The proof reuses LinkPlan's ordered instance access facts and its existing
 `produced-views`/`partial-writes` accounting. `value-accesses` deliberately summarizes ABI access
 only; a `:write` entry is not an initialization postcondition. LinkPlan currently assumes caller
 input/constant/state nodes are initialized when checking the local program. Distributed lowering
 must discharge those caller preconditions using source leases and completed producers/transfers,
-not inherit the assumption as evidence. Expose the shared local pre/postcondition calculation
-from the existing validator rather than adding a second kernel-effect registry.
+not inherit the assumption as evidence. The shared calculation is in the existing validator,
+not a second kernel-effect registry.
 
 Before an executable plan can allocate resources, prove:
 

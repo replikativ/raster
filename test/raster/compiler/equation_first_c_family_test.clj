@@ -243,6 +243,13 @@
         "result views share storage without another allocation")
     (is (nil? (get-in linked [:nodes prefix :source])))
     (is (nil? (reason fresh)) "the contraction produces its entire logical prefix")
+    (let [contract (link-plan/initialization-contract fresh)]
+      (is (contains? (:produces contract) prefix))
+      (is (not (contains? (:produces contract) base)))
+      (is (not (contains? (:requires contract) base))
+          "a write-only prefix does not demand an initialized backing tail")
+      (is (contains? (:writes contract) base)
+          "the ABI pointer is written, but only the certified prefix is initialized"))
     (is (= :link-unproduced-output (reason (assoc fresh :outputs [base])))
         "writing a prefix cannot initialize or export the untouched tail")
     (is (= :program-link-result-view
