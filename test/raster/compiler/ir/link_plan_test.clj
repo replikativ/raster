@@ -77,6 +77,24 @@
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
 
+(deftest logical-value-accesses-come-from-bound-kernel-effects
+  (let [plan (valid-plan)]
+    (is (= {:x :read :w0 :read :w1 :read :hidden :read-write :out :write}
+           (link/value-accesses plan)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (link/value-accesses (assoc plan :instances (vec (reverse (:instances plan)))))))
+    (let [plan (link/make
+                {:id :logical-names :target (:target plan) :nodes (:nodes plan)
+                 :values (mapv (fn [[id value]] (assoc value :id [:logical id])) (:values plan))
+                 :instances (mapv (fn [instance]
+                                    (update instance :bindings
+                                            #(into {} (map (fn [[symbol id]] [symbol [:logical id]])) %)))
+                                  (:instances plan))
+                 :outputs (:outputs plan)})]
+      (is (= {[:logical :x] :read [:logical :w0] :read [:logical :w1] :read
+              [:logical :hidden] :read-write [:logical :out] :write}
+             (link/value-accesses plan))))))
+
 (deftest data-valued-descriptor-instances-compose-through-stable-node-identities
   (let [plan (valid-plan)]
     (is (link/link-plan? plan))
