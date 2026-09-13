@@ -11,6 +11,7 @@
             [raster.compiler.passes.parallel.effect-source :as effect-source]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.parallel.typed-soac-ownership :as ownership]
@@ -622,7 +623,8 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions? scalar-types values abstract-machine]
+  ([form dtype array-types {:keys [resident-reductions? resident-initialization?
+                                 scalar-types values abstract-machine]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
@@ -640,6 +642,10 @@
                    (if resident-reductions?
                      (resident/realize typed-result)
                      [typed-result {:resident-reductions 0 :inlined-scalars 0}])
+                   [typed-result initialization-stats]
+                   (if resident-initialization?
+                     (initialization/materialize typed-result)
+                     [typed-result {}])
                    [typed-result ownership-stats] (ownership/prove typed-result)]
                (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
                                            :segmented-reduce :contract :product-reduce
@@ -652,7 +658,7 @@
                    {:declined decline}
                    (let [{:keys [source realized]} (realize-source form typed-result)]
                      {:program (envelope typed-result source realized)
-                      :stats (merge typed-stats resident-stats ownership-stats
+                      :stats (merge typed-stats resident-stats initialization-stats ownership-stats
                                     {:route :typed-soac :typed-validated true
                                      :front-end :analyzed-source})}))))))
          (catch clojure.lang.ExceptionInfo exception

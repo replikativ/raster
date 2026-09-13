@@ -18,6 +18,29 @@
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
 
+(deftest physical-allocation-initialization-survives-host-scaffolding
+  (let [contracts
+        (fn [allocation]
+          (let [source (list 'let* ['output allocation
+                                   'written '(raster.par/map! output i n nil (aget input i))]
+                             'written)
+                program (frontend/form->program
+                         source {:dtype :double :array-types {'input :float 'output :float}
+                                 :scalar-types {'n :long}})]
+            (is (some? program))
+            (get-in (dialect/facts program) [:attributes :allocations])))]
+    (doseq [[allocation initialization]
+            [['(clojure.core/float-array n) :zero]
+             ['(raster.math/zeros-like input n) :zero]
+             ['(raster.math/alloc-like input n) :unspecified]
+             ['(clojure.core/aclone input) :copy]]]
+      (is (= [{:destination 'output :source-binding-id 0
+               :extent 'n
+               :initialization initialization :dtype :float}]
+             (contracts allocation))))
+    (is (empty? (contracts '(clojure.core/float-array n 7))))
+    (is (empty? (contracts '(clojure.core/float-array [1.0 2.0]))))))
+
 (deftest returned-buffer-identity-is-normalized-before-access-contracts
   (let [source '(let* [r (raster.par/contract C [[i 4]] [] (clojure.core/aget A i))
                        alias r

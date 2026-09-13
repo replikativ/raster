@@ -242,6 +242,11 @@
   [materialized parallel-program target evaluate-host]
   (let [materialized (materialization/validate! materialized)
         parallel-program (emitted-program/validate! parallel-program)
+        _ (when-let [providers (seq (get-in parallel-program
+                                           [:attributes :native-initialization-providers]))]
+            (fail! :invocation-link-native-initialization
+                   "source-independent linking requires an explicit native-content provider"
+                   {:destinations (vec providers)}))
         invocation-plan (:plan materialized)
         invocation-id (:id invocation-plan)
         _ (when-not (= (set (:program-inputs invocation-plan))

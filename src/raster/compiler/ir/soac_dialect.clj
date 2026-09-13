@@ -2085,7 +2085,22 @@
                               :equations equation-facts)
                  (seq (get-in source-facts [:attributes :host-read-values]))
                  (update-in [:attributes :host-read-values]
-                            #(vec (distinct (map rename %)))))]
+                            #(vec (distinct (map rename %))))
+                 (seq (get-in source-facts [:attributes :native-initialization-providers]))
+                 (update-in [:attributes :native-initialization-providers]
+                            #(vec (distinct (map rename %))))
+                 (seq (get-in source-facts [:attributes :allocations]))
+                 (update-in [:attributes :allocations]
+                            #(mapv (fn [allocation]
+                                     (-> allocation
+                                         (update :destination rename)
+                                         (update :extent (fn [extent]
+                                                           (if (value-id? extent)
+                                                             (rename extent)
+                                                             (util/subst-syms value-map extent)))))) %))
+                 (seq (get-in source-facts [:attributes :host-read-sites]))
+                 (update-in [:attributes :host-read-sites]
+                            #(mapv (fn [site] (update site :values (fn [ids] (set (map rename ids))))) %)))]
     (make facts' equation-forms (mapv rename (outputs program)))))
 
 (defn default-equation-facts

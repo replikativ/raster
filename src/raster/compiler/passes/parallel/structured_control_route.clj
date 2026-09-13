@@ -359,6 +359,10 @@
     (fail! :structured-control-soac-promotion
            "loop-free promotion requires an analyzed :typed-soac ParallelProgram"
            {:dialect (:dialect parallel-program)}))
+  (when-let [providers (seq (get-in parallel-program [:attributes :native-initialization-providers]))]
+    (fail! :structured-control-native-initialization
+           "source-independent promotion cannot discard native allocation and host writes"
+           {:destinations (vec providers)}))
   (let [parallel-program (hoist-host-invocation-equations parallel-program)
         public-parameters (vec (or public-parameters active-params))
         _ (when-not (seq public-parameters)

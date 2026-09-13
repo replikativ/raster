@@ -1072,3 +1072,48 @@ emitter-side scalar-type inference import are removed. The focused LinkPlan and 
 namespaces pass 9 tests/41 assertions, including rejection on both ZE and OpenCL. A follow-up must
 validate internal scatter accumulator initialization end to end through ordinary typed fill IR;
 do not reintroduce implicit zeroing in a special runtime convention.
+
+## Fresh-storage initialization through the typed vertical
+
+Resident allocation does not itself implement Clojure's fresh-array zero semantics, and allocating
+once is not enough for repeated execution. The frontend now retains allocation initialization,
+element type, extent, and source order in TypedSOAC facts using the shared allocator descriptor.
+GPU scheduling materializes required zeros as ordinary typed maps after fusion and before
+ownership certification. Native fresh-array execution keeps its native initialization provider.
+Explicit compound allocation lengths use the same scalar SSA normalization as launch extents,
+at the original allocation site; the public invocation plan therefore sees a scalar dimension,
+not a reconstructed arithmetic expression. Value remapping preserves the allocation contracts.
+
+Overwrite elision uses complete logical result shapes for functional maps, stencils, contractions,
+segmented/product reductions, segmented fold-maps, and scans, with no aliased destination read.
+The shared extent proof follows retained integral scalar SSA and checked Long products, allowing
+equal dimensions with reordered factors without erasing narrowing, floating, or wrapping
+arithmetic. Allocation size must equal result volume: padding still requires initialization.
+Write-only permission alone proves nothing for conditional effect stores or sparse updates.
+Allocation cardinality is separate from a destination AbstractValue's logical consumer shape.
+For example, an AD gradient may be allocated with `in*out` elements and later consumed over
+`alength(weights)`. These remain independent symbolic identities: the initializer covers the
+constructor extent, while concrete invocation/LinkPlan validation checks logical demand against
+capacity. Known undersized allocations fail statically; neither symbolic equality nor extra
+capacity is a license to elide a fill. Plain representation and absent logical layout remain
+mandatory for this initialization route.
+Unsupported extent, dtype, placement, alias, and observable-host-use contracts fail closed.
+General effect-map dense-image proofs remain work; this does not change the matrix selector.
+Storage first consumed by retained host bindings keeps the native allocation provider and host
+writes; GPU staging uploads that state. Such host buffer accesses still disqualify straight-line
+resident extraction. Observations between fused constituents cannot use this exemption.
+The native-provider obligation is retained as semantic data and survives value remapping.
+Source-independent SOAC promotion and invocation linking reject it until an explicit content
+provider exists; an ABI `:write` role cannot silently discharge that obligation.
+
+Validation covers ordinary and strided public scatter, holes, collisions, changed inputs, and
+two replays on Arc; both stages are ordinary KernelBody kernels. CUDA/HIP checks cover public
+source compilation **and allocation-free LinkPlan lowering**, not emission alone. Focused pure
+checks cover full/partial overwrite, copy/unspecified storage, malformed facts, aliases, source
+placement, generated names, and value remapping. Existing numerical tests are retained.
+
+Separately, the full typed route namespace on an Intel device exposes remaining unification debt:
+`gemm/split-k-combine-plan` still builds a contraction surface form and calls `contraction-facts`
+and `contract-form->segred`. The source-reparse guard fails with initialization disabled as well;
+its input contains no allocation. Preserve that guard and migrate this compiler-generated
+combine algorithm directly to typed IR in the next slice, rather than weakening the test.
