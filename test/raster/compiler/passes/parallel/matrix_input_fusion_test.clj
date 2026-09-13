@@ -3,6 +3,8 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-graph :as graph]
@@ -114,6 +116,19 @@
                           fused {'A :shared-ac 'B :weights 'C :shared-ac} =))))
     (is (= [] (graph-call/external-alias-violations
                fused {'A :activation 'B :weights 'C :result} =)))
+    (let [choice (dispatch/make
+                  {:id "matrix-storage-admission" :alternatives [ordinary fused]
+                   :default-strategy (executable/strategy ordinary)
+                   :selector {:kind :fixed-strategy :strategy (executable/strategy fused)}})
+          admit (fn [buffers override]
+                  (dispatch/admit-alternative
+                   choice (mapv buffers (:arguments ordinary)) override
+                   #(graph-call/binding-alias-violations % buffers =)))]
+      (is (= ordinary (:executable (admit {'A :same 'B :weights 'C :same} :auto))))
+      (is (= fused (:executable (admit {'A :input 'B :weights 'C :output} :auto))))
+      (is (= :kernel-dispatch-inapplicable
+             (try (admit {'A :same 'B :weights 'C :same} (executable/strategy fused))
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (is (= 3 (count (calls ordinary true))) "global conversion snapshots A before C is written")
     (is (= 2 (count (calls fused false))))
     (is (= :kernel-abi-no-write-alias

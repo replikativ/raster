@@ -155,7 +155,9 @@
     (catch UnsupportedOperationException _
       (identical? left right))))
 
-(defn- pointer-overlaps?
+(defn pointer-overlaps?
+  "Compare the concrete pointer representations accepted by KernelCall, including views and
+   native segment ranges. Shared by validation and pre-allocation dispatch admission."
   [left right]
   (let [left-view (resident-view left)
         right-view (resident-view right)

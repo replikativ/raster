@@ -1425,7 +1425,7 @@
                                    buffer-keys)
            _ (doseq [[id {:keys [view]}] external-bindings]
                (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
-           _ (kgcall/validate-external-aliases! graph (update-vals external-bindings :view) bview/overlaps?)
+           _ (kgcall/validate-binding-aliases! graph (update-vals external-bindings :view) bview/overlaps?)
            _ (release-graph-events! sess graph-key)
            temporary-specs (kgcall/temporary-specs graph scalar-values)
            temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
@@ -1589,6 +1589,17 @@
            (bind-kernel-graph! sess executable-key executable buffers scalar-values
                                (select-keys options [:profile?]))))))))
 
+(defn- executable-alias-violations
+  "Pure storage admission; ordinary scalar, capacity, alignment and backend checks still apply."
+  [executable runtime-arguments]
+  (case (kexec/kind executable)
+    :kernel-artifact
+    (kabi/alias-contract-violations (kexec/abi executable) runtime-arguments
+                                   kcall/pointer-overlaps?)
+    :kernel-graph
+    (let [{:keys [buffers]} (kexec/graph-bindings executable runtime-arguments)]
+      (kgcall/binding-alias-violations executable buffers kcall/pointer-overlaps?))))
+
 (defn- staged-pointer-plan
   "Validate and group ABI pointer values by object identity before any allocation.
 
@@ -1690,8 +1701,16 @@
         dispatch (kdispatch/validate! dispatch)
         common (kdispatch/default-alternative dispatch)
         typed-arguments (kexec/typed-runtime-arguments common runtime-arguments)
-        executable (kdispatch/select-alternative dispatch typed-arguments)
-        {:keys [groups arguments]} (staged-pointer-plan device-id executable typed-arguments)
+        ;; Validate the shared input representation before asking whether any schedule can use
+        ;; these bindings. This pass groups identities but does not allocate or open a session.
+        common-plan (staged-pointer-plan device-id common typed-arguments)
+        executable (:executable
+                    (kdispatch/admit-alternative
+                     dispatch typed-arguments
+                     #(executable-alias-violations % typed-arguments)))
+        {:keys [groups arguments]} (if (identical? common executable)
+                                    common-plan
+                                    (staged-pointer-plan device-id executable typed-arguments))
         result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
                               (map vector (kexec/abi executable) typed-arguments))]
     (when (and (= :single result-policy) (> (count result-pairs) 1))
@@ -1827,6 +1846,7 @@
       :kernel-graph
       (let [{:keys [buffers scalar-values]}
             (kexec/graph-bindings executable runtime-arguments)
+            _ (kgcall/validate-binding-aliases! executable buffers kcall/pointer-overlaps?)
             extent-values (into {} (map (fn [[id buffer]]
                                           [(list 'extent id) (:n-elements buffer)])) buffers)
             _ (doseq [buffer-spec (concat (:inputs executable) (:outputs executable))
@@ -1893,8 +1913,10 @@
                (rt-resolve device-id "expand-pointer-binding"))
               logical-or-physical-args)
             selected (if-let [dispatch (:dispatch step)]
-                       (kdispatch/select-alternative
-                        dispatch ordered-args (step-selection-override step schedule))
+                       (:executable
+                        (kdispatch/admit-alternative
+                         dispatch ordered-args (step-selection-override step schedule)
+                         #(executable-alias-violations % ordered-args)))
                        artifact)
             constant-buffer-ids
             (when (= :kernel-graph (kexec/kind selected))
