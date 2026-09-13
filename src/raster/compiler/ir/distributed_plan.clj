@@ -988,15 +988,15 @@
            (:halos plan))
      (route-costs plan)
      (:cost-vector simulation)
-     (into {}
-           (map (fn [[device-id local]]
-                  [device-id
-                   {:link-plan (some-> (:link-plan local) :id)
-                    :execution-operations (some-> (:execution-plan local) :operations count)}]))
-           (:device-plans plan)))))
+     ;; A name and an operation count do not identify a local computation. Retain the
+     ;; immutable compiler contracts, including artifacts, scalar bindings, views and event
+     ;; dependencies, so replacing an equally sized program invalidates the witness.
+     ;; This is structural plan verification, not a digest of mutable buffer contents.
+     (:device-plans plan))))
 
 (defn certify
-  "Validate a plan and attach a reproducible coverage, route-cost, and resource witness."
+  "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.
+   Local contracts are compared as compiler values, not portable hashes or buffer snapshots."
   [plan]
   (let [plan (validate! plan)]
     (->CertifiedDistributedPlan plan (derive-certificate plan))))

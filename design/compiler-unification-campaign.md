@@ -1088,16 +1088,20 @@ Items 6–8 have checked planning components, not yet one executable numerical a
 `numerical-state` certifies chunk coverage and durable field identity; `numerical-content` tests
 scoped leases and transfer ownership using fake providers; `amr-plan` composes hierarchy, fields,
 regions and routes, but its coarse/fine operator requirements are declarations rather than bodies.
-The distributed certificate currently summarizes optional local plans by ID/operation count, not
-their exact numerical program. Do not treat that summary as a program-equivalence witness.
+The distributed certificate now retains the optional structural local LinkPlan/ExecutionPlan
+contracts instead of only their IDs and operation counts. Equally sized replacements with changed
+operations, scalars, event dependencies, outputs or views invalidate the certificate. Persistent
+compiler values are shared, not serialized or copied; this is not a content hash or snapshot of
+mutable host/device buffers. Explicit compute-step-to-program/shard binding is still required
+before treating the overall plan as an executable numerical workflow.
 
 The next sequence is workload-driven:
 
 1. Admit the existing `raster.ode.pde/heat-rhs-2d!` through direct TypedSOAC scheduling and emission,
-   preserving its multi-store boundaries and offset interior domain. A direct CUDA probe rejects
-   it with `:equation-first-coverage`; the ZE diagnostic reports a scalar route with no SegOps.
-   Existing 1-D RK4 and the direct AD/SGD probe succeed. Do not rewrite the PDE merely to satisfy
-   a narrower matcher, or assume its source comment proves nested-loop lifting already works.
+   preserving its multi-store boundaries and offset interior domain. This local admission now
+   passes CUDA/HIP compile/link and two-grid ZE numerical parity, through counted-store
+   normalization described below. Parallel schedule quality remains unmeasured. Existing 1-D
+   RK4 and the direct AD/SGD probe also succeed; the PDE source was not rewritten for admission.
 2. Bind distributed compute to exact local program entries and shard/view contracts; make numerical
    program drift load-bearing in certification rather than comparing only IDs and counts.
 3. Execute a hardware-free two-shard halo step and compare stitched values with the monolithic

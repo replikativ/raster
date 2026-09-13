@@ -2,6 +2,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.distributed-plan :as distributed]
+            [raster.compiler.ir.execution-plan :as execution]
+            [raster.compiler.ir.kernel-abi :as abi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.scan :as scan]))
 
 (defn- two-device-topology
@@ -146,6 +151,64 @@
         error (try (distributed/verify! modified)
                    (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-certificate (:reason (ex-data error))))))
+
+(deftest local-plan-witnesses-bind-content-not-names-or-counts
+  (let [queue (execution/compute-queue)
+        ready (execution/->LogicalEvent :ready)
+        done (execution/->LogicalEvent :done)
+        local-execution
+        (execution/validate!
+         (execution/->ExecutionPlan
+          [queue] [ready]
+          [(execution/->ScheduledOperation :step {:kernel :heat :alpha 0.25}
+                                           queue [] done)]
+          [done]))
+        kernel (artifact/make
+                {:kernel-name "plan_witness"
+                 :source "__kernel void plan_witness(__global float* state, long n) {}"
+                 :abi [(abi/slot 'state :output :float) (abi/slot 'n :scalar :long)]
+                 :arguments '[state n]
+                 :launch (launch/spec {:workgroup-size [1] :group-count [(launch/ceil-div 'n 1)]})
+                 :effects {:kind :map :writes '[state]}})
+        descriptor {:dtype :float :all-params '[state n] :array-params '[state]
+                    :scalar-params '[n] :allocs [] :result-sym 'state
+                    :steps [{:phase :map :kernel-name "plan_witness" :convention :map
+                             :artifact kernel
+                             :argument-specs [{:kind :output :sym 'state}
+                                              {:kind :scalar :type :long
+                                               :value-fn (fn [args] (second args))}]}]}
+        local-link (fn [width]
+                     (link-plan/make
+                      {:id :same-local-plan :target :gpu-0
+                       :nodes [(link-plan/node {:id :state :dtype :float :shape [width]
+                                                :device :gpu-0 :role :state})]
+                       :instances [(link-plan/instance {:id :write :descriptor descriptor
+                                                         :bindings {'state :state}
+                                                         :scalars {'n width}})]
+                       :outputs [:state]}))
+        local {:link-plan (local-link 16) :execution-plan local-execution}
+        plan (assoc (training-plan) :device-plans {:gpu-0 local})
+        certified (distributed/certify plan)]
+    (is (= {:gpu-0 local} (get-in certified [:certificate :device-plans])))
+    (is (= certified (distributed/verify! certified)))
+    (doseq [[label changed]
+            [[:scalar (assoc-in local [:execution-plan :operations 0 :operation :alpha] 0.5)]
+             [:operation (assoc-in local [:execution-plan :operations 0 :operation :kernel] :wave)]
+             [:dependency (assoc-in local [:execution-plan :operations 0 :waits] [ready])]
+             [:output (assoc-in local [:execution-plan :outputs] [ready])]
+             [:artifact (assoc-in local [:link-plan :instances 0 :descriptor :steps 0
+                                         :artifact :source]
+                                  "__kernel void plan_witness(__global float* state, long n) { state[0] = 1.0f; }")]
+             [:view (assoc local :link-plan (local-link 8))]]]
+      (testing (name label)
+        (let [modified (assoc-in certified [:plan :device-plans :gpu-0] changed)]
+          (is (= 1 (count (get-in changed [:execution-plan :operations]))))
+          (is (= :same-local-plan (get-in changed [:link-plan :id])))
+          (is (distributed/distributed-plan? (distributed/validate! (:plan modified)))
+              "the replacement is valid on its own, but does not match the old certificate")
+          (is (= :distributed-certificate
+                 (:reason (ex-data (try (distributed/verify! modified)
+                                        (catch clojure.lang.ExceptionInfo e e)))))))))))
 
 (defn- two-device-all-reduce
   []
