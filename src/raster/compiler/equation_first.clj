@@ -66,7 +66,11 @@
         ;; build-param-env resolve the same dtype specialization used by get-walked-body.
         tags (mapv param-env parameters)
         parameter-types (opencl-pass/derive-param-types parameters tags effective-dtype)]
-    (merge options
+    ;; A device reduction consumed by a later equation is storage, not a host ABI scalar.
+    ;; Realize the retained cross-equation use before scheduling/emission, as the resident
+    ;; compiler entry does; no binder may repair this by downloading a device result.
+    (merge {:resident-reductions? true}
+           options
            {:dtype effective-dtype
             :target-device target
             :active-params parameters

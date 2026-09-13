@@ -25,6 +25,26 @@
       (is (= :cast (:op cast)))
       (is (= {:rounding :nearest-even :overflow :exact} (:options cast))))))
 
+(deftest resident-reduction-preserves-host-scalar-captures
+  (let [program (fused
+                 '(let* [^long width (alength x)
+                         total (raster.par/reduce acc 0.0 i width (+ acc (aget x i)))
+                         result (raster.par/map-void! j width
+                                  (aset out j (* (aget x j) total)))]
+                    result))
+        scalar-info (fn [p]
+                      (first (filter #(= :scalar (:kind %))
+                                     (map fusion/equation-info (dialect/equations p)))))
+        before (scalar-info program)
+        [result stats] (resident/realize program)
+        after (scalar-info result)]
+    (is (some? before))
+    (is (= 1 (:resident-reductions stats)))
+    (is (= (:captures before) (:captures after)))
+    (is (= (:parameters before) (:parameters after)))
+    (is (= (:body-results before) (:body-results after)))
+    (is (= result (dialect/validate! result)))))
+
 (deftest resident-reduction-preserves-the-independent-transform-boundary
   (let [program (fused
                  '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))

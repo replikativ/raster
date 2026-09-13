@@ -26,11 +26,14 @@
 (defn- emit-equation
   [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
   (list '= id (vec results)
-        (if (= :contract kind)
-          (list 'contract attributes (vec arrays) (vec captures))
-        (list (symbol (name kind)) attributes (vec arrays) (vec captures)
-              (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
-                                   (vec body-results))))))
+        (case kind
+          :contract (list 'contract attributes (vec arrays) (vec captures))
+          :scalar (list 'scalar attributes (vec captures)
+                        (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
+                                             (vec body-results)))
+          (list (symbol (name kind)) attributes (vec arrays) (vec captures)
+                (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
+                                     (vec body-results))))))
 
 (defn- parameter-parts
   [info]
