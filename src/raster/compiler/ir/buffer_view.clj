@@ -183,3 +183,30 @@
       (throw (ex-info "buffer subview exceeds its base view"
                       {:base (:id base) :view (:id child)})))
     child))
+
+(defn rectangular-subview
+  "Select a checked rectangle in the base view's logical coordinate frame.
+
+   Unlike byte-oriented subview, this preserves the base dtype and element strides and proves
+   per-axis containment. It returns an ordinary BufferView, not a new memory representation.
+   Offsets are non-negative base-local coordinates; callers must explicitly translate global
+   or ghost coordinates into this frame. Empty rectangles produce a zero-byte contained view."
+  [base {:keys [id offsets shape]}]
+  (let [base (validate-view! base)
+        rank (count (:shape base))]
+    (when-not (and (vector? offsets) (vector? shape)
+                   (= rank (count offsets) (count shape))
+                   (every? #(and (integer? %) (not (neg? %))) offsets)
+                   (every? #(and (integer? %) (not (neg? %))) shape)
+                   (every? true? (map (fn [offset extent bound] (<= (+' offset extent) bound))
+                                     offsets shape (:shape base))))
+      (throw (ex-info "rectangle exceeds its base logical coordinate domain"
+                      {:reason :buffer-view-region :base-shape (:shape base)
+                       :offsets offsets :shape shape})))
+    (let [empty? (some zero? shape)
+          relative (*' (dtype/bytes-of (:dtype base))
+                       (reduce +' 0 (map *' offsets (:strides base))))
+          ;; A zero-volume rectangle at a trailing multi-axis corner may have a formal
+          ;; linear origin beyond the physical span. Anchor its empty view at the end.
+          relative (if empty? (min relative (:byte-length base)) relative)]
+      (subview base {:id id :byte-offset relative :shape shape :strides (:strides base)}))))

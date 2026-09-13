@@ -56,3 +56,31 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds its base"
                             (view/subview prefix {:byte-offset 32 :dtype :float
                                                   :shape [16]}))))))
+
+(deftest rectangular-regions-preserve-coordinates-and-strides
+  (let [padded (view/view allocation {:id :padded :dtype :float :shape [6 7]})
+        owned (view/rectangular-subview padded {:offsets [1 0] :shape [4 7]})
+        lower-ghost (view/rectangular-subview padded {:offsets [0 0] :shape [1 7]})
+        upper-ghost (view/rectangular-subview padded {:offsets [5 0] :shape [1 7]})
+        column (view/rectangular-subview owned {:offsets [0 2] :shape [4 1]})]
+    (is (= [28 112 [7 1]] ((juxt :byte-offset :byte-length :strides) owned)))
+    (is (= (:allocation padded) (:allocation owned)))
+    (is (view/contiguous? owned))
+    (is (view/disjoint? owned lower-ghost))
+    (is (view/disjoint? owned upper-ghost))
+    (is (= [36 88 [7 1]] ((juxt :byte-offset :byte-length :strides) column)))
+    (is (not (view/contiguous? column)))
+    (let [empty (view/rectangular-subview owned {:offsets [4 7] :shape [0 0]})]
+      (is (= 0 (:byte-length empty)))
+      (is (= (view/byte-end owned) (:byte-offset empty))))))
+
+(deftest rectangles-are-contained-by-axes-not-just-allocation-bytes
+  (let [base (view/view allocation {:dtype :float :shape [4 7]})]
+    (doseq [region [{:offsets [0 6] :shape [1 2]}
+                    {:offsets [-1 0] :shape [1 7]}
+                    {:offsets [0] :shape [4]}
+                    {:offsets [0 0] :shape [4 -1]}
+                    {:offsets [Long/MAX_VALUE 0] :shape [Long/MAX_VALUE 7]}]]
+      (is (= :buffer-view-region
+             (:reason (ex-data (try (view/rectangular-subview base region)
+                                   (catch clojure.lang.ExceptionInfo error error)))))))))

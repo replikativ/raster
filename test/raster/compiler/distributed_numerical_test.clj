@@ -7,6 +7,7 @@
             [raster.ode.pde :as pde]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.compiler.ir.numerical-state :as state]
             [raster.runtime.numerical-content :as content]
@@ -64,15 +65,30 @@
                  [id buffer]))) shards))
 
 (defn- halo-copies [{:keys [shards halo]}]
-  (let [by-id (into {} (map (juxt :id identity)) shards)]
+  (let [by-id (into {} (map (juxt :id identity)) shards)
+        storage (into {}
+                      (map (fn [{:keys [id device shape]}]
+                             (let [padded-shape (update shape 0 + 2)]
+                               [id (view/view
+                                     (view/allocation {:id id :memory-space :device :device device
+                                                       :byte-size (* Double/BYTES (reduce * padded-shape))})
+                                     {:dtype :double :shape padded-shape})]))) shards)]
     (mapv (fn [{:keys [attributes bytes]}]
             (let [{:keys [source-shard target-shard source-region destination-region]} attributes
-                  source-row (- (first (:offsets source-region))
-                                (first (:offsets (by-id source-shard))))
-                  target-row (first (:offsets destination-region))]
+                  source-offsets (mapv - (:offsets source-region) (:offsets (by-id source-shard)))
+                  source (view/rectangular-subview (storage source-shard)
+                                                  {:offsets (update source-offsets 0 inc)
+                                                   :shape (:shape source-region)})
+                  target (view/rectangular-subview (storage target-shard)
+                                                  {:offsets (update (:offsets destination-region) 0 inc)
+                                                   :shape (:shape destination-region)})]
+              (when-not (and (view/contiguous? source) (view/contiguous? target)
+                             (= bytes (:byte-length source) (:byte-length target)))
+                (throw (ex-info "halo copy does not realize its declared contiguous byte range"
+                                {:source source :target target :bytes bytes})))
               {:source source-shard :target target-shard
-               :src-element (* (inc source-row) width)
-               :dst-element (* (inc target-row) width)
+               :src-element (quot (:byte-offset source) Double/BYTES)
+               :dst-element (quot (:byte-offset target) Double/BYTES)
                :elements (quot bytes Double/BYTES)})) (:steps halo))))
 
 (defn- reference
