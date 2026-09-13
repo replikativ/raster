@@ -1056,6 +1056,14 @@ Do not restore the old binder or use the tiny Raster block as evidence those ext
 The pretrained-rstr checkout inspected alongside it was `3b13ad42e7bf4c98e348cb779c28096848931ba0`;
 no sibling source or dependency was changed by this audit.
 
+The existing small `mse ∘ linear-nb` AD/SGD acceptance now executes through the direct equation-first
+compile/lower/LinkPlan boundary. Its legacy descriptor compilation assertion remains a compatibility
+check, but numerical validation uses two resident updates with CPU parity, per-replay state progress,
+and an unchanged host initialization array. Direct lowering reports zero driver allocations; device
+allocation starts only at LinkPlan instantiation. This replaces the old numerical descriptor run,
+rather than adding another model-sized training loop. It is a reusable compiler capability check,
+not external real-model training validation or a performance result.
+
 The retired scatter invocation boundary is removed: its pipeline marker/accumulator metadata,
 Level Zero-only resident convention, runtime positional binders and handwritten zero-fill source
 had no remaining compiler producer or caller in the source/test/dev/benchmark inventory or the
