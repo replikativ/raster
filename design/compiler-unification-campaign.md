@@ -1089,6 +1089,9 @@ segmented/product reductions, segmented fold-maps, and scans, with no aliased de
 The shared extent proof follows retained integral scalar SSA and checked Long products, allowing
 equal dimensions with reordered factors without erasing narrowing, floating, or wrapping
 arithmetic. Allocation size must equal result volume: padding still requires initialization.
+Coverage witnesses are consumed in equation order: only incoming scalars are initially available,
+and scalar definitions extend the proof environment after execution. Allocation extent definitions
+must precede their allocation; a later definition cannot justify an earlier fill or elision.
 Write-only permission alone proves nothing for conditional effect stores or sparse updates.
 Allocation cardinality is separate from a destination AbstractValue's logical consumer shape.
 For example, an AD gradient may be allocated with `in*out` elements and later consumed over
