@@ -26,6 +26,24 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.ad.reverse :as rev]))
 
+(deftest anf-bindings-carry-existing-result-types-without-reinference
+  (let [result (with-meta 'rhs {:raster.type/tag 'doubles})
+        effect (with-meta 'effect {:raster.effect/effectful true})
+        source (with-meta (list 'let* [effect result] result) {:source-marker :kept})
+        flattened (inline/flatten-nested-lets source)
+        binder (first (second flattened))]
+    (is (= source flattened) "metadata-only propagation must survive structural equality")
+    (is (= 'doubles (:raster.type/tag (meta binder))))
+    (is (:raster.effect/effectful (meta binder)))
+    (is (= {:source-marker :kept} (meta flattened)))
+    (is (nil? (:tag (meta binder))) "compiler type evidence is not a JVM primitive hint")
+    (let [already-typed (with-meta 'value {:raster.type/tag 'double})
+          init (with-meta 'input {:raster.type/tag 'float})
+          form (inline/flatten-nested-lets (list 'let* [already-typed init] already-typed))]
+      (is (= 'double (:raster.type/tag (meta (first (second form)))))))
+    (let [form (inline/flatten-nested-lets '(let* [unknown (unregistered-call)] unknown))]
+      (is (nil? (:raster.type/tag (meta (first (second form)))))))))
+
 (deftest value-gradient-projection-indices-use-checked-constant-evidence
   (let [elements {'vg ['primal 'gradient]}]
     (doseq [index [1 '(long 1) '(clojure.core/long 1) '(clojure.core/int (long 1))]]

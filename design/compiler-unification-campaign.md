@@ -1083,6 +1083,23 @@ do not reintroduce implicit zeroing in a special runtime convention.
 
 ## Distributed numerical acceptance checkpoint (2026-09-13)
 
+The first numerical halo acceptance now uses unequal two-row/four-row owned partitions of a
+2D heat field, each with explicit ghost rows. It interprets the existing ScheduledHalo source
+and target-local rectangles into resident range copies, executes a composed `heat-rhs-2d!` plus
+`numeric/axpy!` update through equation-first LinkPlans, and compares four time steps with the
+unpartitioned calculation. A no-exchange negative control diverges. Both workers are emulated
+on the same laptop GPU/session; this is not multi-host execution, transport overlap, or a bandwidth
+benchmark. Intermediate state and halo exchange stay resident; only final numerical verification
+downloads results. A hardware-free compile gate covers the composed update independently of
+device availability. The composition exposed and fixed ANF result-type loss: existing typed
+initializer metadata now survives onto new bindings, including structurally equal rewrites.
+No function/type inference registry or census exemption was added.
+
+Still required: bind padded ghost storage explicitly to the global owned-shard contract, realize
+the distributed compute/transfer DAG with device-scoped allocation and ownership, then checkpoint
+real bytes and continue the same numerical evolution after reopening. The two-worker acceptance
+must not be counted as evidence those cross-entry and multi-device runtime obligations are done.
+
 Items 6–8 have checked planning components, not yet one executable numerical acceptance:
 `distributed-plan` simulates topology, dependencies, collective/halo schedules and analytic costs;
 `numerical-state` certifies chunk coverage and durable field identity; `numerical-content` tests

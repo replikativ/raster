@@ -1465,10 +1465,22 @@
               [lifted [cleaned]])
             [[] body-exprs])
           all-pairs (vec (concat new-pairs body-lifted))
-          new-bindings (vec (mapcat identity all-pairs))]
-      (if (= new-bindings (vec bindings-vec))
-        form
-        (list* 'let* new-bindings final-body-expr)))))
+          ;; Inlining an effectful call can expose its typed result reference (e.g. an
+          ;; array returned after stores). Carry that existing evidence onto the ANF
+          ;; binder; do not reconstruct a function/type registry or infer from syntax.
+          new-bindings (vec (mapcat (fn [[sym init]]
+                                     [(if (and (symbol? sym)
+                                               (nil? (:raster.type/tag (meta sym))))
+                                        (if-let [tag (:raster.type/tag (meta init))]
+                                          (vary-meta sym assoc :raster.type/tag tag)
+                                          sym)
+                                        sym)
+                                      init]) all-pairs))]
+      ;; Clojure equality ignores metadata: returning `form` on structural equality
+      ;; would discard a type-only repair. Retain the enclosing metadata as well.
+      (with-meta (list* (if (= new-bindings (vec bindings-vec)) (first form) 'let*)
+                        new-bindings final-body-expr)
+        (meta form)))))
 
 (defn- try-resolve-dispatch
   "Try to resolve a generic deftm call using arg types from env.
