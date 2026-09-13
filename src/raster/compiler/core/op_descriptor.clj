@@ -457,6 +457,9 @@
   #{'clojure.core/+ 'clojure.core/- 'clojure.core/* 'clojure.core//
     'clojure.core/quot 'clojure.core/rem 'clojure.core/mod
     'clojure.core/inc 'clojure.core/dec
+    'clojure.core/unchecked-add 'clojure.core/unchecked-subtract
+    'clojure.core/unchecked-multiply 'clojure.core/unchecked-negate
+    'clojure.core/unchecked-inc 'clojure.core/unchecked-dec
     'clojure.core/max 'clojure.core/min
     'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//
     'raster.numeric/sqrt 'raster.numeric/pow

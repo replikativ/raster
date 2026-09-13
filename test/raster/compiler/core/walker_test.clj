@@ -126,6 +126,20 @@
     (is (nil? (:raster.op/original (meta mixed)))
         "retaining an inferred type does not pretend that a bare core call was devirtualized")))
 
+(deftest unchecked-long-arithmetic-retains-the-existing-inferred-result-type
+  (doseq [[operation arguments]
+          [['clojure.core/unchecked-add '[state (long i)]]
+           ['clojure.core/unchecked-subtract '[state (long i)]]
+           ['clojure.core/unchecked-multiply '[state (long i)]]
+           ['clojure.core/unchecked-negate '[state]]
+           ['clojure.core/unchecked-inc '[state]]
+           ['clojure.core/unchecked-dec '[state]]]]
+    (let [walked (wb (apply list operation arguments) {'state 'long 'i 'long})]
+      (is (= 'long (:raster.type/tag (meta walked))) (str operation))))
+  (let [walked (wb '(long (unchecked-add state (long i))) {'state 'long 'i 'long})]
+    (is (= 'long (:raster.type/tag (meta (second walked))))
+        "the public map result cast retains its compound operand type")))
+
 (deftest effect-map-index-has-a-lexical-type-scope
   (let [walked (wb (with-meta
                     '(raster.par/map-void! i (clojure.core/+ i i)

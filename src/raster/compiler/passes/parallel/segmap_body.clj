@@ -427,7 +427,10 @@
             (conj scalar-operations (body/->Yield []))
             []
             {:association :ordered :source-order true})]
-          scalar-operations)
+          ;; The physical launch is padded to a workgroup multiple. Guard the complete logical
+          ;; iteration, not only its loads/stores: checked casts and arithmetic in ScalarCompute
+          ;; also carry observable exceptional control and must not run for padding lanes.
+          [(body/->Guard :map-active scalar-operations)])
         ;; These are physical capacities supplied by the enclosing graph, not a proof that
         ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
         pointer-shape (fn [id] (get array-shapes id ['_n_bound]))

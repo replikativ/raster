@@ -31,3 +31,7 @@
   (let [written (raster.par/map! output index n int 1)
         checked (int limit)]
     written))
+
+(deftm narrow-index!
+  [output :- (Array byte) n :- Long] :- (Array byte)
+  (raster.par/map! output index n byte (byte index)))

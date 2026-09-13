@@ -329,7 +329,7 @@
 (def ^:private scalar-operation-kinds
   #{"IndexCompute" "ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
     "PipelineYield" "PipelinedFor"
-    "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
+    "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait" "Guard"})
 
 (defn- scalar-body-operations
   [operations]
@@ -340,7 +340,8 @@
                (concat (scalar-body-operations (:then-operations operation))
                        (scalar-body-operations (:else-operations operation))))
              (when (or (record-kind? "ForLoop" operation)
-                       (record-kind? "PipelinedFor" operation))
+                       (record-kind? "PipelinedFor" operation)
+                       (record-kind? "Guard" operation))
                (scalar-body-operations (:operations operation)))))
    operations))
 
@@ -418,6 +419,9 @@
                (map (comp :id :binding) (:iter-args operation))
                (map :id (:results operation))
                (scalar-defined-ids (:operations operation)))
+
+       (record-kind? "Guard" operation)
+       (scalar-defined-ids (:operations operation))
 
        :else []))
    operations))
@@ -1001,6 +1005,17 @@
               (indent-lines (inc depth) statement)
               (indent-lines depth "}"))
          (indent-lines depth statement))
+       context])
+
+    (record-kind? "Guard" operation)
+    (let [predicate (emit-mask (:mask operation) context)
+          [guarded-source _]
+          (emit-scalar-operations (:operations operation) context (inc depth))]
+      [(str (indent-lines depth (str "if (" predicate ") {"))
+            guarded-source
+            (indent-lines depth "}"))
+       ;; Guard-local SSA definitions cannot escape; KernelBody dataflow validation enforces the
+       ;; same lexical boundary and rejects divergent collectives/barriers before target lowering.
        context])
 
     (record-kind? "IfRegion" operation)

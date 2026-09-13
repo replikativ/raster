@@ -512,6 +512,23 @@
              (catch clojure.lang.ExceptionInfo exception
                (:reason (ex-data exception))))))))
 
+(deftest padded-map-lanes-do-not-evaluate-checked-conversions
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'checked-casts/narrow-index!
+                                            {:target target :dtype :byte})
+          kernel (first (:kernels compilation))
+          operations (get-in kernel [:attributes :kernel-body :operations])
+          guarded (first operations)
+          nodes (tree-seq coll? seq (:operations guarded))]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count operations)))
+      (is (= :map-active (:mask guarded))
+          "the complete per-element region is inactive for padded work-items")
+      (is (some #(and (map? %) (= :cast (:op %)) (= :byte (:result-type %))
+                       (= :trap (get-in % [:options :overflow]))) nodes))
+      (is (= 0 (get-in (equation-first/lower compilation [(byte-array 1) 1])
+                       [:attributes :driver-allocations]))))))
+
 (deftest emitted-program-rejects-a-mixed-target-module
   (let [compilation (equation-first/compile
                      #'c-family-dot {:target cuda-target :dtype :float})
