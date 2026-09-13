@@ -2947,6 +2947,28 @@
   (or (get types id)
       (when (symbol? id) (get types (clojure.core/symbol (name id))))))
 
+(defn- validate-declared-array-values!
+  "Check explicit AbstractValues against the source array declarations they refine.
+
+   This check precedes extent normalization: an exact supplied shape may replace `(alength x)`
+   with its dimension and thereby remove x from every equation.  The declaration still constrains
+   that supplied fact. Array declarations distinguish arrays from scalars and prove element dtype,
+   not the logical tensor rank: a flat array can back a multidimensional tensor. Preserve compatible
+   shape, representation, placement, and ownership facts verbatim."
+  [array-types values]
+  (doseq [[id declared-dtype] array-types]
+    (when-let [value (declared-type values id)]
+      (let [declared-dtype (dtype/canon declared-dtype)
+            value-dtype (cond-> (:dtype value) (keyword? (:dtype value)) dtype/canon)]
+        (when-not (and (= :tensor (:kind value))
+                       (= declared-dtype value-dtype)
+                       (seq (:shape value)))
+          (fail! :source-value-conflict
+                 "an explicit AbstractValue contradicts its declared source array type"
+                 {:id id :first value
+                  :second {:kind :tensor :dtype declared-dtype :non-scalar? true}})))))
+  values)
+
 (defn- ordinary-equation-values
   [equation default-dtype array-types scalar-types known-values]
   (let [[_ _ results] equation
@@ -2987,6 +3009,15 @@
      (if (= 'scalar kind)
        (into {} (keep (fn [id]
                         (when-let [value (or (get known-values id)
+                                             ;; A scalar may read array metadata without reading an
+                                             ;; element, for example `(alength shape-witness)`.  Such
+                                             ;; a capture is still a tensor input.  Its declaration
+                                             ;; proves the element dtype but not its capacity; unlike
+                                             ;; an element operand, the scalar equation has no launch
+                                             ;; extent from which a storage shape could be inferred.
+                                             (when-let [declared (declared-type array-types id)]
+                                               (tensor-value declared
+                                                             [(list 'unknown-dimension id)]))
                                              (when-let [declared (declared-type scalar-types id)]
                                                (tensor-value declared []))
                                              (when-let [declared (and (symbol? id)
@@ -3154,7 +3185,8 @@
   [source {:keys [dtype array-types scalar-types values shape-equalities]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
-    (let [[_ bindings & body] source
+    (let [_ (validate-declared-array-values! array-types values)
+          [_ bindings & body] source
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
           descriptions (preserve-map-storage-inputs

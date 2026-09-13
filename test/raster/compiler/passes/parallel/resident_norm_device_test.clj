@@ -42,6 +42,27 @@
                             (map - expected actual)))))))))
     (opencl-probe/opencl-skip! "public resident softmax backward composition")))
 
+(deftest public-dense-input-gradient-uses-the-shape-not-the-witness-data
+  (if @opencl-probe/opencl-available?
+    (let [compilation (equation-first/compile
+                       #'numerical-nn/dense-backward-dx {:target :ocl:0 :dtype :double})]
+      (doseq [[rows cols] [[2 3] [3 5]]]
+        (let [dy (double-array (map #(- (double %) 1.5) (range rows)))
+              weights (double-array (map #(/ (- (mod % 7) 3) 8.0) (range (* rows cols))))
+              witness (double-array (repeat cols Double/NaN))
+              expected (mapv (fn [j]
+                               (reduce + (for [i (range rows)]
+                                           (* (aget weights (+ (* i cols) j)) (aget dy i)))))
+                             (range cols))
+              plan (equation-first/lower compilation [dy weights witness])]
+          (with-open [live (link/instantiate! plan)]
+            (link/run! live)
+            (let [actual (vec (link/download live (first (:outputs plan))))]
+              (is (= cols (count actual)))
+              (is (every? #(< (Math/abs (double %)) 1.0e-10)
+                          (map - expected actual))))))))
+    (opencl-probe/opencl-skip! "public dense input gradient shape-only input")))
+
 (defn- run-norm! [target]
   (let [descriptor (pipeline/compile-gpu-program #'nn/rms-norm-1row! target :dtype :float)]
     (gpu/with-gpu-session [session target]

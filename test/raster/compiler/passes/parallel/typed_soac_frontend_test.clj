@@ -106,6 +106,57 @@
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
 
+(deftest scalar-metadata-captures-retain-shape-witness-arrays
+  (let [program
+        (frontend/form->program
+         '(let* [^long cols (clojure.core/alength x)
+                 result (raster.par/pmap j cols double (clojure.core/aget y j))]
+            result)
+         {:dtype :double
+          :array-types {'x :double 'y :double}
+          :scalar-types {'cols :long}})
+        values (:values (dialect/facts program))]
+    (is (some? program))
+    (is (= ['scalar 'map] (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= #{'x 'y} (set (:inputs (dialect/facts program)))))
+    (is (= :double (get-in values ['x :dtype])))
+    (is (= '[(unknown-dimension x)] (get-in values ['x :shape])))
+    (is (= {:dtype :long :shape []}
+           (select-keys (get values 'cols) [:dtype :shape])))))
+
+(deftest explicit-shape-witness-values-refine-their-array-declarations
+  (let [source '(let* [^long cols (clojure.core/alength x)
+                       result (raster.par/pmap j cols float (clojure.core/aget y j))]
+                  result)
+        exact (av/tensor {:dtype :double :shape [3]
+                          :representation {:kind :strided :stride 2}
+                          :memory-space :global})
+        options {:dtype :float
+                 :array-types {'x :double 'y :float}
+                 :scalar-types {'cols :long}
+                 :values {'x exact}}
+        program (frontend/form->program source options)
+        conflict-reason
+        (fn [value]
+          (try
+            (frontend/form->program source (assoc options :values {'x value}))
+            nil
+            (catch clojure.lang.ExceptionInfo exception
+              (:reason (ex-data exception)))))]
+    (is (= exact (get-in (dialect/facts program) [:values 'x]))
+        "compatible exact shape and representation facts survive unchanged")
+    (let [multidimensional (av/tensor {:dtype :double :shape [1 3]})
+          result (frontend/form->program source
+                                         (assoc options :values {'x multidimensional}))]
+      (is (some? result) "a source array may back a multidimensional logical tensor")
+      (is (= multidimensional (get-in (dialect/facts result) [:values 'x]))))
+    (is (= :source-value-conflict
+           (conflict-reason (av/tensor {:dtype :float :shape [3]})))
+        "an explicit value may not override the declared element dtype")
+    (is (= :source-value-conflict
+           (conflict-reason (av/tensor {:dtype :double :shape []})))
+        "an explicit scalar may not replace a declared array")))
+
 (deftest physical-allocation-initialization-survives-host-scaffolding
   (let [contracts
         (fn [allocation]
