@@ -9,6 +9,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.distributed-plan :as distributed]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-state :as state]
             [raster.runtime.numerical-content :as content]
             [raster.dl.gpu-grad-parity :as gp]
@@ -211,6 +212,38 @@
       (gpu/copy-range! (:session executable) (link/node-view executable output)
                        (link/node-view executable input) {:elements (* 8 width)}))
     output))
+
+(deftest compiled-heat-executables-borrow-one-continuation-allocation-pool
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "shared-owned-heat-storage")
+    (let [initial (:initial (problem))
+          n (alength ^doubles initial)
+          original (equation/lower @compiled-step [(double-array n) initial (double-array n) 8 width dt])
+          input (first (keep (fn [[id node]] (when (identical? initial (:source node)) id)) (:nodes original)))
+          {:keys [plan allocations initializers]} (link-plan/borrow-owned-storage original)
+          session (gpu/make-session :ze:0)]
+      (try
+        ;; This fixture owns all heat storage in one session. Local executable registrations
+        ;; borrow it; the fixture, not either executable, owns the allocation lifetime.
+        (is (every? #(= :double (get-in % [:view :dtype])) (vals (:nodes original))))
+        (gpu/alloc! session (into {} (map (fn [[id a]] [id [:double (quot (:byte-size a) Double/BYTES) nil]])) allocations))
+        (doseq [[_ {:keys [view source]}] initializers]
+          (gpu/upload-range! session
+                             (gpu/buffer-view session (get-in view [:allocation :id])
+                                              (select-keys view [:id :byte-offset :dtype :shape :strides]))
+                             source {:elements (reduce * 1 (:shape view))}))
+        (let [external (into {} (map (fn [id] [id (gpu/buffer session id)])) (keys allocations))
+              opts {:session session :external-buffers external}]
+          (with-open [first-execution (link/instantiate! plan opts)]
+            (advance-device! first-execution input 2))
+          (is (= (set (keys allocations)) (set (keys (:buffers @session))))
+              "closing the first borrower removes registrations, not owner buffers")
+          ;; No source upload occurs during the second instantiation; it continues resident state.
+          (with-open [second-execution (link/instantiate! plan opts)]
+            (let [output (advance-device! second-execution input 2)]
+              (is (< (max-error (reference initial) (link/download second-execution output)) 1.0e-10))))
+          (is (= (set (keys allocations)) (set (keys (:buffers @session))))))
+        (finally (gpu/close-session! session))))))
 
 (deftest mapped-checkpoint-restores-into-a-new-compiled-device-session
   (if-not @gp/gpu-available?

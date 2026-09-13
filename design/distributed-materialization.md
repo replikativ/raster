@@ -176,6 +176,20 @@ realizations of the scheduling boundary, not native handles inside the semantic 
 
 ## Laptop acceptance and landing order
 
+`link-plan/borrow-owned-storage` is the checked local ownership projection for an enclosing
+allocation owner. It preserves executable instances, roles, logical shapes and physical views,
+changes owned physical/logical ownership to borrowed, and extracts the original allocation
+contracts and host initializers. The projected LinkPlan cannot silently reupload those sources.
+Already borrowed/external allocations retain their contracts. The returned initialization facts
+describe the original program's obligations; projection itself proves neither initialization nor
+lifetime. The enclosing owner must reconcile shared initializers, realize them once, retain buffers
+through completion, and release borrower registrations before freeing storage.
+
+A real GPU acceptance now runs two successive generated heat executables over the same owning
+session buffers. Closing the first removes only its borrowed registrations; the second continues
+resident state without reuploading the original source and matches four CPU reference steps.
+This validates the local storage seam, not DistributedPlan execution or cross-device transport.
+
 The current DistributedPlan enforces one shard of a value per mesh device and requires distinct
 transfer endpoints with nonempty routes. A real co-located two-shard execution therefore needs an
 explicit local-copy lowering or a certified logical-to-runtime placement map. Do not silently map
