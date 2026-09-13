@@ -878,6 +878,15 @@
   [plan]
   (compute/bindings (validate-structure! plan)))
 
+(defn transfer-bindings
+  "Validate and project every transfer to exact physical source/target BufferViews.
+   Currently requires contiguous plain ScheduledHalo copies with bound owned sources and
+   replica destinations. Unsupported or absent endpoints fail rather than acquiring guessed
+   storage. Returns a map keyed by transfer step ID. This does not authorize execution:
+   initialization/freshness, shared allocation and transport capabilities remain obligations."
+  [plan]
+  (compute/transfer-bindings (validate-structure! plan)))
+
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
            halos device-plans steps outputs attributes]

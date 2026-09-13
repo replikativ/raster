@@ -347,3 +347,71 @@
     {:bindings bound
      :unbound (mapv :id (filter #(and (= :compute (:kind %))
                                      (not (contains? bound (:id %)))) steps))}))
+
+(defn- unique-endpoint-view! [views reason step]
+  (let [regions (distinct (map #(dissoc % :id) views))]
+    (when-not (= 1 (count regions))
+      (fail! "transfer requires one unambiguous physical endpoint"
+             reason {:step step :candidates (count regions)}))
+    (first views)))
+
+(defn transfer-bindings
+  "Strict physical endpoint projection after enclosing DistributedPlan structural validation.
+   Supports contiguous plain copy-halo regions only. Unlike the analytical planner, this fails
+   on absent/ambiguous endpoints and unsupported transfer kinds. No allocation is performed;
+   source initialization, freshness, and transport capability are NOT proven here."
+  [{:keys [steps shards halos] :as plan}]
+  (let [bound (:bindings (bindings plan))
+        step-by-id (into {} (map (juxt :id identity)) steps)
+        halo-ids (into #{} (map :id) (mapcat :steps halos))
+        shard-by-id (into {} (for [[value candidates] shards candidate candidates]
+                              [[value (:id candidate)] candidate]))
+        owned (reduce-kv
+               (fn [index step entry]
+                 (reduce-kv (fn [index local-id binding]
+                              (update index [(:device (get step-by-id step))
+                                             (:value binding) (:shard binding)]
+                                      (fnil conj []) {:entry entry :local-id local-id :binding binding}))
+                            index (:values entry))) {} bound)
+        replicas (reduce-kv
+                  (fn [index step entry]
+                    (reduce (fn [index placement]
+                              (update index [(:device (get step-by-id step)) (:transfer placement)]
+                                      (fnil conj []) (:view placement)))
+                            index (for [[_ binding] (:values entry)
+                                        placement (get-in binding [:domain :placements])
+                                        :when (= :replica (:kind placement))] placement))) {} bound)]
+    (into {}
+          (for [{:keys [id source target value bytes attributes] :as step} steps
+                :when (= :transfer (:kind step))]
+            (do
+              (when-not (and (contains? halo-ids id) (= :copy (:destination-mode attributes)))
+                (fail! "physical transfer projection requires a scheduled copy halo"
+                       :distributed-transfer-kind {:step id}))
+              (let [source-shard (:source-shard attributes)
+                    candidate (get shard-by-id [value source-shard])
+                    rectangle (:source-region attributes)
+                    relative {:offsets (mapv -' (:offsets rectangle) (:offsets candidate))
+                              :shape (:shape rectangle)}
+                    source-views
+                    (map (fn [{:keys [entry local-id binding]}]
+                           (let [owned-view (or (some #(when (= :owned (:kind %)) (:view %))
+                                                     (get-in binding [:domain :placements]))
+                                                (project-domain (get-in entry [:link-plan :values local-id])
+                                                                (:leaves binding) (:shape candidate)))]
+                             (view/rectangular-subview owned-view relative)))
+                         (get owned [source value source-shard]))
+                    from (unique-endpoint-view! source-views :distributed-transfer-source id)
+                    to (unique-endpoint-view! (get replicas [target id]) :distributed-transfer-target id)]
+                (when-not (and (view/contiguous? from) (view/contiguous? to))
+                  (fail! "strided halo endpoints require a certified pack/unpack lowering"
+                         :distributed-transfer-layout {:step id}))
+                (when-not (and (= (:dtype from) (:dtype to))
+                               (= (:shape from) (:shape to))
+                               (= bytes (:byte-length from) (:byte-length to)))
+                  (fail! "transfer endpoint extents disagree with scheduled payload"
+                         :distributed-transfer-extent {:step id :bytes bytes}))
+                [id {:source {:device source :value value :shard source-shard :view from}
+                     :target {:device target :value value :shard (:target-shard attributes)
+                              :replica id :view to}
+                     :bytes bytes}]))))))
