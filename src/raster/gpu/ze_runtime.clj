@@ -3182,44 +3182,6 @@
     out-buf))
 
 ;; ================================================================
-;; Reduce-by-key kernel invocation
-;; ================================================================
-
-(defn invoke-registered-reduce-by-key-kernel
-  "Pipeline-friendly reduce-by-key kernel invocation.
-  output[keys[i]] += vals[i] (atomically).
-
-  kernel-name:  registered reduce-by-key kernel
-  output:       JVM array or DeviceBuffer (accumulation target)
-  keys:         JVM int-array or DeviceBuffer (key indices)
-  vals:         JVM array or DeviceBuffer (values to accumulate)
-  n:            number of elements"
-  [^String kernel-name output keys vals n]
-  (let [{:keys [kernel-handle workgroup-size dtype]
-         :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
-        n (long n)
-        dtype-size (long (get dtype-byte-sizes dtype 4))
-        wg (long (or workgroup-size 256))
-        groups (long (Math/ceil (/ (double n) wg)))
-        copy-to (fn [arr tag byte-count]
-                  (if (device-buffer? arr)
-                    (:segment ^DeviceBuffer arr)
-                    (let [seg (ensure-seg kernel-name tag byte-count)
-                          s (MemorySegment/ofArray arr)]
-                      (MemorySegment/copy s 0 seg 0 byte-count)
-                      seg)))
-        out-seg (copy-to output :rbk-out (* (long (if (device-buffer? output) n (alength output))) dtype-size))
-        keys-seg (copy-to keys :rbk-keys (* n 4))
-        vals-seg (copy-to vals :rbk-vals (* n dtype-size))
-        args [out-seg keys-seg vals-seg {:type :int :value (int n)}]]
-    (launch! kernel-handle groups wg args)
-    ;; Copy back output
-    (when-not (device-buffer? output)
-      (MemorySegment/copy out-seg 0 (MemorySegment/ofArray output) 0
-                          (* (long (alength output)) dtype-size)))
-    output))
-
-;; ================================================================
 ;; Cleanup
 ;; ================================================================
 

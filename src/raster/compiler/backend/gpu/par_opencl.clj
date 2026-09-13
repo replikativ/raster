@@ -318,48 +318,6 @@
      :active-ids? true}))
 
 ;; ================================================================
-;; Reduce-by-key kernel generator
-;; ================================================================
-
-(defn generate-par-reduce-by-key-kernel
-  "Generate an OpenCL C kernel from a raster.par/reduce-by-key form.
-  Segmented reduction: output[keys[i]] op= values[i] using atomics.
-
-  Returns {:kernel-name str :source str :array-params [syms]
-           :scalar-params [{:name sym :type kw} ...] :dtype kw}."
-  [form & {:keys [dtype kernel-name-prefix]
-           :or {dtype :float kernel-name-prefix "par_reduce_by_key"}}]
-  (let [info (par/extract-par-reduce-by-key-info form)
-        {:keys [out keys vals]} info
-        kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ctype (get codegen/opencl-type-map dtype "float")
-        out-c (ce/c-symbol out)
-        keys-c (ce/c-symbol keys)
-        vals-c (ce/c-symbol vals)
-        needs-float-atomic? (contains? #{:float :double} dtype)
-        ;; Only + is supported for atomic reduce-by-key (most common case)
-        source (str (codegen/extension-pragmas dtype)
-                    "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
-                    (when needs-float-atomic? ce/opencl-atomic-add-float-helper)
-                    "__kernel void " kernel-name
-                    "(__global " ctype "* " out-c
-                    ", __global const int* restrict " keys-c
-                    ", __global const " ctype "* restrict " vals-c
-                    ", int _n_bound) {\n"
-                    "    for (int i = get_global_id(0); i < _n_bound; i += get_global_size(0)) {\n"
-                    "        int k = " keys-c "[i];\n"
-                    (if needs-float-atomic?
-                      (str "        atomic_add_float(&" out-c "[k], " vals-c "[i]);\n")
-                      (str "        atomic_add(&" out-c "[k], " vals-c "[i]);\n"))
-                    "    }\n"
-                    "}\n")]
-    {:kernel-name kernel-name
-     :source source
-     :array-params [out keys vals]
-     :scalar-params [{:name 'n :type :int}]
-     :dtype dtype}))
-
-;; ================================================================
 ;; Compound kernel codegen
 ;; ================================================================
 
