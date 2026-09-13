@@ -1,6 +1,7 @@
 (ns raster.gpu.dispatch-benchmark-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -14,6 +15,15 @@
             [raster.gpu.measurement :as measurement]
             [raster.gpu.tuning-cache :as cache])
   (:import [java.nio.file Files]))
+
+(defn- test-session []
+  (let [keys [:x :out :values-resident :out-resident]]
+    (atom {:session-id :benchmark-test
+           :buffers (zipmap keys (repeat {:dtype :float :n-elements 2048 :byte-size 8192}))
+           :allocations (into {} (map (fn [key]
+                                       [key (bview/allocation
+                                             {:id [:benchmark-test key] :byte-size 8192
+                                              :memory-space :device :ownership :borrowed})])) keys)})))
 
 (def ^:private abi
   [(kabi/slot 'x :input :float :role :operand)
@@ -44,6 +54,34 @@
     :selector {:kind :runtime-scalar-threshold
                :argument 'width :threshold 256
                :at-least :subgroup :otherwise :reference}}))
+
+(deftest alias-inapplicability-does-not-bind-run-or-measure
+  (let [strict (assoc-in reference [:abi 0 :aliasing] :no-write-alias)
+        dispatch (kdispatch/make
+                  {:id "alias-benchmark" :alternatives [strict]
+                   :default-strategy :reference
+                   :selector {:kind :fixed-strategy :strategy :reference}})
+        session (test-session)
+        fail (fn [& _] (throw (AssertionError. "inapplicable candidate reached execution")))
+        run (fn [arguments]
+              (benchmark/benchmark-candidate!
+               session dispatch strict :fixed
+               (constantly {:arguments arguments :before-run! fail :validate! fail})))]
+    (with-redefs [gpu/bind-kernel-executable! fail
+                  gpu/run-kernel-graph! fail
+                  gpu/measure-bound-kernel-graph! fail
+                  gpu/release-kernel-graph! fail]
+      (let [result (run [:x :x {:type :long :value 128}])]
+        (is (= :inapplicable (:status result)))
+        (is (= [:kernel-abi-no-write-alias] (mapv :reason (:violations result))))
+        (is (= (:source-hash (tuning/executable-signature strict)) (:candidate-hash result)))
+        (is (not (contains? result :measurement)))
+        (is (not (contains? result :validation))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No buffer"
+                           (run [:missing :out {:type :long :value 128}])))
+      (let [left (gpu/buffer-view session :x {:shape [128]})
+            overlap (gpu/buffer-view session :x {:byte-offset 256 :shape [128]})]
+        (is (= :inapplicable (:status (run [left overlap {:type :long :value 128}]))))))))
 
 (def ^:private descriptor
   {:device-id :ze:0 :vendor "Intel" :arch "test" :driver-version "test-driver"
@@ -86,7 +124,7 @@
                       gpu/release-kernel-graph!
                       (fn [_ handle] (swap! actions conj [:release (:candidate handle)]))]
           (benchmark/benchmark-candidate!
-           (atom {}) dispatch reference 128
+           (test-session) dispatch reference 128
            (fn [_]
              {:arguments [:x :out {:type :long :value 128}]
               :before-run! #(swap! actions conj [:restore (:runtime-value %)])
@@ -128,7 +166,7 @@
                                                :compile-ms compile-ms :hashes hashes))
                       gpu/release-kernel-graph! (fn [& _])]
           (benchmark/benchmark-candidate!
-           :session graph-dispatch graph 1025
+           (test-session) graph-dispatch graph 1025
            (fn [_]
              {:arguments [:values-resident :out-resident n]
               :validate! (fn [{:keys [outputs executable]}]
@@ -152,7 +190,7 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"failed its oracle"
            (benchmark/benchmark-candidate!
-            (atom {}) dispatch reference 128
+            (test-session) dispatch reference 128
             (fn [_]
               {:arguments [:x :out {:type :long :value 128}]
                :validate! (constantly {:passed? false :oracle-hash "host-reference-v1"})}))))
@@ -167,7 +205,7 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"require :before-run!"
          (benchmark/benchmark-candidate!
-          (atom {}) stateful-dispatch stateful 128
+          (test-session) stateful-dispatch stateful 128
           (fn [_]
             {:arguments [:x :out {:type :long :value 128}]
              :validate! (constantly {:passed? true :oracle-hash "oracle"})}))))))
@@ -196,7 +234,7 @@
                     gpu/release-kernel-graph! (fn [& _] (swap! releases inc))]
         (let [result
               (benchmark/tune-dispatch!
-               (atom {}) dispatch descriptor [768 128 256]
+               (test-session) dispatch descriptor [768 128 256]
                (fn [runtime-value]
                  {:arguments [:x :out {:type :long :value runtime-value}]
                   :validate! (constantly {:passed? true
@@ -210,7 +248,7 @@
           (is (= 6 @binds @releases))
           (testing "cached result bypasses resident execution"
             (let [cached (benchmark/tune-dispatch!
-                          (atom {}) dispatch descriptor [128 256 768]
+                          (test-session) dispatch descriptor [128 256 768]
                           (fn [_] (throw (ex-info "must not construct a case" {})))
                           :numerical-mode {:input :f32 :accumulate :f32 :output :f32}
                           :layout {:input :row-major :output :row-major})]

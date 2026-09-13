@@ -1600,6 +1600,23 @@
     (let [{:keys [buffers]} (kexec/graph-bindings executable runtime-arguments)]
       (kgcall/binding-alias-violations executable buffers kcall/pointer-overlaps?))))
 
+(defn kernel-executable-alias-violations
+  "Query concrete alias compatibility of an executable's ABI-ordered session keys/views.
+   Resolves live allocation contracts without creating sub-buffers, recording or allocating.
+   Returns structured violations; invalid/missing bindings throw. This is alias preflight only,
+   not proof of scalar, capacity, alignment or target applicability."
+  [sess executable arguments]
+  (let [executable (kexec/validate! executable)
+        abi (kexec/abi executable)
+        _ (when (:closed? @sess)
+            (throw (ex-info "cannot preflight a closed GPU session" {})))
+        _ (kabi/validate-arguments! abi arguments)
+        values (mapv (fn [slot argument]
+                       (if (= :scalar (:kind slot)) argument
+                           (:view (resolve-resident-binding sess argument))))
+                     abi arguments)]
+    (executable-alias-violations executable values)))
+
 (defn- staged-pointer-plan
   "Validate and group ABI pointer values by object identity before any allocation.
 

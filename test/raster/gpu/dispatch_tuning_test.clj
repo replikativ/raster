@@ -86,6 +86,55 @@
   (.toFile (Files/createTempDirectory "raster-dispatch-tuning-"
                                       (make-array java.nio.file.attribute.FileAttribute 0))))
 
+(defn- inapplicable-result [executable]
+  {:status :inapplicable
+   :candidate-hash (:source-hash (tuning/executable-signature executable))
+   :violations [{:reason :kernel-abi-no-write-alias}]})
+
+(deftest inapplicable-candidates-are-retained-but-never-win
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [result (tuning/tune!
+                  dispatch descriptor [128 512]
+                  (fn [executable width]
+                    (if (and (= executable subgroup) (= width 128))
+                      (inapplicable-result executable)
+                      (validated-result executable (if (= executable reference) 100 10))))
+                  :numerical-mode numerical-mode :layout layout)
+          fixed (tuning/tune-fixed!
+                 fixed-dispatch descriptor
+                 #(if (= % subgroup) (inapplicable-result %) (validated-result % 100))
+                 :numerical-mode numerical-mode :layout layout)]
+      (is (= 4 (count (:measurements result))))
+      (is (= 1 (count (filter #(= :inapplicable (:status %)) (:measurements result)))))
+      (is (= {:kind :runtime-scalar-ranges :argument 'width :below :reference
+              :ranges [{:at-least 512 :strategy :subgroup}]}
+             (:selector result)))
+      (is (= {:kind :fixed-strategy :strategy :reference} (:selector fixed)))
+      (is (= fixed
+             (tuning/tune-fixed!
+              fixed-dispatch descriptor (fn [_] (throw (AssertionError. "cache miss")))
+              :numerical-mode numerical-mode :layout layout)))
+      (is (= :dispatch-tuning-default-inapplicable
+             (try (tuning/tune-fixed!
+                   fixed-dispatch descriptor
+                   #(if (= % reference) (inapplicable-result %) (validated-result % 10))
+                   :force? true :numerical-mode numerical-mode :layout layout)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest rejection-rows-cannot-forge-or-hide-measurements
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (doseq [bad [(assoc (inapplicable-result subgroup) :candidate-hash "wrong")
+                 (assoc (inapplicable-result subgroup) :violations [])
+                 (assoc (inapplicable-result subgroup) :violations [{}])
+                 (assoc (inapplicable-result subgroup) :measurement nil)
+                 (assoc (inapplicable-result subgroup) :validation {:passed? true})]]
+      (is (= :dispatch-tuning-inapplicable-result
+             (try (tuning/tune-fixed!
+                   fixed-dispatch descriptor
+                   #(if (= % subgroup) bad (validated-result % 100))
+                   :force? true :numerical-mode numerical-mode :layout layout)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest static-schedule-axis-produces-a-fixed-measured-selector
   (binding [cache/*cache-root* (temporary-cache-root)]
     (let [calls (atom [])

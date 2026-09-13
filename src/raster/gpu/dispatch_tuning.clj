@@ -14,7 +14,7 @@
   (:import [java.nio.charset StandardCharsets]
            [java.security MessageDigest]))
 
-(def tuning-version 3)
+(def tuning-version 4)
 
 (defrecord DispatchTuning
            [key identity selector measurements])
@@ -147,7 +147,7 @@
   [:min-ns :median-ns :p75-ns :mean-ns :cv :stationary? :n :warmup-iterations
    :budget-ms :cold-warm :timing-source :compile-ms :hashes])
 
-(defn- validate-benchmark-result!
+(defn- validate-measured-result!
   [executable runtime-value result]
   (let [{:keys [measurement validation]} result
         signature (executable-signature executable)]
@@ -182,6 +182,28 @@
      :validation (select-keys validation
                               [:passed? :oracle-hash :candidate-hash :max-error :rtol :atol])}))
 
+(defn- validate-benchmark-result!
+  [executable runtime-value result]
+  (if (= :inapplicable (:status result))
+    (let [signature (executable-signature executable)
+          {:keys [violations candidate-hash]} result]
+      (when-not (and (= candidate-hash (:source-hash signature))
+                     (vector? violations) (seq violations)
+                     (every? #(and (map? %) (keyword? (:reason %))) violations)
+                     (not (contains? result :measurement))
+                     (not (contains? result :validation)))
+        (throw (ex-info "inapplicable dispatch candidate requires source-bound preflight violations"
+                        {:reason :dispatch-tuning-inapplicable-result
+                         :strategy (:strategy signature) :runtime-value runtime-value
+                         :result result})))
+      {:runtime-value runtime-value :strategy (:strategy signature)
+       :status :inapplicable :candidate-hash candidate-hash :violations violations})
+    (do
+      (when (contains? result :status)
+        (throw (ex-info "unknown dispatch benchmark result status"
+                        {:reason :dispatch-tuning-result-status :status (:status result)})))
+      (validate-measured-result! executable runtime-value result))))
+
 (defn- winner-at
   [rows default-strategy improvement-threshold]
   (let [by-strategy (into {} (map (juxt :strategy identity)) rows)
@@ -189,7 +211,14 @@
                         (throw (ex-info "dispatch measurements omit the default strategy"
                                         {:default-strategy default-strategy
                                          :strategies (set (keys by-strategy))})))
-        best-row (apply min-key #(get-in % [:measurement :min-ns]) rows)
+        _ (when (= :inapplicable (:status default-row))
+            (throw (ex-info "dispatch tuning requires an applicable default strategy"
+                            {:reason :dispatch-tuning-default-inapplicable
+                             :default-strategy default-strategy
+                             :runtime-value (:runtime-value default-row)
+                             :violations (:violations default-row)})))
+        applicable (filterv #(not= :inapplicable (:status %)) rows)
+        best-row (apply min-key #(get-in % [:measurement :min-ns]) applicable)
         default-cost (double (get-in default-row [:measurement :min-ns]))
         best-cost (double (get-in best-row [:measurement :min-ns]))]
     (if (< best-cost (* default-cost (- 1.0 (double improvement-threshold))))
@@ -264,7 +293,9 @@
 
   This is the schedule mode for compile-time axes such as stage depth and shared-memory layout:
   they do not require manufacturing a runtime ABI scalar. The same oracle, stationary device-event,
-  source-hash, device, numerical and layout gates used by sampled tuning remain mandatory."
+  source-hash, device, numerical and layout gates used by sampled tuning remain mandatory.
+  Source-bound :inapplicable results retain their preflight diagnostics but cannot win; the
+  declared default must remain applicable. Runtime binding must recheck transported choices."
   [dispatch descriptor benchmark-fn
    & {:keys [numerical-mode layout improvement-threshold force?]
       :or {improvement-threshold 0.001 force? false}}]

@@ -97,7 +97,9 @@
 
    The context contains :session, :dispatch, :executable, :runtime-value, :case, and after the
    validation replay, :outputs. The driver supplies :candidate-hash itself, so a callback cannot
-   accidentally validate one source and bless another."
+   accidentally validate one source and bless another. Alias-inapplicable bindings return
+   {:status :inapplicable :candidate-hash ... :violations [...]} before binding or timing;
+   malformed bindings and other failures still throw."
   [session dispatch executable runtime-value case-fn & {:keys [measurement]}]
   (let [dispatch (kdispatch/validate! dispatch)
         strategy (kdispatch/alternative-strategy executable)
@@ -115,7 +117,11 @@
     (when (seq reserved)
       (throw (ex-info "dispatch benchmark measurement options contain driver-owned fields"
                       {:runtime-value runtime-value :reserved reserved})))
-    (let [key [::candidate runtime-value (kdispatch/alternative-strategy executable) (random-uuid)]
+    (if-let [violations (seq (gpu/kernel-executable-alias-violations
+                             session executable (:arguments case)))]
+      {:status :inapplicable :violations (vec violations)
+       :candidate-hash (:source-hash (tuning/executable-signature executable))}
+      (let [key [::candidate runtime-value (kdispatch/alternative-strategy executable) (random-uuid)]
           started (System/nanoTime)
           handle (gpu/bind-kernel-executable! session key executable (:arguments case)
                                               {:profile? true
@@ -140,7 +146,7 @@
                               session handle (mapcat identity opts))]
           {:measurement measured :validation validation})
         (finally
-          (gpu/release-kernel-graph! session handle))))))
+          (gpu/release-kernel-graph! session handle)))))))
 
 (defn tune-dispatch!
   "Tune an emitted KernelDispatch through resident validation and device-event measurement.
