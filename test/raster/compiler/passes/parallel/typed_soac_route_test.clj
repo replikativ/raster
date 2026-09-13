@@ -942,8 +942,8 @@
         kernel (first (:kernels emitted))]
     (is (= :typed-soac (:dialect program)))
     (is (:typed-validated stats))
-    (is (= [] (:outputs program))
-        "the effect binder keeps its host nil semantics")
+    (is (= [[:effect-map 0 0] [:effect-map 0 1]] (:outputs program))
+        "the source explicitly returns both updated destinations, not the effect's nil binder")
     (is (= [[:effect-map 0 0] [:effect-map 0 1]]
            (dialect/outputs algorithm)))
     (is (= ['a 'b]
@@ -1931,16 +1931,34 @@
     (is (some #{'cols} binders) (pr-str source))
     (is (some #{'_eff} binders) "the host loop itself is retained as written")))
 
+(deftest counted-indexed-updates-preserve-an-existing-producer-shape
+  (let [source '(let* [y (raster.par/pmap i n float (* 2.0 (aget x i)))
+                      z (raster.par/pmap j n float (+ 1.0 (aget y j)))
+                      effect (dotimes [k n]
+                               (aset acc 0 (+ (aget acc 0) (aget y k))))]
+                     z)
+        routed (route/attempt source :float {'x :float 'acc :float}
+                              {:scalar-types {'n :long}})
+        program (:program routed)
+        run (fn [form]
+              (let [acc (float-array [0.0])
+                    f (eval (list 'fn '[^floats x ^floats acc ^long n] form))
+                    result (f (float-array [1.0 2.0 3.0 4.0]) acc 4)]
+                [(vec result) (vec acc)]))]
+    (is (nil? (:declined routed)))
+    (is (= '[n] (get-in program [:values 'y :shape])))
+    (is (= 1 (count (filter #{'y} (take-nth 2 (second (:source program)))))))
+    (when program
+      (is (= [[3.0 5.0 7.0 9.0] [20.0]] (run source) (run (:source program)))))))
+
 (deftest a-producer-the-host-reads-is-not-fused-away
-  ;; `y` has one typed consumer (`z`) and one host reader (the loop). Counting only typed uses
+  ;; `y` has one typed consumer (`z`) and one opaque host reader. Counting only typed uses
   ;; would inline `y` into `z` and then resurrect its source binding for the host: the producer
   ;; would run twice. Host reads are uses, so `y` stays its own equation.
   (let [routed (route/attempt
                 '(let* [y (raster.par/pmap i n float (clojure.core/* 2.0 (clojure.core/aget x i)))
                         z (raster.par/pmap j n float (clojure.core/+ 1.0 (clojure.core/aget y j)))
-                        _eff (dotimes [k n]
-                               (clojure.core/aset acc 0 (clojure.core/+ (clojure.core/aget acc 0)
-                                                                         (clojure.core/aget y k))))]
+                        _eff (clojure.core/prn y)]
                        z)
                 :float {'x :float 'acc :float} {:scalar-types {'n :long}})
         program (:program routed)

@@ -13,6 +13,7 @@
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
+            [raster.dl.array-ops :as array-ops]
             [raster.numeric]
             [raster.ode.pde :as pde]
             [raster.par]
@@ -378,6 +379,13 @@
       (is (= [module-target] (mapv :target (:kernels compilation))))
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest counted-mixed-precision-stores-use-explicit-destination-conversion
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'array-ops/reduce-axis-backward
+                                            {:target target :dtype :float})]
+      (is (seq (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest heat-2d-counted-stores-use-the-public-c-family-boundary
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]

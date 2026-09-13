@@ -2481,10 +2481,10 @@
         values (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
         destinations (mapv :destination result-storage)
         semantic-inputs (into (set inputs) destinations)
-        all-expressions (vec (concat (map :init locals) write-indices predicates values))
-        [pointwise stable]
-        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
-        arrays (vec (sort-by pr-str pointwise))
+        ;; Indexed updates do not assert that a captured buffer's capacity equals the
+        ;; update domain. Preserve indexed reads and the buffer's own shape contract.
+        stable semantic-inputs
+        arrays []
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -2521,13 +2521,14 @@
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
+        destination-dtypes (zipmap destinations result-dtypes)
         destination-set (set destinations)
-        all-expressions (vec (concat (map :init locals)
-                                     (mapcat effect-expressions effects)))
         semantic-inputs (set/difference (set inputs) destination-set)
-        [pointwise stable]
-        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
-        arrays (vec (sort-by pr-str pointwise))
+        ;; An effect traversal need not cover the complete physical input. Keep explicit
+        ;; indexed reads instead of giving a pointwise capture the traversal's shape: e.g.
+        ;; a clamped counted loop may read a prefix of an already-shaped producer.
+        stable semantic-inputs
+        arrays []
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         element-parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -2572,7 +2573,11 @@
                 (list 'effect-loop attributes (transform extent) lambda)))
             (list 'effect (get destination-substitutions out)
                   effect-conflict (transform index) (transform predicate)
-                  (transform (if cast (list cast value) value))))))
+                  ;; Primitive aset converts to the destination element type. Preserve any
+                  ;; source conversion inside that store conversion, rather than asking the
+                  ;; target emitter to infer or silently coerce a mismatched scalar value.
+                  (transform (list (dtype/scalar-tag-for-dtype (get destination-dtypes out))
+                                   (if cast (list cast value) value)))))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map

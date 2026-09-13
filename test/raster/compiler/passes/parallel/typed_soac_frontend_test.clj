@@ -300,8 +300,9 @@
                (first (:body-results (dialect/lambda-parts (:lambda operation)))))]
     (is (= 'scatter (:kind operation)))
     (is (= :unique (get-in operation [:attributes :conflict])))
-    (is (= '[indices src out] (dialect/operation-inputs equation)))
-    (is (= {:destination-index '%element0 :predicate 1 :value '%element1} write))
+    (is (= '[indices out src] (dialect/operation-inputs equation)))
+    (is (= {:destination-index '(clojure.core/aget %capture0 i) :predicate 1
+            :value '(clojure.core/aget %capture2 i)} write))
     (is (= [{:destination 'out :access :read-write :host-return :effect}]
            (get-in (dialect/facts program) [:equations 0 :attributes :result-storage])))
     (is (= :analyzed-source
@@ -326,7 +327,7 @@
     (is (= 'scatter (:kind operation)))
     (is (= :unique (get-in operation [:attributes :conflict])))
     (is (= '(clojure.core/+ %capture0 i) (:destination-index write)))
-    (is (= '[src base out] (dialect/operation-inputs equation)))
+    (is (= '[base out src] (dialect/operation-inputs equation)))
     (is (= [{:destination 'out :access :read-write :host-return :buffer}]
            (dialect/result-storage program (second equation))))))
 

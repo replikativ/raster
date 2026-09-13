@@ -477,10 +477,7 @@
                 z (raster.par/pmap j n float
                                    (clojure.core/+ (clojure.core/aget y j)
                                                    (clojure.core/aget b j)))
-                _effect (dotimes [k n]
-                          (clojure.core/aset
-                           acc 0 (clojure.core/+ (clojure.core/aget acc 0)
-                                                 (clojure.core/aget y k))))]
+                _effect (clojure.core/prn y)]
                z)
         options {:dtype :float :target-device :ocl:0
                  :array-types {'x :float 'b :float 'acc :float}
