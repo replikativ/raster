@@ -34,7 +34,7 @@
       (is (nil? (#'inline/known-vg-element elements 'vg index))))))
 
 (deftest lifted-arguments-retain-source-types-not-formal-consumer-types
-  (doseq [[argument environment] [['(float 1.0) {}]
+  (doseq [[argument environment] [['(float (aget a 0)) {'a 'doubles}]
                                  ['(clojure.core/aget a 0) {'a 'floats}]]]
     (let [bindings (atom [])
           substitution (#'inline/argument-substitution
@@ -42,6 +42,12 @@
           id (get substitution 'x)]
       (is (= 'float (:raster.type/tag (meta id))))
       (is (= [[id argument]] @bindings)))))
+
+(deftest checked-constant-evidence-avoids-unnecessary-argument-bindings
+  (doseq [argument ['(float 0.0) '(float 1.0) '(long 4)]]
+    (is (false? (#'inline/needs-arg-lift? argument))))
+  (doseq [argument ['(int 4294967296) '(float (observe!))]]
+    (is (#'inline/needs-arg-lift? argument))))
 
 (deftest leaf-bodies-are-inlinable
   (doseq [body ['x 'java.lang.Float/NEGATIVE_INFINITY 42 1.5 nil true]]

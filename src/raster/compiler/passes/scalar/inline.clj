@@ -129,11 +129,12 @@
     (symbol (namespace impl-sym) n)))
 
 (defn- needs-arg-lift?
-  "Evaluate expression arguments once before substitution, even when unused.
+  "Evaluate nonconstant expression arguments once before substitution, even when unused.
    Casts are expressions too: checked conversion may throw, and its operand may
-   have effects. Later simplification can remove bindings proven unnecessary."
+   have effects. Only the shared checked constant evaluator may prove a call safe
+   to substitute directly; a failing conversion never supplies that evidence."
   [arg]
-  (coll? arg))
+  (and (coll? arg) (nil? (constant/value arg))))
 
 (defn- check-inline-arity! [callee params args call]
   (when (not= (count params) (count args))
