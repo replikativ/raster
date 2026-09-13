@@ -1055,3 +1055,13 @@ artifacts/LinkPlans before rerunning the two-layer chained-gradient and real-wei
 Do not restore the old binder or use the tiny Raster block as evidence those external gates pass.
 The pretrained-rstr checkout inspected alongside it was `3b13ad42e7bf4c98e348cb779c28096848931ba0`;
 no sibling source or dependency was changed by this audit.
+
+The retired scatter invocation boundary is removed: its pipeline marker/accumulator metadata,
+Level Zero-only resident convention, runtime positional binders and handwritten zero-fill source
+had no remaining compiler producer or caller in the source/test/dev/benchmark inventory or the
+inspected pretrained/finetune sources. Current scalar/strided scatter uses the existing typed
+conflict algebra, scheduled KernelBody and ordinary executable binder. Existing tests remain:
+7 typed-scatter tests (55 assertions), plus 3 retained-source/control and OpenCL device tests
+(128 assertions), pass with retired vars unmapped from the REPL. In particular, collision updates
+preserve nonzero destination contents rather than inheriting the old binder's implicit zero-fill.
+This retires an orphan route, not scatter semantics or an independently exercised source oracle.

@@ -1354,8 +1354,7 @@
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
-     raster.compiler.pipeline/invoke-scheduled-executable!
-     raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
+     raster.compiler.pipeline/invoke-scheduled-executable!})
 
 (def ^:private gpu-array-alloc-heads
   '#{double-array float-array int-array long-array byte-array
@@ -1459,26 +1458,6 @@
           (when (and (vector? arguments) (contains? #{:single :none} policy))
             {:dispatch-id dispatch-id :arguments arguments
              :convention :executable :returns sym :result-policy policy})))
-      (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
-      ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
-      ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
-      ;; The resident bind zeroes it each replay (a zero-fill kernel prepended to the
-      ;; scatter). :arrays is the kernel C-sig order (out src index); the extra scalar
-      ;; (stride) is a :scalar (n stays :n-expr, and n precedes stride in the C-sig — the
-      ;; scatter bind places n before the scalars, unlike the map-void arrays,scalars,n order).
-      ;; stride is optional: emitted 7-wide with a trailing nil, or 6-wide when absent.
-      (when (#{6 7} argc)
-        (let [[_ kname out src index n stride] expr
-              ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
-              ;; (scalar-parameter-dtype keys on the name, and the value-fn still evaluates
-              ;; the raw symbol — it is an int stride/index param either way).
-              strip-cast (fn [x] (if (and (seq? x)
-                                          (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
-                                   (second x) x))]
-          {:kernel-name kname :arrays [out src index]
-           :scalars (if stride [(strip-cast stride)] [])
-           :n-expr n :convention :scatter :accumulator out :returns sym}))
-
       (= head 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel)
       ;; SegRed carries VALUES in exact emitter-authored ABI order, including its result and
       ;; bound slots. A nil result is the host-scalar staging protocol and cannot enter a
@@ -2113,16 +2092,12 @@
                            :phase (keyword (str "gpu-step-" i))})
 
                         :else
-                        (let [{:keys [kernel-name arrays scalars n-expr convention output accumulator]} step]
+                        (let [{:keys [kernel-name arrays scalars n-expr convention output]} step]
                           {:kernel-name kernel-name
                            :arrays arrays
                            ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
                            ;; LinkPlan instantiation wires it like a map output (it lives in :allocs as scratch).
                            :output (when output (keyword (name output)))
-                           ;; :scatter steps carry the accumulator buffer sym so the linked binder can
-                           ;; zero it (a zero-fill kernel prepended to the atomic-add scatter) each
-                           ;; replay — the zeros-like semantics of scatter-add's output.
-                           :accumulator (when accumulator (keyword (name accumulator)))
                            :n-fn (expr->arg-fn all-params scalar-lets n-expr)
                            ;; Type each scalar arg with the SAME canonical scalar dtype the kernel
                            ;; DECLARATION uses (par_opencl), so the host arg encoding always matches
