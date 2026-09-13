@@ -47,14 +47,15 @@
      :result-sym 'c}))
 
 (defn- split-gemm-plan
-  [descriptor m n k]
+  [descriptor m n k captured?]
   (link-plan/make
    {:id :split-gemm-topology
     :target :ze:0
     :nodes [(link-plan/node {:id :a :dtype :float :shape [m k]
                              :device :ze:0 :role :input})
             (link-plan/node {:id :b :dtype :float :shape [n k]
-                             :device :ze:0 :role :constant})
+                             :device :ze:0 :role :constant
+                             :ownership (if captured? :borrowed :owned)})
             (link-plan/node {:id :c :dtype :float :shape [m n]
                              :device :ze:0 :role :output})]
     :instances [(link-plan/instance
@@ -73,9 +74,10 @@
     4))
 
 (deftest link-plan-flattens-selected-gemm-graph-and-hoists-constant-transforms
-  (let [m 13 n 640 k 262144
+  (doseq [captured? [true false]]
+   (let [m 13 n 640 k 262144
         descriptor (split-gemm-descriptor)
-        plan (split-gemm-plan descriptor m n k)
+        plan (split-gemm-plan descriptor m n k captured?)
         session (atom {:device-id :ze:0 :session-id :mock-session
                        :buffers {} :allocations {} :prepared {} :graphs {}
                        :kernel-graphs {} :events {} :closed? false})
@@ -89,6 +91,7 @@
         runtime-function
         (fn [_ name]
           (case name
+            "device-buffer?" (fn [buffer] (some? (:mock-allocation-id buffer)))
             "make-buffer"
             (fn [elements dtype]
               {:mock-allocation-id (swap! buffer-counter inc)
@@ -110,7 +113,10 @@
     (with-redefs-fn
       {(ns-resolve 'raster.gpu.core 'rt-resolve) runtime-function}
       (fn []
-        (let [executable (gpu-link/instantiate! plan {:session session})
+        (let [executable (gpu-link/instantiate!
+                          plan (cond-> {:session session}
+                                 captured? (assoc :external-buffers
+                                                   {:b ((runtime-function :ze:0 "make-buffer") (* n k) :float)})))
               phase (first (:phases executable))
               bound (get-in @session [:prepared phase])
               prepareds (:prepareds bound)
@@ -123,10 +129,16 @@
                 "A16, B16, transposed B16, and split partials remain graph-private")
             (is (= 5 (count @registered)))
             (is (every? #(contains? % :kernel-call) prepareds)))
-          (testing "only transforms derived entirely from the constant weight enter the prologue"
+          (if captured?
+           (testing "only transforms derived entirely from caller-ready borrowed weights enter the prologue"
             (is (= [2 3] (mapv (comp count :bounds) @recorded)))
             (is (= 2 (count (filter :const-prologue? prepareds))))
             (is (= 3 (count (remove :const-prologue? prepareds))))
             (is (= 1 (count @replayed)) "the constant prologue executes once at instantiation")
             (is (= 2 (count (:bounds (:prologue-graph graph-entry)))))
-            (is (= 3 (count (:bounds (:replay-graph graph-entry)))))))))))
+            (is (= 3 (count (:bounds (:replay-graph graph-entry))))))
+           (testing "an owned constant awaiting upload must not execute a recording-time transform"
+             (is (= [5] (mapv (comp count :bounds) @recorded)))
+             (is (empty? (filter :const-prologue? prepareds)))
+             (is (empty? @replayed))
+             (is (contains? @(:pending-inputs executable) :b))))))))))

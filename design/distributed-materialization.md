@@ -1,9 +1,10 @@
 # Distributed materialization and execution boundary
 
 Status: owned-domain normalization, copy-replica geometry/coverage and exact boundary
-provider bindings and contiguous halo endpoint projection are implemented; initialization/freshness,
-runtime allocation/transport realization and execution
-remain a reviewed plan.
+provider bindings, contiguous halo endpoint projection and conditional DAG readiness are implemented.
+A first synchronous, owning GPU executor now realizes sources and runs checked DAGs on actual
+device identities. Co-located logical workers, asynchronous transports and reusable execution
+epochs remain implementation work.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
 placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
@@ -105,13 +106,34 @@ until its runtime can execute the stated reduction.
 
 ## Readiness is separate from geometry
 
-The next proof should reuse LinkPlan's ordered instance access facts and its existing
+`link-plan/initialization-contract` now exposes the shared effect validator's node-level
+`:requires`, `:initializers`, `:produces`, `:reads`, `:writes`, and public `:outputs` sets.
+Caller requirements arise from reads or pass-through outputs before a proven local writer;
+alias requirements retain the actual requested subview. Declared source initializers are separate
+from caller obligations and are not immutable snapshots or completed uploads. Produced storage
+does not imply retained semantic identity for private temporary values. These are conditional
+local facts; distributed lowering still needs to discharge them and establish freshness.
+The facts are conservative, not minimal across all aliases. The `gpu.link` runtime now derives
+owned `pending-inputs` from this same `:requires` set, so unused inputs and state fully produced
+before reading do not demand redundant uploads. Pass-through outputs still require initialization.
+Borrowed/external buffers retain their existing caller-initialized contract; importing a buffer
+does not itself prove completion of a distributed producer. A distributed executor must discharge
+those external preconditions through actual completed events, not bypass `run!` input checks.
+
+Descriptor cacheable transforms can execute during graph recording. Runtime constant-role
+admission therefore also requires captured data (an owned source or caller-ready borrowed/external
+storage) with no overlapping local write. A late-uploaded owned constant is bound as a replay
+input instead: its initialization gate remains active and its transform is not run prematurely.
+Captured weights keep the existing one-time transform path. This does not authorize changing
+captured constant contents after instantiation without rebuilding their derived transforms.
+
+The proof reuses LinkPlan's ordered instance access facts and its existing
 `produced-views`/`partial-writes` accounting. `value-accesses` deliberately summarizes ABI access
 only; a `:write` entry is not an initialization postcondition. LinkPlan currently assumes caller
 input/constant/state nodes are initialized when checking the local program. Distributed lowering
 must discharge those caller preconditions using source leases and completed producers/transfers,
-not inherit the assumption as evidence. Expose the shared local pre/postcondition calculation
-from the existing validator rather than adding a second kernel-effect registry.
+not inherit the assumption as evidence. The shared calculation is in the existing validator,
+not a second kernel-effect registry.
 
 Before an executable plan can allocate resources, prove:
 
@@ -126,12 +148,74 @@ Before an executable plan can allocate resources, prove:
 5. Allocation sharing follows device-scoped materialization identities, with release after all
    dependent operations complete. Existing separately instantiated owned LinkPlans do not do this.
 
+Physical interval operations for the initial contiguous readiness proof now live in BufferView:
+`subtract-contiguous` preserves unaffected typed fragments of an initialization fact after a write;
+`covered-contiguous?` checks whether several compatible views jointly cover a required range.
+They use device-scoped allocation identity, reject contradictory allocation contracts, and do not
+mistake strided bounding spans for dense coverage. Invalidation is independent of the writer's dtype
+when the cut is element-aligned; typed initialization coverage requires a matching dtype. A cut
+through part of an element is rejected until a byte-validity or outward-rounded invalidation
+policy exists. These helpers establish geometry only; the DAG checker must retain producer identity
+on each fragment and reject unordered conflicting effects and stale replicas.
+The existing `overlaps?` and `same-range?` predicates use the same device-scoped identity;
+zero-byte views never overlap a nonempty range, including when their offset lies inside it.
+
+`distributed-plan/check-readiness` now combines the local contracts, strict copy endpoints and
+region operations into a conditional DAG check. Every compute must bind an executable local plan.
+The checker rejects unordered read/write conflicts (including private local effect scopes),
+requires complete typed coverage before a read, and checks that replica/boundary regions still
+originate from their declared transfer/provider. A later writer removes that provenance while
+preserving disjoint fragments. Being initialized is therefore not enough to satisfy a stale replica.
+
+The returned `:initializers` are explicit obligations: all declared host sources must be realized
+once before the DAG, with no implicit later reuploads. Overlapping initializers must identify the
+same source object and exact view; this is deliberately conservative and is not source snapshot
+certification. Initializer scopes are currently required at each local invocation conservatively.
+`:actions` records required/read/write/produced scopes, and `:final-regions` retains producer IDs.
+This is not a runnable distributed executable or a full ownership/semantic-equivalence certificate.
+Allocation sharing, private-storage lifetime isolation, runtime pending-input reconciliation and
+actual event/transport completion remain required. Unknown narrow write footprints retain whole-ABI
+invalidation; a produced prefix alone is not substituted for a certified write footprint.
+
 Lower dependencies to the existing ExecutionPlan logical queues/events and reuse the LinkPlan
 executable binder. Keep a synchronous executor as an explicit backend capability, not an implicit
 claim of asynchronous transport overlap. MPI/UCX/NCCL and storage/provider completions remain
 realizations of the scheduling boundary, not native handles inside the semantic IR.
 
 ## Laptop acceptance and landing order
+
+`raster.gpu.distributed/instantiate!` now performs readiness, storage-projection, complete shared
+allocation-contract, resident-pool budget and retained-output checks before device contact. It
+owns one session per actual target, realizes original allocation options, and uploads sources once.
+`run!` interprets the existing ExecutionPlan wait/completion representation synchronously. Each
+borrowed local executable is constructed only after its dependencies complete, run, then closed;
+this also keeps constant prologues behind producer completion. The owner retains storage until
+close. Failed/completed executions cannot replay stale readiness evidence. `output-values` exposes
+retained logical values only after successful completion; later overwrites of retained outputs
+are rejected during preflight.
+
+Cross-device copies currently require explicit `:transport :host-staged`, with bounded native
+staging (default 1 MiB) and synchronous download/upload chunks. This is not P2P, MPI, overlap or
+evidence that the topology's modeled link performance was achieved. The pool budget check covers
+the retained LinkPlan allocations, not all backend-private compilation/graph temporary memory.
+Source stability through initialization and constant immutability remain caller obligations.
+The new actual DAG acceptance is a single-device generated heat program. Bounded transfer tails,
+allocation conflicts and failure cleanup have hardware-free tests; multi-device runtime execution
+and logical-worker co-location are not yet validated by that acceptance.
+
+`link-plan/borrow-owned-storage` is the checked local ownership projection for an enclosing
+allocation owner. It preserves executable instances, roles, logical shapes and physical views,
+changes owned physical/logical ownership to borrowed, and extracts the original allocation
+contracts and host initializers. The projected LinkPlan cannot silently reupload those sources.
+Already borrowed/external allocations retain their contracts. The returned initialization facts
+describe the original program's obligations; projection itself proves neither initialization nor
+lifetime. The enclosing owner must reconcile shared initializers, realize them once, retain buffers
+through completion, and release borrower registrations before freeing storage.
+
+A real GPU acceptance now runs two successive generated heat executables over the same owning
+session buffers. Closing the first removes only its borrowed registrations; the second continues
+resident state without reuploading the original source and matches four CPU reference steps.
+This validates the local storage seam, not DistributedPlan execution or cross-device transport.
 
 The current DistributedPlan enforces one shard of a value per mesh device and requires distinct
 transfer endpoints with nonempty routes. A real co-located two-shard execution therefore needs an

@@ -277,7 +277,7 @@
                     :steps [{:phase :fill :kernel-name "fill_boundary" :convention :map
                              :artifact kernel :argument-specs [{:kind :output :sym 'y}]}]
                     :result-sym 'y}]
-    (link/make {:id :boundary-fill :target :gpu-0
+    (link/make {:id :boundary-fill :target (get-in physical-view [:allocation :device])
                 :nodes [(link/node {:id :boundary-node :role :output :view physical-view})]
                 :values [(link/value {:id :boundary-output :abstract (local-abstract [2])
                                       :leaves [{:name :value :node :boundary-node}]})]
@@ -403,6 +403,142 @@
         "right periodic upper face: padding plus three owned-relative rows")
     (is (= 24 (get-in endpoints [[:periodic :edge 0 :backward] :target :view :byte-offset])))
     (is (= 40 (get-in endpoints [[:periodic :edge 1 :backward] :target :view :byte-offset])))))
+
+(defn- initialized-periodic-plan []
+  (reduce (fn [plan device]
+            (assoc-in plan [:device-plans device :entries :copy :link-plan :nodes :x-node :source]
+                      (float-array 6)))
+          (fully-bound-periodic-plan) [:gpu-0 :gpu-1]))
+
+(deftest readiness-composes-initializers-transfers-and-local-contracts
+  (let [plan (distributed/plan (initialized-periodic-plan))
+        ready (distributed/check-readiness plan)]
+    (is (= 4 (count (:initializers ready))))
+    (is (= 6 (count (:actions ready))))
+    (is (= (mapv :id (:steps plan)) (mapv :id (:actions ready))))
+    (is (= #{[8 8]}
+           (into #{} (keep (fn [{:keys [view initializer]}]
+                             (when (and initializer (= :x-node (get-in view [:allocation :id])))
+                               [(:byte-offset view) (:byte-length view)]))) (:final-regions ready)))
+        "ghost writes preserve the independently initialized owned row")
+    (is (= :distributed-readiness-uninitialized
+           (failure-reason #(distributed/check-readiness
+                             (assoc-in plan [:device-plans :gpu-0 :entries :copy :link-plan
+                                             :nodes :x-node :source] nil)))))
+    (is (= :distributed-readiness-unbound
+           (failure-reason #(distributed/check-readiness (make-plan)))))))
+
+(deftest nonperiodic-readiness-requires-both-boundary-and-halo-producers
+  (let [base (initialized-periodic-plan)
+        old (get-in base [:halos 0])
+        halo (distributed/schedule-halo (assoc (:exchange old) :boundary :nonperiodic)
+                                        (get-in base [:values :x]) (get-in base [:shards :x]) (:routes old) [])
+        providers [(distributed/compute-step {:id :lower-boundary :device :gpu-0 :duration-ns 1})
+                   (distributed/compute-step {:id :upper-boundary :device :gpu-1 :duration-ns 1})]
+        computes (filterv #(= :compute (:kind %)) (:steps base))
+        base (assoc base :halos [halo]
+                    :steps (into (into providers (:steps halo))
+                                 (assoc-in computes [0 :dependencies]
+                                           (into (:completions halo) (map :id providers)))))
+        plan (reduce
+              (fn [plan [device step provider row]]
+                (let [base-view (get-in plan [:device-plans device :entries :copy :link-plan :nodes :x-node :view])
+                      incoming (first (filter #(= device (:target %)) (:steps halo)))
+                      owner (get-in plan [:device-plans device :steps step :bindings :local-x :placements 0])]
+                  (-> plan
+                      (assoc-in [:device-plans device :entries provider]
+                                {:link-plan (boundary-fill-plan (view/subview base-view {:byte-offset (* row 8) :shape [2]}))})
+                      (assoc-in [:device-plans device :steps provider] {:entry provider :bindings {}})
+                      (assoc-in [:device-plans device :steps step :bindings :local-x :placements]
+                                [owner {:kind :replica :transfer (:id incoming)}
+                                 {:kind :boundary :region {:offsets [row 0] :shape [1 2]}
+                                  :provider {:step provider :local-value :boundary-output}}]))))
+              base [[:gpu-0 :copy-0 :lower-boundary 0] [:gpu-1 :analytical-only :upper-boundary 2]])
+        report (distributed/check-readiness (distributed/plan plan))
+        producers (into #{} (mapcat #(map :producer (:fresh %))) (:actions report))]
+    (is (= 6 (count (:actions report))))
+    (is (contains? producers :lower-boundary))
+    (is (contains? producers :upper-boundary))))
+
+(deftest readiness-rejects-unordered-physical-writes
+  (let [plan (initialized-periodic-plan)
+        call (get-in plan [:device-plans :gpu-0 :steps :copy-0])
+        race (distributed/compute-step {:id :racing-copy :device :gpu-0 :duration-ns 1
+                                         :dependencies (get-in plan [:halos 0 :completions])})
+        plan (-> plan (update :steps conj race)
+                 (assoc-in [:device-plans :gpu-0 :steps :racing-copy] call))]
+    (is (distributed/distributed-plan? (distributed/plan plan)))
+    (is (= :distributed-readiness-race
+           (failure-reason #(distributed/check-readiness (distributed/plan plan)))))
+    (is (map? (distributed/check-readiness
+               (distributed/plan (update plan :steps
+                                         (fn [steps] (mapv #(if (= :racing-copy (:id %))
+                                                              (assoc % :dependencies [:copy-0]) %) steps)))))))))
+
+(deftest readiness-orders-pass-through-preconditions-without-abi-reads
+  (let [base (initialized-periodic-plan)
+        output-view (get-in base [:device-plans :gpu-0 :entries :copy :link-plan :nodes :y-node :view])
+        scratch (link/node {:id :unrelated :dtype :float :shape [2] :device :gpu-0 :role :internal})
+        passthrough (-> (boundary-fill-plan (:view scratch))
+                        (assoc-in [:nodes :pass] (link/node {:id :pass :role :input :view output-view}))
+                        (assoc-in [:values :pass]
+                                  (link/value {:id :pass :abstract (local-abstract [2 3])
+                                               :leaves [{:name :value :node :pass}]}))
+                        (assoc :outputs [:pass]))
+        plan (-> base
+                 (assoc-in [:device-plans :gpu-0 :entries :pass] {:link-plan passthrough})
+                 (assoc-in [:device-plans :gpu-0 :steps :pass]
+                           {:entry :pass :bindings {:pass {:value :y :shard :y-0}}})
+                 (update :steps conj (distributed/compute-step
+                                     {:id :pass :device :gpu-0 :duration-ns 1})))
+        contract (link/initialization-contract passthrough)]
+    (is (contains? (:requires contract) :pass))
+    (is (not (contains? (:reads contract) :pass)))
+    (is (= :distributed-readiness-race
+           (failure-reason #(distributed/check-readiness (distributed/plan plan))))
+        "vector order must not substitute for a producer dependency")
+    (is (map? (distributed/check-readiness
+               (distributed/plan (update plan :steps
+                                         (fn [steps] (mapv #(if (= :pass (:id %))
+                                                              (assoc % :dependencies [:copy-0]) %) steps)))))))))
+
+(deftest an-initialized-but-overwritten-replica-is-not-fresh
+  (let [plan (initialized-periodic-plan)
+        plan (-> plan
+                 (assoc-in [:device-plans :gpu-0 :entries :copy :link-plan :nodes :x-node :role] :state)
+                 (assoc-in [:device-plans :gpu-0 :entries :copy :link-plan :instances 0 :bindings 'y] :local-x)
+                 (assoc-in [:device-plans :gpu-0 :entries :copy :link-plan :outputs] [:x-node])
+                 (update-in [:device-plans :gpu-0 :steps :copy-0 :bindings] dissoc :local-y))
+        ;; The unused old y node is private storage, not an exported result.
+        plan (assoc-in plan [:device-plans :gpu-0 :entries :copy :link-plan :nodes :y-node :role] :internal)
+        call (get-in plan [:device-plans :gpu-0 :steps :copy-0])
+        again (distributed/compute-step {:id :again :device :gpu-0 :duration-ns 1 :dependencies [:copy-0]})
+        plan (-> plan (update :steps conj again)
+                 (assoc-in [:device-plans :gpu-0 :steps :again] call))]
+    (is (distributed/distributed-plan? (distributed/plan plan)))
+    (is (= :distributed-readiness-stale
+           (failure-reason #(distributed/check-readiness (distributed/plan plan))))
+        "a full state write initializes storage but invalidates the earlier transfer's provenance")
+    (let [old (get-in plan [:halos 0])
+          refresh (distributed/schedule-halo (assoc (:exchange old) :id :refresh)
+                                             (get-in plan [:values :x]) (get-in plan [:shards :x])
+                                             (:routes old) [:copy-0 :analytical-only])
+          retarget (fn [call]
+                     (update-in call [:bindings :local-x :placements]
+                                (fn [ps] (mapv #(if (= :replica (:kind %))
+                                                  (update % :transfer assoc 0 :refresh) %) ps))))
+          refreshed (-> plan
+                        (update :halos conj refresh)
+                        (assoc :steps (into (into (vec (remove #(= :again (:id %)) (:steps plan)))
+                                                  (:steps refresh))
+                                            [(assoc again :dependencies (:completions refresh))
+                                             (distributed/compute-step {:id :other-again :device :gpu-1
+                                                                        :duration-ns 1 :dependencies (:completions refresh)})]))
+                        (update-in [:device-plans :gpu-0 :steps :again] retarget)
+                        (assoc-in [:device-plans :gpu-1 :steps :other-again]
+                                  (retarget (get-in plan [:device-plans :gpu-1 :steps :analytical-only]))))]
+      (is (= 12 (count (:actions (distributed/check-readiness (distributed/plan refreshed)))))
+          "explicitly refreshed transfers establish the next iteration's replica provenance"))))
 
 (deftest strided-faces-require-pack-unpack-not-a-bounding-span-copy
   (let [base (fully-bound-periodic-plan)

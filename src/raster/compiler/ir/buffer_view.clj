@@ -131,11 +131,17 @@
 (defn byte-end [view]
   (+ (:byte-offset (validate-view! view)) (:byte-length view)))
 
+(defn- allocation-key
+  "A nil device is its own identity scope, never a wildcard for concrete devices."
+  [allocation]
+  [(:device allocation) (:id allocation)])
+
 (defn overlaps?
-  "True when two views address at least one common byte of the same allocation."
+  "True when views address at least one common byte of the same device-scoped allocation."
   [a b]
   (let [a (validate-view! a) b (validate-view! b)]
-    (and (= (get-in a [:allocation :id]) (get-in b [:allocation :id]))
+    (and (= (allocation-key (:allocation a)) (allocation-key (:allocation b)))
+         (pos? (:byte-length a)) (pos? (:byte-length b))
          (< (:byte-offset a) (byte-end b))
          (< (:byte-offset b) (byte-end a)))))
 
@@ -144,7 +150,7 @@
 (defn same-range?
   [a b]
   (let [a (validate-view! a) b (validate-view! b)]
-    (and (= (get-in a [:allocation :id]) (get-in b [:allocation :id]))
+    (and (= (allocation-key (:allocation a)) (allocation-key (:allocation b)))
          (= (:byte-offset a) (:byte-offset b))
          (= (:byte-length a) (:byte-length b)))))
 
@@ -152,6 +158,74 @@
   [view]
   (let [{:keys [shape strides]} (validate-view! view)]
     (= strides (dense-strides shape))))
+
+(defn subtract-contiguous
+  "Return portions of base untouched by cut; split fragments are one-dimensional typed views.
+   An untouched base retains its original shape.
+   This is physical range subtraction, not a copy or a semantic reshape. Different allocations
+   do not intersect. Overlapping cuts must be contiguous and aligned to base's element size;
+   cut dtype does not matter for write invalidation. Partial-element cuts fail closed."
+  [base cut]
+  (let [base (validate-view! base) cut (validate-view! cut)
+        a (:allocation base) b (:allocation cut)]
+    (when-not (contiguous? base)
+      (throw (ex-info "range subtraction requires a contiguous base"
+                      {:reason :buffer-view-region-layout :view (:id base)})))
+    (if (not= (allocation-key a) (allocation-key b))
+      [base]
+      (do
+        (when-not (= a b)
+          (throw (ex-info "one allocation identity must preserve its storage contract"
+                          {:reason :buffer-view-region-allocation :left a :right b})))
+        (let [start (:byte-offset base) end (+' start (:byte-length base))
+              lo (max start (:byte-offset cut))
+              hi (min end (+' (:byte-offset cut) (:byte-length cut)))]
+          (if (>= lo hi)
+            [base]
+            (let [width (dtype/bytes-of (:dtype base))]
+              (when-not (contiguous? cut)
+                (throw (ex-info "a strided write needs a physical region projection"
+                                {:reason :buffer-view-region-layout :view (:id cut)})))
+              (when-not (and (zero? (mod (-' lo start) width))
+                             (zero? (mod (-' hi start) width)))
+                (throw (ex-info "cut intersects only part of a typed element"
+                                {:reason :buffer-view-region-alignment
+                                 :view (:id base) :cut (:id cut)})))
+              (mapv (fn [[begin finish]]
+                      (view a {:byte-offset begin :dtype (:dtype base)
+                               :shape [(quot (-' finish begin) width)]}))
+                    (filter (fn [[begin finish]] (< begin finish)) [[start lo] [hi end]])))))))))
+
+(defn covered-contiguous?
+  "Whether same-dtype physical views jointly cover the complete contiguous target.
+   Coverage may come from several disjoint producers. Unrelated allocations/dtypes do not
+   supply typed initialization evidence. This checks geometry only, not producer provenance."
+  [target covers]
+  (let [target (validate-view! target)
+        covers (mapv validate-view! covers)
+        allocation (:allocation target)
+        related (filterv #(= (allocation-key allocation) (allocation-key (:allocation %))) covers)]
+    (when-not (contiguous? target)
+      (throw (ex-info "coverage requires a contiguous target"
+                      {:reason :buffer-view-region-layout :view (:id target)})))
+    (doseq [cover related]
+      (when-not (= allocation (:allocation cover))
+        (throw (ex-info "one allocation identity must preserve its storage contract"
+                        {:reason :buffer-view-region-allocation
+                         :left allocation :right (:allocation cover)}))))
+    (let [typed (filterv #(and (= (:dtype target) (:dtype %)) (overlaps? target %)) related)]
+      (doseq [cover typed]
+        (when-not (contiguous? cover)
+          (throw (ex-info "strided initialization requires a physical region projection"
+                          {:reason :buffer-view-region-layout :view (:id cover)}))))
+      (loop [cursor (:byte-offset target)
+             pending (sort-by :byte-offset typed)]
+        (cond
+          (>= cursor (+' (:byte-offset target) (:byte-length target))) true
+          (empty? pending) false
+          (> (:byte-offset (first pending)) cursor) false
+          :else (let [cover (first pending)]
+                  (recur (max cursor (+' (:byte-offset cover) (:byte-length cover))) (next pending))))))))
 
 (defn contains-contiguous-view?
   "Whether base covers a dense, same-dtype view in the identical allocation contract."

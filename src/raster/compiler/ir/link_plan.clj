@@ -929,7 +929,7 @@
              (validate-program-instance-bindings! nodes values %))
           instances))
 
-(defn- validate-effects! [{:keys [target nodes values instances outputs aliases] :as plan}]
+(defn- analyze-effects! [{:keys [nodes outputs aliases] :as plan}]
   (let [step-facts (instance-access-facts plan)
         initialized (volatile! (into #{}
                                      (keep (fn [[id {:keys [role source]}]]
@@ -940,22 +940,37 @@
                                                        (contains? #{:input :constant :state} role))
                                                id)))
                                      nodes))
-        initially-initialized @initialized
+        initially-initialized (sort-by pr-str @initialized)
         written (volatile! #{})
+        required (volatile! #{})
+        reads (volatile! #{})
+        writes (volatile! #{})
+        caller-initialization!
+        (fn [node-id required-view-id]
+          (when (and (not (contains? @written node-id))
+                     (not (get-in nodes [node-id :source])))
+            (vswap! required conj required-view-id))
+          true)
         initialized-view?
         (fn [node-id]
-          (or (contains? @initialized node-id)
+          (or (when (contains? @initialized node-id)
+                (caller-initialization! node-id node-id))
               (let [view (get-in nodes [node-id :view])]
                 (and (bview/contiguous? view)
                      (some (fn [initialized-id]
                              (let [cover (get-in nodes [initialized-id :view])]
-                               (bview/contains-contiguous-view? cover view)))
+                               (when (bview/contains-contiguous-view? cover view)
+                                 (caller-initialization! initialized-id node-id))))
                            initially-initialized)))))]
     (doseq [{:keys [instance step phase facts produced-views partial-writes]} step-facts]
       (let [by-node (reduce (fn [m {:keys [node access]}]
                               (update m node merge-access access)) {} facts)]
         (doseq [[node-id access] by-node
                 :let [role (get-in nodes [node-id :role])]]
+          (when (contains? #{:read :read-write} access)
+            (vswap! reads conj node-id))
+          (when (contains? #{:write :read-write} access)
+            (vswap! writes conj node-id))
           (when (and (contains? #{:read :read-write} access)
                      (not (initialized-view? node-id)))
             (throw (ex-info "link plan reads an internal node before an ordered producer writes it"
@@ -988,12 +1003,33 @@
                     (initialized-view? node-id))
         (throw (ex-info "link plan exports a node with no value"
                         {:reason :link-unproduced-output :node node-id}))))
-    plan))
+    {:requires @required
+     :initializers (into #{} (keep (fn [[id node]] (when (:source node) id))) nodes)
+     :produces @written :reads @reads :writes @writes
+     :outputs (set outputs)}))
+
+(defn- validate-effects! [plan]
+  (analyze-effects! plan)
+  plan)
 
 (defn validate!
   "Validate a LinkPlan without allocating storage, registering kernels, or contacting a driver."
   [plan]
   (-> plan validate-plan-structure! validate-allocations-and-aliases! validate-effects!))
+
+(defn initialization-contract
+  "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.
+   :requires names caller-initialized nodes needed by reads or pass-through outputs;
+   :initializers names nodes with declared host sources (not a content snapshot or upload event).
+   :produces names nodes fully established by ordered writes, including certified produced
+   subviews but excluding unproven tails of partial writes. This is initialized storage, not
+   retention or semantic-value preservation of private temporaries. :reads/:writes retain conservative
+   effect scopes, and :outputs is the public output-node set. All sets contain LinkNode IDs.
+   Postconditions assume caller requirements and initializers are realized and execution succeeds;
+   this is not proof of distributed readiness, source immutability, or runtime completion.
+   Requirements need not be minimal across aliases and do not replace a runtime's input gates."
+  [plan]
+  (analyze-effects! (-> plan validate-plan-structure! validate-allocations-and-aliases!)))
 
 (defn value-accesses
   "Return conservative logical-value accesses from the validated executable ABI.
@@ -1025,6 +1061,41 @@
         aliases (into #{} (map canonical-alias-pair) aliases)]
     (validate! (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases
                            attributes))))
+
+(defn borrow-owned-storage
+  "Project a local plan's owned allocations into storage borrowed from an enclosing execution.
+   Returns the validated :plan plus original :allocations and :initializers to realize once in
+   the owner. Initialization requirements refer to the original plan, before sources are removed.
+   No allocation, upload, ownership transfer or initialization proof occurs here. The owner must
+   keep every supplied buffer alive through all local execution and release borrowed registrations
+   before freeing storage. Already external/borrowed allocations retain their original contracts.
+   Projection fails closed if removing a source leaves an internal/output value without a valid
+   caller-input role or local producer; borrowed ownership alone is not initialization evidence."
+  [plan]
+  (let [plan (validate! plan)
+        initialization (initialization-contract plan)
+        owned? (fn [node] (= :owned (get-in node [:view :allocation :ownership])))
+        allocations (into {} (keep (fn [[_ node]]
+                                     (when (owned? node)
+                                       (let [a (get-in node [:view :allocation])]
+                                         [(:id a) a])))) (:nodes plan))
+        initializers (into {} (keep (fn [[id node]]
+                                     (when (:source node) [id {:view (:view node) :source (:source node)}])))
+                           (:nodes plan))
+        nodes (update-vals (:nodes plan)
+                           (fn [node]
+                             (if (owned? node)
+                               (-> node (assoc :source nil)
+                                   (assoc-in [:view :allocation :ownership] :borrowed))
+                               node)))
+        values (update-vals (:values plan)
+                            (fn [value]
+                              (if (owned? (get-in plan [:nodes (get-in value [:leaves 0 :node])]))
+                                (assoc-in value [:abstract :ownership] :borrowed)
+                                value)))]
+    {:plan (validate! (assoc plan :nodes nodes :values values))
+     :allocations allocations :initializers initializers
+     :initialization initialization}))
 
 (defn instance-roles
   "Resolve compiler-symbol roles for the runtime binder. Only `:constant` affects executable

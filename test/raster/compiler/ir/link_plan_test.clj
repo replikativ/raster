@@ -77,6 +77,66 @@
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
 
+(deftest borrowing-storage-preserves-code-and-extracts-owner-obligations
+  (let [original (valid-plan)
+        {:keys [plan allocations initializers initialization]} (link/borrow-owned-storage original)]
+    (is (= #{:x :w0 :w1 :hidden :out} (set (keys allocations))))
+    (is (every? #(= :owned (:ownership %)) (vals allocations)))
+    (is (= #{:x :w0 :w1} (set (keys initializers))))
+    (is (identical? (get-in original [:nodes :x :source]) (get-in initializers [:x :source])))
+    (is (= (link/initialization-contract original) initialization))
+    (is (every? #(and (nil? (:source %))
+                     (= :borrowed (get-in % [:view :allocation :ownership]))) (vals (:nodes plan))))
+    (is (every? #(= :borrowed (get-in % [:abstract :ownership])) (vals (:values plan))))
+    (is (= (:instances original) (:instances plan)))
+    (is (= (:outputs original) (:outputs plan)))
+    (is (= (get-in original [:nodes :x :view]) (get-in initializers [:x :view])))
+    (let [again (link/borrow-owned-storage plan)]
+      (is (= plan (:plan again)))
+      (is (empty? (:allocations again)))
+      (is (empty? (:initializers again))))))
+
+(deftest initialization-contract-separates-caller-data-from-ordered-producers
+  (let [initialized (valid-plan)
+        caller (update initialized :nodes
+                       #(update-vals % (fn [node] (assoc node :source nil))))]
+    (is (= {:requires #{} :initializers #{:x :w0 :w1} :produces #{:hidden :out}
+            :reads #{:x :w0 :w1 :hidden} :writes #{:hidden :out} :outputs #{:out}}
+           (link/initialization-contract initialized)))
+    (is (= #{:x :w0 :w1} (:requires (link/initialization-contract caller))))
+    (is (= #{} (:initializers (link/initialization-contract caller))))
+    (let [state (assoc-in caller [:nodes :hidden :role] :state)]
+      (is (not (contains? (:requires (link/initialization-contract state)) :hidden))
+          "a state role does not impose an initial value when an ordered producer writes first")
+      (is (contains? (:requires (link/initialization-contract
+                                (update state :instances #(vec (reverse %))))) :hidden)
+          "reading state before its writer creates a caller precondition"))
+    (let [with-unused (-> caller
+                          (assoc-in [:nodes :unused] (n :unused :input))
+                          (assoc-in [:values :unused] (link/value {:id :unused :abstract
+                                                                 (av/tensor {:dtype :float :shape [16]})
+                                                                 :leaves [{:name :value :node :unused}]})))]
+      (is (not (contains? (:requires (link/initialization-contract with-unused)) :unused)))
+      (is (contains? (:requires (link/initialization-contract (update with-unused :outputs conj :unused))) :unused)
+          "an unwritten pass-through output still requires caller data"))))
+
+(deftest initialization-contract-retains-the-required-alias-region
+  (let [base (link/node {:id :base :dtype :float :shape [4] :role :input :device :ze:0
+                         :allocation-id :shared :byte-size 16})
+        prefix (link/node {:id :prefix :dtype :float :shape [2] :role :internal :device :ze:0
+                           :allocation-id :shared :byte-size 16})
+        plan (link/make {:id :alias-precondition :target :ze:0
+                         :nodes [base prefix (n :x :input (float-array 16))
+                                 (n :w :constant (float-array 16)) (n :tmp :internal)]
+                         :aliases #{#{:base :prefix}}
+                         :instances [(instance :unrelated :x :w :tmp)] :outputs [:prefix]})
+        contract (link/initialization-contract plan)]
+    (is (= #{:prefix} (:requires contract))
+        "a subview requirement does not demand the untouched tail of its caller-owned base")
+    (is (= #{:tmp} (:produces contract)))
+    (is (= #{} (:requires (link/initialization-contract
+                           (assoc-in plan [:nodes :base :source] (float-array 4))))))))
+
 (deftest logical-value-accesses-come-from-bound-kernel-effects
   (let [plan (valid-plan)]
     (is (= {:x :read :w0 :read :w1 :read :hidden :read-write :out :write}

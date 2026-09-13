@@ -13,6 +13,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.distributed-compute :as compute]
+            [raster.compiler.ir.distributed-readiness :as readiness]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.scan :as scan]
@@ -886,6 +887,14 @@
    initialization/freshness, shared allocation and transport capabilities remain obligations."
   [plan]
   (compute/transfer-bindings (validate-structure! plan)))
+
+(defn check-readiness
+  "Check conditional physical initialization, DAG effect ordering and replica/boundary freshness.
+   Returns startup initializer obligations, action scopes and final initialized regions. Requires
+   bound compute and strict copy endpoints; no allocation or execution occurs. Source snapshots,
+   resource ownership, runtime input gates and event completion remain runtime obligations."
+  [plan]
+  (readiness/check (validate-structure! plan)))
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
