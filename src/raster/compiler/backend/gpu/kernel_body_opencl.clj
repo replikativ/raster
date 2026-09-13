@@ -1323,10 +1323,14 @@
 
 (defn- emit-scalar-operations
   [operations context depth]
-  (reduce (fn [[source ctx] operation]
-            (let [[next-source next-context] (emit-scalar-operation operation ctx depth)]
-              [(str source next-source) next-context]))
-          ["" context] operations))
+  (let [[fragments context]
+        (reduce (fn [[fragments ctx] operation]
+                  (let [[source next-context] (emit-scalar-operation operation ctx depth)]
+                    [(conj fragments source) next-context]))
+                [[] context] operations)]
+    ;; Appending immutable prefixes copies all preceding source for every SSA op.
+    ;; Join once, preserving the exact operation/context order.
+    [(apply str fragments) context]))
 
 (defn- scalar-storage-map
   [kernel-body]
