@@ -334,9 +334,13 @@
   (let [session (atom {:prepared {:manual {}}})]
     (is (nil? (gpu/execution-info session :manual))
         "manual bindings must not manufacture compiler evidence")
-    (is (thrown? clojure.lang.ExceptionInfo (gpu/execution-info session :missing)))
+    (is (= :gpu-execution-info-missing
+           (try (gpu/execution-info session :missing)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (swap! session assoc :closed? true)
-    (is (thrown? clojure.lang.ExceptionInfo (gpu/execution-info session :manual)))))
+    (is (= :gpu-execution-info-closed
+           (try (gpu/execution-info session :manual)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest resident-storage-admission-precedes-backend-binding
   (let [step {:kernel-name "storage-dispatch" :phase :probe :convention :executable

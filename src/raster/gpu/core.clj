@@ -250,9 +250,11 @@
   [sess phase]
   (let [state @sess]
     (when (:closed? state)
-      (throw (ex-info "cannot inspect a closed GPU session" {:phase phase})))
+      (throw (ex-info "cannot inspect a closed GPU session"
+                      {:reason :gpu-execution-info-closed :phase phase})))
     (when-not (contains? (:prepared state) phase)
-      (throw (ex-info "no prepared phase to inspect" {:phase phase})))
+      (throw (ex-info "no prepared phase to inspect"
+                      {:reason :gpu-execution-info-missing :phase phase})))
     (:execution-info (get-in state [:prepared phase]))))
 
 (defn- prepared-bindings
