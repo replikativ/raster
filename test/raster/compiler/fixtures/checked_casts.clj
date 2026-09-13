@@ -9,6 +9,10 @@
   (raster.par/map! output index n int
                    (int (raster.arrays/aget input index))))
 
+(deftm declared-narrow-rows!
+  [input :- (Array long) output :- (Array int) n :- Long] :- (Array int)
+  (raster.par/map! output index n int (raster.arrays/aget input index)))
+
 (deftm narrow-stores!
   [input :- (Array long) output :- (Array int) n :- Long] :- (Array int)
   (raster.par/map-void! index n
