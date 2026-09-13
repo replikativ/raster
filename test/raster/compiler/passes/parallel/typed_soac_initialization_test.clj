@@ -83,10 +83,23 @@
                     #(assoc-in % [:attributes :allocations 0 :extent] -1)
                     #(assoc-in % [:attributes :allocations 0 :extent] 'input)
                     #(assoc-in % [:attributes :allocations 0 :extent] '(do (mutate!) 8))
+                    #(assoc-in % [:values 'output :shape] [9])
                     #(assoc-in % [:attributes :allocations 0 :source-binding-id] nil)
                     #(update-in % [:equations 1 :provenance] dissoc :source-binding-id)
                     #(assoc-in % [:attributes :allocations 0 :source-binding-id] 2)]]
       (is (= :typed-soac-initialization-contract (reason (with-facts program change)))))))
+
+(deftest logical-volume-does-not-prove-physical-layout-coverage
+  (let [p (program (source '(float-array 8) 8))]
+    (doseq [[facet value] [[:representation {:kind :strided :stride 2}]
+                           [:logical-layout {:strides [2]}]]]
+      (let [changed (with-facts p
+                      #(update % :values
+                               (fn [values]
+                                 (into {} (map (fn [[id av]]
+                                                 [id (if (seq (:shape av))
+                                                       (assoc av facet value) av)])) values))))]
+        (is (= :typed-soac-initialization-contract (reason changed)))))))
 
 (deftest generated-initializers-avoid-host-symbols
   (let [program (with-facts (program (source '(float-array 8) 4))

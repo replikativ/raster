@@ -30,6 +30,9 @@
       (some #(= destination (physical-id facts (:destination %)))
             (dialect/result-storage facts (second equation)))))
 
+(defn- plain-storage? [value]
+  (and (= {:kind :plain} (:representation value)) (nil? (:logical-layout value))))
+
 (defn- full-overwrite? [facts extent-environment {:keys [destination extent]} equation]
   ;; These functional operations produce their entire validated logical result shape.
   ;; Indexed/guarded effect maps and scatter do not have that guarantee.
@@ -39,6 +42,8 @@
        (some (fn [[result storage]]
                (and (= destination (physical-id facts (:destination storage)))
                     (= :write (:access storage))
+                    (plain-storage? (get-in facts [:values result]))
+                    (plain-storage? (get-in facts [:values destination]))
                     (extent-proof/same-volume? extent-environment extent
                                               (get-in facts [:values result :shape]))))
              (map vector (nth equation 2) (dialect/result-storage facts (second equation))))))
@@ -113,7 +118,7 @@
                 (assoc-in [:equations id] equation-facts)
                 (update :effects conj :memory/write))}))
 
-(defn- allocation-contracts! [facts]
+(defn- allocation-contracts! [facts extent-environment]
   (let [allocations (get-in facts [:attributes :allocations] [])]
     (when-not (and (vector? allocations)
                    (every? #(and (map? %) (dialect/value-id? (:destination %))
@@ -136,7 +141,14 @@
       (when (and (= :zero (:initialization allocation))
                  (not (integral-extent? facts (:extent allocation))))
         (fail! "zero allocation requires a canonical integral scalar extent"
-               {:allocation allocation})))
+               {:allocation allocation}))
+      (when (and (= :zero (:initialization allocation))
+                 (not (and (plain-storage? value)
+                           (or (= [(list 'unknown-dimension destination)] (:shape value))
+                               (extent-proof/same-volume? extent-environment
+                                                         (:extent allocation) (:shape value))))))
+        (fail! "fresh zero allocation requires matching plain dense storage"
+               {:allocation allocation :value value})))
     allocations))
 
 (defn materialize
@@ -149,7 +161,7 @@
         extent-environment (extent-proof/environment program)
         allocations (filter #(and (= :zero (:initialization %))
                                   (contains? (:values original-facts) (:destination %)))
-                            (allocation-contracts! original-facts))
+                            (allocation-contracts! original-facts extent-environment))
         {:keys [facts equations pending fills elided native]}
         (reduce
          (fn [{:keys [facts pending] :as state} equation]
