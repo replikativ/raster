@@ -1005,3 +1005,23 @@ are not certified by this fix; backend-wide long arithmetic may pay overflow-che
 cross-target semantic parity and performance remain separate acceptance work.
 Shared-memory pipelines or indexed matrix epilogues should be introduced when those measurements
 or workload requirements justify them. Existing scientific/distributed acceptance gates remain.
+
+The input-conversion follow-up now connects that leaf to the ordinary typed contraction vertical:
+the checked private-cast rewrite preserves the semantic source, scheduled graph and per-node body
+certificates; eligible Intel NN/NT dispatches enumerate the candidate without changing the analytic
+selector. Concrete graph dependencies and public/node ABI alias contracts govern admission before
+graph-private allocation. Automatic or cached preferences may fall back only to the declared
+default; explicit incompatible requests fail. Offline tuning retains source-bound alias rejection
+rows without executing or timing them, excludes them from winners, and requires an applicable
+default. This is alias admission, not a claim of complete scalar/alignment/target applicability.
+
+The public prebound-extent GEMM→ReLU canary exercises lowering, schedule-based recompilation,
+LinkPlan instantiation, constant B and changing A through this route. On the laptop Level Zero
+device, two tiny `[13 32 32]` replays matched 832 outputs exactly and each profiled one generated
+contract kernel; B conversion stayed in the one-time prologue. The non-prebound extent still
+preserves its post-write checked-arithmetic barrier. These are correctness and replay-topology
+results, not stationary throughput or a comparison with an external implementation. Next measure
+the public route across the shape ladder against numerically matched external baselines, retain
+the global-conversion alternative, and continue the resident forward/VJP/update and scientific
+demonstrators. No source-form restriction should become a permanent semantic primitive merely
+to make a benchmark fuse; safe scalar placement needs a proof or guarded schedule.
