@@ -333,7 +333,7 @@
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
   [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes epilogue]
+           k-range launch-group-count attributes epilogue input-value-regions]
     :or {result-dtype :float provenance {}}}]
   (let [dimension-parameters
         (or dimension-parameters
@@ -350,6 +350,7 @@
       :tile tile
       :bindings {:row a :col b}
       :epilogue epilogue
+      :input-value-regions (or input-value-regions {})
       :result-dtype result-dtype
       :additional-parameters additional-parameters
       :additional-indices additional-indices
@@ -372,7 +373,7 @@
   [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
            target-dialect
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes parameter-names epilogue]
+           k-range launch-group-count attributes parameter-names epilogue input-value-regions]
     :or {result-dtype :float provenance {} target-dialect :opencl-intel}}]
   (let [kernel-name (c-emit/c-symbol kernel-name)
         kernel-body (scheduled-matrix-body
@@ -383,7 +384,7 @@
                       :additional-indices additional-indices :buffer-shapes buffer-shapes
                       :buffer-views buffer-views :operation-buffers operation-buffers
                       :k-range k-range :launch-group-count launch-group-count
-                      :attributes attributes :epilogue epilogue})
+                      :attributes attributes :epilogue epilogue :input-value-regions input-value-regions})
         emitted (matrix-target/emit-matrix-kernel
                  kernel-name kernel-body target-dialect {:parameter-names parameter-names})]
     (assoc emitted
@@ -391,13 +392,13 @@
            :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
 
 (defn- split-k-matrix-spec
-  [{:keys [kernel-name id a b c m n k kc splits tile provenance]}]
+  [{:keys [kernel-name id a b c m n k kc splits tile provenance input-value-regions]}]
   (let [z 'k-slice
         c-view 'split-result-view
         k-lower (kbody/expression :mul z kc)
         k-upper (kbody/expression :min (kbody/expression :add k-lower kc) k)]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
-     :tile tile :result-dtype :float :provenance provenance
+     :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
                              (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
@@ -419,7 +420,7 @@
   (emit-scheduled-matrix-kernel (split-k-matrix-spec spec)))
 
 (defn- batched-matrix-spec
-  [{:keys [kernel-name id a b c m n k batch tile provenance batching]
+  [{:keys [kernel-name id a b c m n k batch tile provenance batching input-value-regions]
     :or {batching {:row true :col true}}}]
   (let [z 'slab
         a-view 'batch-lhs-view
@@ -443,7 +444,7 @@
           row-batched? (assoc a a-view)
           col-batched? (assoc b b-view))]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
-     :tile tile :result-dtype :float :provenance provenance
+     :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
      :buffer-shapes {a a-shape b b-shape c [batch m n]}
@@ -532,7 +533,8 @@
   [stage kernel-name phase target-dialect scalar-types]
   (let [{stage-id :id a :lhs b :rhs c :result
          [m n k] :dimensions reduction :reduction epilogue :epilogue
-         batching :batching schedule :schedule} (matrix-stage/validate! stage)
+         batching :batching schedule :schedule input-value-regions :input-value-regions}
+        (matrix-stage/validate! stage)
         tile (:tile schedule)
         _ (when-not (and (= :matrix-instruction-tiling (:kind schedule))
                          (= :half (:operand-dtype stage))
@@ -556,6 +558,7 @@
                    :a a :b b :c c :m m :n n :k k
                    :tile tile :result-dtype (:result-dtype stage)
                    :epilogue epilogue
+                   :input-value-regions input-value-regions
                    :phase phase
                    :target-dialect target-dialect
                    :source-operation stage

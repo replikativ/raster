@@ -530,6 +530,19 @@
                           (into scope (concat parameters indices)) epilogue-abi)
     region))
 
+(defn- validate-input-region-boundary!
+  [region input-dtype fragment-dtype]
+  (when-not (and (= 1 (count (:parameters region)))
+                 (= [] (:operands region)) (= [] (:indices region))
+                 (every? #(record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" %)
+                         (:operations region))
+                 (= (dtype/canon input-dtype) (dtype/canon (:accumulator-dtype region)))
+                 (= (dtype/canon fragment-dtype) (dtype/canon (:result-dtype region))))
+    (throw (ex-info "tile-load value region must be closed and preserve its typed boundary"
+                    {:reason :kernel-body-tile-load-region :region region
+                     :input-dtype input-dtype :fragment-dtype fragment-dtype})))
+  region)
+
 (defn- validate-operation!
   [operation storage fragments masks scope epilogue-abi]
   (let [parameter (fn [id]
@@ -588,15 +601,7 @@
             ;; The first ScalarSSARegion parameter is the loaded element here, rather than
             ;; a store accumulator. Input transformations are closed pure per-element regions:
             ;; no extra memory reads, external captures, coordinates, or effects.
-            (when-not (and (= 1 (count (:parameters region)))
-                           (= [] (:operands region)) (= [] (:indices region))
-                           (every? #(record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" %)
-                                   (:operations region))
-                           (= (dtype/canon (:dtype p)) (dtype/canon (:accumulator-dtype region)))
-                           (= (dtype/canon (:dtype f)) (dtype/canon (:result-dtype region))))
-              (throw (ex-info "tile-load value region must be closed and preserve its typed boundary"
-                              {:reason :kernel-body-tile-load-region :region region
-                               :buffer p :fragment f})))
+            (validate-input-region-boundary! region (:dtype p) (:dtype f))
             (validate-scalar-ssa-region! region storage masks (set (:parameters region)) []))
           (when-not (= (dtype/canon (:dtype p)) (dtype/canon (:dtype f)))
             (throw (ex-info "tile-load fragment dtype must equal the buffer element dtype"
@@ -1919,6 +1924,18 @@
                        :result (:result region) :declared (:result-dtype region)
                        :actual (:type result)})))
     region))
+
+(defn validate-input-value-region!
+  "Validate a closed typed per-element input transformation independently of a kernel schedule.
+   Matrix stages and TileLoad share this boundary and SSA checker; no external values or memory
+   operations are admitted. Storage/fragment types are explicit, never inferred from operators."
+  [region input-dtype fragment-dtype]
+  (validate-input-region-boundary! region input-dtype fragment-dtype)
+  (validate-scalar-ssa-region! region {} {} (set (:parameters region)) [])
+  (validate-scalar-ssa-dataflow!
+   region {} {:storage {} :stable-reads #{} :masks {} :reserved #{}
+              :control-uniformity lane-varying :launch nil :schedule {}})
+  region)
 
 (defn- validate-async-protocol!
   [operations storage stable-buffers reserved]
