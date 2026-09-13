@@ -871,7 +871,10 @@
    Copy-halo replicas may complete the domain with `{:kind :replica :transfer step-id}`;
    their geometry is derived from ScheduledHalo and their steps must precede the consumer.
    Exact disjoint coverage is checked. This is not freshness/initialization or execution proof;
-   explicit boundary producers and combining transfers are not yet admitted as placements."
+   boundaries name an exact ABI-written local value of a preceding same-device compute step
+   via `{:kind :boundary :region {...} :provider {:step id :local-value id}}`. Such private
+   outputs are retained under the producer entry's `:boundary-outputs`, without a synthetic
+   global shard. Combining transfers are not admitted as copy-replica placements."
   [plan]
   (compute/bindings (validate-structure! plan)))
 
