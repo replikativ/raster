@@ -207,11 +207,21 @@
 (deftest i8-activation-packing-uses-typed-kernel-body
   (let [compiled (pipeline/show-pipeline #'qk/quant-act-i8-rows-gpu!
                                          :target-device :ocl:0 :dtype :float)
-        report (report/from-pipeline compiled)]
+        report (report/from-pipeline compiled)
+        kernel (first (:kernels compiled))
+        nodes (tree-seq coll? seq (get-in kernel [:attributes :kernel-body :operations]))]
     (is (= :typed-soac (get-in report [:route :source-dialect])))
     (is (true? (get-in report [:route :typed-validated])))
     (is (= {:kernel-body 1} (get-in report [:emission :routes])))
-    (is (empty? (get-in report [:emission :declines])))))
+    (is (empty? (get-in report [:emission :declines])))
+    (is (some #(and (map? %)
+                    (= :cast (:op %))
+                    (= :int (:result-type %))
+                    (= :wrap (get-in % [:options :overflow])))
+              nodes)
+        "packed int8 lanes retain explicit bit-pattern narrowing")
+    (is (not (re-find #"rstr_trap_cast_i64_i32" (:source kernel)))
+        "packing must not emit a checked narrowing that traps when bit 31 is set")))
 
 (deftest row-capable-q4k-path-lowers-through-the-shared-gpu-pipeline
   (let [quant-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-rows-gpu!

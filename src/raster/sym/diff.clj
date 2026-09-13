@@ -50,6 +50,11 @@
     ;; Other atom (symbol, number, nil, etc.)
     (not (seq? expr)) 0
 
+    ;; This is symbolic calculus, not evaluation of an effectful source expression. A subtree
+    ;; independent of the differentiation variable is constant. Resolve that fact here instead
+    ;; of relying on the compiler simplifier to erase an arbitrary expression multiplied by zero.
+    (not (depends-on? expr var-sym)) 0
+
     :else
     (let [[op & args] expr]
       (cond
