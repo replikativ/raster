@@ -2000,7 +2000,7 @@
             (let [id (rename dimension)]
               (if (symbol? id) id (list 'value id)))
 
-            (and (seq? dimension) (contains? #{'value 'unknown-dimension} (first dimension))
+            (and (seq? dimension) (contains? #{'value 'extent 'unknown-dimension} (first dimension))
                  (= 2 (count dimension))
                  (contains? value-map (second dimension)))
             (list (first dimension) (rename (second dimension)))

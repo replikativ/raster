@@ -13,7 +13,9 @@
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
+            [raster.dl.array-ops :as array-ops]
             [raster.numeric]
+            [raster.ode.pde :as pde]
             [raster.par]
             [raster.runtime.hardware :as hardware]))
 
@@ -377,6 +379,36 @@
       (is (= [module-target] (mapv :target (:kernels compilation))))
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest counted-softmax-initializers-use-the-public-c-family-boundary
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'attention/softmax-rows!
+                                            {:target target :dtype :float})
+          plan (equation-first/lower compilation [(float-array 6) 2 3])]
+      (is (= 4 (count (:kernels compilation))))
+      (is (every? #(< (count (:source %)) 32768) (:kernels compilation))
+          "the polynomial's shared scalar spine must not expand into megabytes of source")
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
+
+(deftest counted-mixed-precision-stores-use-explicit-destination-conversion
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'array-ops/reduce-axis-backward
+                                            {:target target :dtype :float})]
+      (is (seq (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest heat-2d-counted-stores-use-the-public-c-family-boundary
+  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile #'pde/heat-rhs-2d!
+                                            {:target target :dtype :double})
+          plan (equation-first/lower compilation
+                                     [(double-array 35) (double-array 35)
+                                      5 7 0.25 4.0 9.0])]
+      (is (seq (:kernels compilation)))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in plan [:attributes :driver-allocations]))))))
 
 (deftest emitted-program-rejects-a-mixed-target-module
   (let [compilation (equation-first/compile

@@ -233,9 +233,13 @@
                                   body-with-lets (if (seq all-lets)
                                                    (list 'let* (vec (mapcat identity all-lets)) body)
                                                    body)
-                                  flat-idx (gensym "flat_idx__")
-                                  flat-body (list 'let* [i-sym (list 'clojure.core/quot flat-idx cols-expr)
-                                                         j-sym (list 'clojure.core/rem flat-idx cols-expr)]
+                                  ;; These coordinates are generated from the Long counted
+                                  ;; domain, not inferred from the stored element's dtype.
+                                  flat-idx (with-meta (gensym "flat_idx__") {:raster.type/tag 'long})
+                                  row-id (vary-meta i-sym assoc :raster.type/tag 'long)
+                                  col-id (vary-meta j-sym assoc :raster.type/tag 'long)
+                                  flat-body (list 'let* [row-id (list 'clojure.core/quot flat-idx cols-expr)
+                                                         col-id (list 'clojure.core/rem flat-idx cols-expr)]
                                                   body-with-lets)]
                               {:out-sym out-sym
                                :index-sym flat-idx

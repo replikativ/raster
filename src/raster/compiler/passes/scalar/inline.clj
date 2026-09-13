@@ -45,13 +45,15 @@
    inlinable, as are bare value-type constructor tails (see value-ctor-call?)
    and branch forms (if / case*) whose whole body is a single value expression
    the inliner substitutes into the call site (e.g. predicate/lookup helpers like
-   chunk-block, block-solid?). Other bare function calls are not — they need
-   let* wrapping for the inliner to decompose."
+   chunk-block, block-solid?), symbols and literal values. Other bare function calls
+   are not — they need let* wrapping for the inliner to decompose."
   [body]
-  (and (seq? body)
-       (or (contains? #{:binding :scope :do :invk :par :branch}
-                      (:kind (form/form-info body)))
-           (value-ctor-call? body))))
+  (or (symbol? body) (number? body) (string? body) (keyword? body)
+      (nil? body) (boolean? body) (char? body)
+      (and (seq? body)
+           (or (contains? #{:binding :scope :do :invk :par :branch}
+                          (:kind (form/form-info body)))
+               (value-ctor-call? body)))))
 
 (def ^:private prim-or-array-tags
   "Tags that are safe for inlining even when body has scoped forms.
@@ -126,21 +128,46 @@
         n (if-let [i (str/index-of n "_m_")] (subs n 0 i) n)]
     (symbol (namespace impl-sym) n)))
 
-(def ^:private trivial-cast?
-  "Cast/coercion calls that are cheap to duplicate — single arg, no allocation."
-  #{'long 'double 'float 'int 'byte 'short 'char
-    'unchecked-long 'unchecked-double 'unchecked-float 'unchecked-int
-    'clojure.core/long 'clojure.core/double 'clojure.core/float 'clojure.core/int
-    'clojure.core/byte 'clojure.core/short 'clojure.core/char})
-
 (defn- needs-arg-lift?
-  "True if arg is a non-trivial expression that should be lifted to a let binding
-   before parameter substitution. Prevents duplication when callee params appear
-   multiple times (e.g. inside par/pmap bodies where CSE can't reach)."
+  "Evaluate nonconstant expression arguments once before substitution, even when unused.
+   Casts are expressions too: checked conversion may throw, and its operand may
+   have effects. Only the shared checked constant evaluator may prove a call safe
+   to substitute directly; a failing conversion never supplies that evidence."
   [arg]
-  (and (seq? arg)
-       (let [head (first arg)]
-         (not (trivial-cast? head)))))
+  (and (coll? arg) (nil? (constant/value arg))))
+
+(defn- check-inline-arity! [callee params args call]
+  (when (not= (count params) (count args))
+    (throw (ex-info
+            (str "Arity mismatch inlining `" callee "`: it takes "
+                 (count params) " arg(s) but the call passes " (count args)
+                 ". A deftm has no variadic or multi-arity form.")
+            {:callee callee :expected-arity (count params) :actual-arity (count args)
+             :params (vec params) :args (vec args) :form call}))))
+
+(defn- argument-substitution
+  "Build a call-by-value substitution, emitting argument bindings in source order."
+  [params args tags source-env emit!]
+  (into {}
+        (map-indexed
+         (fn [i p]
+           (let [a (nth args i)
+                 t (when tags (nth tags i nil))
+                 typed? (and t (not (arg-subst-skip-tags t)) (symbol? a)
+                             (not (.contains (str t) "IFn__")))]
+             (if (or typed? (needs-arg-lift? a))
+               ;; A new binder must retain the argument's actual source type. The formal
+               ;; parameter may widen it; stamping that consumer type here loses precision
+               ;; boundaries. Use the same metadata/environment authority as call resolution.
+               (let [source-tag (when-not typed? (inf/infer-arg-tag a source-env))
+                     id (with-meta (gensym (str "arg_" (name p) "_"))
+                                   (if typed? {:tag t}
+                                       (cond-> (meta a)
+                                         source-tag (assoc :raster.type/tag source-tag))))]
+                 (emit! [id a])
+                 [p id])
+               [p a])))
+         params)))
 
 (defn- safe-to-inline?
   "Check if a resolved deftm body is safe to inline.
@@ -1062,9 +1089,11 @@
                              single-use? (<= (get sym-uses ftm-sym 0) 1)]
                          (when (and (= (count params) (count args))
                                     (or inline? single-use?))
-                           (subst-syms (zipmap params args) body))))]
+                           (let [subst (argument-substitution
+                                        params args nil @type-env #(swap! result-pairs conj %))]
+                             {:body (subst-syms subst body)}))))]
                  (if beta-result
-                   (do (swap! result-pairs conj [sym beta-result])
+                   (do (swap! result-pairs conj [sym (:body beta-result)])
                        (reset! any-inlined? true))
        ;; Check for (nth <vg-sym> N) — resolve to element symbol
                    (let [nth-resolved
@@ -1099,20 +1128,7 @@
                  ;; no overload resolves, the call is left symbolic, and reverse-AD
                  ;; reports "No AD template for <callee>".) A deftm call with the wrong
                  ;; number of args is always a bug — say so, at the call.
-                                 _ (when (not= (count params) (count args))
-                                     (throw (ex-info
-                                             (str "Arity mismatch inlining `" head "`: it takes "
-                                                  (count params) " arg(s) " (pr-str (vec params))
-                                                  " but the call passes " (count args) " "
-                                                  (pr-str (vec args))
-                                                  ". Fix the call site — a deftm has no variadic or "
-                                                  "multi-arity form, so this call can never dispatch.")
-                                             {:callee head
-                                              :expected-arity (count params)
-                                              :actual-arity (count args)
-                                              :params (vec params)
-                                              :args (vec args)
-                                              :form init})))
+                                 _ (check-inline-arity! head params args init)
                  ;; Handle multi-form bodies: wrap in (do ...) if more than one form
                                  body-form (if (> (count walked-body) 1)
                                              (list* 'do walked-body)
@@ -1125,35 +1141,9 @@
                  ;; 2. Non-trivial call expressions: prevents duplication when the param
                  ;;    appears multiple times in the callee body (e.g. inside par/pmap
                  ;;    where CSE can't extract the duplicate afterward)
-                                 skip-tags arg-subst-skip-tags
                                  param-subst
-                                 (into {}
-                                       (map-indexed
-                                        (fn [i p]
-                                          (let [a (nth args i)
-                                                t (when tags (nth tags i nil))]
-                                            (cond
-                              ;; Record/value type — emit typed binding
-                                              (and t (not (skip-tags t))
-                                                   (not (and t (.contains (str t) "IFn__")))
-                                                   (symbol? a))
-                                              (let [typed-sym (with-meta (gensym (str (name p) "_"))
-                                                                {:tag t})]
-                                                (swap! result-pairs conj [typed-sym a])
-                                                [p typed-sym])
-
-                              ;; Non-trivial call arg — lift to prevent duplication
-                                              (needs-arg-lift? a)
-                                              (let [lifted-sym (with-meta (gensym (str "arg_" (name p) "_"))
-                                                                 (meta a))]
-                                                (swap! result-pairs conj [lifted-sym a])
-                                                [p lifted-sym])
-
-                              ;; Simple arg (symbol, constant, trivial cast)
-                                              :else
-                                              [p a]))))
-                                       callee-params)
-                                 body-head (first body-form)]
+                                 (argument-substitution callee-params args tags @type-env
+                                                        #(swap! result-pairs conj %))]
                              (if (form/binding-form? body-form)
                                (let [[_ inner-bindings & inner-body] body-form
                                      inner-pairs (partition 2 inner-bindings)
@@ -1298,7 +1288,7 @@
   ([form] (inline-invk form {}))
   ([form {:keys [preserve-templates?] :as policy}]
    (cond
-     (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
+     (and (seq? form) (= '.invk (first form)) (>= (count form) 2))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
            ;; Keep an op symbolic for reverse-AD only if it has a REVERSE rule
@@ -1312,6 +1302,7 @@
                         (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
+               _ (check-inline-arity! impl-sym params (drop 2 form) form)
                body-form (first walked-body)
                safe? (safe-to-inline? deftm-info)
                ;; size policy: large straight-line callees become calls (wasm path);
@@ -1326,36 +1317,14 @@
                    new-args (map #(inline-invk % policy) args)]
                (util/make-invk impl-sym new-args (meta form)))
              ;; Simple body -- safe to inline
-             (let [args (vec (drop 2 form))
+             (let [args (mapv #(inline-invk % policy) (drop 2 form))
                    {:keys [tags]} deftm-info
                    callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-                   skip-tags arg-subst-skip-tags
                    ;; ANF lifting + typed bindings — same logic as inline-one-pass
                    lifted-bindings (atom [])
                    param-subst
-                   (into {}
-                         (map-indexed
-                          (fn [i p]
-                            (let [a (nth args i nil)
-                                  t (when tags (nth tags i nil))]
-                              (cond
-                                (and t (not (skip-tags t))
-                                     (not (and t (.contains (str t) "IFn__")))
-                                     (symbol? a))
-                                (let [typed-sym (with-meta (gensym (str (name p) "_"))
-                                                  {:tag t})]
-                                  (swap! lifted-bindings conj typed-sym a)
-                                  [p typed-sym])
-
-                                (needs-arg-lift? a)
-                                (let [lifted-sym (with-meta (gensym (str "arg_" (name p) "_"))
-                                                   (meta a))]
-                                  (swap! lifted-bindings conj lifted-sym a)
-                                  [p lifted-sym])
-
-                                :else
-                                [p a]))))
-                         callee-params)
+                   (argument-substitution callee-params args tags *param-env*
+                                          #(swap! lifted-bindings into %))
                    inlined (subst-syms param-subst body-form)
                    ;; mark this callee as on the inline stack while re-processing its
                    ;; body, so a recursive self-call inside stays a call (terminates)
@@ -1379,11 +1348,14 @@
            r (apply list head new-bindings new-body)]
        (if-let [m (meta form)] (with-meta r m) r))
 
-     ;; Scope-introducing forms -- recurse into body only (not binding vector)
+     ;; Scope initializers and outer operands are values, but binder names and par
+     ;; layout are structural. Reuse the shared decomposition without hoisting anything.
      (and (seq? form) (form/scope-form? form))
-     (let [[head binding & body] form
-           r (apply list head binding (map #(inline-invk % policy) body))]
-       (if-let [m (meta form)] (with-meta r m) r))
+     (if-let [{:keys [scopes outer rebuild]} (form/scope-info form)]
+       (let [transform #(mapv (fn [expression] (inline-invk expression policy)) %)]
+         (rebuild (mapv #(-> % (update :inits transform) (update :body transform)) scopes)
+                  (transform outer)))
+       form)
 
      ;; do block -- recurse into all expressions
      (and (seq? form) (= 'do (first form)))

@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.par]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -8,9 +9,96 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.util :as util]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(deftest generated-row-major-coordinates-carry-their-domain-type
+  (let [matched (patterns/match-nested-dotimes-row-major-map
+                 '(dotimes [i rows]
+                    (dotimes [j cols]
+                      (aset out (+ (* i cols) j) 1.0))))
+        locals (take-nth 2 (second (:value-expr matched)))]
+    (is (some? matched))
+    (is (= ['long 'long] (mapv #(get (meta %) :raster.type/tag) locals)))
+    (is (some? (#'frontend/typed-map-region (:value-expr matched))))))
+
+(deftest map-let-spines-become-typed-locals
+  (let [body '(let* [^float p1 (* (aget x i) (aget x i))
+                    ^float p2 (* p1 p1)
+                    ^float p3 (* p2 p2)] p3)
+        source (list 'let* ['y (list 'raster.par/pmap 'i 'n 'float body)] 'y)
+        program (frontend/form->program source
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'n :long}})
+        parts (dialect/operation-parts (first (dialect/equations program)))
+        region (dialect/lambda-parts (:lambda parts))]
+    (is (some? program))
+    (is (= 3 (count (:locals region))))
+    (is (= '[p1 p2 p3] (mapv :id (:locals region))))))
+
+(deftest map-let-spines-require-complete-scalar-type-evidence
+  (doseq [body ['(let* [p (* x x)] p)
+                '(let* [^float p (* x x) ^float p (* p p)] p)
+                '(let* [^float p (* x x)] (observe! p) p)
+                '(let* [^floats p x] p)]]
+    (is (nil? (#'frontend/typed-map-region body)))))
+
+(deftest counted-store-loops-use-the-existing-effect-dialect
+  (let [source '(let* [result (dotimes [i n]
+                               (aset out i 1.0)
+                               (aset scratch i 2.0))] result)
+        options {:dtype :double :array-types {'out :double 'scratch :double}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        bindings (second normalized)
+        program (frontend/form->program normalized options)
+        run (fn [form n]
+              (let [out (double-array 3) scratch (double-array 3)
+                    f (eval (list 'fn '[n out scratch] form))]
+                (try
+                  [(f n out scratch) (vec out) (vec scratch)]
+                  (catch Exception e [(class e) (vec out) (vec scratch)]))))]
+    (is (some? program))
+    (is (= 'long (:tag (meta (first bindings)))))
+    (is (= 'raster.par/map-void! (first (last bindings))))
+    (is (= normalized (frontend/normalize-source normalized options)))
+    (doseq [n [Long/MIN_VALUE -1 0 1 3 2147483648 Long/MAX_VALUE]]
+      (is (= (run source n) (run normalized n)) (str "count " n)))))
+
+(deftest counted-conflicting-stores-retain-order-and-explicit-buffer-return
+  (let [options {:dtype :double :array-types {'out :double} :scalar-types {'n :long}}
+        source '(let* [r (dotimes [i n] (aset out 0 (double i)))] out)
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        equation (last (dialect/equations program))
+        result (first (nth equation 2))
+        renamed (dialect/remap-values program {'out [:argument 0] result [:result 0]})]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= :sequential (:iteration-order (:attributes (dialect/operation-parts equation)))))
+    (is (= [result] (dialect/outputs program)))
+    (is (= '[(extent out)] (get-in (dialect/facts program) [:values result :shape])))
+    (is (= '[(extent [:argument 0])]
+           (get-in (dialect/facts renamed) [:values [:result 0] :shape])))
+    (is (= [[:argument 0]]
+           (dialect/physical-results renamed (last (dialect/equations renamed)))))))
+
+(deftest counted-stores-preserve-source-rounding-before-destination-conversion
+  (let [options {:dtype :double :array-types {'out :double 'x :double}
+                 :scalar-types {'n :long}}
+        source '(let* [r (dotimes [i n] (aset out 0 (float (aget x i))))] out)
+        program (frontend/form->program (frontend/normalize-source source options) options)]
+    (is (some? program))
+    (is (some #(and (seq? %) (= 'double (first %))
+                    (seq? (second %)) (= 'float (first (second %))))
+              (tree-seq coll? seq (last (dialect/equations program))))
+        "widen the source-rounded float; do not replace its cast with a double cast")))
+
+(deftest unknown-or-mutable-counts-are-not-normalized
+  (doseq [bound ['(next-count!) '(aget counts 0)]]
+    (let [source (list 'let* ['r (list 'dotimes ['i bound] '(aset out i 1.0))] 'r)]
+      (is (= source (frontend/normalize-source source
+                                              {:array-types {'out :double 'counts :long}}))))))
 
 (def ^:private source
   '(let* [^long n (clojure.core/alength x)
@@ -255,8 +343,9 @@
                (first (:body-results (dialect/lambda-parts (:lambda operation)))))]
     (is (= 'scatter (:kind operation)))
     (is (= :unique (get-in operation [:attributes :conflict])))
-    (is (= '[indices src out] (dialect/operation-inputs equation)))
-    (is (= {:destination-index '%element0 :predicate 1 :value '%element1} write))
+    (is (= '[indices out src] (dialect/operation-inputs equation)))
+    (is (= {:destination-index '(clojure.core/aget %capture0 i) :predicate 1
+            :value '(clojure.core/aget %capture2 i)} write))
     (is (= [{:destination 'out :access :read-write :host-return :effect}]
            (get-in (dialect/facts program) [:equations 0 :attributes :result-storage])))
     (is (= :analyzed-source
@@ -281,7 +370,7 @@
     (is (= 'scatter (:kind operation)))
     (is (= :unique (get-in operation [:attributes :conflict])))
     (is (= '(clojure.core/+ %capture0 i) (:destination-index write)))
-    (is (= '[src base out] (dialect/operation-inputs equation)))
+    (is (= '[base out src] (dialect/operation-inputs equation)))
     (is (= [{:destination 'out :access :read-write :host-return :buffer}]
            (dialect/result-storage program (second equation))))))
 

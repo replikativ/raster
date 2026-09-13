@@ -7,6 +7,7 @@
             [raster.numeric :as n]
             [raster.arrays :refer [aget aset alength]]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.walker :as walker]
             [raster.ad.reverse :as rev]))
 
 ;; ================================================================
@@ -102,13 +103,15 @@
 ;; ================================================================
 
 (deftest cc10-anf-flatten-preserves-effects
-  (testing "walker.clj ANF flatten splices intermediate effects as bindings"
-    (let [src (slurp "src/raster/compiler/core/walker.clj")
-          ;; Must use butlast/last pattern, not just (last inner-body)
-          idx (.indexOf src "ANF flattening")
-          section (subs src idx (min (+ idx 800) (count src)))]
-      (is (.contains section "butlast")
-          "ANF flattening must use butlast to preserve intermediate forms"))))
+  (testing "ANF flattening preserves intermediate effects in their original order"
+    (let [walked (walker/walk-body
+                  '(let* [result (let* [value 7]
+                                   (println "first") (println "second") value)] result)
+                  {:type-env {}})
+          result (atom nil)
+          output (with-out-str (reset! result (eval walked)))]
+      (is (= 7 @result))
+      (is (= "first\nsecond\n" output)))))
 
 ;; ================================================================
 ;; CC5/CC4: dotimes AD backward must not double-invoke mapcat

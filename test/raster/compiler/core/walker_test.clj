@@ -16,6 +16,13 @@
 ;; classify-form
 ;; ================================================================
 
+(deftest loop-initializer-lets-do-not-add-recur-parameters
+  (let [walked (wb '(loop* [i 0 acc (let* [seed (+ i 2)] seed)]
+                     (if (< i 3) (recur (inc i) (+ acc i)) acc)))]
+    (is (= ['i 'acc] (vec (take-nth 2 (second walked)))))
+    (is (= 'let* (first (nth (second walked) 3))))
+    (is (= 5 (eval walked)))))
+
 (deftest operand-return-contract-is-carried-into-following-bindings
   (doseq [init ['(raster.par/contract out [[i n]] [[j n]] 1.0)
                 '(raster.par/reduce-by-key out keys values n +)]]

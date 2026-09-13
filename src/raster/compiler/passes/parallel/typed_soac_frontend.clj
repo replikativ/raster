@@ -152,6 +152,17 @@
                  (every? :dtype locals))
         locals))))
 
+(defn- typed-map-region
+  "Preserve a map's typed lexical spine instead of expanding shared expressions."
+  [expression]
+  (if (and (seq? expression) (form/let-head? (first expression)))
+    (let [[_ bindings & results] expression
+          locals (typed-region-locals bindings)]
+      (when (and (= 1 (count results)) (some? locals)
+                 (every? (comp simple-symbol? :id) locals))
+        {:locals locals :body (first results)}))
+    {:locals [] :body expression}))
+
 (defn- substitute-store
   [substitutions store]
   (reduce (fn [store field]
@@ -1213,11 +1224,14 @@
           elem-type (dtype/canon (or elem-type
                                      (dtype/dtype-for-scalar-tag cast)
                                      default-dtype))
-          io (extract-io body idx [symbol])]
-      (merge {:kind :map :id id :sym symbol :results [symbol]
-              :index idx :extent bound :locals [] :casts [cast] :bodies [body]
-              :pure? true :elem-type elem-type}
-             io))
+          io (extract-io body idx [symbol])
+          region (typed-map-region body)]
+      (when region
+        (merge {:kind :map :id id :sym symbol :results [symbol]
+                :index idx :extent bound :locals (:locals region)
+                :casts [cast] :bodies [(:body region)]
+                :pure? true :elem-type elem-type}
+               io)))
 
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
@@ -1231,15 +1245,17 @@
                                      (when (symbol? out) (get array-types out))
                                      default-dtype))
           write-index (when offset (list 'clojure.core/+ offset idx))
-          io (extract-io (if offset (list 'do write-index body) body) idx [out])]
+          io (extract-io (if offset (list 'do write-index body) body) idx [out])
+          region (typed-map-region body)]
       ;; A binder with the same spelling as the caller-owned destination needs distinct value/view
       ;; identity before it can be SSA. Every other offset map is an injective partial write:
       ;; destination[base+i] is a typed unique scatter, not a map carrying an emitter-only offset.
       ;; The destination is read/write because elements outside the slice remain observable.
-      (when-not (= symbol out)
+      (when (and region (not= symbol out))
         (if offset
           (merge {:kind :scatter :id id :sym symbol :results [symbol]
-                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :index idx :extent bound :locals (:locals region)
+                  :casts [cast] :bodies [(:body region)]
                   :write-indices [write-index] :predicates [1] :conflict :unique
                   :result-storage [{:destination out :access :read-write
                                     :host-return :buffer}]
@@ -1247,7 +1263,8 @@
                   :source-operation :raster.par/map-offset}
                  io)
           (merge {:kind :map :id id :sym symbol :results [symbol]
-                  :index idx :extent bound :locals [] :casts [cast] :bodies [body]
+                  :index idx :extent bound :locals (:locals region)
+                  :casts [cast] :bodies [(:body region)]
                   :result-storage [{:destination out
                                     :access (if (contains? (:inputs io) out) :read-write :write)
                                     :host-return :buffer}]
@@ -1831,6 +1848,31 @@
             (with-meta (apply list (assoc (vec expression) position id)) (meta expression))]))))
    [state expression] inputs))
 
+(defn- normalize-counted-store-loop
+  "Express a closed source store loop through the existing effect-map boundary.
+   This spelling grants no parallelism: write-region analysis still proves its order.
+   Preserve dotimes' single Long conversion and empty nonpositive domain."
+  [expression]
+  (if (and (seq? expression)
+           (contains? '#{dotimes clojure.core/dotimes} (first expression))
+           (not (contains? util/*shadowing-locals* (first expression)))
+           (vector? (second expression))
+           (= 2 (count (second expression)))
+           (symbol? (first (second expression))))
+    (let [[idx bound] (second expression)
+          body (list* 'do (nnext expression))]
+      (if (and (provably-pure-scalar? bound)
+               ;; Reading mutable storage cannot be shared with a later extent equation.
+               (empty? (par/collect-aget-arrays bound))
+               (store-region body idx))
+        (with-meta
+          (list 'raster.par/map-void! idx
+                (list 'clojure.core/long bound)
+                body)
+          (meta expression))
+        expression))
+    expression))
+
 (defn- normalize-source*
   [source scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
@@ -1866,6 +1908,19 @@
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
                                           [state expression])
+                     counted-expression (normalize-counted-store-loop expression)
+                     [state expression] (if (= expression counted-expression)
+                                          [state expression]
+                                          (let [[state counted] (normalize-fixed-scalar-inputs
+                                                                 state counted-expression [[2 :long]])
+                                                count-id (nth counted 2)
+                                                extent (with-meta
+                                                         (list 'if (list 'clojure.core/< count-id 0)
+                                                               0 count-id)
+                                                         {:tag 'long :raster.type/tag 'long})]
+                                            (normalize-fixed-scalar-inputs
+                                             state (apply list (assoc (vec counted) 2 extent))
+                                             [[2 :long]])))
                      local-scalar-types (:local-scalar-types state)
                      expression (->> expression
                                      (canonicalize-strided-indexed-operation ordinal)
@@ -2443,10 +2498,10 @@
         values (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
         destinations (mapv :destination result-storage)
         semantic-inputs (into (set inputs) destinations)
-        all-expressions (vec (concat (map :init locals) write-indices predicates values))
-        [pointwise stable]
-        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
-        arrays (vec (sort-by pr-str pointwise))
+        ;; Indexed updates do not assert that a captured buffer's capacity equals the
+        ;; update domain. Preserve indexed reads and the buffer's own shape contract.
+        stable semantic-inputs
+        arrays []
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -2470,26 +2525,18 @@
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms writes)))))
 
-(defn- effect-expressions
-  "Every expression an effect evaluates, descending into store loops."
-  [effect]
-  (if-let [region (:region effect)]
-    (concat (map :init (:locals region)) (mapcat effect-expressions (:effects region)))
-  (if-let [{:keys [effects] :as loop} (:loop effect)]
-    (concat (source-loop-expressions loop) (mapcat effect-expressions effects))
-    [(:index effect) (:predicate effect) (:value effect)])))
-
 (defn- effect-map-equation
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
+        destination-dtypes (zipmap destinations result-dtypes)
         destination-set (set destinations)
-        all-expressions (vec (concat (map :init locals)
-                                     (mapcat effect-expressions effects)))
         semantic-inputs (set/difference (set inputs) destination-set)
-        [pointwise stable]
-        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
-        arrays (vec (sort-by pr-str pointwise))
+        ;; An effect traversal need not cover the complete physical input. Keep explicit
+        ;; indexed reads instead of giving a pointwise capture the traversal's shape: e.g.
+        ;; a clamped counted loop may read a prefix of an already-shaped producer.
+        stable semantic-inputs
+        arrays []
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         element-parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -2534,7 +2581,11 @@
                 (list 'effect-loop attributes (transform extent) lambda)))
             (list 'effect (get destination-substitutions out)
                   effect-conflict (transform index) (transform predicate)
-                  (transform (if cast (list cast value) value))))))
+                  ;; Primitive aset converts to the destination element type. Preserve any
+                  ;; source conversion inside that store conversion, rather than asking the
+                  ;; target emitter to infer or silently coerce a mismatched scalar value.
+                  (transform (list (dtype/scalar-tag-for-dtype (get destination-dtypes out))
+                                   (if cast (list cast value) value)))))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map
@@ -2824,13 +2875,11 @@
         destination-results
         (into {}
               (mapcat (fn [description]
-                        (keep (fn [[result {:keys [destination host-return]}]]
-                                ;; Effect-only operations expose their destinations through the
-                                ;; reconstructed host form, not as numerical TypedSOAC results.
-                                ;; Only value-returning storage contracts may rewrite a terminal
-                                ;; physical destination to its logical SSA result.
-                                (when (= :buffer host-return)
-                                  [destination result]))
+                        (map (fn [[result {:keys [destination]}]]
+                               ;; The operation itself may return nil, but an explicit later
+                               ;; read/return of its destination observes the latest stored value.
+                               ;; Do not confuse the loop's host return with the buffer's identity.
+                               [destination result])
                               (map vector (:results description)
                                    (:result-storage description)))))
               descriptions)
@@ -2901,7 +2950,8 @@
 (defn- ordinary-equation-values
   [equation default-dtype array-types scalar-types known-values]
   (let [[_ _ results] equation
-        {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
+        {:keys [kind attributes arrays captures destinations]} (dialect/operation-parts equation)
+        result-destinations (zipmap results destinations)
         extent (:extent attributes)
         dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
         dimension-value
@@ -2969,7 +3019,10 @@
                                          segmented-fold-map
                                          (dialect/segmented-fold-map-result-shape attributes)
                                          scan (dialect/scan-result-shape attributes)
-                                         (scatter effect-map) [(list 'unknown-dimension id)]
+                                         scatter [(list 'unknown-dimension id)]
+                                         ;; An effect updates existing storage, not a dense
+                                         ;; tensor whose length is the iteration count.
+                                         effect-map [(list 'extent (get result-destinations id))]
                                          (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 

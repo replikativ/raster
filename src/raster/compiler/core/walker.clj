@@ -755,8 +755,10 @@
                  ;; ANF flattening: if a typed-macro expansion returns (let* [...] body),
                  ;; splice the inner bindings into the parent let and use the body as
                  ;; the init. This keeps the IR flat for fusion and bytecode compilation.
+                 ;; Never splice into a loop: each binding is also a recur parameter.
                  [extra-binds rewritten-init]
-                 (if (and (seq? rewritten-init) (= 'let* (first rewritten-init)))
+                 (if (and (form/let-head? let-sym)
+                          (seq? rewritten-init) (= 'let* (first rewritten-init)))
                    (let [[_ inner-bindings & inner-body] rewritten-init
                          ;; CC10 fix: splice intermediate effectful forms as bindings
                          ;; so they are not silently dropped

@@ -9,6 +9,15 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
+(deftest scalar-source-assembly-preserves-context-order
+  (with-redefs-fn {#'opencl/emit-scalar-operation
+                  (fn [operation context depth]
+                    [(str depth ":" context ":" operation ";") (inc context)])}
+    (fn []
+      (is (= ["" 7] (#'opencl/emit-scalar-operations [] 7 2)))
+      (is (= ["2:7:a;2:8:b;2:9:c;" 10]
+             (#'opencl/emit-scalar-operations ["a" "b" "c"] 7 2))))))
+
 (defn- scalar-kernel-body []
   (let [group 'query-row
         lane 'lane

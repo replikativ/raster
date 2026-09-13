@@ -1127,6 +1127,44 @@ must still fail target checks rather than narrow. Raw store-loop normalization c
 use one typed Long scalar extent `max(0, long(bound))` and the existing effect-region analysis,
 with sequential order retained until a dependence proof permits parallel scheduling.
 
+The source normalization now uses that existing effect-map boundary: a closed raw `dotimes`
+store region keeps every body form, performs the Long conversion at its original site, and
+clamps negative counts through an ordinary typed scalar conditional. Unknown/effectful or
+mutable-array-derived bounds remain outside this normalization. No new operation registry or
+semantic loop dialect is introduced. An explicit returned destination observes its latest write
+even when the loop itself returns nil. Effect result shapes project the physical destination's
+extent, and that projection participates in ordinary SSA remapping.
+
+The existing `heat-rhs-2d!` now compiles and links through the direct CUDA/HIP boundary without
+driver allocation. A local Level Zero numerical regression compares all cells against the CPU
+for 2×3 (empty interior) and 5×7 grids with nonzero initial destination contents. This establishes
+local execution correctness, not a competitive parallel stencil schedule, distributed execution,
+or a performance result. The next distributed seam remains exact local-program/shard binding,
+followed by numerical halo execution and real-byte durable restore.
+
+The counted-loop migration also exposes `softmax-rows!` as an end-to-end scalar-sharing
+regression. Pure, destination, and offset maps now project a complete typed lexical `let`
+spine into ordered TypedSOAC locals instead of embedding it in one expression for later
+substitution. Missing local type evidence declines admission rather than inventing a consumer
+type. This preserves each intermediate once through SegMap and KernelBody. On the existing
+softmax exponential polynomial, the generated kernel dropped from 25,599 scalar computes and
+3,379,887 source bytes to 24 computes and 2,259 bytes. CUDA/HIP source-size ratchets and local
+Level Zero numerical parity cover this case; these are not throughput or SOTA benchmark claims.
+The shared inliner likewise retains actual argument types and once-only evaluation (including
+unused checked conversions), and never flattens initializer bindings into loop/recur parameters.
+
+Coverage accounting distinguishes newly admitted sequential store work from formerly parallel
+work becoming serialized. The migration's new sequential regions include host loops previously
+outside typed coverage; they do not establish a competitive schedule. The serialization ratchet
+remains in force, with deliberate baseline changes requiring an audit of the previous workload
+route and preservation of existing independent regions.
+The refreshed 236-var baseline admits 23 such regions: 19 previously scalar programs,
+previously compatible `softmax-rows!`, and three partially typed programs (`maxpool2d-bwd!`,
+`mean-pool`, `dense-into!`) whose old typed kernels covered initialization/copy/final scaling
+while the counted loops remained host work. Their existing independent kernels are retained.
+The resulting route counts are 132 typed, 47 scalar, 14 compatible, and 43 errors; the 43 errors
+remain visible debt rather than being excluded from the corpus.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
