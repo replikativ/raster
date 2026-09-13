@@ -4,7 +4,7 @@ Status: owned-domain normalization and copy-replica geometry/coverage are implem
 boundary producers, freshness, endpoint realization and execution remain a reviewed plan.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
-placement that covers the entire local domain. Its report retains the original ABI leaf views and
+placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
 adds a checked `:domain` with the reshaped view and owned placement. A flat `[6]` leaf can explicitly
 realize a `[2 3]` shard. Copy replicas can now complete a padded domain: their destination rectangles
 are derived from validated ScheduledHalo steps, anchored at the owned region, and checked for exact
