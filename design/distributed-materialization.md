@@ -1,9 +1,9 @@
 # Distributed materialization and execution boundary
 
 Status: owned-domain normalization, copy-replica geometry/coverage and exact boundary
-provider bindings and contiguous halo endpoint projection are implemented; initialization/freshness,
-runtime allocation/transport realization and execution
-remain a reviewed plan.
+provider bindings, contiguous halo endpoint projection and conditional DAG readiness are implemented.
+Source realization, resource ownership/lifetimes, runtime allocation/transport and execution remain
+a reviewed implementation plan.
 
 The current `distributed-plan/compute-bindings` accepts an explicit `:local-shape` with one owned
 placement and optional copy replicas that together cover the entire local domain. Its report retains the original ABI leaf views and
@@ -150,6 +150,23 @@ policy exists. These helpers establish geometry only; the DAG checker must retai
 on each fragment and reject unordered conflicting effects and stale replicas.
 The existing `overlaps?` and `same-range?` predicates use the same device-scoped identity;
 zero-byte views never overlap a nonempty range, including when their offset lies inside it.
+
+`distributed-plan/check-readiness` now combines the local contracts, strict copy endpoints and
+region operations into a conditional DAG check. Every compute must bind an executable local plan.
+The checker rejects unordered read/write conflicts (including private local effect scopes),
+requires complete typed coverage before a read, and checks that replica/boundary regions still
+originate from their declared transfer/provider. A later writer removes that provenance while
+preserving disjoint fragments. Being initialized is therefore not enough to satisfy a stale replica.
+
+The returned `:initializers` are explicit obligations: all declared host sources must be realized
+once before the DAG, with no implicit later reuploads. Overlapping initializers must identify the
+same source object and exact view; this is deliberately conservative and is not source snapshot
+certification. Initializer scopes are currently required at each local invocation conservatively.
+`:actions` records required/read/write/produced scopes, and `:final-regions` retains producer IDs.
+This is not a runnable distributed executable or a full ownership/semantic-equivalence certificate.
+Allocation sharing, private-storage lifetime isolation, runtime pending-input reconciliation and
+actual event/transport completion remain required. Unknown narrow write footprints retain whole-ABI
+invalidation; a produced prefix alone is not substituted for a certified write footprint.
 
 Lower dependencies to the existing ExecutionPlan logical queues/events and reuse the LinkPlan
 executable binder. Keep a synchronous executor as an explicit backend capability, not an implicit
