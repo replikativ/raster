@@ -8,6 +8,10 @@ placement that covers the entire local domain. Its report retains the original A
 adds a checked `:domain` with the reshaped view and owned placement. A flat `[6]` leaf can explicitly
 realize a `[2 3]` shard. Padding, replica placements, and boundary placements remain rejected until
 the corresponding coverage/provenance checks land; this is not yet the padded example below.
+Repeated owned realizations compare ordered physical regions: a contiguous ABI reshape preserves
+identity when allocation, dtype, byte range, and field packing agree. Explicit domains use their
+derived owned view; noncontiguous leaves retain their shape/stride mapping. Original ABI views
+remain in the binding report and in the conservative cross-shard alias checks.
 
 The current whole-shard binding deliberately requires one local LinkValue to realize one exact
 owned shard. A halo-padded field cannot satisfy that contract by selecting only its owned cells:

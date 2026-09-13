@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.distributed-compute-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -232,6 +233,45 @@
     (is (= :distributed-compute-entry-device
            (failure-reason
             #(make-plan {:device-plans (device-plans (local-link-plan {:target :gpu-1}))}))))))
+
+(deftest owned-identity-is-independent-of-dense-abi-reshape
+  (let [local (local-link-plan)
+        flat (local-link-plan {:x-shape [6]})
+        rectangular (update-in local [:nodes :x-node :view]
+                               #(view/subview % {:shape [2 3]}))
+        base (plan-map)
+        plans (-> (device-plans flat {:local-x (explicit-domain [2 3])})
+                  (assoc-in [:gpu-0 :entries :again] {:link-plan rectangular})
+                  (assoc-in [:gpu-0 :steps :analytical-only]
+                            (assoc (get-in (device-plans local) [:gpu-0 :steps :copy-0])
+                                   :entry :again)))
+        plan (assoc base :device-plans plans
+                    :steps (mapv #(assoc % :device :gpu-0) (:steps base)))
+        report (distributed/compute-bindings (distributed/plan plan))]
+    (is (empty? (:unbound report)))
+    (is (= [6] (get-in report [:bindings :copy-0 :values :local-x :leaves 0 :view :shape])))
+    (is (= [2 3] (get-in report [:bindings :analytical-only :values :local-x
+                                :leaves 0 :view :shape])))
+    (is (= [2 3] (get-in report [:bindings :copy-0 :values :local-x
+                                :domain :placements 0 :view :shape])))
+    (is (= 0 (get-in report [:bindings :copy-0 :values :local-x
+                             :domain :placements 0 :view :byte-offset])))
+    (testing "dense normalization cannot hide a different allocation"
+      (is (= :distributed-compute-shard-storage
+             (failure-reason
+              #(distributed/plan
+                (assoc-in plan [:device-plans :gpu-0 :entries :again :link-plan
+                                :nodes :x-node :view :allocation :id] :different))))))
+    (testing "nor a disjoint same-sized range in the same allocation"
+      (let [larger (-> plan
+                       (assoc-in [:device-plans :gpu-0 :entries :copy :link-plan
+                                  :nodes :x-node :view :allocation :byte-size] 48)
+                       (assoc-in [:device-plans :gpu-0 :entries :again :link-plan
+                                  :nodes :x-node :view :allocation :byte-size] 48)
+                       (assoc-in [:device-plans :gpu-0 :entries :again :link-plan
+                                  :nodes :x-node :view :byte-offset] 24))]
+        (is (= :distributed-compute-shard-storage
+               (failure-reason #(distributed/plan larger))))))))
 
 (deftest distinct-shards-cannot-alias-across-entries
   (let [local (assoc-in (local-link-plan)

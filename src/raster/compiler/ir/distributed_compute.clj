@@ -141,11 +141,26 @@
                                                                 :view owned}]}))])))
                bindings))))
 
+(defn- owned-realization [{:keys [physical-layout leaves domain]}]
+  (let [owned (some #(when (= :owned (:kind %)) (:view %)) (:placements domain))
+        leaves (if owned [(assoc (first leaves) :view owned)] leaves)]
+    {:physical-layout physical-layout
+     :leaves (mapv (fn [leaf]
+                     (update leaf :view
+                             (fn [v]
+                               ;; Logical shape agreement is checked when binding the shard.
+                               ;; Dense ABI reshapes do not change its ordered physical cells.
+                               ;; Noncontiguous views must retain their coordinate mapping.
+                               (cond-> (dissoc v :id)
+                                 (view/contiguous? v) (dissoc :shape :strides)))))
+                   leaves)}))
+
 (defn bindings
   "Derive bindings after the enclosing DistributedPlan validates its DAG and shards.
    Unbound analytical compute is explicit. Fully bound compute is not a distributed executor:
    device-scoped allocation, transfer realization, events and arena ownership remain runtime
-   obligations. Whole-shard shapes are required; halo subregions need an explicit view relation."
+   obligations. Full owned-domain coverage is required, with optional explicit dense
+   reinterpretation; halo subregions still require coverage and provenance proofs."
   [{:keys [device-plans steps values shards]}]
   (let [step-by-id (into {} (map (juxt :id identity)) steps)
         bound
@@ -187,10 +202,9 @@
     ;; Distinct entry points cannot silently assign one resident shard different storage.
     ;; IDs of views may differ; allocation identity, ranges and ordered field packing may not.
     (doseq [[id entry] bound
-            [_ {:keys [value shard physical-layout leaves]}] (:values entry)]
+            [_ {:keys [value shard leaves] :as binding}] (:values entry)]
       (let [key [(:device (get step-by-id id)) value shard]
-            realization {:physical-layout physical-layout
-                         :leaves (mapv #(update % :view dissoc :id) leaves)}]
+            realization (owned-realization binding)]
         (when (and (contains? @realized key)
                    (not= (:realization (get @realized key)) realization))
           (fail! "compute entries disagree on a resident shard's physical realization"
