@@ -1327,11 +1327,6 @@
         (finally (.close arena))))
     (buffer->array ids-buf)))
 
-(defn invoke-registered-reduce-by-key-kernel
-  "Invoke a compiled reduce-by-key kernel. Same interface as ze_runtime."
-  [^String kernel-name output keys vals n]
-  (invoke-registered-map-void-kernel kernel-name [output keys vals] [] n))
-
 ;; ================================================================
 ;; Lifecycle
 ;; ================================================================

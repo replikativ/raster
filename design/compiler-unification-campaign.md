@@ -1075,6 +1075,14 @@ do not reintroduce implicit zeroing in a special runtime convention.
 
 ## Fresh-storage initialization through the typed vertical
 
+The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
+retired after an exact-symbol and dynamic-dispatch reachability audit. Production reduce-by-key
+already enters the typed reducing-scatter conflict contract, scheduled SegMap/KernelBody, and
+generic map-void invocation; the public combinator and CPU semantics are unchanged. The direct
+OpenCL source generator remains test-only oracle debt, and the retained Vulkan scaffold is not
+changed by this retirement. Neither old source generator validates arbitrary reduction operators;
+they must not become production routes without the typed conflict contract.
+
 Resident allocation does not itself implement Clojure's fresh-array zero semantics, and allocating
 once is not enough for repeated execution. The frontend now retains allocation initialization,
 element type, extent, and source order in TypedSOAC facts using the shared allocator descriptor.
