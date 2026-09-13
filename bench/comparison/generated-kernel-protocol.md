@@ -292,8 +292,10 @@ from a reduced stage count.
 
 `raster.perf.matrix-input-fusion-probe/run!` compares the compiler's global-conversion matrix
 graph with its explicit typed-input-conversion candidate. This is a **scheduled graph** probe,
-not a public `deftm` or end-to-end serving benchmark. Both candidates replay weight conversion;
-constant-weight prologue extraction is not represented. The fused candidate remains outside
+not a public `deftm` or end-to-end serving benchmark. The default `:residency :all-stages` replays
+weight conversion. `:residency :constant-weights` instead uses ordinary LinkPlan constant roles
+and initialized weight sources to hoist weight-only stages into the one-time prologue. The
+profile records actual replay kernel names separately from the complete compiled graph. The fused candidate remains outside
 automatic selection because physical input/output disjointness and performance admission must
 both be established before promotion.
 
@@ -304,6 +306,9 @@ both be established before promotion.
 ;; Paired diagnostic on a larger shape; repeat with matched backend/device/environment.
 (run! :ze:0 {:shape [8 256 256] :tile-policy :multi-fragment
              :timing? true :rounds 12 :warmup-rounds 4})
+;; Same compiler graphs through normal constant-weight initialization and replay.
+(run! :ze:0 {:shape [8 256 256] :tile-policy :multi-fragment
+             :residency :constant-weights :timing? true :rounds 12 :warmup-rounds 4})
 ```
 
 Shapes are capped at 8,388,608 reference products and each dimension at 4096; rounds are bounded
@@ -316,5 +321,22 @@ instead of falling back to host timing.
 
 The retained September 13 tiny-case OpenCL and Level Zero timings were nonstationary. Their
 medians cannot establish a speedup or a backend ranking. Stage removal and exact device replay
-are established; stationary timings, constant-weight serving composition and matched external
-baselines remain separate gates.
+are established. Constant-weight LinkPlan device profiles also confirm that B conversion is
+absent from replay, with exact changing-input validation. Stationary timings, the public `deftm`
+comparison and matched external baselines remain separate gates.
+
+### Arc external baseline readiness (2026-09-13)
+
+The local Python environment has PyTorch 2.4.0+cu121 and Triton 3.0.0 without an Intel backend;
+the installed oneDNN configuration declares `DNNL_GPU_RUNTIME "NONE"`. Neither is a runnable
+Arc comparison. The source checkout `../intel-xpu-backend-for-triton` at
+`8812fa969dda77a5e458810f11f7db56e51dd0e3` supplies a suitable starting point in
+`benchmarks/triton_kernels_benchmark/gemm_tensor_of_ptr_benchmark.py`, but requires an isolated
+compatible PyTorch-XPU/Triton environment; its driver obtains a SYCL queue from `torch.xpu`.
+
+Do not use its stock BF16 benchmark inputs or the tutorial's FP16 output as a matched result.
+The first controlled comparison should use FP16 A/B, FP32 accumulation/output, a fixed recorded
+configuration and independent RNE input checks. A separate derived candidate can load FP32 A
+and cast with explicit `fp_downcast_rounding='rtne'` before its dot. Keep preconverted core GEMM,
+tile-input conversion, full graph conversion and warm constant-weight replay as different
+measurement identities. Retain emitted/native evidence before claiming matrix-instruction use.
