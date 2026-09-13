@@ -36,6 +36,22 @@
           {:keys [stats]} (loop-lift/lift-parallel-forms form)]
       (is (= 1 (:maps-detected stats))))))
 
+(deftest dense-map-matching-does-not-discard-sibling-effects
+  (let [loop '(dotimes [i n]
+                (do (aset scratch i 7.0) (aset out i 1.0))
+                (aset tail i 9.0))
+        source (list 'let* ['written loop] 'written)
+        lifted (loop-lift/lift-parallel-forms source)
+        execute (eval (list 'fn '[scratch out tail n] (:form lifted)))
+        scratch (double-array 3) out (double-array 3) tail (double-array 3)]
+    (is (nil? (patterns/match-dotimes-map-loop loop)))
+    (is (zero? (get-in lifted [:stats :maps-detected])))
+    (is (= source (:form lifted)))
+    (execute scratch out tail 3)
+    (is (= [7.0 7.0 7.0] (vec scratch)))
+    (is (= [1.0 1.0 1.0] (vec out)))
+    (is (= [9.0 9.0 9.0] (vec tail)))))
+
 (deftest detect-let-wrapped-dotimes
   (testing "let-wrapped dotimes (with int bound) is detected"
     (let [form '(let* [x (let [n_ (int bound)]
@@ -44,12 +60,34 @@
                       x)
           {:keys [form stats]} (loop-lift/lift-parallel-forms form)]
       (is (= 1 (:maps-detected stats)))
-      ;; Bound should be the original 'bound', not 'n_'
+      ;; Preserve the narrowing cast and its binding scope instead of substituting raw bound.
       (let [bindings (second form)
-            [_ expr] (take 2 bindings)]
-        (when (and (seq? expr) (= 'raster.par/map! (first expr)))
-          (let [[_ _out _idx bound-expr _cast _body] expr]
-            (is (= 'bound bound-expr))))))))
+            [_ expr] (take 2 bindings)
+            map-form (nth expr 2)]
+        (is (= '[n_ (int bound)] (second expr)))
+        (is (= 'raster.par/map! (first map-form)))
+        (is (= 'n_ (nth map-form 3)))))))
+
+(deftest lifting-preserves-wrapper-bindings-and-sibling-stores
+  (let [source '(let* [n_ (int n) side (aset scratch 0 7.0)]
+                 (dotimes [i n_] (aset out i 1.0))
+                 (aset tail 0 9.0))
+        lifted (loop-lift/lift-parallel-forms source)
+        execute (eval (list 'fn '[scratch out tail n]
+                            (ir.par/expand-par-forms (:form lifted))))
+        scratch (double-array 1) out (double-array 3) tail (double-array 1)]
+    (is (= 1 (get-in lifted [:stats :maps-detected])))
+    (is (= (second source) (second (:form lifted))))
+    (is (= 9.0 (execute scratch out tail 3)))
+    (is (= [7.0] (vec scratch)))
+    (is (= [1.0 1.0 1.0] (vec out)))
+    (is (= [9.0] (vec tail)))))
+
+(deftest dense-store-witnesses-require-exact-aset-arity
+  (is (nil? (patterns/match-aset-write '(aset out i j 1.0) 'i)))
+  (is (nil? (patterns/match-nested-dotimes-row-major-map
+             '(dotimes [i rows]
+                (dotimes [j cols] (aset out (+ (* i cols) j) 0 1.0)))))))
 
 (deftest allow-same-index-self-read-map
   (testing "dotimes reading output at same index (SGD pattern) IS detected as parallel"

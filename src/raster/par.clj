@@ -530,10 +530,11 @@
   side effects (aset, atomic-add!, etc.). Expands to dotimes on CPU.
 
   Form: (raster.par/map-void! idx bound body)
-  Semantics: for idx in 0..bound: body (for side effects)"
+  Semantics: for idx in 0..bound: body (for side effects). Like dotimes, evaluates
+  the bound once as a Long; nonpositive counts execute no iterations."
   [idx-sym bound-expr body-expr]
   (let [n-sym (gensym "n__")]
-    `(let [~n-sym (int ~bound-expr)]
+    `(let [~n-sym (long ~bound-expr)]
        (dotimes [~idx-sym ~n-sym]
          ~body-expr)
        nil)))
