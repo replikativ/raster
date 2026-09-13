@@ -37,6 +37,33 @@
   (is (= 'xs (#'route/shape-projection-source '(clojure.core/long (alength xs)))))
   (is (nil? (#'route/shape-projection-source '(clojure.core/unchecked-int (alength xs))))))
 
+(deftest effect-result-refinement-uses-authoritative-inner-storage
+  (doseq [[host-return shape expected]
+          [[:effect '[(unknown-dimension result)] [13]]
+           [:buffer '[(unknown-dimension result)] '[(unknown-dimension result)]]
+           [:buffer [3] [3]]
+           [:effect [3] [3]]]]
+    (let [values {'dst (av/tensor {:dtype :double :shape [13]})
+                  'result (av/tensor {:dtype :double :shape shape})}
+          inner (list '= 'copy '[result] '(map {} [] [] nil))
+          ;; This unit isolates boundary refinement, not numerical map validation.
+          algorithm (list 'soac-program
+                     (soac/default-program-facts
+                      {:values values
+                       :equations {'copy (merge (soac/default-equation-facts)
+                                          {:aliases {'result 'dst}
+                                           :attributes {:result-storage
+                                                        [{:destination 'dst :access :read-write
+                                                          :host-return host-return}]}})}})
+                     [inner] '[result])
+          ;; Deliberately contradictory copied attributes must not become an authority.
+          outer {:algorithm algorithm :results '[result]
+                 :attributes {:result-storage [{:destination 'dst :access :read-write
+                                                :host-return (if (= :effect host-return)
+                                                               :buffer :effect)}]}}]
+      (is (= expected (:shape (get (#'route/refine-effect-result-shapes values [outer])
+                                   'result)))))))
+
 (defn- evaluate-test-scalar-expression [expression operands]
   (cond
     (number? expression) expression

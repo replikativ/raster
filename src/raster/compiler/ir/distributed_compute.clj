@@ -19,15 +19,15 @@
                     id))))
         (:values plan)))
 
-(defn- entry-facts [device id entry]
+(defn- entry-facts [device target id entry]
   (when-not (and (some? id) (map? entry) (= #{:link-plan} (set (keys entry))))
     (fail! "a named compute entry owns one LinkPlan"
            :distributed-compute-entry {:device device :entry id}))
   (let [plan (:link-plan entry)
         accesses (link/value-accesses plan)]
-    (when-not (= device (:target plan))
-      (fail! "compute entry target differs from its mesh device"
-             :distributed-compute-entry-device {:device device :entry id}))
+    (when-not (= target (:target plan))
+      (fail! "compute entry target differs from its explicit worker placement"
+             :distributed-compute-entry-device {:device device :target target :entry id}))
     {:link-plan plan :accesses accesses :required (required-values plan accesses)}))
 
 (defn- normalize-reference [reference]
@@ -264,10 +264,14 @@
         (reduce-kv
          (fn [bound device local]
            (when-not (set/subset? (set (keys local))
-                                  #{:entries :steps :link-plan :execution-plan :attributes})
+                                  #{:entries :steps :link-plan :execution-plan :attributes :target})
              (fail! "unknown device-local compute contract keys"
                     :distributed-compute-device-keys {:device device :keys (set (keys local))}))
-           (let [entries (get local :entries {}) calls (get local :steps {})]
+           (let [entries (get local :entries {}) calls (get local :steps {})
+                 target (get local :target device)]
+             (when-not (keyword? target)
+               (fail! "a worker placement requires a concrete target keyword"
+                      :distributed-compute-physical-target {:device device :target target}))
              (when-not (and (map? entries) (map? calls))
                (fail! "device compute entries and calls must be maps"
                       :distributed-compute-entries {:device device}))
@@ -276,7 +280,7 @@
                (fail! "analytical plans cannot also declare named compute entries"
                       :distributed-compute-mixed-plans {:device device}))
              (let [entries (into {} (map (fn [[id entry]]
-                                          [id (entry-facts device id entry)])) entries)]
+                                          [id (entry-facts device target id entry)])) entries)]
              (reduce-kv
               (fn [bound id call]
                 (when-not (and (map? call) (= #{:entry :bindings} (set (keys call))))
@@ -312,7 +316,7 @@
           (fail! "compute entries disagree on a resident shard's physical realization"
                  :distributed-compute-shard-storage {:step id :shard key}))
         (doseq [[other-key other] @realized
-                :when (and (not= key other-key) (= (first key) (first other-key)))
+                :when (not= key other-key)
                 left leaves right (:leaves other)]
           (when (view/overlaps? (:view left) (:view right))
             (fail! "distinct distributed shards cannot alias physical storage without a relation"

@@ -733,7 +733,7 @@
              :distributed-device-plan {:device device-id :plan local}))
     (when link-plan
       (link-plan/validate! link-plan)
-      (when-not (= device-id (:target link-plan))
+      (when-not (= (get local :target device-id) (:target link-plan))
         (fail! "shard-local LinkPlan target differs from its mesh device"
                :distributed-device-link-target
                {:device device-id :target (:target link-plan)})))
