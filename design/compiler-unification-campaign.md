@@ -1118,6 +1118,15 @@ effects remain intact. The numerical regression checks every destination. This c
 preservation bug, not the broader 2-D heat admission gap; that still needs a complete typed
 iteration-domain and cross-iteration write/read proof.
 
+The next counted-domain prerequisite aligns `map-void!` and its compiler CPU expansion with
+their documented `dotimes` semantics: evaluate the bound once as Long, execute no iterations for
+nonpositive counts, and return nil. Explicit user narrowing casts remain executable. The former
+implicit Int coercion could not faithfully represent a source Long-count loop. This changes no
+kernel ABI and does not admit GPU launches beyond a target's index limits; unsupported domains
+must still fail target checks rather than narrow. Raw store-loop normalization can subsequently
+use one typed Long scalar extent `max(0, long(bound))` and the existing effect-region analysis,
+with sequential order retained until a dependence proof permits parallel scheduling.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

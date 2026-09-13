@@ -11,16 +11,18 @@
 
 (deftest map-void-counts-match-dotimes-without-implicit-narrowing
   (let [stop (ex-info "first iteration" {:probe :counted-domain})
-        run (fn [head bound]
+        run (fn [head bound & [explicit-int?]]
               (let [evaluations (atom 0)
                     body '(throw stop)
+                    bound-expression (list 'do '(swap! evaluations inc)
+                                           (if explicit-int? '(int bound) 'bound))
                     expression (case head
-                                 :dotimes (list 'dotimes ['i '(do (swap! evaluations inc) bound)] body)
+                                 :dotimes (list 'dotimes ['i bound-expression] body)
                                  :macro (list 'raster.par/map-void! 'i
-                                              '(do (swap! evaluations inc) bound) body)
+                                              bound-expression body)
                                  :ir (ir.par/expand-par-map-void!
                                       (list 'raster.par/map-void! 'i
-                                            '(do (swap! evaluations inc) bound) body)))
+                                            bound-expression body)))
                     execute (eval (list 'fn '[bound evaluations stop] expression))
                     result (try (execute bound evaluations stop)
                                 (catch Throwable e
@@ -32,7 +34,10 @@
         (is (= expected (run :macro bound)))
         (is (= expected (run :ir bound)))
         (is (= 1 (second expected)))))
-    (is (= :first-iteration (first (run :macro 2147483648))))))
+    (is (= :first-iteration (first (run :macro 2147483648))))
+    (doseq [head [:macro :ir]]
+      (is (= (run :dotimes 2147483648 true) (run head 2147483648 true))
+          "an explicit narrowing cast still executes and rejects overflow before the body"))))
 
 (deftest par-map-form-detection
   (testing "par-map-form? identifies parallel map forms"
