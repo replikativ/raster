@@ -29,13 +29,15 @@
 (deftest anf-bindings-carry-existing-result-types-without-reinference
   (let [result (with-meta 'rhs {:raster.type/tag 'doubles})
         effect (with-meta 'effect {:raster.effect/effectful true})
-        source (with-meta (list 'let* [effect result] result) {:source-marker :kept})
+        source (with-meta (list 'let* (with-meta [effect result] {:bindings-marker :kept}) result)
+                 {:source-marker :kept})
         flattened (inline/flatten-nested-lets source)
         binder (first (second flattened))]
     (is (= source flattened) "metadata-only propagation must survive structural equality")
     (is (= 'doubles (:raster.type/tag (meta binder))))
     (is (:raster.effect/effectful (meta binder)))
     (is (= {:source-marker :kept} (meta flattened)))
+    (is (= {:bindings-marker :kept} (meta (second flattened))))
     (is (nil? (:tag (meta binder))) "compiler type evidence is not a JVM primitive hint")
     (let [already-typed (with-meta 'value {:raster.type/tag 'double})
           init (with-meta 'input {:raster.type/tag 'float})

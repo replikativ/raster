@@ -1095,9 +1095,19 @@ device availability. The composition exposed and fixed ANF result-type loss: exi
 initializer metadata now survives onto new bindings, including structurally equal rewrites.
 No function/type inference registry or census exemption was added.
 
+Local checkpoint continuation is now exercised with actual files and scoped mmap leases. A
+certified manifest carries an SHA-256 address and explicit little-endian raw-f64 format; reopening
+checks payload length and digest before consuming bytes, and a corruption negative control fails.
+The device acceptance advances two compiled steps, downloads directly into the mapped file, closes
+the original session and mapping, opens a read-only lease, uploads directly into a fresh session,
+closes the lease after synchronous transfer, and advances two more steps to the unpartitioned
+reference. Temporary payloads are 448 bytes and deleted in `finally`. This is a local-file provider
+fixture, not a production storage adapter, serialized manifest migration test, crash-consistent
+publication protocol, asynchronous restore, or distributed checkpoint.
+
 Still required: bind padded ghost storage explicitly to the global owned-shard contract, realize
-the distributed compute/transfer DAG with device-scoped allocation and ownership, then checkpoint
-real bytes and continue the same numerical evolution after reopening. The two-worker acceptance
+the distributed compute/transfer DAG with device-scoped allocation and ownership, then carry the
+local checkpoint acceptance through distributed publication and restore. The two-worker acceptance
 must not be counted as evidence those cross-entry and multi-device runtime obligations are done.
 
 Items 6–8 have checked planning components, but not yet multi-device numerical execution:
