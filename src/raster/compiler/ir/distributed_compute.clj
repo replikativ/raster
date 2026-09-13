@@ -332,7 +332,7 @@
                  :distributed-compute-boundary-provider {:step id :provider (:provider placement)}))
         (when-not (and (view/contiguous? target) (view/contiguous? source)
                        (= (dissoc source :id :shape :strides) (dissoc target :id :shape :strides)))
-          (fail! "boundary producer's complete written view must equal the boundary region"
+          (fail! "boundary producer's complete public output view must equal the boundary region"
                  :distributed-compute-boundary-storage {:step id :provider (:provider placement)}))))
     (doseq [[id entry] bound
             [_ binding] (:values entry)

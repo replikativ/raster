@@ -12,7 +12,8 @@ are derived from validated ScheduledHalo steps, anchored at the owned region, an
 coordinate-disjoint coverage. Each transfer must precede its consumer through the DAG, and repeated
 consumers must agree on its physical destination. Periodic and nonperiodic halos now have structural
 examples. A nonperiodic boundary names a bound preceding compute step and its ABI-written local
-value; the complete plain dense physical view must match the boundary region exactly. No implicit
+value declared as a public LinkPlan output; an internal/scratch write is not retained-output
+evidence. The complete plain dense physical view must match the boundary region exactly. No implicit
 fill is inferred from the boundary mode. Strided boundary outputs and selecting only part of a
 producer's larger value remain refused until their write-region projection is certified.
 An explicitly referenced boundary output is retained in the producing entry's `:boundary-outputs`
