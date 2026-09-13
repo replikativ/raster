@@ -1,10 +1,18 @@
 (ns raster.compiler.multilevel-numerical-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
+            [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.write-coverage :as coverage]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.ode.multilevel :as multilevel]
+            [raster.ode.multilevel-compiler :as multilevel-compiler]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.amr-plan :as amr]
+            [raster.compiler.ir.amr-execution :as amr-execution]
+            [raster.compiler.ir.numerical-state :as numerical-state]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
@@ -16,6 +24,13 @@
    nx :- Long, ny :- Long]
   (multilevel/prolong-constant-2d! fine coarse nx ny)
   (multilevel/restrict-average-2d! out fine nx ny))
+
+(deftm partial-pair-store!
+  [out :- (Array double), source :- (Array double), n :- Long]
+  (dotimes [i n]
+    (arrays/aset out (* 2 i) (arrays/aget source i))
+    (arrays/aset out (+ (* 2 i) 1) (arrays/aget source i)))
+  out)
 
 (deftest cell-centred-transfer-oracles
   (doseq [[nx ny] [[1 1] [3 5] [4 2]]]
@@ -152,7 +167,7 @@
                                           [id {:local-shape (shapes field)
                                                :placements [{:kind :owned :value field :shard field
                                                              :local-offsets [0 0]}]}]))}]))]
-    (distributed/plan
+    (with-meta (distributed/plan
      {:id :generated-multilevel-cycle
       :mesh (distributed/mesh [{:name :worker :size 1}] [:ze:0])
       :topology (distributed/topology [(distributed/device {:id :ze:0 :memory-capacity-bytes 1048576})] [])
@@ -161,7 +176,224 @@
                         [field [(distributed/shard {:id field :value field :device :ze:0
                                                     :offsets [0 0] :shape shape})]]))
       :device-plans {:ze:0 {:entries entries :steps calls}}
-      :steps (vec (mapcat :steps scheduled)) :outputs [(:completion (peek scheduled))]})))
+      :steps (vec (mapcat :steps scheduled)) :outputs [(:completion (peek scheduled))]})
+      {:hierarchy hierarchy :scheduled scheduled})))
+
+(defn- certified-transfer-workload [plan]
+  (let [{:keys [hierarchy scheduled]} (meta plan)
+        fields (mapv
+                (fn [patch]
+                  (let [field (:field patch) shape (:shape patch) n (reduce * shape)]
+                    (numerical-state/field
+                     {:id field :value (get-in plan [:values field]) :chunk-shape shape
+                      :coordinate-space {:hierarchy (:id hierarchy) :level (:level patch) :patch (:id patch)
+                                         :axes [{:name :x :centering :cell} {:name :y :centering :cell}]}
+                      ;; Structural manifest fixture only: no durable publication is claimed.
+                      :chunks [(numerical-state/chunk
+                                {:id field :offsets [0 0] :shape shape
+                                 :logical-byte-length (* 8 n) :stored-byte-length (* 8 n)
+                                 :content (numerical-state/content-address :sha-256 (format "%064x" n))
+                                 :storage {:format :raw-array :byte-order :little-endian}})]})))
+                (mapcat :patches (:levels hierarchy)))
+        state (numerical-state/certify
+               (numerical-state/manifest
+                {:id :transfer-state :parents [] :logical-coordinate {:step 0}
+                 :fields fields :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
+                                                    :compatibility-id "multilevel-f64"}
+                 :provenance {:program-fingerprint "multilevel-structural-fixture"}}))]
+    (amr/certify (amr/plan {:id :transfer-workload :mode :transfer-cycle
+                           :hierarchy hierarchy :state state :distributed-plan (distributed/certify plan)
+                           :coarse-fine scheduled}))))
+
+(deftest rectangular-coverage-retains-integer-and-control-semantics
+  (let [plan (equation/lower
+               (equation/compile #'multilevel/prolong-constant-2d! {:target :ze:0 :dtype :double})
+               [(double-array 60) (double-array 15) 3 5])
+        step (first (get-in plan [:instances 0 :call :steps]))
+        algorithm (get-in step [:equation :operations 0 :algorithm])
+        result (first (keys (:outputs step)))
+        scalars (merge (get-in plan [:instances 0 :call :scalar-values]) (:scalar-values step))
+        destination-parameter (-> algorithm soac/equations first soac/operation-parts
+                                  :lambda soac/lambda-parts :parameters last)
+        covers? #(boolean (coverage/rectangular-effect-covers? % result 60 scalars))
+        change-store (fn [f] (walk/postwalk (fn [x] (if (and (seq? x) (= 'effect (first x))) (f x) x)) algorithm))]
+    (is (covers? algorithm))
+    (is (not (coverage/rectangular-effect-covers?
+               algorithm result 60 (assoc scalars destination-parameter {:type :long :value 1}))))
+    (is (not (coverage/rectangular-effect-covers? algorithm result 61 scalars)))
+    (is (not (covers? (change-store #(apply list (assoc (vec %) 4 0))))))
+    (is (not (covers? (change-store #(apply list (assoc (vec %) 3 0))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3 (list 'clojure.core/int (nth % 3))))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3
+                                           (with-meta (list 'clojure.core/+ (nth % 3) Long/MAX_VALUE)
+                                             {:tag 'long})))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3 (with-meta (nth % 3) nil)))))))))
+
+(deftest partial-write-permission-is-not-complete-initialization
+  (let [source (double-array 15)
+        target (double-array 60)
+        plan (equation/lower (equation/compile #'partial-pair-store! {:target :ze:0 :dtype :double})
+                             [target source 3])
+        target-node (some (fn [[id node]] (when (identical? target (:source node)) id)) (:nodes plan))
+        target-value (some (fn [[id value]] (when (= target-node (get-in value [:leaves 0 :node])) id))
+                           (:values plan))
+        contract (link-plan/initialization-contract plan)
+        caller (-> plan (assoc-in [:nodes target-node :source] nil)
+                   (assoc-in [:nodes target-node :role] :state))
+        fresh (assoc-in caller [:nodes target-node :role] :internal)]
+    (is (= :write (get (link-plan/value-accesses plan) target-value)))
+    (is (contains? (:produces contract) target-node))
+    (is (not (contains? (:complete-writes contract) target-node)))
+    (is (contains? (:requires (link-plan/initialization-contract caller)) target-node))
+    (is (= :link-unproduced-output
+           (try (link-plan/initialization-contract fresh) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest implementation-witnesses-bind-exact-plans-and-field-effects
+  (let [coarse (double-array (map #(* 0.25 %) (range 15)))
+        fine (double-array 60)
+        plan (scheduled-transfer-cycle coarse fine)
+        workload (certified-transfer-workload plan)
+        bindings (:bindings (distributed/compute-bindings plan))
+        implementations
+        (into {} (for [[kind source-field target-field]
+                       [[:prolongation :coarse :fine] [:restriction :fine :coarse]]
+                       :let [binding (bindings [kind :apply])
+                             local-id (fn [field] (some (fn [[id value]] (when (= field (:value value)) id))
+                                                       (:values binding)))]]
+                   [kind (amr-execution/attest-implementation
+                          workload kind (:link-plan binding)
+                          {:source (local-id source-field) :target (local-id target-field)
+                           :producer :test/multilevel-compiler-provider :invariants #{:constant-preserving}
+                           :numerical {:mode :exact :policy :typed-fp64-evaluation-order}})]))
+        execution (amr-execution/certify workload implementations)
+        failure (fn [changed]
+                  (try (amr-execution/certify workload changed) nil
+                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= execution (amr-execution/verify! execution)))
+    (is (= :amr-execution-implementation
+           (failure (assoc-in implementations [:prolongation :link-plan]
+                              (get-in implementations [:restriction :link-plan])))))
+    (is (= :amr-execution-effects
+           (failure (assoc-in implementations [:prolongation :source]
+                              (get-in implementations [:prolongation :target])))))
+    (is (= :amr-execution-invariants
+           (failure (assoc-in implementations [:restriction :invariants] #{}))))
+    (is (= :amr-execution-implementations (failure (dissoc implementations :restriction))))
+    (doseq [[operator arguments expected-access]
+            [[#'arrays/acopy! [coarse 0 fine 0 3] :read-write]
+             [#'partial-pair-store! [fine coarse 3] :write]]]
+      (let [partial (equation/lower (equation/compile operator {:target :ze:0 :dtype :double})
+                                    arguments)
+          partial (update partial :nodes
+                          #(update-vals % (fn [node]
+                                            (assoc-in node [:view :allocation :id]
+                                                      (if (identical? coarse (:source node)) :coarse :fine)))))
+          ids (into {} (for [[id value] (:values partial)
+                             :let [source (get-in partial [:nodes (get-in value [:leaves 0 :node]) :source])]]
+                         [(if (identical? coarse source) :coarse :fine) id]))
+          changed (-> plan
+                      (assoc-in [:device-plans :ze:0 :entries :prolongation :link-plan] partial)
+                      (assoc-in [:device-plans :ze:0 :steps [:prolongation :apply] :bindings]
+                                (into {} (for [[field id] ids]
+                                           [id {:local-shape (get-in plan [:values field :shape])
+                                                :placements [{:kind :owned :value field :shard field
+                                                              :local-offsets [0 0]}]}]))))
+          changed-workload (amr/certify (amr/plan (assoc (:plan workload)
+                                                       :distributed-plan (distributed/certify changed))))
+          witness (amr-execution/attest-implementation
+                   changed-workload :prolongation partial
+                   {:source (ids :coarse) :target (ids :fine) :producer :test/incorrect-partial-provider
+                    :invariants #{:constant-preserving} :numerical {:mode :exact :policy :test}})]
+      (is (= expected-access (get (link-plan/value-accesses partial) (ids :fine))))
+      (let [target-node (get-in partial [:values (ids :fine) :leaves 0 :node])
+            contract (link-plan/initialization-contract partial)]
+        (is (contains? (:produces contract) target-node))
+        (is (not (contains? (:complete-writes contract) target-node))))
+      (is (= :amr-execution-effects
+             (try (amr-execution/certify changed-workload (assoc implementations :prolongation witness)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+          "partial updates cannot attest whole-patch coverage, even with write-only ABI access")))
+    (is (= :amr-execution-invariants (failure (assoc-in implementations [:restriction :producer] false))))
+    (is (= :numerical-contract (failure (assoc-in implementations [:restriction :numerical] {}))))
+    (is (= :amr-execution-implementation
+           (failure (assoc-in implementations [:restriction :contract :ratio] [4 4]))))
+    (let [compute-bindings distributed/compute-bindings]
+      (with-redefs [distributed/compute-bindings
+                    (fn [p] (assoc-in (compute-bindings p)
+                                      [:bindings [:prolongation :apply] :boundary-outputs :extra]
+                                      {:access :write}))]
+        (is (= :amr-execution-effects (failure implementations))
+            "boundary-output effects cannot bypass the exact external field set")))
+    (let [compute-bindings distributed/compute-bindings
+          target-id (get-in implementations [:prolongation :target])]
+      (with-redefs [distributed/compute-bindings
+                    (fn [p] (assoc-in (compute-bindings p)
+                                      [:bindings [:prolongation :apply] :values target-id :access]
+                                      :read-write))]
+        (is (= :amr-execution-effects (failure implementations))
+            "overwrite transfers may not depend on the previous target contents")))
+    (let [compute-bindings distributed/compute-bindings
+          source-id (get-in implementations [:prolongation :source])]
+      (with-redefs [distributed/compute-bindings
+                    (fn [p] (assoc-in (compute-bindings p)
+                                      [:bindings [:prolongation :apply] :values source-id :domain] nil))]
+        (is (= :amr-execution-shard (failure implementations))
+            "logical shape alone cannot prove a whole dense physical patch")))
+    (if-not @gp/gpu-available?
+      (gp/gpu-skip! "certified-amr-execution-binding")
+      (with-open [executable (gpu-distributed/instantiate!
+                             (get-in (amr-execution/verify! execution)
+                                     [:workload :plan :distributed-plan :plan]))]
+        (gpu-distributed/run! executable)
+        (let [result (first (vals (get (gpu-distributed/output-values executable) [:restriction :apply])))
+              actual (double-array 15)]
+          (gpu/download-range! (get (:sessions executable) :ze:0) result actual {:elements 15})
+          (is (= (vec coarse) (vec actual))))))))
+
+(deftest numerical-providers-compile-attest-and-execute-with-semantic-roles
+  (let [coarse (double-array (map #(* 0.25 %) (range 15))) fine (double-array 60)
+        original (scheduled-transfer-cycle coarse fine)
+        workload (certified-transfer-workload original)
+        implementations {:prolongation (multilevel-compiler/compile-prolongation
+                                        workload :prolongation coarse fine {})
+                         :restriction (multilevel-compiler/compile-restriction
+                                       workload :restriction fine coarse {})}
+        local {:entries (update-vals implementations #(hash-map :link-plan (:link-plan %)))
+               :steps (into {}
+                            (for [[id implementation] implementations
+                                  :let [contract (:contract implementation)]]
+                              [(:completion contract)
+                               {:entry id
+                                :bindings (into {}
+                                                (for [role [:source :target]
+                                                      :let [patch (get contract role)]]
+                                                  [(get implementation role)
+                                                   {:local-shape (:shape patch)
+                                                    :placements [{:kind :owned :value (:field patch)
+                                                                  :shard (:field patch) :local-offsets [0 0]}]}]))}]))}
+        plan (distributed/plan (assoc original :device-plans {:ze:0 local}))
+        workload (amr/certify (amr/plan (assoc (:plan workload) :distributed-plan (distributed/certify plan))))
+        execution (amr-execution/certify workload implementations)]
+    (is (= execution (amr-execution/verify! execution)))
+    (is (= :bounded-error (get-in implementations [:restriction :numerical :mode])))
+    (is (contains? (get-in implementations [:restriction :numerical :error-model :assumptions])
+                   :no-intermediate-overflow))
+    (with-redefs [equation/compile (fn [& _] (throw (ex-info "unexpected compilation" {})))]
+      (is (= :multilevel-provider-contract
+             (try (multilevel-compiler/compile-prolongation workload :restriction fine coarse {}) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (if-not @gp/gpu-available?
+      (gp/gpu-skip! "provider-attested-multilevel-cycle")
+      (with-open [executable (gpu-distributed/instantiate! plan)]
+        (gpu-distributed/run! executable)
+        (let [result (first (vals (get (gpu-distributed/output-values executable) [:restriction :apply])))
+              actual (double-array 15)]
+          (gpu/download-range! (get (:sessions executable) :ze:0) result actual {:elements 15})
+          (is (= (vec coarse) (vec actual))))))))
 
 (deftest coarse-fine-schedule-executes-its-generated-local-entries
   (let [coarse (double-array (map #(* 0.25 %) (range 15)))

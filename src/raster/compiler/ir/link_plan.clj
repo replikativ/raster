@@ -15,6 +15,8 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
 (def node-roles #{:input :constant :state :output :internal :scratch})
@@ -831,18 +833,20 @@
     (doseq [[compiler-value value-id] (:loop-scratch call)]
       (program-value-node! nodes values id compiler-value value-id))))
 
-(defn- program-graph-fact
-  [nodes values instance-id step-id phase graph buffers program-scalars scalar-values]
-  (let [graph (kgraph/validate! graph)
-        extent-values
-        (into {}
+(defn- program-extent-values [nodes values instance-id buffers]
+  (into {}
               (keep (fn [[compiler-value value-id]]
                       (let [node (program-value-node!
                                   nodes values instance-id compiler-value value-id)
                             shape (get-in node [:view :shape])]
                         (when (seq shape)
                           [(list 'extent compiler-value) (first shape)]))))
-              buffers)
+              buffers))
+
+(defn- program-graph-fact
+  [nodes values instance-id step-id phase graph buffers program-scalars scalar-values]
+  (let [graph (kgraph/validate! graph)
+        extent-values (program-extent-values nodes values instance-id buffers)
         ;; A graph ABI contains only scalars consumed by that kernel. Buffer shapes may also name
         ;; an earlier, program-wide shape value which the kernel does not otherwise consume. Keep
         ;; those certified facts available for range validation; kernel-local narrowed values win
@@ -883,6 +887,29 @@
                        :inout :read-write)})))
       external)}))
 
+(defn- program-complete-writes [nodes values instance step call-scalars]
+  (let [operation (first (get-in step [:equation :operations]))
+        algorithm (:algorithm operation)
+        scalars (merge (program-extent-values nodes values instance (:buffers step))
+                       call-scalars (:scalar-values step))
+        resolve-dimension #(kgcall/resolve-integer scalars %)
+        covers? (fn [result node]
+                  (let [capacity (reduce *' 1 (get-in node [:view :shape]))]
+                    (or (coverage/dense-result-covers? algorithm result capacity resolve-dimension)
+                        (coverage/rectangular-effect-covers? algorithm result capacity scalars))))]
+    (into #{}
+          (mapcat (fn [equation]
+                    (mapcat (fn [[result physical]]
+                              (let [base (when (contains? (:buffers step) physical)
+                                           (program-value-node! nodes values instance physical
+                                                                (get (:buffers step) physical)))
+                                    child (when (contains? (:outputs step) result)
+                                            (program-value-node! nodes values instance result
+                                                                 (get (:outputs step) result)))]
+                                (keep #(when (and % (covers? result %)) (:id %)) [base child])))
+                            (map vector (nth equation 2) (soac/physical-results algorithm equation)))))
+          (soac/equations algorithm))))
+
 (defn- validate-program-instance-bindings!
   [nodes values instance]
   (let [{:keys [id call]} (validate-program-instance! instance)]
@@ -893,15 +920,17 @@
         (cond
           (program-call/evaluated-host-equation? step) []
           (program-call/emitted-equation-call? step)
-          [(assoc (program-graph-fact nodes values id step-index
+          (let [complete (program-complete-writes nodes values id step (:scalar-values call))]
+           [(assoc (program-graph-fact nodes values id step-index
                                      (get-in step [:equation :id])
                                      (:graph step) (:buffers step)
                                      (:scalar-values call) (:scalar-values step))
+                  :complete-writes complete
                   :produced-views
-                  (set (map (fn [[result _]]
+                  (set/intersection complete (set (map (fn [[result _]]
                               (:id (program-value-node! nodes values id result
                                                         (get (:outputs step) result))))
-                            (:result-views step)))
+                            (:result-views step))))
                   :partial-writes
                   (set (keep (fn [[result physical]]
                                (let [base (program-value-node! nodes values id physical
@@ -911,7 +940,7 @@
                                  (when (< (get-in child [:view :byte-length])
                                           (get-in base [:view :byte-length]))
                                    (:id base))))
-                             (:result-views step))))]
+                             (:result-views step))))])
           (loop-call/structured-loop-call? step)
           (mapv (fn [iteration]
                   (let [{:keys [buffers scalar-values]}
@@ -942,6 +971,7 @@
                                      nodes))
         initially-initialized (sort-by pr-str @initialized)
         written (volatile! #{})
+        complete (volatile! #{})
         required (volatile! #{})
         reads (volatile! #{})
         writes (volatile! #{})
@@ -962,7 +992,7 @@
                                (when (bview/contains-contiguous-view? cover view)
                                  (caller-initialization! initialized-id node-id))))
                            initially-initialized)))))]
-    (doseq [{:keys [instance step phase facts produced-views partial-writes]} step-facts]
+    (doseq [{:keys [instance step phase facts produced-views partial-writes complete-writes]} step-facts]
       (let [by-node (reduce (fn [m {:keys [node access]}]
                               (update m node merge-access access)) {} facts)]
         (doseq [[node-id access] by-node
@@ -981,10 +1011,22 @@
             (throw (ex-info "link plan writes a read-only node"
                             {:reason :link-write-read-only :instance instance :step step
                              :phase phase :node node-id :role role})))
-          (when (and (contains? #{:write :read-write} access)
-                     (not (contains? partial-writes node-id)))
-            (vswap! initialized conj node-id)
-            (vswap! written conj node-id)))
+          (when (contains? #{:write :read-write} access)
+            (let [full? (if (some? complete-writes)
+                          (contains? complete-writes node-id)
+                          (not (contains? partial-writes node-id)))]
+              ;; Legacy descriptor permissions preserve compatibility initialization behavior,
+              ;; but are not semantic evidence of a complete overwrite.
+              (when (and (some? complete-writes) (contains? complete-writes node-id))
+                (vswap! complete conj node-id))
+              ;; A partial mutation preserves an already initialized value but cannot create
+              ;; one. Record the caller requirement before crediting its conditional result.
+              ;; A certified child view may be the only exported result of a fresh, larger
+              ;; allocation. Leave its untouched parent uninitialized; reads/exports of that
+              ;; parent fail below, while the fully produced child is credited separately.
+              (when (or full? (initialized-view? node-id))
+                (vswap! initialized conj node-id)
+                (vswap! written conj node-id)))))
         (doseq [[left-id left-access] by-node
                 [right-id right-access] by-node
                 :when (neg? (compare (pr-str left-id) (pr-str right-id)))
@@ -997,7 +1039,8 @@
       ;; Only prefix-producing semantic operations contribute these checked views.
       ;; A write through the larger pointer does not establish the untouched tail.
       (vswap! initialized into produced-views)
-      (vswap! written into produced-views))
+      (vswap! written into produced-views)
+      (vswap! complete into produced-views))
     (doseq [node-id outputs]
       (when-not (or (contains? @written node-id)
                     (initialized-view? node-id))
@@ -1005,7 +1048,7 @@
                         {:reason :link-unproduced-output :node node-id}))))
     {:requires @required
      :initializers (into #{} (keep (fn [[id node]] (when (:source node) id))) nodes)
-     :produces @written :reads @reads :writes @writes
+     :produces @written :complete-writes @complete :reads @reads :writes @writes
      :outputs (set outputs)}))
 
 (defn- validate-effects! [plan]
@@ -1021,8 +1064,10 @@
   "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.
    :requires names caller-initialized nodes needed by reads or pass-through outputs;
    :initializers names nodes with declared host sources (not a content snapshot or upload event).
-   :produces names nodes fully established by ordered writes, including certified produced
-   subviews but excluding unproven tails of partial writes. This is initialized storage, not
+   :produces names initialized postconditions of ordered writes, conditional on requirements
+   and initializers; partial updates preserve those initialized contents.
+   :complete-writes names independently proven whole overwrites from retained typed semantics;
+   legacy ABI permissions alone do not contribute this evidence. This is initialized storage, not
    retention or semantic-value preservation of private temporaries. :reads/:writes retain conservative
    effect scopes, and :outputs is the public output-node set. All sets contain LinkNode IDs.
    Postconditions assume caller requirements and initializers are realized and execution succeeds;

@@ -15,6 +15,7 @@
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-control :as control]))
 
 (defn- fail!
@@ -152,18 +153,17 @@
         (some (fn [equation]
                 (some (fn [[result physical contract]]
                         (when (and (= id physical) (= :write (:access contract)))
-                          (when-let [shape (soac/dense-functional-result-shape facts equation result)]
-                            (try
-                              (= capacity
-                                 (reduce *' 1 (concrete-shape result {:shape shape}
-                                                              scalars buffers storage)))
-                              (catch clojure.lang.ExceptionInfo e
-                                (if (contains? #{:invocation-link-shape-scalar
-                                                 :invocation-link-shape-extent
-                                                 :invocation-link-shape-expression}
-                                               (:reason (ex-data e)))
-                                  false
-                                  (throw e)))))))
+                          (or (coverage/dense-result-covers?
+                                algorithm result capacity
+                                #(try (first (concrete-shape result {:shape [%]} scalars buffers storage))
+                                      (catch clojure.lang.ExceptionInfo error
+                                        (if (contains? #{:invocation-link-shape-scalar
+                                                         :invocation-link-shape-extent
+                                                         :invocation-link-shape-expression}
+                                                       (:reason (ex-data error)))
+                                          nil
+                                          (throw error)))))
+                              (coverage/rectangular-effect-covers? algorithm result capacity scalars))))
                       (map vector (nth equation 2) (soac/physical-results facts equation)
                            (soac/result-storage facts (second equation)))))
               equations)))))

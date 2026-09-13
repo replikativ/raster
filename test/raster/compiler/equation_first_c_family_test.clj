@@ -154,6 +154,9 @@
         (is (not-any? #(re-find #"__kernel|get_global_id|get_local_id" (:source %)) kernels))
         (is (= 0 (get-in linked [:attributes :driver-allocations])))
         (is (= 1 (count (:outputs linked))))
+        (is (= (set (:outputs linked))
+               (:complete-writes (link-plan/initialization-contract linked)))
+            "a scalar reduction establishes its complete one-element result")
         (is (= (:emitted compilation)
                (emitted-program/validate! (:emitted compilation))))))))
 
