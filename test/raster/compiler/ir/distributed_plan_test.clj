@@ -152,7 +152,7 @@
                    (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-certificate (:reason (ex-data error))))))
 
-(deftest local-plan-witnesses-bind-content-not-names-or-counts
+(deftest local-plan-witnesses-bind-structure-not-names-or-counts
   (let [queue (execution/compute-queue)
         ready (execution/->LogicalEvent :ready)
         done (execution/->LogicalEvent :done)

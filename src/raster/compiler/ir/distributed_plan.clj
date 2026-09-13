@@ -989,14 +989,15 @@
      (route-costs plan)
      (:cost-vector simulation)
      ;; A name and an operation count do not identify a local computation. Retain the
-     ;; immutable compiler contracts, including artifacts, scalar bindings, views and event
+     ;; validated local plan values, including artifacts, scalar bindings, views and event
      ;; dependencies, so replacing an equally sized program invalidates the witness.
      ;; This is structural plan verification, not a digest of mutable buffer contents.
      (:device-plans plan))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.
-   Local contracts are compared as compiler values, not portable hashes or buffer snapshots."
+   Local contracts are compared as compiler values, not portable hashes or buffer snapshots.
+   Certificates retain their referenced objects but acquire no runtime ownership/arena lease."
   [plan]
   (let [plan (validate! plan)]
     (->CertifiedDistributedPlan plan (derive-certificate plan))))
