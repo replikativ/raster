@@ -58,6 +58,14 @@ initializers and unused checked prefixes, and separates one-shot extent evaluati
 Beichte's external-effect classification remains separate from descriptor-derived exceptional
 control obligations; only retained exact-conversion or checked constant evidence removes them.
 
+The integration follow-up keeps implicit result/storage conversions out of the source-cast tree,
+so explicit casts inside maps and stores retain their original checking and rounding behavior.
+Padded map lanes guard the complete scalar region, not just memory operations. Retained branch
+and loop-entry intervals may prove an integral narrowing exact; an unrestricted long-width argmax
+still requires a trapping target or an explicit bound proof. Required exceptional prefix shapes
+have one evaluator in the typed InvocationPlan, with source-order evidence retained across
+non-equation host bindings. These changes are under PR #569 validation, not a green release claim.
+
 Host-only scalar steps currently execute during preparation. Checked scalars after device work
 therefore decline rather than moving a potential failure ahead of preceding writes. General
 interleaved host/device exceptional control remains future work. Portable OpenCL still declines

@@ -217,25 +217,79 @@
         expression))))
 
 (defn- host-invocation-equation?
-  [available program-outputs equation]
+  [available program-outputs required-shape-scalars source-prefix? equation]
   (let [expression (scalar-equation-expression equation)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
          ;; Invocation-prefix construction is dependency-pruned and executes before all device
          ;; equations. Even a shape projection may not cross that boundary when a checked cast
-         ;; still carries exceptional control; retained totality evidence makes it removable.
-         (effects/removable-expr? expression))))
+         ;; still carries exceptional control. A checked scalar which really precedes device work
+         ;; may cross only when a retained shape requires its value before launch; the attested
+         ;; InvocationPlan region then becomes the exceptional computation's single owner.
+         (or (effects/removable-expr? expression)
+             (and source-prefix?
+                  (true? (get-in equation [:attributes :source-prefix?]))
+                  (some required-shape-scalars (:results equation)))))))
+
+(defn- required-shape-scalars
+  "Return scalar equation results in the transitive definition closure of retained shapes."
+  [parallel-program]
+  (let [shape-symbols
+        (into #{}
+              (mapcat (fn [value]
+                        (mapcat util/free-syms (:shape value))))
+              (vals (:values parallel-program)))
+        definitions
+        (into {}
+              (mapcat (fn [equation]
+                        (when (scalar-equation-expression equation)
+                          (map (fn [result] [result equation]) (:results equation)))))
+              (:equations parallel-program))]
+    (loop [required (set/intersection shape-symbols (set (keys definitions)))]
+      (let [dependencies
+            (into required
+                  (comp (mapcat #(get-in definitions [% :operands]))
+                        (filter #(contains? definitions %)))
+                  required)]
+        (if (= required dependencies) required (recur dependencies))))))
 
 (defn- hoist-host-invocation-equations
   [parallel-program]
   (let [program-outputs (:outputs parallel-program)
+        shape-scalars (required-shape-scalars parallel-program)
         {:keys [hoisted retained]}
-        (reduce (fn [{:keys [available] :as state} equation]
-                  (let [host? (host-invocation-equation? available program-outputs equation)
+        (reduce (fn [{:keys [available source-prefix?] :as state} equation]
+                  (let [expression (scalar-equation-expression equation)
+                        scalar? (some? expression)
+                        required-shape? (some shape-scalars (:results equation))
+                        exceptional-shape? (and required-shape?
+                                                (not (effects/removable-expr? expression)))
+                        host? (host-invocation-equation? available program-outputs
+                                                           shape-scalars source-prefix?
+                                                           equation)
+                        ;; Required shape membership authorizes the exceptional one-shot branch;
+                        ;; only the frontend's explicit proof contract retains a removable scalar
+                        ;; as a host-only graph equation.
                         graph-shape? (true? (get-in equation
-                                                    [:attributes :graph-shape-definition]))]
+                                                    [:attributes :graph-shape-definition]))
+                        ;; A preceding exceptional scalar which stays in the device equation
+                        ;; sequence is an ordering barrier: a later checked shape cannot move
+                        ;; ahead of it merely because invocation needs that shape.
+                        state (cond-> state
+                                (or (not scalar?)
+                                    (and (not host?)
+                                         (not (effects/removable-expr? expression))))
+                                (assoc :source-prefix? false))]
                     (cond
+                      (and host? exceptional-shape?)
+                      ;; The checked algebra moves, with its typed closed region, into the
+                      ;; InvocationPlan ScalarCompute. Removing this equation makes the value an
+                      ;; explicit program input and leaves the attested plan as its sole evaluator.
+                      (-> state
+                          (update :hoisted conj equation)
+                          (update :available into (:results equation)))
+
                       (and host? (not graph-shape?))
                       (-> state
                           (update :hoisted conj equation)
@@ -250,13 +304,14 @@
                           (update :retained conj
                                   (-> equation
                                       (assoc :operations [])
-                                      (update :attributes assoc :host-only true)))
+                                      (update :attributes assoc :host-only true
+                                              :graph-shape-definition true)))
                           (update :available into (:results equation)))
 
                       :else
                       (update state :retained conj equation))))
                 {:available (set (:inputs parallel-program))
-                 :hoisted [] :retained []}
+                 :source-prefix? true :hoisted [] :retained []}
                 (:equations parallel-program))]
     (if (and (empty? hoisted) (= retained (:equations parallel-program)))
       parallel-program

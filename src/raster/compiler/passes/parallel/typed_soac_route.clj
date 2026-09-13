@@ -6,6 +6,7 @@
    control expression and retained as first-class algorithms in a ParallelProgram."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
@@ -83,7 +84,17 @@
 
 (defn- typed-store-value
   [cast value]
-  (if cast (list (symbol "clojure.core" (name cast)) value) value))
+  (let [target (some-> cast descriptor/cast-result-tag
+                       dtype/dtype-for-scalar-tag dtype/canon)
+        source (when (seq? value)
+                 (some-> (descriptor/semantic-op value) descriptor/cast-result-tag
+                         dtype/dtype-for-scalar-tag dtype/canon))]
+    ;; The scalar equation's result dtype still owns the host/JVM boundary conversion.  When its
+    ;; already-validated body ends in exactly that primitive cast, reusing it preserves the source
+    ;; check/rounding point without manufacturing a redundant `(long (long ...))` wrapper.
+    (if (or (nil? cast) (= target source))
+      value
+      (list (symbol "clojure.core" (name cast)) value))))
 
 (defn- materialize-region
   [locals body]

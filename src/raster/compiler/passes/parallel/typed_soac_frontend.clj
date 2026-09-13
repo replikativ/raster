@@ -139,6 +139,25 @@
     (or (dtype/dtype-for-scalar-tag (types/sym-type-tag binding))
         (dtype/dtype-for-scalar-tag init-tag))))
 
+(defn- retained-expression-tag
+  "The source result tag already owned by an expression, without a consumer expectation."
+  [expression]
+  (or (when (seq? expression)
+        (descriptor/cast-result-tag (descriptor/semantic-op expression)))
+      (when (instance? clojure.lang.IObj expression)
+        (or (:raster.type/tag (meta expression)) (:tag (meta expression))))
+      (types/literal-tag expression)))
+
+(defn- typed-value-if
+  "Construct a value conditional only when both alternatives prove one source result type."
+  [predicate then-expression else-expression]
+  (let [then-tag (retained-expression-tag then-expression)
+        else-tag (retained-expression-tag else-expression)
+        form (list 'if predicate then-expression else-expression)]
+    (if (and then-tag (= then-tag else-tag))
+      (with-meta form {:tag then-tag :raster.type/tag then-tag})
+      form)))
+
 (defn- typed-region-locals
   "Translate a flat source binding vector into explicit typed lexical SSA.
 
@@ -505,8 +524,17 @@
                          ;; store of a scoped value: keep the locals lexically inside the
                          ;; branch instead of executing them unconditionally.
                          (let [bindings (vec (mapcat (fn [{:keys [id init]}] [id init]) locals))
-                               value (:value (first stores))]
-                           (if (seq bindings) (list 'let* bindings value) value)))]
+                               value (:value (first stores))
+                               value-tag (or (retained-expression-tag value)
+                                             (some (fn [{:keys [id dtype]}]
+                                                     (when (= id value)
+                                                       (dtype/scalar-tag-for-dtype dtype)))
+                                                   locals))
+                               expression (if (seq bindings) (list 'let* bindings value) value)]
+                           (if (and (seq bindings) value-tag)
+                             (with-meta expression
+                               {:tag value-tag :raster.type/tag value-tag})
+                             expression)))]
       (cond
         ;; Store loops under a branch would need predicated loop regions; decline for now.
         (or (seq (:loops then-region)) (seq (:loops else-region)))
@@ -521,9 +549,9 @@
               else-store (first (:stores else-region))]
           {:locals []
            :stores [(assoc then-store
-                           :value (list 'if predicate
-                                        (branch-value then-region)
-                                        (branch-value else-region))
+                           :value (typed-value-if predicate
+                                                  (branch-value then-region)
+                                                  (branch-value else-region))
                            :predicate (merged-predicate (:predicate then-store)
                                                         (:predicate else-store)))]})
 
@@ -537,7 +565,8 @@
            (mapv (fn [ordinal then-store]
                    (let [else-store (nth (:stores else-region) ordinal)]
                      (assoc then-store
-                            :value (list 'if predicate (:value then-store) (:value else-store))
+                            :value (typed-value-if predicate
+                                                   (:value then-store) (:value else-store))
                             :predicate (merged-predicate (:predicate then-store)
                                                          (:predicate else-store)))))
                  (range) (:stores then-region))
@@ -582,39 +611,28 @@
                                       (not= (strip-index-cast index)
                                             (strip-index-cast raw-index)))
                              (additive-update-contribution
-                              (descriptor/aset-array-sym body) raw-index value))
-              cast? (and (seq? value)
-                         (contains? #{'float 'double 'int 'long
-                                      'clojure.core/float 'clojure.core/double
-                                      'clojure.core/int 'clojure.core/long}
-                                    (first value))
-                         (= 2 (count value)))]
+                              (descriptor/aset-array-sym body) raw-index value))]
           {:locals []
            :stores [{:out (descriptor/aset-array-sym body)
                      :index (strip-index-cast (or unique-index raw-index))
                      :conflict (when unique-index :unique)
                      :reduction-op (when contribution '+)
                      :predicate 1
-                     :value (if contribution
-                              contribution
-                              (if cast? (second value) value))
-                     :cast (when (and cast? (not contribution)) (first value))}]})))
+                     ;; Keep a source-written cast in the expression. The result/storage dtype
+                     ;; separately owns an implicit conversion; decomposing both through one
+                     ;; `:cast` field made those two contracts indistinguishable downstream.
+                     :value (if contribution contribution value)
+                     :cast nil}]})))
 
     (atomic-add-call? body)
-    (let [[destination raw-index raw-value] (descriptor/call-args body)
-          cast? (and (seq? raw-value)
-                     (contains? #{'float 'double 'int 'long
-                                  'clojure.core/float 'clojure.core/double
-                                  'clojure.core/int 'clojure.core/long}
-                                (first raw-value))
-                     (= 2 (count raw-value)))]
+    (let [[destination raw-index raw-value] (descriptor/call-args body)]
       {:locals []
        :stores [{:out destination
                  :index (strip-index-cast raw-index)
                  :reduction-op '+
                  :predicate 1
-                 :value (if cast? (second raw-value) raw-value)
-                 :cast (when cast? (first raw-value))}]})
+                 :value raw-value
+                 :cast nil}]})
 
     :else nil)]
     (cond-> region
@@ -731,13 +749,33 @@
 (defn- retained-scalar-dtype
   [expression scalar-types]
   (or (get scalar-types expression)
-      (some-> (when (instance? clojure.lang.IObj expression)
-                (types/sym-type-tag expression))
-              dtype/dtype-for-scalar-tag)
+      ;; A primitive cast's result contract is stronger than incidental metadata copied by an
+      ;; earlier source rewrite. In particular `(long (int seed))` is long even if the outer
+      ;; list accidentally retained the inner operand's int tag.
       (when (and (seq? expression)
                  (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression))))
         (some-> (descriptor/semantic-op expression) descriptor/cast-result-tag
-                dtype/dtype-for-scalar-tag))))
+                dtype/dtype-for-scalar-tag))
+      (some-> (when (instance? clojure.lang.IObj expression)
+                (types/sym-type-tag expression))
+              dtype/dtype-for-scalar-tag)))
+
+(defn- retain-free-scalar-reference-types
+  "Attach authoritative lexical scalar facts to free references before effect classification.
+
+   `subst-syms` supplies the shared capture-aware scope traversal: an inner binding that shadows a
+   source scalar is not annotated. This introduces no type inference; every tag comes directly
+   from the threaded declared/retained scalar environment."
+  [expression scalar-types]
+  (let [typed-references
+        (into {}
+              (keep (fn [[id scalar-dtype]]
+                      (when (and (symbol? id) scalar-dtype)
+                        (let [tag (dtype/scalar-tag-for-dtype scalar-dtype)]
+                          [id (with-meta id (assoc (meta id)
+                                                  :tag tag :raster.type/tag tag))]))))
+              scalar-types)]
+    (util/subst-syms typed-references expression)))
 
 (defn- normalize-scalar-casts
   "Erase only integral identity/widening casts proved by retained types. A narrowing cast
@@ -2058,15 +2096,29 @@
                    (update state :normalized conj
                            [symbol (replace-extent expression canonical-extent)])
 
-                   ;; A checked extent is evaluated exactly once at this source position. It must
-                   ;; receive an SSA identity, but unlike a removable expression it cannot be
-                   ;; deduplicated with an earlier equal spelling.
+                   ;; A checked extent is evaluated exactly once at its first source position. It
+                   ;; receives an SSA identity and is not generally CSE-safe; only a dominating
+                   ;; identical check over immutable scalar operands may reuse that proved value.
                    (and (ordered-scalar-expression? canonical-extent)
                         (requires-ordered-evaluation? canonical-extent))
-                   (let [extent-id (fresh-extent-id)]
-                     (update state :normalized into
-                             [[extent-id canonical-extent]
-                              [symbol (replace-extent expression extent-id)]]))
+                   (let [immutable-operands?
+                         (and (empty? (par/collect-aget-arrays canonical-extent))
+                              (set/subset? (util/free-syms canonical-extent)
+                                           (set (keys local-scalar-types))))]
+                     (if-let [extent-id (when immutable-operands?
+                                          (get (:checked-extents state) canonical-extent))]
+                       ;; The first identical check dominates this use. Its immutable scalar
+                       ;; operands cannot change, so reaching here proves a repeated evaluation
+                       ;; would also succeed; reuse the checked value without making casts
+                       ;; generally removable or CSE-safe.
+                       (update state :normalized conj
+                               [symbol (replace-extent expression extent-id)])
+                       (let [extent-id (fresh-extent-id)]
+                         (cond-> (update state :normalized into
+                                         [[extent-id canonical-extent]
+                                          [symbol (replace-extent expression extent-id)]])
+                           immutable-operands?
+                           (assoc-in [:checked-extents canonical-extent] extent-id)))))
 
                    (provably-pure-scalar? canonical-extent)
                    (if-let [extent-id (get compound-extents canonical-extent)]
@@ -2084,7 +2136,7 @@
 
                    :else
                    (update state :normalized conj [symbol expression]))))
-             {:normalized [] :compound-extents {} :allocation-lengths {}
+             {:normalized [] :compound-extents {} :checked-extents {} :allocation-lengths {}
               :scalar-aliases {} :buffer-aliases {} :pure-scalar-ids {} :local-scalar-types scalar-types}
              (map-indexed vector pairs))]
         (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
@@ -2104,15 +2156,21 @@
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
   (:descriptions
    (reduce
-    (fn [{:keys [array-types scalar-definitions stageable-prefix?] :as state}
+    (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?] :as state}
          [id [symbol expression]]]
-      (let [description
+      (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
+            description
             (or (binding [*scalar-definitions* scalar-definitions]
-                  (operation-description id symbol expression default-dtype array-types scalar-types))
+                  (operation-description id symbol expression default-dtype array-types
+                                         local-scalar-types))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
             description (assoc description :source-prefix? stageable-prefix?)
+            scalar-dtype (when (= :scalar (:kind description))
+                           (some-> (or (retained-scalar-dtype symbol local-scalar-types)
+                                       (retained-scalar-dtype expression local-scalar-types))
+                                   dtype/canon))
             ;; a pure product/sum of scalars is a definition later index algebra may expand
             scalar-definition
             (when (and (= :scalar (:kind description)) (symbol? symbol)
@@ -2137,9 +2195,11 @@
               (and (not (effects/removable-expr? expression))
                    (not (requires-ordered-evaluation? expression))))
           (assoc :stageable-prefix? false)
+          scalar-dtype (assoc-in [:local-scalar-types symbol] scalar-dtype)
           allocation-dtype (assoc-in [:array-types symbol] allocation-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
-    {:descriptions [] :array-types array-types :scalar-definitions {} :stageable-prefix? true}
+    {:descriptions [] :array-types array-types :scalar-definitions {}
+     :local-scalar-types scalar-types :stageable-prefix? true}
     (map-indexed vector pairs))))
 
 (defn- canonical-extent
@@ -2476,32 +2536,14 @@
             expression))
         expression))))
 
-(defn- declare-result-conversion
-  "Wrap a map body in the explicit cast to its result element dtype when the body's retained
-   dtype differs.
-
-   Both dtypes are facts: the result buffer's element dtype and the walker's stamp on the body.
-   A double body written to a float buffer (a double-typed schedule compiled under the float
-   policy) is a stated narrowing, not a silent one; KernelBody would otherwise refuse the store."
-  [expression elem-type]
-  (let [tag (when (instance? clojure.lang.IObj expression)
-              (or (:raster.type/tag (meta expression)) (:tag (meta expression))))
-        source (some-> tag dtype/dtype-for-scalar-tag dtype/canon)
-        target (some-> elem-type dtype/canon)]
-    (if (and source target (not= source target)
-             (dtype/fp-dtype? source) (dtype/fp-dtype? target))
-      (list (dtype/scalar-tag-for-dtype target) expression)
-      expression)))
-
 (defn- map-equation
   [description]
-  (let [{:keys [id index extent locals casts bodies inputs results elem-type]} description
+  (let [{:keys [id index extent locals bodies inputs results elem-type]} description
         fold-dtype (or elem-type (:result-dtype description) :double)
-        expressions (mapv (fn [cast body]
-                            (if cast
-                              (list cast body)
-                              (declare-result-conversion body fold-dtype)))
-                          casts bodies)
+        ;; The map result dtype is already an explicit TypedSOAC/storage contract. Keep it out of
+        ;; the scalar expression tree so it cannot masquerade as a user source cast. Casts written
+        ;; inside `body` remain intact and retain their checked/unchecked source semantics.
+        expressions (vec bodies)
         all-expressions (into (mapv :init locals) expressions)
         [pointwise stable] ((juxt filter remove)
                             #(and (not (contains? (:storage-inputs description) %))
@@ -2570,7 +2612,6 @@
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
-        destination-dtypes (zipmap destinations result-dtypes)
         destination-set (set destinations)
         semantic-inputs (set/difference (set inputs) destination-set)
         ;; An effect traversal need not cover the complete physical input. Keep explicit
@@ -2622,11 +2663,10 @@
                 (list 'effect-loop attributes (transform extent) lambda)))
             (list 'effect (get destination-substitutions out)
                   effect-conflict (transform index) (transform predicate)
-                  ;; Primitive aset converts to the destination element type. Preserve any
-                  ;; source conversion inside that store conversion, rather than asking the
-                  ;; target emitter to infer or silently coerce a mismatched scalar value.
-                  (transform (list (dtype/scalar-tag-for-dtype (get destination-dtypes out))
-                                   (if cast (list cast value) value)))))))
+                  ;; The destination dtype is already carried by the effect-map result/storage
+                  ;; contract. Preserve a cast explicitly present in the source store, without
+                  ;; adding a second synthetic cast around the complete value expression.
+                  (transform (if cast (list cast value) value))))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map
@@ -3388,6 +3428,9 @@
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
                                         :source-binding-id (:id description)})
+                                true
+                                (update :attributes assoc
+                                        :source-prefix? (boolean (:source-prefix? description)))
                                 (contains? graph-shape-scalar-ids (:sym description))
                                 (update :attributes assoc :graph-shape-definition true)
                                 storage
