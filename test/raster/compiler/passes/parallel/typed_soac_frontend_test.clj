@@ -1085,6 +1085,28 @@
     (is (= [:float :float]
            ((juxt :source-dtype :target-dtype) (:attributes conversion))))))
 
+(deftest agreeing-conditional-branches-own-the-map-source-dtype
+  (let [source '(let* [y (raster.par/pmap i n float
+                                           (if (> (clojure.core/aget x i) threshold)
+                                             (clojure.core/aget x i)
+                                             (* alpha (clojure.core/aget x i))))]
+                         y)
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'x :float}
+                         :scalar-types {'n :long 'threshold :float 'alpha :float}})
+        conversion (-> program dialect/equations first dialect/operation-parts :lambda
+                       dialect/lambda-parts :body-results first dialect/scalar-convert-parts)]
+    (is program)
+    (is (= [:float :float]
+           ((juxt :source-dtype :target-dtype) (:attributes conversion))))
+    (is (nil? (frontend/form->program
+               '(let* [y (raster.par/pmap i n float
+                                           (if flag (clojure.core/aget x i) 0.0))]
+                  y)
+               {:dtype :float :array-types {'x :float}
+                :scalar-types {'n :long 'flag :int}}))
+        "a consumer cast cannot invent one source dtype for mixed conditional exits")))
+
 (deftest closed-core-integer-case-becomes-a-typed-conditional-map
   (let [expression
         '(raster.par/map-void!
@@ -1703,3 +1725,18 @@
     (is (= :unique
            (effect-map-order source {:dtype :float :array-types {'sc :float 'q :float}
                                      :scalar-types {'nrows :long 'n-q :long}})))))
+
+(deftest host-control-cannot-hide-an-unequated-parallel-leaf
+  (let [source
+        '(let* [seed (raster.par/map! initial i n float (aget x i))]
+           (loop* [h 0 acc seed]
+             (if (< h heads)
+               (let* [next (raster.par/map! scratch i n float
+                                             (+ (aget acc i) (aget x i)))]
+                 (recur (inc h) next))
+               acc)))]
+    (is (nil? (frontend/form->program
+               source {:dtype :float
+                       :array-types {'initial :float 'scratch :float 'x :float}
+                       :scalar-types {'heads :long 'n :long}}))
+        "a validated TypedSOAC program must own every parallel leaf as an equation")))

@@ -17,6 +17,14 @@
   [^doubles arr]
   (every? #(Double/isFinite %) arr))
 
+(deftest strided-slice-and-scatter-are-padding-duals
+  (doseq [src [(double-array (range 10)) (float-array (range 10))]]
+    (let [packed (ops/slice-strided-2d src 2 5 1 3)
+          restored (ops/pad-strided-2d packed 2 5 1 3)]
+      (is (= [1.0 2.0 3.0 6.0 7.0 8.0] (mapv double packed)))
+      (is (= [0.0 1.0 2.0 3.0 0.0 0.0 6.0 7.0 8.0 0.0]
+             (mapv double restored))))))
+
 (defn- arr-approx=
   "Check two arrays are approximately equal."
   ([^doubles a ^doubles b] (arr-approx= a b 1e-6))

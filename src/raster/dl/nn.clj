@@ -162,10 +162,12 @@
                         batch :- Long in-f :- Long out-f :- Long] :- (Array T)
                    (let [;; y = x @ W^T, x:[batch,in_f] W:[out_f,in_f] -> y:[batch,out_f]
         ;; Use BLAS with B-transposed to avoid explicit transpose
-                         y (alloc-like x (* batch out-f))
-        ;; Pre-fill y with bias (broadcast b over batch rows) for epilogue fusion
-                         _ (dotimes [i batch]
-                             (acopy! b 0 y (* i out-f) out-f))
+                         n (* batch out-f)
+                         y (alloc-like x n)
+        ;; Pre-fill y with the bias as a first-class map.  This is the same semantic epilogue as
+        ;; copying one row at a time, but remains visible to TypedSOAC fusion and scheduling.
+                         _ (raster.par/map! y i n nil
+                                             (aget b (rem i out-f)))
         ;; y = 1.0 * x @ W^T + 1.0 * y (bias already in y)
                          _ (blas/dgemm-nt! x W y batch in-f out-f (n/oftype x 1.0) (n/oftype x 1.0))]
                      y)))
@@ -174,8 +176,9 @@
 (deftm linear! (All [T] [x :- (Array T) W :- (Array T) b :- (Array T)
                          y :- (Array T)
                          batch :- Long in-f :- Long out-f :- Long] :- (Array T)
-                    (let [_ (dotimes [i batch]
-                              (acopy! b 0 y (* i out-f) out-f))
+                    (let [n (* batch out-f)
+                          _ (raster.par/map! y i n nil
+                                              (aget b (rem i out-f)))
                           _ (blas/dgemm-nt! x W y batch in-f out-f (n/oftype x 1.0) (n/oftype x 1.0))]
                       y)))
 
@@ -1274,19 +1277,24 @@
                                                      ckk :- Long c-out :- Long bhw :- Long] :- (Array T)
                                                     (blas/dgemm-tn! W dy-cols d-cols ckk c-out bhw (n/oftype W 1.0) (n/oftype W 0.0))))
 
-;; db = sum dy over spatial dims — tight 2-deep loop
+;; db = sum dy over batch and spatial dimensions.  The output-channel map is independent; each
+;; lane owns one ordered reduction.  Keeping that algebra explicit lets the common TypedSOAC
+;; frontend choose a segmented reduction schedule instead of recovering one from three nested
+;; imperative loops.
 (deftm ^:no-inline conv2d-backward-db-into! (All [T]
                                                  [dy :- (Array T) db :- (Array T)
                                                   batch :- Long c-out :- Long h-out :- Long w-out :- Long] :- (Array T)
                                                  (let [hw-out (* h-out w-out)
                                                        chw-out (* c-out hw-out)]
-                                                   (dotimes [i c-out] (aset db i 0.0))
-                                                   (dotimes [bi batch]
-                                                     (dotimes [co c-out]
-                                                       (let [base (+ (* bi (int chw-out)) (* co (int hw-out)))]
-                                                         (dotimes [j hw-out]
-                                                           (aset db co (+ (aget db co) (aget dy (+ base j))))))))
-                                                   db)))
+                                                   (raster.par/map!
+                                                    db co c-out nil
+                                                    (raster.par/reduce
+                                                     acc 0.0 element (* batch hw-out)
+                                                     (let [bi (quot element hw-out)
+                                                           j (rem element hw-out)
+                                                           base (+ (* bi (int chw-out))
+                                                                   (* co (int hw-out)))]
+                                                       (+ acc (aget dy (+ base j)))))))))
 
 ;; conv2d rrule — uses dedicated in-place helpers for rearrange/gemm/bias
 

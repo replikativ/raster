@@ -1,6 +1,7 @@
 (ns raster.dl.attention-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [raster.dl.attention :as attn]
+            [raster.dl.array-ops :as ops]
             [raster.dl.nn :as nn]
             [raster.ad.templates :as tmpl]
             [raster.linalg.blas :as blas]))
@@ -110,6 +111,44 @@
 ;; ================================================================
 ;; Multi-head attention
 ;; ================================================================
+
+(defn- headwise-causal-mha-reference
+  [x Wq bq Wk bk Wv bv Wo bo seq-len d-model n-heads]
+  (let [dk (quot d-model n-heads)
+        n (* seq-len d-model)
+        Q (nn/linear x Wq bq seq-len d-model d-model)
+        K (nn/linear x Wk bk seq-len d-model d-model)
+        V (nn/linear x Wv bv seq-len d-model d-model)]
+    (loop [head 0 acc (double-array n)]
+      (if (< head n-heads)
+        (let [column-offset (* head dk)
+              Qh (ops/slice-strided-2d Q seq-len d-model column-offset dk)
+              Kh (ops/slice-strided-2d K seq-len d-model column-offset dk)
+              Vh (ops/slice-strided-2d V seq-len d-model column-offset dk)
+              head-out (attn/causal-scaled-dot-product-attn Qh Kh Vh seq-len dk dk)
+              wide (ops/scatter-strided-2d head-out seq-len d-model column-offset dk)]
+          (recur (inc head) (ops/array-add acc wide n)))
+        (nn/linear acc Wo bo seq-len d-model d-model)))))
+
+(deftest batched-causal-mha-preserves-headwise-and-ragged-width-semantics
+  (doseq [d-model [4 5]]
+    (let [seq-len 2 n-heads 2
+          values (fn [n offset]
+                   (double-array (map #(/ (+ offset %) 37.0) (range n))))
+          x (values (* seq-len d-model) -3)
+          Wq (values (* d-model d-model) -7)
+          Wk (values (* d-model d-model) 2)
+          Wv (values (* d-model d-model) -5)
+          Wo (values (* d-model d-model) 1)
+          bq (values d-model -2) bk (values d-model 1)
+          bv (values d-model -1) bo (values d-model 3)
+          expected (headwise-causal-mha-reference
+                    x Wq bq Wk bk Wv bv Wo bo seq-len d-model n-heads)
+          actual (attn/causal-multi-head-attention
+                  x Wq bq Wk bk Wv bv Wo bo seq-len d-model n-heads)]
+      (is (= (* seq-len d-model) (alength ^doubles actual)))
+      (is (arr-approx= expected actual 1.0e-6)
+          (str "packed batched heads preserve the headwise result at d-model=" d-model)))))
 
 (deftest multi-head-attention-test
   (testing "MHA output has correct shape"

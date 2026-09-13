@@ -329,6 +329,24 @@
                      (aget packed (+ src-off c))))))
          out)))
 
+(deftm pad-strided-2d
+  "Embed packed [rows × n-cols] values in a zero-padded [rows × row-stride] result.
+  Unlike scatter-strided-2d, this is a pure output-element map: every result coordinate has one
+  owner, so padding remains parallel without an indexed-write conflict proof."
+  (All [T] [packed :- (Array T)
+            rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
+       :- (Array T)
+       (let [out (alloc-like packed (* rows row-stride))]
+         (par/map! out i (* rows row-stride) nil
+                   (let [r (quot i row-stride)
+                         c (rem i row-stride)]
+                     (if (< c col-offset)
+                       (n/oftype packed 0)
+                       (if (< c (+ col-offset n-cols))
+                         (aget packed (+ (* r n-cols) (- c col-offset)))
+                         (n/oftype packed 0)))))
+         out)))
+
 ;; ================================================================
 ;; pack-heads / unpack-heads: multi-head attention layout combinators.
 ;; Both are parametric (All [T]) and expressed as output-element-parallel
@@ -534,6 +552,18 @@
                                  [d-src nil nil nil nil]]))})
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
+                           {:params '[packed rows row-stride col-offset n-cols]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [packed rows row-stride col-offset n-cols]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [d-packed (gensym-fn "d_packed" (tmpl/grad-tag packed))]
+                                [(update ctx :bindings into
+                                         [d-packed (list 'raster.dl.array-ops/slice-strided-2d
+                                                         adjoint-sym rows row-stride col-offset n-cols)])
+                                 [d-packed nil nil nil nil]]))})
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/pad-strided-2d
                            {:params '[packed rows row-stride col-offset n-cols]
                             :result nil :adjoint 'dy
                             :grads-fn

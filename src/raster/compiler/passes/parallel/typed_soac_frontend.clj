@@ -166,6 +166,19 @@
       (when (symbol? expression) (some-> (get scalar-types expression) dtype/canon))
       (when (descriptor/aget-call? expression)
         (some-> (get array-types (descriptor/aget-array-sym expression)) dtype/canon))
+      ;; A value conditional owns a result dtype exactly when both exits independently own the
+      ;; same dtype.  TypedClojure commonly retains the branch facts without tagging the `if`
+      ;; node itself, so preserve that join here rather than borrowing the surrounding map/store
+      ;; target.  Mixed or unknown branches remain untyped and therefore fail closed later.
+      (when (and (seq? expression)
+                 (= 'if (first expression))
+                 (= 4 (count expression)))
+        (let [then-dtype (retained-expression-dtype (nth expression 2)
+                                                    array-types scalar-types)
+              else-dtype (retained-expression-dtype (nth expression 3)
+                                                    array-types scalar-types)]
+          (when (and then-dtype (= then-dtype else-dtype))
+            then-dtype)))
       ;; A source reduction returns its accumulator.  Its explicit element annotation wins when
       ;; present; otherwise the accumulator binder/identity owns the result type.  The reduction
       ;; constructor independently certifies the recurrence at this dtype, so this does not infer
@@ -2503,6 +2516,11 @@
     ;; lowering route inside one program would duplicate semantics.
     (every? #(or (supported-description? physical-outputs %)
                  (and (= :scalar (:kind %))
+                      ;; Host control may surround typed islands, but it may not hide a parallel
+                      ;; operation that has no equation in this program. Such a leaf must remain
+                      ;; on the explicit compatibility/structured-control route until its control
+                      ;; scope itself is represented.
+                      (not (contains-parallel-form? (:expr %)))
                       (not (requires-ordered-evaluation? (:expr %)))))
             descriptions)))
 
@@ -3478,6 +3496,10 @@
                                      :product-reduce :segmented-fold-map :scan}
                                    (:kind %))
                        descriptions)
+                 ;; Body expressions are projected as host results, not equations. They therefore
+                 ;; cannot contain an unrepresented parallel leaf; structured control or the
+                 ;; compatibility scheduler must retain that lexical operation instead.
+                 (not-any? contains-parallel-form? body)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
               (filterv #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce

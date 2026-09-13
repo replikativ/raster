@@ -585,7 +585,7 @@
 (deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
   (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
 
-(deftest nested-compatibility-parallel-work-is-an-opaque-host-barrier
+(deftest nested-compatibility-parallel-work-declines-the-whole-typed-route
   (let [source '(let* [mapped (raster.par/pmap i n double
                                                (* (clojure.core/aget x i) 2.0))
                        mean (let* [total (raster.par/reduce
@@ -593,14 +593,12 @@
                                           (+ acc (clojure.core/aget mapped j)))]
                                   (/ total (double n)))]
                       mean)
-        {:keys [program stats]} (route/attempt source :double {'x :double})]
-    (is (= :typed-soac (:dialect program)))
-    (is (= 1 (count (:equations program))))
-    (is (= '[mapped] (:outputs program))
-        "the typed result consumed by compatibility host work stays materialized")
-    (is (= [1] (get-in program [:attributes :host-binding-ids])))
-    (is (some #{'raster.par/reduce} (flatten (:source program))))
-    (is (:typed-validated stats))))
+        result (route/attempt source :double {'x :double})]
+    (is (= :typed-soac-source-coverage (get-in result [:declined :reason])))
+    (is (= [{:id 1 :binding 'mean :kind :scalar :operation 'let*
+             :reason :uncertified-host-scalar}]
+           (get-in result [:declined :bindings]))
+        "a typed prefix must not hide nested parallel work behind a compatibility host barrier")))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
