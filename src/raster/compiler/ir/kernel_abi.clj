@@ -162,8 +162,8 @@
                       {:expected (count abi) :actual (count arguments) :abi abi})))
     arguments))
 
-(defn validate-alias-contracts!
-  "Enforce ABI no-write-alias requirements for complete ordered arguments.
+(defn alias-contract-violations
+  "Return ABI no-write-alias violations for complete ordered arguments.
 
   `overlaps?` receives two pointer values and must conservatively report whether their physical
   ranges overlap. Compiler-symbol validation may use equality; runtime call validation supplies
@@ -178,13 +178,18 @@
         stable-inputs (filterv (fn [[slot _]]
                                  (= :no-write-alias (:aliasing slot))) pairs)
         outputs (filterv (fn [[slot _]] (writable? slot)) pairs)]
-    (doseq [[input-slot input] stable-inputs
-            [output-slot output] outputs
-            :when (overlaps? input output)]
-      (throw (ex-info "kernel stable input overlaps a writable output"
-                      {:reason :kernel-abi-no-write-alias
-                       :input-slot input-slot :output-slot output-slot})))
-    arguments))
+    (vec (for [[input-slot input] stable-inputs
+               [output-slot output] outputs
+               :when (overlaps? input output)]
+           {:reason :kernel-abi-no-write-alias
+            :input-slot input-slot :output-slot output-slot}))))
+
+(defn validate-alias-contracts!
+  "Enforce ABI no-write-alias requirements using the same facts as candidate admission."
+  [abi arguments overlaps?]
+  (when-let [violation (first (alias-contract-violations abi arguments overlaps?))]
+    (throw (ex-info "kernel stable input overlaps a writable output" violation)))
+  arguments)
 
 (defn validate-split-binding!
   "Validate the compatibility binder shape `(pointers, user-scalars, implicit-bound)` against an
