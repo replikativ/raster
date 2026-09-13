@@ -86,7 +86,7 @@
                                  (= :write (:access target))
                                  (= #{target-id} (set (link/output-value-ids (:link-plan binding))))
                                  (set/subset? (set (link/value-node-ids (:link-plan binding) target-id))
-                                              (:produces (link/initialization-contract (:link-plan binding))))
+                                              (:complete-writes (link/initialization-contract (:link-plan binding))))
                                  (= (:value source) (get-in contract [:source :field]))
                                  (= (:value target) (get-in contract [:target :field])))
                     (fail! "AMR implementation must read only its source field and write/export its target field"

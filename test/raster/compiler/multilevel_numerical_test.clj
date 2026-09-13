@@ -1,8 +1,11 @@
 (ns raster.compiler.multilevel-numerical-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.core :refer [deftm]]
             [raster.arrays :as arrays]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.write-coverage :as coverage]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.ode.multilevel :as multilevel]
             [raster.ode.multilevel-compiler :as multilevel-compiler]
             [raster.compiler.equation-first :as equation]
@@ -21,6 +24,13 @@
    nx :- Long, ny :- Long]
   (multilevel/prolong-constant-2d! fine coarse nx ny)
   (multilevel/restrict-average-2d! out fine nx ny))
+
+(deftm partial-pair-store!
+  [out :- (Array double), source :- (Array double), n :- Long]
+  (dotimes [i n]
+    (arrays/aset out (* 2 i) (arrays/aget source i))
+    (arrays/aset out (+ (* 2 i) 1) (arrays/aget source i)))
+  out)
 
 (deftest cell-centred-transfer-oracles
   (doseq [[nx ny] [[1 1] [3 5] [4 2]]]
@@ -195,6 +205,53 @@
                            :hierarchy hierarchy :state state :distributed-plan (distributed/certify plan)
                            :coarse-fine scheduled}))))
 
+(deftest rectangular-coverage-retains-integer-and-control-semantics
+  (let [plan (equation/lower
+               (equation/compile #'multilevel/prolong-constant-2d! {:target :ze:0 :dtype :double})
+               [(double-array 60) (double-array 15) 3 5])
+        step (first (get-in plan [:instances 0 :call :steps]))
+        algorithm (get-in step [:equation :operations 0 :algorithm])
+        result (first (keys (:outputs step)))
+        scalars (merge (get-in plan [:instances 0 :call :scalar-values]) (:scalar-values step))
+        destination-parameter (-> algorithm soac/equations first soac/operation-parts
+                                  :lambda soac/lambda-parts :parameters last)
+        covers? #(boolean (coverage/rectangular-effect-covers? % result 60 scalars))
+        change-store (fn [f] (walk/postwalk (fn [x] (if (and (seq? x) (= 'effect (first x))) (f x) x)) algorithm))]
+    (is (covers? algorithm))
+    (is (not (coverage/rectangular-effect-covers?
+               algorithm result 60 (assoc scalars destination-parameter {:type :long :value 1}))))
+    (is (not (coverage/rectangular-effect-covers? algorithm result 61 scalars)))
+    (is (not (covers? (change-store #(apply list (assoc (vec %) 4 0))))))
+    (is (not (covers? (change-store #(apply list (assoc (vec %) 3 0))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3 (list 'clojure.core/int (nth % 3))))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3
+                                           (with-meta (list 'clojure.core/+ (nth % 3) Long/MAX_VALUE)
+                                             {:tag 'long})))))))
+    (is (not (covers? (change-store
+                       #(apply list (assoc (vec %) 3 (with-meta (nth % 3) nil)))))))))
+
+(deftest partial-write-permission-is-not-complete-initialization
+  (let [source (double-array 15)
+        target (double-array 60)
+        plan (equation/lower (equation/compile #'partial-pair-store! {:target :ze:0 :dtype :double})
+                             [target source 3])
+        target-node (some (fn [[id node]] (when (identical? target (:source node)) id)) (:nodes plan))
+        target-value (some (fn [[id value]] (when (= target-node (get-in value [:leaves 0 :node])) id))
+                           (:values plan))
+        contract (link-plan/initialization-contract plan)
+        caller (-> plan (assoc-in [:nodes target-node :source] nil)
+                   (assoc-in [:nodes target-node :role] :state))
+        fresh (assoc-in caller [:nodes target-node :role] :internal)]
+    (is (= :write (get (link-plan/value-accesses plan) target-value)))
+    (is (contains? (:produces contract) target-node))
+    (is (not (contains? (:complete-writes contract) target-node)))
+    (is (contains? (:requires (link-plan/initialization-contract caller)) target-node))
+    (is (= :link-unproduced-output
+           (try (link-plan/initialization-contract fresh) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest implementation-witnesses-bind-exact-plans-and-field-effects
   (let [coarse (double-array (map #(* 0.25 %) (range 15)))
         fine (double-array 60)
@@ -226,8 +283,11 @@
     (is (= :amr-execution-invariants
            (failure (assoc-in implementations [:restriction :invariants] #{}))))
     (is (= :amr-execution-implementations (failure (dissoc implementations :restriction))))
-    (let [partial (equation/lower (equation/compile #'arrays/acopy! {:target :ze:0 :dtype :double})
-                                  [coarse 0 fine 0 3])
+    (doseq [[operator arguments expected-access]
+            [[#'arrays/acopy! [coarse 0 fine 0 3] :read-write]
+             [#'partial-pair-store! [fine coarse 3] :write]]]
+      (let [partial (equation/lower (equation/compile operator {:target :ze:0 :dtype :double})
+                                    arguments)
           partial (update partial :nodes
                           #(update-vals % (fn [node]
                                             (assoc-in node [:view :allocation :id]
@@ -248,11 +308,15 @@
                    changed-workload :prolongation partial
                    {:source (ids :coarse) :target (ids :fine) :producer :test/incorrect-partial-provider
                     :invariants #{:constant-preserving} :numerical {:mode :exact :policy :test}})]
-      (is (= :read-write (get (link-plan/value-accesses partial) (ids :fine))))
+      (is (= expected-access (get (link-plan/value-accesses partial) (ids :fine))))
+      (let [target-node (get-in partial [:values (ids :fine) :leaves 0 :node])
+            contract (link-plan/initialization-contract partial)]
+        (is (contains? (:produces contract) target-node))
+        (is (not (contains? (:complete-writes contract) target-node))))
       (is (= :amr-execution-effects
              (try (amr-execution/certify changed-workload (assoc implementations :prolongation witness)) nil
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
-          "an initialized partial-copy result is not a pure whole-patch transfer"))
+          "partial updates cannot attest whole-patch coverage, even with write-only ABI access")))
     (is (= :amr-execution-invariants (failure (assoc-in implementations [:restriction :producer] false))))
     (is (= :numerical-contract (failure (assoc-in implementations [:restriction :numerical] {}))))
     (is (= :amr-execution-implementation

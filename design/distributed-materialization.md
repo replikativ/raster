@@ -284,6 +284,19 @@ binding. Only the target may be exported, and the exact external field set is so
 target-write. Full-patch domains cannot contain extra padded boundary or replica regions. Partial
 regions still need actual logical-domain and physical-view checks, not byte-span containment.
 
+Target coverage uses LinkPlan's `:complete-writes`, not its conditional `:produces` postcondition.
+A partial update can preserve a caller-initialized field without independently establishing all of
+its contents. Reading or exporting an uninitialized tail is rejected; a certified prefix can still
+be exported from a larger fresh allocation. Invocation linking and plan validation share
+the retained semantic coverage rules: dense functional results, and unconditional single-store
+rectangles whose typed arithmetic is exact and in bounds and whose index map is injective over a
+domain with exactly the destination capacity. This reuses typed index lowering, scalar ranges and
+mixed-radix algebra; it does not erase casts before checking arithmetic or identify numerical
+functions by name. Multiple-store unions and data-dependent address domains decline this proof.
+Legacy descriptor permissions and structured-loop compatibility facts do not contribute certified
+complete-write evidence; their coverage needs separate retained-semantic derivation before AMR
+providers may rely on them.
+
 `raster.ode.multilevel-compiler` is the implementation-local provider: it compiles its known
 ordinary numerical function, retains its exact LinkPlan, and exposes semantic source/target IDs.
 It supports dense dyadic FP64 whole patches on one logical worker. Field-qualified allocation

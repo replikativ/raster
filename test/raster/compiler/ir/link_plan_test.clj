@@ -101,6 +101,7 @@
         caller (update initialized :nodes
                        #(update-vals % (fn [node] (assoc node :source nil))))]
     (is (= {:requires #{} :initializers #{:x :w0 :w1} :produces #{:hidden :out}
+            :complete-writes #{}
             :reads #{:x :w0 :w1 :hidden} :writes #{:hidden :out} :outputs #{:out}}
            (link/initialization-contract initialized)))
     (is (= #{:x :w0 :w1} (:requires (link/initialization-contract caller))))
