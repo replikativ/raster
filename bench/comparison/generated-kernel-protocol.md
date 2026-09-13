@@ -287,3 +287,34 @@ The static public composition regression now fuses to one generated stage. This 
 the parameterized canary gap: normalized dynamic extent computation still separates its producer
 and consumer. Report static and dynamic workloads separately, and do not infer measured speedups
 from a reduced stage count.
+
+## Matrix input conversion experiments
+
+`raster.perf.matrix-input-fusion-probe/run!` compares the compiler's global-conversion matrix
+graph with its explicit typed-input-conversion candidate. This is a **scheduled graph** probe,
+not a public `deftm` or end-to-end serving benchmark. Both candidates replay weight conversion;
+constant-weight prologue extraction is not represented. The fused candidate remains outside
+automatic selection because physical input/output disjointness and performance admission must
+both be established before promotion.
+
+```clojure
+;; Independent rounding and geometry oracle, no timing.
+(run! :ocl:0 {:shape [17 64 96] :tile-policy :multi-fragment
+              :input-policy :half-rounding-ties :variant :nt})
+;; Paired diagnostic on a larger shape; repeat with matched backend/device/environment.
+(run! :ze:0 {:shape [8 256 256] :tile-policy :multi-fragment
+             :timing? true :rounds 12 :warmup-rounds 4})
+```
+
+Shapes are capped at 8,388,608 reference products and each dimension at 4096; rounds are bounded
+and even. Available tiles exercise either one fragment or multiple row/column fragments, with
+one or two prefetch stages. `:half-rounding-ties` perturbs the dyadic input before an independent
+Java binary16 rounding oracle. Every replay alternates A's sign, poisons C, and checks against
+the host reference outside the measured interval. Raw profiles identify validation, warmup and
+measurement phases and retain both graph span and per-kernel timings. Missing device spans fail
+instead of falling back to host timing.
+
+The retained September 13 tiny-case OpenCL and Level Zero timings were nonstationary. Their
+medians cannot establish a speedup or a backend ranking. Stage removal and exact device replay
+are established; stationary timings, constant-weight serving composition and matched external
+baselines remain separate gates.

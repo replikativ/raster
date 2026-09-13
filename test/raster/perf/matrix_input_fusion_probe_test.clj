@@ -6,8 +6,15 @@
 
 (deftest invalid-probe-options-do-not-open-a-session
   (with-redefs [gpu/with-gpu-session* (fn [& _] (throw (AssertionError. "unexpected session")))]
-    (doseq [options [{:rounds 1} {:rounds 121} {:warmup-rounds -1} {:timing? :yes}]]
+    (doseq [options [{:rounds 1} {:rounds 121} {:warmup-rounds -1} {:timing? :yes}
+                    {:shape [4096 4096 4096]} {:shape [0 32 32]} {:shape [13 32 nil]}
+                    {:tile-policy :unknown} {:input-policy :unknown} {:variant :tn}]]
       (is (thrown? clojure.lang.ExceptionInfo (probe/run! :mock options))))))
+
+(deftest independent-oracle-rounds-halfway-values-to-even
+  (is (= [0.5 0.5009765625 -0.5 -0.5009765625]
+         (vec (probe/rounded-inputs [0.500244140625 0.500732421875
+                                     -0.500244140625 -0.500732421875])))))
 
 (deftest paired-probe-validates-every-replay-and-releases-handles
   (let [storage (atom {}) calls (atom []) released (atom [])
