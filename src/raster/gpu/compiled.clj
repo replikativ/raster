@@ -416,6 +416,15 @@
     (println "  steps    :" (count (:steps descriptor)) "resident, by kind:" kinds))
   c)
 
+(defn execution-info
+  "Report the instantiated artifact's admitted resident schedules, without running it.
+   Unlike `ir`, this observes binding-time selection. It is not a replay or timing report."
+  [c]
+  (when-not (compiled? c)
+    (throw (ex-info "execution info requires an instantiated compiled artifact"
+                    {:reason :compiled-execution-info-unbound})))
+  (gpu-link/execution-info (:executable c)))
+
 (defn ir
   "Return the descriptor's resident steps (the artifact's lowered IR) for inspection."
   [c]

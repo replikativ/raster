@@ -215,6 +215,11 @@
                 (map executable/strategy (:alternatives choice))))
       (let [live (compiled/instantiate! selected {:profile? true})]
         (try
+          (let [bound (mapv :executable (compiled/execution-info live))]
+            (is (= [:xmx-direct-lhs-tile-cast] (mapv :strategy bound)))
+            (is (= [:mixed-f16-f32] (mapv :precision bound)))
+            (is (= [[{:strategy :xmx-direct-lhs-tile-cast :reasons []}]]
+                   (mapv :admission bound))))
           (dotimes [replay 2]
             (when (pos? replay)
               (dotimes [i (alength a)] (aset a i (- (aget a i)))))

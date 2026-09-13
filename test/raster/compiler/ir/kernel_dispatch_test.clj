@@ -330,6 +330,14 @@
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
         (is (false? @opened?) "the selected fallback must meet its own capacity contract")))))
 
+(deftest execution-info-requires-a-live-existing-binding
+  (let [session (atom {:prepared {:manual {}}})]
+    (is (nil? (gpu/execution-info session :manual))
+        "manual bindings must not manufacture compiler evidence")
+    (is (thrown? clojure.lang.ExceptionInfo (gpu/execution-info session :missing)))
+    (swap! session assoc :closed? true)
+    (is (thrown? clojure.lang.ExceptionInfo (gpu/execution-info session :manual)))))
+
 (deftest resident-storage-admission-precedes-backend-binding
   (let [step {:kernel-name "storage-dispatch" :phase :probe :convention :executable
               :dispatch (storage-dispatch)
@@ -346,8 +354,16 @@
          (swap! selected conj (kexec/strategy executable))
          (gpu/->BoundExecutableStep [] {} []))}
       (fn []
-        (bind! :same :same {})
-        (bind! :same :separate {})
+        (let [fallback (gpu/execution-info (bind! :same :same {}) :probe)
+              direct (gpu/execution-info (bind! :same :separate {}) :probe)]
+          (is (= :two-stage (:strategy fallback)))
+          (is (= :direct (:strategy direct)))
+          (is (= [:direct :two-stage] (mapv :strategy (:admission fallback))))
+          (is (seq (get-in fallback [:admission 0 :reasons])))
+          (is (= [] (get-in fallback [:admission 1 :reasons])))
+          (is (= [{:strategy :direct :reasons []}] (:admission direct)))
+          (is (= (kexec/entry-points (kdispatch/default-alternative (storage-dispatch)))
+                 (:entry-points fallback))))
         (is (= [:two-stage :direct] @selected))
         (is (= :kernel-dispatch-inapplicable
                (try (bind! :same :same {:strategy :direct})

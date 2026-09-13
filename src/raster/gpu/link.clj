@@ -711,6 +711,19 @@
       (swap! (:pending-inputs executable) disj node-id)
       executable)))
 
+(defn execution-info
+  "Return resident phase admission reports without executing the linked program.
+   Entry points describe the bound executable, including any prologue, not measured replay events.
+   Equation-first prepared programs do not yet retain this evidence and are explicitly declined."
+  [executable]
+  (let [executable (ensure-live! executable :execution-info)]
+    (when (:prepared-program executable)
+      (throw (ex-info "equation-first execution reporting is not yet available"
+                      {:reason :link-program-execution-info-unsupported})))
+    (mapv (fn [phase]
+            {:phase phase :executable (gpu/execution-info (:session executable) phase)})
+          (:phases executable))))
+
 (defn profile!
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready."
   [executable]

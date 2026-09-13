@@ -243,6 +243,18 @@
   [value]
   (instance? BoundExecutableStep value))
 
+(defn execution-info
+  "Describe a currently bound compiler step, without running it or repeating selection.
+   Reports the admitted executable, not timing or proof that a replay has executed. Returns nil
+   for low-level/manual bindings without compiler selection evidence. Missing/closed bindings throw."
+  [sess phase]
+  (let [state @sess]
+    (when (:closed? state)
+      (throw (ex-info "cannot inspect a closed GPU session" {:phase phase})))
+    (when-not (contains? (:prepared state) phase)
+      (throw (ex-info "no prepared phase to inspect" {:phase phase})))
+    (:execution-info (get-in state [:prepared phase]))))
+
 (defn- prepared-bindings
   "Return the ordered backend bindings represented by one prepared session entry. Plain bindings
    from the low-level prepare! API remain valid; compiler steps use BoundExecutableStep because one
@@ -1931,12 +1943,21 @@
                interface logical-or-physical-args
                (rt-resolve device-id "expand-pointer-binding"))
               logical-or-physical-args)
-            selected (if-let [dispatch (:dispatch step)]
-                       (:executable
+            admission (when-let [dispatch (:dispatch step)]
                         (kdispatch/admit-alternative
                          dispatch ordered-args (step-selection-override step schedule)
                          #(executable-alias-violations % ordered-args)))
-                       artifact)
+            selected (if admission (:executable admission) artifact)
+            execution-info
+            {:kind (kexec/kind selected)
+             :strategy (kexec/strategy selected)
+             :precision (:precision (kexec/attributes selected))
+             :entry-points (kexec/entry-points selected)
+             ;; Keep reasons, not live buffer bindings or full executable/source objects.
+             :admission (mapv (fn [{:keys [strategy violations]}]
+                                {:strategy strategy
+                                 :reasons (mapv :reason violations)})
+                              (:attempts admission))}
             constant-buffer-ids
             (when (= :kernel-graph (kexec/kind selected))
               (into #{}
@@ -1947,8 +1968,9 @@
             ;; that needs one group must arrive as an explicit :single SegRed refinement; the
             ;; binder cannot reinterpret an occupancy-capped partial-reduction artifact.
             group-count nil]
-        (bind-selected-executable
-         device-id selected ordered-args phase constant-buffer-ids group-count))
+        (assoc (bind-selected-executable
+                device-id selected ordered-args phase constant-buffer-ids group-count)
+               :execution-info execution-info))
 
       :scatter
       (do
