@@ -12,6 +12,17 @@
   ([form] (walker/walk-body form {:type-env {}}))
   ([form flat-env] (walker/walk-body form {:type-env (te flat-env)})))
 
+(deftest comparison-types-survive-and-macroexpansion
+  (let [walked (wb '(and (>= i 0) (< i n)) {'i 'long 'n 'long})
+        [_ bindings conditional] walked
+        [binder initializer] bindings]
+    (is (= 'let* (first walked)))
+    (is (= 'boolean (:raster.type/tag (meta initializer))))
+    (is (= 'boolean (:raster.type/tag (meta binder))))
+    (is (nil? (:tag (meta binder))) "Raster typing does not add a JVM primitive hint")
+    (is (= 'if (first conditional)))
+    (is (= 'boolean (:raster.type/tag (meta (nth conditional 2)))))))
+
 ;; ================================================================
 ;; classify-form
 ;; ================================================================

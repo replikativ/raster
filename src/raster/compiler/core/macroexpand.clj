@@ -26,6 +26,37 @@
       (with-meta result (merge (meta result) m))
       result)))
 
+(defn- carry-let-init-type-meta
+  "Carry authoritative Raster type facts from an initializer to an untyped
+   `let*` binder introduced by macro expansion.
+
+   Clojure macros such as `and` and `or` introduce fresh single-evaluation
+   locals after the typed walker has run.  Their binding is definitionally the
+   initializer value, so copying retained type metadata is propagation, not
+   inference.  Source binders already typed by the walker win.  Do not apply
+   this to `loop*`: a loop-carried value requires a recurrence/LUB proof rather
+   than merely the initializer type.  JVM `:tag` is deliberately not copied;
+   primitive local hints can change host compilation and are not part of the
+   Raster IR contract."
+  [form]
+  (if (and (seq? form) (= 'let* (first form)) (vector? (second form))
+           (even? (count (second form))))
+    (let [[head bindings & body] form
+          bindings*
+          (vec
+           (mapcat
+            (fn [[binder init]]
+              (let [facts (select-keys (meta init)
+                                       [:raster.type/tag :raster.type/element])
+                    binder* (if (and (symbol? binder) (seq facts))
+                              (with-meta binder (merge facts (meta binder)))
+                              binder)]
+                [binder* init]))
+            (partition 2 bindings)))
+          result (list* head bindings* body)]
+      (with-meta result (meta form)))
+    form))
+
 (defn macroexpand-all-preserving
   "Like clojure.walk/macroexpand-all but preserves metadata on forms.
 
@@ -48,7 +79,7 @@
                       form)
            m (meta form)
            result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
-                                        identity expanded)]
+                                        carry-let-init-type-meta expanded)]
        (if (and m (instance? clojure.lang.IObj result))
          (with-meta result (merge (meta result) m))
          result)))))
