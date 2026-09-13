@@ -1199,7 +1199,7 @@
                  (get-in dispatch [:attributes :matrix-graph-decline :reason]))))
         (let [{:keys [abi arguments]} (executable/common-view (kdispatch/default-alternative dispatch))]
           (is (= (if batched? #{:portable-segred :xmx-batched}
-                               #{:portable-segred :xmx-direct :xmx-split-k})
+                               #{:portable-segred :xmx-direct :xmx-split-k :xmx-direct-lhs-tile-cast})
                  (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
           (doseq [[dimensions expected]
                   (cond-> [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
@@ -1258,7 +1258,7 @@
                  (kdispatch/alternative-strategy
                   (kdispatch/select-alternative dispatch
                                                 [:a :b :c m n k])))]
-    (is (= [:portable-segred :xmx-direct :xmx-split-k] strategies))
+    (is (= [:portable-segred :xmx-direct :xmx-split-k :xmx-direct-lhs-tile-cast] strategies))
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
     (is (= '[A B C m n k] (:arguments (first (:alternatives dispatch)))))
@@ -1289,15 +1289,11 @@
             (is (= :scheduled-graph-refinement-source (:reason (ex-data exception))))))))
     (testing "input fusion retains the exact typed source and rewritten stage graph"
       (let [source-graph (:source direct-refinement)
-            candidate (gpu-gemm/emit-matrix-input-fusion-alternative
-                       {:id :typed-input-fusion :a 'A :b 'B :c 'C :m 'm :n 'n :k 'k
-                        :variant :nn :tile (get-in direct-graph [:attributes :tile])
-                        :source-operation operation :source-graph source-graph
-                        :external-interface (select-keys source-graph [:abi :arguments :effects])})
+            candidate (kdispatch/alternative dispatch :xmx-direct-lhs-tile-cast)
             refinement (get-in candidate [:attributes :scheduled-graph-refinement])
             stages (graph-refinement/scheduled-graph refinement)]
         (is (identical? operation (graph-refinement/source-operation refinement)))
-        (is (= source-graph (:source refinement)))
+        (is (identical? source-graph (:source refinement)))
         (is (= [:convert-b :contract] (mapv (comp last :id) (:nodes stages))))
         (is (kernel-graph/dataflow-equivalent? stages candidate))
         (doseq [[stage-node emitted-node] (map vector (:nodes stages) (:nodes candidate))]
@@ -1409,7 +1405,7 @@
                      algorithm operation :dtype :float :desc descriptor
                      :precision :mixed-f16-f32 :split-factors [2 8])]
         (is (= #{:portable-segred :xmx-direct :xmx-split-k
-                 :xmx-split-k-2 :xmx-split-k-8}
+                 :xmx-split-k-2 :xmx-split-k-8 :xmx-direct-lhs-tile-cast}
                (set (map kdispatch/alternative-strategy (:alternatives tunable)))))
         (is (= 8 (get-in tunable [:attributes :candidate-schedules
                                   :xmx-split-k-8 :split-factor])))))
@@ -1764,7 +1760,7 @@
         matrix-graph (kdispatch/alternative scheduled :xmx-direct)
         contract-artifact (-> matrix-graph :nodes last :operation)
         body (get-in contract-artifact [:attributes :kernel-body])]
-    (is (= [:portable-segred :xmx-direct]
+    (is (= [:portable-segred :xmx-direct :xmx-direct-lhs-tile-cast]
            (mapv kdispatch/alternative-strategy (:alternatives scheduled)))
         "split-K waits until its final combine can own the result transform")
     (is (= '[A B C bias scale m n k] (:arguments matrix-graph)))

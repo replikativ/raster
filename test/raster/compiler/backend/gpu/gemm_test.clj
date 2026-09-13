@@ -63,7 +63,7 @@
 (deftest hardware-aware-gemm-selection-is-checked-data
   (let [scheduled (emitted :nn)
         select #(dispatch/select-alternative scheduled (apply arguments %))]
-    (is (= [:f32-scalar :xmx-direct :xmx-split-k]
+    (is (= [:f32-scalar :xmx-direct :xmx-split-k :xmx-direct-lhs-tile-cast]
            (mapv executable/strategy (:alternatives scheduled))))
     (testing "the matrix-instruction pitch gate is part of the selector, not a runtime binder"
       (is (= :f32-scalar (executable/strategy (select [32 4 4096]))))
@@ -103,7 +103,7 @@
         by-strategy (into {} (map (juxt executable/strategy identity))
                           (:alternatives scheduled))]
     (is (= #{:f32-scalar :xmx-direct :xmx-split-k
-             :xmx-split-k-2 :xmx-split-k-8 :xmx-split-k-32}
+             :xmx-split-k-2 :xmx-split-k-8 :xmx-split-k-32 :xmx-direct-lhs-tile-cast}
            (set (keys by-strategy))))
     (doseq [factor [2 8 32]]
       (let [strategy (gemm/split-factor-strategy factor)
@@ -218,7 +218,8 @@
         temporaries (into {} (map (fn [id] [id {:id [:temporary-buffer id] :alignment 64}]))
                           (keys temporary-specs))
         call (graph-call/make graph (merge buffers temporaries) scalar-values)]
-    (is (= 1 (count alternatives)) "a result transform intentionally disables split-K")
+    (is (= [:xmx-direct :xmx-direct-lhs-tile-cast] (mapv executable/strategy alternatives))
+        "the result transform composes with input fusion but still disables split-K")
     (is (= epilogue (:epilogue stage)))
     (is (= '[bias scale]
            (mapv :name (filter #(= :epilogue (:role %)) (:abi contract)))))

@@ -295,9 +295,13 @@ graph with its explicit typed-input-conversion candidate. This is a **scheduled 
 not a public `deftm` or end-to-end serving benchmark. The default `:residency :all-stages` replays
 weight conversion. `:residency :constant-weights` instead uses ordinary LinkPlan constant roles
 and initialized weight sources to hoist weight-only stages into the one-time prologue. The
-profile records actual replay kernel names separately from the complete compiled graph. The fused candidate remains outside
-automatic selection because physical input/output disjointness and performance admission must
-both be established before promotion.
+profile records actual replay kernel names separately from the complete compiled graph.
+Normal nonbatched Intel NN/NT typed contraction dispatch now enumerates the checked fused
+candidate, including eligible output epilogues. Its analytic selector is unchanged. Explicit
+offline tuning may consider it: alias-inapplicable bindings are recorded without timing, and
+runtime admission rechecks concrete aliases for cached choices. This makes the candidate
+available, not a measured winner. Stationary matched evidence is still required for promotion;
+this scheduled-graph probe still does not measure the public compilation entry end to end.
 
 ```clojure
 ;; Independent rounding and geometry oracle, no timing.

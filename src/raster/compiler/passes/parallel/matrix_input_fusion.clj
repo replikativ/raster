@@ -93,7 +93,7 @@
                               (assoc-in [:attributes :input-fusion]
                                         {:producer producer :consumer (:operation (get by-id consumer-id))
                                          :physical-precondition :input-output-disjoint
-                                         :selection :explicit-only}))]
+                                         :selection :binding-admission-required}))]
             (graph/validate! candidate)
             (when-not (= (graph/boundary-contract g) (graph/boundary-contract candidate))
               (throw (ex-info "matrix input fusion changed the public boundary"

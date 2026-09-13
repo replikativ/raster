@@ -254,8 +254,12 @@
      {:measurement Measurement
       :validation {:passed? true :oracle-hash string :candidate-hash executable-source-hash ...}}
 
+   or {:status :inapplicable :candidate-hash executable-source-hash :violations [...]} from
+   preflight, without a measurement or validation. These rows cannot win; the default must remain
+   applicable for every sample. Runtime admission must recheck cached/transported choices.
+
    Correctness is therefore established before a timing can influence selection. Every result
-   must be stationary and device-event timed. A candidate must improve on the dispatch default by
+   that participates in selection must be stationary and device-event timed. A candidate must improve on the dispatch default by
    more than `improvement-threshold` (default 0.1%) at a sample or the default wins that sample.
    Cache hits do not invoke benchmark-fn."
   [dispatch descriptor runtime-values benchmark-fn
