@@ -1105,9 +1105,9 @@
   Returns the final transformed form.
 
   `start-dialect` (default :walked) lets a caller resume a split pipeline — e.g.
-  the resident GPU path runs the front half to :materialized, applies soa-lower
-  (which is not a registered pass because it also rewrites the param signature),
-  then resumes the back half from :materialized."
+  the resident GPU path runs the representation-neutral front half to :write-read-fused, applies
+  soa-lower (which also rewrites the parameter signature), then constructs TypedSOAC from the
+  scalar-replaced program."
   ([form passes opts] (run-passes form passes opts :walked))
   ([form passes opts start-dialect]
    (first
@@ -1184,15 +1184,23 @@
   [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :compound-detect :segop-lower :backend :resolve-alength :mem-merge])
 
 (def gpu-resident-pre-soa-passes
-  "forward-passes up to (and including) :materialize. The resident GPU path splits here so
-   soa-lower can explode value-type (Params container) params into per-field arrays at the
-   :materialized boundary — BEFORE the :backend pass emits kernels (the JVM bytecode backend
-   keeps Valhalla value-classes native, so soa-lower is per-backend, not a shared pass)."
-  [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
+  "Representation-neutral front end, ending before TypedSOAC construction.
+
+   GPU scalar replacement must run here: admitting aggregate source first and flattening it later
+   leaves an untyped compatibility program that can never regain algebraic fusion. JVM compilation
+   keeps Valhalla value classes and therefore does not use this split."
+  [:lower :region-copy :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup
+   :loop-lift :write-read-fuse])
+
+(def gpu-semantic-post-soa-passes
+  "Construct and materialize the typed functional program after physical value representation is
+   known. Equation-first and resident compilation share this exact semantic suffix."
+  [:soac-fuse :materialize])
 
 (def gpu-resident-post-soa-passes
-  "forward-passes from :compound-detect onward — resumed (from :materialized) after soa-lower."
-  [:compound-detect :segop-lower :backend :resolve-alength :mem-merge])
+  "Typed semantic construction, scheduling and emission after GPU scalar replacement."
+  (into gpu-semantic-post-soa-passes
+        [:compound-detect :segop-lower :backend :resolve-alength :mem-merge]))
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline
@@ -1806,8 +1814,8 @@
                              (try (the-ns s) (catch Exception _ nil)))
                            (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
         ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
-        ;; Run the front half to :materialized, explode any Params-container / value-type param
-        ;; into per-field array params, then resume to the backend. Gated on a value-type param
+        ;; Run the front half to :write-read-fused, explode any Params-container / value-type param
+        ;; into per-field array params, then construct TypedSOAC and resume to the backend. Gated on a value-type param
         ;; so flat-param deftms are untouched (their eff-param-specs == param-specs). The
         ;; descriptor's params + the backend's array types are derived from the EXPLODED leaves.
         d-params*   (:raster.core/deftm-params (meta resolved-var))
@@ -1816,7 +1824,11 @@
                                      :tag (when t (symbol t))})
                           d-params* d-tags*)
         value-reg   @types/soa-registry
-        value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
+        soa-reverse @types/soa-reverse-registry
+        value-fn?   (boolean
+                     (some #(or (contains? value-reg (:tag %))
+                                (contains? soa-reverse (:tag %)))
+                           param-specs))
         pre-gpu-param-types
         ;; Flat signatures already have their authoritative walker/deftm parameter tags. Give
         ;; TypedSOAC those facts before fusion instead of defaulting every resident array to the
@@ -1837,7 +1849,7 @@
                           :array-types (:array-types pre-gpu-param-types)))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
         pre-diagnostic (when compiler-report?
-                         (run-passes-diagnostic raw-form gpu-resident-pre-soa-passes pre-opts))
+                          (run-passes-diagnostic raw-form gpu-resident-pre-soa-passes pre-opts))
         form-mat (if pre-diagnostic
                    (:form pre-diagnostic)
                    (run-passes raw-form gpu-resident-pre-soa-passes pre-opts))
@@ -1861,10 +1873,10 @@
                                            :array-types (:array-types gpu-param-types)))
         post-diagnostic (when compiler-report?
                           (run-passes-diagnostic form-soa gpu-resident-post-soa-passes
-                                                 post-opts :materialized))
+                                                 post-opts :write-read-fused))
         form (if post-diagnostic
                (:form post-diagnostic)
-               (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized))
+               (run-passes form-soa gpu-resident-post-soa-passes post-opts :write-read-fused))
         compiler-diagnostic
         (when compiler-report?
           {:stages (merge (:stages pre-diagnostic) (:stages post-diagnostic))

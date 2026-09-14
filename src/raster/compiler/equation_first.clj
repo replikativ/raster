@@ -115,8 +115,11 @@
                                             (dissoc options :target))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
-         semantic-candidate (pipeline/run-passes
+         represented-source (pipeline/run-passes
                              source pipeline/gpu-resident-pre-soa-passes compiler-options)
+         semantic-candidate (pipeline/run-passes
+                             represented-source pipeline/gpu-semantic-post-soa-passes
+                             compiler-options :write-read-fused)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel semantic-candidate
                     :typed-soac (structured-route/promote-soac-program
