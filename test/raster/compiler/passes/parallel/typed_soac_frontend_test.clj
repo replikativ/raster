@@ -1101,6 +1101,33 @@
     (is (= 'clojure.core/int (first result))
         "the source cast stays in the scalar region; result storage owns no source policy")))
 
+(deftest walked-identity-cast-does-not-hide-an-additive-scatter
+  (let [index '(clojure.core/aget slots i)
+        accumulator (list 'clojure.core/aget 'out index)
+        contribution '(clojure.core/aget input i)
+        addition (with-meta
+                   (list '.invk 'raster.numeric/_plus__m_float_float-impl
+                         accumulator contribution)
+                   {:tag 'float :raster.type/tag 'float
+                    :raster.op/original 'clojure.core/+})
+        source (list 'let* ['effect
+                            (list 'raster.par/map-void! 'i 'n
+                                  (list 'clojure.core/aset 'out index
+                                        (list 'float addition)))]
+                     'effect)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'slots :int 'out :float 'input :float}
+                         :scalar-types {'n :long}})
+        equation (first (dialect/equations program))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        expression (first (:body-results (dialect/lambda-parts lambda)))
+        effect (dialect/write-parts expression)]
+    (is (= 'scatter (dialect/operation-kind equation)))
+    (is (= :reduce (get-in attributes [:conflict :kind])))
+    (is (= '(clojure.core/aget %capture0 i) (:value effect))
+        "the typed contribution, not a destination read outside the atomic update, is retained")))
+
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
     (let [source (list 'let*

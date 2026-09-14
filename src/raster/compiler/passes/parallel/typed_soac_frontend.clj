@@ -107,16 +107,31 @@
     (= (name left) (name right))
     (= left right)))
 
+(declare retained-expression-tag)
+
 (defn- additive-update-contribution
   "Return the contribution in destination[index] + contribution.
 
    The contribution must not read the destination again: such a read would occur outside the
    eventual atomic update and would therefore be racy. This recognizes algebra, not a source
-   primitive, so generic effect maps and indexed operations share one conflict proof."
+  primitive, so generic effect maps and indexed operations share one conflict proof."
   [destination destination-index value]
-  (when (and (seq? value)
-             (contains? #{'+ 'clojure.core/+} (descriptor/semantic-op value)))
-    (let [arguments (vec (descriptor/call-args value))
+  (let [;; The walker may retain an identity result cast around typed numeric dispatch (for
+        ;; example `(float (.invk plus_float ...))` at a polymorphic `aset`). Looking through
+        ;; it is legal only when the inner expression already has exactly the cast's result type;
+        ;; checked narrowing and source-requested conversion remain executable scalar terms.
+        value (if (and (seq? value)
+                       (descriptor/cast-op? (descriptor/semantic-op value))
+                       (= 1 (count (descriptor/call-args value)))
+                       (= (descriptor/cast-result-tag (descriptor/semantic-op value))
+                          (retained-expression-tag (first (descriptor/call-args value)))))
+                (first (descriptor/call-args value))
+                value)
+        operation (when (seq? value) (descriptor/semantic-op value))]
+    (when (and operation
+               (descriptor/addition-op? operation)
+               (not (contains? util/*shadowing-locals* operation)))
+      (let [arguments (vec (descriptor/call-args value))
           accumulator-read?
           (fn [expression]
             (and (descriptor/aget-call? expression)
@@ -131,7 +146,7 @@
           (when (and contribution
                      (not-any? #(same-symbol? destination %)
                                (par/collect-aget-arrays contribution)))
-            contribution))))))
+            contribution)))))))
 
 (defn- retained-local-dtype
   [binding init]
