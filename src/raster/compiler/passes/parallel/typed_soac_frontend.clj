@@ -2888,7 +2888,8 @@
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
   (:descriptions
    (reduce
-    (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?] :as state}
+    (fn [{:keys [array-types scalar-definitions local-scalar-types stageable-prefix?
+                 before-parallel?] :as state}
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
@@ -2898,11 +2899,18 @@
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
-            description (assoc description :source-prefix? stageable-prefix?)
+            description (assoc description
+                               :source-prefix? stageable-prefix?
+                               ;; Distinct from `source-prefix?`: a host allocation or other
+                               ;; non-stageable host binding prevents scalar hoisting, but it does
+                               ;; not put device work before a following checked scalar boundary.
+                               :before-parallel? before-parallel?)
             scalar-dtype (when (= :scalar (:kind description))
                            (some-> (or (retained-scalar-dtype symbol local-scalar-types)
                                        (retained-scalar-dtype expression local-scalar-types))
                                    dtype/canon))
+            description (cond-> description
+                          scalar-dtype (assoc :scalar-dtype scalar-dtype))
             ;; a pure product/sum of scalars is a definition later index algebra may expand
             ;; normalize-counted-store-loop clamps every launch count after evaluating it once.
             ;; If the unclamped SSA value is already a proved nonnegative monomial, this exact
@@ -2957,6 +2965,10 @@
               (some-> (:elem-type description) dtype/canon))]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
+              (and (nil? allocation-dtype)
+                   (not (ordered-scalar-expression? expression))))
+          (assoc :before-parallel? false)
+          (or (not= :scalar (:kind description))
               (and (not (effects/removable-expr? expression))
                    (not (requires-ordered-evaluation? expression))))
           (assoc :stageable-prefix? false)
@@ -2965,7 +2977,7 @@
           logical-array-dtype (assoc-in [:array-types symbol] logical-array-dtype)
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
     {:descriptions [] :array-types array-types :scalar-definitions {}
-     :local-scalar-types scalar-types :stageable-prefix? true}
+     :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true}
     (map-indexed vector pairs))))
 
 (defn- canonical-extent
@@ -3138,9 +3150,19 @@
                       ;; Host control may surround typed islands, but it may not hide a parallel
                       ;; operation that has no equation in this program. Such a leaf must remain
                       ;; on the explicit compatibility/structured-control route until its control
-                      ;; scope itself is represented.
+                      ;; scope itself is represented.  An ordered scalar before the first
+                      ;; parallel equation (for example a checked source cast after an
+                      ;; allocation) is a valid host boundary: retaining it at its source
+                      ;; position preserves exceptional control transfer.  Once device work has
+                      ;; occurred, the same scalar remains a decline until the graph represents
+                      ;; the required device-to-host sequencing explicitly.
                       (not (contains-parallel-form? (:expr %)))
-                      (not (requires-ordered-evaluation? (:expr %)))))
+                      (or (not (requires-ordered-evaluation? (:expr %)))
+                          (and (:before-parallel? %)
+                               ;; This value becomes a typed input of the following island.  Its
+                               ;; source declaration/metadata must therefore attest the ABI; the
+                               ;; extent use is not permission to guess `long`.
+                               (:scalar-dtype %)))))
             descriptions)))
 
 (defn normalize-source
@@ -4133,6 +4155,16 @@
                                      :product-reduce :segmented-fold-map :scan} (:kind %))
                        descriptions)
               physical-outputs (physical-output-symbols descriptions)
+              ;; Source descriptions retain the same authoritative local scalar contracts used
+              ;; during admission.  Thread them into AbstractValue construction as well: a
+              ;; checked host boundary consumed as a launch extent must not silently fall back to
+              ;; the generic integral dimension type after its `:int` result was certified.
+              source-scalar-types
+              (reduce (fn [types {:keys [kind sym scalar-dtype]}]
+                        (if (and (= :scalar kind) scalar-dtype)
+                          (assoc types sym scalar-dtype)
+                          types))
+                      scalar-types descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :contract (contract-equation %)
                                                :scatter (scatter-equation %)
@@ -4168,7 +4200,8 @@
                         (case (:kind description)
                           :scalar
                           (if (contains? required-scalars (:sym description))
-                            (let [equation (scalar-equation description scalar-dtypes scalar-types)
+                            (let [equation (scalar-equation description scalar-dtypes
+                                                           source-scalar-types)
                                   result-dtype (first (:dtypes (second (nth equation 3))))]
                               (-> state
                                   (update :equations conj equation)
@@ -4233,20 +4266,21 @@
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
                                                    (equation-values equation dtype array-types'
-                                                                    scalar-types
+                                                                    source-scalar-types
                                                                     contracts)))
                                       (merge destination-values
                                              (contraction-storage-values equations dtype array-types' values))
                                       equations)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)
-              allocations (allocation-contracts descriptions array-types scalar-types values
+              allocations (allocation-contracts descriptions array-types source-scalar-types values
                                                 shape-equalities)
               ;; An allocation-only public dimension need not appear in a numerical equation.
               ;; Retain its declared type now; inserting the initializer later makes it an
               ;; ordinary operation input. Do not infer a missing declaration from its name.
               values (reduce (fn [values {:keys [extent]}]
-                               (if-let [declared (and (symbol? extent) (get scalar-types extent))]
+                               (if-let [declared (and (symbol? extent)
+                                                     (get source-scalar-types extent))]
                                  (merge-value values extent (tensor-value declared []) shape-equalities)
                                  values)) values allocations)
               equation-facts
