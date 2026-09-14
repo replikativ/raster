@@ -4,7 +4,9 @@
    Target projections supply store and loop spelling; this function alone owns ordered effect
    sequencing and the scope of an exported loop result. It neither infers types nor parses source."
   (:require [clojure.walk :as walk]
-            [raster.compiler.core.dtype :as dtype]))
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
 (defn storage-cast
   "Generated storage conversion, not a user-written cast. Strict FP32 regions use IEEE rounding
@@ -37,13 +39,52 @@
   "Materialize retained local dtypes through explicit generated casts."
   [generated-cast locals body]
   (if (seq locals)
-    (list 'let*
-          (vec (mapcat (fn [{:keys [id dtype init]}]
-                         (let [tag (dtype/scalar-tag-for-dtype dtype)]
-                           [(with-meta id {:raster.type/tag tag})
-                            (list (generated-cast tag) (strip-binder-tags init))]))
-                       locals))
-          body)
+    (let [products
+          (vec
+           (distinct
+            (mapcat (fn [{:keys [init]}]
+                      (keep #(when (dialect/product-fold-form? %) %)
+                            (tree-seq coll? seq init)))
+                    locals)))
+          product-bindings (mapv (fn [product] [product (gensym "product_fold__")]) products)
+          product-binding-map (into {} product-bindings)
+          project-components
+          (fn [expression]
+            (walk/postwalk
+             (fn [form]
+               (if (dialect/product-component-form? form)
+                 (let [[_ product ordinal] form]
+                   (list 'clojure.core/nth (get product-binding-map product)
+                         (list 'clojure.core/long ordinal)))
+                 form))
+             expression))
+          ;; Insert each tuple binding immediately before its first projection. Product Fold
+          ;; expressions may capture earlier scalar locals (mean/inv-std in layer norm), so
+          ;; hoisting every tuple to the front of the let spine would violate lexical order.
+          scalar-bindings
+          (:bindings
+           (reduce
+            (fn [{:keys [bindings emitted] :as state} {:keys [id dtype init]}]
+              (let [local-products
+                    (distinct
+                     (keep #(when (dialect/product-fold-form? %) %)
+                           (tree-seq coll? seq init)))
+                    fresh-products (remove emitted local-products)
+                    tag (dtype/scalar-tag-for-dtype dtype)]
+                {:bindings
+                 (into bindings
+                       (concat
+                        (mapcat (fn [product]
+                                  [(get product-binding-map product)
+                                   (projection/product-fold->source product)])
+                                fresh-products)
+                        [(with-meta id {:raster.type/tag tag})
+                         (list (generated-cast tag)
+                               (strip-binder-tags (project-components init)))]))
+                 :emitted (into emitted fresh-products)}))
+            {:bindings [] :emitted #{}}
+            locals))]
+      (list 'let* (vec scalar-bindings) body))
     body))
 
 (defn counted-loop
