@@ -113,6 +113,49 @@
 
       :else [{:kind :unsupported :reason :unknown-effect :effect effect}])))
 
+(def ^:private minimum-operators
+  "Canonical minimum spellings accepted only as an explicit executable bound. Devirtualized calls
+   retain their original operator through op-descriptor metadata, so no implementation name is
+   parsed here."
+  '#{min clojure.core/min raster.numeric/min Math/min})
+
+(defn- unwrap-bound-expression
+  [expression local-initializers seen]
+  (cond
+    (and (symbol? expression) (contains? local-initializers expression)
+         (not (contains? seen expression)))
+    (recur (get local-initializers expression) local-initializers (conj seen expression))
+
+    (and (seq? expression) (= 2 (count expression))
+         (descriptor/cast-op? (first expression)))
+    (recur (second expression) local-initializers seen)
+
+    :else expression))
+
+(defn- loop-radix-candidates
+  "Return exact or explicitly dominating radices for a loop extent.
+
+   `i < min(a,b)` proves that either `a` or `b` can safely be the physical row radix. This is an
+   executable bound, unlike an ABI comment or a guessed relation between unrelated scalars. The
+   later index algebra still has to prove that a candidate is invariant and is the actual address
+   stride."
+  [extent local-initializers]
+  (let [resolved (unwrap-bound-expression extent local-initializers #{})
+        operator (descriptor/semantic-op resolved)]
+    (vec (distinct
+          (cons extent
+                (when (contains? minimum-operators operator)
+                  (descriptor/call-args resolved)))))))
+
+(defn- loop-radix-environments
+  [loops local-initializers]
+  (reduce
+   (fn [environments {:keys [index extent]}]
+     (vec (for [environment environments
+                candidate (loop-radix-candidates extent local-initializers)]
+            (assoc environment index candidate))))
+   [{}] loops))
+
 (defn- ownership-signature
   [{:keys [index locals loops]} outer-index outer-extent forbidden-index-symbols]
   (let [local-initializers (into {} (map (juxt :id :init)) locals)
@@ -124,29 +167,36 @@
                                symbols)]
             (if (= symbols expanded) symbols (recur expanded))))
         relevant-loops (filterv #(contains? address-dependencies (:index %)) loops)
-        loop-indices (into {} (map (juxt :index :extent)) relevant-loops)
-        form (index-algebra/index-form index outer-index outer-extent locals loop-indices)
+        loop-indices (loop-radix-environments relevant-loops local-initializers)
         inner-indices (mapv :index relevant-loops)
         ;; A nested sequential loop may evaluate an address invariant in one of its indices
         ;; (for example every output component rereads the same per-head score row). Ownership is
         ;; across outer work items: require every digit which actually reaches the address to be
         ;; canonical and bounded, without demanding irrelevant lexical indices in the formula.
         expected-digits (into #{outer-index} inner-indices)
-        form-symbols (set (filter symbol? (tree-seq coll? seq form)))]
-    (when (and (every? #(and (= 0 (:lower %))
-                             (not= :inclusive (:upper-bound %)))
-                       relevant-loops)
-               form (index-algebra/injective? form)
-               (contains? (:terms form) outer-index)
-               (empty? (set/intersection forbidden-index-symbols form-symbols))
-               (= expected-digits (set (keys (:terms form))))
-               (= expected-digits (:leaves form))
-               (empty? (:parents form))
-               (nil? (:fixed-leaves form)))
-      {:owner (get-in form [:terms outer-index])
-       :inner (mapv #(get-in form [:terms %]) inner-indices)
-       :offset (:offset form)
-       :quot-facts (:quot-facts form)})))
+        canonical
+        (when (every? #(and (= 0 (:lower %))
+                            (not= :inclusive (:upper-bound %)))
+                      relevant-loops)
+          (some
+           (fn [loop-environment]
+             (let [form (index-algebra/index-form
+                         index outer-index outer-extent locals loop-environment)
+                   form-symbols (set (filter symbol? (tree-seq coll? seq form)))]
+               (when (and form (index-algebra/injective? form)
+                          (contains? (:terms form) outer-index)
+                          (empty? (set/intersection forbidden-index-symbols form-symbols))
+                          (= expected-digits (set (keys (:terms form))))
+                          (= expected-digits (:leaves form))
+                          (empty? (:parents form))
+                          (nil? (:fixed-leaves form)))
+                 form)))
+           loop-indices))]
+    (when canonical
+      {:owner (get-in canonical [:terms outer-index])
+       :inner (mapv #(get-in canonical [:terms %]) inner-indices)
+       :offset (:offset canonical)
+       :quot-facts (:quot-facts canonical)})))
 
 (defn- carried-symbols
   "Values that evolve with an inner iteration or are derived from one. They are not invariant
