@@ -302,7 +302,10 @@
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
                    tag (inf/infer-arg-tag tagged-init env)
-                   tagged-sym (if tag (vary-meta sym assoc :tag tag :raster.type/tag tag) sym)
+                   tagged-sym (cond-> sym
+                                tag (vary-meta assoc :tag tag :raster.type/tag tag)
+                                (util/void-form? tagged-init)
+                                (vary-meta assoc :raster.effect/effectful true))
                    new-env (if tag (assoc env sym tag) env)]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
@@ -326,6 +329,28 @@
    Entry point that initializes the env from param-env."
   [form param-env]
   (tag-expr-types form (or param-env {})))
+
+(defn- carry-void-binding-contracts
+  "Carry statement effects through binding forms nested inside opaque control.
+
+   Type tagging deliberately does not descend into loop bodies, but the fixpoint census sees every
+   nested binder. This pass attaches only the authoritative void contract of the immediate RHS;
+   it performs no type inference and leaves value-producing expressions untouched."
+  [form]
+  (clojure.walk/postwalk
+   (fn [expression]
+     (if-not (form/binding-form? expression)
+       expression
+       (let [[head bindings & body] expression
+             bindings (vec
+                       (mapcat (fn [[symbol initializer]]
+                                 [(cond-> symbol
+                                    (util/void-form? initializer)
+                                    (vary-meta assoc :raster.effect/effectful true))
+                                  initializer])
+                               (partition 2 bindings)))]
+         (with-meta (list* head bindings body) (meta expression)))))
+   form))
 
 (defn- pass-region-copy
   "Spell array region copies (`acopy!`, `System/arraycopy`) in statement position as the
@@ -455,7 +480,9 @@
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        (let [final (ensure-let*-result current)]
+        (let [final (-> (ensure-let*-result current)
+                        (tag-binding-types (:param-env opts))
+                        carry-void-binding-contracts)]
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
@@ -477,7 +504,9 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            (let [final (ensure-let*-result current)]
+            (let [final (-> (ensure-let*-result current)
+                            (tag-binding-types (:param-env opts))
+                            carry-void-binding-contracts)]
               (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})
@@ -596,14 +625,15 @@
      clojure.core/quot clojure.core/rem clojure.core/mod
      clojure.core/inc clojure.core/dec})
 
-(defn- census-exempt-head?
+(defn- census-exempt-binding?
   "The fixpoint-edge typedness contract's EXEMPT classes (measured floor, plan
-  Phase 0/2 of .internal/ad_typed_emission_plan.md), keyed by census-rhs-head:
+  Phase 0/2 of .internal/ad_typed_emission_plan.md):
 
-    1. void-returning SOAC/effect STATEMENT bindings (raster.par/map-void!,
-       raster.par/map2!, dotimes) — the binding exists only to sequence an effect; there is no
-       result VALUE to tag (the census's untagged-binding-pairs already excludes
-       fn* pullback closures and loop*/dotimes BINDERS for the same reason).
+    1. explicitly marked effect STATEMENT bindings — the binding exists only to sequence an
+       effect; there is no result VALUE to tag. `normalize-let-body` and the inliner attach this
+       contract independently of whether the statement is a SOAC, loop, conditional, or another
+       effectful control form. Inspecting the binder avoids an open RHS spelling registry while an
+       unmarked value-producing conditional remains subject to typedness enforcement.
     2. clojure.core integer scalar arithmetic on Long dims/indices — see
        census-exempt-int-arith-heads.
     3. :vector — an aggregate host result (the AD [primal grads] result vector);
@@ -613,13 +643,11 @@
   Everything else (raster.dl/raster.nn kernels, .invk impls, raster.numeric
   scalar math, aliases, constants) MUST carry :raster.type/tag at the fixpoint
   edge."
-  [head]
-  (or (contains? '#{raster.par/map-void! par/map-void!
-                    raster.par/map2! par/map2!
-                    raster.par/product-reduce! par/product-reduce!
-                    raster.par/segmented-fold-map! par/segmented-fold-map! dotimes} head)
-      (contains? census-exempt-int-arith-heads head)
-      (= :vector head)))
+  [[binding expression]]
+  (let [head (census-rhs-head expression)]
+    (or (true? (:raster.effect/effectful (meta binding)))
+        (contains? census-exempt-int-arith-heads head)
+        (= :vector head))))
 
 (defn- record-fixpoint-census!
   "Append one tag-completeness entry to fixpoint-census (Phase 0 of
@@ -627,7 +655,7 @@
 
   Phase 2 (D1) ENFORCEMENT: at the :final entry on a GPU target (the same
   device/gpu-target? gate pass-late-cleanup's throw uses), typedness is an
-  invariant — any NON-EXEMPT untagged binding (see census-exempt-head?) or any
+  invariant — any NON-EXEMPT untagged binding (see census-exempt-binding?) or any
   surviving undevirtualized raster.* dispatch call THROWS with op frequencies +
   example forms. GPU cannot fall back to IFn.invoke, and a tag lost here is
   guessed downstream (the f32→f64 narrowing hazard) — fail loud at the AD/
@@ -636,7 +664,7 @@
   [label form opts]
   (let [untagged (untagged-binding-pairs form)
         undevirt (collect-undevirtualized form)
-        non-exempt (remove (fn [[_ e]] (census-exempt-head? (census-rhs-head e))) untagged)
+        non-exempt (remove census-exempt-binding? untagged)
         entry {:label label
                :untagged-bindings (count untagged)
                :untagged-by-head (frequencies (map (comp census-rhs-head second) untagged))
@@ -665,7 +693,7 @@
                              "downstream — an untagged binding here narrows f32→f64 or "
                              "miscompiles to GPU garbage. Fix the emission site (grads-fn "
                              "tagged gensym / template Π) or the upstream forward-path tag "
-                             "loss; exempt classes are documented at census-exempt-head?.")
+                             "loss; exempt classes are documented at census-exempt-binding?.")
                         {:non-exempt-untagged untagged-heads
                          :untagged-examples untagged-examples
                          :undevirtualized undevirt-ops

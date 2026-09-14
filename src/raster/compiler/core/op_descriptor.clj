@@ -548,7 +548,12 @@
    Includes array writes and parallel side-effect primitives.
    Note: atomic-add! returns the old value (not void) — it's excluded here."
   (into aset-ops
-        #{'raster.par/collect! 'par/collect!}))
+        #{'dotimes 'clojure.core/dotimes
+          'raster.par/collect! 'par/collect!
+          'raster.par/map-void! 'par/map-void!
+          'raster.par/map2! 'par/map2!
+          'raster.par/product-reduce! 'par/product-reduce!
+          'raster.par/segmented-fold-map! 'par/segmented-fold-map!}))
 
 (defn void-op?
   "True if sym is a void (statement-only) operation."

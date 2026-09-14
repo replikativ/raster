@@ -29,9 +29,9 @@
             an intermediate's aset materializes to .invk, which a head-only check misses"
     (is (util/effectful? (with-meta (list '.invk 'impl 'O 0 1.0)
                            {:raster.op/original 'raster.arrays/aset}))))
-  (testing "a tagged form has a return type and is therefore not a statement"
-    (is (not (util/effectful? (with-meta (list 'raster.arrays/aset 'O 0 1.0)
-                                {:raster.type/tag 'Double})))))
+  (testing "a known void descriptor is authoritative over incidental contextual result metadata"
+    (is (util/effectful? (with-meta (list 'raster.arrays/aset 'O 0 1.0)
+                           {:raster.type/tag 'Double}))))
   (testing "pure arithmetic and reads"
     (is (not (util/effectful? '(clojure.core/* (raster.arrays/aget A i) 2)))))
   (testing "quoted data is data, not code to scan"

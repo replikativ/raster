@@ -66,6 +66,41 @@
     (is (fn? pipeline/compile-aot))
     (is (fn? pipeline/show-pipeline))))
 
+(deftest fixpoint-typedness-distinguishes-statements-from-untyped-values
+  (let [effect (with-meta '_effect {:raster.effect/effectful true})]
+    (testing "an explicit statement contract is independent of the RHS control spelling"
+      (is (#'pipeline/census-exempt-binding?
+           [effect '(if predicate (raster.par/map-void! i n body) nil)])))
+    (testing "the same untyped conditional is not exempt when its value could be observed"
+      (is (not (#'pipeline/census-exempt-binding?
+                ['result '(if predicate then-value else-value)]))))
+    (testing "an unmarked parallel call is not admitted by an operation-name whitelist"
+      (is (not (#'pipeline/census-exempt-binding?
+                ['result '(raster.par/map-void! i n body)]))))))
+
+(deftest binding-tagging-carries-the-void-statement-contract
+  (doseq [expression [(with-meta '(dotimes [i n] (clojure.core/aset output i 0.0))
+                         {:raster.type/tag 'float})
+                      '(raster.par/segmented-fold-map!
+                        [output] [[segment segment-count]] index width
+                        [[sum 0.0 :float width sum]] [(float sum)])]]
+    (let [tagged (#'pipeline/tag-binding-types
+                  (list 'let* ['effect expression] 'output) {})
+          binder (first (second tagged))]
+      (is (:raster.effect/effectful (meta binder))
+          (str "missing statement contract for " (first expression))))))
+
+(deftest void-contract-carrying-reaches-bindings-inside-opaque-loops
+  (let [form '(let* [outer
+                     (dotimes [i n]
+                       (let* [_ (dotimes [j i] (clojure.core/aset output j 0.0))]
+                         nil))]
+                output)
+        carried (#'pipeline/carry-void-binding-contracts form)
+        inner-binder (-> carried second second (nth 2) second first)]
+    (is (:raster.effect/effectful (meta (first (second carried)))))
+    (is (:raster.effect/effectful (meta inner-binder)))))
+
 ;; ================================================================
 ;; Pass registry
 ;; ================================================================
