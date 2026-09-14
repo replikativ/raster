@@ -40,6 +40,35 @@
 
 (defn- fuse [g] (fusion/fuse-lhs-cast g [:test :cast] [:test :matrix]))
 
+(defn- rhs-stage-graph []
+  (let [cast (layout/make {:id [:test :cast-b] :operation :cast :input 'B :output 'B16
+                           :input-shape [1024] :output-shape [1024]
+                           :input-dtype :float :output-dtype :half
+                           :policy {:rounding :nearest-even :overflow :ieee}})
+        matrix (matrix/make
+                {:id [:test :matrix-b] :lhs 'A :rhs 'B16 :result 'C
+                 :dimensions [13 32 32] :result-shape [13 32]
+                 :reduction {:kind :full :range [0 32]}
+                 :schedule {:kind :matrix-instruction-tiling
+                            :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32
+                                   :num-stages 1
+                                   :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}}})]
+    (graph/make
+     {:inputs [(graph/buffer 'A :half 416 :device :input)
+               (graph/buffer 'B :float 1024 :device :input)]
+      :outputs [(graph/buffer 'C :float 416 :device :output)]
+      :temporaries [(graph/buffer 'B16 :half 1024 :device :temporary)] :scalars []
+      :nodes [(graph/->ScheduledKernel [:test :cast-b] cast
+                                      [(graph/->ValueUse 'B :read)
+                                       (graph/->ValueUse 'B16 :write)] #{} [])
+              (graph/->ScheduledKernel [:test :matrix-b] matrix
+                                      [(graph/->ValueUse 'A :read)
+                                       (graph/->ValueUse 'B16 :read)
+                                       (graph/->ValueUse 'C :write)] #{} [[:test :cast-b]])]
+      :abi [(abi/slot 'A :input :half) (abi/slot 'B :input :float)
+            (abi/slot 'C :output :float)]
+      :arguments '[A B C] :effects {:reads ['A 'B] :writes ['C]}})))
+
 (deftest private-cast-becomes-a-typed-load-region
   (let [original (stage-graph) candidate (fuse original)
         stage (get-in candidate [:nodes 0 :operation])
@@ -58,6 +87,21 @@
     (is (= :no-write-alias (get-in artifact [:abi 0 :aliasing])))
     (is (re-find #"convert_half_rte" (:source artifact)))
     (is (identical? stage (get-in artifact [:attributes :scheduled-kernel-body :source])))))
+
+(deftest rhs-cast-becomes-the-same-typed-load-region
+  (let [original (rhs-stage-graph)
+        candidate (fusion/fuse-rhs-cast original [:test :cast-b] [:test :matrix-b])
+        stage (get-in candidate [:nodes 0 :operation])
+        emitted (gemm/emit-scheduled-stage-graph candidate {:target-dialect :opencl-intel})
+        source (get-in emitted [:nodes 0 :operation :source])]
+    (is (= (graph/boundary-contract original) (graph/boundary-contract candidate)))
+    (is (= 1 (count (:nodes candidate))))
+    (is (empty? (:temporaries candidate)))
+    (is (= 'B (:rhs stage)))
+    (is (= '#{B} (set (keys (:input-value-regions stage)))))
+    (is (re-find #"__global const float\* restrict B" source))
+    (is (re-find #"as_int8\(\(short16\)" source))
+    (is (re-find #"convert_half_rte" source))))
 
 (deftest changed-policy-shape-storage-or-consumer-declines
   (let [g (stage-graph)]

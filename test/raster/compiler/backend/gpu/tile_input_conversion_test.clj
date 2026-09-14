@@ -18,13 +18,17 @@
                           (body/cast-expression 'element :half :nearest-even :ieee))]
    'half-value :half))
 
-(defn converted-body []
-  (schedule/matrix-body
-   {:id :converted-tile-input :row 'A :col 'B :out 'C
-    :dimensions [13 32 32] :result-dtype :float
-    :input-value-regions {'A (conversion-region)}
-    :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
-           :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}}))
+(defn converted-body
+  ([] (converted-body #{:lhs}))
+  ([roles]
+   (schedule/matrix-body
+    {:id :converted-tile-input :row 'A :col 'B :out 'C
+     :dimensions [13 32 32] :result-dtype :float
+     :input-value-regions (cond-> {}
+                            (contains? roles :lhs) (assoc 'A (conversion-region))
+                            (contains? roles :rhs) (assoc 'B (conversion-region)))
+     :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
+            :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}})))
 
 (deftest intel-input-conversion-is-an-explicit-typed-load-and-prefetch
   (let [kernel (converted-body)
@@ -55,12 +59,24 @@
       (is (thrown? clojure.lang.ExceptionInfo
                    (fragment/emit-matrix-kernel "bad_direct_target" kernel dialect))))))
 
+(deftest both-input-conversions-are-explicit-typed-tile-loads
+  (let [kernel (converted-body #{:lhs :rhs})
+        source (:source (target/emit-matrix-kernel "converted_both_inputs" kernel
+                                                   :opencl-intel))]
+    (is (= kernel (body/validate! kernel)))
+    (is (= [:float :float] (mapv :dtype (take 2 (:parameters kernel)))))
+    (is (re-find #"__global const float\* restrict A" source))
+    (is (re-find #"__global const float\* restrict B" source))
+    (is (< 1 (count (re-seq #"convert_half_rte" source))))
+    (is (re-find #"as_int8\(\(short16\)" source))))
+
 (defn run-device!
   "Opt-in generated-kernel oracle; tiny allocations, no timing or schedule promotion.
    Includes partial M tiles and compares FP32 output against independently half-rounded inputs."
-  []
-  (ocl/init!)
-  (let [kernel (converted-body)
+  ([] (run-device! #{:lhs}))
+  ([roles]
+   (ocl/init!)
+   (let [kernel (converted-body roles)
         emitted (target/emit-matrix-kernel "converted_input_device" kernel :opencl-intel)
         slots (mapv (fn [{:keys [id kind dtype role]}]
                       (abi/slot id kind dtype :role role :c-name (name id)
@@ -90,7 +106,10 @@
                     buf))]
     (try
       (ocl/register-kernel! (:kernel-name compiled) compiled)
-      (let [ab (buffer! a :float) bb (buffer! (short-array (map half b)) :half)
+      (let [ab (buffer! a :float)
+            bb (if (contains? roles :rhs)
+                 (buffer! b :float)
+                 (buffer! (short-array (map half b)) :half))
             cb (buffer! (float-array (repeat (* 13 32) Float/NaN)) :float)]
         (ocl/launch-registered-bound!
          (ocl/bind-kernel-call
@@ -101,5 +120,6 @@
             (throw (ex-info "generated converted-input GEMM differs from rounded host oracle"
                             {:expected (take 16 expected) :actual (take 16 actual)})))
           {:passed? true :elements (count actual) :shape [13 32 32] :comparison :exact
+           :converted-inputs roles
            :generated-kernel? true :partial-m-tile? true :temporary-buffers 0}))
-      (finally (doseq [buf (reverse @live)] (ocl/free-buffer! buf))))))
+      (finally (doseq [buf (reverse @live)] (ocl/free-buffer! buf)))))))

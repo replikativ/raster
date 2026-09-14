@@ -892,9 +892,9 @@
 (defn emit-batched-matrix-alternative
   "Emit one compiler-owned matrix schedule for a leading batch of dense NN contractions.
 
-   The input and result tensors remain ordinary contiguous f32 values.  Flat layout adapters
-   convert both operands once, then a grid-Z-selected matrix KernelBody interprets them as
-   [batch,M,K], [batch,K,N], and [batch,M,N] views.  The return value deliberately is not a
+   The input and result tensors remain ordinary contiguous f32 values. The matrix KernelBody
+   converts each selected tile to its f16 instruction representation at the load boundary, then
+   interprets the storage as [batch,M,K], [batch,K,N], and [batch,M,N] views. The return value is not a
    standalone dispatch: the originating typed contraction supplies its general fallback and this
    schedule contributes the alignment selector that chooses between them."
   [{:keys [id a b c batch m n k variant tile vector-width batching
@@ -971,6 +971,13 @@
                        :precision :mixed-f16-f32
                        :vector-width vector-width
                        :tile tile}})
+        stage-graph
+        (or (some-> stage-graph
+                    (input-fusion/fuse-lhs-cast convert-a-id contract-id)
+                    (input-fusion/fuse-rhs-cast convert-b-id contract-id))
+            (throw (ex-info "batched matrix input casts could not be fused into tile loads"
+                            {:reason :batched-matrix-input-fusion
+                             :id id :batching batching})))
         emit-spec (assoc spec :strategy :xmx-batched
                          :vector-width vector-width :batching batching)
         refinement (make-refinement stage-graph source-operation source-graph emit-spec)
