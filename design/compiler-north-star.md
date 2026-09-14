@@ -1523,6 +1523,15 @@ The immediate continuation after the verified double-buffered weighted-reduction
    division accuracy. Audit target arithmetic guarantees separately, and extend OpenCL feature
    discovery beyond storage declarations to intermediate scalar types (the current FP64 preamble
    scan misses those). Explicit cast/rounding and checked-integer contracts remain unchanged.
+   Ordinary and batched BLAS source spellings now project through one frontend contract to this
+   same segmented contraction algebra; batching is one additional free axis, not an attention or
+   matrix opcode. Bidirectional `multi-head-attention` consequently reaches validated TypedSOAC
+   and emits only KernelBody artifacts. Its FP32 route includes the generated batched matrix
+   conversion/contraction candidate. Equal semantic dimensions (the square score matrix) map to
+   distinct body-local M/N/K SSA identities and one shared public scalar where appropriate, so
+   view closure and external ABI identity remain separate. This is route and emission coverage;
+   matched performance against vendor BLAS/Triton and fusion of surrounding projection/softmax
+   stages remain explicit measurement and scheduling gates.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

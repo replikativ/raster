@@ -1513,11 +1513,11 @@
   per row (max → exp → sum → normalize). Scale is assumed already folded into the
   values (via the QK^T GEMM alpha). Parametric; float-pure."
   (All [T] [x :- (Array T) rows :- Long cols :- Long] :- (Array T)
-       (let [n (* rows (int cols))
+       (let [n (* rows cols)
           ;; per-row max → broadcast to per-element (cheap, memory-bound scalar)
              maxes (alloc-like x n)
              _ (dotimes [r rows]
-                 (let [off (* r (int cols))
+                 (let [off (* r cols)
                        mx (loop [j 0 m (n/neg-inf-val (aget x off))]
                             (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
                    (dotimes [j cols] (aset maxes (+ off j) mx))))
@@ -1536,7 +1536,7 @@
                             p10))
           ;; per-row sum of e, normalize back into x (cheap, memory-bound scalar)
              _ (dotimes [r rows]
-                 (let [off (* r (int cols))
+                 (let [off (* r cols)
                        s (loop [j 0 acc 0.0]
                            (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
                        inv (/ 1.0 s)]

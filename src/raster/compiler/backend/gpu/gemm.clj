@@ -418,35 +418,41 @@
   [{:keys [kernel-name id a b c m n k batch tile provenance batching input-value-regions]
     :or {batching {:row true :col true}}}]
   (let [z 'slab
+        ;; MatrixBody parameters are SSA identities, not semantic expressions.  Keep M/N/K
+        ;; distinct even when two runtime dimensions are the same compiler value (square
+        ;; attention scores are the common case); graph binding maps these identities back to
+        ;; m/n/k.  Buffer views must reference this body-local scope, not the outer aliases.
+        [M N K :as dimension-parameters] ['M 'N 'K]
         a-view 'batch-lhs-view
         b-view 'batch-rhs-view
         c-view 'batch-result-view
         row-batched? (get batching :row true)
         col-batched? (get batching :col true)
-        a-shape (if row-batched? [batch m k] [m k])
-        b-shape (if col-batched? [batch k n] [k n])
+        a-shape (if row-batched? [batch M K] [M K])
+        b-shape (if col-batched? [batch K N] [K N])
         buffer-views
         (cond-> [{:id c-view :buffer c
-                  :element-offset (kbody/leading-slice-offset z [m n]) :shape [m n]}]
+                  :element-offset (kbody/leading-slice-offset z [M N]) :shape [M N]}]
           row-batched?
           (conj {:id a-view :buffer a
-                 :element-offset (kbody/leading-slice-offset z [m k]) :shape [m k]})
+                 :element-offset (kbody/leading-slice-offset z [M K]) :shape [M K]})
           col-batched?
           (conj {:id b-view :buffer b
-                 :element-offset (kbody/leading-slice-offset z [k n]) :shape [k n]}))
+                 :element-offset (kbody/leading-slice-offset z [K N]) :shape [K N]}))
         operation-buffers
         (cond-> {c c-view}
           row-batched? (assoc a a-view)
           col-batched? (assoc b b-view))]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+     :dimension-parameters dimension-parameters
      :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
-     :buffer-shapes {a a-shape b b-shape c [batch m n]}
+     :buffer-shapes {a a-shape b b-shape c [batch M N]}
      :buffer-views buffer-views
      :operation-buffers operation-buffers
-     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
-                          (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value N) (:block-n tile))
+                          (klaunch/ceil-div (klaunch/runtime-value M) (:block-m tile))
                           (klaunch/runtime-value batch)]
      :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}
                   :batching batching}
