@@ -96,9 +96,9 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"launch does not match"
                             (matrix-plan/analyze
                              (assoc-in kernel [:launch :workgroup-size 0] 1)))))
-    (testing "an emitter cannot assume row-major storage from a stale permutation"
+    (testing "an emitter rejects a physical operand permutation it cannot lower"
       (let [shape (get-in kernel [:parameters 0 :shape])]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact row-major"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dense operand permutations and row-major results"
                               (matrix-plan/analyze
                                (assoc-in kernel [:parameters 0 :layout]
                                          (layout/col-major shape :half)))))))

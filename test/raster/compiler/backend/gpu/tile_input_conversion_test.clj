@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.matrix-target :as target]
             [raster.compiler.backend.gpu.matrix-fragment-source :as fragment]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-abi :as abi]
@@ -20,13 +21,18 @@
 
 (defn converted-body
   ([] (converted-body #{:lhs}))
-  ([roles]
+  ([roles] (converted-body roles {}))
+  ([roles {:keys [transposed-rhs? n] :or {n 32}}]
    (schedule/matrix-body
     {:id :converted-tile-input :row 'A :col 'B :out 'C
-     :dimensions [13 32 32] :result-dtype :float
+     :dimensions [13 n 32] :result-dtype :float
      :input-value-regions (cond-> {}
                             (contains? roles :lhs) (assoc 'A (conversion-region))
                             (contains? roles :rhs) (assoc 'B (conversion-region)))
+     :input-layouts (cond-> {}
+                      transposed-rhs?
+                      (assoc 'B (layout/transpose-layout
+                                 (layout/row-major [32 n] :float))))
      :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
             :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}})))
 
@@ -74,9 +80,10 @@
   "Opt-in generated-kernel oracle; tiny allocations, no timing or schedule promotion.
    Includes partial M tiles and compares FP32 output against independently half-rounded inputs."
   ([] (run-device! #{:lhs}))
-  ([roles]
+  ([roles] (run-device! roles {}))
+  ([roles {:keys [transposed-rhs? n] :or {n 32} :as options}]
    (ocl/init!)
-   (let [kernel (converted-body roles)
+   (let [kernel (converted-body roles options)
         emitted (target/emit-matrix-kernel "converted_input_device" kernel :opencl-intel)
         slots (mapv (fn [{:keys [id kind dtype role]}]
                       (abi/slot id kind dtype :role role :c-name (name id)
@@ -91,13 +98,17 @@
                                               :extensions #{"cl_khr_fp16" "cl_intel_subgroup_2d_block_io"
                                                             "cl_intel_subgroup_matrix_multiply_accumulate"}}}})
         a (float-array (map #(/ (- (mod % 13) 6) 8.0) (range (* 13 32))))
-        b (float-array (map #(/ (- (mod % 11) 5) 8.0) (range (* 32 32))))
+        b (float-array (map #(/ (- (mod % 11) 5) 8.0) (range (* 32 n))))
+        physical-b (if transposed-rhs?
+                     (float-array (for [j (range n) k (range 32)]
+                                    (aget b (+ (* k n) j))))
+                     b)
         half #(Float/floatToFloat16 (float %))
         rounded #(double (Float/float16ToFloat (half %)))
-        expected (vec (for [i (range 13) j (range 32)]
+        expected (vec (for [i (range 13) j (range n)]
                         (float (reduce + (for [k (range 32)]
                                            (* (rounded (aget a (+ (* i 32) k)))
-                                              (rounded (aget b (+ (* k 32) j)))))))))
+                                              (rounded (aget b (+ (* k n) j)))))))))
         live (atom [])
         buffer! (fn [values dtype]
                   (let [buf (ocl/make-buffer (count values) dtype)]
@@ -108,18 +119,19 @@
       (ocl/register-kernel! (:kernel-name compiled) compiled)
       (let [ab (buffer! a :float)
             bb (if (contains? roles :rhs)
-                 (buffer! b :float)
-                 (buffer! (short-array (map half b)) :half))
-            cb (buffer! (float-array (repeat (* 13 32) Float/NaN)) :float)]
+                 (buffer! physical-b :float)
+                 (buffer! (short-array (map half physical-b)) :half))
+            cb (buffer! (float-array (repeat (* 13 n) Float/NaN)) :float)]
         (ocl/launch-registered-bound!
          (ocl/bind-kernel-call
           (call/make compiled [ab bb cb {:type :int :value 13}
-                               {:type :int :value 32} {:type :int :value 32}])))
+                               {:type :int :value n} {:type :int :value 32}])))
         (let [actual (vec (ocl/buffer->array cb))]
           (when-not (= expected actual)
             (throw (ex-info "generated converted-input GEMM differs from rounded host oracle"
                             {:expected (take 16 expected) :actual (take 16 actual)})))
-          {:passed? true :elements (count actual) :shape [13 32 32] :comparison :exact
+          {:passed? true :elements (count actual) :shape [13 n 32] :comparison :exact
+           :rhs-layout (if transposed-rhs? :transposed :row-major)
            :converted-inputs roles
            :generated-kernel? true :partial-m-tile? true :temporary-buffers 0}))
       (finally (doseq [buf (reverse @live)] (ocl/free-buffer! buf)))))))

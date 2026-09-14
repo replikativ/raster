@@ -71,7 +71,7 @@
       (doseq [variant [:nn :nt :tn :tt]]
         (let [scheduled (emitted variant)]
           (is (= (cond-> [:f32-scalar :xmx-direct :xmx-split-k]
-                   (contains? #{:nn :nt} variant) (conj :xmx-direct-lhs-tile-cast))
+                   (contains? #{:nn :nt} variant) (conj :xmx-direct-tile-inputs))
                  (mapv executable/strategy (:alternatives scheduled))))
           (doseq [artifact (mapcat executable/artifacts (:alternatives scheduled))]
             (is (body/kernel-body? (get-in artifact [:attributes :kernel-body])))))))))
@@ -79,7 +79,7 @@
 (deftest hardware-aware-gemm-selection-is-checked-data
   (let [scheduled (emitted :nn)
         select #(dispatch/select-alternative scheduled (apply arguments %))]
-    (is (= [:f32-scalar :xmx-direct :xmx-split-k :xmx-direct-lhs-tile-cast]
+    (is (= [:f32-scalar :xmx-direct :xmx-split-k :xmx-direct-tile-inputs]
            (mapv executable/strategy (:alternatives scheduled))))
     (testing "the matrix-instruction pitch gate is part of the selector, not a runtime binder"
       (is (= :f32-scalar (executable/strategy (select [32 4 4096]))))
@@ -119,7 +119,7 @@
         by-strategy (into {} (map (juxt executable/strategy identity))
                           (:alternatives scheduled))]
     (is (= #{:f32-scalar :xmx-direct :xmx-split-k
-             :xmx-split-k-2 :xmx-split-k-8 :xmx-split-k-32 :xmx-direct-lhs-tile-cast}
+             :xmx-split-k-2 :xmx-split-k-8 :xmx-split-k-32 :xmx-direct-tile-inputs}
            (set (keys by-strategy))))
     (doseq [factor [2 8 32]]
       (let [strategy (gemm/split-factor-strategy factor)
@@ -234,7 +234,7 @@
         temporaries (into {} (map (fn [id] [id {:id [:temporary-buffer id] :alignment 64}]))
                           (keys temporary-specs))
         call (graph-call/make graph (merge buffers temporaries) scalar-values)]
-    (is (= [:xmx-direct :xmx-direct-lhs-tile-cast] (mapv executable/strategy alternatives))
+    (is (= [:xmx-direct :xmx-direct-tile-inputs] (mapv executable/strategy alternatives))
         "the result transform composes with input fusion but still disables split-K")
     (is (= epilogue (:epilogue stage)))
     (is (= '[bias scale]

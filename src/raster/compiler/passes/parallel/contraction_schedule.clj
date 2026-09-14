@@ -88,7 +88,8 @@
   fragment dtype. Target lowering must explicitly admit the resulting representation change."
   [{:keys [id row col out dimensions dimension-parameters axis-symbols tile bindings epilogue
            result-dtype provenance additional-parameters additional-indices buffer-shapes
-           buffer-views operation-buffers k-range launch-group-count attributes input-value-regions]
+           buffer-views operation-buffers k-range launch-group-count attributes input-value-regions
+           input-layouts]
     :or {dimension-parameters ['M 'N 'K]
          axis-symbols ['i 'j 'k]
          result-dtype :half
@@ -99,6 +100,7 @@
          buffer-views []
          operation-buffers {}
          input-value-regions {}
+         input-layouts {}
          attributes {}}}]
   (let [_ (when-not (and (map? input-value-regions)
                          (every? #{row col} (keys input-value-regions)))
@@ -131,8 +133,14 @@
         k-width (max 1 (quot 32 (layout/dtype-bits :half)))
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
-        row-storage-layout (layout/row-major (get buffer-shapes row [M K]) row-dtype)
-        col-storage-layout (layout/row-major (get buffer-shapes col [K N]) col-dtype)
+        row-storage-shape (get buffer-shapes row [M K])
+        col-storage-shape (get buffer-shapes col [K N])
+        row-storage-layout (or (some-> (get input-layouts row)
+                                       (assoc :shape row-storage-shape))
+                               (layout/row-major row-storage-shape row-dtype))
+        col-storage-layout (or (some-> (get input-layouts col)
+                                       (assoc :shape col-storage-shape))
+                               (layout/row-major col-storage-shape col-dtype))
         out-layout (layout/row-major (get buffer-shapes out [M N]) result-dtype)
         buffer-layouts {row row-storage-layout col col-storage-layout out out-layout}
         buffer-views (mapv (fn [view]

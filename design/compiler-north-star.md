@@ -1537,6 +1537,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    conversion/contraction candidate. Equal semantic dimensions (the square score matrix) map to
    distinct body-local M/N/K SSA identities and one shared public scalar where appropriate, so
    view closure and external ABI identity remain separate. This is route and emission coverage;
+   Matrix stages retain their exact semantic axis identities and independently describe dense
+   physical operand permutations. Exact FP32-to-FP16 conversion and a transposed RHS can therefore
+   compose at the tile-load boundary: the generated Intel matrix candidate for an ordinary linear
+   projection has one kernel and no cast/transpose temporary, while the semantic contraction and
+   public ABI remain unchanged. The portable candidate remains its independent correctness oracle.
+   This is not yet evidence of competitive throughput.
    matched performance against vendor BLAS/Triton and fusion of surrounding projection/softmax
    stages remain explicit measurement and scheduling gates.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a

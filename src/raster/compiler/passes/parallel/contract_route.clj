@@ -1404,9 +1404,9 @@
                         (merge
                          (cond-> {:xmx-direct (:schedule mixed)
                                   :xmx-split-k (assoc (:schedule mixed) :split-k? true)}
-                           (some #(= :xmx-direct-lhs-tile-cast (kdispatch/alternative-strategy %))
+                           (some #(= :xmx-direct-tile-inputs (kdispatch/alternative-strategy %))
                                  (:alternatives mixed))
-                           (assoc :xmx-direct-lhs-tile-cast
+                           (assoc :xmx-direct-tile-inputs
                                   (assoc (:schedule mixed) :input-fusion? true)))
                          (into {}
                                (map (fn [[strategy factor]]

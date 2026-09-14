@@ -108,7 +108,8 @@
 
 (defn- intel-matrix-plan
   [kernel-body]
-  (let [{:keys [instruction input-regions input-dtypes prefetches buffer-offsets group-z] :as plan}
+  (let [{:keys [instruction input-regions input-dtypes input-layouts prefetches
+                buffer-offsets group-z] :as plan}
         (matrix-plan/analyze kernel-body)
         {mi :m ni :n ki :k subgroup :subgroup} instruction
         valid-input-region?
@@ -136,6 +137,12 @@
                           [(:k-lower plan) (:k-upper plan)])))
               "Intel matrix lowering has no implementation for this transformed tile input"
               {:input-regions input-regions :input-dtypes input-dtypes})
+    (require! (and (= [0 1] (get-in input-layouts [:lhs :perm]))
+                   (or (= [0 1] (get-in input-layouts [:rhs :perm]))
+                       (and (= [1 0] (get-in input-layouts [:rhs :perm]))
+                            (some? (:rhs input-regions)))))
+              "Intel matrix lowering requires row-major lhs and a transformed load for transposed rhs"
+              {:input-layouts input-layouts :input-regions input-regions})
     (require! (every? #(and (= (:lhs input-dtypes) (get-in % [:layout :dtype]))
                            (or (nil? (:lhs input-regions))
                                (= (layout/row-major [mi ki] :float) (:layout %)))) prefetches)
@@ -143,11 +150,13 @@
               {:input-dtypes input-dtypes :prefetches prefetches})
     plan))
 
+(declare emit-layout-expression)
+
 (defn- emit-plan
   [kernel-name {:keys [mi ni ki subgroup block-m block-n block-k sg-m sg-n
                        ncols lhs-ids rhs-ids mad-by-operands stores prefetch result-dtype
                        dimension-parameters schedule-parameters group-z k-lower k-upper
-                       buffer-offsets index-dtype k-bounds input-dtypes]}
+                       buffer-offsets index-dtype k-bounds input-dtypes] :as plan}
    {:keys [epilogue epilogue-params parameter-names input-values]}]
   (let [index-type (dtype/ctype :opencl index-dtype)
         nms (count lhs-ids)
@@ -177,6 +186,14 @@
                                              schedule-parameters))
                                parameter-names)
         index-names (cond-> parameter-names group-z (assoc group-z (target-name group-z)))
+        rhs-strides (case (get-in plan [:input-layouts :rhs :perm])
+                      [0 1] ["N" "1"]
+                      [1 0] ["1" "K"])
+        rhs-load (fn [row col]
+                   (str "B[(((long)(" row ") * (long)("
+                        (first rhs-strides)
+                        ")) + ((long)(" col ") * (long)("
+                        (second rhs-strides) ")))]"))
         sliced-k? (not= [0 (:k dimension-parameters)] [k-lower k-upper])
         k-begin (if sliced-k? "k_begin" "0")
         k-end (if sliced-k? "k_end" "K")
@@ -213,7 +230,7 @@
                                                (for [kk (range ki)
                                                      :let [row (str "(" kpos " + " kk ")")
                                                            col (str "(n_base" n " + sg_lid)")
-                                                           load (str "B[((long)" row ") * N + " col "]")]]
+                                                           load (rhs-load row col)]]
                                                  (str "as_short((" row " < " k-end " && " col " < N) ? "
                                                       (rhs-input-value load "" "") " : (half)0)")))
                                      "));\n")
