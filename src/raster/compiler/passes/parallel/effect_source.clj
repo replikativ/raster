@@ -80,8 +80,9 @@
     (let [loop (:loop effect)
           form (cond
                  (:region effect)
-                 (let [{:keys [locals effects]} (:region effect)]
-                   (emit-region locals (ordered-effects effects emitters)))
+                 (let [{:keys [predicate locals effects]} (:region effect)
+                       region (emit-region locals (ordered-effects effects emitters))]
+                   (if predicate (list 'if predicate region) region))
                  loop (emit-loop loop (ordered-effects (:effects loop) emitters))
                  :else (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]

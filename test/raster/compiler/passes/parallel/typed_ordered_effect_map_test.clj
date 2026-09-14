@@ -170,6 +170,32 @@
               "a proof-carrying per-destination reduction is never certified as exact")
           (is (str/includes? (:source artifact) atomic)))))))
 
+(deftest guarded-effect-locals-lower-under-portable-kernelbody-control
+  (let [source '(let* [effect
+                        (raster.par/map-void!
+                         i n
+                         (if (clojure.core/< i active)
+                           (let* [^long destination (clojure.core/rem i width)]
+                             (clojure.core/aset
+                              out destination
+                              (clojure.core/+ (clojure.core/aget out destination)
+                                              (clojure.core/aget input i))))))]
+                       effect)
+        result (route/attempt source :float {'out :float 'input :float}
+                              {:scalar-types {'n :long 'active :long 'width :long}})
+        program (-> result :program :equations first :algorithm)
+        operation (first (soac-lower/lower-typed-effect-map program :ze:0 :dtype :float))]
+    (is (= :independent (get-in operation [:scalar-region :iteration-order])))
+    (is (some? (get-in operation [:scalar-region :effects 0 :region :predicate])))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (let [artifact (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :dtype :float :target-dialect target
+                      :array-types {'out :float 'input :float}
+                      :scalar-types {'n :long 'active :long 'width :long})
+            operations (nested-operations (get-in artifact [:attributes :kernel-body :operations]))]
+        (is (some #(= "IfRegion" (some-> % class .getSimpleName)) operations))
+        (is (some #(= "AtomicRMW" (some-> % class .getSimpleName)) operations))))))
+
 (deftest analyzed-source-selects-the-same-ordered-effect-schedule
   (let [result (route/attempt mixed-effect-source :float
                               {'x :float 'slots :int 'out :float 'total :float})

@@ -289,9 +289,10 @@
               (:region effect)
               (update effect :region
                       (fn [region]
-                        (-> region
+                        (cond-> (-> region
                             (update :locals #(mapv (fn [local] (update local :init substitute)) %))
-                            (update :effects #(mapv (partial substitute-effect substitutions) %)))))
+                            (update :effects #(mapv (partial substitute-effect substitutions) %)))
+                          (:predicate region) (update :predicate substitute))))
               (:loop effect)
               (let [loop (:loop effect)]
               (assoc effect :loop
@@ -308,8 +309,10 @@
         lower-effect
         (fn lower-effect
           [environment {:keys [destination conflict destination-index predicate value] :as effect}]
-          (if-let [{:keys [locals effects]} (:region effect)]
-            (let [state (lower-locals locals environment)
+          (if-let [{:keys [predicate locals effects]} (:region effect)]
+            (let [lowered-predicate (when predicate
+                                      ((:lower lowerer) predicate :predicate environment))
+                  state (lower-locals locals environment)
                   inner (reduce (fn [{:keys [environment operations]} effect]
                                   (let [next (lower-effect
                                               environment
@@ -317,9 +320,16 @@
                                     (update next :operations #(into operations %))))
                                 {:environment (:environment state) :operations (:operations state)}
                                 effects)]
-              ;; Nested locals/results remain lexical. Their operations still occur here, not
-              ;; in the enclosing region's prefix or inside each later loop iteration.
-              {:environment environment :operations (:operations inner)})
+              ;; Nested locals/results remain lexical. A guard dominates their evaluation, so a
+              ;; checked conversion in the region is never speculated into an inactive lane.
+              {:environment environment
+               :operations
+               (if predicate
+                 (vec (concat (:operations lowered-predicate)
+                              [(body/->IfRegion (:result lowered-predicate)
+                                                (conj (vec (:operations inner)) (body/->Yield []))
+                                                [(body/->Yield [])] [])]))
+                 (:operations inner))})
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its

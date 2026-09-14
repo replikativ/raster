@@ -107,16 +107,31 @@
     (= (name left) (name right))
     (= left right)))
 
+(declare retained-expression-tag)
+
 (defn- additive-update-contribution
   "Return the contribution in destination[index] + contribution.
 
    The contribution must not read the destination again: such a read would occur outside the
    eventual atomic update and would therefore be racy. This recognizes algebra, not a source
-   primitive, so generic effect maps and indexed operations share one conflict proof."
+  primitive, so generic effect maps and indexed operations share one conflict proof."
   [destination destination-index value]
-  (when (and (seq? value)
-             (contains? #{'+ 'clojure.core/+} (descriptor/semantic-op value)))
-    (let [arguments (vec (descriptor/call-args value))
+  (let [;; The walker may retain an identity result cast around typed numeric dispatch (for
+        ;; example `(float (.invk plus_float ...))` at a polymorphic `aset`). Looking through
+        ;; it is legal only when the inner expression already has exactly the cast's result type;
+        ;; checked narrowing and source-requested conversion remain executable scalar terms.
+        value (if (and (seq? value)
+                       (descriptor/cast-op? (descriptor/semantic-op value))
+                       (= 1 (count (descriptor/call-args value)))
+                       (= (descriptor/cast-result-tag (descriptor/semantic-op value))
+                          (retained-expression-tag (first (descriptor/call-args value)))))
+                (first (descriptor/call-args value))
+                value)
+        operation (when (seq? value) (descriptor/semantic-op value))]
+    (when (and operation
+               (descriptor/addition-op? operation)
+               (not (contains? util/*shadowing-locals* operation)))
+      (let [arguments (vec (descriptor/call-args value))
           accumulator-read?
           (fn [expression]
             (and (descriptor/aget-call? expression)
@@ -131,7 +146,7 @@
           (when (and contribution
                      (not-any? #(same-symbol? destination %)
                                (par/collect-aget-arrays contribution)))
-            contribution))))))
+            contribution)))))))
 
 (defn- retained-local-dtype
   [binding init]
@@ -352,19 +367,31 @@
             (when (= :region kind)
               (concat (:locals region) (order-locals (:order region))))) order))
 
+(defn- order-predicates [order]
+  (mapcat (fn [[kind region]]
+            (when (= :region kind)
+              (concat (when (:predicate region) [(:predicate region)])
+                      (order-predicates (:order region)))))
+          order))
+
 (defn- map-region-order
   "Transform the source effect spine without flattening lexical continuation scopes."
-  [order local-fn store-offset loop-offset]
-  (mapv (fn [[kind value]]
-          [kind (case kind
-                  :region (-> value
-                              (update :locals #(mapv local-fn %))
-                              (update :order #(map-region-order % local-fn store-offset loop-offset)))
-                  :store (+ store-offset value)
-                  :loop (+ loop-offset value))]) order))
+  ([order local-fn store-offset loop-offset]
+   (map-region-order order local-fn identity store-offset loop-offset))
+  ([order local-fn expression-fn store-offset loop-offset]
+   (mapv (fn [[kind value]]
+           [kind (case kind
+                   :region (cond-> (-> value
+                                       (update :locals #(mapv local-fn %))
+                                       (update :order #(map-region-order % local-fn expression-fn
+                                                                         store-offset loop-offset)))
+                             (:predicate value) (update :predicate expression-fn))
+                   :store (+ store-offset value)
+                   :loop (+ loop-offset value))]) order)))
 
 (defn- substitute-order [order substitutions]
-  (map-region-order order #(update % :init (partial util/subst-syms substitutions)) 0 0))
+  (map-region-order order #(update % :init (partial util/subst-syms substitutions))
+                    #(util/subst-syms substitutions %) 0 0))
 
 (defn- rebase-region-locals
   "Move a recursively recognized region behind `offset` lexical SSA values.
@@ -384,7 +411,8 @@
     (cond-> {:locals (mapv rename-local locals)
      :stores (mapv #(substitute-store renames %) stores)
      :loops (mapv #(substitute-loop renames %) (or loops []))
-     :order (map-region-order (region-order region) rename-local 0 0)}
+     :order (map-region-order (region-order region) rename-local
+                              #(util/subst-syms renames %) 0 0)}
       (contains? region :result) (assoc :result (util/subst-syms renames (:result region))))))
 
 (defn- split-trailing-recur
@@ -664,6 +692,18 @@
                                                   (branch-value else-region))
                            :predicate (merged-predicate (:predicate then-store)
                                                         (:predicate else-store)))]})
+
+        ;; Preserve branch-local evaluation around an effect. Hoisting these locals would move
+        ;; checked conversions and other exceptional scalar control into lanes where the source
+        ;; never evaluated them. The ordered effect dialect keeps the guard outside the lexical
+        ;; local region; KernelBody lowers it to an IfRegion.
+        (and then-region (nil? else-expression) (seq (:locals then-region)))
+        {:locals []
+         :stores (:stores then-region)
+         :loops []
+         :order [[:region {:predicate predicate
+                            :locals (:locals then-region)
+                            :order (region-order then-region)}]]}
 
         (and then-region
              (empty? (:locals then-region))
@@ -1272,8 +1312,10 @@
             effect-contracts (mapv :effect-conflict all-stores)
             uniform-conflict (when (= 1 (count (set effect-contracts)))
                                (first effect-contracts))
+            scoped-effects? (boolean (seq (order-locals order)))
             scatter? (and (not pointwise?)
                           (empty? loops)
+                          (not scoped-effects?)
                           (independent-stores? locals stores)
                           (or (= :unique uniform-conflict)
                               (dialect/reducing-scatter-conflict? uniform-conflict)))
@@ -1284,13 +1326,14 @@
                                   (group-by :out all-stores)))
             all-locals (vec (concat analysis-locals (mapcat :locals loops)))
             loop-expressions (mapcat source-loop-expressions loops)
+            scoped-predicates (order-predicates order)
             carry-bindings (set (mapcat #(when-let [carry (:carry %)]
                                           [(:parameter carry) (:result carry)]) loops))
             iteration-order (when ordered?
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
                                             analysis-locals all-stores
-                                            loop-expressions)))
+                                            (concat loop-expressions scoped-predicates))))
                                 :sequential
                                 :independent))
             destinations (if ordered?
@@ -1300,7 +1343,7 @@
             body-dtypes (mapv #(retained-expression-dtype % array-types local-types) values)
             write-indices (mapv :index all-stores)
             predicates (mapv :predicate all-stores)
-            analysis-values (concat (map :init analysis-locals) loop-expressions
+            analysis-values (concat (map :init analysis-locals) loop-expressions scoped-predicates
                                     write-indices predicates values)
             io (update (extract-io (list* 'do analysis-values) index destinations)
                        :scalars set/difference (set (map :id all-locals))
@@ -1327,6 +1370,7 @@
                                (mapv (fn [[kind value]]
                                        (case kind
                                          :region {:region {:locals (:locals value)
+                                                           :predicate (:predicate value)
                                                            :effects (project (:order value))}}
                                          :store (store-effect (nth stores value))
                                          :loop (nth loop-effects value))) order)) order)]
@@ -3050,12 +3094,15 @@
         effect-form
         (fn effect-form [{:keys [out index predicate value cast effect-conflict] :as effect}]
           (if-let [region (:region effect)]
-            (dialect/effect-lambda-region
-             (mapv (fn [{:keys [id dtype init]}]
-                     (dialect/local-value id dtype
-                                          (canonicalize-scalar-folds
-                                           (transform init) dtype))) (:locals region))
-             (mapv effect-form (:effects region)))
+            (let [locals (mapv (fn [{:keys [id dtype init]}]
+                                 (dialect/local-value id dtype
+                                                      (canonicalize-scalar-folds
+                                                       (transform init) dtype)))
+                               (:locals region))
+                  effects (mapv effect-form (:effects region))]
+              (if-let [guard (:predicate region)]
+                (dialect/effect-guard-region (transform guard) locals effects)
+                (dialect/effect-lambda-region locals effects)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower extent carry]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]
