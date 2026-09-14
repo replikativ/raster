@@ -15,6 +15,7 @@
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
             [raster.dl.array-ops :as array-ops]
+            [raster.dl.loss :as loss]
             [raster.numeric]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]
@@ -177,6 +178,16 @@
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
       (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs linked)))))))
+
+(deftest public-huber-loss-shares-typed-conditional-reduction-lowering
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'loss/huber-loss {:target target :dtype :float})]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 2 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (some #(str/includes? (:source %) "if (") (:kernels compilation))
+          "the mixed Float/Double value conditional is emitted from shared KernelBody control"))))
 
 (deftest public-dense-input-gradient-retains-shape-only-array-input
   (doseq [target [cuda-target hip-target]]

@@ -500,7 +500,20 @@
    Split out because one caller (the SOAC lowerer) has already destructured the let and recursed
    into its body, so it needs the env rather than the whole-form rewrite."
   [bindings]
-  (reduce (fn [m [s init]] (assoc m s (subst-syms m init)))
+  (reduce (fn [m [s init]]
+            (let [init (subst-syms m init)
+                  binder-type (select-keys (meta s) [:tag :raster.type/tag])
+                  initializer-typed? (or (:tag (meta init))
+                                         (:raster.type/tag (meta init)))
+                  ;; A value conditional often carries its primitive join type only on the
+                  ;; walker binder.  Preserve that authoritative fact when beta-reducing it.
+                  ;; Never overwrite an initializer's own type: differing binder/initializer
+                  ;; types describe a conversion which a later typed pass must keep explicit.
+                  init (if (and (seq binder-type) (not initializer-typed?)
+                                (instance? clojure.lang.IObj init))
+                         (with-meta init (merge (meta init) binder-type))
+                         init)]
+              (assoc m s init)))
           {} (partition 2 bindings)))
 
 (defn inline-pure-lets

@@ -1400,6 +1400,16 @@ removes the former policy split in which the resident-program API compiled RMSNo
 backward, and gradient clipping while `show-pipeline` reported contradictory scalar/buffer ABI
 roles for the same typed programs.
 
+Ordinary scalar reductions now delegate their complete element expression to the same strict
+typed-SSA lowerer as maps, scans, stencils, contractions, and ordered fold-maps. The reduction
+adapter retains only its algebra, coordinate, storage, and currently executable overflow gates;
+it no longer reparses literals, loads, casts, and arithmetic through a second recursive lowerer.
+Authoritative lexical binder types survive the shared pure-let normalization when an initializer
+has no result stamp, without overwriting an initializer's own type. Consequently mixed-precision
+value conditionals such as public Huber loss lower to KernelBody `IfRegion` plus explicit branch
+conversions on OpenCL, CUDA, and HIP, while untyped compound arithmetic and unchecked coordinate
+claims still decline.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

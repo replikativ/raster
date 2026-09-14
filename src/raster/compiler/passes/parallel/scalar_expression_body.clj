@@ -102,9 +102,11 @@
                               (some-> (descriptor/semantic-op expression)
                                       descriptor/cast-result-tag
                                       dtype/dtype-for-scalar-tag))
-                            (some-> (or (:raster.type/tag (meta expression))
-                                        (:tag (meta expression)))
-                                    dtype/dtype-for-scalar-tag)))
+                            (let [tag (or (:raster.type/tag (meta expression))
+                                          (:tag (meta expression)))]
+                              (or (when (and (keyword? tag) (dtype/known? tag))
+                                    (dtype/canon tag))
+                                  (dtype/dtype-for-scalar-tag tag)))))
         authoritative-source-type
         (fn authoritative-source-type [expression env]
           (or (retained-type expression)
@@ -383,12 +385,15 @@
                     expected (canon-type expected)
                     _ (when (and require-source-types? (seq? expression) (not lexical-let?))
                         (source-type expression expected env))
-                    retained (when (seq? expression) (retained-type expression))
-                    operation-type (if (and retained
-                                            (or require-source-types?
-                                                (and (dtype/fp-dtype? expected)
-                                                     (dtype/fp-dtype? retained))))
-                                     retained expected)
+                    retained (retained-type expression)
+                    source-result-type (when require-source-types?
+                                         (authoritative-source-type expression env))
+                    operation-type (if (or source-result-type
+                                           (and retained
+                                                (dtype/fp-dtype? expected)
+                                                (dtype/fp-dtype? retained)))
+                                     (or source-result-type retained)
+                                     expected)
                     lowered (if lexical-let?
                               (lower-let expression operation-type env)
                               (lower-value expression operation-type env))]
