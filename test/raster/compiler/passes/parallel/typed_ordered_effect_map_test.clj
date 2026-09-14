@@ -462,6 +462,65 @@
       (is (= [3.0 6.0 3.0 6.0] (vec out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
 
+(deftest triangular-effect-domains-retain-dynamic-or-inclusive-boundaries
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 row rows
+                 (loop* [j row]
+                   (if (clojure.core/<= j last-column)
+                     (do
+                       (loop* [d 0]
+                         (if (clojure.core/< d width)
+                           (let* [^long address (clojure.core/+ (clojure.core/* row width) d)
+                                  ^float previous (clojure.core/aget out address)]
+                             (clojure.core/aset out address
+                                                (float (clojure.core/+ previous 1.0)))
+                             (recur (clojure.core/inc d)))))
+                       (recur (clojure.core/inc j))))))]
+               effect)
+        result (route/attempt source :float {'out :float}
+                              {:scalar-types {'rows :long 'last-column :long 'width :long}})
+        program (:program result)
+        algorithm (-> program :equations first :algorithm)
+        equation (first (dialect/equations algorithm))
+        outer (-> equation dialect/operation-parts :lambda dialect/lambda-parts
+                  :body-results first dialect/effect-parts)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out rows last-column width] (:form jvm)))
+        out (float-array 6)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= 'row (:lower outer)))
+    (is (= :inclusive (:upper-bound outer)))
+    (is (= :independent (-> equation dialect/operation-parts :attributes :iteration-order)))
+    (doseq [[field value reason]
+            [[:upper-bound :closed :typed-soac-syntax]
+             [:lower 'outside :typed-soac-effect-loop]]]
+      (let [broken (clojure.walk/postwalk
+                    (fn [form]
+                      (if (dialect/effect-loop-form? form)
+                        (let [[head attributes extent lambda] form]
+                          (list head (assoc attributes field value) extent lambda))
+                        form))
+                    algorithm)]
+        (is (= reason
+               (try (dialect/validate! broken) :accepted
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (doseq [target [:opencl-intel :cuda :hip]]
+      (let [artifact (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :dtype :float :target-dialect target
+                      :array-types {'out :float}
+                      :scalar-types {'rows :long 'last-column :long 'width :long})]
+        (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+        (is (some #(= :inclusive (get-in % [:attributes :upper-bound]))
+                  (nested-operations
+                   (get-in artifact [:attributes :kernel-body :operations]))))))
+    (is (nil? (execute out 3 2 2)))
+    (is (= [3.0 3.0 2.0 2.0 1.0 1.0] (vec out)))))
+
 (deftest production-host-store-loops-preserve-the-continuation
   (let [source '(let* [effect
                       (raster.par/map-void!

@@ -76,22 +76,21 @@
 
 (defn- effect-accesses
   [effect destination-parameters locals loops]
-  (let [{:keys [region loop index lower extent lambda carry destination destination-index
+  (let [{:keys [region loop index lower upper-bound extent lambda carry destination destination-index
                 predicate value conflict]}
         (dialect/effect-parts effect)]
     (cond
       region (region-accesses region destination-parameters locals loops)
 
       loop
-      (let [loop-scope {:index index :extent extent :lower lower :kind :effect-loop}
+      (let [loop-scope {:index index :extent extent :lower lower
+                        :upper-bound upper-bound :kind :effect-loop}
             prefix (expressions-accesses (cond-> [lower extent] carry (conj (:init carry)))
                                          destination-parameters locals loops)
             body (dialect/lambda-parts lambda)
             scoped (local-accesses (:locals body) destination-parameters locals
                                    (conj loops loop-scope))]
-        (into (cond-> prefix
-                (not= 0 lower)
-                (conj {:kind :unsupported :reason :nonzero-effect-loop-origin :lower lower}))
+        (into prefix
               (concat (:accesses scoped)
                       (mapcat #(effect-accesses % destination-parameters (:locals scoped)
                                                (conj loops loop-scope))
@@ -134,7 +133,10 @@
         ;; canonical and bounded, without demanding irrelevant lexical indices in the formula.
         expected-digits (into #{outer-index} inner-indices)
         form-symbols (set (filter symbol? (tree-seq coll? seq form)))]
-    (when (and form (index-algebra/injective? form)
+    (when (and (every? #(and (= 0 (:lower %))
+                             (not= :inclusive (:upper-bound %)))
+                       relevant-loops)
+               form (index-algebra/injective? form)
                (contains? (:terms form) outer-index)
                (empty? (set/intersection forbidden-index-symbols form-symbols))
                (= expected-digits (set (keys (:terms form))))

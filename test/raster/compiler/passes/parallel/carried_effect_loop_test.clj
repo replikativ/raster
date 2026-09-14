@@ -143,6 +143,27 @@
                           (= {:rounding :nearest-even :overflow :ieee}
                              (get-in % [:expression :options]))) all)))))))
 
+(deftest inclusive-effect-carry-does-not-advance-past-long-max
+  (let [operation (-> (scheduled-loop 1)
+                      (assoc-in [:scalar-region :effects 0 :loop :lower] Long/MAX_VALUE)
+                      (assoc-in [:scalar-region :effects 0 :loop :extent] Long/MAX_VALUE)
+                      (assoc-in [:scalar-region :effects 0 :loop :upper-bound] :inclusive)
+                      (assoc-in [:scalar-region :effects 0 :loop :locals]
+                                [{:id 'loaded :dtype :float :init 1.0}])
+                      (assoc-in [:scalar-region :effects 0 :loop :effects 0 :destination-index] 'i)
+                      (assoc-in [:scalar-region :effects 0 :loop :carry :init] 0.0))
+        execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))
+        words (float-array 1)
+        totals (float-array 1)]
+    (is (nil? (execute (float-array 1) words totals 1)))
+    (is (= [1.0] (vec words)))
+    (is (= [1.0] (vec totals)))
+    (doseq [target [:opencl-intel :cuda :hip]]
+      (let [all (operations (get-in (artifact operation target)
+                                    [:attributes :kernel-body :operations]))
+            loop (first (filter #(seq (:iter-args %)) all))]
+        (is (= :inclusive (get-in loop [:attributes :upper-bound])))))))
+
 (deftest sequential-carried-loops-export-only-their-results
   (let [base (scheduled-loop 1)
         loop (get-in base [:scalar-region :effects 0])

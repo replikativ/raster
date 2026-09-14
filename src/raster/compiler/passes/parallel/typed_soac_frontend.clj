@@ -587,7 +587,7 @@
                   (and (symbol? head) (form/loop-head? head)
                        (vector? bindings) (= 2 (count bindings))
                        (symbol? (first bindings))
-                       (integer? (second bindings)) (<= 0 (second bindings))
+                       (not (util/effectful? (second bindings)))
                        (= 1 (count body)))
                   (let [[loop-index lower] bindings
                         conditional (first body)]
@@ -597,14 +597,18 @@
                                (nil? (nth conditional 3 nil)))
                       (let [[_ test then] conditional]
                         (when (and (seq? test) (= 3 (count test))
-                                   (contains? '#{< clojure.core/<} (first test))
+                                   (contains? '#{< <= clojure.core/< clojure.core/<=}
+                                              (first test))
                                    (= loop-index (strip-index-cast (second test))))
                           (when-let [split (split-trailing-recur then loop-index false)]
                             {:index loop-index :lower lower
+                             :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
+                                            :inclusive :exclusive)
                              :extent (strip-index-cast (nth test 2))
                              :body (:body split)}))))))]
     (when (and counted
                (not= (:index counted) index)
+               (not (contains? (util/free-syms (:lower counted)) (:index counted)))
                (not (contains? (util/free-syms (:extent counted)) (:index counted))))
       (when-let [region (store-region (:body counted) index)]
         (when (or (seq (:stores region)) (seq (:loops region)))
@@ -620,6 +624,7 @@
              :stores []
              :loops [{:index loop-index
                       :lower (:lower counted)
+                      :upper-bound (:upper-bound counted :exclusive)
                       :extent (:extent counted)
                       :locals (mapv (fn [{:keys [id] :as local}]
                                       (-> local (assoc :id (get renames id))
@@ -1381,20 +1386,25 @@
 
 (defn- write-region-description
   [id symbol index extent {:keys [locals stores loops] :as region} elem-type
-   & {:keys [host-return array-types scalar-types]
+  & {:keys [host-return array-types scalar-types]
       :or {host-return :effect array-types {} scalar-types {}}}]
   (let [order (region-order region)
         analysis-locals (vec (concat locals (order-locals order)))
-        local-types (into scalar-types (map (juxt :id :dtype)) analysis-locals)
         loops (vec (map-indexed (fn [ordinal loop]
                                   (rename-loop-tree loop [ordinal]))
-                                (or loops [])))]
+                                (or loops [])))
+        local-types (into (into (assoc scalar-types index :long)
+                                (map (juxt :id :dtype)) analysis-locals)
+                          (map (fn [loop] [(:index loop) :long]) (loop-tree loops)))]
     (when (and (or (seq stores) (seq loops))
-               (every? (fn [{:keys [extent carry]}]
-                         (or (nil? carry) (integer? extent)
-                             (contains? #{:int :long}
-                                        (or (get local-types extent)
-                                            (retained-local-dtype extent nil)))))
+               (every? (fn [{:keys [lower extent carry]}]
+                         (or (nil? carry)
+                             (every? (fn [bound]
+                                       (or (integer? bound)
+                                           (contains? #{:int :long}
+                                                      (or (get local-types bound)
+                                                          (retained-local-dtype bound nil)))))
+                                     [lower extent])))
                        (loop-tree loops))
                (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
                ;; A destination written both directly and inside a store loop would lose the work
@@ -1571,6 +1581,8 @@
                 {:loop (cond-> {:index (:index loop) :lower (:lower loop)
                                 :extent (:extent loop) :locals (:locals loop)
                                 :effects (project-order (region-order loop))}
+                         (= :inclusive (:upper-bound loop))
+                         (assoc :upper-bound :inclusive)
                          (:carry loop) (assoc :carry (:carry loop)))}))
             loop-effects (mapv (fn [ordinal loop]
                                  (project-loop loop [:loop ordinal]))
@@ -3451,7 +3463,7 @@
                 (dialect/effect-guard-region (transform guard) locals effects)
                 (dialect/effect-lambda-region locals effects)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower extent carry]} (:loop effect)]
+                    :keys [lower upper-bound extent carry]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]
                                       (dialect/local-value id dtype
                                                            (canonicalize-scalar-folds
@@ -3461,6 +3473,7 @@
                          carry (concat [(canonicalize-scalar-folds
                                          (transform (:update carry)) (:dtype carry))]))
                   attributes (cond-> {:index loop-index :lower lower}
+                               (= :inclusive upper-bound) (assoc :upper-bound :inclusive)
                                carry (assoc :carry (select-keys carry [:parameter :result :dtype])))
                   lambda (list 'lambda (cond-> [loop-index] carry (conj (:parameter carry))) body)]
               (if carry

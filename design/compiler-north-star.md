@@ -1490,10 +1490,16 @@ The immediate continuation after the verified double-buffered weighted-reduction
    `effect-loop`. Fold domains retain an exact typed lower expression and an exclusive or inclusive
    upper-bound mode. KernelBody emits inclusive termination with a guarded final advance, so a
    `Long/MAX_VALUE` endpoint never requires constructing or executing an overflowing successor.
-   This removes the last verified-SegMap fallback from the batched causal SDPA dQ/dK/dV kernels:
-   their causal inclusive bound and row-dependent nonzero lower bound now remain ordinary Fold
-   facts. Transformed exits and other control shapes retain their source spelling until a richer
-   canonical construct exists. This reuses the shared loop matcher and the enclosing retained
+   This removes the scalar-expression fallback inside batched causal SDPA dQ/dK/dV: their nested
+   reductions retain causal inclusive bounds and row-dependent nonzero lower bounds as ordinary
+   Fold facts. The surrounding effect loops now carry the same explicit inclusive/exclusive mode
+   and typed dynamic lower operand through TypedSOAC, JVM and KernelBody. Together with recursive
+   effect regions this removes the complete causal-gradient compatibility kernel. Inclusive
+   execution guards the final advance, including a `Long/MAX_VALUE` endpoint; ownership refuses
+   to use inclusive or nonzero loops as mixed-radix address digits, but correctly ignores such a
+   loop when its index does not reach a destination address. Transformed exits and other control
+   shapes retain their source spelling until a richer canonical construct exists. This reuses the
+   shared loop matcher and the enclosing retained
    dtype rather than adding a function/type registry. KernelBody consumes Fold directly as a typed
    ordered loop; conversion does not descend through arbitrary lexical bindings and therefore
    cannot detach a recurrence from its scope. In particular, prefill maximum reduction no longer
