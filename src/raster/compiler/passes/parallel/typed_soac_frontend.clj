@@ -1326,16 +1326,10 @@
           (mapcat (fn [[_ ordinals]]
                     (let [group-forms (map #(nth forms %) ordinals)]
                       (when (and (every? some? group-forms)
-                                 (every? index-algebra/injective? group-forms)
-                                 (apply = (map :terms group-forms))
-                                 ;; Different guarded domains can alias across work items even
-                                 ;; when each store is separately injective on its own domain.
-                                 (apply = (map :fixed-leaves group-forms))
-                                 ;; stores at one address (the arms of a conditional) are the
-                                 ;; same element of one work item; distinct offsets must be
-                                 ;; disjoint across work items
-                                 (index-algebra/disjoint-offsets?
-                                  (first group-forms) (distinct (map :offset group-forms))))
+                                 ;; This also proves distinct translated slabs such as
+                                 ;; `base+i` and `base+i+half`; the common base is algebraically
+                                 ;; irrelevant, not a layout fact supplied by the operator.
+                                 (index-algebra/disjoint-translated-forms? group-forms))
                         ordinals))))
           by-destination)))
 
@@ -1721,6 +1715,72 @@
      :result-storage [{:destination destination :access :write :host-return :buffer}]
      :host-binding symbol :elem-type body-dtype :source-operation source-operation}))
 
+(defn- butterfly-effect-form
+  "Project the public paired-stride transform into ordinary scalar algebra and four stores.
+
+   This is surface normalization, not a privileged kernel operation. The existing store-index
+   algebra must prove the two half-intervals disjoint before the resulting effect traversal may
+   become independent. Checked `int` conversions remain explicit at the public boundary."
+  [expression default-dtype array-types]
+  (let [{:keys [re im idx half wr wi base]} (par/extract-par-butterfly-info expression)
+        element-dtypes (mapv #(some-> (or (get array-types %)
+                                          default-dtype)
+                                      dtype/canon)
+                             [re im wr wi])
+        element-dtype (when (and (every? dtype/known? element-dtypes)
+                                 (apply = element-dtypes))
+                        (first element-dtypes))
+        element-tag (some-> element-dtype dtype/scalar-tag-for-dtype)
+        typed-element (fn [prefix]
+                        (with-meta (gensym prefix)
+                          {:tag element-tag :raster.type/tag element-tag}))
+        lo (with-meta (gensym "rstr_butterfly_lo_")
+             {:tag 'int :raster.type/tag 'int})
+        hi (with-meta (gensym "rstr_butterfly_hi_")
+             {:tag 'int :raster.type/tag 'int})
+        ur (typed-element "rstr_butterfly_ur_")
+        ui (typed-element "rstr_butterfly_ui_")
+        rhi (typed-element "rstr_butterfly_rhi_")
+        ihi (typed-element "rstr_butterfly_ihi_")
+        wrv (typed-element "rstr_butterfly_wr_")
+        wiv (typed-element "rstr_butterfly_wi_")
+        vr (typed-element "rstr_butterfly_vr_")
+        vi (typed-element "rstr_butterfly_vi_")
+        checked-lo (list 'int (list 'clojure.core/+ base idx))
+        checked-hi (list 'int (list 'clojure.core/+ base idx half))]
+    (when element-tag
+      (with-meta
+      (list 'raster.par/map-void! idx half
+            (list 'let*
+                  [lo checked-lo
+                   hi checked-hi
+                   ur (list 'clojure.core/aget re lo)
+                   ui (list 'clojure.core/aget im lo)
+                   rhi (list 'clojure.core/aget re hi)
+                   ihi (list 'clojure.core/aget im hi)
+                   wrv (list 'clojure.core/aget wr idx)
+                   wiv (list 'clojure.core/aget wi idx)
+                   vr (list 'clojure.core/-
+                            (list 'clojure.core/* wrv rhi)
+                            (list 'clojure.core/* wiv ihi))
+                   vi (list 'clojure.core/+
+                            (list 'clojure.core/* wrv ihi)
+                            (list 'clojure.core/* wiv rhi))]
+                  (list 'do
+                        (list 'clojure.core/aset re
+                              (list 'raster.par/unique-index lo)
+                              (list 'clojure.core/+ ur vr))
+                        (list 'clojure.core/aset re
+                              (list 'raster.par/unique-index hi)
+                              (list 'clojure.core/- ur vr))
+                        (list 'clojure.core/aset im
+                              (list 'raster.par/unique-index lo)
+                              (list 'clojure.core/+ ui vi))
+                        (list 'clojure.core/aset im
+                              (list 'raster.par/unique-index hi)
+                              (list 'clojure.core/- ui vi)))))
+        (meta expression)))))
+
 (defn- operation-description
   [id symbol expression default-dtype array-types scalar-types]
   (cond
@@ -1775,6 +1835,14 @@
        (fn [mixed]
          (list 'int (list 'mod (list 'bit-and mixed Long/MAX_VALUE) population)))
        :raster.par/active-ids!))
+
+    ;; Butterfly is paired pointwise scalar algebra. Its two output slabs are a layout/ownership
+    ;; fact, not a reason for a dedicated emitter or semantic IR node.
+    (par/par-butterfly-form? expression)
+    (when-let [effect-form (butterfly-effect-form expression default-dtype array-types)]
+      (some-> (operation-description id symbol effect-form
+                                     default-dtype array-types scalar-types)
+              (assoc :source-operation :raster.par/butterfly!)))
 
     (par/par-scatter-form? expression)
     (let [{:keys [out src index n stride]} (par/extract-par-scatter-info expression)]

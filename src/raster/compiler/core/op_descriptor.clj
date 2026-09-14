@@ -552,6 +552,7 @@
           'raster.par/collect! 'par/collect!
           'raster.par/map-void! 'par/map-void!
           'raster.par/map2! 'par/map2!
+          'raster.par/butterfly! 'par/butterfly!
           'raster.par/product-reduce! 'par/product-reduce!
           'raster.par/segmented-fold-map! 'par/segmented-fold-map!}))
 

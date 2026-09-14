@@ -3,7 +3,7 @@
 
    This pass never recognizes Clojure loop syntax. It consumes explicit Fold/effect-loop scopes
    and mixed-radix index forms, upgrading a sequential effect-map only when every access to each
-   written destination has one common injective address function modulo lexical inner-index names.
+   written destination has one injective, possibly translated mixed-radix address family.
    Distinct written destinations remain a binding precondition: KernelGraph call validation rejects
    overlapping writable resident views before private allocation or launch."
   (:require [clojure.set :as set]
@@ -157,7 +157,8 @@
    [{}] loops))
 
 (defn- ownership-signature
-  [{:keys [index locals loops]} outer-index outer-extent forbidden-index-symbols]
+  [{:keys [index locals loops]} outer-index outer-extent forbidden-index-symbols
+   capture-substitutions]
   (let [local-initializers (into {} (map (juxt :id :init)) locals)
         address-dependencies
         (loop [symbols (util/free-syms index)]
@@ -190,12 +191,14 @@
                           (= expected-digits (:leaves form))
                           (empty? (:parents form))
                           (nil? (:fixed-leaves form)))
-                 form)))
+                 (clojure.walk/postwalk-replace capture-substitutions form))))
            loop-indices))]
     (when canonical
       {:owner (get-in canonical [:terms outer-index])
        :inner (mapv #(get-in canonical [:terms %]) inner-indices)
        :offset (:offset canonical)
+       :offset-terms (:offset-terms canonical)
+       :form canonical
        :quot-facts (:quot-facts canonical)})))
 
 (defn- carried-symbols
@@ -222,6 +225,7 @@
         (dialect/operation-parts equation)
         layout (when (= 'effect-map kind) (dialect/parameter-layout equation))
         destination-parameters (set (:destination-parameters layout))
+        capture-substitutions (zipmap (:capture-parameters layout) captures)
         values (:values (dialect/facts program))]
     (when (and (= 'effect-map kind)
                (= :sequential (:iteration-order attributes))
@@ -243,13 +247,25 @@
                   (keep (fn [[destination destination-accesses]]
                           (let [signatures (mapv #(ownership-signature % (:index attributes)
                                                                      (:extent attributes)
-                                                                     forbidden-index-symbols)
+                                                                     forbidden-index-symbols
+                                                                     capture-substitutions)
                                                  destination-accesses)]
                             (when (and (some #(= :write (:kind %)) destination-accesses)
                                        (every? some? signatures)
-                                       (apply = signatures))
+                                       ;; All accesses belong to one translated mixed-radix
+                                       ;; address family. Repeated reads/writes at an address are
+                                       ;; allowed within an item; distinct slabs must be proved
+                                       ;; disjoint after cancelling their common translation.
+                                       (apply = (map #(dissoc % :offset :offset-terms :form)
+                                                     signatures))
+                                       (or (= 1 (count (distinct
+                                                        (map :offset-terms signatures))))
+                                           (index-algebra/disjoint-translated-forms?
+                                            (mapv :form signatures))))
                               [destination {:accesses (count destination-accesses)
-                                            :signature (first signatures)}]))))
+                                            :signature (dissoc (first signatures) :form)
+                                            :offsets (vec (distinct
+                                                           (map :offset-terms signatures)))}]))))
                   grouped)]
         (when (and (empty? unsupported)
                    (= destination-parameters (set (keys grouped)) (set (keys proofs))))

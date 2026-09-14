@@ -61,6 +61,14 @@
   [ids :- (Array int), n-active :- Long, n-agents :- Long, seed :- Long] :- (Array int)
   (raster.par/active-ids! ids n-active n-agents seed))
 
+(deftm public-c-family-butterfly!
+  "Paired in-place effects exercise relational ownership and multiple stores in CUDA/HIP CI."
+  [re :- (Array float), im :- (Array float),
+   wr :- (Array float), wi :- (Array float),
+   half :- Long, base :- Long] :- (Array float)
+  (let [effect (raster.par/butterfly! re im index half wr wi base)]
+    re))
+
 (deftm public-c-family-dot
   "Public equation-first workload compiled by nvcc/hipcc without a physical device."
   (All [T] [left :- (Array T) right :- (Array T) n :- Long] :- Double
@@ -348,6 +356,8 @@
                  #'public-c-family-checked-rng {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-active-ids {:target device-id :dtype :int}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-butterfly! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-arrays/argmax-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

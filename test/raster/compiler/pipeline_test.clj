@@ -135,7 +135,7 @@
       (is (not (contains? specs :peephole)))
       (is (not (contains? specs :par-fuse))))))
 
-(deftest uncertified-parallel-source-never-reenters-legacy-fusion
+(deftest certified-butterfly-enters-the-typed-effect-vertical
   (let [source '(let* [step (raster.par/butterfly! re im i half wr wi base)] step)
         options {:dtype :float
                  :array-types {'re :float 'im :float 'wr :float 'wi :float}
@@ -143,16 +143,12 @@
         result (#'pipeline/pass-soac-fuse source options)
         bare '(raster.par/butterfly! re im i half wr wi base)
         bare-result (#'pipeline/pass-soac-fuse bare options)]
-    (testing "a binding-form coverage gap remains byte-for-byte unfused"
-      (is (= source (:form result)))
-      (is (= :disabled (get-in result [:stats :compatibility-fusion])))
-      (is (= :typed-soac-source-coverage
-             (get-in result [:stats :typed-soac-declined :reason])))
-      (is (= {:vertical 0 :horizontal 0 :iterations 0}
-             (select-keys (:stats result) [:vertical :horizontal :iterations]))))
-    (testing "a bare unsupported form also bypasses the historical recursive fusion pass"
-      (is (= bare (:form bare-result)))
-      (is (= :disabled (get-in bare-result [:stats :compatibility-fusion]))))))
+    (testing "the binding form is certified instead of entering compatibility fusion"
+      (is (= :typed-soac (get-in result [:stats :route])))
+      (is (nil? (get-in result [:stats :typed-soac-declined])))
+      (is (= :typed-soac (get-in result [:form :dialect]))))
+    (testing "the bare surface form is normalized into the same typed dialect"
+      (is (= :typed-soac (get-in bare-result [:form :dialect]))))))
 
 ;; ================================================================
 ;; Dialect validation

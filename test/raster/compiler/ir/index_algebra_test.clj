@@ -71,6 +71,19 @@
     (is (not (ia/disjoint-offsets? row [0 2]))
         "two literal offsets inside a symbolic-width row overlap")))
 
+(deftest common-symbolic-translations-cancel-relationally
+  (let [low (ia/index-form '(+ base i) 'i 'half [] {})
+        high (ia/index-form '(+ base i half) 'i 'half [] {})
+        unrelated (ia/index-form '(+ base i stride) 'i 'half [] {})]
+    (is (ia/injective? low))
+    (is (ia/injective? high))
+    (is (= [{:const 1 :factors '[base]} {:const 1 :factors '[half]}]
+           (:offset-terms high)))
+    (is (ia/disjoint-translated-forms? [low high])
+        "translation by base does not alter the two adjacent half-width slabs")
+    (is (not (ia/disjoint-translated-forms? [low unrelated]))
+        "an unrelated symbolic displacement carries no separation proof")))
+
 (deftest lossy-projections-and-unresolved-locals-are-not-injective
   (testing "a lone quot or rem is a projection, not a decomposition"
     (is (not (ia/injective? (ia/index-form 'q 'idx 4 '[{:id q :init (quot idx 2)}] {}))))
