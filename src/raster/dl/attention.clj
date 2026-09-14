@@ -498,7 +498,7 @@
                                       (do
   ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
                                         (raster.par/map-void! ij (clojure.core/* n-q maxpos)
-                                                              (let [cache-len (aget clenbuf 0)
+                                                              (let [cache-len (n/min (aget clenbuf 0) maxpos)
                                                                     hq (quot ij maxpos)
                                                                     j (rem ij maxpos)]
                                                                 (when (< j cache-len)
@@ -518,7 +518,7 @@
                                                                     (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
   ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
                                         (raster.par/map-void! hq n-q
-                                                              (let [cache-len (aget clenbuf 0)
+                                                              (let [cache-len (n/min (aget clenbuf 0) maxpos)
                                                                     scb (clojure.core/* hq maxpos)
                                                                     neg-inf -1.0e38
                                                                     mx (loop [j 0 mm neg-inf]
@@ -538,7 +538,7 @@
                                                                     nil))))
   ;; phase 3: out[hq,d] = Σ_j sc[hq,j] * v[j,hkv,d] — one work-item per (hq, d)
                                         (raster.par/map-void! hd (clojure.core/* n-q head-dim)
-                                                              (let [cache-len (aget clenbuf 0)
+                                                              (let [cache-len (n/min (aget clenbuf 0) maxpos)
                                                                     hq (quot hd head-dim)
                                                                     d (rem hd head-dim)
                                                                     scb (clojure.core/* hq maxpos)

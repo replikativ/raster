@@ -229,6 +229,44 @@
                            (-> equation dialect/operation-parts :lambda
                                dialect/lambda-parts :body-results))))))
 
+(deftest clamped-inner-extents-prove-padded-row-ownership
+  (let [form
+        '(let* [effect
+                (raster.par/map-void!
+                 row rows
+                 (let* [^long bound (clojure.core/min width capacity)
+                        _ (loop* [^long j 0]
+                            (if (< j bound)
+                              (do (aset packed (+ (* row capacity) j)
+                                        (aget x (+ (* row width) j)))
+                                  (recur (inc j)))
+                              nil))
+                        ^float factor seed]
+                   (do (loop* [^long j 0]
+                         (if (< j bound)
+                           (do (aset packed (+ (* row capacity) j)
+                                     (* (aget packed (+ (* row capacity) j)) factor))
+                               (recur (inc j)))
+                           nil))
+                       (aset sums row factor))))]
+           effect)
+        options {:scalar-types {'rows :long 'width :long 'capacity :long 'seed :float}
+                 :array-types {'x :float 'packed :float 'sums :float}}
+        result (route/attempt form :float (:array-types options) options)
+        equation (-> result :program :equations first :algorithm dialect/equations first)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= :independent (-> equation dialect/operation-parts
+                            :attributes :iteration-order)))
+    (is (= :outer-item-owned
+           (-> equation dialect/operation-parts :attributes :attributes
+               :ownership-proof :kind)))
+    (is (= :sequential-effect-continuation
+           (get-in (route/attempt
+                    (replace-form form '(clojure.core/min width capacity) 'width)
+                    :float (:array-types options) options)
+                   [:declined :reason]))
+        "an unrelated logical width is not guessed to fit the physical row stride")))
+
 (deftest effect-only-loop-bindings-compose-with-their-typed-continuation
   (let [form
         '(let* [effect
