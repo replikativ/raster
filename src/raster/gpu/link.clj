@@ -395,12 +395,9 @@
                  [value]
                  (let [slots (:slots spec)]
                    (if (resident-value/resident-composite? value)
-                     (let [fields (:fields value)]
-                       (when-not (= (count slots) (count fields))
-                         (throw (ex-info "linked dispatch composite differs from its ABI"
-                                         {:reason :linked-dispatch-composite-count
-                                          :phase (:phase step) :binding (:binding spec)
-                                          :slots slots :fields fields})))
+                     (let [fields (resident-value/select-fields
+                                   {:binding (:binding spec) :slots slots}
+                                   (:fields value))]
                        (mapv (fn [slot field]
                                (let [view (:view (:value field))]
                                  (when (and (:field slot)

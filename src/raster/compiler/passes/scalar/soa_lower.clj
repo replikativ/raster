@@ -25,6 +25,12 @@
 (defn field-arr-sym [soa-sym field-name]
   (symbol (str (name soa-sym) "_" (name field-name))))
 
+(defn- field-id
+  "Canonical logical field identity. Registry spellings may be strings, symbols, or keywords;
+   physical names remain symbols while ABI/runtime projection paths use keywords."
+  [field-name]
+  (if (keyword? field-name) field-name (keyword (name field-name))))
+
 (defn soa-param-env
   "From ordered param-specs [{:sym :tag}], find SoA-typed params and build
    {param-sym → {:scalar-tag :fields [{:name :element-tag :array-tag}]}}."
@@ -65,6 +71,21 @@
                          (:fields info))
                    [p]))
                param-specs)))
+
+(defn buffer-projections
+  "Physical-leaf projection facts for a scalar-replaced SoA environment.
+
+   The source rewrite and KernelABI projection consume the same facts: a field symbol names
+   storage, while `:binding` and `:field` retain the logical caller value and its stable path.
+   This is representation data, not a backend naming convention."
+  [soa-env]
+  (into {}
+        (mapcat (fn [[binding {:keys [fields]}]]
+                  (map (fn [{field :name}]
+                         [(field-arr-sym binding field)
+                          {:binding binding :field (field-id field)}])
+                       fields)))
+        soa-env))
 
 (defn- local-name [head] (let [s (str head)] (subs s (inc (.lastIndexOf s "/")))))
 

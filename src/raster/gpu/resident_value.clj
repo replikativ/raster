@@ -34,19 +34,39 @@
   (composite (:id composite-value)
              (mapv #(update % :value f) (:fields composite-value))))
 
+(defn select-fields
+  "Select the ordered physical fields named by an ABI group.
+
+   A kernel may consume only some leaves of a logical composite. Projected slots select those
+   leaves by stable `:field` identity; a field-less ABI retains the exact positional contract."
+  [{:keys [binding slots]} fields]
+  (let [fields (vec fields)
+        field-key #(if (instance? clojure.lang.Named %) (name %) %)]
+    (cond
+      (= (count slots) (count fields)) fields
+
+      (every? :field slots)
+      (let [by-name (into {} (map (juxt (comp field-key :name) identity)) fields)
+            selected (mapv #(get by-name (field-key (:field %))) slots)]
+        (when (some nil? selected)
+          (throw (ex-info "resident composite omits an ABI-projected field"
+                          {:binding binding :slots slots :fields (mapv :name fields)})))
+        selected)
+
+      :else
+      (throw (ex-info "resident composite field count differs from its artifact binding"
+                      {:binding binding :expected (count slots) :actual (count fields)
+                       :slots slots :fields (mapv :name fields)})))))
+
 (defn expand
   "Validate and flatten a ResidentComposite against one ordered logical ABI group. Backend
    buffers share the `:dtype` contract, so field identity and storage type are checked once here
    before either Level Zero or OpenCL sees physical pointer arguments."
-  [{:keys [binding slots]} composite-value]
+  [{:keys [binding slots] :as group} composite-value]
   (when-not (resident-composite? composite-value)
     (throw (ex-info "expand requires a ResidentComposite"
                     {:binding binding :actual (type composite-value)})))
-  (let [fields (:fields composite-value)]
-    (when-not (= (count slots) (count fields))
-      (throw (ex-info "resident composite field count differs from its artifact binding"
-                      {:binding binding :expected (count slots) :actual (count fields)
-                       :slots slots :fields (mapv :name fields)})))
+  (let [fields (select-fields group (:fields composite-value))]
     (doseq [[slot field] (map vector slots fields)]
       (when (and (:field slot) (not= (:field slot) (:name field)))
         (throw (ex-info "resident composite field order differs from its physical ABI slot"

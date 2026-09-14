@@ -435,15 +435,31 @@
                       (throw (ex-info "link instance binding names an absent logical value"
                                       {:reason :link-absent-value :instance id :symbol sym
                                        :value value-id :phase (:phase step)})))
-                    (when-not (= (count slots) (count leaves))
-                      (throw (ex-info "logical value leaf count differs from its physical ABI group"
-                                      {:reason :link-value-abi-leaves :instance id :symbol sym
-                                       :value value-id :slots slots :leaves leaves})))
                     (when (and (< 1 (count leaves)) (not (:logical-bindings? step)))
                       (throw (ex-info "composite link value requires logical descriptor binding"
                                       {:reason :link-composite-binding-mode :instance id
                                        :symbol sym :value value-id :phase (:phase step)})))
-                    (let [leaf-facts
+                    (let [selected-leaves
+                          (cond
+                            (= (count slots) (count leaves)) leaves
+
+                            (every? :field slots)
+                            (let [by-name (into {} (map (juxt :name identity)) leaves)
+                                  selected (mapv #(get by-name (:field %)) slots)]
+                              (when (some nil? selected)
+                                (throw (ex-info "logical value omits an ABI-projected field"
+                                                {:reason :link-value-abi-field-missing
+                                                 :instance id :symbol sym :value value-id
+                                                 :slots slots :leaves leaves})))
+                              selected)
+
+                            :else
+                            (throw
+                             (ex-info
+                              "logical value leaf count differs from its physical ABI group"
+                              {:reason :link-value-abi-leaves :instance id :symbol sym
+                               :value value-id :slots slots :leaves leaves})))
+                          leaf-facts
                           (mapv
                            (fn [slot {:keys [name node] :as leaf}]
                              (let [link-node (get nodes node)]
@@ -471,8 +487,8 @@
                                                   :actual (get-in link-node [:view :dtype])})))
                                {:symbol sym :value value-id :node node
                                 :field name :access (kabi/slot-access slot)}))
-                           slots leaves)]
-                      {:symbol sym :value value-id :slots slots :leaves leaves
+                           slots selected-leaves)]
+                      {:symbol sym :value value-id :slots slots :leaves selected-leaves
                        :facts leaf-facts})))
                 spec-syms slot-groups)
           physical-pointers (vec (mapcat (comp (partial map :node) :leaves) binding-facts))

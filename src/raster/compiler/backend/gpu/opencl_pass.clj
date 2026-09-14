@@ -394,6 +394,24 @@
          (= 1 (count (soac-dialect/equations algorithm)))
          (= 'contract (soac-dialect/operation-kind (first (soac-dialect/equations algorithm)))))))
 
+(defn- project-artifact-bindings
+  [artifact projections]
+  (if (seq projections)
+    (kart/validate!
+     (assoc artifact :abi (kabi/project-pointer-bindings (:abi artifact) projections)))
+    artifact))
+
+(defn- project-graph-bindings
+  [graph projections]
+  (if (seq projections)
+    (-> graph
+        (update :abi kabi/project-pointer-bindings projections)
+        (kgraph/map-operations
+         (fn [node]
+           (project-artifact-bindings (:operation node) projections)))
+        kgraph/validate!)
+    graph))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -410,7 +428,8 @@
      :dtype         — :double or :float (default :double)
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
-  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types schedule]
+  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types
+                  buffer-projections schedule]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
@@ -565,7 +584,8 @@
 
         register-kernel!
         (fn [kernel stat-key]
-          (let [_ (when (kart/kernel-artifact? kernel) (kart/validate! kernel))
+          (let [kernel (project-artifact-bindings kernel buffer-projections)
+                _ (when (kart/kernel-artifact? kernel) (kart/validate! kernel))
                 k (maybe-compile-spirv kernel compile-spirv? device-id)]
             (swap! stats update stat-key inc)
             (swap! kernels conj k)
@@ -586,7 +606,7 @@
                           (opencl-pass form :device-id device-id :dtype dtype
                                        :min-elements min-elements :compile-spirv? compile-spirv?
                                        :scalar-types top-scalar-types :array-types top-array-types
-                                       :schedule schedule))]
+                                       :buffer-projections buffer-projections :schedule schedule))]
             (swap! kernels into (:kernels emitted))
             (swap! dispatches into (:dispatches emitted))
             (doseq [[k v] (:stats emitted) :when (number? v)]
@@ -611,6 +631,7 @@
                           :scheduled-equation-algorithm (:algorithm equation)
                           :scheduled-equation-body
                           (when equation (equation-graph/body-for-equation parallel-program equation)))
+                emitted0 (project-graph-bindings emitted0 buffer-projections)
                 emitted (-> emitted0
                             (kgraph/map-operations
                              (fn [node]
