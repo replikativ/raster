@@ -45,6 +45,31 @@
     (is (= (:body-results before) (:body-results after)))
     (is (= result (dialect/validate! result)))))
 
+(deftest resident-reduction-rewrites-an-effect-map-without-touching-host-scalar-equations
+  (let [program (fused
+                 '(let* [^long width (alength x)
+                         total (raster.par/reduce acc 0.0 i width (+ acc (aget x i)))
+                         result (raster.par/map-void! j width
+                                  (if (> total 0.0)
+                                    (let* [^double scaled (* total 2.0)]
+                                      (aset x j (* (aget x j) scaled)))
+                                    nil))]
+                    result))
+        scalar-before (first (filter #(= :scalar (:kind %))
+                                     (map fusion/equation-info
+                                          (dialect/equations program))))
+        [result stats] (resident/realize program)
+        infos (mapv fusion/equation-info (dialect/equations result))
+        scalar-after (first (filter #(= :scalar (:kind %)) infos))
+        effect (first (filter #(= :effect-map (:kind %)) infos))]
+    (is (= 1 (:resident-reductions stats)))
+    (is (= scalar-before scalar-after))
+    (is (= '[x] (:destinations effect)))
+    (is (= (inc (count (:captures effect))) (count (:parameters effect))))
+    (is (resident/resident-scalar-value? (get-in (dialect/facts result)
+                                                  [:values 'total])))
+    (is (= result (dialect/validate! result)))))
+
 (deftest resident-reduction-preserves-the-independent-transform-boundary
   (let [program (fused
                  '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))

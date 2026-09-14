@@ -1193,6 +1193,66 @@
                first :conflict)))
     (is (= program (dialect/validate! program)))))
 
+(deftest removable-top-level-conditional-loop-normalizes-to-a-guarded-effect-map
+  (let [source
+        '(let* [effect
+                (if (clojure.core/> norm max-norm)
+                  (let* [^double scale (clojure.core// max-norm norm)]
+                    (dotimes [i n]
+                      (clojure.core/aset
+                       grads i
+                       (clojure.core/* (clojure.core/aget grads i) scale))))
+                  nil)]
+               grads)
+        program (:program
+                 (route/attempt
+                  source :double {'grads :double}
+                  {:scalar-types {'n :long 'norm :double 'max-norm :double}}))
+        algorithm (-> program :equations first :algorithm)
+        equation (first (dialect/equations algorithm))
+        guarded (-> equation dialect/operation-parts :lambda
+                    dialect/lambda-parts :body-results first)
+        parts (dialect/effect-parts guarded)]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= 'effect-when (first guarded)))
+    (is (= '(clojure.core/> %capture1 %capture0) (:predicate parts)))
+    (is (= [:double] (mapv :dtype (:locals (:region parts)))))
+    (is (= :unique (-> parts :region :body-results first dialect/effect-parts :conflict)))
+    (is (= algorithm (dialect/validate! algorithm)))))
+
+(deftest a-nested-scalar-reduction-is-lifted-and-fused-before-a-guarded-effect
+  (let [reduction (with-meta
+                    '(raster.par/reduce acc (float 0.0) i n
+                       (+ acc (* (clojure.core/aget grads i)
+                                 (clojure.core/aget grads i))))
+                    {:tag 'float :raster.type/tag 'float :raster.type/elem-type :float})
+        norm-expression
+        (with-meta (list '.invk 'raster.numeric/sqrt_m_float-impl reduction)
+          {:tag 'float :raster.type/tag 'float :raster.op/original 'raster.numeric/sqrt})
+        norm (with-meta 'norm {:tag 'float :raster.type/tag 'float})
+        source
+        (list 'let*
+              [norm norm-expression
+               'effect
+               '(if (> norm max-norm)
+                  (let* [^double scale (/ max-norm (double norm))]
+                    (dotimes [i n]
+                      (clojure.core/aset grads i
+                                        (* (clojure.core/aget grads i) scale))))
+                  nil)]
+              'grads)
+        program (:program
+                 (route/attempt source :float {'grads :float}
+                                {:scalar-types {'n :long 'max-norm :double}}))
+        algorithms (mapv :algorithm (:equations program))
+        equations (mapv (comp first dialect/equations) algorithms)
+        reduction-operation (dialect/operation-parts (first equations))]
+    (is (= '[reduce effect-map] (mapv (comp :kind dialect/operation-parts) equations)))
+    (is (= '[norm] (nth (first equations) 2)))
+    (is (dialect/result-transform? (get-in reduction-operation
+                                           [:attributes :result-transform])))
+    (is (every? true? (map = algorithms (map dialect/validate! algorithms))))))
+
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
     (let [source (list 'let*
