@@ -189,6 +189,14 @@
       (is (some #(str/includes? (:source %) "if (") (:kernels compilation))
           "the mixed Float/Double value conditional is emitted from shared KernelBody control"))))
 
+(deftest public-loss-gradients-use-portable-predicate-and-signum-ssa
+  (doseq [target [cuda-target hip-target]
+          operation [#'loss/huber-loss-backward #'loss/l1-loss-backward]]
+    (let [compilation (equation-first/compile operation {:target target :dtype :float})]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (get-in compilation [:kernels 0 :attributes :kernel-body])))))
+
 (deftest public-dense-input-gradient-retains-shape-only-array-input
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

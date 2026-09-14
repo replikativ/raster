@@ -198,6 +198,19 @@
     (is (every? #(= :double (get-in % [:result :type])) (:operations result))
         "Absent retained metadata still uses the owner's contextual dtype")))
 
+(deftest numeric-predicates-and-signum-expand-to-portable-typed-ssa
+  (let [lower (:lower (lowerer))
+        positive (lower '(clojure.core/pos? x) :predicate {'x :double})
+        sign (lower '(Math/signum x) :double {'x :double})
+        default-arm (lower '(if :else x missing) :double {'x :double})]
+    (is (= :gt (get-in positive [:operations 0 :expression :op])))
+    (is (= :predicate (:type positive)))
+    (is (= [:gt :lt :select :select]
+           (mapv #(get-in % [:expression :op]) (:operations sign))))
+    (is (= 'x (:result default-arm)))
+    (is (empty? (:operations default-arm))
+        "Clojure cond's literal :else is resolved before boolean KernelBody control")))
+
 (deftest floating-precision-change-does-not-retarget-integral-loop-carries
   ;; Reduced from the public Q4 projection fixture. The intrinsic owns Int32 arithmetic; the
   ;; wider loop carry is a distinct exact result conversion, never evidence to retarget dp4a.

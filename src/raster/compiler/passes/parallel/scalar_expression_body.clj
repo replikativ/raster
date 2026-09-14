@@ -138,6 +138,13 @@
                 (some-> expression dialect/scalar-convert-parts
                         :attributes :target-dtype canon-type)
 
+                (and (seq? expression) (= 2 (count expression))
+                     (contains? '#{pos? neg? zero? clojure.core/pos? clojure.core/neg?
+                                   clojure.core/zero? raster.numeric/pos? raster.numeric/neg?
+                                   raster.numeric/zero?}
+                                (descriptor/semantic-op expression)))
+                :predicate
+
                 ;; The canonical ordered-loop matcher supplies the only source loop shape this
                 ;; lowerer accepts. Prove its carry from the initializer, then type the update in
                 ;; the lexical accumulator/index scope and require an invariant dtype before the
@@ -211,11 +218,19 @@
                 ;; A value conditional owns a result type when both alternatives independently
                 ;; prove the same type. The enclosing cast target contributes no evidence.
                 (and (seq? expression) (= 'if (first expression)) (= 4 (count expression)))
-                (let [then-type (authoritative-source-type (nth expression 2) env)
-                      else-type (authoritative-source-type (nth expression 3) env)]
-                  (when (and then-type else-type
-                             (= (canon-type then-type) (canon-type else-type)))
-                    (canon-type then-type)))
+                (let [condition (second expression)
+                      constant-condition?
+                      (or (nil? condition) (boolean? condition) (keyword? condition)
+                          (number? condition) (string? condition) (char? condition))]
+                  (if constant-condition?
+                    (authoritative-source-type
+                     (if (or (nil? condition) (false? condition))
+                       (nth expression 3) (nth expression 2)) env)
+                    (let [then-type (authoritative-source-type (nth expression 2) env)
+                          else-type (authoritative-source-type (nth expression 3) env)]
+                      (when (and then-type else-type
+                                 (= (canon-type then-type) (canon-type else-type)))
+                        (canon-type then-type)))))
 
                 (and (seq? expression)
                      (= :cmp (:kind (intrinsics/descriptor
@@ -516,28 +531,59 @@
 
                   (and (seq? expression) (= 'if (first expression)) (= 4 (count expression)))
                   (let [[_ condition then-expression else-expression] expression
-                        condition (lower condition :predicate env)
-                        then-value (lower then-expression expected env)
-                        else-value (lower else-expression expected env)
-                        result-type (:type then-value)
-                        _ (when-not (= result-type (:type else-value) expected)
-                            (decline! :branch-dtype
-                                      "scalar branches must have one explicit result dtype"
-                                      {:expression expression :then (:type then-value)
-                                       :else (:type else-value) :expected expected}))
-                        result (fresh "if")
-                        range (scalar-range/hull [(:range then-value) (:range else-value)])]
-                    (remember-range! result range)
-                    {:operations
-                     (conj (vec (:operations condition))
-                           (body/->IfRegion
-                            (:result condition)
-                            (conj (vec (:operations then-value))
-                                  (body/->Yield [(:result then-value)]))
-                            (conj (vec (:operations else-value))
-                                  (body/->Yield [(:result else-value)]))
-                            [(body/value result result-type)]))
-                     :result result :type result-type :range range})
+                        constant-condition?
+                        (or (nil? condition) (boolean? condition) (keyword? condition)
+                            (number? condition) (string? condition) (char? condition))]
+                    (if constant-condition?
+                      ;; Clojure `cond` expands its default arm to `(if :else ...)`. Resolve
+                      ;; literal truthiness before entering KernelBody, whose predicates are
+                      ;; deliberately boolean and must never inherit C-family zero semantics.
+                      (lower (if (or (nil? condition) (false? condition))
+                               else-expression then-expression)
+                             expected env)
+                      (let [condition (lower condition :predicate env)
+                            then-value (lower then-expression expected env)
+                            else-value (lower else-expression expected env)
+                            result-type (:type then-value)
+                            _ (when-not (= result-type (:type else-value) expected)
+                                (decline! :branch-dtype
+                                          "scalar branches must have one explicit result dtype"
+                                          {:expression expression :then (:type then-value)
+                                           :else (:type else-value) :expected expected}))
+                            result (fresh "if")
+                            range (scalar-range/hull [(:range then-value) (:range else-value)])]
+                        (remember-range! result range)
+                        {:operations
+                         (conj (vec (:operations condition))
+                               (body/->IfRegion
+                                (:result condition)
+                                (conj (vec (:operations then-value))
+                                      (body/->Yield [(:result then-value)]))
+                                (conj (vec (:operations else-value))
+                                      (body/->Yield [(:result else-value)]))
+                                [(body/value result result-type)]))
+                         :result result :type result-type :range range})))
+
+                  (and (seq? expression) (= 2 (count expression))
+                       (contains? '#{pos? neg? zero? clojure.core/pos? clojure.core/neg?
+                                     clojure.core/zero? raster.numeric/pos? raster.numeric/neg?
+                                     raster.numeric/zero?}
+                                  (descriptor/semantic-op expression)))
+                  (let [source-operation (descriptor/semantic-op expression)
+                        operator (case (name source-operation)
+                                   "pos?" :gt "neg?" :lt "zero?" :eq)
+                        operand-expression (second expression)
+                        operand-type (canon-type
+                                      (or (authoritative-source-type operand-expression env)
+                                          (decline! :scalar-source-type
+                                                    "numeric predicate requires a retained operand dtype"
+                                                    {:expression expression
+                                                     :operand operand-expression})))
+                        operand (lower operand-expression operand-type env)
+                        compared (compute-ssa operator :predicate
+                                              [(:result operand)
+                                               (body/literal 0 operand-type)] {} nil)]
+                    (update compared :operations #(into (vec (:operations operand)) %)))
 
                   (dialect/scalar-fold-form? expression)
                   (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts expression)
@@ -731,6 +777,38 @@
                                          (vec (mapcat :operations
                                                       [input base fraction up next rounded converted])))
                                   expected expression))
+
+                  (and (seq? expression)
+                       (= :source-signum
+                          (:typed-expansion
+                           (intrinsics/descriptor
+                            (intrinsics/canonical (descriptor/semantic-op expression))))))
+                  (let [arguments (vec (descriptor/call-args expression))
+                        _ (when-not (= 1 (count arguments))
+                            (decline! :scalar-expression "signum requires one argument"
+                                      {:expression expression}))
+                        input-type (canon-type
+                                    (or (authoritative-source-type (first arguments) env)
+                                        (decline! :scalar-source-type
+                                                  "signum requires a retained operand dtype"
+                                                  {:expression expression})))
+                        input (lower (first arguments) input-type env)
+                        positive? (compute-ssa :gt :predicate
+                                               [(:result input) (body/literal 0 input-type)] {} nil)
+                        negative? (compute-ssa :lt :predicate
+                                               [(:result input) (body/literal 0 input-type)] {} nil)
+                        negative (compute-ssa :select input-type
+                                              [(:result negative?) (body/literal -1 input-type)
+                                               (:result input)] {} nil)
+                        signed (compute-ssa :select input-type
+                                            [(:result positive?) (body/literal 1 input-type)
+                                             (:result negative)] {} nil)
+                        signed (assoc signed :operations
+                                      (vec (mapcat :operations
+                                                   [input positive? negative? negative signed])))]
+                    (if (= input-type expected)
+                      signed
+                      (cast-lowered signed expected expression)))
 
                   (seq? expression)
                   (let [semantic-operation (descriptor/semantic-op expression)

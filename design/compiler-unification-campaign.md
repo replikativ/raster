@@ -1410,6 +1410,14 @@ value conditionals such as public Huber loss lower to KernelBody `IfRegion` plus
 conversions on OpenCL, CUDA, and HIP, while untyped compound arithmetic and unchecked coordinate
 claims still decline.
 
+The shared scalar language now normalizes Clojure's unary numeric predicates to typed comparison
+SSA and expands `signum` into comparisons and selects. The expansion preserves signed zero and
+returns NaN unchanged instead of relying on target builtins with differing edge semantics.
+Compile-time Clojure truthiness is resolved before KernelBody boolean control, including the
+literal `:else` arm produced by `cond`; runtime integers are still never treated as predicates.
+Public Huber and L1 gradients therefore use the same KernelBody route on OpenCL, CUDA, and HIP
+without source fallback or target-specific intrinsic spelling.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
