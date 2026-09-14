@@ -72,6 +72,10 @@
     ;; Static typed contractions emit ABI-normalized schedule alternatives. Offline fixed-shape
     ;; tuning writes the validated selector here; recompilation consumes it without benchmarking.
     :typed-contraction {:strategy :auto
+                        ;; Compile only the analytic tile in the hot path. `:finite` materializes
+                        ;; the descriptor-derived tile family as compatible dispatch alternatives
+                        ;; for explicit measurement/autotuning.
+                        :matrix-tiles :default
                         :measured-selectors {}}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
@@ -96,6 +100,7 @@
 (def ^:private valid-segmented-reduction-strategies
   #{:auto :reference :subgroup-score-reuse})
 (def ^:private valid-typed-contraction-strategies #{:auto})
+(def ^:private valid-matrix-tile-spaces #{:default :finite})
 
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
@@ -203,6 +208,8 @@
         (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})
         typed-contraction-strategy
         (get-in schedule [:typed-contraction :strategy] :auto)
+        matrix-tiles
+        (get-in schedule [:typed-contraction :matrix-tiles] :default)
         typed-contraction-selectors
         (get-in schedule [:typed-contraction :measured-selectors] {})
         {:keys [target-fill-multiple min-split-chunk max-splits]}
@@ -236,6 +243,10 @@
       (throw (ex-info "schedule: unknown typed contraction strategy"
                       {:strategy typed-contraction-strategy
                        :expected valid-typed-contraction-strategies})))
+    (when-not (valid-matrix-tile-spaces matrix-tiles)
+      (throw (ex-info "schedule: unknown typed contraction matrix tile space"
+                      {:matrix-tiles matrix-tiles
+                       :expected valid-matrix-tile-spaces})))
     (when-not (and (map? typed-contraction-selectors)
                    (every? #(and (string? %) (not-empty %))
                            (keys typed-contraction-selectors))

@@ -1542,8 +1542,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    compose at the tile-load boundary: the generated Intel matrix candidate for an ordinary linear
    projection has one kernel and no cast/transpose temporary, while the semantic contraction and
    public ABI remain unchanged. The portable candidate remains its independent correctness oracle.
-   This is not yet evidence of competitive throughput.
-   matched performance against vendor BLAS/Triton and fusion of surrounding projection/softmax
+   This is not yet evidence of competitive throughput. The ordinary compile path retains one
+   analytic tile; an explicit `:typed-contraction {:matrix-tiles :finite}` schedule materializes
+   the descriptor-derived finite tile family as ABI-compatible, refinement-checked alternatives
+   with stable identities for the existing measured-selector machinery. Thus selective tuning
+   does not multiply normal compilation cost or create a GEMM-specific runtime registry. Matched
+   performance against vendor BLAS/Triton and fusion of surrounding projection/softmax
    stages remain explicit measurement and scheduling gates.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.

@@ -15,6 +15,7 @@
    :out-elems :wg/:grid (uniform 1-3D geometry) :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.util :as util]
@@ -1233,7 +1234,16 @@
                                    (cond-> (vec (:dimensions matrix-view))
                                      (:batched? matrix-view) (conj (:batch matrix-view)))))
         target-schedule (when (and (= :mixed-f16-f32 precision) (:ok matrix-view))
-                          (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))]
+                          (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))
+        finite-matrix-tiles?
+        (= :finite (get options :matrix-tiles :default))
+        tile-schedules
+        (when target-schedule
+          (let [tiles (if finite-matrix-tiles?
+                        (distinct (cons (:tile target-schedule)
+                                        (hardware/gemm-tile-candidates (:desc options))))
+                        [(:tile target-schedule)])]
+            (mapv #(gpu-gemm/mixed-dpas-schedule (:desc options) %) tiles)))]
     (cond
       (not matrix-enabled?)
       {:alternatives [] :decline {:reason :schedule-family-disabled :family :matrix}}
@@ -1307,6 +1317,22 @@
             raw-alternatives (if (:batched? matrix-view)
                                [(:graph emitted)]
                                (:alternatives emitted))
+            additional-tile-schedules
+            (if (and finite-matrix-tiles?
+                     (not (:batched? matrix-view))
+                     (contains? #{:nn :nt} (:variant matrix-view)))
+              (rest tile-schedules)
+              [])
+            additional-tile-alternatives
+            (mapv
+             (fn [schedule]
+               (gpu-gemm/emit-matrix-input-fusion-alternative
+                (assoc emit-spec
+                       :tile (:tile schedule)
+                       :fill-workgroups (:fill-workgroups schedule)
+                       :strategy (gpu-gemm/tile-input-strategy (:tile schedule)))))
+             additional-tile-schedules)
+            raw-alternatives (into raw-alternatives additional-tile-alternatives)
             alternatives (mapv (fn [graph]
                                  (let [graph (kgraph/validate! graph)]
                                    (when-not (= [abi arguments semantic-effects]
@@ -1327,19 +1353,29 @@
         {:alternatives alternatives
          :source-graph source-graph
          :selector selector
-         :schedule {:family :matrix
-                    :precision :mixed-f16-f32
-                    :variant (:variant matrix-view)
-                    :batched? (:batched? matrix-view)
-                    :batch (:batch matrix-view)
-                    :batching (:batching matrix-view)
-                    :result-transform? (boolean (seq (:epilogue matrix-view)))
-                    :split-factor-schedules (:split-factor-schedules emitted)
-                    :split-k-decline (:result-transform-split-decline emitted)
-                    :bindings (:bindings matrix-view)
-                    :dimensions (:dimensions matrix-view)
-                    :tile (:tile target-schedule)
-                    :matrix (:matrix target-schedule)}}))))
+         :schedule
+         (cond-> {:family :matrix
+                  :precision :mixed-f16-f32
+                  :variant (:variant matrix-view)
+                  :batched? (:batched? matrix-view)
+                  :batch (:batch matrix-view)
+                  :batching (:batching matrix-view)
+                  :result-transform? (boolean (seq (:epilogue matrix-view)))
+                  :split-factor-schedules (:split-factor-schedules emitted)
+                  :split-k-decline (:result-transform-split-decline emitted)
+                  :bindings (:bindings matrix-view)
+                  :dimensions (:dimensions matrix-view)
+                  :tile (:tile target-schedule)
+                  :matrix (:matrix target-schedule)}
+           finite-matrix-tiles?
+           (assoc :matrix-tiles :finite
+                  :tile-schedules
+                  (when (and (not (:batched? matrix-view))
+                             (contains? #{:nn :nt} (:variant matrix-view)))
+                    (into {:xmx-direct-tile-inputs target-schedule}
+                          (map (fn [schedule]
+                                 [(gpu-gemm/tile-input-strategy (:tile schedule)) schedule]))
+                          additional-tile-schedules))))}))))
 
 (defn- replace-selector-strategy
   [selector old-strategy new-strategy]
@@ -1374,6 +1410,8 @@
         candidates (mapv #(bindable-private-scalars! % operation-id public-scalars) candidates)
         fallback-strategy (:strategy (first candidates))
         mixed (mixed-dpas-alternatives program operation options abi arguments)
+        matrix-schedule (:schedule mixed)
+        base-matrix-schedule (some-> matrix-schedule (dissoc :tile-schedules))
         matrix-default (some-> mixed :alternatives first kdispatch/alternative-strategy)
         default-strategy (or matrix-default fallback-strategy)
         schedule-identity (select-keys mixed [:schedule :decline])
@@ -1399,21 +1437,32 @@
                    (cond-> (into {} (map (juxt :strategy :candidate-schedule)) candidates)
                      (:schedule mixed)
                      (merge
-                      (if (:batched? (:schedule mixed))
-                        {:xmx-batched (:schedule mixed)}
+                      (if (:batched? matrix-schedule)
+                        {:xmx-batched base-matrix-schedule}
                         (merge
-                         (cond-> {:xmx-direct (:schedule mixed)
-                                  :xmx-split-k (assoc (:schedule mixed) :split-k? true)}
+                         (cond-> {:xmx-direct base-matrix-schedule
+                                  :xmx-split-k (assoc base-matrix-schedule :split-k? true)}
                            (some #(= :xmx-direct-tile-inputs (kdispatch/alternative-strategy %))
                                  (:alternatives mixed))
                            (assoc :xmx-direct-tile-inputs
-                                  (assoc (:schedule mixed) :input-fusion? true)))
+                                  (assoc base-matrix-schedule :input-fusion? true)))
+                         (into {}
+                               (map (fn [[strategy target-schedule]]
+                                      [strategy
+                                       (-> base-matrix-schedule
+                                           (assoc :tile (:tile target-schedule)
+                                                  :matrix (:matrix target-schedule)
+                                                  :fill-workgroups
+                                                  (:fill-workgroups target-schedule)
+                                                  :input-fusion? true)
+                                           (dissoc :tile-schedules))]))
+                               (:tile-schedules matrix-schedule))
                          (into {}
                                (map (fn [[strategy factor]]
-                                      [strategy (assoc (:schedule mixed)
+                                      [strategy (assoc base-matrix-schedule
                                                        :split-k? true
                                                        :split-factor factor)]))
-                               (:split-factor-schedules (:schedule mixed)))))))
+                               (:split-factor-schedules matrix-schedule))))))
                    :declines (:declines routed)
                    :matrix-graph-decline (:decline mixed)
                    :tuning (typed-contraction-tuning-contract schedule dispatch-id abi

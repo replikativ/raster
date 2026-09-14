@@ -1528,6 +1528,51 @@
         (is (= :mixed-dpas-target-capability
                (get-in portable [:attributes :matrix-graph-decline :reason])))))))
 
+(deftest finite-matrix-tile-space-is-an-opt-in-compatible-dispatch-family
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                                          (* (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ze:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :int 'n :int 'k :int}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        tiles (hardware/gemm-tile-candidates descriptor)
+        dispatch (contract-route/route-typed-contraction-dispatch
+                  algorithm operation :dtype :float :desc descriptor
+                  :precision :mixed-f16-f32 :matrix-tiles :finite)
+        strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
+        tile-strategies (into #{:xmx-direct-tile-inputs}
+                              (map gpu-gemm/tile-input-strategy (rest tiles)))]
+    (is (> (count tiles) 1))
+    (is (= (count strategies) (count (set strategies))))
+    (is (= (+ 3 (count tiles)) (count strategies))
+        "portable, materialized direct/split, and one fused-input alternative per tile")
+    (is (= tile-strategies (set (filter tile-strategies strategies))))
+    (is (apply = (map :abi (:alternatives dispatch))))
+    (is (apply = (map :arguments (:alternatives dispatch))))
+    (is (apply = (map :effects (:alternatives dispatch))))
+    (is (= :xmx-direct
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative dispatch [:a :b :c 256 256 512])))
+        "enabling a search space does not silently change analytic selection")
+    (doseq [strategy tile-strategies]
+      (is (= strategy
+             (kdispatch/alternative-strategy
+              (kdispatch/select-alternative
+               (kdispatch/with-selector dispatch {:kind :fixed-strategy :strategy strategy})
+               [:a :b :c 256 256 512])))))))
+
 (deftest batched-f32-contraction-derives-one-grid-z-matrix-schedule
   (let [source
         '(let* [step (raster.par/contract

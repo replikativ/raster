@@ -797,7 +797,8 @@
                       (croute/route-typed-contraction-dispatch
                        typed-algorithm bound-sr
                        :dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
-                       :precision (:precision schedule))
+                       :precision (:precision schedule)
+                       :matrix-tiles (get-in schedule [:typed-contraction :matrix-tiles] :default))
                       (catch clojure.lang.ExceptionInfo exception
                         (let [reason (:reason (ex-data exception))]
                           (if (contains? #{:typed-contraction-dispatch-invoke-protocol}
