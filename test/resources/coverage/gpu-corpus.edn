@@ -343,10 +343,9 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/multi-head-attention,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :unsupported-scalar-binding, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.attention/rope,
    :route :typed-soac,
    :typed-validated true,

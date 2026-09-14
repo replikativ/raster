@@ -206,9 +206,17 @@
                     "matrix body dimension roles and parameter identities disagree"
                     {:dimension-parameters dimension-parameters
                      :parameters (:dimension parameters-by-role)})
-        _ (require! (= {m-parameter m-extent n-parameter n-extent k-parameter k-extent}
-                       dimension-values)
-                    "matrix dimension specializations must agree with its storage shapes"
+        ;; Dynamic bodies use their distinct M/N/K SSA parameters in storage shapes. Static
+        ;; bodies may substitute the corresponding compile-time value.  Requiring only the
+        ;; specialized value made equal semantic dimensions (for example M=N=seq-len) impossible
+        ;; to represent without leaking an outer alias into a body-local view.
+        _ (require! (every? (fn [[parameter extent]]
+                              (or (= parameter extent)
+                                  (= (get dimension-values parameter) extent)))
+                            [[m-parameter m-extent]
+                             [n-parameter n-extent]
+                             [k-parameter k-extent]])
+                    "matrix storage dimensions must use their body parameter or exact specialization"
                     {:dimension-parameters dimension-parameters
                      :dimension-values dimension-values
                      :storage-dimensions [m-extent n-extent k-extent]})

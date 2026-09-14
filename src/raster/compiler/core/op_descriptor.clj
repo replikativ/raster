@@ -1149,13 +1149,15 @@
 
 ;; --- BLAS GEMM projection into the typed contraction frontend ---
 
-(def blas-gemm-ops
-  "BLAS GEMM source spellings projected by the TypedSOAC frontend, → dense layout variant.
-   This is a frontend translation table, not a kernel or runtime dispatch registry: after
-   projection, verified contraction facts and AxisMaps are the sole scheduling authority."
-  {'raster.linalg.blas/dgemm!    :nn
-   'raster.linalg.blas/dgemm-nt! :nt
-   'raster.linalg.blas/dgemm-tn! :tn})
+(def blas-gemm-projections
+  "BLAS source spellings projected into the typed contraction algebra.  Layout states
+   operand indexing; `:batched?` adds a free logical axis rather than a new operation kind.
+   After projection, verified contraction facts and AxisMaps are the scheduling authority."
+  {'raster.linalg.blas/dgemm! {:layout :nn}
+   'raster.linalg.blas/dgemm-nt! {:layout :nt}
+   'raster.linalg.blas/dgemm-tn! {:layout :tn}
+   'raster.linalg.blas/batched-gemm-nn! {:layout :nn :batched? true}
+   'raster.linalg.blas/batched-gemm-nt! {:layout :nt :batched? true}})
 
 (defn gemm-scalar-literal
   "The compile-time numeric VALUE of a GEMM alpha/beta operand, or nil if it is not a

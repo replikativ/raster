@@ -2268,7 +2268,7 @@
       expression)))
 
 (defn- canonicalize-blas-gemm
-  "Express a devirtualized BLAS GEMM call as the explicit contraction it computes.
+  "Express a devirtualized BLAS GEMM or batched GEMM call as its explicit contraction.
 
    `(dgemm! A B C m k n alpha beta)` is `C[m,n] = alpha·A·B + beta·C` over row-major operands;
    the `-tn!`/`-nt!` variants store `A` as `[k,m]` / `B` as `[n,k]`. With `beta = 0` the call
@@ -2279,13 +2279,22 @@
    reads the destination element it overwrites: `C[i,j] := acc + beta·C[i,j]`. The destination
    is then read-write storage of one kernel, which the KernelBody builders express as a single
    `:inout` parameter. A `beta` that is neither a literal nor a scalar value id, or a call whose
-   element type is unknown, stays a host call."
+   element type is unknown, stays a host call.  A batched call adds one free logical axis; it
+   does not introduce a different numerical operation or kernel kind."
   [ordinal expression]
-  (let [variant (when (and (seq? expression) (= '.invk (first expression)))
-                  (get descriptor/blas-gemm-ops (:raster.op/original (meta expression))))
+  (let [source-operation (when (and (seq? expression) (= '.invk (first expression)))
+                           (:raster.op/original (meta expression)))
+        {:keys [layout batched?] :as projection}
+        (get descriptor/blas-gemm-projections source-operation)
+        variant layout
         arguments (when variant (vec (drop 2 expression)))
-        [A B C m k n alpha beta] arguments
-        beta-literal (when variant (descriptor/gemm-scalar-literal beta))
+        [A B C dimension-0 dimension-1 dimension-2 dimension-3 dimension-4] arguments
+        [batch m k n alpha beta]
+        (if batched?
+          [dimension-0 dimension-1 dimension-2 dimension-3 dimension-4 nil]
+          [nil dimension-0 dimension-1 dimension-2 dimension-3 dimension-4])
+        beta-literal (when (and projection (not batched?))
+                       (descriptor/gemm-scalar-literal beta))
         alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))
         ;; `alpha`/`beta` arrive as `(oftype witness value)` from the source spelling; the scalar
         ;; factor is its value, not the type witness array.
@@ -2300,23 +2309,44 @@
                          (second (descriptor/call-args argument))
                          :else argument))
         beta-value (when variant (scalar-value beta beta-literal))
-        accumulate? (not= 0.0 beta-literal)
+        accumulate? (and (not batched?) (not= 0.0 beta-literal))
         elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
                           dtype/dtype-for-array-tag dtype/canon)]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
              (or (not accumulate?)
                  (and elem-type (or (number? beta-value) (symbol? beta-value)))))
-      (let [i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
+      (let [batch-axis (clojure.core/symbol (str "rstr_gemm_batch_" ordinal))
+            i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
             j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
             l (clojure.core/symbol (str "rstr_gemm_l_" ordinal))
-            [m k n] (map descriptor/unwrap-int-cast [m k n])
-            a-index (case variant
-                      (:nn :nt) (list 'clojure.core/+ (list 'clojure.core/* i k) l)
-                      :tn (list 'clojure.core/+ (list 'clojure.core/* l m) i))
-            b-index (case variant
-                      (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
-                      :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l))
+            [batch m k n] (map descriptor/unwrap-int-cast [batch m k n])
+            a-index (if batched?
+                      (list 'clojure.core/+ (list 'clojure.core/*
+                                                  (list 'clojure.core/+
+                                                        (list 'clojure.core/* batch-axis m) i)
+                                                  k)
+                            l)
+                      (case variant
+                        (:nn :nt) (list 'clojure.core/+ (list 'clojure.core/* i k) l)
+                        :tn (list 'clojure.core/+ (list 'clojure.core/* l m) i)))
+            b-index (if batched?
+                      (case variant
+                        :nn (list 'clojure.core/+
+                                  (list 'clojure.core/*
+                                        (list 'clojure.core/+
+                                              (list 'clojure.core/* batch-axis k) l)
+                                        n)
+                                  j)
+                        :nt (list 'clojure.core/+
+                                  (list 'clojure.core/*
+                                        (list 'clojure.core/+
+                                              (list 'clojure.core/* batch-axis n) j)
+                                        k)
+                                  l))
+                      (case variant
+                        (:nn :tn) (list 'clojure.core/+ (list 'clojure.core/* l n) j)
+                        :nt (list 'clojure.core/+ (list 'clojure.core/* j k) l)))
             ;; The walker stamps every arithmetic form with its result dtype; the emitted loads
             ;; and product carry the same stamp so scalar lowering reads the type instead of
             ;; guessing it.
@@ -2348,7 +2378,10 @@
                  :operands [{:sym C :map (axis-map/of-axes [[i m] [j n]]) :dtype elem-type}]
                  :scalars (if (symbol? beta-value) [{:sym beta-value :dtype elem-type}] [])
                  :dtype elem-type}))]
-        (with-meta (cond-> (list 'raster.par/contract C [[i m] [j n]] [[l k]] body)
+        (with-meta (cond-> (list 'raster.par/contract C
+                                (cond-> [] batched? (conj [batch-axis batch])
+                                  true (conj [i m] [j n]))
+                                [[l k]] body)
                      epilogue (concat [:epilogue epilogue])
                      true (->> (apply list)))
           (cond-> {:raster.op/original (:raster.op/original (meta expression))}

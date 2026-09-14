@@ -167,6 +167,21 @@
     (raster.par/map! out i n float (raster.numeric/* (raster.arrays/aget x i) s))
     out))
 
+(deftm diagnostic-late-shape
+  "A declared long remains authoritative after an earlier numerical equation."
+  [x :- (Array double), n :- Long] :- (Array double)
+  (let [first-out (double-array n)
+        _ (raster.par/map! first-out i n double (raster.arrays/aget x i))
+        ^long square (* (long n) (long n))
+        out (double-array square)]
+    (raster.par/map! out i square double 1.0)
+    out))
+
+(deftest target-free-diagnostics-retain-declared-parameter-types
+  (let [stages (pipeline/show-pipeline #'diagnostic-late-shape :dtype :double)]
+    (is (= :typed-soac (get-in stages [:soac-fused-stats :route]))
+        "show-pipeline and production compilation must feed the same source ABI facts to TypedSOAC")))
+
 (deftest float-pipeline-uses-float-vector-test
   (testing "Float relu pipeline uses FloatVector, not DoubleVector"
     (let [stages (pipeline/show-pipeline #'f32-relu)

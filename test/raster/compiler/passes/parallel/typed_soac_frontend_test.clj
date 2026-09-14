@@ -1663,6 +1663,46 @@
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
 
+(deftest batched-blas-gemm-is-the-same-contraction-with-one-more-free-axis
+  (doseq [[operation variant]
+          [['raster.linalg.blas/batched-gemm-nn! :nn]
+           ['raster.linalg.blas/batched-gemm-nt! :nt]]]
+    (let [call (with-meta
+                 (list '.invk (symbol "generated" (str (name operation) "-impl"))
+                       'A 'B 'C 'batch 'm 'k 'n 'scale)
+                 {:raster.op/original operation
+                  :raster.type/tag 'floats :tag 'floats})
+          source (list 'let* ['result call] 'result)
+          options {:dtype :float :array-types {'A :float 'B :float 'C :float}
+                   :scalar-types {'batch :long 'm :long 'k :long 'n :long
+                                  'scale :float}}
+          program (frontend/form->program (frontend/normalize-source source options) options)
+          equation (first (dialect/equations program))
+          {:keys [attributes lambda]} (dialect/operation-parts equation)
+          body (first (:body-results (dialect/lambda-parts lambda)))
+          b-index (some (fn [expression]
+                          (when (and (seq? expression)
+                                     (descriptor/aget-op?
+                                      (descriptor/semantic-op expression))
+                                     (= '%capture1
+                                        (first (descriptor/call-args expression))))
+                            (second (descriptor/call-args expression))))
+                        (tree-seq coll? seq body))]
+      (is (= 'segmented-reduce (dialect/operation-kind equation)))
+      (is (= '[[rstr_gemm_batch_0 batch] [rstr_gemm_i_0 m] [rstr_gemm_j_0 n]]
+             (:segment-axes attributes)))
+      (is (= 'k (:extent attributes)))
+      (is (some #{'scale} (dialect/operation-inputs equation)))
+      (is (every? (set (flatten b-index))
+                  '[rstr_gemm_batch_0 rstr_gemm_j_0 rstr_gemm_l_0])
+          "B's ordinary row-major index retains the batch, column, and reduction axes")
+      (is (= (case variant :nn 'rstr_gemm_j_0 :nt 'rstr_gemm_l_0)
+             (last b-index))
+          "the final coordinate distinguishes B[batch,k,n] from B[batch,n,k]")
+      (is (= [{:destination 'C :access :write :host-return :buffer}]
+             (get-in (dialect/facts program)
+                     [:equations (second equation) :attributes :result-storage]))))))
+
 (defn- accumulating-gemm-call
   [beta]
   (with-meta

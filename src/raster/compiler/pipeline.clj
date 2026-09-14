@@ -2354,19 +2354,21 @@
                           (try (the-ns s) (catch Exception _ nil)))
                         (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
         param-env (build-param-env f-var dtype)
-        gpu-param-types (when target-device
-                          (opencl-pass/derive-param-types
-                           (:raster.core/deftm-params (meta resolved-var))
-                           (:raster.core/deftm-tags (meta resolved-var))
-                           effective-dtype))
+        ;; Declared parameter types are middle-end facts, not GPU-emitter hints.  Production
+        ;; compilation supplies them for every backend; diagnostics must do the same or a
+        ;; target-free `show-pipeline` can misclassify proven identity casts as throwing.
+        parameter-types (opencl-pass/derive-param-types
+                         (:raster.core/deftm-params (meta resolved-var))
+                         (:raster.core/deftm-tags (meta resolved-var))
+                         effective-dtype)
         opts (cond-> {:inline? inline?
                       :active-params active-params
                       :simd? simd? :target-device target-device
                       :dtype effective-dtype}
                param-env (assoc :param-env param-env)
                source-ns (assoc :source-ns source-ns)
-               gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
-                                      :array-types (:array-types gpu-param-types)))
+               parameter-types (assoc :scalar-types (:scalar-types parameter-types)
+                                      :array-types (:array-types parameter-types)))
         diagnostic (run-passes-diagnostic raw-form passes opts)]
     (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))
 

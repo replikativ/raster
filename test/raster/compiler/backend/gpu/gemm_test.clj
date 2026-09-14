@@ -1,5 +1,6 @@
 (ns raster.compiler.backend.gpu.gemm-test
-  (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
+  (:require [clojure.set :as set]
+            [raster.compiler.reference.gemm-opencl :as gemm-oracle]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
@@ -416,6 +417,27 @@
         (is (= (:arguments certificate) (:arguments artifact)))
         (is (= (:effects certificate) (:effects artifact)))
         (is (= (scheduled-body/realized-launch certificate) (:launch artifact)))))))
+
+(deftest square-batched-matrix-views-use-distinct-body-dimension-identities
+  (let [emitted
+        (gemm/emit-scheduled-batched-matrix-kernel
+         {:id :square-batched-scope
+          :kernel-name "square_batched_scope"
+          :a 'a :b 'b :c 'c :batch 'batch :m 'side :n 'side :k 'depth
+          :tile (hardware/derive-gemm-tile {})
+          :batching {:row true :col true}})
+        body (:kernel-body emitted)]
+    (is (= ['M 'N 'K]
+           (mapv #(get-in body [:attributes :dimension-parameters %]) [:m :n :k])))
+    (is (= #{'batch 'M 'N 'K}
+           (set (map :id (filter #(= :scalar (:kind %)) (:parameters body))))))
+    (is (= #{'batch-lhs-view 'batch-rhs-view 'batch-result-view}
+           (set (map :id (:views body)))))
+    (is (every? #(empty? (set/intersection
+                          #{'side 'depth}
+                          (set (tree-seq coll? seq (:element-offset %)))))
+                (:views body))
+        "views refer only to the body-local M/N/K parameters when semantic dimensions alias")))
 
 (deftest every-layout-schedule-realizes-to-kernel-calls
   (let [runtime-arguments (arguments 13 640 262144)]
