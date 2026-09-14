@@ -144,6 +144,36 @@
     (is (= 1 (count (filter #(= 'scatter (dialect/operation-kind %))
                             (dialect/equations program)))))))
 
+(deftest rectangular-axis-permutations-keep-derived-dimensions-opaque
+  (let [source '(let* [^long l-out
+                       (clojure.core/+ 1 (clojure.core/quot
+                                          (clojure.core/- length kernel) stride))
+                       ^long col-cols (clojure.core/* batch l-out)
+                       effect
+                       (dotimes [b batch]
+                         (dotimes [c channels]
+                           (dotimes [k kernel]
+                             (dotimes [p l-out]
+                               (clojure.core/aset
+                                cols
+                                (clojure.core/+
+                                 (clojure.core/*
+                                  (clojure.core/+ (clojure.core/* c kernel) k)
+                                  col-cols)
+                                 (clojure.core/+ (clojure.core/* b l-out) p))
+                                (float p))))))]
+                      effect)
+        options {:dtype :float :array-types {'cols :float}
+                 :scalar-types {'batch :long 'channels :long 'length :long
+                                'kernel :long 'stride :long}}
+        normalized (frontend/normalize-source source options)
+        program (frontend/form->program normalized options)
+        equation (last (dialect/equations program))]
+    (is (some? program))
+    (is (= 'scatter (dialect/operation-kind equation))
+        "a bijective axis permutation is a unique scatter, not an ordered effect loop")
+    (is (= :unique (get-in (dialect/operation-parts equation) [:attributes :conflict])))))
+
 (deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
   (let [options {:dtype :double :array-types {'out :double}
                  :scalar-types {'n :long}}
