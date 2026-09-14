@@ -487,6 +487,31 @@
     (body/full-participation) :implementation-defined)
    (compute 'logit :float (expr :* :float 'dot (lit (:scale problem) :float)))])
 
+(defn- reference-dot-operations
+  "Compute one score independently in the work-item that owns an output component.
+
+   This is the portable correctness schedule.  Cooperative schedules replace only this physical
+   mapping with a lane-strided dot and subgroup reduction; membership and online-state semantics
+   remain shared below."
+  [{:keys [query k-pages qk-head-dim q-dtype k-dtype k-layout] :as problem}]
+  [(body/->ForLoop
+    (body/value 'qk-component :int) 0 qk-head-dim 1
+    [(body/->LoopArg (body/value 'partial-dot-state :float) (lit 0.0 :float))]
+    [(load-value 'query-element q-dtype (:values query)
+                 ['query-token 'query-head 'qk-component])
+     (load-value 'key-element k-dtype k-pages
+                 (cache-coordinates k-layout 'kv-head 'safe-physical-page
+                                    'page-token 'qk-component))
+     (compute 'query-float :float (half-or-float->float 'query-element q-dtype))
+     (compute 'key-float :float (half-or-float->float 'key-element k-dtype))
+     (compute 'qk-product :float (expr :* :float 'query-float 'key-float))
+     (compute 'partial-dot-next :float
+              (expr :+ :float 'partial-dot-state 'qk-product))
+     (body/->Yield ['partial-dot-next])]
+    [(body/value 'dot :float)]
+    {})
+   (compute 'logit :float (expr :* :float 'dot (lit (:scale problem) :float)))])
+
 (defn- value-load-operations
   [{:keys [v-pages v-dtype v-layout]} slots]
   (mapcat
@@ -544,8 +569,8 @@
   [operations]
   (vec (mapcat #(if (and (vector? %) (not (record? %))) % [%]) operations)))
 
-(defn- membership-loop
-  [problem schedule slots lower upper]
+(defn- membership-loop*
+  [problem slots lower upper dot-ops]
   (let [csr? (attention/csr-visibility? (:visibility problem))
         member (if csr? 'membership-edge 'membership-token)
         member-type (if csr? :int :long)
@@ -567,7 +592,6 @@
         page-ops (physical-page-operations problem)
         filter-expr (position-visible-expression
                      (attention/position-filter (:visibility problem)))
-        dot-ops (dot-operations problem (:workgroup-size schedule))
         value-ops (value-load-operations problem slots)
         update-region (flatten-operations (online-update-region slots))
         unchanged (vec (concat ['member-valid-next 'maximum-state 'denominator-state]
@@ -612,6 +636,15 @@
      (body/value member member-type) lower upper 1
      (mapv body/->LoopArg state-bindings state-initials)
      body-ops state-results {})))
+
+(defn- membership-loop
+  [problem schedule slots lower upper]
+  (membership-loop* problem slots lower upper
+                    (dot-operations problem (:workgroup-size schedule))))
+
+(defn- reference-membership-loop
+  [problem slots lower upper]
+  (membership-loop* problem slots lower upper (reference-dot-operations problem)))
 
 (defn- component-slots
   [schedule]
@@ -1141,6 +1174,111 @@
                        :route-kind (attention/route-kind (:route problem))
                        :visibility-kind (attention/visibility-kind (:visibility problem))}))))
   [plan scheduled problem])
+
+(defn lower-routed-paged-reference
+  "Construct the portable one-work-item-per-output-component correctness schedule.
+
+   The semantic plan, metadata validation, routed storage traversal, visibility bounds, online
+   normalized reduction and ABI identities are shared with the cooperative schedules.  Only the
+   physical mapping is conservative: each work-item computes its own score dot and value state,
+   so the body requires no subgroup collective and is executable on every C-family GPU target."
+  [plan workgroup-size]
+  (let [plan (swr/validate! plan)
+        problem (attention/validate! (:source-operation plan))
+        _ (when-not (and (pos-int? workgroup-size)
+                         (swr/online-softmax-algebra? plan)
+                         (= (attention/ordered-input-buffer-ids problem)
+                            (swr/ordered-input-ids plan))
+                         (= (:value-head-dim problem) (get-in plan [:value :components]))
+                         (= (:qk-head-dim problem) (get-in plan [:score :axis :extent]))
+                         (= (:accumulator-dtype plan) :float)
+                         (= (:output problem) (get-in plan [:output :id])))
+            (throw (ex-info "reference weighted-reduction body does not match its semantic plan"
+                            {:reason :segmented-weighted-reduction-reference-body-plan-mismatch
+                             :plan-id (:id plan) :workgroup-size workgroup-size
+                             :operation-id (:id problem)})))
+        slot {:slot 0
+              :id 'value-component
+              :safe-id 'safe-value-component
+              :mask-id :active-value-component
+              :binding-id 'weighted-value-state
+              :next-id 'weighted-value-next
+              :iteration-result-id 'weighted-value-iteration
+              :result-id 'weighted-value-result}
+        slots [slot]
+        query-ops (query-metadata-operations problem)
+        route-ops (if (attention/dense-paged-route? (:route problem))
+                    (dense-route-operations problem)
+                    (csr-route-operations problem))
+        membership-ops (if (attention/interval-visibility? (:visibility problem))
+                         (interval-membership-operations problem)
+                         (csr-membership-operations problem))
+        operations
+        (flatten-operations
+         (concat
+          query-ops
+          [(load-value 'query-position :int (get-in problem [:query :positions])
+                       ['query-token])
+           (compute 'query-position-valid :predicate
+                    (expr :ge :predicate 'query-position (lit 0 :int)))
+           (compute 'query-batch-valid :predicate
+                    (expr :ge :predicate 'query-batch (lit 0 :int)))
+           (compute 'safe-query-batch :int
+                    (expr :min :int
+                          (expr :max :int 'query-batch (lit 0 :int))
+                          (lit (dec (:batch-size problem)) :int)))
+           (compute 'query-position-long :long (cast-expr 'query-position :long))]
+          route-ops membership-ops
+          [(compute 'initial-valid :predicate
+                    (all-expr ['query-metadata-valid 'query-position-valid
+                               'query-batch-valid 'route-valid 'membership-valid]))
+           (compute 'kv-head :int
+                    (expr :quot :int 'query-head
+                          (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
+           (reference-membership-loop problem slots 'attention-begin 'attention-end)]
+          (output-operations problem slots)))
+        launch (launch/spec
+                {:workgroup-size [workgroup-size 1 1]
+                 :group-count [(long (quot (+ (:value-head-dim problem)
+                                              (dec workgroup-size))
+                                           workgroup-size))
+                               (:q-heads problem)
+                               (get-in problem [:query :total-tokens])]})]
+    (body/make
+     {:id [:segmented-weighted-reduction-reference-body (:id plan) workgroup-size]
+      :parameters (parameters plan problem)
+      :stable-reads (mapv body/stable-read (swr/ordered-input-ids plan))
+      :indices [(body/->IndexBinding 'value-component-tile :group 0)
+                (body/->IndexBinding 'query-head :group 1)
+                (body/->IndexBinding 'query-token :group 2)
+                (body/->IndexBinding 'lane :local 0)
+                (body/->IndexCompute
+                 'value-component
+                 (body/expression :add
+                                  (body/expression :mul
+                                                   'value-component-tile workgroup-size)
+                                  'lane))
+                (body/->IndexCompute
+                 'safe-value-component
+                 (body/expression :min 'value-component
+                                  (dec (:value-head-dim problem))))]
+      :masks [(body/->Mask :active-value-component
+                           [(body/predicate :lt 'value-component
+                                            (:value-head-dim problem))])]
+      :operations operations
+      :schedule {:strategy :one-work-item-per-output-component
+                 :score-reduction :sequential
+                 :membership-traversal (if (attention/csr-visibility?
+                                             (:visibility problem))
+                                         :csr-row :contiguous-interval)}
+      :launch launch
+      :provenance {:operation-id (:id problem)
+                   :semantic-op :segmented-weighted-reduction
+                   :algebra-plan-id (:id plan)
+                   :lowering :reference-kernel-body}
+      :attributes {:storage-kind :routed-paged-kv
+                   :route-kind (attention/route-kind (:route problem))
+                   :visibility-kind (attention/visibility-kind (:visibility problem))}})))
 
 (defn lower-routed-paged
   "Construct the verified KernelBody for the routed paged online schedule.

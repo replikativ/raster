@@ -425,6 +425,7 @@
                         (schedule/plan-subgroup-online-tiled
                          plan (assoc descriptor
                                      :segmented-weighted-reduction-history-tile-size 4)))
+        reference (attention-emit/emit-fp16-reference plan descriptor)
         cooperative (attention-emit/emit-fp16-cooperative
                      plan cooperative-schedule dialect)
         pipelined (attention-emit/emit-fp16-pipelined
@@ -433,7 +434,8 @@
                             plan swizzled-pipelined-schedule dialect descriptor)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
         public-artifacts (equation-first-artifacts target descriptor)]
-    (into [(write-artifact! directory suffix "cooperative" cooperative)
+    (into [(write-artifact! directory suffix "reference-attention" reference)
+           (write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
                             swizzled-pipelined)
