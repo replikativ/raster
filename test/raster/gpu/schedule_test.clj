@@ -56,8 +56,8 @@
       (is (= {:strategy :auto :score-reuse-subgroup-multiple 16
               :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
-    (testing "static typed contractions default to analytic fixed selection"
-      (is (= {:strategy :auto :measured-selectors {}}
+    (testing "static typed contractions keep finite tile search out of the hot compile path"
+      (is (= {:strategy :auto :matrix-tiles :default :measured-selectors {}}
              (:typed-contraction derived))))
     (testing "GEMM dispatch policy is explicit, serializable schedule data"
       (is (= {:target-fill-multiple 4 :min-split-chunk 1024 :max-splits 64}
@@ -166,6 +166,15 @@
                           (sched/feasible?
                            (sched/resolve (sched/derive-default nil arc-desc)
                                           {:typed-contraction {:measured-selectors :invalid}})
+                           arc-desc)))
+    (is (true? (sched/feasible?
+                (sched/resolve (sched/derive-default nil arc-desc)
+                               {:typed-contraction {:matrix-tiles :finite}})
+                arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown typed contraction matrix tile space"
+                          (sched/feasible?
+                           (sched/resolve (sched/derive-default nil arc-desc)
+                                          {:typed-contraction {:matrix-tiles :unbounded}})
                            arc-desc))))
   (testing "GEMM dispatch controls reject missing, zero, and non-integral policy data"
     (doseq [invalid [{:max-splits 0}

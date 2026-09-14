@@ -886,11 +886,20 @@
   (and (contains? #{:nn :nt} variant)
        (= :opencl-intel (or target-dialect :opencl-intel))))
 
+(defn tile-input-strategy
+  "Stable strategy identity for a finite-search tile-local matrix schedule. Every physical tile
+   axis that can alter emitted code or launch geometry participates in the identity; the analytic
+   default keeps the existing concise `:xmx-direct-tile-inputs` name."
+  [{:keys [block-m block-n block-k sg-m sg-n num-stages]}]
+  (keyword
+   (format "xmx-direct-tile-inputs-bm%d-bn%d-sm%d-sn%d-bk%d-s%d"
+           block-m block-n sg-m sg-n block-k (or num-stages 3))))
+
 (defn- matrix-input-fusion-alternative [spec]
   (when (matrix-input-fusion-target? spec)
     (xmx-graph (assoc spec :split-k? false :fuse-tile-inputs? true
                      :vector-width (get spec :vector-width 4)
-                     :strategy :xmx-direct-tile-inputs))))
+                     :strategy (or (:strategy spec) :xmx-direct-tile-inputs)))))
 
 (defn emit-matrix-input-fusion-alternative
   "Emit an explicit Intel direct-matrix candidate with tile-local FP32→FP16 inputs.
