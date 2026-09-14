@@ -103,7 +103,7 @@
                                (assoc-in kernel [:parameters 0 :layout]
                                          (layout/col-major shape :half)))))))
     (testing "runtime dimension identities are specialized to the storage contract"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"dimension specializations"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"body parameter or exact specialization"
                             (matrix-plan/analyze
                              (assoc-in kernel [:attributes :dimension-values 'M] 63)))))
     (testing "restrict-qualified matrix inputs require stable read contracts"

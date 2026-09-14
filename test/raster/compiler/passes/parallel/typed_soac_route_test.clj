@@ -1589,9 +1589,12 @@
            (get-in matrix-node [:operation :arguments])))
     (is (nil? (get buffer-views 'batch-rhs-view))
         "shared weights remain the original stable buffer, not a fabricated batched view")
-    (is (= '[k n]
+    (is (= '[K N]
            (:shape (first (filter #(= :rhs (:role %)) (:parameters matrix-body)))))
-        "the matrix ABI records the shared weight shape without a leading batch extent")
+        "the matrix body uses its local dimensions without a leading batch extent")
+    (is (= {'M 'm 'N 'n 'K 'k}
+           (get-in matrix-body [:attributes :dimension-values]))
+        "the graph binds body-local matrix dimensions to semantic extents")
     (is (= 3 (count (get-in matrix-node [:operation :launch :group-count]))))
     (is (= 'batch
            (get-in matrix-node [:operation :launch :group-count 2 :value]))
