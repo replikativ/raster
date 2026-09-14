@@ -3,7 +3,9 @@
 
    This pass never recognizes Clojure loop syntax. It consumes explicit Fold/effect-loop scopes
    and mixed-radix index forms, upgrading a sequential effect-map only when every access to each
-   written destination has one common injective address function modulo lexical inner-index names."
+   written destination has one common injective address function modulo lexical inner-index names.
+   Distinct written destinations remain a binding precondition: KernelGraph call validation rejects
+   overlapping writable resident views before private allocation or launch."
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -114,12 +116,26 @@
 
 (defn- ownership-signature
   [{:keys [index locals loops]} outer-index outer-extent forbidden-index-symbols]
-  (let [loop-indices (into {} (map (juxt :index :extent)) loops)
+  (let [local-initializers (into {} (map (juxt :id :init)) locals)
+        address-dependencies
+        (loop [symbols (util/free-syms index)]
+          (let [expanded (into symbols
+                               (mapcat #(some-> (get local-initializers %)
+                                               util/free-syms))
+                               symbols)]
+            (if (= symbols expanded) symbols (recur expanded))))
+        relevant-loops (filterv #(contains? address-dependencies (:index %)) loops)
+        loop-indices (into {} (map (juxt :index :extent)) relevant-loops)
         form (index-algebra/index-form index outer-index outer-extent locals loop-indices)
-        inner-indices (mapv :index loops)
+        inner-indices (mapv :index relevant-loops)
+        ;; A nested sequential loop may evaluate an address invariant in one of its indices
+        ;; (for example every output component rereads the same per-head score row). Ownership is
+        ;; across outer work items: require every digit which actually reaches the address to be
+        ;; canonical and bounded, without demanding irrelevant lexical indices in the formula.
         expected-digits (into #{outer-index} inner-indices)
         form-symbols (set (filter symbol? (tree-seq coll? seq form)))]
     (when (and form (index-algebra/injective? form)
+               (contains? (:terms form) outer-index)
                (empty? (set/intersection forbidden-index-symbols form-symbols))
                (= expected-digits (set (keys (:terms form))))
                (= expected-digits (:leaves form))
@@ -158,10 +174,12 @@
     (when (and (= 'effect-map kind)
                (= :sequential (:iteration-order attributes))
                (empty? arrays)
-               (every? #(and (contains? values %) (empty? (:shape (get values %)))) captures)
-               ;; Multiple logical destinations may be rebound to the same physical buffer. The
-               ;; first vertical proves one inout view until ABI no-alias facts are available here.
-               (= 1 (count destinations) (count destination-parameters)))
+               ;; Read-only tensor captures do not affect cross-item ownership. If one reaches a
+               ;; destination address, index-form cannot resolve that data-dependent expression
+               ;; and the access still declines below.
+               (every? #(contains? values %) captures)
+               (seq destinations)
+               (= (count destinations) (count destination-parameters)))
       (let [region (dialect/lambda-parts lambda)
             forbidden-index-symbols (carried-symbols lambda)
             accesses (region-accesses region destination-parameters [] [])

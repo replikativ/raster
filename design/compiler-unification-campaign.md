@@ -1427,6 +1427,17 @@ GQA decode loop from an early untyped-fixpoint error to the explicit
 read/write ownership proof for scratch written by the loop and read by later scalar folds; the
 compiler does not claim parallel safety merely because the source came from an attention workload.
 
+That ownership boundary now admits multiple writable destinations when every destination's complete
+read/write set has one proved injective outer-item slice. Read-only tensor captures are irrelevant
+unless they flow into an address, where the index algebra still declines data-dependent forms.
+Dependency closure through typed locals determines which nested sequential loop digits actually
+participate in each address; an address may be invariant in a surrounding inner loop without losing
+outer-item ownership. Scalar loops embedded directly in effect-store values are canonicalized to
+`Fold` before this proof, just like local initializers and carries. KernelGraph binding remains the
+physical precondition and rejects overlapping writable views. With these pieces, public GQA decode
+proves independent head slices over scratch and output and emits one ordinary KernelBody kernel;
+the proof is general mixed-radix ownership, not attention recognition.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
