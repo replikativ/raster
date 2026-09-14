@@ -11,7 +11,7 @@
             [raster.compiler.ir.kernel-body :as kernel-body]))
 
 (defrecord MatrixStage
-           [id lhs rhs result dimensions batching reduction result-shape epilogue
+           [id lhs rhs result dimensions axis-symbols batching reduction result-shape epilogue
             operand-dtype accumulator-dtype result-dtype schedule input-value-regions])
 
 (defn matrix-stage?
@@ -24,7 +24,7 @@
   (when-not (matrix-stage? stage)
     (throw (ex-info "expected a MatrixStage"
                     {:reason :matrix-stage-type :actual (type stage)})))
-  (let [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
+  (let [{:keys [id lhs rhs result dimensions axis-symbols batching reduction result-shape epilogue
                 operand-dtype accumulator-dtype result-dtype schedule input-value-regions]} stage]
     (doseq [[field value] [[:id id] [:lhs lhs] [:rhs rhs] [:result result]]]
       (when (nil? value)
@@ -33,6 +33,12 @@
     (when-not (and (vector? dimensions) (= 3 (count dimensions)) (not-any? nil? dimensions))
       (throw (ex-info "matrix stage requires exact M/N/K dimensions"
                       {:reason :matrix-stage-dimensions :dimensions dimensions})))
+    (when-not (and (vector? axis-symbols)
+                   (= 3 (count axis-symbols))
+                   (every? symbol? axis-symbols)
+                   (= 3 (count (distinct axis-symbols))))
+      (throw (ex-info "matrix stage requires distinct M/N/K coordinate identities"
+                      {:reason :matrix-stage-axis-symbols :axis-symbols axis-symbols})))
     (when-not (and (map? reduction)
                    (contains? #{:full :split-k} (:kind reduction))
                    (vector? (:range reduction)) (= 2 (count (:range reduction))))
@@ -78,10 +84,12 @@
     stage))
 
 (defn make
-  [{:keys [id lhs rhs result dimensions batching reduction result-shape epilogue
+  [{:keys [id lhs rhs result dimensions axis-symbols batching reduction result-shape epilogue
            operand-dtype accumulator-dtype result-dtype schedule input-value-regions]
-    :or {operand-dtype :half accumulator-dtype :float result-dtype :float input-value-regions {}}}]
+    :or {axis-symbols ['i 'j 'l]
+         operand-dtype :half accumulator-dtype :float result-dtype :float input-value-regions {}}}]
   (validate!
-   (->MatrixStage id lhs rhs result (vec dimensions) batching reduction (vec result-shape)
+   (->MatrixStage id lhs rhs result (vec dimensions) (vec axis-symbols)
+                  batching reduction (vec result-shape)
                   epilogue (dtype/canon operand-dtype) (dtype/canon accumulator-dtype)
                   (dtype/canon result-dtype) schedule input-value-regions)))

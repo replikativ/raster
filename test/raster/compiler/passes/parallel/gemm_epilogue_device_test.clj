@@ -117,14 +117,14 @@
                      (reduce + (for [l (range in-f)]
                                  (* (aget x (+ (* i in-f) l)) (aget W (+ (* j in-f) l)))))))))))
 
-(deftest the-linear-layer-is-a-resident-map-and-typed-executable
+(deftest the-linear-layer-is-one-typed-executable
   (doseq [target [:ocl:0 :ze:0]]
     (let [descriptor (pipeline/compile-gpu-program #'nn/linear! target :dtype :float)]
       (testing (str target)
-        (is (= [:map :executable] (mapv :convention (:steps descriptor))))
-        (is (= '[[W :input] [x :input] [y :inout]]
+        (is (= [:executable] (mapv :convention (:steps descriptor))))
+        (is (= '[[W :input] [x :input] [y :output] [b :input]]
                (vec (for [slot (kexec/abi
-                                (default-executable (second (:steps descriptor))))
+                                (default-executable (first (:steps descriptor))))
                           :when (not= :scalar (:kind slot))]
                       [(:name slot) (:kind slot)]))))))))
 

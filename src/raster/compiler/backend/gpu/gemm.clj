@@ -326,7 +326,7 @@
 
 (defn- scheduled-matrix-body
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
-  [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
+  [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
            k-range launch-group-count attributes epilogue input-value-regions]
     :or {result-dtype :float provenance {}}}]
@@ -341,7 +341,7 @@
       :row a :col b :out c
       :dimensions [m n k]
       :dimension-parameters dimension-parameters
-      :axis-symbols ['i 'j 'l]
+      :axis-symbols (or axis-symbols ['i 'j 'l])
       :tile tile
       :bindings {:row a :col b}
       :epilogue epilogue
@@ -365,7 +365,7 @@
   is solely a target concern. Optional views, hardware indices, and K bounds are explicit schedule
   values used by the split-K and batched wrappers below. An optional epilogue becomes a typed
   ScalarSSARegion on every store and is lowered as part of the body."
-  [{:keys [kernel-name id a b c m n k dimension-parameters tile result-dtype provenance
+  [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
            target-dialect
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
            k-range launch-group-count attributes parameter-names epilogue input-value-regions]
@@ -373,7 +373,7 @@
   (let [kernel-name (c-emit/c-symbol kernel-name)
         kernel-body (scheduled-matrix-body
                      {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
-                      :dimension-parameters dimension-parameters :tile tile
+                      :dimension-parameters dimension-parameters :axis-symbols axis-symbols :tile tile
                       :result-dtype result-dtype :provenance provenance
                       :additional-parameters additional-parameters
                       :additional-indices additional-indices :buffer-shapes buffer-shapes
@@ -387,12 +387,13 @@
            :workgroup-size (get-in kernel-body [:launch :workgroup-size]))))
 
 (defn- split-k-matrix-spec
-  [{:keys [kernel-name id a b c m n k kc splits tile provenance input-value-regions]}]
+  [{:keys [kernel-name id a b c m n k kc splits axis-symbols tile provenance input-value-regions]}]
   (let [z 'k-slice
         c-view 'split-result-view
         k-lower (kbody/expression :mul z kc)
         k-upper (kbody/expression :min (kbody/expression :add k-lower kc) k)]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+     :axis-symbols axis-symbols
      :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
                              (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
@@ -415,7 +416,7 @@
   (emit-scheduled-matrix-kernel (split-k-matrix-spec spec)))
 
 (defn- batched-matrix-spec
-  [{:keys [kernel-name id a b c m n k batch tile provenance batching input-value-regions]
+  [{:keys [kernel-name id a b c m n k batch axis-symbols tile provenance batching input-value-regions]
     :or {batching {:row true :col true}}}]
   (let [z 'slab
         ;; MatrixBody parameters are SSA identities, not semantic expressions.  Keep M/N/K
@@ -445,6 +446,7 @@
           col-batched? (assoc b b-view))]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
      :dimension-parameters dimension-parameters
+     :axis-symbols axis-symbols
      :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
@@ -514,7 +516,7 @@
      kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn- matrix-stage-for
-  [{:keys [m n k epilogue tile]} stage-id a b c split-k? kc splits]
+  [{:keys [m n k axis-symbols epilogue tile]} stage-id a b c split-k? kc splits]
   (let [reduction (if split-k?
                     (let [slice 'k-slice
                           lower (kbody/expression :mul slice kc)]
@@ -525,6 +527,7 @@
     (matrix-stage/make
      {:id stage-id
       :lhs a :rhs b :result c :dimensions [m n k]
+      :axis-symbols (or axis-symbols ['i 'j 'l])
       :reduction reduction
       :result-shape (if split-k? [splits m n] [m n])
       :epilogue (when-not split-k? epilogue)
@@ -533,7 +536,7 @@
 (defn- gemm-artifact
   [stage kernel-name phase target-dialect scalar-types]
   (let [{stage-id :id a :lhs b :rhs c :result
-         [m n k] :dimensions reduction :reduction epilogue :epilogue
+         [m n k] :dimensions axis-symbols :axis-symbols reduction :reduction epilogue :epilogue
          batching :batching schedule :schedule input-value-regions :input-value-regions}
         (matrix-stage/validate! stage)
         tile (:tile schedule)
@@ -557,6 +560,7 @@
         emit-args {:kernel-name kernel-name
                    :id stage-id
                    :a a :b b :c c :m m :n n :k k
+                   :axis-symbols axis-symbols
                    :tile tile :result-dtype (:result-dtype stage)
                    :epilogue epilogue
                    :input-value-regions input-value-regions
@@ -927,6 +931,7 @@
         contract (matrix-stage/make
                   {:id contract-id
                    :lhs a16 :rhs b16 :result c :dimensions [m n k]
+                   :axis-symbols (or (:axis-symbols spec) ['i 'j 'l])
                    :batching {:extent batch
                               :lhs (get batching :row true)
                               :rhs (get batching :col true)}

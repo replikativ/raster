@@ -23,6 +23,18 @@
               :tile {:block-m 16 :block-n 32 :sg-m 8 :sg-n 16 :block-k 32 :num-stages 1
                      :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}}})
 
+(deftest matrix-stage-retains-exact-coordinate-identities
+  (let [axes '[semantic-row semantic-column semantic-reduction]
+        stage (matrix-stage/make (assoc (stage-spec) :axis-symbols axes))]
+    (is (= axes (:axis-symbols stage)))
+    (doseq [invalid [['i 'j]
+                     ['i 'i 'k]
+                     ['i :j 'k]]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"distinct M/N/K coordinate identities"
+           (matrix-stage/make (assoc (stage-spec) :axis-symbols invalid)))))))
+
 (deftest matrix-stage-keeps-fragment-types-separate-from-physical-inputs
   (let [plain (matrix-stage/make (stage-spec))
         region (cast-region)

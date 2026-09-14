@@ -309,12 +309,18 @@
       (let [split (gemm/emit-scheduled-split-k-kernel
                    {:kernel-name "body_split"
                     :a 'a :b 'b :c 'partials :m 'm :n 'n :k 'k
-                    :kc 'kc :splits 'splits :tile tile})
+                    :kc 'kc :splits 'splits :tile tile
+                    :axis-symbols '[split-row split-column split-reduction]})
             batched (gemm/emit-scheduled-batched-matrix-kernel
                      {:kernel-name "body_batched"
                       :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
-                      :batch 'batch :tile tile})]
+                      :batch 'batch :tile tile
+                      :axis-symbols '[batch-row batch-column batch-reduction]})]
         (is (body/kernel-body? (:kernel-body split)))
+        (is (= '[split-row split-column split-reduction]
+               (get-in split [:kernel-body :attributes :axis-symbols])))
+        (is (= '[batch-row batch-column batch-reduction]
+               (get-in batched [:kernel-body :attributes :axis-symbols])))
         (is (= 1 (count (get-in split [:kernel-body :views]))))
         (is (re-find #"int KC, int splits" (:source split)))
         (is (re-find #"long k_begin" (:source split)))
