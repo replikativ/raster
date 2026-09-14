@@ -1501,3 +1501,14 @@ storage token. The current proof admits single-equation algorithms only; multi-e
 need an ordered first-touch proof. Unavailable dimensions and unsupported shape expressions
 decline elision, while invalid negative dimensions still fail. This shares the functional-domain
 classification with initialization scheduling, rather than introducing a backend operation list.
+
+### 2026-09-14 — ordered product-valued scalar folds
+
+The typed scalar language now retains exact counted recurrences with two or more carries as one
+product-valued `Fold`. The source matcher preserves binding order, origins, inclusive/exclusive
+bounds and the shared lexical update region without asserting reassociation. Static `nth`
+projections are scalar SSA uses of that product region: KernelBody lowering memoizes the region and
+emits one multi-carry `ForLoop`, while JVM projection binds the returned tuple once. Focused tests
+cover frontend validation, one-loop OpenCL/CUDA/HIP emission, JVM numerical execution, and rejection
+of changed exits and non-unit induction. This is general loop-language coverage, not a layer-norm
+operation rule; algebra certification and parallel schedules remain separate follow-ups.

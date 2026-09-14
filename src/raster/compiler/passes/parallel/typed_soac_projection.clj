@@ -89,6 +89,34 @@
 
 (declare materialize-region)
 
+(defn product-fold->source
+  "Project one product-valued Fold to the exact ordered Clojure recurrence that returns its
+   carry tuple. Consumers decide whether to bind the tuple once or select one component."
+  [product]
+  (let [{:keys [attributes lambda]} (dialect/product-fold-parts product)
+        {:keys [locals body-results]} (dialect/lambda-parts lambda)
+        accumulators (:accumulators attributes)
+        index (:index attributes)
+        typed-index (with-meta index {:raster.type/tag 'long})
+        typed-accumulators
+        (mapv (fn [accumulator component-dtype]
+                (with-meta accumulator
+                  {:raster.type/tag (dtype/scalar-tag-for-dtype component-dtype)}))
+              accumulators (:dtypes attributes))
+        recur-form (apply list 'recur
+                          (list 'clojure.core/inc (list 'clojure.core/long index))
+                          body-results)]
+    (list 'loop*
+          (vec (concat [typed-index (:lower attributes 0)]
+                       (mapcat vector typed-accumulators (:identities attributes))))
+          (list 'if
+                (list (if (= :inclusive (:upper-bound attributes))
+                        'clojure.core/<= 'clojure.core/<)
+                      (list 'clojure.core/long index)
+                      (list 'clojure.core/long (:extent attributes)))
+                (materialize-region locals recur-form)
+                typed-accumulators))))
+
 (defn scalar-folds->source
   "Project explicit scalar Fold/conversion terms to Raster's interpreted host vocabulary."
   [expression]
@@ -125,6 +153,11 @@
          (with-meta
            projected
            {:raster.type/elem-type (:dtype attributes)}))
+
+       (dialect/product-component-form? form)
+       (let [[_ product ordinal] form
+             loop-form (product-fold->source product)]
+         (list 'clojure.core/nth loop-form (list 'clojure.core/long ordinal)))
 
        :else form))
    expression))

@@ -310,7 +310,22 @@
       (is (= '[0.0 0 n] outer))
       (is (= '[acc i off value] (:binders scope)))
       (is (= '[nil nil (+ base i) (clojure.core/aget x off)] (:inits scope)))
-      (is (= '[(+ acc value)] (:body scope))))))
+      (is (= '[(+ acc value)] (:body scope)))))
+  (testing "product Fold — carries precede its index and shared typed local spine"
+    (let [fold '(product-fold
+                 {:accumulators [sum squares] :identities [0.0 0.0]
+                  :dtypes [:float :float] :index i :lower start :extent n
+                  :association :ordered}
+                 (lambda [sum squares i]
+                   (region [(let-value value :float (clojure.core/aget x i))]
+                           [(+ sum value) (+ squares (* value value))])))
+          {:keys [scopes outer sequential?]} (form/scope-info fold)
+          scope (first scopes)]
+      (is (true? sequential?))
+      (is (= '[0.0 0.0 start n] outer))
+      (is (= '[sum squares i value] (:binders scope)))
+      (is (= '[nil nil nil (clojure.core/aget x i)] (:inits scope)))
+      (is (= '[(+ sum value) (+ squares (* value value))] (:body scope))))))
 
 (deftest scope-info-rebuild-identity-test
   (testing "rebuild ∘ scope-info is identity for every closed-core binder form"
@@ -333,6 +348,10 @@
                         (region [(let-value off :long (+ base i))
                                  (let-value value :float (aget in off))]
                                 [(+ acc value)])))
+               '(product-fold
+                 {:accumulators [a b] :identities [0.0 1.0] :dtypes [:float :float]
+                  :index i :lower 0 :extent n :association :ordered}
+                 (lambda [a b i] (region [] [(+ a i) (* b i)])))
                '(raster.par/scan res acc 0.0 i n nil (+ acc (aget in i)))]]
       (let [{:keys [scopes outer rebuild]} (form/scope-info f)]
         (is (= f (rebuild scopes outer)) (str "round-trip: " (first f)))))))

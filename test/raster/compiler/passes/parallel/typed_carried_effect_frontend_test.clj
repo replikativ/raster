@@ -210,10 +210,13 @@
                      [:attributes :emission-route]))))))
 
 (deftest production-admission-preserves-parallelism-without-rejecting-the-dialect
-  (let [result (attempt normalization-source)]
-    (is (= :sequential-effect-continuation (get-in result [:declined :reason])))
-    (is (some? (get-in result [:declined :equation])))
-    (is (nil? (:program result))))
+  (let [result (attempt normalization-source)
+        equation (-> result :program :equations first :algorithm dialect/equations first)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= :independent (-> equation dialect/operation-parts :attributes :iteration-order)))
+    (is (= :outer-item-owned
+           (-> equation dialect/operation-parts :attributes :attributes
+               :ownership-proof :kind))))
   (let [independent (replace-form
                      source '(aset sums row (float sum))
                      '(let* [^double inverse ^{:raster.type/tag double} (/ 1.0 sum)]
@@ -288,7 +291,7 @@
                                                          shadow :object)})
                       [:stats :route])))))
 
-(deftest carry-only-destination-reads-constrain-storage-and-iteration
+(deftest carry-only-destination-reads-preserve-storage-under-row-ownership
   (doseq [variant [(replace-form source 0.25 '(double (aget sums row)))
                    (replace-form source '(+ acc (double v)) '(+ acc (double (aget scales row))))]]
     (let [result (attempt variant)
@@ -299,7 +302,10 @@
           read-write (set (map :destination (filter #(= :read-write (:access %)) storage)))]
       (is (= :typed-soac (get-in result [:stats :route])))
       (is (contains? (get-in facts [:equations (second equation) :effects]) :memory/read))
-      (is (= :sequential (-> equation dialect/operation-parts :attributes :iteration-order)))
+      (is (= :independent (-> equation dialect/operation-parts :attributes :iteration-order)))
+      (is (= :outer-item-owned
+             (-> equation dialect/operation-parts :attributes :attributes
+                 :ownership-proof :kind)))
       (is (seq read-write)))))
 
 (deftest floating-or-unknown-symbolic-bounds-are-not-integral-iteration-contracts

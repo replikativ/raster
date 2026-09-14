@@ -122,13 +122,13 @@
         (staged/lower
          (assoc-in (three-stage-facts) [:stages 0 :lift] (list '* 'inner addition))
          :scalar-types {'gain :long})
-        branch-failure (try (staged/analyze!
-                             (assoc-in (three-stage-facts) [:stages 0 :lift]
-                                       (list '* 'inner
-                                             (with-meta (list 'if true addition 0.0)
-                                               {:raster.type/tag 'float})))
-                             :scalar-types {'gain :long}) nil
-                            (catch clojure.lang.ExceptionInfo e (ex-data e)))
+        constant-branch
+        (staged/lower
+         (assoc-in (three-stage-facts) [:stages 0 :lift]
+                   (list '* 'inner
+                         (with-meta (list 'if true addition 0.0)
+                           {:raster.type/tag 'float})))
+         :scalar-types {'gain :long})
         typed-addition (with-meta addition {:raster.type/tag 'long})
         scheduled (staged/lower (source typed-addition) :scalar-types {'gain :long})
         implicit-conversion (staged/lower
@@ -144,9 +144,9 @@
               (tree-seq coll? seq (:body inferred))))
     (is (some #(and (map? %) (= :cast (:op %)) (= :float (:result-type %)))
               (tree-seq coll? seq (:body implicit-inferred))))
-    (is (= :staged-scalar-body-declined (:reason branch-failure)))
-    (is (= :kernel-body-proof (:missing-rule branch-failure))
-        "a trapping branch remains rejected until target control preserves its exception order")
+    (is (some #(and (map? %) (= :trap (:overflow %)))
+              (tree-seq coll? seq (:body constant-branch)))
+        "constant control is eliminated without losing checked source arithmetic")
     (is (some #(and (map? %) (= :trap (:overflow %)))
               (tree-seq coll? seq (:body scheduled))))
     (is (some #(and (map? %) (= :trap (:overflow %)))

@@ -1,16 +1,104 @@
 (ns raster.compiler.passes.parallel.typed-scalar-fold-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.nn :as nn]))
+
+(deftest product-fold-components-share-one-multi-carry-loop
+  (let [product
+        '(product-fold {:accumulators [sum squares]
+                        :identities [0.0 0.0]
+                        :dtypes [:float :float]
+                        :index i :lower 0 :extent width :association :ordered}
+           (lambda [sum squares i]
+             (region [(let-value value :float (clojure.core/aget x i))]
+                     [(+ sum value) (+ squares (* value value))])))
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{'x} :array-types {'x :float}
+                  :scalar-types {'width :long} :index-scope #{}
+                  :lower-index (fn [expression _] expression)
+                  :decline! (fn [rule message data]
+                              (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:lower-region lowerer)
+                 {:bindings []
+                  :results [(list 'product-component product 0)
+                            (list 'product-component product 1)]}
+                 [:float :float] {} {'width :long})
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (:operations lowered))
+        loop (first loops)]
+    (is (= [:float :float] (:types lowered)))
+    (is (= 1 (count loops)) "component projections must not duplicate the fold")
+    (is (= 2 (count (:iter-args loop))))
+    (is (= 2 (count (:results loop))))
+    (is (= 2 (count (:values (peek (:operations loop))))))))
+
+(def ^:private product-fold-map
+  '(let* [y
+          (raster.par/pmap
+           row rows float
+           (let* [sums
+                  (loop* [i 0
+                          ^{:raster.type/tag float} sum 0.0
+                          ^{:raster.type/tag float} squares 0.0]
+                    (if (< (long i) width)
+                      (let* [^{:raster.type/tag float} value
+                             (clojure.core/aget x (+ (* row width) i))]
+                        (recur (inc (long i))
+                               ^{:raster.type/tag float} (+ sum value)
+                               ^{:raster.type/tag float} (+ squares (* value value))))
+                      [sum squares]))
+                  ^{:raster.type/tag float} sum-result
+                  (clojure.core/nth sums (long 0))
+                  ^{:raster.type/tag float} square-result
+                  (clojure.core/nth sums (long 1))]
+             (+ sum-result square-result)))]
+     y))
+
+(deftest mapped-product-recurrence-reaches-one-gpu-loop
+  (let [options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'rows :long 'width :long}}
+        routed (route/attempt product-fold-map :float (:array-types options) options)
+        program (:program routed)
+        algorithm (-> program :equations first :algorithm)
+        scheduled (segop-lower/segop-lower-pass
+                   program {:dtype :float :target-device :ocl:0})
+        emitted (opencl-pass/opencl-pass (:form scheduled) :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        artifact (first (:kernels emitted))
+        source (:source artifact)
+        kernel-body (get-in artifact [:attributes :kernel-body])
+        jvm-emitted (par-simd/simd-pass
+                     (:form (pipeline/schedule-parallel-form product-fold-map options))
+                     :min-elements 1)
+        jvm-form (:form jvm-emitted)
+        execute (eval (list 'fn '[x rows width] jvm-form))]
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= algorithm (dialect/validate! algorithm)))
+    (is (= 2 (count (filter dialect/product-fold-form?
+                            (tree-seq coll? seq algorithm)))))
+    (is (= 1 (count (:kernels emitted))))
+    (is (= 1 (count (re-seq #"for \(long [^ ]*product_fold_index_" source)))
+        "two component uses must share one emitted multi-carry loop")
+    (doseq [target [:cuda :hip]]
+      (let [target-source (body-emit/emit-scalar-kernel
+                           "product_fold" kernel-body {:target-dialect target})]
+        (is (= 1 (count (re-seq #"for \(long(?: long)? [^ ]*product_fold_index_"
+                                target-source))))))
+    (is (= 2 (count (re-seq #"loop\*" (pr-str jvm-form))))
+        "JVM has one outer map loop and one shared product loop")
+    (is (= [20.0 92.0]
+           (mapv double (execute (float-array [1 2 3 4 5 6]) 2 3))))))
 
 (def ^:private dot-map
   '(let* [y (raster.par/pmap
