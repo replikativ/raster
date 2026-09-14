@@ -124,7 +124,12 @@
                 (boolean? expression) :predicate
 
                 (symbol? expression)
-                (some-> (or (get env expression) (get scalar-types expression)) canon-type)
+                (or (some-> (or (get env expression) (get scalar-types expression)) canon-type)
+                    ;; Java numeric fields are a closed literal set in numeric-constant, not
+                    ;; arbitrary var/field resolution. Their runtime value supplies independent
+                    ;; source-width evidence before an explicit conversion is lowered.
+                    (some-> (numeric-constant/value expression) :value
+                            types/literal-tag dtype/dtype-for-scalar-tag canon-type))
 
                 (descriptor/aget-call? expression)
                 (some-> (get array-types (descriptor/aget-array-sym expression)) canon-type)

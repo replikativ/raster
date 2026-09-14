@@ -408,11 +408,13 @@
             (update store field #(util/subst-syms substitutions %)))
           store [:index :predicate :value]))
 
+(declare substitute-loop substitute-order)
+
 (defn- instantiate-store-loop
   "Apply the shared lexical scope engine to a source loop descriptor. A closed-core let scope
    carries the local initializers and operand payloads; no separate carry/local scope walker is
    maintained here. The bound and carry initializer remain outside the body parameter scope."
-  [substitutions {:keys [index locals stores carry] :as loop} & [fresh-index]]
+  [substitutions {:keys [index locals stores loops order carry] :as loop} & [fresh-index]]
   (binding [util/*shadowing-locals*
             (into util/*shadowing-locals* (filter symbol? (vals substitutions)))]
     (let [fields [:index :predicate :value]
@@ -425,14 +427,22 @@
                  (util/subst-syms {bound-index fresh-index} (first (:body scope)))
                  (first (:body scope)))
           [_ bindings payload] body
-          local-pairs (partition 2 bindings)]
+          local-pairs (partition 2 bindings)
+          next-index (or fresh-index bound-index)
+          local-renames (into {}
+                              (map (fn [local [id _]] [(:id local) id]) locals local-pairs))
+          nested-substitutions
+          (cond-> (into substitutions (assoc local-renames index next-index))
+            carry (assoc (:parameter carry) parameter))]
       (cond-> (assoc loop
-                     :index (or fresh-index bound-index)
+                     :index next-index
                      :extent (util/subst-syms substitutions (:extent loop))
                      :locals (mapv (fn [local [id init]] (assoc local :id id :init init))
                                    locals local-pairs)
                      :stores (mapv (fn [store values] (merge store (zipmap fields values)))
-                                   stores payload))
+                                   stores payload)
+                     :loops (mapv #(substitute-loop nested-substitutions %) loops)
+                     :order (when order (substitute-order order nested-substitutions)))
         carry (assoc :carry (assoc carry :parameter parameter
                                    :init (util/subst-syms substitutions (:init carry))
                                    :update (peek payload)))))))
@@ -455,6 +465,17 @@
    KernelBody SSA value."
   [loop fresh]
   (instantiate-store-loop {} loop fresh))
+
+(defn- rename-loop-tree
+  "Give every loop in a nested effect tree a deterministic path-qualified SSA index."
+  [loop path]
+  (let [loop (rename-loop-index
+              loop (symbol (str "rstr_loop_index_" (apply str (interpose "_" path)))))]
+    (update loop :loops
+            (fn [children]
+              (mapv (fn [ordinal child]
+                      (rename-loop-tree child (conj path ordinal)))
+                    (range) children)))))
 
 (defn- order-locals [order]
   (mapcat (fn [[kind region]]
@@ -551,8 +572,10 @@
 
    Accepted shapes are the unexpanded `(dotimes [i n] …)` and its closed-core form
    `(loop* [i 0] (if (< i n) (do … (recur (inc i)))))`. The body is recognized by `store-region`
-   with the map index as its context; nested store loops decline. The loop's body locals live in
-   their own SSA namespace so they cannot collide with the enclosing region's locals."
+   with the map index as its context. Ordinary nested store loops remain a recursive effect tree;
+   carried nested loops are admitted separately because their result scope is different. The
+   loop's body locals live in their own SSA namespace so they cannot collide with the enclosing
+   region's locals."
   [form index]
   (let [[head bindings & body] (when (seq? form) form)
         counted (cond
@@ -584,7 +607,7 @@
                (not= (:index counted) index)
                (not (contains? (util/free-syms (:extent counted)) (:index counted))))
       (when-let [region (store-region (:body counted) index)]
-        (when (and (seq (:stores region)) (empty? (:loops region)))
+        (when (or (seq (:stores region)) (seq (:loops region)))
           ;; The loop index and the body locals get their own names: a source loop index may
           ;; shadow a captured scalar of the enclosing region, and the region's SSA namespace
           ;; must not confuse the two.
@@ -602,7 +625,9 @@
                                       (-> local (assoc :id (get renames id))
                                           (update :init #(util/subst-syms renames %))))
                                     (:locals region))
-                      :stores (mapv #(substitute-store renames %) (:stores region))}]
+                      :stores (mapv #(substitute-store renames %) (:stores region))
+                      :loops (mapv #(substitute-loop renames %) (:loops region))
+                      :order (substitute-order (region-order region) renames)}]
              :order [[:loop 0]]}))))))
 
 (defn- carried-store-binding
@@ -1318,9 +1343,41 @@
                    [effect]))
                effects)))
 
-(defn- source-loop-expressions [{:keys [lower extent locals carry]}]
+(defn- loop-tree
+  [loops]
+  (mapcat (fn [loop] (cons loop (loop-tree (:loops loop)))) loops))
+
+(defn- source-loop-expressions [{:keys [lower extent locals carry loops]}]
   (concat [lower extent] (map :init locals)
-          (when carry [(:init carry) (:update carry)])))
+          (when carry [(:init carry) (:update carry)])
+          (mapcat source-loop-expressions loops)))
+
+(defn- loop-store-leaves
+  "Flatten stores only for cross-item conflict analysis while retaining their exact effect path.
+   Scheduling later rebuilds the recursive loop tree from that path."
+  [top-ordinal loop path]
+  (concat
+   (map-indexed (fn [ordinal store]
+                  (let [nested? (> (count path) 2)
+                        ;; A syntactic `dst[i] = dst[i] + x` inside a nested sequential loop is
+                        ;; lane-local state, not a cross-work-item reducing scatter. Preserve the
+                        ;; read-modify-write expression; the later outer-item ownership proof must
+                        ;; establish that different map lanes cannot share `dst[i]`.
+                        store (if (and nested? (:reduction-op store))
+                                (-> store
+                                    (assoc :value (list (:reduction-op store)
+                                                       (list 'clojure.core/aget
+                                                             (:out store) (:index store))
+                                                       (:value store)))
+                                    (dissoc :reduction-op :conflict))
+                                store)]
+                    (assoc store :loop top-ordinal
+                           :effect-path (conj path :store ordinal)
+                           :nested-loop? nested?)))
+                (:stores loop))
+   (mapcat (fn [ordinal child]
+             (loop-store-leaves top-ordinal child (conj path :loop ordinal)))
+           (range) (:loops loop))))
 
 (defn- write-region-description
   [id symbol index extent {:keys [locals stores loops] :as region} elem-type
@@ -1330,8 +1387,7 @@
         analysis-locals (vec (concat locals (order-locals order)))
         local-types (into scalar-types (map (juxt :id :dtype)) analysis-locals)
         loops (vec (map-indexed (fn [ordinal loop]
-                                  (rename-loop-index
-                                   loop (clojure.core/symbol (str "rstr_loop_index_" ordinal))))
+                                  (rename-loop-tree loop [ordinal]))
                                 (or loops [])))]
     (when (and (or (seq stores) (seq loops))
                (every? (fn [{:keys [extent carry]}]
@@ -1339,19 +1395,17 @@
                              (contains? #{:int :long}
                                         (or (get local-types extent)
                                             (retained-local-dtype extent nil)))))
-                       loops)
+                       (loop-tree loops))
                (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
                ;; A destination written both directly and inside a store loop would lose the work
                ;; item's source order between the two kinds of write; such regions stay unsupported.
                (empty? (set/intersection (set (map :out stores))
-                                         (set (mapcat #(map :out (:stores %)) loops)))))
+                                         (set (map :out (mapcat #(loop-store-leaves nil % []) loops))))))
       (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
             loop-stores
-            (vec (mapcat (fn [ordinal {loop-store-list :stores}]
-                           (map (fn [store]
-                                  (assoc (merge {:index index :predicate 1} store)
-                                         :loop ordinal))
-                                loop-store-list))
+            (vec (mapcat (fn [ordinal loop]
+                           (map #(merge {:index index :predicate 1} %)
+                                (loop-store-leaves ordinal loop [:loop ordinal])))
                          (range) loops))
             scoped-effects? (boolean (some #(= :region (first %)) order))
             dense-pointwise? (and (empty? loops)
@@ -1380,7 +1434,9 @@
             proven (proven-unique-stores (vec (remove :reduction-op candidate-stores))
                                          index extent analysis-locals loops)
             proven? (let [indices (vec (remove :reduction-op candidate-stores))]
-                      (fn [store] (contains? proven (.indexOf ^java.util.List indices store))))
+                      (fn [store]
+                        (and (not (:nested-loop? store))
+                             (contains? proven (.indexOf ^java.util.List indices store)))))
             ;; A marker is honoured only for an index outside the algebra's reach: the index
             ;; expression or a local it depends on (transitively) reads an array. Unrelated
             ;; locals may not authorize a claim, so only the index's dependency slice counts.
@@ -1423,6 +1479,7 @@
                                                   (dialect/reducing-scatter-conflict
                                                    reduction-op destination-type))
                                                 uniqueness :unique
+                                                (:nested-loop? store) :ordered
                                                 (and (nil? (:loop store)) (= index (:index store)))
                                                 :unique
                                                 :else :ordered)]
@@ -1460,11 +1517,14 @@
                           (every? (fn [[_ grouped]]
                                     (= 1 (count (set (map :effect-conflict grouped)))))
                                   (group-by :out all-stores)))
-            all-locals (vec (concat analysis-locals (mapcat :locals loops)))
+            all-locals (vec (concat analysis-locals
+                                    (mapcat :locals (loop-tree loops))))
             loop-expressions (mapcat source-loop-expressions loops)
             scoped-predicates (order-predicates order)
+            all-effect-loops (vec (loop-tree loops))
             carry-bindings (set (mapcat #(when-let [carry (:carry %)]
-                                          [(:parameter carry) (:result carry)]) loops))
+                                          [(:parameter carry) (:result carry)])
+                                        all-effect-loops))
             iteration-order (when ordered?
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
@@ -1483,7 +1543,7 @@
                                     write-indices predicates values)
             io (update (extract-io (list* 'do analysis-values) index destinations)
                        :scalars set/difference (set (map :id all-locals))
-                       (set (map :index loops)) carry-bindings)
+                       (set (map :index all-effect-loops)) carry-bindings)
             results (if (= :buffer host-return)
                       [symbol]
                       (mapv #(effect-result-id id %) (range (count destinations))))
@@ -1492,14 +1552,28 @@
             store-effect (fn [store]
                            (select-keys store [:out :index :predicate :value :cast
                                                :effect-conflict]))
-            loop-effects (mapv (fn [ordinal {loop-index :index loop-locals :locals
-                                             :keys [lower extent carry]}]
-                                 {:loop (cond-> {:index loop-index :lower lower :extent extent
-                                         :locals loop-locals
-                                         :effects (mapv store-effect
-                                                        (filter #(= ordinal (:loop %))
-                                                                all-stores))}
-                                          carry (assoc :carry carry))})
+            stores-by-path (into {} (keep (fn [store]
+                                            (when-let [path (:effect-path store)]
+                                              [path store]))) all-stores)
+            project-loop
+            (fn project-loop [loop path]
+              (letfn [(project-order [order]
+                        (mapv (fn [[kind value]]
+                                (case kind
+                                  :region {:region {:locals (:locals value)
+                                                    :predicate (:predicate value)
+                                                    :effects (project-order (:order value))}}
+                                  :store (store-effect (get stores-by-path
+                                                            (conj path :store value)))
+                                  :loop (project-loop (nth (:loops loop) value)
+                                                      (conj path :loop value))))
+                              order))]
+                {:loop (cond-> {:index (:index loop) :lower (:lower loop)
+                                :extent (:extent loop) :locals (:locals loop)
+                                :effects (project-order (region-order loop))}
+                         (:carry loop) (assoc :carry (:carry loop)))}))
+            loop-effects (mapv (fn [ordinal loop]
+                                 (project-loop loop [:loop ordinal]))
                                (range) loops)
             ;; Effects keep the region's source order across direct stores and loops.
             ordered-effects ((fn project [order]

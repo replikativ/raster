@@ -406,6 +406,62 @@
       (is (= [2.5 5.0 37.5 50.0] (mapv double out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
 
+(def ^:private nested-row-update-source
+  '(let* [effect
+          (raster.par/map-void!
+           row rows
+           (loop* [j 0]
+             (if (clojure.core/< j columns)
+               (do
+                 (loop* [d 0]
+                   (if (clojure.core/< d width)
+                     (let* [^long address (clojure.core/+ (clojure.core/* row width) d)
+                            ^float previous (clojure.core/aget out address)
+                            ^float increment (float (clojure.core/+ j d))]
+                       (clojure.core/aset out address
+                                          (float (clojure.core/+ previous increment)))
+                       (recur (clojure.core/inc d)))))
+                 (recur (clojure.core/inc j))))))]
+         effect))
+
+(deftest nested-ordinary-effect-loops-retain-one-recursive-typed-region
+  (let [result (route/attempt nested-row-update-source :float {'out :float}
+                              {:scalar-types {'rows :long 'columns :long 'width :long}})
+        program (:program result)
+        algorithm (-> program :equations first :algorithm)
+        equation (first (dialect/equations algorithm))
+        {:keys [attributes lambda]} (dialect/operation-parts equation)
+        outer (-> lambda dialect/lambda-parts :body-results first dialect/effect-parts)
+        inner (-> outer :lambda dialect/lambda-parts :body-results first dialect/effect-parts)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:target-device :ze:0 :dtype :float}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out rows columns width] (:form jvm)))
+        out (float-array 4)]
+    (testing "source admission and ownership preserve the recursive SOAC algebra"
+      (is (= :typed-soac (get-in result [:stats :route])))
+      (is (= :independent (:iteration-order attributes)))
+      (is (:loop outer))
+      (is (:loop inner))
+      (is (= [:unique] (mapv :conflict (dialect/effect-part-leaves [inner])))
+          "the leaf is sequentially revisited inside one lane but disjoint across map lanes")
+      (is (= (dialect/validate! algorithm) algorithm)))
+    (testing "one scheduled operation lowers the same loop tree for every supported C target"
+      (doseq [target [:opencl-intel :cuda :hip]]
+        (let [artifact (segop-opencl/generate-scheduled-segmap-kernel
+                        operation :dtype :float :target-dialect target
+                        :array-types {'out :float}
+                        :scalar-types {'rows :long 'columns :long 'width :long})
+              operations (nested-operations
+                          (get-in artifact [:attributes :kernel-body :operations]))]
+          (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+          (is (= 2 (count (filter #(= "ForLoop" (some-> % class .getSimpleName)) operations)))))))
+    (testing "JVM realization consumes the identical scheduled tree"
+      (is (nil? (execute out 2 3 2)))
+      (is (= [3.0 6.0 3.0 6.0] (vec out)))
+      (is (zero? (get-in jvm [:stats :fallback]))))))
+
 (deftest production-host-store-loops-preserve-the-continuation
   (let [source '(let* [effect
                       (raster.par/map-void!
