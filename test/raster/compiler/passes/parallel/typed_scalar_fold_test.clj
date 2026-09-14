@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-scalar-fold-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
@@ -12,6 +13,7 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.dl.nn :as dl-nn]
             [raster.nn :as nn]))
 
 (deftest product-fold-components-share-one-multi-carry-loop
@@ -99,6 +101,22 @@
         "JVM has one outer map loop and one shared product loop")
     (is (= [20.0 92.0]
            (mapv double (execute (float-array [1 2 3 4 5 6]) 2 3))))))
+
+(deftest public-layer-norm-backward-reuses-the-product-region
+  (let [pipeline (pipeline/show-pipeline #'dl-nn/layer-norm-backward-dx
+                                         :dtype :float :target-device :ocl:0)
+        kernels (:kernels pipeline)
+        product-loop-lines
+        (mapcat #(filter (fn [line]
+                           (and (.contains line "for (")
+                                (.contains line "product_fold_index")))
+                         (str/split-lines (:source %)))
+                kernels)]
+    (is (= 2 (get-in pipeline [:segop-lowered-stats :segops-lowered])))
+    (is (= 2 (count kernels)) "initialization and the fused backward body remain explicit")
+    (is (every? #(= :kernel-body (get-in % [:attributes :emission-route])) kernels))
+    (is (= 1 (count product-loop-lines))
+        "sum and square-sum uses share one loop inside the generated backward kernel")))
 
 (def ^:private dot-map
   '(let* [y (raster.par/pmap

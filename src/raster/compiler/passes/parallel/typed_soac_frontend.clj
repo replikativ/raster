@@ -702,6 +702,12 @@
   (let [region
   (cond
     (and (seq? body) (form/let-head? (first body)))
+    (let [[head source-bindings & tail] body
+          bindings (or (expand-product-loop-locals source-bindings tail)
+                       source-bindings)
+          body (if (= bindings source-bindings)
+                 body
+                 (with-meta (list* head bindings tail) (meta body)))]
     (or (let [[head bindings & tail] body]
           (when (and (vector? bindings) (> (count bindings) 2) (even? (count bindings))
                      (some util/effectful? (take-nth 2 (rest bindings))))
@@ -743,7 +749,7 @@
                  :loops (mapv #(substitute-loop substitutions %) (:loops nested))
                  :order (substitute-order (region-order nested) substitutions)}
                   (contains? nested :result)
-                  (assoc :result (util/subst-syms substitutions (:result nested)))))))))))
+                  (assoc :result (util/subst-syms substitutions (:result nested))))))))))))
 
     (and (seq? body) (= 'do (first body)))
     (let [expressions (vec (rest body))]

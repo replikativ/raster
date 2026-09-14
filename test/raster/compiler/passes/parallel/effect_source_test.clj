@@ -46,3 +46,23 @@
     (let [log (atom [])]
       (is (nil? (execute log true 4)))
       (is (= [5 :after] @log)))))
+
+(deftest product-fold-tuple-is-bound-once-after-its-captures
+  (let [product
+        '(product-fold {:accumulators [sum squares] :identities [0.0 0.0]
+                        :dtypes [:float :float] :index i :lower 0 :extent n
+                        :association :ordered}
+           (lambda [sum squares i]
+             (region [] [(+ sum mean) (+ squares (* mean mean))])))
+        locals [{:id 'mean :dtype :float :init 2.0}
+                {:id 'sum-result :dtype :float
+                 :init (list 'product-component product 0)}
+                {:id 'squares-result :dtype :float
+                 :init (list 'product-component product 1)}]
+        form (source/typed-locals (partial source/storage-cast true)
+                                  locals '[sum-result squares-result])
+        execute (eval (list 'fn '[n] form))]
+    (is (= [6.0 12.0] (mapv double (execute 3))))
+    (is (= 1 (count (filter #(and (seq? %) (= 'loop* (first %)))
+                            (tree-seq coll? seq form))))
+        "both projections share one tuple loop after the mean binding")))
