@@ -75,6 +75,28 @@ earlier host-clock measurements, and no winner is promoted from this shared-lapt
 Next: automatic symbolic-extent fusion, correlating observed events with executable evidence,
 then larger projection shapes and matched external implementations.
 
+### Public linear schedule probe
+
+`bench/public_linear_schedule_probe.clj` compares schedules for one ordinary public
+`raster.dl.nn/linear!` program rather than comparing different source spellings. In a `:bench`
+REPL:
+
+```clojure
+(require '[public-linear-schedule-probe :as linear])
+(linear/run! {:shape [32 256 256]
+              :revision "<git revision>"
+              :environment "<machine/driver identity>"
+              :rounds 12 :warmup-rounds 4})
+```
+
+The candidates are the portable segmented contraction, the materialized XMX graph, and the
+tile-local-input XMX graph. All share the same resident activation, transposed model weights,
+bias and output, and exactly binary16-representable inputs. Each candidate must match the same
+independently rounded host oracle before timing. The materialized graph deliberately pays its
+cast and transpose on every replay; a constant/prepacked-weight comparison is a separate scope.
+The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
+stationarity diagnostics, and never updates the tuning cache.
+
 The dynamic prebound slice can be measured with the same probe by adding
 `:composed-variant :relu-prebound` and `:timing-source :device-event`. This source computes `m*n`
 before the contraction and then uses an ordinary map; it does not declare an epilogue. The original
