@@ -7,6 +7,7 @@
    Once an operation is accepted, all value, effect and provenance facts are made explicit before
    fusion or scheduling sees it."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -1224,7 +1225,9 @@
                                          :loop ordinal))
                                 loop-store-list))
                          (range) loops))
+            scoped-effects? (boolean (some #(= :region (first %)) order))
             dense-pointwise? (and (empty? loops)
+                                  (not scoped-effects?)
                                   (every? #(and (= index (:index %)) (nil? (:reduction-op %)))
                                           stores))
             pointwise? (and dense-pointwise? (independent-stores? locals stores))
@@ -1318,7 +1321,6 @@
             effect-contracts (mapv :effect-conflict all-stores)
             uniform-conflict (when (= 1 (count (set effect-contracts)))
                                (first effect-contracts))
-            scoped-effects? (boolean (seq (order-locals order)))
             scatter? (and (not pointwise?)
                           (empty? loops)
                           (not scoped-effects?)
@@ -2313,6 +2315,110 @@
             expression))
         expression)))
 
+(defn- duplicable-counted-loop-branch
+  "Peel a pure, total scalar let prefix from one counted store loop.
+
+   The prefix will execute once per active map lane rather than once before the source loop, so
+   every initializer must satisfy the shared removable-expression contract and may not read
+   mutable array storage. Anything less stays as source control."
+  [expression]
+  (cond
+    (and (seq? expression) (= 'do (first expression)) (= 2 (count expression)))
+    (duplicable-counted-loop-branch (second expression))
+
+    (and (seq? expression)
+         (contains? '#{dotimes clojure.core/dotimes} (first expression)))
+    {:bindings [] :loop expression}
+
+    (and (seq? expression) (form/let-head? (first expression))
+         (vector? (second expression)) (even? (count (second expression)))
+         (= 3 (count expression)))
+    (let [bindings (second expression)
+          initializers (take-nth 2 (rest bindings))]
+      (when (every? #(and (effects/removable-expr? %)
+                          (empty? (par/collect-aget-arrays %)))
+                    initializers)
+        (when-let [nested (duplicable-counted-loop-branch (nth expression 2))]
+          (update nested :bindings #(into (vec bindings) %)))))
+
+    :else nil))
+
+(defn- normalize-guarded-counted-store-loop
+  "Turn one removable one-arm conditional store loop into a guarded effect map.
+
+   This is semantic predication, not schedule selection: the counted domain remains explicit and
+   the existing effect ownership pass still decides whether iterations are independent. Requiring
+   a removable predicate preserves zero-trip behavior even though the predicate moves into the
+   traversal. Two-arm algorithm choice remains program-control work."
+  [expression]
+  (or
+   (when (and (seq? expression)
+              (contains? '#{if clojure.core/if} (first expression))
+              (<= 3 (count expression) 4)
+              (nil? (nth expression 3 nil))
+              (effects/removable-expr? (second expression))
+              (empty? (par/collect-aget-arrays (second expression))))
+     (when-let [{:keys [bindings loop]}
+                (duplicable-counted-loop-branch (nth expression 2))]
+       (let [normalized (normalize-counted-store-loop loop)]
+         (when (and (not= normalized loop) (par/par-map-void-form? normalized))
+           (let [{:keys [idx bound body]} (par/extract-par-map-void-info normalized)
+                 guarded-body (list 'if (second expression)
+                                    (if (seq bindings)
+                                      (list 'let* bindings body)
+                                      body)
+                                    nil)]
+             (with-meta (list 'raster.par/map-void! idx bound guarded-body)
+               (meta expression)))))))
+   expression))
+
+(defn- nested-scalar-reductions
+  "Return scalar reductions nested inside an expression, without entering a reduction body."
+  [expression]
+  (letfn [(sites [value]
+            (cond
+              (par/par-reduce-form? value) [value]
+              (seq? value) (mapcat sites value)
+              (vector? value) (mapcat sites value)
+              :else []))]
+    (vec (sites expression))))
+
+(defn- lift-nested-scalar-reductions
+  "Give a single nested scalar reduction its own SSA binding.
+
+   TypedSOAC already fuses an adjacent pure scalar equation into a reduction result-transform,
+   but analyzed Clojure can retain `(scalar-op (reduce ...))` as one initializer.  Lifting that
+   value exposes the existing algebra without teaching the frontend about individual scalar
+   functions.  The surrounding expression must be removable after substitution, may not read
+   mutable array storage, and the reduction must carry its walker-provided result type."
+  [source]
+  (if-not (and (seq? source) (contains? #{'let 'let*} (first source)))
+    source
+    (let [[head bindings & body] source
+          pairs (partition 2 bindings)
+          lifted
+          (mapcat
+           (fn [[symbol expression]]
+             (let [sites (nested-scalar-reductions expression)]
+               (if (and (= 1 (count sites))
+                        (not (par/par-reduce-form? expression)))
+                 (let [reduction (first sites)
+                       reduction-tag (types/sym-type-tag reduction)
+                       value-id (with-meta (gensym "rstr_reduction_value_")
+                                  (cond-> {}
+                                    reduction-tag
+                                    (assoc :tag reduction-tag :raster.type/tag reduction-tag)))
+                       outer (walk/postwalk #(if (= % reduction) value-id %) expression)]
+                   (if (and reduction-tag
+                            (effects/removable-expr? outer)
+                            (empty? (par/collect-aget-arrays outer))
+                            (empty? (nested-scalar-reductions outer)))
+                     [[value-id reduction] [symbol outer]]
+                     [[symbol expression]]))
+                 [[symbol expression]])))
+           pairs)]
+      (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source)))))
+
 (defn- normalize-source*
   [source scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
@@ -2320,7 +2426,9 @@
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (util/uniquify-rebindings (util/free-syms source) source)]
+  (let [source (->> source
+                    (util/uniquify-rebindings (util/free-syms source))
+                    lift-nested-scalar-reductions)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
@@ -2348,6 +2456,7 @@
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
                                           [state expression])
+                     expression (normalize-guarded-counted-store-loop expression)
                      counted-expression (normalize-counted-store-loop expression)
                      [state expression] (if (= expression counted-expression)
                                           [state expression]

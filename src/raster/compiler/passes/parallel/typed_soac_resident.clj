@@ -24,13 +24,18 @@
                       {:reason :typed-soac-resident-equation :equation equation}))))
 
 (defn- emit-equation
-  [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
+  [{:keys [kind id results attributes arrays captures destinations parameters locals body-results]}]
   (list '= id (vec results)
         (case kind
           :contract (list 'contract attributes (vec arrays) (vec captures))
           :scalar (list 'scalar attributes (vec captures)
                         (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
                                              (vec body-results)))
+          :effect-map (list 'effect-map attributes (vec arrays) (vec captures)
+                            (vec destinations)
+                            (dialect/effect-lambda-form
+                             (vec parameters) (dialect/emit-locals locals)
+                             (vec body-results)))
           (list (symbol (name kind)) attributes (vec arrays) (vec captures)
                 (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
                                      (vec body-results))))))
@@ -111,7 +116,8 @@
 
 (defn- rewrite-lambda-consumer
   [info values scalar-defs dependent roots]
-  (let [{:keys [accumulators elements capture-parameters]} (parameter-parts info)
+  (let [{:keys [accumulators elements capture-parameters destination-parameters]}
+        (parameter-parts info)
         capture-substitutions
         (into {}
               (map (fn [[parameter capture]]
@@ -127,7 +133,8 @@
                                        (util/subst-syms capture-substitutions init)))
                             (:locals info))
         global-bodies (mapv #(util/subst-syms capture-substitutions %) (:body-results info))
-        bound (set (concat accumulators elements [(get-in info [:attributes :index])]
+        bound (set (concat accumulators elements destination-parameters
+                           [(get-in info [:attributes :index])]
                            (map first (get-in info [:attributes :segment-axes]))))
         stable-before (set (get-in info [:attributes :attributes :stable-array-captures]))
         referenced-values (->> (concat (mapcat #(util/free-syms (:init %) bound) global-locals)
@@ -142,7 +149,8 @@
                                   referenced-values))]
     (assoc info
            :captures referenced-values
-           :parameters (vec (concat accumulators elements new-parameters))
+           :parameters (vec (concat accumulators elements new-parameters
+                                    destination-parameters))
            :locals (mapv #(update % :init
                                   (fn [init]
                                     (util/subst-syms body-substitutions init)))
@@ -153,10 +161,16 @@
 
 (defn- rewrite-consumer
   [info values scalar-defs dependent roots]
-  ;; A contraction's scalar closure is not a resident-buffer lambda. Its capture uses
-  ;; are explicit escape sites above, so unrelated resident reductions can still proceed.
-  (if (= :contract (:kind info)) info
-      (rewrite-lambda-consumer info values scalar-defs dependent roots)))
+  ;; Only a lexical consumer of a realized/dependent scalar needs a new buffer load. Besides
+  ;; avoiding needless alpha-renaming, this keeps unrelated host scalar equations entirely out
+  ;; of the parallel parameter-layout machinery (their lambda may intentionally have no element
+  ;; or accumulator partition). A contraction's scalar closure is likewise not a resident-buffer
+  ;; lambda; its capture uses are explicit escape sites above.
+  (let [affected (set/union dependent roots)]
+    (if (or (= :contract (:kind info))
+            (empty? (set/intersection affected (set (:captures info)))))
+      info
+      (rewrite-lambda-consumer info values scalar-defs dependent roots))))
 
 (defn realize
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.

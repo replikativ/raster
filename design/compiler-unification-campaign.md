@@ -1383,6 +1383,17 @@ obsolete frontend rejection without adding a loop or branch dialect. Integer val
 implicitly predicates: Clojure treats zero as truthy, unlike C-family targets, so source must use
 an explicit comparison until a first-class boolean ABI/value contract is carried end to end.
 
+One-arm source conditionals whose active branch is a removable counted store loop are predicated
+into that same effect-map contract. Pure branch-local scalar bindings remain typed effect-region
+locals; ownership proof, rather than the rewrite, decides whether the traversal is independent.
+A single walker-typed scalar reduction nested under a removable scalar expression is first exposed
+as SSA, then handled by the existing reduction-to-scalar fusion rule. Thus gradient clipping lowers
+`sqrt(reduce(...))` as a typed reduction result-transform followed by a guarded effect-map, without
+a host scalar round trip or an optimizer-specific rule. Resident realization rewrites only actual
+consumers of that rank-zero value, preserves effect-map destinations, and carries it physically as
+a one-element device buffer. Full resident compilation emits two scheduled GPU stages and no
+fallback; this is functional coverage, not a throughput claim.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
