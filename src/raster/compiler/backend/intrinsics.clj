@@ -177,7 +177,10 @@
    :deg2rad {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "radians"}}
    :rad2deg {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "degrees"}}
    :clamp {:arity 3 :kind :fn :wasm :poly :wgsl {:fn "clamp"}}
-   :signum {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "sign"}}
+   ;; Source signum preserves signed zero and returns NaN unchanged. Target `sign` builtins do not
+   ;; state that contract uniformly, so strict scalar lowering expands it to compares/selects.
+   :signum {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "sign"}
+            :typed-expansion :source-signum}
    :copysign {:arity 2 :kind :fn :wasm :poly :c {:fn "copysign"}}
    :flipsign {:arity 2 :kind :fn :wasm :poly}})
 
