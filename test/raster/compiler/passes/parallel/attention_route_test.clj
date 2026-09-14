@@ -90,11 +90,18 @@
     (is (= 3 (count (:workgroup-size (:launch artifact)))))
     (is (= 1 (count (:nodes graph))))
     (is (= :dense-paged (get-in artifact [:attributes :route-kind])))
+    (is (kbody/kernel-body? (get-in artifact [:attributes :kernel-body])))
+    (is (= :reference-kernel-body
+           (get-in artifact [:attributes :kernel-body :provenance :lowering])))
+    (is (not (str/includes? (:source artifact) "reqd_sub_group_size")))
+    (is (not (str/includes? (:source artifact) "sub_group_reduce")))
     (is (str/includes? (:source artifact) "q_row_offsets"))
-    (is (str/includes? (:source artifact) "kv_position <= (long)q_position"))
-    (is (str/includes? (:source artifact) "kv_position >= (long)q_position - 2L"))
-    (is (str/includes? (:source artifact) "physical_page = page_table"))
-    (is (str/includes? (:source artifact) "const long v_base"))))
+    (is (str/includes? (:source artifact)
+                       "rstr_kv_position <= rstr_query_position_long"))
+    (is (str/includes? (:source artifact)
+                       "rstr_query_position_long - 2L"))
+    (is (str/includes? (:source artifact) "rstr_physical_page = page_table["))
+    (is (str/includes? (:source artifact) "v_pages["))))
 
 (deftest dense-interval-attention-uses-the-shared-score-online-schedule
   (let [desc {:device-type :gpu :vendor "Intel" :subgroup-size 16
@@ -647,9 +654,9 @@
 (deftest independent-k-and-v-layouts-are-lowered-without-repacking
   (let [source (:source (:artifact (route/route! (problem))))]
     (is (str/includes? source
-                       "((long)kv_head * 7 + physical_page) * 2 + page_token) * 8"))
+                       "((long)(rstr_kv_head) * (long)(112))"))
     (is (str/includes? source
-                       "((long)physical_page * 2 + page_token) * 2 + kv_head) * 6"))))
+                       "((long)(rstr_safe_physical_page) * (long)(24))"))))
 
 (deftest fp32-query-and-output-compose-with-fp16-kv-storage
   (let [fp16-artifact (:artifact (route/route! (problem) intel-desc))

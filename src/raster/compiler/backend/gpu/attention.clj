@@ -8,6 +8,7 @@
   ordered external ABI, storage ownership or graph effects."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-opencl]
+            [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -102,222 +103,6 @@
                          :total-query-tokens (get-in problem [:query :total-tokens]))]
      (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity)))))))
 
-(defn- opencl-type
-  [dtype]
-  (case dtype
-    :half "half"
-    :float "float"))
-
-(defn- load-float
-  [dtype expression]
-  (case dtype
-    :half (str "convert_float(" expression ")")
-    :float expression))
-
-(defn- store-float
-  [dtype expression]
-  (case dtype
-    :half (str "convert_half_rte(" expression ")")
-    :float expression))
-
-(defn- cache-base
-  [{:keys [physical-pages page-size kv-heads]} layout dim]
-  (case layout
-    :kv-head-major
-    (str "((((long)kv_head * " physical-pages " + physical_page) * "
-         page-size " + page_token) * " dim ")")
-    :page-major
-    (str "((((long)physical_page * " page-size " + page_token) * "
-         kv-heads " + kv_head) * " dim ")")))
-
-(defn- route-signature
-  [route]
-  (if (attention/dense-paged-route? route)
-    (str "    __global const int* page_table,\n"
-         "    __global const int* kv_lengths,\n"
-         "    __global const int* kv_start_positions,\n")
-    (str "    __global const int* page_offsets,\n"
-         "    __global const int* page_indices,\n"
-         "    __global const int* last_page_lengths,\n"
-         "    __global const int* kv_start_positions,\n")))
-
-(defn- visibility-signature
-  [visibility]
-  (when (attention/csr-visibility? visibility)
-    (str "    __global const int* attention_row_offsets,\n"
-         "    __global const int* attention_key_indices,\n")))
-
-(defn- route-initialization
-  [{:keys [route page-size]} invalid-result]
-  (if (attention/dense-paged-route? route)
-    (let [capacity (* (:pages-per-sequence route) page-size)]
-      (str "  const int length = kv_lengths[batch];\n"
-           "  const int kv_start_position = kv_start_positions[batch];\n"
-           "  if (length < 0 || length > " capacity
-           " || kv_start_position < 0\n"
-           "      || (long)kv_start_position + (long)length > 2147483648L) {\n"
-           invalid-result
-           "  }\n"))
-    (let [capacity (:page-index-capacity route)]
-      (str "  const int page_begin = page_offsets[batch];\n"
-           "  const int page_end = page_offsets[batch + 1];\n"
-           "  const int final_page_length = last_page_lengths[batch];\n"
-           "  const int kv_start_position = kv_start_positions[batch];\n"
-           "  if (page_offsets[0] != 0 || page_begin < 0 || page_end < page_begin\n"
-           "      || page_end > " capacity " || kv_start_position < 0) {\n"
-           invalid-result
-           "  }\n"
-           "  const int routed_page_count = page_end - page_begin;\n"
-           "  if ((routed_page_count == 0 && final_page_length != 0)\n"
-           "      || (routed_page_count > 0\n"
-           "          && (final_page_length < 1 || final_page_length > " page-size "))) {\n"
-           invalid-result
-           "  }\n"
-           "  const int length = routed_page_count == 0 ? 0\n"
-           "      : (routed_page_count - 1) * " page-size " + final_page_length;\n"
-           "  if ((long)kv_start_position + (long)length > 2147483648L) {\n"
-           invalid-result
-           "  }\n"))))
-
-(defn- physical-page-expression
-  [route]
-  (if (attention/dense-paged-route? route)
-    (str "page_table[(long)batch * " (:pages-per-sequence route) " + logical_page]")
-    "page_indices[page_begin + logical_page]"))
-
-(defn- visibility-statements
-  [{:keys [causal? window-left window-right]}]
-  (str (when causal?
-         "    visible = visible && (kv_position <= (long)q_position);\n")
-       (when (some? window-left)
-         (str "    visible = visible && (kv_position >= (long)q_position - "
-              window-left "L);\n"))
-       (when (some? window-right)
-         (str "    visible = visible && (kv_position <= (long)q_position + "
-              window-right "L);\n"))))
-
-(defn- visibility-initialization
-  [visibility invalid-result]
-  (if (attention/csr-visibility? visibility)
-    (str "  const int attention_begin = attention_row_offsets[q_token];\n"
-         "  const int attention_end = attention_row_offsets[q_token + 1];\n"
-         "  if (attention_row_offsets[0] != 0 || attention_begin < 0\n"
-         "      || attention_end < attention_begin || attention_end > "
-         (:key-index-capacity visibility) ") {\n"
-         invalid-result
-         "  }\n")
-    (let [{:keys [causal? window-left window-right]} visibility]
-      (str "  long attention_begin = 0L;\n"
-           "  long attention_end = (long)length;\n"
-           (when (some? window-left)
-             (str "  attention_begin = max(0L, (long)q_position - " window-left
-                  "L - (long)kv_start_position);\n"
-                  "  attention_begin = min(attention_begin, (long)length);\n"))
-           (cond
-             causal?
-             (str "  attention_end = min(attention_end, (long)q_position"
-                  " - (long)kv_start_position + 1L);\n"
-                  "  attention_end = max(attention_end, 0L);\n")
-
-             (some? window-right)
-             (str "  attention_end = min(attention_end, (long)q_position + " window-right
-                  "L - (long)kv_start_position + 1L);\n"
-                  "  attention_end = max(attention_end, 0L);\n"))))))
-
-(defn- visibility-loop-start
-  [visibility invalid-result]
-  (if (attention/csr-visibility? visibility)
-    (str "  for (int edge = attention_begin; edge < attention_end; ++edge) {\n"
-         "    const int token = attention_key_indices[edge];\n"
-         "    if (token < 0 || token >= length) {\n"
-         invalid-result
-         "    }\n")
-    "  for (int token = (int)attention_begin; token < (int)attention_end; ++token) {\n"))
-
-(defn- reference-source
-  [problem name]
-  (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
-                page-size physical-pages scale k-layout v-layout visibility
-                q-dtype output-dtype]} problem
-        total-query-tokens (:total-tokens query)
-        gqa-ratio (quot q-heads kv-heads)
-        k-base (cache-base problem k-layout qk-head-dim)
-        v-base (cache-base problem v-layout value-head-dim)
-        invalid-result (str "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-                            "    return;\n")]
-    (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
-         "__kernel void " name "(\n"
-         "    __global const " (opencl-type q-dtype) "* q,\n"
-         "    __global const int* q_row_offsets,\n"
-         "    __global const int* q_positions,\n"
-         "    __global const half* k_pages,\n"
-         "    __global const half* v_pages,\n"
-         (route-signature route)
-         (visibility-signature visibility)
-         "    __global " (opencl-type output-dtype) "* output) {\n"
-         "  const int d = (int)get_global_id(0);\n"
-         "  const int q_head = (int)get_global_id(1);\n"
-         "  const int q_token = (int)get_global_id(2);\n"
-         "  if (d >= " value-head-dim " || q_head >= " q-heads
-         " || q_token >= " total-query-tokens ") return;\n"
-         "  const long out_index = ((long)q_token * " q-heads
-         " + q_head) * " value-head-dim " + d;\n"
-         "  int query_metadata_valid = q_row_offsets[0] == 0\n"
-         "      && q_row_offsets[" batch-size "] == " total-query-tokens ";\n"
-         "  int batch = -1;\n"
-         "  for (int b = 0; b < " batch-size "; ++b) {\n"
-         "    const int row_start = q_row_offsets[b];\n"
-         "    const int row_end = q_row_offsets[b + 1];\n"
-         "    query_metadata_valid = query_metadata_valid && row_start >= 0\n"
-         "        && row_end >= row_start && row_end <= " total-query-tokens ";\n"
-         "    if (q_token >= row_start && q_token < row_end) batch = b;\n"
-         "  }\n"
-         "  const int q_position = q_positions[q_token];\n"
-         "  if (!query_metadata_valid || batch < 0 || q_position < 0) {\n"
-         "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-         "    return;\n"
-         "  }\n"
-         (route-initialization problem invalid-result)
-         (visibility-initialization visibility invalid-result)
-         "  const int kv_head = q_head / " gqa-ratio ";\n"
-         "  const long q_base = ((long)q_token * " q-heads
-         " + q_head) * " qk-head-dim ";\n"
-         "  float maximum = -3.402823466e+38f;\n"
-         "  float denominator = 0.0f;\n"
-         "  float accumulator = 0.0f;\n"
-         (visibility-loop-start visibility invalid-result)
-         "    const long kv_position = (long)kv_start_position + token;\n"
-         "    int visible = 1;\n"
-         (visibility-statements (attention/position-filter visibility))
-         "    if (!visible) continue;\n"
-         "    const int logical_page = token / " page-size ";\n"
-         "    const int physical_page = " (physical-page-expression route) ";\n"
-         "    if (physical_page < 0 || physical_page >= " physical-pages ") {\n"
-         "      output[out_index] = " (store-float output-dtype "NAN") ";\n"
-         "      return;\n"
-         "    }\n"
-         "    const int page_token = token - logical_page * " page-size ";\n"
-         "    const long k_base = " k-base ";\n"
-         "    const long v_base = " v-base ";\n"
-         "    float dot = 0.0f;\n"
-         "    for (int x = 0; x < " qk-head-dim "; ++x) {\n"
-         "      dot += " (load-float q-dtype "q[q_base + x]")
-         " * convert_float(k_pages[k_base + x]);\n"
-         "    }\n"
-         "    const float logit = dot * " (Float/toString (float scale)) "f;\n"
-         "    const float next_maximum = fmax(maximum, logit);\n"
-         "    const float old_weight = exp(maximum - next_maximum);\n"
-         "    const float new_weight = exp(logit - next_maximum);\n"
-         "    accumulator = accumulator * old_weight\n"
-         "                  + convert_float(v_pages[v_base + d]) * new_weight;\n"
-         "    denominator = denominator * old_weight + new_weight;\n"
-         "    maximum = next_maximum;\n"
-         "  }\n"
-         "  output[out_index] = denominator == 0.0f ? "
-         (store-float output-dtype "0.0f") "\n"
-         "      : " (store-float output-dtype "accumulator / denominator") ";\n"
-         "}\n")))
-
 (defn- cooperative-plan!
   [plan schedule]
   (let [plan (reference-plan! plan)
@@ -390,25 +175,33 @@
                             :c-name "output" :role :result))))))
 
 (defn emit-fp16-reference
-  "Emit route-specialized attention with FP16 K/V storage as a verified KernelArtifact."
+  "Emit the portable correctness schedule from target-neutral KernelBody.
+
+   This deliberately retains the slower one-work-item-per-output-component mapping, but no target
+   source template. It is therefore the common semantic baseline for OpenCL, CUDA and HIP."
   [plan desc]
   (let [plan (reference-plan! plan)
-        {:keys [query output q-heads value-head-dim route] :as problem}
+        {:keys [output route] :as problem}
         (attention-problem plan)
         name (kernel-name problem)
         workgroup-x (reference-workgroup-x plan desc)
         inputs (ordered-inputs plan)
         arguments (conj inputs output)
-        launch (klaunch/spec
-                {:workgroup-size [workgroup-x 1 1]
-                 :group-count [(long (quot (+ value-head-dim (dec workgroup-x)) workgroup-x))
-                               q-heads (:total-tokens query)]})]
+        target-dialect (or (gpu-target/kernel-body-c-dialect desc) :opencl-portable)
+        dialect (c-dialect/resolve! target-dialect)
+        kernel-body (swr-body/lower-routed-paged-reference plan workgroup-x)
+        base-abi (ordered-abi problem)
+        parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+        abi (body-abi/project-contracts base-abi kernel-body)]
     (kart/make
      {:kernel-name name
-      :source (reference-source problem name)
-      :abi (ordered-abi problem)
+      :target (c-dialect/target dialect)
+      :source (body-opencl/emit-scalar-kernel
+               name kernel-body
+               {:parameter-names parameter-names :target-dialect target-dialect})
+      :abi abi
       :arguments arguments
-      :launch launch
+      :launch (:launch kernel-body)
       :effects {:kind :attention :reads inputs :writes [output]}
       :provenance {:operation-id (:id problem) :semantic-op :attention
                    :algebra-plan-id (:id plan) :lowering :fp16-reference}
@@ -422,6 +215,9 @@
                    :k-layout (:k-layout problem) :v-layout (:v-layout problem)
                    :visibility (:visibility problem)
                    :layout (attention/layouts problem)
+                   :kernel-body kernel-body
+                   :target-dialect target-dialect
+                   :materialized-intermediates []
                    :complexity :quadratic-in-qk-head-dim}})))
 
 (defn emit-fp16-cooperative
