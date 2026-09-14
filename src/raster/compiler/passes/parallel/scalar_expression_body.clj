@@ -102,9 +102,11 @@
                               (some-> (descriptor/semantic-op expression)
                                       descriptor/cast-result-tag
                                       dtype/dtype-for-scalar-tag))
-                            (some-> (or (:raster.type/tag (meta expression))
-                                        (:tag (meta expression)))
-                                    dtype/dtype-for-scalar-tag)))
+                            (let [tag (or (:raster.type/tag (meta expression))
+                                          (:tag (meta expression)))]
+                              (or (when (and (keyword? tag) (dtype/known? tag))
+                                    (dtype/canon tag))
+                                  (dtype/dtype-for-scalar-tag tag)))))
         authoritative-source-type
         (fn authoritative-source-type [expression env]
           (or (retained-type expression)

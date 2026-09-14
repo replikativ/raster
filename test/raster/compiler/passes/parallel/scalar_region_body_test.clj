@@ -323,6 +323,16 @@
     (is (= {:rounding :nearest-even :overflow :ieee} (get-in cast [:expression :options])))
     (is (= :float (get-in add [:result :type])))))
 
+(deftest certified-reduction-result-retains-non-jvm-kernel-dtype
+  (let [result (segred/lower-element-operations
+                '(* (aget a i) (aget b i))
+                {:index 'i :coordinate 'i :dtype :half :declared-result-dtype :half
+                 :arrays #{'a 'b} :array-types {'a :half 'b :half}})]
+    (is (= :half (get-in result [:operations 0 :result :type])))
+    (is (= :half (get-in result [:operations 1 :result :type])))
+    (is (= :half (get-in result [:operations 2 :result :type]))
+        "a certified KernelBody dtype must survive even when it has no JVM scalar tag")))
+
 (deftest result-transforms-share-typed-ssa-without-changing-owner-policy
   (doseq [[kind role] [[:input :operand] [:inout :result]]]
     (let [factory scalar/make-lowerer calls (atom [])

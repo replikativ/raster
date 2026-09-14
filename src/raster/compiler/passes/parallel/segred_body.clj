@@ -429,7 +429,11 @@
                  (instance? clojure.lang.IObj expression))
           (with-meta expression
             (assoc (meta expression) :raster.type/tag
-                   (:scalar-tag (dtype/info (dtype/canon declared-result-dtype)))))
+                   (or (:scalar-tag (dtype/info (dtype/canon declared-result-dtype)))
+                       ;; Storage/KernelBody dtypes such as :half deliberately have no JVM
+                       ;; primitive scalar tag.  Keep the certified canonical dtype instead of
+                       ;; erasing the region result fact at this adapter boundary.
+                       (dtype/canon declared-result-dtype))))
           expression)
         lowerer (scalar-expression/make-lowerer
                  {:arrays (set arrays)
