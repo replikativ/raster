@@ -7,6 +7,9 @@
 
 (defrecord ResidentComposite [id fields])
 
+(defn- field-id [field]
+  (if (instance? clojure.lang.Named field) (name field) field))
+
 (defn resident-composite?
   [value]
   (and value (= "raster.gpu.resident_value.ResidentComposite" (.getName (class value)))))
@@ -40,18 +43,17 @@
    A kernel may consume only some leaves of a logical composite. Projected slots select those
    leaves by stable `:field` identity; a field-less ABI retains the exact positional contract."
   [{:keys [binding slots]} fields]
-  (let [fields (vec fields)
-        field-key #(if (instance? clojure.lang.Named %) (name %) %)]
+  (let [fields (vec fields)]
     (cond
-      (= (count slots) (count fields)) fields
-
       (every? :field slots)
-      (let [by-name (into {} (map (juxt (comp field-key :name) identity)) fields)
-            selected (mapv #(get by-name (field-key (:field %))) slots)]
+      (let [by-name (into {} (map (juxt (comp field-id :name) identity)) fields)
+            selected (mapv #(get by-name (field-id (:field %))) slots)]
         (when (some nil? selected)
           (throw (ex-info "resident composite omits an ABI-projected field"
                           {:binding binding :slots slots :fields (mapv :name fields)})))
         selected)
+
+      (= (count slots) (count fields)) fields
 
       :else
       (throw (ex-info "resident composite field count differs from its artifact binding"
@@ -68,7 +70,8 @@
                     {:binding binding :actual (type composite-value)})))
   (let [fields (select-fields group (:fields composite-value))]
     (doseq [[slot field] (map vector slots fields)]
-      (when (and (:field slot) (not= (:field slot) (:name field)))
+      (when (and (:field slot)
+                 (not= (field-id (:field slot)) (field-id (:name field))))
         (throw (ex-info "resident composite field order differs from its physical ABI slot"
                         {:binding binding :slot slot :field (:name field)})))
       (when-not (= (dtype/canon (:dtype slot))

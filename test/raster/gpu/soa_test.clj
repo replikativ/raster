@@ -142,8 +142,8 @@
       (is (not (str/includes? source "typedef struct")))
       (is (not (str/includes? source "TestParticle")))
       ;; aget->aset roundtrip lowers to per-field array copies
-      (is (str/includes? source "particles_x[idx] = particles_x[idx];"))
-      (is (str/includes? source "particles_vy[idx] = particles_vy[idx];")))))
+      (is (re-find #"particles_x\[.*\] = rstr_map_load_" source))
+      (is (re-find #"particles_vy\[.*\] = rstr_map_load_" source)))))
 
 (deftest soa-kernel-flat-params-test
   (testing "SoA arrays decompose into flat __global pointers"
@@ -168,10 +168,10 @@
                   {'particles 'TestParticleSoA})
             kernel (first (:kernels (opencl-pass/opencl-pass body :dtype :float)))
             abi (:abi kernel)]
-        (is (= '[particles_x particles_y particles_vx particles_vy _n_bound]
-               (mapv :name abi)))
+        (is (= '#{particles_x particles_y particles_vx particles_vy}
+               (set (map :name (kabi/pointer-slots abi)))))
         (is (= '[particles] (kabi/pointer-binding-names abi)))
-        (is (= '[particles] (kart/attribute kernel :array-params)))))))
+        (is (= :kernel-body (kart/emission-route kernel)))))))
 
 (deftest soa-kernel-aget-field-projects-test
   (testing "SoA aget + field projection scalar-replaces to the per-field array read"
@@ -183,7 +183,7 @@
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
       ;; (.x (aget particles i)) → particles_x[idx], no struct literal
-      (is (str/includes? source "particles_x[idx]"))
+      (is (str/includes? source "particles_x["))
       (is (not (str/includes? source "(TestParticle)"))))))
 
 (deftest soa-kernel-aset-fieldwise-test
@@ -195,8 +195,8 @@
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
       (is (not (str/includes? source "_soa_tmp")))
-      (is (str/includes? source "particles_x[idx] = 1.0"))
-      (is (str/includes? source "particles_vy[idx] = 4.0")))))
+      (is (re-find #"particles_x\[.*\] = 1\.0f;" source))
+      (is (re-find #"particles_vy\[.*\] = 4\.0f;" source)))))
 
 (deftest soa-kernel-constructor-scalar-replaced-test
   (testing "->Type construction in aset scalar-replaces to per-field stores"
@@ -208,8 +208,8 @@
           source (:source (first (:kernels result)))]
       ;; No struct constructor of any form survives the SROA pass
       (is (not (str/includes? source "TestParticle")))
-      (is (str/includes? source "particles_x[idx] = 0.0"))
-      (is (str/includes? source "particles_vx[idx] = 1.0")))))
+      (is (re-find #"particles_x\[.*\] = 0\.0f;" source))
+      (is (re-find #"particles_vx\[.*\] = 1\.0f;" source)))))
 
 (deftest soa-kernel-field-access-test
   (testing ".field on a value-type local projects to the per-field array (no struct access)"
@@ -221,19 +221,19 @@
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
       ;; .x of the SoA-bound local resolves to the flat field array read
-      (is (str/includes? source "particles_x[idx]"))
+      (is (str/includes? source "particles_x["))
       (is (not (str/includes? source ").x"))))))
 
-(deftest soa-expansions-in-kernel-result-test
-  (testing "Kernel result includes soa-expansions map"
+(deftest typed-soa-kernel-needs-no-emitter-expansion-metadata
+  (testing "shared scalar replacement leaves no backend-local SoA expansion contract"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(aset particles i (aget particles i)))
                 {'particles 'TestParticleSoA})
           result (opencl-pass/opencl-pass body :dtype :float)
           kernel (first (:kernels result))]
-      (is (some? (kart/attribute kernel :soa-expansions)))
-      (is (contains? (kart/attribute kernel :soa-expansions) 'particles)))))
+      (is (= :kernel-body (kart/emission-route kernel)))
+      (is (nil? (kart/attribute kernel :soa-expansions))))))
 
 ;; ================================================================
 ;; Phase 3: deftm inlining in OpenCL kernels

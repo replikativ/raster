@@ -291,19 +291,17 @@
                                         :leaves (:leaves x)})]
                              :instances [i] :outputs [:out]})
                  (catch clojure.lang.ExceptionInfo error error))))))
-      (is (= :link-value-abi-field
-             (:reason
-              (ex-data
-               (try
-                 (link/make {:id :soa-swapped :target :ze:0
-                             :nodes [x-a x-b (n :out :output)]
-                             :values [(link/value
-                                       {:id :x
-                                        :abstract (:abstract x)
-                                        :leaves [{:name :b :node :x-a}
-                                                 {:name :a :node :x-b}]})]
-                             :instances [i] :outputs [:out]})
-                 (catch clojure.lang.ExceptionInfo error error))))))))
+      (let [permuted
+            (link/make {:id :soa-permuted :target :ze:0
+                        :nodes [x-a x-b (n :out :output)]
+                        :values [(link/value
+                                  {:id :x
+                                   :abstract (:abstract x)
+                                   :leaves [{:name :b :node :x-a}
+                                            {:name :a :node :x-b}]})]
+                        :instances [i] :outputs [:out]})]
+        (is (= [:x-a :x-b] (link/value-node-ids permuted :x))
+            "explicit ABI field identities safely project a different physical leaf order"))))
   (testing "an internal consumer cannot precede its producer"
     (is (= :link-read-before-write
            (:reason (ex-data (try

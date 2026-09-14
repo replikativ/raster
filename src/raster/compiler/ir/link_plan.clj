@@ -22,6 +22,9 @@
 (def node-roles #{:input :constant :state :output :internal :scratch})
 (def binder-roles #{:input :constant :state :output :scratch})
 
+(defn- field-id [field]
+  (if (instance? clojure.lang.Named field) (name field) field))
+
 (defrecord LinkNode [id view role source])
 (defrecord LinkValue [id abstract physical-layout leaves])
 (defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
@@ -441,17 +444,17 @@
                                        :symbol sym :value value-id :phase (:phase step)})))
                     (let [selected-leaves
                           (cond
-                            (= (count slots) (count leaves)) leaves
-
                             (every? :field slots)
-                            (let [by-name (into {} (map (juxt :name identity)) leaves)
-                                  selected (mapv #(get by-name (:field %)) slots)]
+                            (let [by-name (into {} (map (juxt (comp field-id :name) identity)) leaves)
+                                  selected (mapv #(get by-name (field-id (:field %))) slots)]
                               (when (some nil? selected)
                                 (throw (ex-info "logical value omits an ABI-projected field"
                                                 {:reason :link-value-abi-field-missing
                                                  :instance id :symbol sym :value value-id
                                                  :slots slots :leaves leaves})))
                               selected)
+
+                            (= (count slots) (count leaves)) leaves
 
                             :else
                             (throw
@@ -473,7 +476,8 @@
                                                   :symbol sym :node node :phase (:phase step)
                                                   :shape (get-in link-node [:view :shape])
                                                   :strides (get-in link-node [:view :strides])})))
-                               (when (and (:field slot) (not= (:field slot) name))
+                               (when (and (:field slot)
+                                          (not= (field-id (:field slot)) (field-id name)))
                                  (throw (ex-info "link value physical field order differs from its ABI"
                                                  {:reason :link-value-abi-field :instance id
                                                   :symbol sym :value value-id :node node

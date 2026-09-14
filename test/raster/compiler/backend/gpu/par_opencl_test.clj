@@ -411,15 +411,13 @@
         (is (= [:compatibility-effect-opencl]
                (mapv kart/emission-route (:kernels emitted))))))))
 
-(deftest unexpanded-soa-effects-retain-their-logical-abi-group
+(deftest direct-soa-effects-scalar-replace-before-typed-scheduling
   (with-redefs [types/soa-registry
                 (atom {'Particle {:fields [{:name "x" :element-tag 'float :array-tag 'floats}
                                            {:name "id" :element-tag 'int :array-tag 'ints}]}})
                 types/soa-reverse-registry (atom {'ParticleSoA 'Particle})
-                segop-lower/schedule-single-program
-                (fn [& _] (throw (ex-info "unexpanded SoA entered plain-array scheduling" {})))
-                segop-lower/schedule-source-program
-                (fn [& _] (throw (ex-info "unexpanded SoA entered source scheduling" {})))]
+                par-opencl/generate-par-map-void-kernel
+                (fn [& _] (throw (ex-info "legacy SoA emitter reached" {})))]
     (doseq [wrap [identity #(list 'if 'enabled % nil)
                  #(list 'let* ['effect %] 'effect)]]
       (let [emitted (opencl-pass/opencl-pass
@@ -429,12 +427,42 @@
                      :scalar-types {'n :int 'enabled :boolean})
             kernel (first (:kernels emitted))
             fields (filterv #(= 'particles (:binding %)) (:abi kernel))]
-        (is (= 1 (get-in emitted [:stats :effect-compatibility])))
-        (is (= :compatibility-effect-opencl (kart/emission-route kernel)))
-        (is (= '[particles_x particles_id] (mapv :name fields)))
-        (is (= [:float :int] (mapv :dtype fields)))
-        (is (= ["x" "id"] (mapv :field fields)))
-        (is (= '[out particles] (kabi/pointer-binding-names (:abi kernel))))))))
+        (is (zero? (get-in emitted [:stats :effect-compatibility] 0)))
+        (is (or (true? (get-in emitted [:stats :direct-scheduling :typed-validated]))
+                (some #(true? (:typed-validated %))
+                      (get-in emitted [:stats :nested-scheduling]))))
+        (is (= :kernel-body (kart/emission-route kernel)))
+        (is (= '[particles_x] (mapv :name fields))
+            "dead-field elimination does not force the unused id leaf into this kernel")
+        (is (= [:float] (mapv :dtype fields)))
+        (is (= [:x] (mapv :field fields)))
+        (is (= '[particles out] (kabi/pointer-binding-names (:abi kernel))))))))
+
+(deftest direct-soa-representation-facts-cannot-contradict-the-registry
+  (with-redefs [types/soa-registry
+                (atom {'Particle {:fields [{:name "x" :element-tag 'float :array-tag 'floats}]}})
+                types/soa-reverse-registry (atom {'ParticleSoA 'Particle})]
+    (let [source '(raster.par/map-void! i n
+                    (aset out i (.x (aget ^ParticleSoA particles i))))]
+      (is (= :soa-array-type-conflict
+             (:reason
+              (ex-data
+               (try
+                 (opencl-pass/opencl-pass
+                  source :dtype :float :min-elements 0
+                  :array-types {'particles_x :int 'out :float}
+                  :scalar-types {'n :int})
+                 (catch clojure.lang.ExceptionInfo error error))))))
+      (is (= :soa-buffer-projection-conflict
+             (:reason
+              (ex-data
+               (try
+                 (opencl-pass/opencl-pass
+                  source :dtype :float :min-elements 0 :array-types {'out :float}
+                  :scalar-types {'n :int}
+                  :buffer-projections
+                  {'particles_x {:binding 'wrong-particles :field :x}})
+                 (catch clojure.lang.ExceptionInfo error error)))))))))
 
 (deftest opencl-pass-fallback-test
   (testing "Small arrays fall back to scalar expansion"
