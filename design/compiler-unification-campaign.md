@@ -1418,6 +1418,15 @@ literal `:else` arm produced by `cond`; runtime integers are still never treated
 Public Huber and L1 gradients therefore use the same KernelBody route on OpenCL, CUDA, and HIP
 without source fallback or target-specific intrinsic spelling.
 
+Effectful source loops now acquire the fixpoint statement contract only when they have no terminal
+value and their enclosing binder is unused; a consumed nil or a value-carrying loop remains subject
+to typed-value validation. TypedSOAC composes such an effect-only counted store loop with its later
+lane-local continuation through the existing ordered effect-region algebra. This moves the public
+GQA decode loop from an early untyped-fixpoint error to the explicit
+`sequential-effect-continuation` production boundary. Crossing that boundary still requires a
+read/write ownership proof for scratch written by the loop and read by later scalar folds; the
+compiler does not claim parallel safety merely because the source came from an attention workload.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

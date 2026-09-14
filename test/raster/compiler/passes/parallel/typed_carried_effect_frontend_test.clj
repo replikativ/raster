@@ -226,6 +226,30 @@
                            (-> equation dialect/operation-parts :lambda
                                dialect/lambda-parts :body-results))))))
 
+(deftest effect-only-loop-bindings-compose-with-their-typed-continuation
+  (let [form
+        '(let* [effect
+                (raster.par/map-void!
+                 row rows
+                 (let* [_ (loop* [k 0]
+                            (if (< k width)
+                              (do (aset packed (+ (* row width) k) (aget x (+ (* row width) k)))
+                                  (recur (inc k)))
+                              nil))
+                        ^float first-value (aget packed (* row width))]
+                   (aset sums row first-value)))]
+           effect)
+        result (attempt form)
+        program (continuation-program form)
+        equation (-> program :equations first :algorithm dialect/equations first)
+        effects (-> equation dialect/operation-parts :lambda
+                    dialect/lambda-parts :body-results)]
+    (is (= :sequential-effect-continuation (get-in result [:declined :reason])))
+    (is (= [true true]
+           (mapv #(boolean (or (:loop (dialect/effect-parts %))
+                               (:region (dialect/effect-parts %)))) effects))
+        "the existing ordered effect algebra retains the loop before its dependent read/store")))
+
 (deftest post-carry-local-reads-see-the-preceding-loop-writes
   (let [form (replace-form normalization-source '(/ 1.0 sum)
                            '(double (aget packed (* row width))))

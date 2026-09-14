@@ -342,13 +342,21 @@
      (if-not (form/binding-form? expression)
        expression
        (let [[head bindings & body] expression
-             bindings (vec
-                       (mapcat (fn [[symbol initializer]]
-                                 [(cond-> symbol
-                                    (util/void-form? initializer)
-                                    (vary-meta assoc :raster.effect/effectful true))
-                                  initializer])
-                               (partition 2 bindings)))]
+             pairs (vec (partition 2 bindings))
+             bindings
+             (vec
+              (mapcat
+               (fn [position [symbol initializer]]
+                 (let [later (concat (map second (subvec pairs (inc position))) body)
+                       unused? (not (contains? (apply set/union #{}
+                                                       (map util/free-syms later))
+                                                symbol))
+                       statement? (or (util/void-form? initializer)
+                                      (and unused? (util/effect-loop-statement? initializer)))]
+                   [(cond-> symbol
+                      statement? (vary-meta assoc :raster.effect/effectful true))
+                    initializer]))
+               (range) pairs))]
          (with-meta (list* head bindings body) (meta expression)))))
    form))
 
