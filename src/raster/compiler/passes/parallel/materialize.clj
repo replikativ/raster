@@ -60,7 +60,7 @@
                     (list 'raster.par/map! sym idx bound cast body)
                     (meta form))]
     [[buf-sym (list alloc-fn bound)]
-     [(gensym "_mapeff_") map!-form]]))
+     [(with-meta (gensym "_mapeff_") {:raster.effect/effectful true}) map!-form]]))
 
 (defn- materialize-expr
   "Recursively materialize pure par/map forms in an expression.

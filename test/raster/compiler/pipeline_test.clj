@@ -66,6 +66,18 @@
     (is (fn? pipeline/compile-aot))
     (is (fn? pipeline/show-pipeline))))
 
+(deftest fixpoint-typedness-distinguishes-statements-from-untyped-values
+  (let [effect (with-meta '_effect {:raster.effect/effectful true})]
+    (testing "an explicit statement contract is independent of the RHS control spelling"
+      (is (#'pipeline/census-exempt-binding?
+           [effect '(if predicate (raster.par/map-void! i n body) nil)])))
+    (testing "the same untyped conditional is not exempt when its value could be observed"
+      (is (not (#'pipeline/census-exempt-binding?
+                ['result '(if predicate then-value else-value)]))))
+    (testing "an unmarked parallel call is not admitted by an operation-name whitelist"
+      (is (not (#'pipeline/census-exempt-binding?
+                ['result '(raster.par/map-void! i n body)]))))))
+
 ;; ================================================================
 ;; Pass registry
 ;; ================================================================

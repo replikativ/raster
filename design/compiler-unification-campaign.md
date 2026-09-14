@@ -1368,6 +1368,14 @@ shared OpenCL/CUDA/HIP path. A local Arc comparison covers the public equation-f
 the exact CPU result. This is general guarded reducing-scatter support; convolution names do not
 participate in admission or lowering.
 
+Fixpoint typedness now distinguishes statement bindings from value bindings through the existing
+`:raster.effect/effectful` binder contract. Normalized loops, SOACs and effectful conditionals no
+longer require an RHS-head whitelist merely to cross the typedness gate; an unmarked conditional
+or parallel call still requires a retained result type and fails closed. The pure-map materializer
+now attaches the same effect contract to its generated write step. This only admits statements to
+the next conversion boundary: whole-program conditional branches still require explicit typed
+program control and may not be mistaken for a scalar expression or a `KernelDispatch` selector.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
