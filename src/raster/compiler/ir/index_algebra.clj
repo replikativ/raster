@@ -28,7 +28,11 @@
 
 (defn monomial
   "Normalize an extent expression to `{:const n :factors [sym …]}` (factors sorted, repeated
-   for powers), or nil when the expression is not a product of non-negative factors."
+   for powers), or nil when the expression is not a product of non-negative factors.
+
+   A canonical `(if (< d 1) 0 product)` guard may wrap such a product when `d` is one of its
+   factors. This is the exact empty-nonpositive-domain spelling produced while flattening Clojure
+   `dotimes` nests: an executing work item proves that every guarded dimension is positive."
   [expression]
   (let [expression (strip-cast expression)]
     (cond
@@ -42,6 +46,25 @@
                      :factors (vec (sort (concat (:factors product) (:factors m))))})))
               {:const 1 :factors []}
               (rest expression))
+
+      (and (seq? expression) (= 4 (count expression))
+           (contains? '#{if clojure.core/if} (first expression))
+           (= 0 (nth expression 2)))
+      (let [[_ test _ nonempty] expression
+            [comparison guarded lower-bound] (when (seq? test) test)
+            result (monomial nonempty)
+            guarded (monomial guarded)]
+        (when (and (= 3 (count test))
+                   (contains? '#{< clojure.core/<} comparison)
+                   (= 1 lower-bound)
+                   result guarded
+                   ;; The zero arm is justified only by a factor of the nonempty domain. An
+                   ;; unrelated condition could discard arbitrary iterations and is not an
+                   ;; extent identity.
+                   (every? (fn [[factor n]]
+                             (>= (get (frequencies (:factors result)) factor 0) n))
+                           (frequencies (:factors guarded))))
+          result))
       :else nil)))
 
 (defn- multiset

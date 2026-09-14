@@ -237,8 +237,9 @@
 
    The SegMap has no implicit primary result store (`out-sym` is nil); its typed scalar region
    contains every conditional indexed write or certified atomic contribution. Physical
-   destinations remain both inputs and outputs because an indexed update preserves unselected
-   elements."
+   destinations retain their logical preservation contract in TypedSOAC, while the scheduled
+   kernel ABI lists them as inputs only when the scalar region actually reads them (or the
+   scatter is an atomic reduction)."
   [program device-id & {:keys [dtype] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))]
@@ -293,13 +294,16 @@
           scalar-result (list* 'do statements)
           body (materialize-region-locals locals scalar-result)
           stable (set (get-in attributes [:attributes :stable-array-captures]))
+          explicit-read-arrays (par/collect-aget-arrays body)
+          kernel-inputs (into explicit-read-arrays
+                              (when reducing? physical-results))
           scalar-captures (set (remove stable captures))
           description {:id equation-id
                        :bound (:extent attributes)
                        :idx (:index attributes)
                        :lambda body
                        :scalar-region {:locals locals :result scalar-result}
-                       :inputs (into (set arrays) stable)
+                       :inputs kernel-inputs
                        :outputs (set physical-results)
                        :scalars scalar-captures
                        :elem-type result-dtype
@@ -325,16 +329,11 @@
       (throw (ex-info "typed effect-map lowering requires one effect-map equation"
                       {:reason :typed-soac-effect-map-subset :program program})))
     (let [[_ equation-id results _operation] equation
-          {:keys [attributes arrays captures destinations lambda]}
+          {:keys [attributes captures destinations]}
           (soac-dialect/operation-parts equation)
           facts (soac-dialect/facts program)
           values (:values facts)
           physical-results (soac-dialect/physical-results facts equation)
-          result-storage (soac-dialect/result-storage facts equation-id)
-          read-write-destinations
-          (into #{} (keep (fn [{:keys [destination access]}]
-                            (when (= :read-write access) destination)))
-                result-storage)
           destination-dtypes (zipmap physical-results (:dtypes attributes))
           _ (when-not (= destinations physical-results)
               (throw (ex-info "typed effect-map destination storage changed after validation"
@@ -358,6 +357,10 @@
           effects (mapv (comp lower-effect soac-dialect/scheduled-effect) body-results)
           effect-leaves (soac-dialect/effect-leaves effects)
           stable (set (get-in attributes [:attributes :stable-array-captures]))
+          explicit-read-arrays
+          (reduce set/union #{}
+                  (map par/collect-aget-arrays
+                       (tree-seq coll? seq [locals effects])))
           scalar-captures (set (remove stable captures))
           write-conflicts
           (into {} (map (fn [destination]
@@ -365,6 +368,15 @@
                                         (first (filter #(= destination (:destination %))
                                                        effect-leaves)))])
                         physical-results))
+          ;; Result-storage :read-write means the *logical result* may preserve untouched
+          ;; destination elements.  It is not by itself evidence that this kernel reads the
+          ;; destination.  Keep the physical ABI :inout only for an explicit destination read
+          ;; or an atomic reduction; write coverage is certified separately by write-coverage.
+          kernel-read-write-destinations
+          (into (set/intersection explicit-read-arrays (set physical-results))
+                (keep (fn [[destination conflict]]
+                        (when (soac-dialect/reducing-scatter-conflict? conflict) destination)))
+                write-conflicts)
           result-dtype (or (:dtype (get values (first results))) dtype :double)
           iteration-order (:iteration-order attributes)
           description {:id equation-id
@@ -373,7 +385,8 @@
                        :lambda nil
                        :scalar-region {:locals locals :effects effects
                                        :iteration-order iteration-order}
-                       :inputs (into (into (set arrays) stable) read-write-destinations)
+                       :inputs (into explicit-read-arrays
+                                     kernel-read-write-destinations)
                        :outputs (set physical-results)
                        :scalars scalar-captures
                        :elem-type result-dtype

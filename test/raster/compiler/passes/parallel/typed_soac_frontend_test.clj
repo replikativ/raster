@@ -1,11 +1,11 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.par]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -69,6 +69,80 @@
     (is (= normalized (frontend/normalize-source normalized options)))
     (doseq [n [Long/MIN_VALUE -1 0 1 3 2147483648 Long/MAX_VALUE]]
       (is (= (run source n) (run normalized n)) (str "count " n)))))
+
+(deftest rectangular-dotimes-nests-linearize-before-independent-ownership
+  (let [source '(let* [effect
+                       (dotimes [row rows]
+                         (dotimes [column columns]
+                           (if (clojure.core/< column visible)
+                             (clojure.core/aset out
+                                                (clojure.core/+ (clojure.core/* row columns)
+                                                                column)
+                                                (double (clojure.core/+ row column))))))]
+                      effect)
+        options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'rows :long 'columns :long 'visible :long}}
+        normalized (frontend/normalize-source source options)
+        operation (last (take-nth 2 (rest (second normalized))))
+        program (frontend/form->program normalized options)
+        equation (last (dialect/equations program))
+        run (fn [form rows columns visible]
+              (let [out (double-array (max 0 (* (max 0 rows) (max 0 columns))))
+                    f (eval (list 'fn '[rows columns visible out] form))]
+                [(f rows columns visible out) (vec out)]))]
+    (is (= 'raster.par/map-void! (first operation)))
+    (is (some? program))
+    (is (= 'scatter (dialect/operation-kind equation))
+        "the ordinary mixed-radix proof, not the source rewrite, certifies unique writes")
+    (doseq [[rows columns visible] [[2 3 2] [1 4 8] [0 3 2] [-1 3 2] [2 -3 2]]]
+      (is (= (run source rows columns visible)
+             (run normalized rows columns visible))
+          (str "shape " [rows columns visible])))))
+
+(deftest irregular-loop-nests-remain-source-control
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'rows :long 'columns :long}}
+        dependent '(let* [effect (dotimes [row rows]
+                                   (dotimes [column (clojure.core/long row)]
+                                     (clojure.core/aset out column 1.0)))]
+                         effect)
+        imperfect '(let* [effect (dotimes [row rows]
+                                   (clojure.core/aset out row 1.0)
+                                   (dotimes [column columns]
+                                     (clojure.core/aset out column 2.0)))]
+                         effect)]
+    (doseq [source [dependent imperfect]]
+      (let [loop-expression (nth (second source) 1)]
+        (is (nil? (#'frontend/flatten-rectangular-dotimes loop-expression))
+            "a nonrectangular source loop must not acquire a flattened-domain certificate")
+        ;; Later structured-control/effect analysis remains free to support it sequentially.
+        (frontend/normalize-source source options)))))
+
+(deftest three-dimensional-row-major-source-enters-one-typed-equation
+  (let [source '(let* [^long row-width (clojure.core/* channels kernel)
+                       effect
+                       (dotimes [position positions]
+                         (dotimes [channel channels]
+                           (dotimes [tap kernel]
+                             (clojure.core/aset
+                              patches
+                              (clojure.core/+ (clojure.core/* position row-width)
+                                              (clojure.core/* channel kernel) tap)
+                              (float (clojure.core/aget
+                                      input
+                                      (clojure.core/+ (clojure.core/* position channels)
+                                                      channel)))))))]
+                      effect)
+        options {:dtype :float :array-types {'input :float 'patches :float}
+                 :scalar-types {'positions :long 'channels :long 'kernel :long}}
+        normalized (frontend/normalize-source source options)
+        program (frontend/form->program normalized options)
+        equation (last (dialect/equations program))]
+    (is (some? program))
+    (is (= 'scatter (dialect/operation-kind equation)))
+    (is (= :unique (get-in (dialect/operation-parts equation) [:attributes :conflict])))
+    (is (= 1 (count (filter #(= 'scatter (dialect/operation-kind %))
+                            (dialect/equations program)))))))
 
 (deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
   (let [options {:dtype :double :array-types {'out :double}
@@ -1589,7 +1663,7 @@
                         effect)
                  {:dtype :float :array-types {'x :float 'out :float}
                   :scalar-types {'rows :long 'feat :long}})
-        swapped (clojure.walk/postwalk
+        swapped (walk/postwalk
                  (fn [form]
                    (if (and (seq? form) (= 'effect-region (first form)) (= 2 (count (second form))))
                      (list 'effect-region (vec (reverse (second form))) (nth form 2))
