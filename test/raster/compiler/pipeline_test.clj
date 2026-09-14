@@ -101,6 +101,19 @@
     (is (:raster.effect/effectful (meta (first (second carried)))))
     (is (:raster.effect/effectful (meta inner-binder)))))
 
+(deftest void-contract-carrying-marks-only-unused-effect-loop-results
+  (let [effect-loop '(loop* [i 0]
+                       (if (< i n)
+                         (do (clojure.core/aset output i 0.0) (recur (inc i)))
+                         nil))
+        unused (#'pipeline/carry-void-binding-contracts
+                (list 'let* ['_ effect-loop 'answer 1] 'answer))
+        consumed (#'pipeline/carry-void-binding-contracts
+                  (list 'let* ['result effect-loop 'answer '(if result 1 2)] 'answer))]
+    (is (:raster.effect/effectful (meta (first (second unused)))))
+    (is (not (:raster.effect/effectful (meta (first (second consumed)))))
+        "an observable nil result is not silently reclassified as a GPU statement")))
+
 ;; ================================================================
 ;; Pass registry
 ;; ================================================================

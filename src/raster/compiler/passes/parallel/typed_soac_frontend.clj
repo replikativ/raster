@@ -570,6 +570,33 @@
                                     [[:region {:locals (:locals continuation) :order order}]]
                                     order)))})))))))))
 
+(defn- effect-store-binding
+  "Compose an effect-only counted loop binding with its ordered continuation.
+
+   The loop itself is recognized by the existing counted-store-loop contract. Its unused binder
+   must carry the fixpoint statement marker (or still satisfy the same structural contract); this
+   rule therefore cannot reinterpret a value-returning loop as an effect."
+  [body index]
+  (let [[head bindings & tail] body
+        [statement initializer] bindings]
+    (when (and (form/let-head? head) (vector? bindings) (= 2 (count bindings))
+               (symbol? statement)
+               (or (true? (:raster.effect/effectful (meta statement)))
+                   (util/effect-loop-statement? initializer)))
+      (when-let [loop-region (counted-store-loop initializer index)]
+        (when-let [continuation (store-region (list* 'do tail) index)]
+          (let [loop-count (count (:loops loop-region))
+                continuation-order
+                (map-region-order (region-order continuation) identity 0 loop-count)]
+            {:locals []
+             :stores (:stores continuation)
+             :loops (into (:loops loop-region) (:loops continuation))
+             :order (into (region-order loop-region)
+                          (if (seq (:locals continuation))
+                            [[:region {:locals (:locals continuation)
+                                       :order continuation-order}]]
+                            continuation-order))}))))))
+
 (defn- store-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
 
@@ -591,7 +618,9 @@
              (reduce (fn [tail pair] (list head (vec pair) tail))
                      (list* 'do tail) (reverse (partition 2 bindings)))
              index result-expression)))
-        (when-not (some? result-expression) (carried-store-binding body index))
+        (when-not (some? result-expression)
+          (or (effect-store-binding body index)
+              (carried-store-binding body index)))
     (let [[_ bindings & nested-body] body]
       (when (and (even? (count bindings))
                  (seq nested-body)

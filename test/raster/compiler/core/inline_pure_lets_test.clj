@@ -37,6 +37,19 @@
   (testing "quoted data is data, not code to scan"
     (is (not (util/effectful? '(quote (raster.arrays/aset O 0 1.0)))))))
 
+(deftest effect-loop-statements-have-no-terminal-value
+  (is (util/effect-loop-statement?
+       '(loop* [i 0]
+          (if (< i n)
+            (do (raster.arrays/aset O i 1.0) (recur (inc i)))
+            nil))))
+  (is (not (util/effect-loop-statement?
+            '(loop* [i 0 acc 0.0]
+               (if (< i n)
+                 (recur (inc i) (+ acc (raster.arrays/aget A i)))
+                 acc))))
+      "a value-carrying reduction loop is never a statement"))
+
 ;; ── the rewrite ─────────────────────────────────────────────────────────────────────
 (deftest sequential-inits-see-the-prior-bindings
   (testing "let* is sequential: b's init must already carry a's substitution"

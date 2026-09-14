@@ -492,6 +492,19 @@
                  (od/aset-op? (:raster.op/original (meta expr))))
             (some effectful? (rest expr))))))
 
+(defn effect-loop-statement?
+  "True when a source loop performs effects and has no terminal value.
+
+   This is a structured result contract, not a loop-name exemption: value-carrying loops return a
+   terminal expression and are false. Callers must additionally prove that the enclosing binder is
+   unused before treating the loop as a statement, since Clojure's nil remains an observable host
+   value even though it has no GPU scalar representation."
+  [expr]
+  (and (seq? expr)
+       (form/loop-head? (first expr))
+       (nil? (form/terminal-value-expr expr))
+       (effectful? expr)))
+
 (defn binding-env
   "A `let*` binding vector → the substitution env that beta-reduces it: {sym → init}, with each
    init already carrying the substitutions of the bindings BEFORE it (`let*` is sequential).
