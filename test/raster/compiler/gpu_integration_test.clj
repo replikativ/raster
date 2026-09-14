@@ -166,6 +166,23 @@
                (vec (gpu-link/download executable (first (:outputs plan))))))
         (finally (gpu-link/close! executable))))))
 
+(deftest im2col-2d-axis-permutation-executes-through-the-direct-vertical
+  (when-gpu "im2col-2d-axis-permutation"
+    (let [input (float-array (map float (range 1 10)))
+          arguments [input 1 1 3 3 2 2 1 1 0 0]
+          expected (apply nn/im2col-2d arguments)
+          compilation (equation-first/compile #'nn/im2col-2d
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          executable (gpu-link/instantiate! plan)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 2 (count (:kernels compilation))))
+      (try
+        (gpu-link/run! executable)
+        (is (= (vec expected)
+               (vec (gpu-link/download executable (first (:outputs plan))))))
+        (finally (gpu-link/close! executable))))))
+
 (deftest heat-2d-counted-stores-execute-through-the-direct-vertical
   (when-gpu "heat-2d-counted-store-execution"
     (doseq [[nx ny] [[2 3] [5 7]]]
