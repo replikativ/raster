@@ -925,21 +925,14 @@
    algebra needs an extent's product structure, which its SSA id hides."
   {})
 
-(defn- expand-scalar-definitions
-  [expression]
-  (loop [expression expression remaining (inc (count *scalar-definitions*))]
-    (let [expanded (util/subst-syms *scalar-definitions* expression)]
-      (if (or (= expanded expression) (zero? remaining))
-        expanded
-        (recur expanded (dec remaining))))))
-
 (defn- expand-extent-definitions
   "Expand only scalar names whose definitions remain multiplicative extent algebra.
 
    A derived dimension such as `l-out = 1 + quot(...)` is an opaque nonnegative shape factor;
    substituting its implementation into `l-out*c*kernel` destroys the monomial even though the
    dimension is perfectly valid. Products, guarded rectangular products, and aliases remain
-   transparent. Index expressions continue to use full scalar expansion."
+   transparent. Address expressions use the context-sensitive sibling below: they expose product
+   spines while preserving derived dimensions where those dimensions act as factors or radices."
   [expression]
   (let [definitions (into {}
                           (filter (fn [[_ definition]]
@@ -960,6 +953,56 @@
         (if (or (= expanded expression) (zero? remaining))
           expanded
           (recur expanded (dec remaining)))))))
+
+(defn- expand-index-definitions
+  "Expand address arithmetic without dissolving opaque shape factors.
+
+   A scalar used as an additive term may expose its complete definition. A scalar used as a
+   multiplicative factor exposes aliases and product spines, but an additive derived dimension
+   remains an atom. Thus `col-cols = batch*l-out` becomes that product in
+   `row*col-cols + col`, while `l-out = 1 + quot(...)` remains the dimension named by the
+   mixed-radix decomposition. This is proof-only expansion; executable scalar equations and
+   their evaluation order are unchanged."
+  [expression]
+  (letfn [(expand [form context seen]
+            (cond
+              (and (symbol? form) (contains? *scalar-definitions* form)
+                   (not (contains? seen form)))
+              (let [definition (get *scalar-definitions* form)
+                    operation (when (seq? definition) (descriptor/semantic-op definition))
+                    transparent? (or (= :term context)
+                                     (symbol? definition)
+                                     (and operation (descriptor/multiplication-op? operation))
+                                     (some? (index-algebra/monomial definition)))]
+                (if transparent?
+                  (expand definition context (conj seen form))
+                  form))
+
+              (seq? form)
+              (let [operation (descriptor/semantic-op form)
+                    quotient-or-remainder?
+                    (contains? '#{quot clojure.core/quot rem clojure.core/rem
+                                  mod clojure.core/mod}
+                               operation)
+                    contexts (cond
+                               (descriptor/multiplication-op? operation)
+                               (repeat :factor)
+
+                               ;; The divisor is a radix/shape factor. Expanding an additive
+                               ;; derived dimension there changes the vocabulary of the matched
+                               ;; quot/rem decomposition and makes an equivalent mixed-radix
+                               ;; program depend on whether it has already been walked.
+                               quotient-or-remainder?
+                               (cons :term (repeat :factor))
+
+                               :else (repeat context))]
+                (with-meta (apply list (first form)
+                                  (map #(expand %1 %2 seen) (rest form) contexts))
+                  (meta form)))
+
+              (vector? form) (mapv #(expand % context seen) form)
+              :else form))]
+    (expand expression :term #{})))
 
 (defn- invariant-read-atoms
   "Replace every array read in `form` that is uniform across the map with an atom symbol: a
@@ -1020,7 +1063,7 @@
                               (map :index loops) carry-bindings))
         atoms (atom {})
         expand-index (fn [form]
-                       (invariant-read-atoms (expand-scalar-definitions form)
+                       (invariant-read-atoms (expand-index-definitions form)
                                              destinations varying atoms))
         expand-extent (fn [form]
                         (invariant-read-atoms (expand-extent-definitions form)
@@ -1031,12 +1074,12 @@
       (index-algebra/index-form
        (canonical-index-arithmetic (expand-index (:index store)))
        index (expand-extent extent)
-       ;; Region locals participate in address arithmetic, not merely in the launch extent.
-       ;; Preserve the established full expansion here: Q4 packing and other mixed-radix
-       ;; kernels name quotient/remainder digits through these locals.  Selective expansion is
-       ;; only appropriate for shape extents, where derived dimensions must remain opaque
-       ;; non-negative factors.
-       (mapv #(update % :init expand-index) (concat locals (:locals loop)))
+       ;; Region locals are part of the same proof expression as the final store address. Expose
+       ;; their address/product spines and canonicalize retained numeric dispatch too; leaving a
+       ;; walked `.invk` inside a row/column local would make an otherwise affine permutation
+       ;; opaque to the algebra.
+       (mapv #(update % :init (comp canonical-index-arithmetic expand-index))
+             (concat locals (:locals loop)))
        (if loop {(:index loop) (expand-extent (:extent loop))} {})))))
 
 (defn- fixed-guard-domain
