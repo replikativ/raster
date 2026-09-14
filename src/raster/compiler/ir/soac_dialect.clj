@@ -785,14 +785,16 @@
          parts)))
 
 (defn strict-effect-scalar-policy?
-  "Carried values and nested lexical regions require retained arithmetic types and explicit
+  "Carried values and nested lexical scopes require retained arithmetic types and explicit
    storage conversion. Legacy flat, uncarried effects keep their existing policy."
   [effects]
   (boolean
    (some (fn [effect]
            (or (:region effect)
                (when-let [loop (:loop effect)]
-                 (or (:carry loop) (strict-effect-scalar-policy? (:effects loop))))))
+                 (or (:carry loop)
+                     (some #(or (:loop %) (:region %)) (:effects loop))
+                     (strict-effect-scalar-policy? (:effects loop))))))
          effects)))
 
 (declare fail! validate-scalar-fold-scopes!)
@@ -1451,7 +1453,11 @@
                               (= (count ids) (count (distinct ids)))
                               (empty? (set/intersection scope (set ids)))
                               (every? some? inner)
-                              (not (effect-parts-contain? :loop inner)) (seq inner))
+                              ;; Ordinary counted loops may contain another ordered effect loop.
+                              ;; A carried loop still forbids it until exported nested carry state
+                              ;; has an explicit lexical contract.
+                              (or (not carry) (not (effect-parts-contain? :loop inner)))
+                              (seq inner))
                  (fail! :typed-soac-effect-loop
                         "effect loops require matching typed binders and one closed effect level"
                         {:equation equation-id :loop (:index part) :parameters loop-parameters}))

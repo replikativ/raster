@@ -44,16 +44,17 @@
                  (program '(effect-region [(let-value v :unknown 1)]
                                           [(effect dst :unique i 1 v)])
                           :write #{:memory/write})))
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (program
-                  '(effect-loop {:index k :lower 0} 2
-                     (lambda [k]
-                       (effect-region []
-                         [(effect-region []
-                            [(effect-loop {:index j :lower 0} 2
-                               (lambda [j]
-                                 (effect-region [] [(effect dst :unique i 1 0.0)])))])])))
-                  :write #{:memory/write})))))
+    (let [nested-loops
+          '(effect-loop {:index k :lower 0} 2
+             (lambda [k]
+               (effect-region []
+                 [(effect-region []
+                    [(effect-loop {:index j :lower 0} 2
+                       (lambda [j]
+                         (effect-region [] [(effect dst :unique i 1 0.0)])))])])))
+          nested-program (program nested-loops :write #{:memory/write})]
+      (is (= nested-program (dialect/validate! nested-program))
+          "ordinary nested effect loops are a closed recursive lexical region"))))
 
 (def nested
   '(effect-region [(let-value inv :double (/ 1.0 sum))]

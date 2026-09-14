@@ -25,6 +25,8 @@
         result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]
     (is (= :float (:type result)))
     (is (= Float/NEGATIVE_INFINITY (get-in result [:result :value])))
+    (is (= :float (:type (lower '(float Double/NEGATIVE_INFINITY) :float {})))
+        "a closed Java numeric field retains its source width across an explicit cast")
     (is (= 'Float/NEGATIVE_INFINITY
            (:result (lower 'Float/NEGATIVE_INFINITY :float
                            {'Float/NEGATIVE_INFINITY :float})))

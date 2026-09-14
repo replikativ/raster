@@ -782,6 +782,14 @@ are explicit. Static component projections share one multi-result KernelBody loo
 does not become host allocation and does not duplicate reads or arithmetic. The matcher requires the
 exact carry tuple on exit and makes no associativity claim; parallel product-reduction scheduling
 still requires component algebra certificates. OpenCL, CUDA, HIP and JVM consume this same region.
+Ordinary ordered effect loops form the same recursive lexical tree: a loop may contain typed locals,
+stores, regions and another ordinary loop without flattening source order into a backend string.
+Store leaves retain their full effect path; cross-work-item ownership is proved over the enclosing
+map domain, while repeated lane-local updates remain sequenced by their loop tree. Nested carried
+effect loops remain outside this boundary until their exported state has an explicit lexical
+contract. The bidirectional attention dQ/dK/dV programs are the first public training workload to
+exercise this vertical: each now reaches validated TypedSOAC and emits only KernelBody artifacts,
+without an attention opcode or handwritten attention-gradient kernel.
 
 Sequential control around a parallel algorithm is represented separately as the Pattern-declared
 `TypedStructuredControl` dialect. Its canonical loop is a typed fixpoint around one closed
