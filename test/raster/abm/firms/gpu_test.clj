@@ -257,30 +257,37 @@
             [{:type :long :value 42}] 17]
            @call))))
 
-(deftest test-active-ids-codegen
-  (testing "generate-par-active-ids-kernel emits correct long types"
-    (let [k (par-opencl/generate-par-active-ids-kernel)]
-      (is (some? k) "Should return kernel info")
-      (is (string? (:source k)))
-      (let [src ^String (:source k)]
-        (is (.contains src "__global int* ids") "Output must be int*")
-        (is (.contains src "long n_agents") "n_agents must be long")
-        (is (.contains src "long base_seed") "base_seed must be long")
-        (is (.contains src "0x9e3779b97f4a7c15") "Must use splitmix64 golden ratio"))
-      (is (= ['ids] (:array-params k)) "Array param should be 'ids")
-      (is (some #(= :long (:type %)) (:scalar-params k)) "Some scalar must be :long"))))
+(deftest active-ids-session-api-uses-the-generic-map-abi
+  (let [call (atom nil)
+        session (atom {:device-id :ze:0
+                       :kernels {:generate-active-ids [{:kernel-name "typed_active_ids_map"}]}
+                       :buffers {:active-ids :resident-ids}})
+        resolver (fn [_device operation]
+                   (is (= "invoke-registered-kernel" operation))
+                   (fn [& arguments] (reset! call arguments)))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      #(gpu/invoke-active-ids! session :generate-active-ids :active-ids 17 1000 42))
+    (is (= ["typed_active_ids_map" [] :resident-ids
+            [{:type :long :value 42} {:type :long :value 1000}] 17]
+           @call))))
 
 (deftest test-active-ids-opencl-dispatch
-  (testing "opencl-pass dispatches par/active-ids! to invoke-registered-active-ids-kernel"
+  (testing "opencl-pass dispatches par/active-ids! through the ordinary typed map ABI"
     (let [form '(raster.par/active-ids! ids n-active n-agents base-seed)
-          result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)]
+          result (opencl-pass/opencl-pass
+                  form :dtype :int :compile-spirv? false
+                  :array-types {'ids :int}
+                  :scalar-types {'n-active :long 'n-agents :long 'base-seed :long})]
       (is (= 1 (count (:kernels result))) "Should generate exactly one kernel")
       (let [k (first (:kernels result))
             emitted (:form result)]
         (is (.contains ^String (:source k) "__global int* ids") "Kernel output is int*")
+        (is (.contains ^String (:source k) "long n_agents") "Population stays int64")
         (is (seq? emitted) "Emitted form should be a seq")
-        (is (= 'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel (first emitted))
-            "Should emit invoke-registered-active-ids-kernel call")))))
+        (is (some #{'raster.gpu.ze-runtime/invoke-registered-kernel} (flatten emitted)))
+        (is (not-any? #{'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel}
+                      (flatten emitted)))))))
 
 (deftest test-active-ids-opencl-compilation-is-owned-by-the-pass
   (testing "the optional pass boundary compiles generated source exactly once"
@@ -292,7 +299,9 @@
                       spv)]
         (let [result (opencl-pass/opencl-pass
                       '(raster.par/active-ids! ids n-active n-agents base-seed)
-                      :dtype :float
+                      :dtype :int
+                      :array-types {'ids :int}
+                      :scalar-types {'n-active :long 'n-agents :long 'base-seed :long}
                       :device-id :ze:0
                       :compile-spirv? true)]
           (is (= 1 @compilations)
@@ -310,33 +319,32 @@
 
 (deftest test-active-ids-gpu
   (when-ze "ABM active-id generation"
-   (testing "GPU active-ids kernel: all indices in [0, n-agents)"
-     (ze/init!)
-     (gpu/with-gpu-session [sess :ze:0]
-       (fgpu/compile-abm-kernels! sess)
-       (gpu/alloc! sess {:active-ids [:int 5000 nil]})
-       (let [n-active 5000
-             n-agents 100000]
-         (gpu/invoke-active-ids! sess :generate-active-ids :active-ids n-active n-agents 42424242)
-         (let [ids (gpu/download sess :active-ids)]
-           (is (every? #(and (>= % 0) (< % n-agents)) ids)
-               "All GPU-generated indices should be in [0, n-agents)")
-           (let [unique (count (distinct (seq ids)))]
-             (is (> unique 4700) "GPU indices should be well-distributed"))))))
-
-   (testing "GPU active-ids: different seeds → different results"
-     (ze/init!)
-     (gpu/with-gpu-session [sess :ze:0]
-       (fgpu/compile-abm-kernels! sess)
-       (gpu/alloc! sess {:ids1 [:int 1000 nil]
-                         :ids2 [:int 1000 nil]})
-       (let [n-active 1000 n-agents 50000
-             aid-kinfo (first (gpu/kernel sess :generate-active-ids))
-             aid-kname (:kernel-name aid-kinfo)]
-         (ze/invoke-registered-active-ids-kernel aid-kname (gpu/buffer sess :ids1) n-active n-agents 111)
-         (ze/invoke-registered-active-ids-kernel aid-kname (gpu/buffer sess :ids2) n-active n-agents 999)
-         (is (not= (seq (gpu/download sess :ids1)) (seq (gpu/download sess :ids2)))
-             "Different seeds should give different GPU indices"))))))
+    (ze/init!)
+    (gpu/with-gpu-session [sess :ze:0]
+      (gpu/compile! sess :generate-active-ids #'phases/generate-active-ids-par! {:dtype :int})
+      (gpu/alloc! sess {:active-ids [:int 5000 nil]
+                        :ids1 [:int 1000 nil]
+                        :ids2 [:int 1000 nil]})
+      (testing "GPU active-ids kernel: all indices in [0, n-agents)"
+        (let [n-active 5000
+              n-agents 100000
+              seed 42424242
+              expected (int-array n-active)]
+          (par/active-ids! expected n-active n-agents seed)
+          (gpu/invoke-active-ids! sess :generate-active-ids :active-ids
+                                  n-active n-agents seed)
+          (let [ids (gpu/download sess :active-ids)]
+            (is (= (seq expected) (seq ids))
+                "typed GPU scalar algebra agrees exactly with the host SplitMix expansion")
+            (is (every? #(and (>= % 0) (< % n-agents)) ids)
+                "All GPU-generated indices should be in [0, n-agents)")
+            (is (> (count (distinct (seq ids))) 4700)
+                "GPU indices should be well-distributed"))))
+      (testing "GPU active-ids: different seeds produce different results"
+        (let [n-active 1000 n-agents 50000]
+          (gpu/invoke-active-ids! sess :generate-active-ids :ids1 n-active n-agents 111)
+          (gpu/invoke-active-ids! sess :generate-active-ids :ids2 n-active n-agents 999)
+          (is (not= (seq (gpu/download sess :ids1)) (seq (gpu/download sess :ids2)))))))))
 
 ;; ================================================================
 ;; Test: Full GPU Blelloch scan correctness (requires Level Zero)

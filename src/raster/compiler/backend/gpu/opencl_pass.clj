@@ -400,7 +400,7 @@
    Uses full SegOp conversion for par/map! and par/reduce.
    Effect-only map-void forms consume their scheduled TypedSOAC SegMap, including raw nested
    leaves. Effect bodies without a typed schedule retain a reported compatibility route;
-   the remaining active-id and key-reduction forms also retain compatibility generators.
+   key reduction still retains a compatibility entry for callers without a complete program.
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
             :kernels [{:kernel-name :source ...} ...]}
@@ -473,6 +473,7 @@
         direct-mini-program?
         (and (nil? supplied-program)
              (or (par/par-rng-fill-form? form)
+                 (par/par-active-ids-form? form)
                  ;; Plain-array scheduling cannot interpret a logical SoA as one tensor pointer.
                  (and (par/par-map-void-form? form) (not (unlowered-soa-effect? form)))
                  (and (par/par-gather-form? form)
@@ -959,12 +960,16 @@
 
             ;; par/active-ids!
             (par/par-active-ids-form? form)
-            (let [{:keys [ids n-active n-agents base-seed]} (par/extract-par-active-ids-info form)
-                  k (register-kernel!
-                     (legacy/generate-par-active-ids-kernel)
-                     :ze-maps)]
-              (list 'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel
-                    (:kernel-name k) ids n-active n-agents base-seed))
+            (if-let [scheduled (take-bound-segop
+                                stats :segmap
+                                #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                      (= :typed-soac (:algorithm-dialect %))))]
+              (let [kernel (segop-cl/generate-scheduled-segmap-kernel
+                            scheduled :dtype (:dtype scheduled)
+                            :scalar-types top-scalar-types :array-types top-array-types)
+                    k (register-kernel! kernel :ze-maps)]
+                (emit-map-invocation k device-id))
+              (emit-nested-map! form))
 
             ;; par/stencil!
             (par/par-stencil-form? form)
