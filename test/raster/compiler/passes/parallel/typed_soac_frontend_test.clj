@@ -233,6 +233,24 @@
     (is (nil? (frontend/form->program source options))
         "host-only staging cannot move a later throw before an independent device write")))
 
+(deftest certified-checked-scalars-after-host-allocation-bound-a-following-typed-island
+  (let [source '(let* [out (double-array (long n))
+                       checked (clojure.core/int n)
+                       result (raster.par/map! out i checked double 1.0)]
+                      result)
+        result (route/attempt source :double {} {:scalar-types {'n :long}})
+        program (:program result)
+        source-symbols (mapv first (partition 2 (second (:source program))))]
+    (is (= :typed-soac (:dialect program)))
+    (is (= [1] (get-in program [:attributes :host-binding-ids]))
+        "the checked cast stays a host boundary rather than becoming a hoisted scalar equation")
+    (is (= '[out checked result] source-symbols)
+        "allocation, checked cast, and device operation retain their source order")
+    (is (= :int (get-in program [:values 'checked :dtype]))
+        "the following island consumes the retained source ABI, not an extent-derived guess")
+    (is (= 1 (count (:equations program))))
+    (is (:typed-validated (:stats result)))))
+
 (deftest retained-local-types-prove-generated-identity-casts-after-a-map
   (let [source '(let* [first-result (raster.par/map! tmp i n long 1)
                        ^long rows (* n n)
