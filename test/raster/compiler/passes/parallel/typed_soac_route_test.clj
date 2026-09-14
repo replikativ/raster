@@ -1963,6 +1963,39 @@
     (is (= #{partial} (:inputs phase-two)))
     (is (= :double (get-in scheduled [:values partial :dtype])))))
 
+(deftest direct-zero-slot-store-is-a-resident-functional-reduction
+  (let [source
+        '(let* [out (clojure.core/double-array 1)
+                effect (clojure.core/aset
+                        out 0
+                        (raster.par/reduce acc 0.0 i (clojure.core/long n)
+                                           (clojure.core/+ (clojure.core/double acc)
+                                                           (clojure.core/aget x i))))]
+               out)
+        {:keys [program stats]} (route/attempt
+                                 source :double {'x :double}
+                                 {:resident-reductions? true
+                                  :resident-initialization? true
+                                  :scalar-types {'n :long}})
+        algorithm (get-in program [:equations 0 :algorithm])
+        equation (first (dialect/equations algorithm))
+        equation-id (second equation)
+        storage (dialect/result-storage (dialect/facts algorithm) equation-id)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :double :target-device :ze:0}))
+        scheduled-outputs (into #{} (mapcat segop/operation-outputs)
+                                (:operations (first (:equations scheduled))))]
+    (is (= 'reduce (dialect/operation-kind equation))
+        "explicit storage does not turn an ordinary reduction into a synthetic contraction")
+    (is (= 1 (:resident-reductions stats)))
+    (is (= [{:destination 'out :access :write :host-return :buffer}] storage))
+    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (= 1 (count (filter #{'clojure.core/double-array} (flatten (:source program)))))
+        "resident realization reuses the caller allocation")
+    (is (contains? scheduled-outputs 'out))
+    (is (not (contains? scheduled-outputs 'effect))
+        "the SegRed physical output is the typed storage alias, not a duplicate logical buffer")))
+
 (deftest host-visible-reduction-is-not-represented-as-resident-storage
   (let [source
         '(let* [y (raster.par/pmap i n float

@@ -180,15 +180,26 @@
    Scalar chains depending on eligible roots must likewise remain internal and capture-only."
   [program]
   (let [program (dialect/validate! program)
+        facts (dialect/facts program)
         equations (dialect/equations program)
         infos (mapv operation-info equations)
         outputs (set (dialect/outputs program))
         uses (group-by first (use-sites equations))
+        stored-reduction-destinations
+        (into {}
+              (mapcat (fn [equation]
+                        (when (= 'reduce (dialect/operation-kind equation))
+                          (map (fn [result storage] [result (:destination storage)])
+                               (nth equation 2)
+                               (or (dialect/result-storage facts (second equation)) [])))))
+              equations)
+        stored-reduction-results (set (keys stored-reduction-destinations))
         candidate-roots
         (set (mapcat (fn [{:keys [kind results]}]
                        (when (= :reduce kind)
                          (filter (fn [result]
-                                   (and (not (contains? outputs result))
+                                   (and (or (not (contains? outputs result))
+                                            (contains? stored-reduction-results result))
                                         (every? #(= :capture (get-in % [1 :role]))
                                                 (get uses result []))))
                                  results)))
@@ -214,12 +225,17 @@
         removed-scalars (set/difference dependent escaping-dependent)]
     (if (empty? roots)
       [program {:resident-reductions 0 :inlined-scalars 0}]
-      (let [facts (dialect/facts program)
-            values (reduce (fn [vs root]
-                             (-> vs
-                                 (assoc-in [root :representation]
-                                           {:kind resident-representation :elements 1})
-                                 (assoc-in [root :memory-space] :device)))
+      (let [values (reduce (fn [vs root]
+                             (let [destination (get stored-reduction-destinations root)
+                                   mark-resident
+                                   (fn [values id]
+                                     (cond-> values
+                                       id (assoc-in [id :representation]
+                                                    {:kind resident-representation :elements 1})
+                                       id (assoc-in [id :memory-space] :device)))]
+                               (-> vs
+                                   (mark-resident root)
+                                   (mark-resident destination))))
                            (:values facts) roots)
             rewritten
             (->> infos

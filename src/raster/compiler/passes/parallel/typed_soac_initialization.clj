@@ -30,8 +30,10 @@
       (some #(= destination (physical-id facts (:destination %)))
             (dialect/result-storage facts (second equation)))))
 
-(defn- plain-storage? [value]
-  (and (= {:kind :plain} (:representation value)) (nil? (:logical-layout value))))
+(defn- dense-initializable-storage? [value]
+  (and (or (= {:kind :plain} (:representation value))
+           (= {:kind :resident-scalar-buffer :elements 1} (:representation value)))
+       (nil? (:logical-layout value))))
 
 (defn- full-overwrite? [facts extent-environment {:keys [destination extent]} equation]
   ;; These functional operations produce their entire validated logical result shape.
@@ -40,7 +42,7 @@
        (some (fn [[result storage]]
                (and (= destination (physical-id facts (:destination storage)))
                     (= :write (:access storage))
-                    (plain-storage? (get-in facts [:values destination]))
+                    (dense-initializable-storage? (get-in facts [:values destination]))
                     (extent-proof/same-volume? extent-environment extent
                                               (dialect/dense-functional-result-shape facts equation result))))
              (map vector (nth equation 2) (dialect/result-storage facts (second equation))))))
@@ -150,7 +152,7 @@
         (fail! "zero allocation requires a canonical integral scalar extent"
                {:allocation allocation}))
       (when (and (= :zero (:initialization allocation))
-                 (not (plain-storage? value)))
+                 (not (dense-initializable-storage? value)))
         (fail! "fresh zero allocation requires plain dense storage"
                {:allocation allocation :value value}))
       ;; AbstractValue shape can be a consumer's logical access domain, not the allocator's
