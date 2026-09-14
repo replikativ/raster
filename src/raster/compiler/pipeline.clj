@@ -330,6 +330,28 @@
   [form param-env]
   (tag-expr-types form (or param-env {})))
 
+(defn- carry-void-binding-contracts
+  "Carry statement effects through binding forms nested inside opaque control.
+
+   Type tagging deliberately does not descend into loop bodies, but the fixpoint census sees every
+   nested binder. This pass attaches only the authoritative void contract of the immediate RHS;
+   it performs no type inference and leaves value-producing expressions untouched."
+  [form]
+  (clojure.walk/postwalk
+   (fn [expression]
+     (if-not (form/binding-form? expression)
+       expression
+       (let [[head bindings & body] expression
+             bindings (vec
+                       (mapcat (fn [[symbol initializer]]
+                                 [(cond-> symbol
+                                    (util/void-form? initializer)
+                                    (vary-meta assoc :raster.effect/effectful true))
+                                  initializer])
+                               (partition 2 bindings)))]
+         (with-meta (list* head bindings body) (meta expression)))))
+   form))
+
 (defn- pass-region-copy
   "Spell array region copies (`acopy!`, `System/arraycopy`) in statement position as the
   counted store loops they are, so the loop lifter, the typed frontend and the resident
@@ -458,7 +480,9 @@
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        (let [final (tag-binding-types (ensure-let*-result current) (:param-env opts))]
+        (let [final (-> (ensure-let*-result current)
+                        (tag-binding-types (:param-env opts))
+                        carry-void-binding-contracts)]
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
@@ -480,7 +504,9 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            (let [final (tag-binding-types (ensure-let*-result current) (:param-env opts))]
+            (let [final (-> (ensure-let*-result current)
+                            (tag-binding-types (:param-env opts))
+                            carry-void-binding-contracts)]
               (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})

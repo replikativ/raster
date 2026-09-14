@@ -466,12 +466,12 @@
 (defn void-form?
   "Does this form have NO return value — i.e. is it a statement rather than an expression?
 
-   Reads the walker/TC-stamped `:raster.type/tag` first: if the form has a return type it is not
-   void. Falls back to the op-descriptor registry for the compiler primitives (`aset`, `collect!`)
-   that pass through the walker as opaque macros."
+   The operation descriptor is authoritative. Statement forms can inherit incidental contextual
+   type metadata while being moved through an enclosing typed expression (`dotimes` is the common
+   case); that metadata cannot turn a language-level void operation into a value. Value-producing
+   atomics are deliberately absent from the descriptor's void set."
   [expr]
   (and (seq? expr)
-       (not (:raster.type/tag (meta expr)))
        (od/void-op? (first expr))))
 
 (defn effectful?

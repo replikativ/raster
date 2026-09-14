@@ -79,7 +79,8 @@
                 ['result '(raster.par/map-void! i n body)]))))))
 
 (deftest binding-tagging-carries-the-void-statement-contract
-  (doseq [expression ['(dotimes [i n] (clojure.core/aset output i 0.0))
+  (doseq [expression [(with-meta '(dotimes [i n] (clojure.core/aset output i 0.0))
+                         {:raster.type/tag 'float})
                       '(raster.par/segmented-fold-map!
                         [output] [[segment segment-count]] index width
                         [[sum 0.0 :float width sum]] [(float sum)])]]
@@ -88,6 +89,17 @@
           binder (first (second tagged))]
       (is (:raster.effect/effectful (meta binder))
           (str "missing statement contract for " (first expression))))))
+
+(deftest void-contract-carrying-reaches-bindings-inside-opaque-loops
+  (let [form '(let* [outer
+                     (dotimes [i n]
+                       (let* [_ (dotimes [j i] (clojure.core/aset output j 0.0))]
+                         nil))]
+                output)
+        carried (#'pipeline/carry-void-binding-contracts form)
+        inner-binder (-> carried second second (nth 2) second first)]
+    (is (:raster.effect/effectful (meta (first (second carried)))))
+    (is (:raster.effect/effectful (meta inner-binder)))))
 
 ;; ================================================================
 ;; Pass registry
