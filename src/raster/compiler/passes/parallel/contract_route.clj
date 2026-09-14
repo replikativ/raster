@@ -1442,6 +1442,13 @@
                         (merge
                          (cond-> {:xmx-direct base-matrix-schedule
                                   :xmx-split-k (assoc base-matrix-schedule :split-k? true)}
+                           (some #(= :xmx-direct-dynamic-lhs
+                                     (kdispatch/alternative-strategy %))
+                                 (:alternatives mixed))
+                           (assoc :xmx-direct-dynamic-lhs
+                                  (assoc base-matrix-schedule
+                                         :input-fusion {:lhs :tile-local
+                                                        :rhs :materialized}))
                            (some #(= :xmx-direct-tile-inputs (kdispatch/alternative-strategy %))
                                  (:alternatives mixed))
                            (assoc :xmx-direct-tile-inputs

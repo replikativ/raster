@@ -1,5 +1,5 @@
 (ns raster.perf.matrix-input-fusion-probe
-  "Opt-in device replay oracle and paired timing for staged versus fused matrix input conversion."
+  "Opt-in replay oracle for materialized, activation-fused, and fully fused matrix inputs."
   (:refer-clojure :exclude [run!])
   (:require [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -73,8 +73,13 @@
          spec {:id :input-fusion-replay :a 'A :b 'B :c 'C :m m :n n :k k :variant variant
                :fill-workgroups 16
                :tile (get tiles tile-policy)}
-         candidates [(first (:alternatives (gemm/emit-matrix-alternatives spec)))
-                     (gemm/emit-matrix-input-fusion-alternative spec)]
+         emitted (:alternatives (gemm/emit-matrix-alternatives spec))
+         candidates (mapv (fn [strategy]
+                            (or (some #(when (= strategy (get-in % [:attributes :strategy])) %)
+                                      emitted)
+                                (throw (ex-info "matrix input probe candidate is absent"
+                                                {:strategy strategy :variant variant}))))
+                          [:xmx-direct :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs])
          live (atom []) profiles (atom [])]
      (gpu/with-gpu-session [sess device]
        (when (= :all-stages residency)
