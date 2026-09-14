@@ -1498,6 +1498,35 @@
 (defn- operation-description
   [id symbol expression default-dtype array-types scalar-types]
   (cond
+    ;; A scalar reduction stored directly into element zero is precisely the resident
+    ;; `reduce-into` contract.  Fixpoint reduction recovery produces this form from ordinary
+    ;; Clojure loops; recognize the algebra here instead of sending the nested reduction to a
+    ;; source-emitter fallback.  Other coordinates remain ordinary effects and are not guessed.
+    (and (descriptor/aset-call? expression)
+         (= 0 (descriptor/unwrap-int-cast
+               (second (descriptor/call-args expression))))
+         (par/par-reduce-form? (nth (descriptor/call-args expression) 2)))
+    (let [[_ _ reduction] (descriptor/call-args expression)
+          destination (descriptor/aset-array-sym expression)
+          {:keys [acc init idx bound body elem-type]}
+          (par/extract-par-reduce-info reduction)
+          bound (normalize-scalar-casts bound scalar-types)
+          result-dtype (dtype/canon (or elem-type
+                                        (get array-types destination)
+                                        default-dtype :double))
+          reduction (with-meta
+                      (list 'raster.par/reduce acc init idx bound body)
+                      (assoc (meta reduction) :raster.type/elem-type result-dtype))
+          description (operation-description
+                       id symbol reduction default-dtype array-types scalar-types)]
+      (assoc description
+             :results [symbol]
+             :outputs #{destination}
+             :effect-only? true
+             :host-binding symbol
+             :result-storage [{:destination destination :access :write
+                               :host-return :buffer}]))
+
     ;; SplitMix64 is pointwise scalar algebra, not a semantic parallel primitive. Preserve the
     ;; public convenience operation's fixed-width ABI here, then expose an ordinary typed map to
     ;; fusion and scheduling. Wrapping arithmetic remains explicit in the scalar source and is
@@ -1792,7 +1821,7 @@
           identity-scalars
           (set/difference (util/free-syms init) (:inputs io)
                           (set [symbol acc idx]) descriptor/aget-ops descriptor/aset-ops)]
-      (merge {:kind :reduce :id id :sym symbol :index idx :extent bound
+      (merge {:kind :reduce :id id :sym symbol :results [symbol] :index idx :extent bound
               :product (reduction/scalar
                         ;; The walker stamps contextual FP narrowing on the par form.  Without
                         ;; that retained fact, Clojure's scalar reduction semantics are double;
@@ -3535,7 +3564,7 @@
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter :effect-map :stencil) (:results %)
                                               :scan [(:sym %)]
-                                              (:contract :segmented-reduce) (:results %)
+                                              (:reduce :contract :segmented-reduce) (:results %)
                                               :product-reduce (:results %)
                                               :segmented-fold-map (:results %)
                                               (:outputs %))
@@ -3545,7 +3574,8 @@
                         (:map :scatter :effect-map :stencil)
                         (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
-                        (:contract :segmented-reduce) (if (:effect-only? %) [] (:results %))
+                        (:reduce :contract :segmented-reduce)
+                        (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
                         :segmented-fold-map (if (:effect-only? %) [] (:results %))
                         (:outputs %))
@@ -4005,8 +4035,12 @@
                                      [destination
                                       (tensor-value
                                        (value-dtype destination dtype array-types)
-                                       (if (= :contract (:kind description))
+                                       (case (:kind description)
+                                         :contract
                                          [(reduce *' 1 (map second (get-in description [:facts :free-axes])))]
+                                         ;; A scalar reduction's explicit storage contract is
+                                         ;; exactly one resident element.
+                                         :reduce [1]
                                          [(list 'unknown-dimension destination)]))])
                                    (:result-storage description))))
                     equation-descriptions)

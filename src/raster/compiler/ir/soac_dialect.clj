@@ -1860,7 +1860,7 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter 'effect-map 'stencil 'segmented-reduce 'scan
+      (when-not (contains? #{'map 'scatter 'effect-map 'stencil 'reduce 'segmented-reduce 'scan
                              'product-reduce 'segmented-fold-map 'contract} kind)
         (fail! :typed-soac-result-storage-operation
                "physical result storage is valid only for writing tensor operations"

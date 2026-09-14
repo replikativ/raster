@@ -765,6 +765,11 @@ The internal direct `reduce-into` spelling enters that same rank-zero typed stor
 its separate backend one-workgroup refinement and dispatch constructor are deleted. Small and
 empty reductions use one terminal phase, while large/dynamic reductions retain the complete
 partial/finalization graph. Pointwise, disjoint-output admission remains explicit.
+An ordinary Clojure scalar-reduction loop whose terminal continuation stores the result at
+`destination[0]` now reaches that contract without changing its functional algebra: fixpoint
+recovery exposes `reduce`, TypedSOAC attaches an explicit one-element result-storage alias, resident
+realization reuses the caller-owned destination, and SegRed scheduling consumes the physical alias.
+It is neither reclassified as a zero-axis contraction nor allocated as a duplicate scalar buffer.
 Nested scalar folds inside a retained map are now explicit typed scalar-region terms. Monoid-shaped
 folds carry an `AssociativeScan` certificate and an implementation-defined association contract, so
 the JVM may select its multi-accumulator SIMD reduction. General recurrences carry an ordered

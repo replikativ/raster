@@ -439,7 +439,11 @@
                        [parameter (list 'clojure.core/aget array index)])
                      elements arrays))
           step-result (util/subst-syms substitutions (first body-results))
-          result (first results)
+          ;; Scheduling writes the equation's declared physical destination. Pure reductions
+          ;; default to their logical result; resident reductions carry an explicit one-element
+          ;; result-storage alias and must not reintroduce the logical SSA name as a second buffer.
+          result (first (soac-dialect/physical-results
+                         (soac-dialect/facts program) equation))
           accumulator (first accumulators)
           accumulator-dtype (or (first (:dtypes attributes)) dtype :double)
           stable-array-captures (set (get-in attributes
@@ -466,7 +470,7 @@
                        :bound (:extent attributes)
                        :idx index
                        :inputs (into (set arrays) stable-array-captures)
-                       :outputs (set results)
+                       :outputs #{result}
                        :scalars scalar-captures
                        :elem-type accumulator-dtype}]
       (mapv #(assoc % :algorithm-dialect :typed-soac

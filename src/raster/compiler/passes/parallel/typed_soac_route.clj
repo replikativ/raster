@@ -398,11 +398,13 @@
       (let [result (first results)
             accumulator (first (:accumulators attributes))
             resident? (resident/resident-scalar-value? (get values result))
+            storage (get-in placement-facts [:attributes :result-storage])
+            resident-destination (when resident? (:destination (first storage)))
             body (materialize-region region-locals (first bodies))
             source (if resident?
                      ;; reduce-into owns its explicit one-element destination first. The
                      ;; functional reduction algorithm itself remains unchanged.
-                     (list 'raster.par/reduce-into result accumulator
+                     (list 'raster.par/reduce-into (or resident-destination result) accumulator
                            (first (:identities attributes)) (:index attributes)
                            (:extent attributes) body)
                      (list 'raster.par/reduce accumulator (first (:identities attributes))
@@ -411,7 +413,9 @@
           (let [effect (gensym (str "typed_soac_reduce_" equation-id "__"))]
             {:equation-id equation-id
              :placement placement
-             :pairs [(allocation-pair values result 1) [effect source]]
+             :pairs (cond-> []
+                      (nil? resident-destination) (conj (allocation-pair values result 1))
+                      true (conj [effect source]))
              :site [:binding effect]
              :source source})
           {:equation-id equation-id
