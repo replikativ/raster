@@ -2492,6 +2492,55 @@
                 {:raster.type/tag 'long}))
             product (reverse bounds))))
 
+(defn- flatten-counted-row-map
+  "Flatten `dotimes row` around one row-major offset map into one dense map.
+
+   The source spelling is a two-dimensional independent map whose outer dimension was still host
+   control.  Accept it only when both dimensions are immutable for the complete traversal and the
+   inner destination offset is algebraically `row*columns`.  The resulting mixed-radix locals
+   preserve the source coordinates while the dense index makes write uniqueness explicit to the
+   ordinary TypedSOAC ownership proof.  This is semantic normalization; physical 1--3D launch
+   geometry remains a later schedule choice."
+  [expression]
+  (when (and (seq? expression)
+             (contains? '#{dotimes clojure.core/dotimes} (first expression))
+             (not (contains? util/*shadowing-locals* (first expression)))
+             (vector? (second expression)) (= 2 (count (second expression)))
+             (= 1 (count (nnext expression))))
+    (let [[row rows] (second expression)
+          inner (first (nnext expression))]
+      (when (and (par/par-map-form? inner)
+                 (immutable-counted-bound? rows))
+        (let [{:keys [out idx bound offset cast body]} (par/extract-par-map-info inner)
+              offset-product (some-> offset canonical-index-arithmetic index-algebra/monomial)
+              expected-product (index-algebra/monomial
+                                (list 'clojure.core/* row bound))]
+          (when (and offset
+                     (immutable-counted-bound? bound)
+                     (not (contains? (util/free-syms bound) row))
+                     offset-product (= offset-product expected-product))
+            (let [flat-index (with-meta (gensym "rstr_flat_index_")
+                               {:tag 'long :raster.type/tag 'long})
+                  row (vary-meta row assoc :tag 'long :raster.type/tag 'long)
+                  idx (vary-meta idx assoc :tag 'long :raster.type/tag 'long)
+                  ;; The proved row-major coordinate is exactly the new dense coordinate.  Make
+                  ;; that equality executable in the scalar body as well as implicit in the
+                  ;; rewrite, so same-lane inout reads require no second alias/affine proof in the
+                  ;; portable KernelBody scheduler.
+                  body (walk/postwalk
+                        #(if (patterns/row-major-linear-index? % row idx bound)
+                           flat-index %)
+                        body)
+                  flat-body (list 'let*
+                                  [row (with-meta (list 'clojure.core/quot flat-index bound)
+                                         {:tag 'long :raster.type/tag 'long})
+                                   idx (with-meta (list 'clojure.core/rem flat-index bound)
+                                         {:tag 'long :raster.type/tag 'long})]
+                                  body)]
+              (with-meta
+                (list 'raster.par/map! out flat-index (positive-product [rows bound]) cast flat-body)
+                (meta inner)))))))))
+
 (defn- flatten-rectangular-dotimes
   "Linearize a perfect loop nest in the same lexicographic order as its source.
 
@@ -2699,6 +2748,7 @@
                                           (normalize-fixed-scalar-inputs state expression
                                                                          [[2 :int] [3 :long]])
                                           [state expression])
+                     expression (or (flatten-counted-row-map expression) expression)
                      expression (normalize-guarded-counted-store-loop expression)
                      counted-expression (normalize-counted-store-loop expression)
                      [state expression] (if (= expression counted-expression)
