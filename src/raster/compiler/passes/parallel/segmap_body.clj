@@ -331,7 +331,7 @@
                                                 [(body/->Yield [])] [])]))
                  (:operations inner))})
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower extent carry]} (:loop effect)]
+                    :keys [lower upper-bound extent carry]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
             ;; locals are SSA values scoped to one iteration and its stores keep their own
             ;; per-destination contracts.
@@ -370,7 +370,9 @@
                                                (:operations update-value)
                                                [(body/->Yield (if carry [(:result update-value)] []))]))
                                   (if carry [(body/value (:result carry) (:dtype carry))] [])
-                                  {:association :ordered :source-order true})]
+                                  (cond-> {:association :ordered :source-order true}
+                                    (= :inclusive upper-bound)
+                                    (assoc :upper-bound :inclusive)))]
               {:operations (conj (vec (:operations initial)) loop-operation)
                :environment (cond-> environment carry (assoc (:result carry) (:dtype carry)))})
           (let [operations (do

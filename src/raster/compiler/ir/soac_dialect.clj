@@ -194,19 +194,22 @@
   (or (contains? #{:unique :ordered} value) (reducing-scatter-conflict? value)))
 
 (defn effect-loop-attributes?
-  "The binder of a counted store loop inside an effect region: its index symbol and the integer
-   lower bound, optionally a typed carry/result binding. Extent, initializer and update stay
-   scalar operands of the grammar, never expressions hidden inside attribute maps."
+  "The binder of a counted store loop inside an effect region: its index symbol and integer-typed
+   lower operand, optionally an inclusive upper-bound mode and a typed carry/result binding.
+   Extent, initializer and update stay scalar operands of the grammar."
   [value]
   (and (map? value)
-       (or (= #{:index :lower} (set (keys value)))
-           (and (= #{:index :lower :carry} (set (keys value)))
-                (let [{:keys [parameter result dtype] :as carry} (:carry value)]
-                  (and (= #{:parameter :result :dtype} (set (keys carry)))
-                       (symbol? parameter) (symbol? result)
-                       (contains? #{:int :long :float :double} dtype)))))
+       (set/subset? (set (keys value)) #{:index :lower :upper-bound :carry})
+       (contains? value :index)
+       (contains? value :lower)
+       (contains? #{:exclusive :inclusive} (:upper-bound value :exclusive))
+       (or (not (contains? value :carry))
+           (let [{:keys [parameter result dtype] :as carry} (:carry value)]
+             (and (= #{:parameter :result :dtype} (set (keys carry)))
+                  (symbol? parameter) (symbol? result)
+                  (contains? #{:int :long :float :double} dtype))))
        (symbol? (:index value))
-       (integer? (:lower value))))
+       (some? (:lower value))))
 
 (defn effect-map-attributes?
   [value]
@@ -732,6 +735,7 @@
           carried? (= 5 (count value))
           lambda (last value)]
       (cond-> {:loop true :index (:index attributes) :lower (:lower attributes)
+               :upper-bound (:upper-bound attributes :exclusive)
                :extent extent :lambda lambda}
         (or carried? (:carry attributes))
         (assoc :carry (assoc (:carry attributes)
@@ -917,7 +921,8 @@
   "Project a canonical effect into the shared scheduled shape, without source reconstruction.
    This projection does not substitute captures, assign destination dtypes or select a target."
   [effect]
-  (let [{:keys [loop index lower extent lambda carry] :as part} (effect-parts effect)]
+  (let [{:keys [loop index lower upper-bound extent lambda carry] :as part}
+        (effect-parts effect)]
     (cond
       (:region part)
       {:region (cond-> {:locals (:locals (:region part))
@@ -927,6 +932,7 @@
       (let [{:keys [locals body-results]} (lambda-parts lambda)]
         {:loop (cond-> {:index index :lower lower :extent extent :locals locals
                         :effects (mapv scheduled-effect body-results)}
+                 (= :inclusive upper-bound) (assoc :upper-bound :inclusive)
                  carry (assoc :carry carry))})
       :else part)))
 

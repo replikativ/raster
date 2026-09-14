@@ -91,24 +91,35 @@
   "Spell the validated scheduled counted-loop contract, including its optional typed carry.
    Bounds/initializer are evaluated once. Stores precede recurrence evaluation. A zero-trip loop
    returns its initializer. Result scope is supplied separately by `ordered-effects`."
-  [generated-cast {:keys [index lower extent locals carry]} ordered-body]
+  [generated-cast {:keys [index lower upper-bound extent locals carry]} ordered-body]
   (let [{:keys [parameter dtype init update]} carry
         tag (when carry (generated-cast (dtype/scalar-tag-for-dtype dtype)))
         index-tag (if carry 'clojure.core/long 'clojure.core/int)
         limit (gensym "effect_carry_limit__")
-        initial (gensym "effect_carry_init__")]
+        initial (gensym "effect_carry_init__")
+        next-value (gensym "effect_carry_next__")
+        inclusive? (= :inclusive upper-bound)
+        advance (list (if carry 'clojure.core/unchecked-inc
+                          'clojure.core/unchecked-inc-int) index)
+        recur-form (if carry
+                     (list 'let* [next-value (list tag (strip-binder-tags update))]
+                           (if inclusive?
+                             (list 'if (list 'clojure.core/= index limit)
+                                   next-value (list 'recur advance next-value))
+                             (list 'recur advance next-value)))
+                     (if inclusive?
+                       (list 'if (list 'clojure.core/= index limit)
+                             nil (list 'recur advance))
+                       (list 'recur advance)))]
     (list 'let* (cond-> [limit (list index-tag extent)]
                   carry (conj initial (list tag (strip-binder-tags init))))
           (list 'loop* (cond-> [(vary-meta index dissoc :tag) (list index-tag lower)]
                          carry (conj (vary-meta parameter dissoc :tag) initial))
-                (list 'if (list 'clojure.core/< index limit)
+                (list 'if (list (if inclusive? 'clojure.core/<= 'clojure.core/<)
+                                index limit)
                       (typed-locals
                        generated-cast locals
-                       (list 'do ordered-body
-                             (list* 'recur
-                                    (cond-> [(list (if carry 'clojure.core/unchecked-inc
-                                                     'clojure.core/unchecked-inc-int) index)]
-                                      carry (conj (list tag (strip-binder-tags update)))))))
+                       (list 'do ordered-body recur-form))
                       parameter)))))
 
 (defn ordered-effects
