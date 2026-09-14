@@ -431,6 +431,27 @@
            (and (= :implementation-defined (:association value))
                 (scan-ir/associative-scan? (:algebra value))))))
 
+(defn product-fold-attributes?
+  "Attributes of one ordered scalar loop with multiple typed carries.
+
+   This is a product-valued sequential region, not a claim that its components form a monoid.
+   A later schedule may reassociate only components carrying their own checked algebra proof."
+  [value]
+  (let [accumulators (:accumulators value)
+        identities (:identities value)
+        dtypes (:dtypes value)]
+    (and (map? value)
+         (vector? accumulators) (<= 2 (count accumulators))
+         (= (count accumulators) (count (distinct accumulators)))
+         (every? symbol? accumulators)
+         (or (nil? (:index value)) (symbol? (:index value)))
+         (vector? identities) (= (count accumulators) (count identities))
+         (every? scalar-literal? identities)
+         (vector? dtypes) (= (count accumulators) (count dtypes))
+         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %))) dtypes)
+         (or (extent? (:extent value)) (seq? (:extent value)))
+         (= :ordered (:association value)))))
+
 (defn segmented-fold-map-attributes?
   "Attributes for independent segments containing dependent ordered folds and a final dense map."
   [value]
@@ -508,6 +529,7 @@
              [cta contraction/attributes?]
              [pra product-reduce-attributes?]
              [fa fold-attributes?]
+             [pfa product-fold-attributes?]
              [sfma segmented-fold-map-attributes?]
              [ca scan-attributes?]
              [sca scalar-convert-attributes?]
@@ -521,6 +543,7 @@
           (do (?:+ s))
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
           (raster.compiler.ir.soac-dialect/scalar-convert ?sca ?s:operand)
+          (product-component ?pf:product ?lit:ordinal)
           (write ?s:destination-index ?s:predicate ?s:value)
           [(?:* s)]
           (.invk ?sym:impl (?:* s:args))
@@ -555,6 +578,9 @@
 
   (Fold [f :enforce]
         (fold ?fa ?l))
+
+  (ProductFold [pf :enforce]
+               (product-fold ?pfa ?l))
 
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
@@ -914,6 +940,23 @@
     (let [[_ attributes lambda] value]
       {:attributes attributes :lambda lambda})))
 
+(defn product-fold-form?
+  "True for a typed ordered fold with multiple scalar results."
+  [value]
+  (and (seq? value) (= 'product-fold (first value)) (= 3 (count value))))
+
+(defn product-fold-parts
+  "Project a product-valued scalar fold without recovering source syntax."
+  [value]
+  (when (product-fold-form? value)
+    (let [[_ attributes lambda] value]
+      {:attributes attributes :lambda lambda})))
+
+(defn product-component-form?
+  [value]
+  (and (seq? value) (= 'product-component (first value)) (= 3 (count value))
+       (product-fold-form? (second value)) (integer? (nth value 2))))
+
 (defn scalar-convert-form?
   "True for a typed source conversion embedded in a scalar region."
   [value]
@@ -957,6 +1000,55 @@
                          "scalar conversion requires one descriptor-derived typed policy"
                          {:equation equation-id :expression expression}))
                 (walk-expression! operand bound))
+
+              (product-component-form? expression)
+              (let [[_ product ordinal] expression
+                    {:keys [attributes lambda]} (product-fold-parts product)
+                    {parameters :parameters locals :locals results :body-results}
+                    (lambda-parts lambda)
+                    accumulators (:accumulators attributes)
+                    expected (conj accumulators (:index attributes))
+                    lower-bound (:lower attributes 0)
+                    outer-unbound (set/union (util/free-syms lower-bound bound)
+                                             (util/free-syms (:extent attributes) bound))]
+                (when-not (and (product-fold-attributes? attributes)
+                               (< -1 ordinal (count accumulators))
+                               (= expected parameters)
+                               (= (count accumulators) (count results))
+                               (= (count parameters) (count (distinct parameters)))
+                               (empty? (set/intersection bound (set parameters)))
+                               (empty? outer-unbound)
+                               (not (util/effectful? lower-bound))
+                               (not (util/effectful? (:extent attributes))))
+                  (fail! :typed-soac-product-fold
+                         "product fold requires a closed ordered multi-carry region"
+                         {:equation equation-id :fold product :parameters parameters
+                          :expected expected :results results :ordinal ordinal
+                          :outer-unbound outer-unbound}))
+                (let [final-bound
+                      (reduce
+                       (fn [local-bound {:keys [id dtype init] :as local}]
+                         (when-not (and (symbol? id) (not (contains? local-bound id))
+                                        (dtype/known? dtype) (= dtype (dtype/canon dtype))
+                                        (:scalar-tag (dtype/info dtype)))
+                           (fail! :typed-soac-product-fold-local
+                                  "product Fold locals require distinct typed scalar SSA identities"
+                                  {:equation equation-id :fold product :local local}))
+                         (walk-expression! init local-bound)
+                         (when-let [unbound (seq (util/free-syms init local-bound))]
+                           (fail! :typed-soac-product-fold-local
+                                  "product Fold locals may reference only earlier values"
+                                  {:equation equation-id :fold product :local local
+                                   :unbound unbound}))
+                         (conj local-bound id))
+                       (into bound parameters) locals)]
+                  (doseq [result results]
+                    (walk-expression! result final-bound)
+                    (when (or (seq (util/free-syms result final-bound))
+                              (some write-form? (tree-seq coll? seq result)))
+                      (fail! :typed-soac-product-fold
+                             "product Fold results must be closed and effect free"
+                             {:equation equation-id :fold product :result result})))))
 
               (scalar-fold-form? expression)
               (let [{:keys [attributes lambda]} (scalar-fold-parts expression)

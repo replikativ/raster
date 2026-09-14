@@ -842,7 +842,8 @@
 (defn- scalar-folds
   [expression]
   (->> (tree-seq coll? seq expression)
-       (filter soac-dialect/scalar-fold-form?)
+       (filter #(or (soac-dialect/scalar-fold-form? %)
+                    (soac-dialect/product-fold-form? %)))
        vec))
 
 (defn- compile-scalar-fold
@@ -879,15 +880,26 @@
 (defn- compile-fold-map-scalar-loop
   [segmap out-sym cast store-offset]
   (let [folds (scalar-folds (:lambda segmap))
+        product-bindings
+        (mapv (fn [product] [product (gensym "product_fold__")])
+              (distinct (filter soac-dialect/product-fold-form? folds)))
+        product-binding-map (into {} product-bindings)
         complete? (atom true)
         body
         (clojure.walk/postwalk
          (fn [form]
-           (if (soac-dialect/scalar-fold-form? form)
+           (cond
+             (soac-dialect/scalar-fold-form? form)
              (if-let [compiled (compile-scalar-fold form segmap)]
                compiled
                (do (reset! complete? false) form))
-             form))
+
+             (soac-dialect/product-component-form? form)
+             (let [[_ product ordinal] form]
+               (list 'clojure.core/nth (get product-binding-map product)
+                     (list 'clojure.core/long ordinal)))
+
+             :else form))
          (:lambda segmap))]
     (when (and (seq folds) @complete?)
       (let [idx (seg-idx segmap)
@@ -900,7 +912,21 @@
                   ;; them remain typed IR.  The JVM scalar loop executes descriptor-owned source
                   ;; operations, just like the vector-map scalar tail; never evaluate the
                   ;; canonical constructor as ordinary Clojure data.
-                  (bc/desugar-invk (soac-dialect/scalar-converts->source body)))
+                  (soac-dialect/scalar-converts->source body))
+            body
+            (if (seq product-bindings)
+              (list 'let*
+                    (vec
+                     (mapcat
+                      (fn [[product binding]]
+                        [binding
+                         ((requiring-resolve
+                           'raster.compiler.passes.parallel.typed-soac-projection/product-fold->source)
+                          (util/subst-syms {idx j-sym} product))])
+                      product-bindings))
+                    body)
+              body)
+            body (bc/desugar-invk body)
             store-index (if store-offset (ix+ store-offset j-sym) j-sym)
             value (if cast (list cast body) body)]
         (list 'let* [n-sym (list 'int bound)]

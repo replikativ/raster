@@ -49,6 +49,7 @@
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
+            [raster.compiler.passes.parallel.patterns :as parallel-patterns]
             [raster.compiler.passes.region-copy :as region-copy]
             [raster.compiler.passes.parallel.write-read-fuse :as write-read-fuse]
             [raster.compiler.passes.parallel.materialize :as materialize]
@@ -647,6 +648,8 @@
     3. :vector — an aggregate host result (the AD [primal grads] result vector);
        a persistent vector carries no element dtype, so tag-typedness does not
        apply to the binding.
+    4. an exactly matched ordered product recurrence — its binding is an aggregate tuple whose
+       component carry dtypes are checked by TypedSOAC admission; it has no scalar tag of its own.
 
   Everything else (raster.dl/raster.nn kernels, .invk impls, raster.numeric
   scalar math, aliases, constants) MUST carry :raster.type/tag at the fixpoint
@@ -655,7 +658,9 @@
   (let [head (census-rhs-head expression)]
     (or (true? (:raster.effect/effectful (meta binding)))
         (contains? census-exempt-int-arith-heads head)
-        (= :vector head))))
+        (= :vector head)
+        (and (contains? #{'loop 'loop*} head)
+             (some? (parallel-patterns/match-ordered-product-loop expression))))))
 
 (defn- record-fixpoint-census!
   "Append one tag-completeness entry to fixpoint-census (Phase 0 of

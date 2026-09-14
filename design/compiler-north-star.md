@@ -776,6 +776,12 @@ the JVM may select its multi-accumulator SIMD reduction. General recurrences car
 association contract and lower to an exact scalar loop. Portable C-family emission consumes the same
 term as a sequential fold; future subgroup/workgroup schedules must be selected from its certificate
 rather than rediscovering a reduction from source spelling.
+Ordered source recurrences with multiple scalar carries use the corresponding product-valued
+`Fold`: identities, carry dtypes, induction domain, shared typed local SSA, and one result per carry
+are explicit. Static component projections share one multi-result KernelBody loop, so tuple syntax
+does not become host allocation and does not duplicate reads or arithmetic. The matcher requires the
+exact carry tuple on exit and makes no associativity claim; parallel product-reduction scheduling
+still requires component algebra certificates. OpenCL, CUDA, HIP and JVM consume this same region.
 
 Sequential control around a parallel algorithm is represented separately as the Pattern-declared
 `TypedStructuredControl` dialect. Its canonical loop is a typed fixpoint around one closed

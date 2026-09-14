@@ -298,11 +298,104 @@
                  (every? :dtype locals))
         locals))))
 
+(defn- source-product-fold
+  "Translate an exact multi-carry source recurrence into one typed product Fold term.
+
+   This retains source order. It deliberately supplies no component algebra: reassociation is a
+   separate proof, while the portable sequential schedule is correct for every admitted update."
+  [expression]
+  (when-let [{:keys [carry-syms carry-inits index-sym index-init bound-expr bound-mode
+                     then-branch update-exprs]}
+             (patterns/match-ordered-product-loop expression)]
+    (let [dtypes (mapv (fn [carry init]
+                         (some-> (retained-local-dtype carry init) dtype/canon))
+                       carry-syms carry-inits)
+          [_ local-bindings] (when (and (seq? then-branch)
+                                        (form/let-head? (first then-branch)))
+                               then-branch)
+          locals (if local-bindings (typed-region-locals local-bindings) [])]
+      (when (and (every? some? dtypes) (some? locals)
+                 (every? dialect/scalar-literal? carry-inits)
+                 (not-any? util/effectful?
+                           (concat carry-inits [index-init bound-expr] update-exprs
+                                   (map :init locals))))
+        (list 'product-fold
+              (cond-> {:accumulators carry-syms :identities carry-inits :dtypes dtypes
+                       :index index-sym :lower index-init :extent bound-expr
+                       :association :ordered}
+                (= :inclusive bound-mode) (assoc :upper-bound :inclusive))
+              (dialect/lambda-form
+               (conj carry-syms index-sym)
+               (mapv (fn [{:keys [id dtype init]}]
+                       (dialect/local-value id dtype init))
+                     locals)
+               update-exprs))))))
+
+(defn- product-component-alias
+  [aggregate expression component-count]
+  (let [ordinal (when (and (seq? expression) (= 3 (count expression)))
+                  (descriptor/unwrap-int-cast (nth expression 2)))]
+    (when (and (contains? '#{nth clojure.core/nth} (descriptor/semantic-op expression))
+               (= aggregate (second expression))
+               (integer? ordinal) (< -1 ordinal component-count))
+      ordinal)))
+
+(defn- expand-product-loop-locals
+  "Replace `[tuple (loop* ...), c0 (nth tuple 0), ...]` by scalar component locals that
+   project one shared product Fold. Static complete projection is required; an aggregate that
+   otherwise escapes remains outside the typed scalar subset."
+  [bindings results]
+  (let [pairs (vec (partition 2 bindings))
+        candidate (first (keep-indexed
+                          (fn [i [_ expression]]
+                            (when-let [product (and (seq? expression)
+                                                   (source-product-fold expression))]
+                              [i product]))
+                          pairs))]
+    (if-not candidate
+      bindings
+      (let [[product-index product] candidate
+            aggregate (first (nth pairs product-index))
+            component-count (count (get-in (dialect/product-fold-parts product)
+                                           [:attributes :dtypes]))
+            aliases (into {}
+                          (keep-indexed
+                           (fn [i [id expression]]
+                             (when-let [ordinal (product-component-alias aggregate expression
+                                                                         component-count)]
+                               [ordinal {:pair-index i :id id}]))
+                           pairs))
+            alias-indices (set (map (comp :pair-index val) aliases))
+            remaining (concat results
+                              (keep-indexed (fn [i [_ expression]]
+                                              (when (and (not= i product-index)
+                                                         (not (contains? alias-indices i)))
+                                                expression))
+                                            pairs))]
+        (when (and (= (set (range component-count)) (set (keys aliases)))
+                   (not-any? #(contains? (util/free-syms % #{}) aggregate) remaining))
+          (vec
+           (mapcat
+            (fn [i pair]
+              (if (= i product-index)
+                (mapcat
+                 (fn [ordinal]
+                   (let [id (get-in aliases [ordinal :id])
+                         component (list 'product-component product ordinal)
+                         tag (dtype/scalar-tag-for-dtype
+                              (nth (get-in (dialect/product-fold-parts product)
+                                           [:attributes :dtypes]) ordinal))]
+                     [id (with-meta component {:tag tag :raster.type/tag tag})]))
+                 (range component-count))
+                (when-not (contains? alias-indices i) pair)))
+            (range) pairs)))))))
+
 (defn- typed-map-region
   "Preserve a map's typed lexical spine instead of expanding shared expressions."
   [expression]
   (if (and (seq? expression) (form/let-head? (first expression)))
     (let [[_ bindings & results] expression
+          bindings (or (expand-product-loop-locals bindings results) bindings)
           locals (typed-region-locals bindings)]
       (when (and (= 1 (count results)) (some? locals)
                  (every? (comp simple-symbol? :id) locals))

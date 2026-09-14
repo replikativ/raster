@@ -127,6 +127,9 @@
         (= 'fold head)
         {:kind :fold :introduces-scope? true :liftable? false :head head}
 
+        (= 'product-fold head)
+        {:kind :product-fold :introduces-scope? true :liftable? false :head head}
+
         (= 'effect-region head)
         {:kind :effect-region :introduces-scope? true :liftable? false :head head}
 
@@ -376,6 +379,49 @@
                  (rl form 'fold attributes'
                      (list 'lambda parameters' (list 'region locals' (vec body))))))})))
 
+        ;; Product-valued scalar Fold. Accumulator parameters precede the induction index and
+        ;; every result is one next-carry value in that same order.
+        :product-fold
+        (let [[_ attributes [_ parameters [_ locals results]]] form]
+          (when (and (map? attributes) (vector? parameters)
+                     (vector? locals) (vector? results)
+                     (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))
+                                   (symbol? (second %)))
+                             locals))
+            (let [parameter-count (count parameters)
+                  accumulator-count (count (:accumulators attributes))
+                  local-dtypes (mapv #(nth % 2) locals)]
+              (when (= parameter-count (inc accumulator-count))
+                {:sequential? true
+                 :scopes [{:binders (into (vec parameters) (map second locals))
+                           :inits (into (vec (repeat parameter-count nil))
+                                        (map #(nth % 3) locals))
+                           :body results}]
+                 :outer (vec (concat (:identities attributes)
+                                     [(get attributes :lower 0) (:extent attributes)]))
+                 :rebuild
+                 (fn [[{:keys [binders inits body]}] outer]
+                   (let [parameters' (vec (take parameter-count binders))
+                         local-binders (drop parameter-count binders)
+                         local-inits (drop parameter-count inits)
+                         locals' (mapv (fn [id dtype init]
+                                         (list 'let-value id dtype init))
+                                       local-binders local-dtypes local-inits)
+                         identities (vec (take accumulator-count outer))
+                         lower (nth outer accumulator-count)
+                         extent (nth outer (inc accumulator-count))
+                         accumulators (vec (take accumulator-count parameters'))
+                         index (last parameters')
+                         attributes' (cond-> (assoc attributes
+                                                    :accumulators accumulators
+                                                    :index index
+                                                    :identities identities
+                                                    :extent extent)
+                                       (contains? attributes :lower) (assoc :lower lower))]
+                     (rl form 'product-fold attributes'
+                         (list 'lambda parameters'
+                               (list 'region locals' (vec body))))))}))))
+
         ;; An effect-region's result binders enter scope only after their loop initializer.
         ;; Nil binder slots retain intervening stores in the same sequential spine.
         :effect-region
@@ -428,6 +474,12 @@
         ;; (matched as :call by form-info, so dispatch on head here)
         :call
         (cond
+          (= 'product-component head)
+          (let [[_ product ordinal] form]
+            (when (and (= 3 (count form)) (integer? ordinal))
+              {:sequential? false :scopes [] :outer [product]
+               :rebuild (fn [_ [product']] (rl form 'product-component product' ordinal))}))
+
           (= 'letfn* head)
           (let [[_ bindings & body] form
                 pairs (partition 2 bindings)]
@@ -520,7 +572,8 @@
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
-  (contains? #{:scope :lambda :par :fold :effect-region :effect-loop} (:kind (form-info form))))
+  (contains? #{:scope :lambda :par :fold :product-fold :effect-region :effect-loop}
+             (:kind (form-info form))))
 
 (defn call-form?
   "True if the form is a function call (.invk or regular)."

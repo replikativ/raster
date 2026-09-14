@@ -62,6 +62,10 @@
                           (with-meta form (assoc (meta source) :raster.type/tag
                                                  (dtype/scalar-tag-for-dtype type))))
         counter (atom 0)
+        ;; One product Fold may feed several component projections in the same scalar region.
+        ;; Cache its multi-result SSA refinement so projections never duplicate the loop or its
+        ;; loads. `lower-region` creates a fresh builder per owning kernel region.
+        product-fold-cache (atom {})
         reserved (atom (set (concat arrays (keys array-types) (keys scalar-types) index-scope)))
         reserve! (fn [form]
                    (swap! reserved into (filter symbol? (tree-seq coll? seq form))))
@@ -133,6 +137,13 @@
                 ;; intrinsic region contract, not an inference from an enclosing consumer cast.
                 (dialect/scalar-fold-form? expression)
                 (some-> expression dialect/scalar-fold-parts :attributes :dtype canon-type)
+
+                (dialect/product-component-form? expression)
+                (let [[_ product ordinal] expression
+                      dtypes (get-in (dialect/product-fold-parts product)
+                                     [:attributes :dtypes])]
+                  (when (< -1 ordinal (count dtypes))
+                    (canon-type (nth dtypes ordinal))))
 
                 (dialect/scalar-convert-form? expression)
                 (some-> expression dialect/scalar-convert-parts
@@ -301,30 +312,30 @@
                 (if (= target (:type lowered))
                   lowered
                   (let [source (dtype/canon (:type lowered))
+                        ;; A proved integral interval makes narrowing total regardless of whether
+                        ;; the source wrote an explicit cast.  This is what permits ordinary
+                        ;; predicates such as `(> int-value 0)`: the Clojure literal is a Long,
+                        ;; but its singleton range is exactly representable as an int.  Unknown or
+                        ;; wider ranges still require the owner's explicit conversion policy.
+                        proved-exact-narrowing?
+                        (and (not (dtype/fp-dtype? source))
+                             (not (dtype/fp-dtype? target))
+                             (scalar-range/contained-in-dtype? (:range lowered) target))
                         [rounding overflow]
-                        ;; An explicit source cast owns its checked-versus-unchecked narrowing
-                        ;; contract. Implicit conversions continue to use the owner's policy, or
-                        ;; the legacy map/fold wrap default when the owner supplies none.
-                        (or (case explicit-narrowing
-                              :wrap (scalar-conversion/policy source target :wrap)
-                              :reject (scalar-conversion/policy source target :trap)
-                              nil (if conversion-policy
-                                    (conversion-policy source target)
-                                    (scalar-conversion/policy source target :wrap)))
-                            (decline! :cast-policy
-                                      "scalar cast has no portable rounding and overflow policy"
-                                      {:expression expression :source source :target target}))
-                        ;; A checked integral narrowing remains a conversion, so its operand is
-                        ;; still evaluated exactly once.  When the producer's retained interval
-                        ;; proves every possible value representable by the target, however, the
-                        ;; checked conversion is total and needs no target trap instruction.
-                        [rounding overflow]
-                        (if (and (= :reject explicit-narrowing)
-                                 (not (dtype/fp-dtype? source))
-                                 (not (dtype/fp-dtype? target))
-                                 (scalar-range/contained-in-dtype? (:range lowered) target))
+                        (if proved-exact-narrowing?
                           [:exact :exact]
-                          [rounding overflow])
+                          ;; An explicit source cast owns its checked-versus-unchecked narrowing
+                          ;; contract. Implicit conversions continue to use the owner's policy, or
+                          ;; the legacy map/fold wrap default when the owner supplies none.
+                          (or (case explicit-narrowing
+                                :wrap (scalar-conversion/policy source target :wrap)
+                                :reject (scalar-conversion/policy source target :trap)
+                                nil (if conversion-policy
+                                      (conversion-policy source target)
+                                      (scalar-conversion/policy source target :wrap)))
+                              (decline! :cast-policy
+                                        "scalar cast has no portable rounding and overflow policy"
+                                        {:expression expression :source source :target target})))
                         id (fresh "cast")]
                     (let [range (when (scalar-range/contained-in-dtype? (:range lowered) target)
                                   (:range lowered))]
@@ -655,6 +666,97 @@
                     {:operations (conj (vec (:operations initial)) loop-operation)
                      :result result :type fold-type})
 
+                  (dialect/product-component-form? expression)
+                  (let [[_ product ordinal] expression
+                        cached (get @product-fold-cache product)
+                        first-use? (nil? cached)
+                        lowered-product
+                        (or cached
+                            (let [{:keys [attributes lambda]}
+                                  (dialect/product-fold-parts product)
+                                  {parameters :parameters fold-locals :locals
+                                   body-results :body-results} (dialect/lambda-parts lambda)
+                                  accumulators (:accumulators attributes)
+                                  index (:index attributes)
+                                  dtypes (mapv canon-type (:dtypes attributes))
+                                  identities (:identities attributes)
+                                  _ (when-not (and (= parameters (conj accumulators index))
+                                                   (= (count accumulators) (count identities)
+                                                      (count dtypes) (count body-results)))
+                                      (decline! :typed-product-fold-shape
+                                                "product Fold parameters, identities, dtypes and results must align"
+                                                {:expression expression :parameters parameters
+                                                 :accumulators accumulators
+                                                 :results body-results}))
+                                  loop-index (fresh "product-fold-index")
+                                  carries (mapv (fn [_] (fresh "product-fold-carry")) accumulators)
+                                  results (mapv (fn [_] (fresh "product-fold-result")) accumulators)
+                                  initials (mapv (fn [identity type] (lower identity type env))
+                                                 identities dtypes)
+                                  initial-env (into (assoc env loop-index :long)
+                                                    (map vector carries dtypes))
+                                  substitutions (into {index loop-index}
+                                                      (map vector accumulators carries))
+                                  local-state
+                                  (reduce
+                                   (fn [{:keys [operations substitutions environment]} local]
+                                     (let [local-type (canon-type (:dtype local))
+                                           local-expression (util/subst-syms substitutions (:init local))
+                                           lowered (lower local-expression local-type environment)]
+                                       (when-not (= local-type (:type lowered))
+                                         (decline! :typed-product-fold-local-dtype
+                                                   "product Fold local must preserve its retained dtype"
+                                                   {:expression expression :local local
+                                                    :actual (:type lowered)}))
+                                       {:operations (into operations (:operations lowered))
+                                        :substitutions (assoc substitutions (:id local) (:result lowered))
+                                        :environment (cond-> environment
+                                                       (symbol? (:result lowered))
+                                                       (assoc (:result lowered) local-type))}))
+                                   {:operations [] :substitutions substitutions
+                                    :environment initial-env}
+                                   fold-locals)
+                                  updates (mapv (fn [update type]
+                                                  (lower (util/subst-syms (:substitutions local-state)
+                                                                         update)
+                                                         type (:environment local-state)))
+                                                body-results dtypes)
+                                  _ (doseq [[update type] (map vector updates dtypes)]
+                                      (when-not (= type (:type update))
+                                        (decline! :typed-product-fold-dtype
+                                                  "product Fold carry dtype must remain invariant"
+                                                  {:expression expression :expected type
+                                                   :actual (:type update)})))
+                                  loop-operation
+                                  (body/->ForLoop
+                                   (body/value loop-index :long)
+                                   (lower-index (:lower attributes 0) (set (keys env)))
+                                   (lower-index (:extent attributes) (set (keys env)))
+                                   1
+                                   (mapv (fn [carry initial]
+                                           (body/->LoopArg (body/value carry (:type initial))
+                                                           (:result initial)))
+                                         carries initials)
+                                   (conj (vec (concat (:operations local-state)
+                                                     (mapcat :operations updates)))
+                                         (body/->Yield (mapv :result updates)))
+                                   (mapv (fn [result type] (body/value result type)) results dtypes)
+                                   (cond-> {:association :ordered :source-order true}
+                                     (= :inclusive (:upper-bound attributes))
+                                     (assoc :upper-bound :inclusive)))
+                                  lowered {:operations (conj (vec (mapcat :operations initials))
+                                                             loop-operation)
+                                           :results results :types dtypes}]
+                              (swap! product-fold-cache assoc product lowered)
+                              lowered))
+                        _ (when-not (< -1 ordinal (count (:results lowered-product)))
+                            (decline! :typed-product-fold-component
+                                      "product Fold component ordinal is outside its result tuple"
+                                      {:expression expression :ordinal ordinal}))]
+                    {:operations (if first-use? (:operations lowered-product) [])
+                     :result (nth (:results lowered-product) ordinal)
+                     :type (nth (:types lowered-product) ordinal)})
+
                   (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                   (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
                                    inclusive? index-init]}
@@ -912,6 +1014,7 @@
                   (compute-ssa operator result-type arguments options nil))
        :lower-region
        (fn [{:keys [bindings results]} result-types binding-types env]
+         (reset! product-fold-cache {})
          ;; Later binders matter too: substitutions must never capture a generated earlier ID.
          (reserve! [bindings results (keys env) predicate])
          ;; Region locals are evaluated once, in source order. In particular, a product's
