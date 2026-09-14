@@ -785,6 +785,61 @@
                                      (:index-sym matched)))
         matched))))
 
+(defn match-ordered-product-loop
+  "Match a unit-step counted recurrence with two or more scalar carries.
+
+   This is only a structural recognition boundary. It does not assert associativity or
+   commutativity; the owning typed region must retain source order or separately certify each
+   component algebra before selecting a parallel product-reduction schedule. The exit must be
+   the carry tuple in binding order, ruling out post-loop projections and ambiguous aggregates."
+  [loop-form]
+  (when (and (seq? loop-form) (contains? loop-heads (first loop-form))
+             (= 3 (count loop-form)) (vector? (second loop-form))
+             (even? (count (second loop-form))))
+    (let [pairs (vec (partition 2 (second loop-form)))
+          ids (mapv first pairs)
+          body-form (last loop-form)]
+      (when (and (>= (count pairs) 3)
+                 (every? symbol? ids) (= (count ids) (count (set ids)))
+                 (seq? body-form) (= 'if (first body-form)) (= 4 (count body-form)))
+        (let [[_ test then-branch else-branch] body-form
+              [index-sym bound-expr] (test-index+bound test)
+              index-slot (.indexOf ids index-sym)
+              recur-form (find-recur-form then-branch)
+              recur-args (when recur-form (vec (rest recur-form)))
+              index-init (when-not (neg? index-slot) (second (nth pairs index-slot)))
+              lhs (first (descriptor/call-args test))
+              lhs (if (and (seq? lhs) (= 2 (count lhs))
+                           (contains? '#{long clojure.core/long} (first lhs)))
+                    (second lhs) lhs)
+              comparison (descriptor/comparison-kind (descriptor/semantic-op test))]
+          (when (and (not (neg? index-slot)) (= index-sym lhs)
+                     (contains? #{:lt :le} comparison)
+                     (= (count pairs) (count recur-args))
+                     (ordered-unit-step? (nth recur-args index-slot) index-sym)
+                     (or (and (integer? index-init)
+                              (<= Long/MIN_VALUE index-init Long/MAX_VALUE))
+                         (symbol? index-init) (seq? index-init)))
+            (let [carry-slots (vec (remove #{index-slot} (range (count pairs))))
+                  carry-syms (mapv #(first (nth pairs %)) carry-slots)
+                  carry-inits (mapv #(second (nth pairs %)) carry-slots)
+                  update-exprs (mapv #(nth recur-args %) carry-slots)
+                  scoped (mapv #(scoped-recur-value then-branch %) update-exprs)]
+              (when (and (= else-branch carry-syms) (every? some? scoped))
+                {:index-sym index-sym
+                 :index-init index-init
+                 :index-slot index-slot
+                 :bound-expr bound-expr
+                 :bound-mode (if (= :le comparison) :inclusive :exclusive)
+                 :test-expr test
+                 :then-branch then-branch
+                 :else-expr else-branch
+                 :recur-form recur-form
+                 :carry-syms carry-syms
+                 :carry-inits carry-inits
+                 :update-exprs update-exprs
+                 :scoped-update-exprs scoped}))))))))
+
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.
 	valid-op? is a predicate over the reduction operator symbol.

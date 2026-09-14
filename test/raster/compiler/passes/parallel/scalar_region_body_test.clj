@@ -619,6 +619,28 @@
                      '(if (< r n) (recur (inc r) (+ acc r)) acc))]
       (is (= origin (:index-init (patterns/match-ordered-reduce-loop form)))))))
 
+(deftest ordered-product-loop-matcher-is-exact
+  (let [form '(loop* [i 0 s1 0.0 s2 1.0]
+                (if (< (long i) width)
+                  (let* [x (clojure.core/aget values i)]
+                    (recur (inc (long i)) (+ s1 x) (* s2 x)))
+                  [s1 s2]))
+        matched (patterns/match-ordered-product-loop form)]
+    (is (= '[s1 s2] (:carry-syms matched)))
+    (is (= '[0.0 1.0] (:carry-inits matched)))
+    (is (= :exclusive (:bound-mode matched)))
+    (is (= 0 (:index-init matched)))
+    (is (= 2 (count (:scoped-update-exprs matched))))
+    (is (every? #(and (seq? %) (= 'let* (first %)))
+                (:scoped-update-exprs matched))))
+  (doseq [form ['(loop* [i 0 a 0.0 b 0.0]
+                  (if (< i n) (recur (inc i) (+ a 1.0) (+ b 1.0)) [b a]))
+                '(loop* [i 0 a 0.0 b 0.0]
+                  (if (< i n) (recur (+ i 2) (+ a 1.0) (+ b 1.0)) [a b]))
+                '(loop* [i 0 a 0.0]
+                  (if (< i n) (recur (inc i) (+ a 1.0)) a))]]
+    (is (nil? (patterns/match-ordered-product-loop form)))))
+
 (deftest ordered-loop-admission-does-not-drop-effects-or-swap-recur-slots
   (doseq [form ['(loop [r 1 acc 0.0]
                   (aset out 0 7.0)
