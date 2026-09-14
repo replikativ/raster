@@ -87,7 +87,8 @@ REPL:
               :revision "<git revision>"
               :environment "<machine/driver identity>"
               :rounds 12 :warmup-rounds 4
-              :residency :all-stages})
+              :residency :all-stages
+              :matrix-tiles :default})
 ```
 
 The candidates are the portable segmented contraction, the materialized XMX graph, and the
@@ -100,6 +101,10 @@ bias are ordinary constants, eligible weight-only cast/transpose nodes execute i
 untimed prologue, and the reported samples cover only steady-state replay. Activations remain
 runtime inputs in both modes. Initialization time is reported separately as binding time and is
 never folded into the replay result.
+Set `:matrix-tiles :finite` to compile and compare the descriptor-derived tile-local schedule
+family in addition to portable and materialized XMX. Candidate identities come from the emitted
+dispatch and cover block-M/N/K, subgroup-M/N and pipeline depth; the probe does not maintain a
+parallel tile registry. Finite search can be combined with either residency regime.
 The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
 stationarity diagnostics, and never updates the tuning cache.
 
