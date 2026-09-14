@@ -1080,10 +1080,19 @@
                       (descriptor/addition-op? operation) 'clojure.core/+
                       (descriptor/subtraction-op? operation) 'clojure.core/-
                       (descriptor/multiplication-op? operation) 'clojure.core/*
-                      :else nil)]
-      (if canonical
-        (with-meta (list* canonical arguments) (meta expression))
-        expression))
+                      :else nil)
+          algebra-wrapper? (or (descriptor/cast-op? operation)
+                               (contains? '#{quot clojure.core/quot rem clojure.core/rem
+                                             mod clojure.core/mod}
+                                          operation))]
+      (cond
+        canonical (with-meta (list* canonical arguments) (meta expression))
+        ;; A cast or quotient/remainder is itself part of the index vocabulary. Preserve that
+        ;; exact operation while canonicalizing arithmetic nested inside it; leaving an `.invk`
+        ;; product opaque merely because it occurs under `(int ...)` made equivalent 2-D and 1-D
+        ;; row-major formulas take different ownership routes.
+        algebra-wrapper? (with-meta (list* (first expression) arguments) (meta expression))
+        :else expression))
     expression))
 
 (defn- store-index-form

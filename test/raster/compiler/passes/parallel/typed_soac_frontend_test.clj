@@ -174,6 +174,13 @@
         "a bijective axis permutation is a unique scatter, not an ordered effect loop")
     (is (= :unique (get-in (dialect/operation-parts equation) [:attributes :conflict])))))
 
+(deftest index-proof-canonicalizes-typed-products-under-source-casts
+  (let [product (with-meta
+                  '(.invk raster.numeric/_star__m_long_long-impl kh kw)
+                  {:raster.op/original 'raster.numeric/* :raster.type/tag 'long})]
+    (is (= '(int (clojure.core/* kh kw))
+           (#'frontend/canonical-index-arithmetic (list 'int product))))))
+
 (deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
   (let [options {:dtype :double :array-types {'out :double}
                  :scalar-types {'n :long}}
