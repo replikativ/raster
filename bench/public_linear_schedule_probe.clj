@@ -4,7 +4,8 @@
    This is an internal Raster schedule probe, not an external baseline and not a tuning
    promotion. It keeps compilation, binding, transfers and validation outside timed samples."
   (:refer-clojure :exclude [run!])
-  (:require [raster.compiler.ir.kernel-dispatch :as dispatch]
+  (:require [clojure.string :as str]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
@@ -18,18 +19,29 @@
 (def ^:private compared-strategies
   [:portable-segred :xmx-direct :xmx-direct-tile-inputs])
 
+(defn- comparison-strategies
+  [choice matrix-tiles]
+  (if (= :finite matrix-tiles)
+    (filterv (fn [candidate]
+               (let [strategy (executable/strategy candidate)]
+                 (or (contains? #{:portable-segred :xmx-direct} strategy)
+                     (str/starts-with? (name strategy) "xmx-direct-tile-inputs"))))
+             (:alternatives choice))
+    (mapv #(dispatch/alternative choice %) compared-strategies)))
+
 (defn- checked-options!
-  [{:keys [shape revision environment rounds warmup-rounds target residency]}]
+  [{:keys [shape revision environment rounds warmup-rounds target residency matrix-tiles]}]
   (when-not (and (vector? shape) (= 3 (count shape))
                  (every? #(and (integer? %) (pos? %)) shape)
                  (string? revision) (seq revision)
                  (string? environment) (seq environment)
                  (= :ocl:0 target)
                  (contains? #{:all-stages :constant-weights} residency)
+                 (contains? #{:default :finite} matrix-tiles)
                  (integer? rounds) (<= 2 rounds 120) (even? rounds)
                  (integer? warmup-rounds) (<= 0 warmup-rounds 30))
     (throw (ex-info "linear probe requires Arc OpenCL, positive [rows,in,out], identities and bounded rounds"
-                    {:target target :shape shape :residency residency
+                    {:target target :shape shape :residency residency :matrix-tiles matrix-tiles
                      :rounds rounds :warmup-rounds warmup-rounds})))
   (let [[rows in out] shape
         products (*' rows in out)
@@ -109,14 +121,16 @@
    Shape is [rows,input-width,output-width]. Inputs are exactly binary16-representable, allowing
    all three numerical policies to share an exact oracle. `:all-stages` includes materialized
    transforms on every replay; `:constant-weights` uses the ordinary LinkPlan role contract to
-   hoist weight-only transforms into an untimed one-time prologue."
-  [{:keys [shape revision environment rounds warmup-rounds target residency]
+   hoist weight-only transforms into an untimed one-time prologue. `:matrix-tiles :finite`
+   compares the complete compiler-emitted tile-local family; the default keeps the three main
+   schedules for a cheaper diagnostic."
+  [{:keys [shape revision environment rounds warmup-rounds target residency matrix-tiles]
     :or {shape [32 256 256] rounds 12 warmup-rounds 4 target :ocl:0
-         residency :all-stages}
+         residency :all-stages matrix-tiles :default}
     :as options}]
   (let [[rows in out] (checked-options!
                        (merge {:shape shape :rounds rounds :warmup-rounds warmup-rounds
-                               :target target :residency residency}
+                               :target target :residency residency :matrix-tiles matrix-tiles}
                               options))
         x (float-array (map #(/ (- (mod % 13) 6) 8.0) (range (* rows in))))
         weights (float-array (map #(/ (- (mod % 11) 5) 8.0) (range (* out in))))
@@ -124,15 +138,11 @@
         expected (reference x weights bias rows in out)
         poison (float-array (repeat (* rows out) Float/NaN))
         descriptor (pipeline/compile-gpu-program #'nn/linear! target :dtype :float
-                                                 :gemm-precision :mixed-f16-f32)
+                                                 :gemm-precision :mixed-f16-f32
+                                                 :schedule {:typed-contraction
+                                                            {:matrix-tiles matrix-tiles}})
         choice (:dispatch (first (:steps descriptor)))
-        candidates (mapv (fn [strategy]
-                           (or (dispatch/alternative choice strategy)
-                               (throw (ex-info "linear probe schedule is unavailable"
-                                               {:strategy strategy
-                                                :available (mapv executable/strategy
-                                                                 (:alternatives choice))}))))
-                         compared-strategies)
+        candidates (comparison-strategies choice matrix-tiles)
         scalar-values {'n (* rows out) 'batch rows 'in-f in 'out-f out}]
     (gpu/with-gpu-session [session target]
       (when (= :all-stages residency)
@@ -193,6 +203,8 @@
            :scope {:public-compiler-path? true :timing-source :device-event
                    :cache-state :warm-resident :transfers-included? false
                    :residency residency
+                   :matrix-tiles matrix-tiles
+                   :candidate-count (count candidates)
                    :materialized-weight-transform
                    (if (= :constant-weights residency)
                      :one-time-prologue-excluded
