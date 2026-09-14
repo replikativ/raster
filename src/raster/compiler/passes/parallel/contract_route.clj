@@ -1324,13 +1324,16 @@
               (rest tile-schedules)
               [])
             additional-tile-alternatives
-            (mapv
+            (mapcat
              (fn [schedule]
-               (gpu-gemm/emit-matrix-input-fusion-alternative
-                (assoc emit-spec
-                       :tile (:tile schedule)
-                       :fill-workgroups (:fill-workgroups schedule)
-                       :strategy (gpu-gemm/tile-input-strategy (:tile schedule)))))
+               (let [tile (:tile schedule)
+                     scheduled (assoc emit-spec
+                                      :tile tile
+                                      :fill-workgroups (:fill-workgroups schedule))]
+                 [(gpu-gemm/emit-matrix-dynamic-lhs-alternative
+                   (assoc scheduled :strategy (gpu-gemm/dynamic-lhs-strategy tile)))
+                  (gpu-gemm/emit-matrix-input-fusion-alternative
+                   (assoc scheduled :strategy (gpu-gemm/tile-input-strategy tile)))]))
              additional-tile-schedules)
             raw-alternatives (into raw-alternatives additional-tile-alternatives)
             alternatives (mapv (fn [graph]
@@ -1372,9 +1375,11 @@
                   :tile-schedules
                   (when (and (not (:batched? matrix-view))
                              (contains? #{:nn :nt} (:variant matrix-view)))
-                    (into {:xmx-direct-tile-inputs target-schedule}
-                          (map (fn [schedule]
-                                 [(gpu-gemm/tile-input-strategy (:tile schedule)) schedule]))
+                    (into {:xmx-direct-dynamic-lhs target-schedule
+                           :xmx-direct-tile-inputs target-schedule}
+                          (mapcat (fn [schedule]
+                                    [[(gpu-gemm/dynamic-lhs-strategy (:tile schedule)) schedule]
+                                     [(gpu-gemm/tile-input-strategy (:tile schedule)) schedule]]))
                           additional-tile-schedules))))}))))
 
 (defn- replace-selector-strategy
@@ -1456,13 +1461,20 @@
                          (into {}
                                (map (fn [[strategy target-schedule]]
                                       [strategy
-                                       (-> base-matrix-schedule
-                                           (assoc :tile (:tile target-schedule)
-                                                  :matrix (:matrix target-schedule)
-                                                  :fill-workgroups
-                                                  (:fill-workgroups target-schedule)
-                                                  :input-fusion? true)
-                                           (dissoc :tile-schedules))]))
+                                       (cond-> (-> base-matrix-schedule
+                                                   (assoc :tile (:tile target-schedule)
+                                                          :matrix (:matrix target-schedule)
+                                                          :fill-workgroups
+                                                          (:fill-workgroups target-schedule))
+                                                   (dissoc :tile-schedules))
+                                         (str/starts-with? (name strategy)
+                                                           "xmx-direct-dynamic-lhs")
+                                         (assoc :input-fusion {:lhs :tile-local
+                                                               :rhs :materialized})
+
+                                         (str/starts-with? (name strategy)
+                                                           "xmx-direct-tile-inputs")
+                                         (assoc :input-fusion? true))]))
                                (:tile-schedules matrix-schedule))
                          (into {}
                                (map (fn [[strategy factor]]

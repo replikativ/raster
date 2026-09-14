@@ -1556,13 +1556,22 @@
                   algorithm operation :dtype :float :desc descriptor
                   :precision :mixed-f16-f32 :matrix-tiles :finite)
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
-        tile-strategies (into #{:xmx-direct-tile-inputs}
-                              (map gpu-gemm/tile-input-strategy (rest tiles)))]
+        dynamic-strategies (into #{:xmx-direct-dynamic-lhs}
+                                 (map gpu-gemm/dynamic-lhs-strategy (rest tiles)))
+        fused-strategies (into #{:xmx-direct-tile-inputs}
+                               (map gpu-gemm/tile-input-strategy (rest tiles)))
+        tile-strategies (into dynamic-strategies fused-strategies)]
     (is (> (count tiles) 1))
     (is (= (count strategies) (count (set strategies))))
-    (is (= (+ 4 (count tiles)) (count strategies))
-        "portable, materialized direct/split, dynamic-LHS, and one fused-input alternative per tile")
+    (is (= (+ 3 (* 2 (count tiles))) (count strategies))
+        "portable/materialized direct/split plus dynamic-LHS and fully fused alternatives per tile")
     (is (= tile-strategies (set (filter tile-strategies strategies))))
+    (doseq [strategy dynamic-strategies]
+      (is (= {:lhs :tile-local :rhs :materialized}
+             (get-in dispatch [:attributes :candidate-schedules strategy :input-fusion]))))
+    (doseq [strategy fused-strategies]
+      (is (true? (get-in dispatch [:attributes :candidate-schedules
+                                   strategy :input-fusion?]))))
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
     (is (apply = (map :effects (:alternatives dispatch))))

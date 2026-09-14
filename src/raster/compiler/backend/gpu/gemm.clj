@@ -895,6 +895,14 @@
    (format "xmx-direct-tile-inputs-bm%d-bn%d-sm%d-sn%d-bk%d-s%d"
            block-m block-n sg-m sg-n block-k (or num-stages 3))))
 
+(defn dynamic-lhs-strategy
+  "Stable strategy identity for a finite-search tile whose activation cast is tile-local while
+   the RHS representation remains a cacheable materialized graph value."
+  [{:keys [block-m block-n block-k sg-m sg-n num-stages]}]
+  (keyword
+   (format "xmx-direct-dynamic-lhs-bm%d-bn%d-sm%d-sn%d-bk%d-s%d"
+           block-m block-n sg-m sg-n block-k (or num-stages 3))))
+
 (defn- matrix-input-fusion-alternative [spec]
   (when (matrix-input-fusion-target? spec)
     (xmx-graph (assoc spec :split-k? false :fuse-tile-inputs? true
@@ -905,7 +913,18 @@
   (when (matrix-input-fusion-target? spec)
     (xmx-graph (assoc spec :split-k? false :fuse-lhs-cast? true
                      :vector-width (get spec :vector-width 4)
-                     :strategy :xmx-direct-dynamic-lhs))))
+                     :strategy (or (:strategy spec) :xmx-direct-dynamic-lhs)))))
+
+(defn emit-matrix-dynamic-lhs-alternative
+  "Emit an Intel direct-matrix candidate that converts dynamic FP32 activations in tile loads
+   while retaining the typed RHS conversion/layout graph for ordinary constant hoisting."
+  [{:keys [variant target-dialect] :as spec}]
+  (when-not (matrix-input-fusion-target? spec)
+    (throw (ex-info "dynamic-LHS matrix fusion requires Intel direct NN/NT storage"
+                    {:reason :matrix-dynamic-lhs-target :variant variant :target target-dialect})))
+  (or (matrix-dynamic-lhs-alternative spec)
+      (throw (ex-info "dynamic-LHS matrix fusion obligations are not satisfied"
+                      {:reason :matrix-dynamic-lhs-ineligible :id (:id spec)}))))
 
 (defn emit-matrix-input-fusion-alternative
   "Emit an explicit Intel direct-matrix candidate with tile-local FP32→FP16 inputs.
