@@ -1282,6 +1282,12 @@
             emit-spec {:id [:typed-contraction operation-id]
                        :a row :b col :c (:out facts)
                        :m m :n n :k k
+                       ;; Matrix scheduling drops an optional leading batch axis, but the
+                       ;; remaining coordinate identities continue to scope the typed result
+                       ;; transform.  Preserve that proven semantic→scheduled correspondence.
+                       :axis-symbols
+                       (vec (concat (map first (take-last 2 (:free-axes facts)))
+                                    (map first (:contract-axes facts))))
                        :variant (:variant matrix-view)
                        :epilogue (:epilogue matrix-view)
                        :precision :mixed-f16-f32

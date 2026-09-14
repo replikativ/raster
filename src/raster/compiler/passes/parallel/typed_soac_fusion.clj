@@ -5,6 +5,7 @@
    checks and fact-table updates explicitly; failed candidates leave the immutable program intact.
    This first slice covers map→map, map→reduce, map→scan and horizontal map fusion."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [pattern.nanopass.dialect :refer [from-dialect]]
             [pattern.r3.core :refer [rule success]]
             [raster.compiler.core.dtype :as dtype]
@@ -685,6 +686,23 @@
         (catch clojure.lang.ExceptionInfo e
           (when-not (= ::extent-proof-decline (:reason (ex-data e))) (throw e)))))))
 
+(defn- erase-axis-mapped-load-indices
+  "Erase source flat indices once an operand AxisMap has proved the address relation.
+
+   A result transform is a scalar region: its tensor operands are loaded at coordinates derived
+   from their declared AxisMaps.  Keeping the old flat index in the scalar expression duplicates
+   that semantics, leaks extent captures into the kernel ABI, and invites the scalar lowerer to
+   disagree with the schedule.  The placeholder is intentionally inert; scalar-region lowering
+   never consumes it."
+  [expression operand-values]
+  (walk/postwalk
+   (fn [form]
+     (if (and (descriptor/aget-call? form)
+              (contains? operand-values (descriptor/aget-array-sym form)))
+       (list 'clojure.core/aget (descriptor/aget-array-sym form) 0)
+       form))
+   expression))
+
 (defn- result-map-transform
   "Translate one pointwise map region into a typed post-reduction scalar region.
 
@@ -713,6 +731,8 @@
         expression (first (:body-results consumer))
         reads (descriptor/aget-reads expression)
         capture-bindings (mapv vector captures capture-parameters)
+        capture-values (into {} (map (fn [[value parameter]] [parameter value])
+                                     capture-bindings))
         stable-bindings (filterv #(contains? stable-values (first %)) capture-bindings)
         scalar-bindings (remove #(contains? stable-values (first %)) capture-bindings)
         indexed-operands
@@ -722,7 +742,9 @@
                                    distinct vec)]
                   (when (= 1 (count indices))
                     (when-let [operand-map
-                               (axis-map/flat-index->map (first indices) map-index segment-axes)]
+                               (axis-map/flat-index->map
+                                (util/subst-syms capture-values (first indices))
+                                map-index segment-axes)]
                       {:value value :dtype (value-scalar-dtype program value)
                        :map operand-map}))))
               stable-bindings)
@@ -734,12 +756,6 @@
               (range) arrays)
         pointwise-operands (vec (remove nil? pointwise-operands))
         operands (vec (concat pointwise-operands indexed-operands))
-        scalars (mapv (fn [[value _]]
-                        {:value value :dtype (value-scalar-dtype program value)})
-                      scalar-bindings)
-        scalars (cond-> scalars
-                  (and extent-witness (not-any? #(= extent-witness (:value %)) scalars))
-                  (conj {:value extent-witness :dtype :long}))
         element-substitutions
         (into {}
               (map-indexed
@@ -754,7 +770,18 @@
         expression (->> expression
                         (util/subst-syms (merge element-substitutions
                                                 capture-substitutions
-                                                {map-index flat-index})))]
+                                                {map-index flat-index})))
+        expression (erase-axis-mapped-load-indices
+                    expression (set (map :value operands)))
+        expression-values (util/free-syms expression)
+        scalars (->> scalar-bindings
+                     (keep (fn [[value _]]
+                             (when (contains? expression-values value)
+                               {:value value :dtype (value-scalar-dtype program value)})))
+                     vec)
+        scalars (cond-> scalars
+                  (and extent-witness (not-any? #(= extent-witness (:value %)) scalars))
+                  (conj {:value extent-witness :dtype :long}))]
     (when (and (or (= output-extent consumer-extent) extent-witness)
                (= 1 (count consumed-indices))
                (every? some? indexed-operands)
@@ -769,6 +796,227 @@
         :operands operands
         :scalars scalars
         :result-dtype (value-scalar-dtype program (first (:results consumer)))}))))
+
+(defn- initializer-map-region
+  "Project a dense map into the completed-result coordinates of a segmented reduction.
+
+   This is the pre-reduction dual of `result-map-transform`: the map's pointwise inputs and
+   stable indexed captures become typed result-transform operands, while uniform captures become
+   scalars.  It returns program-value syntax suitable for composition with an existing transform;
+   no target or contraction-specific spelling enters the proof."
+  [program preceding-infos producer consumer]
+  (let [segment-axes (get-in consumer [:attributes :segment-axes])
+        output-map (axis-map/of-axes segment-axes)
+        output-extent (axis-map/n-elements output-map)
+        producer-extent (get-in producer [:attributes :extent])
+        extent-witness (when-not (= output-extent producer-extent)
+                         (dominating-product-extent program preceding-infos
+                                                    producer-extent output-extent))
+        flat-index (axis-map/index-expr output-map)
+        map-index (get-in producer [:attributes :index])
+        {:keys [elements capture-parameters]} (parameter-parts producer)
+        arrays (:arrays producer)
+        captures (:captures producer)
+        stable-values (stable-array-captures producer)
+        capture-bindings (mapv vector captures capture-parameters)
+        capture-values (into {} (map (fn [[value parameter]] [parameter value])
+                                     capture-bindings))
+        stable-bindings (filterv #(contains? stable-values (first %)) capture-bindings)
+        scalar-bindings (remove #(contains? stable-values (first %)) capture-bindings)
+        expression (first (:body-results producer))
+        reads (descriptor/aget-reads expression)
+        indexed-operands
+        (mapv (fn [[value parameter]]
+                (let [indices (->> reads
+                                   (keep #(when (= parameter (:sym %)) (:idx %)))
+                                   distinct vec)]
+                  (when (= 1 (count indices))
+                    (when-let [operand-map
+                               (axis-map/flat-index->map
+                                (util/subst-syms capture-values (first indices))
+                                map-index segment-axes)]
+                      {:value value :dtype (value-scalar-dtype program value)
+                       :map operand-map}))))
+              stable-bindings)
+        pointwise-operands
+        (mapv (fn [value]
+                {:value value :dtype (value-scalar-dtype program value) :map output-map})
+              arrays)
+        operands (vec (concat pointwise-operands indexed-operands))
+        substitutions
+        (into {map-index flat-index}
+              (concat
+               (map (fn [[value parameter]]
+                      [parameter (list 'clojure.core/aget value flat-index)])
+                    (map vector arrays elements))
+               (map (fn [[value parameter]] [parameter value]) capture-bindings)))
+        expression (util/subst-syms substitutions expression)
+        expression (erase-axis-mapped-load-indices
+                    expression (set (map :value operands)))
+        expression-values (util/free-syms expression)
+        scalars (->> scalar-bindings
+                     (keep (fn [[value _]]
+                             (when (contains? expression-values value)
+                               {:value value :dtype (value-scalar-dtype program value)})))
+                     vec)
+        scalars (cond-> scalars
+                  (and extent-witness (not-any? #(= extent-witness (:value %)) scalars))
+                  (conj {:value extent-witness :dtype :long}))]
+    (when (and (or (= output-extent producer-extent) extent-witness)
+               (empty? (:locals producer))
+               (every? some? indexed-operands)
+               (every? :dtype operands)
+               (every? :dtype scalars)
+               (= (count (concat (map :value operands) (map :value scalars)))
+                  (count (distinct (concat (map :value operands) (map :value scalars))))))
+      {:expression expression :operands operands :scalars scalars})))
+
+(defn- compose-initializer-transform
+  [program preceding-infos producer consumer destination]
+  (let [transform (get-in consumer [:attributes :result-transform])
+        old-operands (:operands transform)
+        destination-operands (filterv #(= destination (:value %)) old-operands)
+        initializer
+        (initializer-map-region program preceding-infos producer consumer)
+        initializer-expression (:expression initializer)
+        initializer-operands (:operands initializer)
+        initializer-scalars (:scalars initializer)
+        transform-parameters (dialect/lambda-parts (:lambda transform))
+        accumulator (first (get-in consumer [:attributes :accumulators]))
+        old-accumulator (first (:parameters transform-parameters))
+        old-expression (dialect/result-transform-boundary-expression transform)
+        destination-parameter (:parameter (first destination-operands))
+        retained-operands (vec (remove #(= destination (:value %)) (:operands transform)))
+        retained-scalars (:scalars transform)
+        external-substitutions
+        (into {old-accumulator accumulator destination-parameter initializer-expression}
+              (concat (map (juxt :parameter :value) retained-operands)
+                      (map (juxt :parameter :value) retained-scalars)))
+        result-expression (when initializer
+                            (util/subst-syms external-substitutions old-expression))
+        result-operands (vec (concat
+                              (map #(select-keys % [:value :dtype :map]) retained-operands)
+                              initializer-operands))
+        result-scalars (vec (concat
+                             (map #(select-keys % [:value :dtype]) retained-scalars)
+                             initializer-scalars))
+        values (concat (map :value result-operands) (map :value result-scalars))]
+    (when (and initializer (= 1 (count destination-operands))
+               (= (axis-map/of-axes (get-in consumer [:attributes :segment-axes]))
+                  (:map (first destination-operands)))
+               (= (count values) (count (distinct values))))
+      (dialect/make-result-transform
+       {:accumulator accumulator
+        :expression result-expression
+        :operands result-operands
+        :scalars result-scalars
+        :result-dtype (:result-dtype transform)}))))
+
+(defn- map-initialized-segmented-reduce-candidate
+  [program]
+  (let [equations (dialect/equations program)
+        infos (mapv equation-info equations)
+        facts (dialect/facts program)
+        uses (value-use-counts program)
+        outputs (set (dialect/outputs program))]
+    (first
+     (for [producer-index (range (dec (count infos)))
+           :let [consumer-index (inc producer-index)
+                 producer (nth infos producer-index)
+                 consumer (nth infos consumer-index)
+                 producer-result (first (:results producer))
+                 destination (get-in facts [:equations (:id producer)
+                                            :attributes :result-storage 0 :destination])
+                 consumer-result (first (:results consumer))
+                 consumer-destination (get-in facts [:equations (:id consumer)
+                                                     :attributes :result-storage 0 :destination])
+                 consumer-parameters (parameter-parts consumer)
+                 destination-capture-parameters
+                 (->> (map vector (:captures consumer)
+                           (:capture-parameters consumer-parameters))
+                      (keep (fn [[value parameter]]
+                              (when (= destination value) parameter)))
+                      set)
+                 fold-references
+                 (set (concat (util/free-syms (:body-results consumer))
+                              (mapcat (comp util/free-syms :init) (:locals consumer))))
+                 transform (when (and (= :map (:kind producer))
+                                      (= :segmented-reduce (:kind consumer))
+                                      destination (= destination consumer-destination))
+                             (compose-initializer-transform
+                              program (subvec infos 0 producer-index)
+                              producer consumer destination))]
+           :when (= :map (:kind producer))
+           :when (= :segmented-reduce (:kind consumer))
+           :when (= 1 (count (:results producer)) (count (:body-results producer)))
+           :when (= 1 (count (:results consumer)) (count (:body-results consumer)))
+           :when (some? (get-in consumer [:attributes :result-transform]))
+           :when (zero? (get uses producer-result 0))
+           :when (not (contains? outputs producer-result))
+           :when (not (contains? outputs destination))
+           :when (single-write-boundary? facts (:id producer) producer-result destination :write)
+           :when (single-write-boundary? facts (:id consumer) consumer-result destination :read-write)
+           :when (not-any? #{destination} (:arrays consumer))
+           :when (empty? (set/intersection destination-capture-parameters fold-references))
+           :when (host-barrier-free? program producer consumer)
+           :when transform]
+       {:producer-index producer-index :consumer-index consumer-index
+        :producer producer :consumer consumer :destination destination :transform transform}))))
+
+(defn- fuse-map-initialized-segmented-reduce-once
+  [program]
+  (when-let [{:keys [producer-index consumer-index producer consumer destination transform]}
+             (map-initialized-segmented-reduce-candidate program)]
+    (let [equations (dialect/equations program)
+          facts (dialect/facts program)
+          old-transform (get-in consumer [:attributes :result-transform])
+          removed-values (set (concat [destination]
+                                      (map :value (:operands old-transform))
+                                      (map :value (:scalars old-transform))))
+          fold-references (set (concat (util/free-syms (:body-results consumer))
+                                       (mapcat (comp util/free-syms :init) (:locals consumer))))
+          retained-captures
+          (vec (filter #(or (not (contains? removed-values %))
+                            (contains? fold-references %))
+                       (:captures consumer)))
+          transform-values (vec (concat (map :value (:operands transform))
+                                        (map :value (:scalars transform))))
+          fresh-transform-parameters
+          (mapv #(symbol (str "%fused-initializer-capture" %))
+                (range (count transform-values)))
+          consumer-parameters (parameter-parts consumer)
+          retained-bindings
+          (filterv (fn [[value _]] (some #{value} retained-captures))
+                   (map vector (:captures consumer) (:capture-parameters consumer-parameters)))
+          canonical (canonical-operands
+                     (:arrays consumer) (:elements consumer-parameters)
+                     (vec (concat (map first retained-bindings) transform-values))
+                     (vec (concat (map second retained-bindings) fresh-transform-parameters))
+                     (:locals consumer) (:body-results consumer))
+          stable (set/union (disj (stable-array-captures consumer) destination)
+                            (set (map :value (:operands transform))))
+          updated (assoc consumer
+                         :attributes (-> (:attributes consumer)
+                                         (with-stable-array-captures (:captures canonical) stable)
+                                         (assoc :result-transform transform))
+                         :arrays (:arrays canonical)
+                         :captures (:captures canonical)
+                         :parameters (vec (concat (:accumulators consumer-parameters)
+                                                  (:elements canonical)
+                                                  (:capture-parameters canonical)))
+                         :locals (:locals canonical)
+                         :body-results (:body-results canonical))
+          equations (-> equations
+                        (assoc consumer-index (emit-equation updated))
+                        (->> (keep-indexed (fn [index equation]
+                                             (when-not (= index producer-index) equation)))
+                             vec))
+          facts (-> (remove-equation-fact facts (:id producer) (:id consumer)
+                                          :map-initialized-segmented-reduce)
+                    (update :values dissoc (first (:results producer)))
+                    (assoc-in [:equations (:id consumer) :attributes :result-storage 0 :access]
+                              :write))]
+      (rebuild-boundary program facts equations))))
 
 (defn- segmented-reduce-result-map-candidate
   [program]
@@ -1219,20 +1467,22 @@
          (recur (fuse-vertical-candidate program candidate)
                 (inc vertical) horizontal (inc iterations)
                 (remember-placement placements (:placement candidate)))
-         (if-let [fused (fuse-reduce-result-scalar-once program)]
+         (if-let [fused (fuse-map-initialized-segmented-reduce-once program)]
            (recur fused (inc vertical) horizontal (inc iterations) placements)
-           (if-let [fused (fuse-segmented-reduce-result-map-once program)]
+           (if-let [fused (fuse-reduce-result-scalar-once program)]
              (recur fused (inc vertical) horizontal (inc iterations) placements)
-             (if-let [fused (fuse-horizontal-once program)]
-               (recur fused vertical (inc horizontal) (inc iterations) placements)
-               (let [placements
-                     (reduce remember-placement placements
-                             (map :placement
-                                  (filter (comp not :fuse? :placement) candidates)))
-                     [program ordered-placements] (attach-placement-facts program placements)
-                     stats {:vertical vertical
-                            :horizontal horizontal
-                            :iterations (inc iterations)}]
-                 [program (cond-> stats
-                            (seq ordered-placements)
-                            (assoc :placements ordered-placements))])))))))))
+             (if-let [fused (fuse-segmented-reduce-result-map-once program)]
+               (recur fused (inc vertical) horizontal (inc iterations) placements)
+               (if-let [fused (fuse-horizontal-once program)]
+                 (recur fused vertical (inc horizontal) (inc iterations) placements)
+                 (let [placements
+                       (reduce remember-placement placements
+                               (map :placement
+                                    (filter (comp not :fuse? :placement) candidates)))
+                       [program ordered-placements] (attach-placement-facts program placements)
+                       stats {:vertical vertical
+                              :horizontal horizontal
+                              :iterations (inc iterations)}]
+                   [program (cond-> stats
+                              (seq ordered-placements)
+                              (assoc :placements ordered-placements))]))))))))))

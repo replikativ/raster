@@ -432,6 +432,76 @@
     :array-types '{A :float B :float C :float D :float bias :float residual :float}
     :scalar-types '{scale :float}})))
 
+(defn- map-initialized-contract-program
+  ([initializer-expression]
+   (map-initialized-contract-program initializer-expression
+                                     '(* (clojure.core/aget A (+ (* i 16) l))
+                                         (clojure.core/aget B (+ (* l 8) j)))
+                                     32))
+  ([initializer-expression fold-element initializer-extent]
+   (frontend/form->program
+    (list 'let*
+          ['init (list 'raster.par/map! 'C 't initializer-extent nil
+                       initializer-expression)
+           'product
+           (list 'raster.par/contract 'C '[[i 4] [j 8]] '[[l 16]]
+                 fold-element
+                 :epilogue
+                 '{:acc acc
+                   :expr (+ acc (clojure.core/aget C (+ (* i 8) j)))
+                   :operands [{:sym C
+                               :map {:groups [[[i 4]] [[j 8]]]}
+                               :dtype :float}]
+                   :scalars []
+                   :dtype :float})]
+          'product)
+    {:dtype :float
+     :array-types '{A :float B :float C :float bias :float}})))
+
+(deftest dense-initializer-map-becomes-a-contraction-result-transform
+  (let [program (map-initialized-contract-program
+                 '(clojure.core/aget bias (clojure.core/rem t 8)))
+        fold-before (-> program dialect/equations second typed-fusion/equation-info :body-results)
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations result))
+        operation (dialect/operation-parts equation)
+        transform (get-in operation [:attributes :result-transform])
+        facts (dialect/facts result)]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= fold-before (:body-results (dialect/lambda-parts (:lambda operation))))
+        "initializer fusion does not rewrite the contraction fold")
+    (is (= '[bias] (mapv :value (:operands transform))))
+    (is (= '#{j} (-> transform :operands first :map axis-map/axes set)))
+    (is (empty? (:scalars transform)))
+    (is (not-any? #{'C 't} (flatten (:lambda transform))))
+    (is (= :write (get-in facts [:equations 1 :attributes :result-storage 0 :access])))
+    (is (= result (dialect/validate! result)))))
+
+(deftest initializer-fusion-refuses-unproved-addresses-and-extents
+  (doseq [program [(map-initialized-contract-program
+                    '(clojure.core/aget bias (clojure.core/rem (+ t 1) 8)))
+                   (map-initialized-contract-program
+                    '(clojure.core/aget bias (clojure.core/rem t 8))
+                    '(* (clojure.core/aget A (+ (* i 16) l))
+                        (clojure.core/aget B (+ (* l 8) j)))
+                    31)]]
+    (let [[result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= program result))
+      (is (zero? (:vertical stats))))))
+
+(deftest initializer-fusion-refuses-a-destination-read-in-the-fold
+  (let [program
+        (map-initialized-contract-program
+         '(clojure.core/aget bias (clojure.core/rem t 8))
+         '(+ (* (clojure.core/aget A (+ (* i 16) l))
+                (clojure.core/aget B (+ (* l 8) j)))
+             (clojure.core/aget C (+ (* i 8) j)))
+         32)
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (zero? (:vertical stats)))))
+
 (deftest same-destination-result-map-fuses-without-reading-old-output
   (let [program (contract-result-map-program '(max (float 0.0) (clojure.core/aget C t)) 'C)
         [result stats] (typed-fusion/fusion-fixpoint program)

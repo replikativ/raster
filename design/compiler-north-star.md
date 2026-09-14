@@ -526,6 +526,13 @@ result-transform. It transfers the map's logical result, physical storage, alias
 return boundary to the reduction; removes the dead intermediate; proves each residual/broadcast
 operand's map over the segment axes; and leaves the fold lambda byte-for-byte unchanged. Ambiguous
 indices, observable intermediates, read-write stores and dtype changes decline rather than guessing.
+The dual initialization rewrite is equally algebraic: an adjacent dense map that fully writes the
+same physical result immediately before an accumulating segmented contraction is composed into its
+result transform. Its tensor reads retain proved AxisMaps, exact integral index wrappers do not
+become ABI captures, and the contraction store changes from read-write to write-only. This removes
+the separate bias-fill launch from ordinary linear projections without introducing a linear, GEMM,
+or attention opcode; mismatched extents, unproved addresses, observable initialization results and
+fold reads of the old destination remain materialized.
 Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
 the certified compatibility front door, and may still use `SegContract`, until the typed equation
 has explicit facts for them; admitting them while dropping those contracts would be a miscompile,

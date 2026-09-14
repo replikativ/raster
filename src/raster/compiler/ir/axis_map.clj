@@ -334,9 +334,16 @@
      (quot t Ninner)→ the outer axes only              (per-row broadcast, e.g. a row scale)
      <constant/none>→ nil
 
-   Returns an axis-map, or nil when the shape is not recognized."
+  Returns an axis-map, or nil when the shape is not recognized."
   [idx-expr t free-axes]
-  (let [fa (vec free-axes)
+  (let [idx-expr (od/unwrap-int-cast idx-expr)
+        ;; Typed source walking retains exact integral widenings around the flat index and
+        ;; symbolic extent.  They do not alter the indexing relation; compare the semantic
+        ;; operands rather than making every fusion caller erase retained type evidence.
+        idx-expr (if (seq? idx-expr)
+                   (apply list (first idx-expr) (map od/unwrap-int-cast (rest idx-expr)))
+                   idx-expr)
+        fa (vec free-axes)
         n-inner (second (peek fa))
         outer (vec (butlast fa))]
     (cond
