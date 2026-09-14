@@ -3457,7 +3457,7 @@
                             (canonical-fold-step-region scoped-update-expr fold-dtype))]
           (if (and step-region fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
                    (= else-expr acc-sym)
-                   (dialect/scalar-literal? acc-init)
+                   (or (dialect/scalar-literal? acc-init) (symbol? acc-init))
                    (not (util/effectful? acc-init))
                    (not (util/effectful? index-init))
                    (not (util/effectful? bound-expr))
