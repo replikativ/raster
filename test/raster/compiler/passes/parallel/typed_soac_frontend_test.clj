@@ -1163,6 +1163,36 @@
     (is (= :reduce (-> parts :region :body-results first dialect/effect-parts :conflict :kind)))
     (is (= program (dialect/validate! program)))))
 
+(deftest guarded-counted-store-loop-remains-inside-the-conditional-region
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i rows
+                 (if (clojure.core/> enabled 0)
+                   (dotimes [j width]
+                     (clojure.core/aset
+                      out (clojure.core/+ (clojure.core/* i width) j)
+                      (clojure.core/aget input
+                                        (clojure.core/+ (clojure.core/* i width) j))))))]
+               effect)
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'out :float 'input :float}
+                         :scalar-types {'rows :long 'width :long 'enabled :int}})
+        equation (first (dialect/equations program))
+        guarded (-> equation dialect/operation-parts :lambda
+                    dialect/lambda-parts :body-results first)
+        region (:region (dialect/effect-parts guarded))
+        loop-effect (first (:body-results region))]
+    (is (= 'effect-map (dialect/operation-kind equation)))
+    (is (= 'effect-when (first guarded)))
+    (is (= '(clojure.core/> %capture0 0)
+           (:predicate (dialect/effect-parts guarded))))
+    (is (= 'effect-loop (first loop-effect)))
+    (is (= :unique
+           (-> guarded dialect/effect-parts vector dialect/effect-part-leaves
+               first :conflict)))
+    (is (= program (dialect/validate! program)))))
+
 (deftest functional-map-result-casts-become-typed-conversion-terms
   (doseq [[cast overflow] [['int :trap] ['unchecked-int :wrap]]]
     (let [source (list 'let*

@@ -1376,6 +1376,13 @@ now attaches the same effect contract to its generated write step. This only adm
 the next conversion boundary: whole-program conditional branches still require explicit typed
 program control and may not be mistaken for a scalar expression or a `KernelDispatch` selector.
 
+Guarded lexical effect regions now admit counted store loops. The existing `effect-when` term
+remains the only conditional effect scope; its body may contain the existing `effect-loop`, and
+portable KernelBody lowering preserves the nesting as `IfRegion` around `ForLoop`. This closes an
+obsolete frontend rejection without adding a loop or branch dialect. Integer values are not
+implicitly predicates: Clojure treats zero as truthy, unlike C-family targets, so source must use
+an explicit comparison until a first-class boolean ABI/value contract is carried end to end.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also

@@ -674,10 +674,6 @@
                                {:tag value-tag :raster.type/tag value-tag})
                              expression)))]
       (cond
-        ;; Store loops under a branch would need predicated loop regions; decline for now.
-        (or (seq (:loops then-region)) (seq (:loops else-region)))
-        nil
-
         ;; Both branches store once to the same destination and at least one branch owns
         ;; locals: one predicated store of a value-if over the two scoped branch values.
         (and then-region else-region aligned?
@@ -697,10 +693,11 @@
         ;; checked conversions and other exceptional scalar control into lanes where the source
         ;; never evaluated them. The ordered effect dialect keeps the guard outside the lexical
         ;; local region; KernelBody lowers it to an IfRegion.
-        (and then-region (nil? else-expression) (seq (:locals then-region)))
+        (and then-region (nil? else-expression)
+             (or (seq (:locals then-region)) (seq (:loops then-region))))
         {:locals []
          :stores (:stores then-region)
-         :loops []
+         :loops (:loops then-region)
          :order [[:region {:predicate predicate
                             :locals (:locals then-region)
                             :order (region-order then-region)}]]}
