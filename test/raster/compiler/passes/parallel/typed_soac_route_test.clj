@@ -146,6 +146,48 @@
       (is (= ['base-seed] (:captures operation)))
       (is (= 'n (get-in operation [:attributes :extent]))))))
 
+(deftest active-ids-is-the-same-typed-splitmix-map-with-a-range-projection
+  (let [source '(let* [result (raster.par/active-ids!
+                               ids n-active n-agents base-seed)] result)
+        options {:scalar-types {'n-active :long 'n-agents :long 'base-seed :long}}
+        {:keys [program stats]} (route/attempt source :int {'ids :int} options)
+        equation (last (:equations program))
+        operation (dialect/operation-parts
+                   (first (dialect/equations (:algorithm equation))))
+        locals (:locals (dialect/lambda-parts (:lambda operation)))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :int :target-device :ze:0}))
+        segmap (first (get-in scheduled [:equations 1 :operations]))
+        emitted (segop-opencl/generate-scheduled-segmap-kernel
+                 segmap :dtype :int :array-types {'ids :int}
+                 :scalar-types {'n-agents :long 'base-seed :long})]
+    (is (= :typed-soac (:route stats)))
+    (is (= 2 (count (:equations program)))
+        "the checked Long-to-int launch extent remains a preceding host scalar equation")
+    (is (= 'map (:kind operation)))
+    (is (= [:long :long :long :long :long :long] (mapv :dtype locals)))
+    (is (= ['base-seed 'n-agents] (:captures operation)))
+    (is (= 'int (-> operation :lambda dialect/lambda-parts :body-results first first)))
+    (is (= #{:wrap :trap}
+           (into #{}
+                 (keep #(when (= "ScalarCompute" (some-> % class .getSimpleName))
+                          (get-in % [:expression :options :overflow])))
+                 (kernel-body-operations emitted))))
+    (is (re-find #"% n_agents" (:source emitted)))
+    (is (re-find #"rstr_trap_cast_i64_i32" (:source emitted))))
+  (testing "the direct backend preserves the host extent equation and generic map ABI"
+    (let [{:keys [kernels form stats]}
+          (opencl-pass/opencl-pass
+           '(raster.par/active-ids! ids n-active n-agents base-seed)
+           :dtype :int :min-elements 1 :array-types {'ids :int}
+           :scalar-types {'n-active :long 'n-agents :long 'base-seed :long})]
+      (is (= 1 (count kernels)))
+      (is (= 1 (get-in stats [:direct-scheduling :typed-scalar-equations])))
+      (is (re-find #"% n_agents" (:source (first kernels))))
+      (is (some #{'raster.gpu.ze-runtime/invoke-registered-kernel} (flatten form)))
+      (is (not-any? #{'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel}
+                    (flatten form))))))
+
 (deftest materialized-scalars-preserve-their-typed-result-conversions
   (let [program (:program (route/attempt
                            '(let* [^long value (long (int seed))

@@ -853,7 +853,7 @@
              [{:type :long :value (long base-seed)}] n)))
 
 (defn invoke-active-ids!
-  "Invoke a compiled parallel active-id generation kernel from the session.
+  "Invoke the compiled typed-map active-id artifact from the session.
 
    sess: session atom
    phase-key: keyword identifying the active-ids kernel
@@ -865,8 +865,11 @@
   (let [{:keys [kernels buffers]} @sess
         kernel-info (first (get kernels phase-key))
         device-id (:device-id @sess)
-        invoke! (rt-resolve device-id "invoke-registered-active-ids-kernel")]
-    (invoke! (:kernel-name kernel-info) (get buffers buf-key) n-active n-total base-seed)))
+        invoke! (rt-resolve device-id "invoke-registered-kernel")]
+    (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
+             [{:type :long :value (long base-seed)}
+              {:type :long :value (long n-total)}]
+             n-active)))
 
 ;; ================================================================
 ;; Data transfer

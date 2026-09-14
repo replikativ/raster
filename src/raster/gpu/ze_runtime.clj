@@ -2835,39 +2835,6 @@
     output-array))
 
 ;; ================================================================
-;; Active-ids kernel invocation (splitmix64 random index generation)
-;; ================================================================
-
-(defn invoke-registered-active-ids-kernel
-  "Invoke a compiled active-ids kernel to fill an ids buffer on-device.
-  Generates n-active random int indices in [0, n-agents) from base-seed + i*golden_ratio.
-
-  kernel-name: registered active-ids kernel
-  ids-buf:     DeviceBuffer (int, n-active elements) or JVM int-array
-  n-active:    number of active agents to sample
-  n-agents:    total agent count (modulus for index generation)
-  base-seed:   scalar long seed from which per-element indices are derived"
-  [^String kernel-name ids-buf n-active n-agents base-seed]
-  (let [{:keys [kernel-handle workgroup-size]} (ensure-kernel-loaded! kernel-name)
-        n-active (long n-active)
-        n-agents (long n-agents)
-        base-seed (long base-seed)
-        wg (long (or workgroup-size 256))
-        groups (long (Math/ceil (/ (double n-active) (double wg))))
-        ids-seg (if (device-buffer? ids-buf)
-                  (:segment ^DeviceBuffer ids-buf)
-                  (let [ab (* n-active 4)
-                        seg (ensure-seg kernel-name :ids-buf ab)
-                        src (MemorySegment/ofArray ids-buf)]
-                    (MemorySegment/copy src 0 seg 0 ab)
-                    seg))]
-    (launch! kernel-handle groups wg
-             [ids-seg {:type :int :value (int n-active)}
-              {:type :long :value n-agents}
-              {:type :long :value base-seed}])
-    ids-buf))
-
-;; ================================================================
 ;; Compound kernel invocation (PDE solver fusion)
 ;; ================================================================
 

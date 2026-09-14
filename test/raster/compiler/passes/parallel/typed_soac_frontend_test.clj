@@ -1813,6 +1813,25 @@
     (is (= normalized (frontend/normalize-source normalized options))
         "normalization re-entry does not introduce another set of guards")))
 
+(deftest fixed-active-id-inputs-share-the-ordered-scalar-normalizer
+  (let [options {:dtype :int :array-types {'ids :int}
+                 :scalar-types {'n-active :long 'population :long 'seed :long}}
+        normalized (frontend/normalize-source
+                    '(let* [result (raster.par/active-ids!
+                                    ids n-active (int population) (int seed))] result)
+                    options)
+        bindings (second normalized)
+        program (frontend/form->program normalized options)]
+    (is (= '(clojure.core/int n-active) (nth bindings 1)))
+    (is (= '(clojure.core/long (int population)) (nth bindings 3)))
+    (is (= '(clojure.core/long (int seed)) (nth bindings 5)))
+    (is (= '[int long long]
+           (mapv #(-> % meta :raster.type/tag)
+                 [(nth bindings 0) (nth bindings 2) (nth bindings 4)])))
+    (is (= '[scalar scalar scalar map]
+           (mapv dialect/operation-kind (dialect/equations program))))
+    (is (= normalized (frontend/normalize-source normalized options)))))
+
 (deftest indexed-operation-counts-use-the-shared-scalar-normalizer
   (doseq [operation ['(raster.par/gather out x indices count)
                      '(raster.par/scatter! out x indices count)

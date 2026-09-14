@@ -1680,6 +1680,47 @@
            :effect-only? true :host-binding symbol
            :result-storage [{:destination (:out facts) :access :write :host-return :buffer}]})))))
 
+(defn- typed-scalar
+  [value tag]
+  (if (symbol? value)
+    (with-meta value (merge (meta value) {:tag tag :raster.type/tag tag}))
+    value))
+
+(defn- splitmix64-map-description
+  [id symbol destination extent base extra-scalars body-dtype body-fn source-operation]
+  (let [extent (typed-scalar extent 'int)
+        base (typed-scalar base 'long)
+        index (with-meta (clojure.core/symbol (str "rstr_rng_index_" id))
+                {:tag 'long :raster.type/tag 'long})
+        local (fn [name]
+                (with-meta (clojure.core/symbol (str "rstr_rng_" name "_" id))
+                  {:tag 'long :raster.type/tag 'long}))
+        state (local "state")
+        s1 (local "s1")
+        s2 (local "s2")
+        s3 (local "s3")
+        s4 (local "s4")
+        s5 (local "s5")
+        locals [{:id state :dtype :long
+                 :init (list 'unchecked-add base
+                             (list 'unchecked-multiply (list 'long index) par/SM-GAMMA))}
+                {:id s1 :dtype :long
+                 :init (list 'bit-xor state
+                             (list 'unsigned-bit-shift-right state 30))}
+                {:id s2 :dtype :long :init (list 'unchecked-multiply s1 par/SM-MIX1)}
+                {:id s3 :dtype :long
+                 :init (list 'bit-xor s2 (list 'unsigned-bit-shift-right s2 27))}
+                {:id s4 :dtype :long :init (list 'unchecked-multiply s3 par/SM-MIX2)}
+                {:id s5 :dtype :long
+                 :init (list 'bit-xor s4 (list 'unsigned-bit-shift-right s4 31))}]]
+    {:kind :map :id id :sym symbol :results [symbol]
+     :index index :extent extent :locals locals :casts [nil] :bodies [(body-fn s5)]
+     :body-dtypes [body-dtype]
+     :inputs #{} :outputs #{destination}
+     :scalars (set (filter symbol? (cons base extra-scalars)))
+     :result-storage [{:destination destination :access :write :host-return :buffer}]
+     :host-binding symbol :elem-type body-dtype :source-operation source-operation}))
+
 (defn- operation-description
   [id symbol expression default-dtype array-types scalar-types]
   (cond
@@ -1718,42 +1759,22 @@
     ;; retained by scalar-expression-body when a schedule becomes KernelBody SSA.
     (par/par-rng-fill-form? expression)
     (let [{:keys [seeds n base-seed]} (par/extract-par-rng-fill-info expression)
-          typed-symbol (fn [value tag]
-                         (if (symbol? value)
-                           (with-meta value (merge (meta value)
-                                                  {:tag tag :raster.type/tag tag}))
-                           value))
-          extent (typed-symbol n 'int)
-          base (typed-symbol base-seed 'long)
-          index (with-meta (clojure.core/symbol (str "rstr_rng_index_" id))
-                  {:tag 'long :raster.type/tag 'long})
-          local (fn [name]
-                  (with-meta (clojure.core/symbol (str "rstr_rng_" name "_" id))
-                    {:tag 'long :raster.type/tag 'long}))
-          state (local "state")
-          s1 (local "s1")
-          s2 (local "s2")
-          s3 (local "s3")
-          s4 (local "s4")
-          s5 (local "s5")
-          locals [{:id state :dtype :long
-                   :init (list 'unchecked-add base
-                               (list 'unchecked-multiply (list 'long index) par/SM-GAMMA))}
-                  {:id s1 :dtype :long
-                   :init (list 'bit-xor state
-                               (list 'unsigned-bit-shift-right state 30))}
-                  {:id s2 :dtype :long :init (list 'unchecked-multiply s1 par/SM-MIX1)}
-                  {:id s3 :dtype :long
-                   :init (list 'bit-xor s2 (list 'unsigned-bit-shift-right s2 27))}
-                  {:id s4 :dtype :long :init (list 'unchecked-multiply s3 par/SM-MIX2)}
-                  {:id s5 :dtype :long
-                   :init (list 'bit-xor s4 (list 'unsigned-bit-shift-right s4 31))}]]
-      {:kind :map :id id :sym symbol :results [symbol]
-       :index index :extent extent :locals locals :casts [nil] :bodies [s5]
-       :body-dtypes [:long]
-       :inputs #{} :outputs #{seeds} :scalars (set (filter symbol? [base]))
-       :result-storage [{:destination seeds :access :write :host-return :buffer}]
-       :host-binding symbol :elem-type :long :source-operation :raster.par/rng-fill!})
+          description (splitmix64-map-description
+                       id symbol seeds n base-seed [] :long identity :raster.par/rng-fill!)]
+      description)
+
+    ;; Active-id selection is the same pointwise SplitMix64 map followed by a typed range
+    ;; projection. Population size is an ordinary scalar capture; neither the functional IR nor
+    ;; KernelBody needs an active-id-specific operation.
+    (par/par-active-ids-form? expression)
+    (let [{:keys [ids n-active n-agents base-seed]}
+          (par/extract-par-active-ids-info expression)
+          population (typed-scalar n-agents 'long)]
+      (splitmix64-map-description
+       id symbol ids n-active base-seed [population] :int
+       (fn [mixed]
+         (list 'int (list 'mod (list 'bit-and mixed Long/MAX_VALUE) population)))
+       :raster.par/active-ids!))
 
     (par/par-scatter-form? expression)
     (let [{:keys [out src index n stride]} (par/extract-par-scatter-info expression)]
@@ -2200,6 +2221,8 @@
     (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
         (par/par-reduce-by-key-form? expression)) (nth expression 4)
     (par/par-rng-fill-form? expression) (:n (par/extract-par-rng-fill-info expression))
+    (par/par-active-ids-form? expression)
+    (:n-active (par/extract-par-active-ids-info expression))
     (par/par-map-pure-form? expression) (nth expression 2)
     (par/par-map-form? expression) (nth expression 3)
     (par/par-map2-form? expression) (nth expression 4)
@@ -2217,7 +2240,8 @@
   (let [position (cond
                    (or (par/par-gather-form? expression) (par/par-scatter-form? expression)
                        (par/par-reduce-by-key-form? expression)) 4
-                   (par/par-rng-fill-form? expression) 2
+                   (or (par/par-rng-fill-form? expression)
+                       (par/par-active-ids-form? expression)) 2
                    (par/par-map-pure-form? expression) 2
                    (par/par-map-form? expression) 3
                    (par/par-map2-form? expression) 4
@@ -2776,11 +2800,17 @@
                                     (contains? (:arrays *declared-kinds*) returned))
                              (assoc-in state [:buffer-aliases symbol] returned)
                              state)
-                     [state expression] (if (par/par-rng-fill-form? expression)
-                                          ;; rng-fill! evaluates its int count before its long seed.
-                                          (normalize-fixed-scalar-inputs state expression
-                                                                         [[2 :int] [3 :long]])
-                                          [state expression])
+                     [state expression]
+                     (cond
+                       (par/par-rng-fill-form? expression)
+                       ;; rng-fill! evaluates its int count before its long seed.
+                       (normalize-fixed-scalar-inputs state expression [[2 :int] [3 :long]])
+
+                       (par/par-active-ids-form? expression)
+                       (normalize-fixed-scalar-inputs state expression
+                                                      [[2 :int] [3 :long] [4 :long]])
+
+                       :else [state expression])
                      expression (or (flatten-counted-row-map expression) expression)
                      expression (normalize-guarded-counted-store-loop expression)
                      counted-expression (normalize-counted-store-loop expression)
