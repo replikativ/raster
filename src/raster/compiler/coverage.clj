@@ -57,10 +57,12 @@
       (some-> (.getMessage throwable) (subs 0 (min 120 (count (.getMessage throwable)))))))
 
 (defn- effect-order-facts
-  "How the typed program's effect maps iterate: `{:independent n :sequential m}`. A store the
-   index algebra proves injective keeps its map `:independent`; an unproven one serializes the
-   whole launch, so a move from `:independent` to `:sequential` is a performance regression the
-   ratchet must see even though the route is unchanged."
+  "How the typed program's effectful iterations execute: `{:independent n :sequential m}`.
+
+   An injective source store may normalize either to an independent `effect-map` or to the
+   stronger functional `scatter` representation. Count a unique scatter as independent so the
+   coverage ratchet follows the semantic parallelism certificate rather than treating that IR
+   refinement as if the effect disappeared."
   [pipeline]
   (let [program (:soac-fused pipeline)]
     (when (and (map? program) (= :typed-soac (:dialect program)))
@@ -68,8 +70,9 @@
        (for [equation (:equations program)
              typed-equation (dialect/equations (:algorithm equation))
              :let [{:keys [kind attributes]} (dialect/operation-parts typed-equation)]
-             :when (= 'effect-map kind)]
-         (:iteration-order attributes))))))
+             :when (or (= 'effect-map kind)
+                       (and (= 'scatter kind) (= :unique (:conflict attributes))))]
+         (if (= 'scatter kind) :independent (:iteration-order attributes)))))))
 
 (defn report-var
   "Compile one source deftm for `target-device` at `dtype` and reduce its report to route facts."
@@ -134,10 +137,11 @@
 
                        ;; an effect map that iterated independently may not start serializing
                        ;; or disappear from the typed program
-                       (or (> (get-in row [:effect-orders :sequential] 0)
-                              (get-in old [:effect-orders :sequential] 0))
-                           (< (get-in row [:effect-orders :independent] 0)
-                              (get-in old [:effect-orders :independent] 0)))
+                       (and (:effect-orders old)
+                            (or (> (get-in row [:effect-orders :sequential] 0)
+                                   (get-in old [:effect-orders :sequential] 0))
+                                (< (get-in row [:effect-orders :independent] 0)
+                                   (get-in old [:effect-orders :independent] 0))))
                        (conj {:var (:var row) :violation :effect-map-serialized
                               :before (:effect-orders old) :after (:effect-orders row)}))]
        violation))))

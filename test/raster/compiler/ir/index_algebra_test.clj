@@ -22,6 +22,15 @@
                        [{:factor 'hdim2 :times {:const 2 :factors []}
                          :le {:const 1 :factors ['head-dim]}}]))))
 
+(deftest empty-nonpositive-rectangular-domains-retain-their-product
+  (is (= {:const 1 :factors '[columns rows]}
+         (ia/monomial '(if (< rows 1) 0
+                           (if (< columns 1) 0 (* rows columns))))))
+  (is (nil? (ia/monomial '(if (< unrelated 1) 0 (* rows columns))))
+      "an unrelated guard is not evidence about a rectangular product")
+  (is (nil? (ia/monomial '(if (< rows 1) 7 (* rows columns))))
+      "a nonempty alternative is not an empty-domain guard"))
+
 (deftest row-major-forms-are-injective-and-dropped-digits-are-not
   (let [row (ia/index-form '(+ (* r feat) j) 'r 'rows [] '{j feat})
         overlap (ia/index-form '(+ (* r 3) j) 'r 'rows [] '{j 4})

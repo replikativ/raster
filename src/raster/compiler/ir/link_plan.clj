@@ -920,11 +920,37 @@
         (cond
           (program-call/evaluated-host-equation? step) []
           (program-call/emitted-equation-call? step)
-          (let [complete (program-complete-writes nodes values id step (:scalar-values call))]
-           [(assoc (program-graph-fact nodes values id step-index
-                                     (get-in step [:equation :id])
-                                     (:graph step) (:buffers step)
-                                     (:scalar-values call) (:scalar-values step))
+          (let [complete (program-complete-writes nodes values id step (:scalar-values call))
+                operation (first (get-in step [:equation :operations]))
+                algorithm (:algorithm operation)
+                equation (first (soac/equations algorithm))
+                logical-preservation-nodes
+                (into #{}
+                      (keep (fn [[_ physical storage]]
+                              (when (= :read-write (:access storage))
+                                (:id (program-value-node! nodes values id physical
+                                                          (get (:buffers step) physical))))))
+                      (map vector (nth equation 2)
+                           (soac/physical-results algorithm equation)
+                           (soac/result-storage algorithm (second equation))))
+                graph-fact
+                (program-graph-fact nodes values id step-index
+                                    (get-in step [:equation :id])
+                                    (:graph step) (:buffers step)
+                                    (:scalar-values call) (:scalar-values step))
+                ;; Kernel ABI access describes physical loads/stores. TypedSOAC result-storage
+                ;; separately says whether untouched elements remain part of the logical result.
+                ;; Preserve that dependency only when whole-write coverage was not proved.
+                graph-fact
+                (update graph-fact :facts
+                        (fn [facts]
+                          (mapv (fn [{:keys [node] :as fact}]
+                                  (if (and (contains? logical-preservation-nodes node)
+                                           (not (contains? complete node)))
+                                    (assoc fact :access :read-write)
+                                    fact))
+                                facts)))]
+           [(assoc graph-fact
                   :complete-writes complete
                   :produced-views
                   (set/intersection complete (set (map (fn [[result _]]

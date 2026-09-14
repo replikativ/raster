@@ -933,6 +933,34 @@
         expanded
         (recur expanded (dec remaining))))))
 
+(defn- expand-extent-definitions
+  "Expand only scalar names whose definitions remain multiplicative extent algebra.
+
+   A derived dimension such as `l-out = 1 + quot(...)` is an opaque nonnegative shape factor;
+   substituting its implementation into `l-out*c*kernel` destroys the monomial even though the
+   dimension is perfectly valid. Products, guarded rectangular products, and aliases remain
+   transparent. Index expressions continue to use full scalar expansion."
+  [expression]
+  (let [definitions (into {}
+                          (filter (fn [[_ definition]]
+                                    (or (symbol? definition)
+                                        ;; Expose the product spine even when one factor is a
+                                        ;; quotient. `digits` records that quotient as an opaque
+                                        ;; factor and its bound; hiding the spine would lose the
+                                        ;; Q4 row-layout proof. Additive derived dimensions stay
+                                        ;; opaque, which is the distinction this expander exists
+                                        ;; to preserve.
+                                        (and (seq? definition)
+                                             (descriptor/multiplication-op?
+                                              (descriptor/semantic-op definition)))
+                                        (some? (index-algebra/monomial definition)))))
+                          *scalar-definitions*)]
+    (loop [expression expression remaining (inc (count definitions))]
+      (let [expanded (util/subst-syms definitions expression)]
+        (if (or (= expanded expression) (zero? remaining))
+          expanded
+          (recur expanded (dec remaining)))))))
+
 (defn- invariant-read-atoms
   "Replace every array read in `form` that is uniform across the map with an atom symbol: a
    read of an array the region does not write, at an index free of the map index, the loop
@@ -954,6 +982,27 @@
                  (swap! atoms assoc key atom-symbol)
                  atom-symbol))))))))
 
+(defn- canonical-index-arithmetic
+  "Project walked numeric dispatch back to the small index algebra vocabulary.
+
+   The walker deliberately retains `.invk` for executable scalar dispatch. Ownership proof is not
+   execution and must compare the semantic arithmetic operation instead. This projection handles
+   only the exact integer ring operations the index algebra already understands; everything else
+   remains opaque and therefore declines conservatively."
+  [expression]
+  (if (seq? expression)
+    (let [operation (descriptor/semantic-op expression)
+          arguments (mapv canonical-index-arithmetic (descriptor/call-args expression))
+          canonical (cond
+                      (descriptor/addition-op? operation) 'clojure.core/+
+                      (descriptor/subtraction-op? operation) 'clojure.core/-
+                      (descriptor/multiplication-op? operation) 'clojure.core/*
+                      :else nil)]
+      (if canonical
+        (with-meta (list* canonical arguments) (meta expression))
+        expression))
+    expression))
+
 (defn- store-index-form
   "The mixed-radix index form of a store's destination index over the map index (extent
    `extent`), the region locals and, for a loop store, its loop's locals and index. Host
@@ -970,14 +1019,25 @@
                       (concat (map :id locals) (map :id (:locals loop))
                               (map :index loops) carry-bindings))
         atoms (atom {})
-        expand (fn [form]
-                 (invariant-read-atoms (expand-scalar-definitions form) destinations varying atoms))]
+        expand-index (fn [form]
+                       (invariant-read-atoms (expand-scalar-definitions form)
+                                             destinations varying atoms))
+        expand-extent (fn [form]
+                        (invariant-read-atoms (expand-extent-definitions form)
+                                              destinations varying atoms))]
     ;; Evolving carries and exported per-item results are not invariant extent factors. A carry
     ;; in the transitive index slice must not accidentally prove unique cross-item addressing.
     (when (empty? (set/intersection carry-bindings (util/free-syms index-expanded)))
-    (index-algebra/index-form (expand (:index store)) index (expand extent)
-                              (mapv #(update % :init expand) (concat locals (:locals loop)))
-                              (if loop {(:index loop) (expand (:extent loop))} {})))))
+      (index-algebra/index-form
+       (canonical-index-arithmetic (expand-index (:index store)))
+       index (expand-extent extent)
+       ;; Region locals participate in address arithmetic, not merely in the launch extent.
+       ;; Preserve the established full expansion here: Q4 packing and other mixed-radix
+       ;; kernels name quotient/remainder digits through these locals.  Selective expansion is
+       ;; only appropriate for shape extents, where derived dimensions must remain opaque
+       ;; non-negative factors.
+       (mapv #(update % :init expand-index) (concat locals (:locals loop)))
+       (if loop {(:index loop) (expand-extent (:extent loop))} {})))))
 
 (defn- fixed-guard-domain
   "A guard equality fixes one integral digit. Consume only retained integral operands and
@@ -2048,14 +2108,101 @@
             (with-meta (apply list (assoc (vec expression) position id)) (meta expression))]))))
    [state expression] inputs))
 
-(defn- normalize-counted-store-loop
-  "Express a closed source store loop through the existing effect-map boundary.
-   This spelling grants no parallelism: write-region analysis still proves its order.
-   Preserve dotimes' single Long conversion and empty nonpositive domain."
+(defn- immutable-counted-bound?
+  "A rectangular loop bound that may be evaluated once for the complete flattened domain.
+
+   Inner `dotimes` bounds are evaluated once per enclosing iteration in Clojure. Hoisting an
+   arbitrary pure expression would still change whether it is evaluated when an outer domain is
+   empty. Restrict the first vertical to immutable scalar references and integral literals; shape
+   arithmetic is already named by normalize-source before it reaches a following operation."
+  [bound]
+  (or (integer? bound)
+      (symbol? bound)
+      (and (seq? bound) (= 2 (count bound))
+           (contains? '#{long clojure.core/long} (first bound))
+           (or (integer? (second bound)) (symbol? (second bound))))))
+
+(defn- rectangular-dotimes-nest
+  "Return the axes and terminal body of a perfect rectangular `dotimes` nest.
+
+   Bounds may not depend on an enclosing induction value. A non-perfect nest, a data-dependent
+   bound, or multiple statements at an iteration level remains source control and is not silently
+   parallelized."
   [expression]
-  (if (and (seq? expression)
-           (contains? '#{dotimes clojure.core/dotimes} (first expression))
-           (not (contains? util/*shadowing-locals* (first expression)))
+  (loop [form expression axes []]
+    (if (and (seq? form)
+             (contains? '#{dotimes clojure.core/dotimes} (first form))
+             (not (contains? util/*shadowing-locals* (first form)))
+             (vector? (second form)) (= 2 (count (second form)))
+             (symbol? (first (second form)))
+             (= 1 (count (nnext form))))
+      (let [[index bound] (second form)
+            bound-free (util/free-syms bound)]
+        (when (and (immutable-counted-bound? bound)
+                   (empty? (set/intersection bound-free (set (map :index axes)))))
+          (recur (first (nnext form)) (conj axes {:index index :bound bound}))))
+      (when (>= (count axes) 2)
+        {:axes axes :body form}))))
+
+(defn- positive-product
+  "The exact row-major domain size, with `dotimes`' empty nonpositive-bound semantics."
+  [bounds]
+  (let [product (with-meta (list* 'clojure.core/* bounds)
+                  {:raster.type/tag 'long})]
+    (reduce (fn [result bound]
+              (with-meta (list 'if (list 'clojure.core/< bound 1) 0 result)
+                {:raster.type/tag 'long}))
+            product (reverse bounds))))
+
+(defn- flatten-rectangular-dotimes
+  "Linearize a perfect loop nest in the same lexicographic order as its source.
+
+   This rewrite is semantic normalization, not a parallelism claim. The resulting effect map is
+   still classified as independent, ordered, reducing, or unsupported by the ordinary store and
+   mixed-radix ownership proofs. Logical rank is therefore independent from the eventual 1--3D
+   hardware launch."
+  [expression]
+  (when-let [{:keys [axes body]} (rectangular-dotimes-nest expression)]
+    (let [flat-index (with-meta (gensym "rstr_flat_index_")
+                       {:raster.type/tag 'long})
+          bounds (mapv :bound axes)
+          ;; Peel row-major digits from the innermost axis. Each quotient/remainder pair is an
+          ;; explicit mixed-radix witness consumed by the existing ownership algebra.
+          {:keys [quotient bindings]}
+          (reduce
+           (fn [{:keys [quotient bindings]} {:keys [index bound]}]
+             (let [next-quotient (with-meta (gensym "rstr_flat_quotient_")
+                                   {:raster.type/tag 'long})
+                   digit (vary-meta index assoc :raster.type/tag 'long)]
+               {:quotient next-quotient
+                :bindings (into bindings
+                                [next-quotient
+                                 (with-meta (list 'clojure.core/quot quotient bound)
+                                   {:raster.type/tag 'long})
+                                 digit
+                                 (with-meta (list 'clojure.core/rem quotient bound)
+                                   {:raster.type/tag 'long})])}))
+           {:quotient flat-index :bindings []}
+           (reverse (subvec axes 1)))
+          outer-index (:index (first axes))
+          body (util/subst-syms {outer-index quotient} body)
+          flat-body (with-meta (list 'let* (vec bindings) body) (meta body))]
+      (when (store-region flat-body flat-index)
+        (with-meta
+          (list 'raster.par/map-void! flat-index (positive-product bounds) flat-body)
+          (meta expression))))))
+
+(defn- normalize-counted-store-loop
+  "Express closed source store loops through the existing effect-map boundary.
+
+   Perfect rectangular nests are first linearized in source order. A single loop retains the
+   established normalization. Neither spelling grants parallelism: write-region analysis and the
+   mixed-radix ownership pass still prove the effect contract."
+  [expression]
+  (or (flatten-rectangular-dotimes expression)
+      (if (and (seq? expression)
+               (contains? '#{dotimes clojure.core/dotimes} (first expression))
+               (not (contains? util/*shadowing-locals* (first expression)))
            (vector? (second expression))
            (= 2 (count (second expression)))
            (symbol? (first (second expression))))
@@ -2068,10 +2215,10 @@
         (with-meta
           (list 'raster.par/map-void! idx
                 (list 'clojure.core/long bound)
-                body)
-          (meta expression))
-        expression))
-    expression))
+                    body)
+              (meta expression))
+            expression))
+        expression)))
 
 (defn- normalize-source*
   [source scalar-types]
@@ -2312,15 +2459,42 @@
                                        (retained-scalar-dtype expression local-scalar-types))
                                    dtype/canon))
             ;; a pure product/sum of scalars is a definition later index algebra may expand
+            ;; normalize-counted-store-loop clamps every launch count after evaluating it once.
+            ;; If the unclamped SSA value is already a proved nonnegative monomial, this exact
+            ;; `max(x,0)` spelling is an identity for index algebra and may retain x as its
+            ;; definition. No general conditional simplification is implied.
+            nonnegative-clamp-source
+            (when (and (seq? expression) (= 4 (count expression))
+                       (contains? '#{if clojure.core/if} (first expression))
+                       (= 0 (nth expression 2))
+                       (symbol? (nth expression 3)))
+              (let [[comparison operand zero] (when (seq? (second expression))
+                                                (second expression))
+                    source (nth expression 3)
+                    expanded (util/subst-syms scalar-definitions source)]
+                (when (and (= 3 (count (second expression)))
+                           (contains? '#{< clojure.core/<} comparison)
+                           (= operand source) (= zero 0)
+                           (some? (index-algebra/monomial expanded)))
+                  source)))
+            proof-scalar-expression (canonical-index-arithmetic expression)
             scalar-definition
             (when (and (= :scalar (:kind description)) (symbol? symbol)
                        (seq? expression)
-                       (contains? '#{* + clojure.core/* clojure.core/+ quot clojure.core/quot}
-                                  (descriptor/semantic-op expression))
+                       (or nonnegative-clamp-source
+                           (some? (index-algebra/monomial proof-scalar-expression))
+                           (contains? '#{* + clojure.core/* clojure.core/+ quot clojure.core/quot}
+                                      (descriptor/semantic-op expression))
+                           ;; Empty-nonpositive rectangular domains are guarded products. The
+                           ;; index algebra accepts only its exact sufficient-condition shape.
+                           (some? (index-algebra/monomial expression)))
                        (provably-pure-scalar? expression)
                        ;; a definition that reads an array is not an invariant extent
                        (empty? (par/collect-aget-arrays expression)))
-              expression)
+              (or nonnegative-clamp-source
+                  (when (index-algebra/monomial proof-scalar-expression)
+                    proof-scalar-expression)
+                  expression))
             allocation-dtype
             (when (and (= :scalar (:kind description))
                        (seq? expression)

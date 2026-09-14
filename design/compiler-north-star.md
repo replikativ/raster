@@ -1457,6 +1457,15 @@ The immediate continuation after the verified double-buffered weighted-reduction
    TypedSOAC path as other kernels. Proving each loop separately would be insufficient because
    cross-loop accesses may race across rows. This is a general effect-domain proof, not an
    attention-specific exception, scalar hoist, synthetic one-trip loop, or performance claim.
+   Perfect rectangular `dotimes` nests over immutable scalar bounds now normalize to one
+   lexicographically equivalent effect domain of arbitrary logical rank. Nonpositive dimensions
+   retain Clojure's empty-domain semantics. Quotient/remainder locals preserve the mixed-radix
+   axes, and a separate ownership proof—not the source rewrite—may certify row-major guarded
+   stores as unique parallel effects. Walked numeric `.invk` calls are projected to the existing
+   integer index algebra only for proof; executable scalar dispatch remains untouched. The
+   channels-last one-dimensional `im2col` workload consequently reaches validated TypedSOAC and
+   portable KernelBody emission without a loop-shaped compatibility kernel. Permuted layouts,
+   data-dependent/triangular domains and imperfect nests remain explicit follow-up coverage.
    Pure unit-step, single-carry Clojure `loop*` recurrences that are complete typed scalar
    expressions are now canonical ordered `Fold` terms before scheduling; effectful loops remain
    `effect-loop`. Fold domains retain an exact typed lower expression and an exclusive or inclusive

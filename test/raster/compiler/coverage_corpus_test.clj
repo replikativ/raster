@@ -43,6 +43,31 @@
         (is (= :unsupported-loop (get-in row [:emission :declines 0 :reason])))
         (is (= 1 (:emission-declines row)))))))
 
+(deftest unique-scatter-retains-independent-effect-ratchet-evidence
+  (let [algorithm (list 'soac-program {}
+                        [(list '= 0 ['result]
+                               (list 'scatter {:index 'i :extent 'n :conflict :unique}
+                                     [] [] '(lambda [] (region [] []))))]
+                        ['result])
+        compiled {:soac-fused {:dialect :typed-soac
+                               :equations [{:algorithm algorithm}]}}]
+    (is (= {:independent 1} (#'coverage/effect-order-facts compiled))
+        "refining an independent effect-map to a proved unique scatter is not serialization")))
+
+(deftest effect-order-ratchet-compares-only-established-parallelism
+  (let [row {:var 'workload :route :typed-soac :typed-validated true :declines []}
+        report (fn [effect-orders]
+                 {:vars [(cond-> row effect-orders (assoc :effect-orders effect-orders))]})]
+    (is (empty? (coverage/ratchet-violations {:vars [row]}
+                                             (report {:sequential 1})))
+        "newly admitted ordered control has no prior parallel schedule to regress")
+    (is (= :effect-map-serialized
+           (:violation
+            (first (coverage/ratchet-violations
+                    {:vars [(assoc row :effect-orders {:independent 1})]}
+                    (report {:sequential 1})))))
+        "an established independent effect remains a protected performance fact")))
+
 (deftest emitted-artifact-summary-does-not-change-the-portable-ratchet
   (let [rows [{:var 'a :route :typed-soac :typed-validated true :declines []
                :emission-declines 0 :emission {:routes {:kernel-body 2} :declines []}}
