@@ -13,6 +13,10 @@
   (delay (pipeline/show-pipeline #'attention/attn-prefill-softmax!
                                  :target-device :ocl:0 :dtype :float)))
 
+(def ^:private gqa-decode-compiled
+  (delay (pipeline/show-pipeline #'attention/gqa-decode-attention-gpu!
+                                 :target-device :ocl:0 :dtype :float)))
+
 (defn- prefill-program []
   (let [options {:dtype :float :array-types {'sc :float}
                  :scalar-types {'nrows :long 'n-q :long}}]
@@ -89,6 +93,19 @@
           (is (= :sequential
                  (get-in (dialect/operation-parts equation)
                          [:attributes :iteration-order]))))))))
+
+(deftest multi-destination-ownership-proves-gqa-head-slices
+  (let [p @gqa-decode-compiled
+        equation (-> p :soac-fused :equations first :algorithm dialect/equations first)
+        parts (dialect/operation-parts equation)]
+    (is (= :typed-soac (get-in p [:soac-fused-stats :route])))
+    (is (= 1 (get-in p [:soac-fused-stats :effect-row-ownership-proofs])))
+    (is (= :independent (get-in parts [:attributes :iteration-order])))
+    (is (= 2 (count (:destinations parts))) "scratch and output are separate writable views")
+    (is (= :kernel-body (get-in p [:kernels 0 :attributes :emission-route])))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
+                  (tree-seq coll? seq equation))
+        "scalar loops nested directly in store values must reach canonical Fold before ownership")))
 
 (deftest prefill-softmax-keeps-row-values-and-output-tails-on-opencl
   (if-not @probe/opencl-available?

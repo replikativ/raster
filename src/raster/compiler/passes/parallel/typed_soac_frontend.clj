@@ -3211,6 +3211,7 @@
   [{:keys [id index extent iteration-order locals inputs scalars results result-storage effects
            result-dtypes]}]
   (let [destinations (mapv :destination result-storage)
+        destination-dtypes (zipmap destinations result-dtypes)
         destination-set (set destinations)
         semantic-inputs (set/difference (set inputs) destination-set)
         ;; An effect traversal need not cover the complete physical input. Keep explicit
@@ -3268,7 +3269,9 @@
                   ;; The destination dtype is already carried by the effect-map result/storage
                   ;; contract. Preserve a cast explicitly present in the source store, without
                   ;; adding a second synthetic cast around the complete value expression.
-                  (transform (if cast (list cast value) value))))))
+                  (canonicalize-scalar-folds
+                   (transform (if cast (list cast value) value))
+                   (get destination-dtypes out))))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map
