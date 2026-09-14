@@ -334,6 +334,24 @@
                                                    (monomial-form m))])))}))))))
       :else nil)))
 
+(defn- affine-offset-terms
+  "Canonical polynomial of invariant monomials in an affine form's offset.
+
+   `base + half` is not itself a monomial, but it is still an exact invariant translation.  Keep
+   its two terms so proofs comparing several address families can cancel their common `base`
+   without pretending that either symbol has a numerical value."
+  [{:keys [const symbolic]}]
+  (let [terms (concat (when-not (zero? const) [{:const const :factors []}])
+                      (map monomial symbolic))]
+    (when (every? some? terms)
+      (->> terms
+           (group-by :factors)
+           (map (fn [[factors like-terms]]
+                  {:const (reduce + (map :const like-terms)) :factors factors}))
+           (remove #(zero? (:const %)))
+           (sort-by (juxt :factors :const))
+           vec))))
+
 (defn index-form
   "The affine form of `expression` over the digits of `index`, with each term's radix, or nil.
 
@@ -376,20 +394,20 @@
         unresolved-locals (set/intersection (set (remove resolved unresolved))
                                             (set (filter symbol? (tree-seq coll? seq expression))))
         form (when (and loop-digits (empty? unresolved-locals)) (affine expression digit-set))
-        ;; the constant offset: an integer, or the sum of the symbolic operands when that sum
-        ;; is one monomial (`d + d = 2d`); a mixed or non-monomial sum is undecidable
-        offset (when form
-                 (let [symbolic (map monomial (:symbolic form))]
-                   (cond
-                     (empty? symbolic) {:const (:const form) :factors []}
-                     (and (every? some? symbolic) (zero? (:const form)))
-                     (reduce add symbolic)
-                     :else nil)))
+        ;; Retain an exact polynomial offset. A single monomial is projected through `:offset`
+        ;; for older consumers; relational proofs use every term.
+        offset-terms (when form (affine-offset-terms form))
+        ;; Preserve the historical monomial projection for consumers which need one scale.  The
+        ;; exact polynomial remains available for relational ownership proofs.
+        offset (when offset-terms
+                 (if (empty? offset-terms)
+                   {:const 0 :factors []}
+                   (when (= 1 (count offset-terms)) (first offset-terms))))
         ancestors (fn ancestors [digit]
                     (when-let [parent (get parents digit)]
                       (cons parent (ancestors parent))))
         term-set (set (keys (:terms form)))]
-    (when (and form offset (seq term-set)
+    (when (and form offset-terms (seq term-set)
                ;; a quantity used whole may not appear beside a digit derived from it
                (not-any? (fn [digit] (some term-set (ancestors digit))) term-set)
                (every? #(some? (get-in digits [% :radix])) term-set)
@@ -397,12 +415,14 @@
                (every? (fn [[_ coefficient]]
                          (empty? (set/intersection (set (:factors coefficient)) digit-set)))
                        (:terms form))
-               (empty? (set/intersection (set (:factors offset)) digit-set)))
+               (every? #(empty? (set/intersection (set (:factors %)) digit-set))
+                       offset-terms))
       {:terms (into {} (map (fn [[digit coefficient]]
                               [digit {:coefficient coefficient
                                       :radix (get-in digits [digit :radix])}]))
                     (:terms form))
        :offset offset
+       :offset-terms offset-terms
        :leaves leaves
        :parents parents
        :quot-facts quot-facts})))
@@ -526,3 +546,41 @@
                         (-> form
                             (assoc-in [:terms ordinal] {:coefficient stride :radix radix})
                             (update :leaves conj ordinal)))))))))))
+
+(defn disjoint-translated-forms?
+  "Whether address forms with identical digit terms are mutually disjoint across work items.
+
+   A common invariant translation is irrelevant to injectivity.  This cancels it exactly from
+   each form's polynomial offset, then delegates the remaining single-monomial offsets to
+   `disjoint-offsets?`.  Mixed residual polynomials conservatively decline."
+  [forms]
+  (let [forms (vec forms)
+        polynomials (mapv (fn [form]
+                            (into {} (map (juxt :factors :const)) (:offset-terms form)))
+                          forms)
+        factors (set (mapcat keys polynomials))
+        common (into {} (map (fn [factor]
+                              [factor (apply min (map #(get % factor 0) polynomials))]))
+                     factors)
+        residuals
+        (mapv (fn [polynomial]
+                (let [terms (->> factors
+                                 (keep (fn [factor]
+                                         (let [coefficient (- (get polynomial factor 0)
+                                                              (get common factor 0))]
+                                           (when-not (zero? coefficient)
+                                             {:const coefficient :factors factor}))))
+                                 vec)]
+                  (cond
+                    (empty? terms) {:const 0 :factors []}
+                    (= 1 (count terms)) (first terms)
+                    :else nil)))
+              polynomials)]
+    (boolean
+     (and (seq forms)
+          (every? :offset-terms forms)
+          (every? some? residuals)
+          (apply = (map #(select-keys % [:terms :leaves :parents :fixed-leaves :quot-facts])
+                        forms))
+          (every? injective? forms)
+          (disjoint-offsets? (first forms) residuals)))))

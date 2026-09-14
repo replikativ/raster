@@ -1035,13 +1035,11 @@
 
             ;; par/butterfly!
             (par/par-butterfly-form? form)
-            (let [{:keys [half]} (par/extract-par-butterfly-info form)]
-              (if (and (number? half) (< half min-elements))
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-butterfly! form))
-                ;; No dedicated GPU kernel yet — fall back to scalar expansion
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-butterfly! form))))
+            (throw
+             (ex-info
+              "butterfly! must be certified as a typed effect traversal before GPU emission"
+              {:reason :unbound-typed-butterfly
+               :form form}))
 
             ;; === Structural recursion (PRESERVE metadata) ===
             ;; A bare (apply list head ...) rebuild drops source and type metadata on devirtualized
