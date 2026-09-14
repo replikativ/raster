@@ -550,7 +550,7 @@
         top-array-types (merge (or (:array-types program-types) {})
                                (or (:array-types (meta source-form)) {})
                                (or (:array-types (meta form)) {}) array-types)
-        stats (atom (cond-> {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
+        stats (atom (cond-> {:ze-maps 0 :ze-reduces 0 :ze-contracts 0
                              :ze-structured-reductions 0 :kernel-graphs 0
                              :fallback 0}
                       direct-schedule
@@ -714,17 +714,11 @@
 
             ;; === Compound kernel ===
             (and (seq? form) (= 'raster.compiler/compound-kernel (first form)))
-            (let [[_ metadata original-dotimes] form
-                  strategy (get-in metadata [:execution :strategy])]
-              (case strategy
-                :local
-                (let [k (register-kernel!
-                         (legacy/generate-compound-local-kernel metadata
-                                                                :dtype dtype :device-id device-id)
-                         :ze-compounds)]
-                  (legacy/emit-compound-kernel-invocation metadata [k]))
-                :global
-                (transform original-dotimes)))
+            (let [[_ _metadata original-dotimes] form]
+              ;; Preserve the outer iteration and lower its phases through the ordinary typed
+              ;; backend. Local-memory fusion is legal only after KernelGraph dependencies and
+              ;; barrier participation have been proved; a source marker is insufficient.
+              (transform original-dotimes))
 
             ;; === par/map! — SegOp path ===
             (par/par-map-form? form)
