@@ -686,6 +686,33 @@
                                   {:scalar-types {'n :long}})
                    [:stats :front-end])))))
 
+(deftest unique-scatter-values-canonicalize-captured-identity-folds
+  (let [source
+        '(let* [step
+                (raster.par/map-void!
+                 i rows
+                 (clojure.core/aset
+                  out (raster.par/unique-index (+ base i))
+                  (float
+                   (loop* [^{:raster.type/tag long} j 0
+                           ^{:raster.type/tag float} acc seed]
+                     (if (< (long j) width)
+                       (recur (inc (long j))
+                              (+ acc (clojure.core/aget x (+ (* i width) j))))
+                       acc)))))]
+           step)
+        options {:dtype :float :array-types {'x :float 'out :float}
+                 :scalar-types {'rows :long 'width :long 'base :long 'seed :float}}
+        routed (route/attempt source :float (:array-types options) options)
+        equation (-> routed :program :equations first :algorithm dialect/equations first)
+        nodes (tree-seq coll? seq equation)
+        fold (first (filter dialect/scalar-fold-form? nodes))]
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= 'scatter (dialect/operation-kind equation)))
+    (is (dialect/scalar-fold-form? fold))
+    (is (symbol? (get-in (dialect/scalar-fold-parts fold) [:attributes :identity])))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %))) nodes))))
+
 (deftest offset-map-is-an-injective-typed-scatter
   (let [source '(let* [result
                        (raster.par/map! out i n :offset base float

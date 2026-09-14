@@ -3524,9 +3524,10 @@
 
 (defn- scatter-equation
   [description]
-  (let [{:keys [id index extent locals casts bodies inputs results result-storage
+  (let [{:keys [id index extent locals casts bodies body-dtypes inputs results result-storage
                 write-indices predicates conflict]} description
         values (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
+        body-dtypes (or body-dtypes (repeat (count values) nil))
         destinations (mapv :destination result-storage)
         semantic-inputs (into (set inputs) destinations)
         ;; Indexed updates do not assert that a captured buffer's capacity equals the
@@ -3542,12 +3543,15 @@
                      substitutions
                      (first (elementize [expression] arrays parameters index))))
         local-forms (mapv (fn [{:keys [id dtype init]}]
-                            (dialect/local-value id dtype (transform init)))
+                            (dialect/local-value
+                             id dtype (canonicalize-scalar-folds (transform init) dtype)))
                           locals)
-        writes (mapv (fn [destination-index predicate value]
+        writes (mapv (fn [destination-index predicate value value-dtype]
                        (list 'write (transform destination-index)
-                             (transform predicate) (transform value)))
-                     write-indices predicates values)]
+                             (transform predicate)
+                             (canonicalize-scalar-folds (transform value)
+                                                        (or value-dtype :double))))
+                     write-indices predicates values body-dtypes)]
     (list '= id results
           (list 'scatter {:index index :extent extent :conflict conflict
                           :attributes {:stable-array-captures
