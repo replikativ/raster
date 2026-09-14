@@ -33,6 +33,9 @@
              (lambda [element ... capture-parameter ... destination-parameter ...]
                (effect-region [(let-value local :dtype init-expr) ...]
                  [(effect destination-parameter conflict destination-index predicate value)
+                  (effect-when predicate
+                    [(let-value branch-local :dtype init-expr) ...]
+                    [(effect destination-parameter conflict destination-index true value) ...])
                   ...]))))
         (= equation-id [result ...]
            (reduce {:index i :extent n
@@ -525,6 +528,7 @@
 
   (Effect [e :enforce]
           (effect-region [(?:* d)] [(?:+ e)])
+          (effect-when ?s:predicate [(?:* d)] [(?:+ e)])
           (effect ?sym:destination ?ec:conflict
                   ?s:destination-index ?s:predicate ?s:value)
           (effect-loop ?ela ?s:extent ?el)
@@ -669,13 +673,15 @@
   (and (seq? value) (= 'effect-loop (first value)) (contains? #{4 5} (count value))))
 
 (defn effect-form?
-  "Whether a typed ordered-effect region item has canonical syntax: one store effect or one
-   counted loop of them."
+  "Whether a typed ordered-effect item has canonical syntax: a store, counted loop, lexical
+   region, or guarded lexical region."
   [value]
   (or (and (seq? value) (= 'effect (first value)) (= 6 (count value)))
       (effect-loop-form? value)
       (and (seq? value) (= 'effect-region (first value)) (= 3 (count value))
-           (vector? (second value)) (vector? (nth value 2)))))
+           (vector? (second value)) (vector? (nth value 2)))
+      (and (seq? value) (= 'effect-when (first value)) (= 4 (count value))
+           (vector? (nth value 2)) (vector? (nth value 3)))))
 
 (declare lambda-parts)
 
@@ -683,11 +689,17 @@
   "Project one effect-region item. Store effects yield their destination, conflict contract,
    index, predicate and value; loops yield `:loop true` with `:index`, `:lower`, `:extent` and
    the `:lambda`. Result-bearing loops additionally expose a typed `:carry` with initializer and
-   update; their parameter vector is [index carry-parameter]."
+   update; their parameter vector is [index carry-parameter]. Guarded regions expose their
+   predicate beside the lexical region."
   [value]
   (cond
     (and (effect-form? value) (= 'effect-region (first value)))
     {:region (lambda-parts (list 'lambda [] value))}
+
+    (and (effect-form? value) (= 'effect-when (first value)))
+    (let [[_ predicate locals effects] value]
+      {:predicate predicate
+       :region (lambda-parts (list 'lambda [] (list 'effect-region locals effects)))})
 
     (effect-loop-form? value)
     (let [[_ attributes extent] value
@@ -790,7 +802,11 @@
             (reduce
              (fn [bound effect]
                (if-let [region (:region effect)]
-                 (do (walk (:effects region) (locals! (:locals region) bound)) bound)
+                 (do
+                   (when-let [predicate (:predicate region)]
+                     (closed! predicate bound :predicate))
+                   (walk (:effects region) (locals! (:locals region) bound))
+                   bound)
                (if-let [{:keys [index lower extent locals effects carry]} (:loop effect)]
                  (if carry
                    (let [{:keys [parameter result dtype init update]} carry
@@ -836,6 +852,11 @@
   [locals effects]
   (list 'effect-region (vec locals) (vec effects)))
 
+(defn effect-guard-region
+  "Construct a lexical ordered-effect region evaluated only when `predicate` is true."
+  [predicate locals effects]
+  (list 'effect-when predicate (vec locals) (vec effects)))
+
 (defn effect-lambda-form
   "Construct a canonical TypedSOAC ordered-effect lambda."
   ([parameters effects]
@@ -871,8 +892,9 @@
   (let [{:keys [loop index lower extent lambda carry] :as part} (effect-parts effect)]
     (cond
       (:region part)
-      {:region {:locals (:locals (:region part))
-                :effects (mapv scheduled-effect (:body-results (:region part)))}}
+      {:region (cond-> {:locals (:locals (:region part))
+                        :effects (mapv scheduled-effect (:body-results (:region part)))}
+                 (:predicate part) (assoc :predicate (:predicate part)))}
       loop
       (let [{:keys [locals body-results]} (lambda-parts lambda)]
         {:loop (cond-> {:index index :lower lower :extent extent :locals locals

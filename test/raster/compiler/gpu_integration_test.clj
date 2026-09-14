@@ -1,5 +1,5 @@
 (ns raster.compiler.gpu-integration-test
-  "Numerical and GPU-compiler ratchets for the heat-equation workload.
+  "Numerical and GPU-compiler ratchets for representative scientific/ML workloads.
 
   These tests require a Level Zero GPU device. They skip gracefully
   when no GPU is available (CI, CPU-only machines).
@@ -14,6 +14,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.attention :as attention]
+            [raster.dl.nn :as nn]
             [raster.gpu.link :as gpu-link]
             [raster.linalg.contract :as contract]
             [raster.ode.pde :as pde]))
@@ -145,6 +146,24 @@
         (let [actual (gpu-link/download executable (first (:outputs plan)))]
           (doseq [i (range 6)]
             (is (< (Math/abs (- (aget expected i) (aget ^floats actual i))) 1.0e-4))))
+        (finally (gpu-link/close! executable))))))
+
+(deftest col2im-guarded-reduction-executes-through-the-direct-vertical
+  (when-gpu "col2im-guarded-reducing-effect"
+    (let [columns (float-array (map float (range 1 13)))
+          arguments [columns 1 1 4 3 1 1 1]
+          expected (apply nn/col2im-1d arguments)
+          compilation (equation-first/compile #'nn/col2im-1d
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          executable (gpu-link/instantiate! plan)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 2 (count (:kernels compilation)))
+          "zero initialization and the guarded reducing effect are ordinary KernelBody stages")
+      (try
+        (gpu-link/run! executable)
+        (is (= (vec expected)
+               (vec (gpu-link/download executable (first (:outputs plan))))))
         (finally (gpu-link/close! executable))))))
 
 (deftest heat-2d-counted-stores-execute-through-the-direct-vertical

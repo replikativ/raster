@@ -29,3 +29,20 @@
     (is (nil? (source/ordered-effects [] {})))
     (is (nil? (execute log)))
     (is (= [:before :inside :after] @log))))
+
+(deftest guarded-region-dominates-its-local-initializers
+  (let [form (source/ordered-effects
+              [{:region {:predicate 'active?
+                         :locals [{:id 'checked :dtype :long :init '(inc n)}]
+                         :effects [{:source '(swap! log conj checked)}]}}
+               {:source '(swap! log conj :after)}]
+              {:emit-store :source
+               :emit-region (fn [locals body]
+                              (list 'let* (vec (mapcat (juxt :id :init) locals)) body))})
+        execute (eval (list 'fn '[log active? n] form))]
+    (let [log (atom [])]
+      (is (nil? (execute log false Long/MAX_VALUE)))
+      (is (= [:after] @log)))
+    (let [log (atom [])]
+      (is (nil? (execute log true 4)))
+      (is (= [5 :after] @log)))))

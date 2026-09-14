@@ -1358,6 +1358,16 @@ while the counted loops remained host work. Their existing independent kernels a
 The resulting route counts are 132 typed, 47 scalar, 14 compatible, and 43 errors; the 43 errors
 remain visible debt rather than being excluded from the corpus.
 
+Rectangular axis permutations now retain derived dimensions as opaque mixed-radix factors while
+exposing their product spines to the ownership algebra. `im2col-1d` therefore lowers as a proved
+unique traversal rather than an ordered compatibility effect. Its reverse, `col2im-1d`, exercises
+the colliding case: walked typed addition is recognized through an identity result cast, and a
+branch-local address region is represented as a guarded lexical effect rather than speculated out
+of its source branch. That region lowers to ordinary KernelBody `IfRegion` plus `AtomicRMW` on the
+shared OpenCL/CUDA/HIP path. A local Arc comparison covers the public equation-first LinkPlan and
+the exact CPU result. This is general guarded reducing-scatter support; convolution names do not
+participate in admission or lowering.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
