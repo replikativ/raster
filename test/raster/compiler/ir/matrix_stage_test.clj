@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.matrix-stage-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
@@ -34,6 +35,17 @@
            clojure.lang.ExceptionInfo
            #"distinct M/N/K coordinate identities"
            (matrix-stage/make (assoc (stage-spec) :axis-symbols invalid)))))))
+
+(deftest matrix-stage-validates-physical-operand-layouts
+  (let [transposed (layout/transpose-layout (layout/row-major [32 32] :half))
+        stage (matrix-stage/make (assoc (stage-spec) :input-layouts {'B transposed}))]
+    (is (= [1 0] (get-in stage [:input-layouts 'B :perm])))
+    (doseq [invalid [(assoc transposed :shape [16 64])
+                     (assoc transposed :dtype :float)
+                     (assoc transposed :perm [0 0])]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"dense permutation"
+           (matrix-stage/make (assoc (stage-spec) :input-layouts {'B invalid})))))))
 
 (deftest matrix-stage-keeps-fragment-types-separate-from-physical-inputs
   (let [plain (matrix-stage/make (stage-spec))

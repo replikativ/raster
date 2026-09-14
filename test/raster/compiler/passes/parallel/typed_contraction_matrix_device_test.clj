@@ -190,7 +190,7 @@
           (finally
             (gpu/release-kernel-graph! session handle))))))))
 
-(deftest public-composed-matrix-selects-input-fusion-and-hoists-constant-weights
+(deftest public-composed-matrix-selects-one-tile-local-input-kernel
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "public composed GEMM input fusion")
     (let [shape [13 32 32]
@@ -208,17 +208,17 @@
                      :schedule {:typed-contraction
                                 {:measured-selectors
                                  {(:id choice) {:kind :fixed-strategy
-                                                :strategy :xmx-direct-lhs-tile-cast}}}}})]
+                                                :strategy :xmx-direct-tile-inputs}}}}})]
       (is (= 1 (count (get-in selected [:descriptor :steps]))))
       (is (empty? (get-in selected [:descriptor :allocs])))
-      (is (some #{:xmx-direct-lhs-tile-cast}
+      (is (some #{:xmx-direct-tile-inputs}
                 (map executable/strategy (:alternatives choice))))
       (let [live (compiled/instantiate! selected {:profile? true})]
         (try
           (let [bound (mapv :executable (compiled/execution-info live))]
-            (is (= [:xmx-direct-lhs-tile-cast] (mapv :strategy bound)))
+            (is (= [:xmx-direct-tile-inputs] (mapv :strategy bound)))
             (is (= [:mixed-f16-f32] (mapv :precision bound)))
-            (is (= [[{:strategy :xmx-direct-lhs-tile-cast :reasons []}]]
+            (is (= [[{:strategy :xmx-direct-tile-inputs :reasons []}]]
                    (mapv :admission bound))))
           (dotimes [replay 2]
             (when (pos? replay)
@@ -229,8 +229,8 @@
                                  (canary/gemm-reference a b shape))
                   profile (:profile result)]
               (is (= expected actual) (str "public input-fused replay " replay))
-              (is (= 1 (count profile)) "weight conversion stays in the one-time prologue")
-              (is (= [:xmx-direct-lhs-tile-cast :contract]
+              (is (= 1 (count profile)) "conversion and matrix execution share one kernel")
+              (is (= [:xmx-direct-tile-inputs :contract]
                      (take-last 2 (:phase (first profile)))))))
           (finally (compiled/close! live)))))))
 

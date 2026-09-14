@@ -8,11 +8,12 @@
    operand-dtype fragments; the closed typed SSA region retains the conversion policy without
    introducing a second scalar language or assuming target support."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as kernel-body]))
 
 (defrecord MatrixStage
            [id lhs rhs result dimensions axis-symbols batching reduction result-shape epilogue
-            operand-dtype accumulator-dtype result-dtype schedule input-value-regions])
+            operand-dtype accumulator-dtype result-dtype schedule input-value-regions input-layouts])
 
 (defn matrix-stage?
   [value]
@@ -81,15 +82,37 @@
         (throw (ex-info "matrix input region requires a canonical physical input dtype"
                         {:reason :matrix-stage-input-dtype :input input :dtype physical-dtype})))
       (kernel-body/validate-input-value-region! region physical-dtype operand-dtype))
+    (when-not (and (map? (:input-layouts stage))
+                   (every? (set [lhs rhs]) (keys (:input-layouts stage))))
+      (throw (ex-info "matrix input layouts must name current operands"
+                      {:reason :matrix-stage-input-layouts :layouts (:input-layouts stage)})))
+    (let [[m n k] dimensions]
+      (doseq [[input descriptor] (:input-layouts stage)
+              :let [expected-shape (if (= input lhs) [m k] [k n])
+                    physical-dtype (or (get-in input-value-regions [input :accumulator-dtype])
+                                       operand-dtype)
+                    perm (:perm descriptor)]]
+        (when-not (and (= :row-major (:kind descriptor))
+                       (= 2 (:rank descriptor))
+                       (= expected-shape (:shape descriptor))
+                       (= physical-dtype (:dtype descriptor))
+                       (= #{0 1} (set perm)) (= 2 (count perm)))
+          (throw (ex-info "matrix input layout must be a dense permutation of its logical operand"
+                          {:reason :matrix-stage-input-layout
+                           :input input :layout descriptor
+                           :expected-shape expected-shape :expected-dtype physical-dtype})))
+        ;; Resolve now so malformed descriptors cannot survive until target emission.
+        (layout/resolve-strides descriptor)))
     stage))
 
 (defn make
   [{:keys [id lhs rhs result dimensions axis-symbols batching reduction result-shape epilogue
-           operand-dtype accumulator-dtype result-dtype schedule input-value-regions]
+           operand-dtype accumulator-dtype result-dtype schedule input-value-regions input-layouts]
     :or {axis-symbols ['i 'j 'l]
-         operand-dtype :half accumulator-dtype :float result-dtype :float input-value-regions {}}}]
+         operand-dtype :half accumulator-dtype :float result-dtype :float
+         input-value-regions {} input-layouts {}}}]
   (validate!
    (->MatrixStage id lhs rhs result (vec dimensions) (vec axis-symbols)
                   batching reduction (vec result-shape)
                   epilogue (dtype/canon operand-dtype) (dtype/canon accumulator-dtype)
-                  (dtype/canon result-dtype) schedule input-value-regions)))
+                  (dtype/canon result-dtype) schedule input-value-regions input-layouts)))

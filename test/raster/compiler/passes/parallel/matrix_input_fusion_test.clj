@@ -120,22 +120,36 @@
                                                   [(graph/->ValueUse 'A16 :read)] #{} [[:test :cast]]))]]
       (is (nil? (fuse bad))))))
 
-(deftest explicit-production-candidate-retains-weight-conversion
+(deftest explicit-production-candidate-converts-both-canonical-inputs-in-tile-loads
   (let [spec {:id :fused-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32 :variant :nn
               :fill-workgroups 16
               :tile (get-in (stage-graph) [:nodes 1 :operation :schedule :tile])}
         candidate (gemm/emit-matrix-input-fusion-alternative spec)
         ordinary (gemm/emit-matrix-alternatives spec)]
-    (is (= :xmx-direct-lhs-tile-cast (get-in candidate [:attributes :strategy])))
-    (is (= [:convert-b :contract] (mapv (comp last :id) (:nodes candidate))))
-    (is (= [:b16] (mapv (comp last :id) (:temporaries candidate))))
+    (is (= :xmx-direct-tile-inputs (get-in candidate [:attributes :strategy])))
+    (is (= [:contract] (mapv (comp last :id) (:nodes candidate))))
+    (is (empty? (:temporaries candidate)))
     (is (= :xmx-direct (get-in ordinary [:selector :default])))
     (is (contains? (set (map executable/strategy (:alternatives ordinary)))
-                   :xmx-direct-lhs-tile-cast))
+                   :xmx-direct-tile-inputs))
     (doseq [override [{:variant :tn} {:variant :tt} {:target-dialect :cuda}
                      {:target-dialect :hip}]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (gemm/emit-matrix-input-fusion-alternative (merge spec override)))))))
+
+(deftest transposed-rhs-becomes-a-strided-tile-load-without-layout-temporaries
+  (let [spec {:id :transposed-input-test :a 'A :b 'B :c 'C
+              :m 16 :n 16 :k 32 :variant :nt :fill-workgroups 16
+              :tile (get-in (stage-graph) [:nodes 1 :operation :schedule :tile])}
+        candidate (gemm/emit-matrix-input-fusion-alternative spec)
+        artifact (get-in candidate [:nodes 0 :operation])
+        stage (get-in artifact [:attributes :scheduled-kernel-body :source])]
+    (is (= [:contract] (mapv (comp last :id) (:nodes candidate))))
+    (is (empty? (:temporaries candidate)))
+    (is (= '#{A B} (set (keys (:input-value-regions stage)))))
+    (is (= [1 0] (get-in stage [:input-layouts 'B :perm])))
+    (is (re-find #"__global const float\* restrict B" (:source artifact)))
+    (is (re-find #"\* \(long\)\(1\).*\* \(long\)\(K\)" (:source artifact)))))
 
 (deftest normal-enumeration-retains-checked-input-fusion-without-changing-selection
   (let [spec {:id :enumeration-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32
@@ -145,10 +159,10 @@
       (let [result (gemm/emit-matrix-alternatives (assoc spec :variant variant))
             strategies (set (map executable/strategy (:alternatives result)))]
         (is (= (contains? #{:nn :nt} variant)
-               (contains? strategies :xmx-direct-lhs-tile-cast)))
+               (contains? strategies :xmx-direct-tile-inputs)))
         (is (= :xmx-direct (get-in result [:selector :default])))))
     (with-redefs [fusion/fuse-lhs-cast (constantly nil)]
-      (is (not (some #(= :xmx-direct-lhs-tile-cast (executable/strategy %))
+      (is (not (some #(= :xmx-direct-tile-inputs (executable/strategy %))
                      (:alternatives (gemm/emit-matrix-alternatives (assoc spec :variant :nn))))))
       (is (= :matrix-input-fusion-ineligible
              (try (gemm/emit-matrix-input-fusion-alternative (assoc spec :variant :nn))
@@ -196,7 +210,7 @@
              (try (admit {'A :same 'B :weights 'C :same} (executable/strategy fused))
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (is (= 3 (count (calls ordinary true))) "global conversion snapshots A before C is written")
-    (is (= 2 (count (calls fused false))))
+    (is (= 1 (count (calls fused false))))
     (is (= :kernel-abi-no-write-alias
            (try (calls fused true) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))

@@ -328,7 +328,7 @@
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
   [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes epilogue input-value-regions]
+           k-range launch-group-count attributes epilogue input-value-regions input-layouts]
     :or {result-dtype :float provenance {}}}]
   (let [dimension-parameters
         (or dimension-parameters
@@ -346,6 +346,7 @@
       :bindings {:row a :col b}
       :epilogue epilogue
       :input-value-regions (or input-value-regions {})
+      :input-layouts (or input-layouts {})
       :result-dtype result-dtype
       :additional-parameters additional-parameters
       :additional-indices additional-indices
@@ -368,7 +369,8 @@
   [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
            target-dialect
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes parameter-names epilogue input-value-regions]
+           k-range launch-group-count attributes parameter-names epilogue input-value-regions
+           input-layouts]
     :or {result-dtype :float provenance {} target-dialect :opencl-intel}}]
   (let [kernel-name (c-emit/c-symbol kernel-name)
         kernel-body (scheduled-matrix-body
@@ -379,7 +381,8 @@
                       :additional-indices additional-indices :buffer-shapes buffer-shapes
                       :buffer-views buffer-views :operation-buffers operation-buffers
                       :k-range k-range :launch-group-count launch-group-count
-                      :attributes attributes :epilogue epilogue :input-value-regions input-value-regions})
+                      :attributes attributes :epilogue epilogue
+                      :input-value-regions input-value-regions :input-layouts input-layouts})
         emitted (matrix-target/emit-matrix-kernel
                  kernel-name kernel-body target-dialect {:parameter-names parameter-names})]
     (assoc emitted
@@ -537,7 +540,8 @@
   [stage kernel-name phase target-dialect scalar-types]
   (let [{stage-id :id a :lhs b :rhs c :result
          [m n k] :dimensions axis-symbols :axis-symbols reduction :reduction epilogue :epilogue
-         batching :batching schedule :schedule input-value-regions :input-value-regions}
+         batching :batching schedule :schedule input-value-regions :input-value-regions
+         input-layouts :input-layouts}
         (matrix-stage/validate! stage)
         tile (:tile schedule)
         _ (when-not (and (= :matrix-instruction-tiling (:kind schedule))
@@ -564,6 +568,7 @@
                    :tile tile :result-dtype (:result-dtype stage)
                    :epilogue epilogue
                    :input-value-regions input-value-regions
+                   :input-layouts input-layouts
                    :phase phase
                    :target-dialect target-dialect
                    :source-operation stage
@@ -856,9 +861,20 @@
             :attributes {:strategy strategy :variant variant :precision :mixed-f16-f32
                          :tile tile :vector-width vector-width
                          :requested-splits requested-splits}})
-          stage-graph (if (:fuse-lhs-cast? spec)
-                        (input-fusion/fuse-lhs-cast stage-graph convert-a-id contract-id)
-                        stage-graph)]
+          stage-graph
+          (cond
+            (:fuse-tile-inputs? spec)
+            (some-> (case variant
+                      :nn stage-graph
+                      :nt (input-fusion/fuse-input-transpose
+                           stage-graph transpose-b-id contract-id :rhs))
+                    (input-fusion/fuse-lhs-cast convert-a-id contract-id)
+                    (input-fusion/fuse-rhs-cast convert-b-id contract-id))
+
+            (:fuse-lhs-cast? spec)
+            (input-fusion/fuse-lhs-cast stage-graph convert-a-id contract-id)
+
+            :else stage-graph)]
       (when stage-graph
         (let [emit-spec (assoc spec :strategy strategy)
               refinement (make-refinement stage-graph source-operation source-graph emit-spec)]
@@ -872,12 +888,12 @@
 
 (defn- matrix-input-fusion-alternative [spec]
   (when (matrix-input-fusion-target? spec)
-    (xmx-graph (assoc spec :split-k? false :fuse-lhs-cast? true
+    (xmx-graph (assoc spec :split-k? false :fuse-tile-inputs? true
                      :vector-width (get spec :vector-width 4)
-                     :strategy :xmx-direct-lhs-tile-cast))))
+                     :strategy :xmx-direct-tile-inputs))))
 
 (defn emit-matrix-input-fusion-alternative
-  "Emit an explicit Intel direct-matrix candidate with an inlined lhs FP32→FP16 cast.
+  "Emit an explicit Intel direct-matrix candidate with tile-local FP32→FP16 inputs.
    Binding requires physical A/C disjointness; runtime admission checks the concrete ranges.
    Retains the ordinary public ABI and original semantic
    refinement source. Unsupported layouts/targets fail closed; no implicit fallback."

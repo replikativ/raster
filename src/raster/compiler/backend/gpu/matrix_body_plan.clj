@@ -44,6 +44,16 @@
   (when-not condition
     (throw (ex-info message (assoc data :reason :kernel-body-matrix-plan-unimplemented)))))
 
+(defn- dense-permutation-layout?
+  [{:keys [shape dtype] descriptor :layout}]
+  (let [perm (:perm descriptor)]
+    (and (= :row-major (:kind descriptor))
+         (= 2 (:rank descriptor))
+         (= shape (:shape descriptor))
+         (= dtype (:dtype descriptor))
+         (= #{0 1} (set perm))
+         (= 2 (count perm)))))
+
 (defn- expression-references [expression]
   (cond
     (value-id? expression) #{expression}
@@ -183,10 +193,10 @@
         _ (require! (= [m-extent k-extent n-extent]
                        [m-extent' k-extent' n-extent'])
                     "matrix parameter shapes do not compose" {:parameters parameters})
-        _ (require! (every? (fn [{:keys [shape dtype] storage-layout :layout}]
-                             (= (layout/row-major shape dtype) storage-layout))
-                           [lhs-storage rhs-storage out-storage])
-                    "matrix plan currently requires exact row-major storage layouts"
+        _ (require! (and (every? dense-permutation-layout? [lhs-storage rhs-storage])
+                         (= (layout/row-major (:shape out-storage) (:dtype out-storage))
+                            (:layout out-storage)))
+                    "matrix plan requires dense operand permutations and row-major results"
                     {:lhs lhs-storage :rhs rhs-storage :out out-storage})
         dimension-parameters (:dimension-parameters attributes)
         m-parameter (:m dimension-parameters)
@@ -446,6 +456,7 @@
      :input-regions {:lhs (only! "lhs input value region" (distinct (map :value-region lhs-loads)))
                      :rhs (only! "rhs input value region" (distinct (map :value-region rhs-loads)))}
      :input-dtypes {:lhs (:dtype lhs-param) :rhs (:dtype rhs-param)}
+     :input-layouts {:lhs (:layout lhs-storage) :rhs (:layout rhs-storage)}
      :prefetches prefetches
      :dimension-parameters dimension-parameters
      :index-dtype (get-in outer-loop [:index :type])
