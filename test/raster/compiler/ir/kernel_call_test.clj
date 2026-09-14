@@ -287,13 +287,13 @@
              (ze/expand-pointer-binding (first plan) resident)))
       (is (= [{:dtype :float :resident :x} {:dtype :int :resident :id}]
              (ocl/expand-pointer-binding (first plan) resident))))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"field order/name"
-         (ze/expand-pointer-binding
-          (first plan)
-          (ze/->GpuSoA 'Particle 'ParticleSoA 65
-                       [{:name "id" :dtype :float :seg :seg-id}
-                        {:name "x" :dtype :int :seg :seg-x}]))))
+    (is (= [:seg-x :seg-id]
+           (ze/expand-pointer-binding
+            (first plan)
+            (ze/->GpuSoA 'Particle 'ParticleSoA 65
+                         [{:name "id" :dtype :int :seg :seg-id}
+                          {:name "x" :dtype :float :seg :seg-x}])))
+        "explicit fields project a physical value whose storage order differs from the kernel ABI")
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"differs from physical ABI"
          (kcall/expand-logical-arguments soa-artifact

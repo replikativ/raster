@@ -36,16 +36,6 @@
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
 
-(defn- unlowered-soa-effect?
-  "A logical SoA must retain its grouped pointer ABI until shared scalar replacement expands it."
-  [form]
-  (and (par/par-map-void-form? form)
-       (seq (soa-lower/collect-soa-env (:body (par/extract-par-map-void-info form))))))
-
-(defn- contains-unlowered-soa-effect?
-  [source]
-  (boolean (some unlowered-soa-effect? (tree-seq coll? seq source))))
-
 (defn- host-scalar-result?
   [program equation]
   (let [value (get-in program [:values (first (:results equation))])
@@ -435,7 +425,51 @@
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [supplied-program0 (when (parallel-program/parallel-program? form)
+  (let [soa-env (soa-lower/collect-soa-env form)
+        soa-array-types
+        (into {}
+              (mapcat (fn [[binding {:keys [fields]}]]
+                        (map (fn [{field :name element-tag :element-tag}]
+                               (let [field-dtype
+                                     (or (dtype/dtype-for-scalar-tag element-tag)
+                                         (throw
+                                          (ex-info "SoA field has no GPU storage dtype"
+                                                   {:reason :soa-field-dtype
+                                                    :binding binding :field field
+                                                    :element-tag element-tag})))]
+                                 [(soa-lower/field-arr-sym binding field)
+                                  (if (and (dtype/fp-dtype? field-dtype)
+                                           (dtype/fp-dtype? dtype))
+                                    dtype field-dtype)]))
+                             fields)))
+              soa-env)
+        array-type-conflicts
+        (into {}
+              (keep (fn [[id derived]]
+                      (when-let [supplied (get array-types id)]
+                        (when-not (= (dtype/canon derived) (dtype/canon supplied))
+                          [id {:derived derived :supplied supplied}]))))
+              soa-array-types)
+        _ (when (seq array-type-conflicts)
+            (throw (ex-info "SoA field dtype contradicts the supplied array type"
+                            {:reason :soa-array-type-conflict
+                             :conflicts array-type-conflicts})))
+        array-types (merge array-types soa-array-types)
+        soa-projections (soa-lower/buffer-projections soa-env)
+        projection-conflicts
+        (into {}
+              (keep (fn [[id derived]]
+                      (when-let [supplied (get buffer-projections id)]
+                        (when-not (= derived supplied)
+                          [id {:derived derived :supplied supplied}]))))
+              soa-projections)
+        _ (when (seq projection-conflicts)
+            (throw (ex-info "SoA field projection contradicts the supplied logical binding"
+                            {:reason :soa-buffer-projection-conflict
+                             :conflicts projection-conflicts})))
+        buffer-projections (merge buffer-projections soa-projections)
+        form (if (seq soa-env) (soa-lower/lower-body soa-env form) form)
+        supplied-program0 (when (parallel-program/parallel-program? form)
                             (parallel-program/validate! form segop/segop-node?))
         retained-operations (mapcat :operations (:equations supplied-program0))
         retained-buffer-ids
@@ -493,8 +527,7 @@
         (and (nil? supplied-program)
              (or (par/par-rng-fill-form? form)
                  (par/par-active-ids-form? form)
-                 ;; Plain-array scheduling cannot interpret a logical SoA as one tensor pointer.
-                 (and (par/par-map-void-form? form) (not (unlowered-soa-effect? form)))
+                 (par/par-map-void-form? form)
                  (and (par/par-gather-form? form)
                       (:stride (par/extract-par-gather-info form)))
                  (and (par/par-scatter-form? form)
@@ -519,8 +552,7 @@
             :scalar-types (merge scalar-types retained-scalar-types)
             :array-types (merge array-types retained-array-types)})
 
-          (and (nil? supplied-program) (form/binding-form? form)
-               (not (contains-unlowered-soa-effect? form)))
+          (and (nil? supplied-program) (form/binding-form? form))
           (segop-lower-pass/schedule-source-program
            form {:target-device device-id :dtype dtype
                  :scalar-types scalar-types :array-types array-types})
@@ -941,7 +973,7 @@
                   ;; graph/ABI formation. Keep that explicit compatibility boundary until the
                   ;; whole host region can be normalized before emission.
                   (if (and (not supplied-program)
-                           (or direct-mini-program? parallel-program (unlowered-soa-effect? form)))
+                           (or direct-mini-program? parallel-program))
                     (let [kernel (legacy/generate-par-map-void-kernel
                                   form :dtype dtype :device-id device-id
                                   :array-types top-array-types :scalar-types top-scalar-types)
