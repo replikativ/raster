@@ -47,22 +47,9 @@
 ;; ================================================================
 
 (deftest select-strategy-test
-  (testing "Small n selects :local"
-    (is (= :local (cd/select-strategy 64 5 nil))))
-
-  (testing "Large n selects :global"
-    (is (= :global (cd/select-strategy 4096 5 nil))))
-
-  (testing "Many scratch arrays force :global even with small n"
-    ;; 256 elements * 100 scratch arrays * 8 bytes = 204800 > 49152 (75% of 65536)
-    (is (= :global (cd/select-strategy 256 100 nil))))
-
-  (testing "Boundary: n exactly at max-workgroup-size"
-    ;; 1024 elements, 5 scratch: 1024*5*8=40960 < 49152 (75% of 65536)
-    (is (= :local (cd/select-strategy 1024 5 nil))))
-
-  (testing "Just over max-workgroup-size selects :global"
-    (is (= :global (cd/select-strategy 1025 5 nil)))))
+  (testing "source-shaped compounds always preserve their ordered global phases"
+    (doseq [[n scratch] [[64 5] [4096 5] [256 100] [1024 5] [1025 5]]]
+      (is (= :global (cd/select-strategy n scratch nil))))))
 
 ;; ================================================================
 ;; Full detection pass
@@ -98,6 +85,21 @@
           result (cd/compound-detect-pass form {})]
       (is (= 0 (get-in result [:stats :compound-kernels]))))))
 
+(deftest reductions-can-never-enter-a-source-shaped-local-kernel
+  (let [form '(dotimes [step 4]
+                (raster.par/map! tmp i n double (clojure.core/aget values i))
+                (raster.par/reduce acc 0.0 i n
+                                   (clojure.core/+ acc (clojure.core/aget tmp i))))
+        result (cd/compound-detect-pass form {})
+        compound (first (filter #(and (seq? %)
+                                      (= 'raster.compiler/compound-kernel (first %)))
+                                (tree-seq seq? seq (:form result))))
+        metadata (second compound)]
+    (is (= :global (get-in metadata [:execution :strategy])))
+    (is (= [:map :reduce] (mapv :type (:phases metadata))))
+    (is (= form (nth compound 2))
+        "the original ordered loop remains available to the ordinary typed backend")))
+
 (deftest compound-metadata-test
   (testing "Compound kernel metadata contains correct arrays and phases"
     (let [form '(let* [u (double-array 64)]
@@ -111,7 +113,7 @@
                                   (tree-seq seq? seq (:form result))))
           metadata (second compound)]
       (is (some? metadata))
-      (is (contains? #{:local :global} (get-in metadata [:execution :strategy])))
+      (is (= :global (get-in metadata [:execution :strategy])))
       (is (= :compound (get-in metadata [:execution :kind])))
       (is (vector? (:phases metadata)))
       (is (= 2 (count (:phases metadata))))

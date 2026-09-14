@@ -5,16 +5,14 @@
   stencil!) and wraps them in a `raster.compiler/compound-kernel` marker
   for downstream codegen.
 
-  Strategy selection:
-    :local  — single OpenCL kernel with __local scratch (n ≤ max_workgroup_size)
-    :global — persistent __global DeviceBuffers with per-phase kernel launches
+  Source-shaped candidates retain an ordered `:global` execution plan. A future shared-local
+  fusion must be introduced after dependency and barrier-participation proofs in KernelBody.
 
   Usage in pipeline:
     (compound-detect-pass form opts)
     ;; Returns {:form new-form :stats {:compound-kernels N}}"
   (:require [raster.compiler.passes.parallel.descriptors :as desc]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]
-            [raster.runtime.hardware :as hw]
             [raster.compiler.core.util :as util]
             [clojure.walk :as walk]
             [clojure.set :as set]))
@@ -123,25 +121,14 @@
 ;; ================================================================
 
 (defn select-strategy
-  "Choose :local or :global compound kernel strategy.
-  :local — single kernel with __local scratch arrays (fast, n ≤ max_workgroup_size)
-  :global — persistent __global buffers with per-phase kernel launches (any n)"
-  [n-estimate scratch-count device-id]
-  (let [slm (if device-id
-              (try (hw/shared-local-memory device-id) (catch Exception _ 65536))
-              65536)
-        max-wg (if device-id
-                 (try
-                   (or (get-in (hw/device device-id) [:capabilities :max-workgroup-size])
-                       1024)
-                   (catch Exception _ 1024))
-                 1024)
-        ;; Estimate scratch memory: each scratch array uses n * 8 bytes (double)
-        scratch-bytes (* scratch-count n-estimate 8)]
-    (if (and (<= n-estimate max-wg)
-             (<= scratch-bytes (long (* 0.75 slm))))
-      :local
-      :global)))
+  "Retain compound loops as ordered global phases.
+
+   The former `:local` choice entered a handwritten OpenCL template which silently omitted reduce
+   phases and could not prove whole-workgroup participation around barriers. A future local-memory
+   optimization must be a certified KernelGraph/KernelBody schedule; source-shape heuristics are
+   not an execution contract."
+  [_n-estimate _scratch-count _device-id]
+  :global)
 
 ;; ================================================================
 ;; Live symbol analysis
