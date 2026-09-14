@@ -16,11 +16,17 @@
                 (empty? (launch/expression-references b))
                 (= (launch/resolve-expression {} a) (launch/resolve-expression {} b))))))
 
-(defn fuse-lhs-cast
-  "Return an eligible candidate graph, or nil when this rewrite cannot prove its obligations.
-   Accepts only an exact, full-reduction, unbatched matrix consumer of a private FP32→FP16 cast.
-   No source expressions or operator inference participate. Target support is checked later."
-  [g producer-id consumer-id]
+(defn fuse-input-cast
+  "Fuse one exact private FP32→FP16 cast into a matrix operand load region.
+
+   `operand-role` is `:lhs` or `:rhs`. The matrix may be unbatched or carry a leading batch axis;
+   its declared batching contract determines whether that operand owns the batch extent. Returns
+   nil unless the cast covers exactly the selected physical operand and its temporary has no other
+   observer. No source expression or target inference participates."
+  [g producer-id consumer-id operand-role]
+  (when-not (contains? #{:lhs :rhs} operand-role)
+    (throw (ex-info "matrix input fusion requires an explicit operand role"
+                    {:reason :raster/bug :operand-role operand-role})))
   (let [g (graph/validate! g)
         nodes (:nodes g)
         by-id (into {} (map (juxt :id identity)) nodes)
@@ -36,18 +42,24 @@
             temp-buffer (first (filter #(= temporary (:id %)) (:temporaries g)))
             uses-of (fn [id] (for [node nodes use (:uses node) :when (= id (:buffer use))]
                               [(:id node) (:access use)]))
-            [m _ k] (:dimensions stage)
-            extent (launch/product m k)]
+            [m n k] (:dimensions stage)
+            selected (get stage operand-role)
+            other (get stage (if (= :lhs operand-role) :rhs :lhs))
+            batch-extent (when (get (:batching stage) operand-role)
+                           (get-in stage [:batching :extent]))
+            extent (apply launch/product
+                          (cond-> []
+                            batch-extent (conj batch-extent)
+                            true (into (if (= :lhs operand-role) [m k] [k n]))))]
         (when (and (= :cast (:operation cast))
                    (= [:float :half] ((juxt :input-dtype :output-dtype) cast))
                    (= {:rounding :nearest-even :overflow :ieee}
                       (dissoc (:policy cast) :vector-width))
                    (= :half (:operand-dtype stage))
-                   (= temporary (:lhs stage))
-                   (not= temporary (:rhs stage))
+                   (= temporary selected)
+                   (not= temporary other)
                    (not-any? #(= temporary (:sym %)) (get-in stage [:epilogue :operands]))
-                   (empty? (:input-value-regions stage))
-                   (nil? (:batching stage))
+                   (not (contains? (:input-value-regions stage) temporary))
                    (= {:kind :full :range [0 k]} (:reduction stage))
                    (= 1 (count (:input-shape cast)))
                    (same-extent? extent (first (:input-shape cast)))
@@ -77,7 +89,9 @@
                           (body/cast-expression loaded :half :nearest-even :ieee))]
                         converted :half)
                 replacement (matrix/validate!
-                             (assoc stage :lhs input :input-value-regions {input region}))
+                             (-> stage
+                                 (assoc operand-role input)
+                                 (update :input-value-regions assoc input region)))
                 consumer (-> consumer
                              (assoc :operation replacement)
                              (update :uses (fn [uses] (mapv #(if (= temporary (:buffer %))
@@ -90,8 +104,18 @@
                               (assoc :nodes (into [] (comp (remove #(= producer-id (:id %)))
                                                           (map #(if (= consumer-id (:id %)) consumer %))) nodes))
                               (update :temporaries #(filterv (fn [b] (not= temporary (:id b))) %))
+                              (update-in [:attributes :input-fusions] (fnil conj [])
+                                         {:operand operand-role
+                                          :producer producer
+                                          :consumer (:operation (get by-id consumer-id))
+                                          :physical-precondition :input-output-disjoint
+                                          :selection :binding-admission-required})
+                              ;; Retain the singular diagnostic key for callers that inspect a
+                              ;; graph with one fused input.
                               (assoc-in [:attributes :input-fusion]
-                                        {:producer producer :consumer (:operation (get by-id consumer-id))
+                                        {:operand operand-role
+                                         :producer producer
+                                         :consumer (:operation (get by-id consumer-id))
                                          :physical-precondition :input-output-disjoint
                                          :selection :binding-admission-required}))]
             (graph/validate! candidate)
@@ -99,3 +123,13 @@
               (throw (ex-info "matrix input fusion changed the public boundary"
                               {:reason :matrix-input-fusion-boundary})))
             candidate))))))
+
+(defn fuse-lhs-cast
+  "Compatibility spelling for fusing an exact cast into the left matrix operand."
+  [g producer-id consumer-id]
+  (fuse-input-cast g producer-id consumer-id :lhs))
+
+(defn fuse-rhs-cast
+  "Fuse an exact cast into the right matrix operand."
+  [g producer-id consumer-id]
+  (fuse-input-cast g producer-id consumer-id :rhs))

@@ -522,7 +522,8 @@
         bindings (mapcat #(get-in % [:operation :attributes :scheduled-kernel-body :scalar-bindings])
                          (:nodes graph))]
     (is (every? #(= :long (:dtype %)) bindings))
-    (is (= #{:identity :checked-range} (set (map :conversion bindings))))
+    (is (= #{:checked-range} (set (map :conversion bindings)))
+        "the one fused matrix stage narrows every public long launch dimension explicitly")
     (is (map? (graph-call/temporary-specs graph values)))
     (doseq [[batch fallback?] [[2 false] [2147483648 true]]]
       (let [scalars (assoc (into {} (map (fn [[id value]] [id (:value value)])) values)

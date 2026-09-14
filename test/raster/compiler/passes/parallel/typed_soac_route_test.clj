@@ -1573,14 +1573,16 @@
     (is (= {:row true :col false}
            (get-in matrix-graph [:attributes :batching])))
     (is (identical? operation (graph-refinement/source-operation refinement)))
-    (is (= [raster.compiler.ir.layout_stage.LayoutStage
-            raster.compiler.ir.layout_stage.LayoutStage
-            raster.compiler.ir.matrix_stage.MatrixStage]
+    (is (= [raster.compiler.ir.matrix_stage.MatrixStage]
            (mapv (comp class :operation) (:nodes stage-graph))))
+    (is (empty? (:temporaries stage-graph))
+        "tile-local conversion removes both full-size half buffers")
     (is (kernel-graph/dataflow-equivalent? stage-graph matrix-graph))
     (is (scheduled-body/scheduled-kernel-body? scheduled-matrix))
     (is (matrix-stage/matrix-stage? matrix-stage))
     (is (= {:extent 'batch :lhs true :rhs false} (:batching matrix-stage)))
+    (is (= '#{A B} (set (keys (:input-value-regions matrix-stage))))
+        "both FP32 operands use the same typed tile-load conversion contract")
     (is (= '[batch m n] (:result-shape matrix-stage)))
     (is (= (:effects scheduled-matrix) (get-in matrix-node [:operation :effects])))
     (is (= (scheduled-body/realized-launch scheduled-matrix)
