@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.par]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.par :as ir-par]
             [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -98,6 +99,59 @@
       (is (= (run source rows columns visible)
              (run normalized rows columns visible))
           (str "shape " [rows columns visible])))))
+
+(deftest counted-row-maps-flatten-into-one-typed-dense-domain
+  (let [source '(let* [effect
+                       (dotimes [row rows]
+                         (raster.par/map! out column columns
+                                          :offset (* row columns) double
+                                          (+ (aget out (+ (* row columns) column))
+                                             (+ row column))))]
+                      out)
+        options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'rows :long 'columns :long}}
+        normalized (frontend/normalize-source source options)
+        map-form (some #(when (and (seq? %) (= 'raster.par/map! (first %))) %)
+                       (take-nth 2 (rest (second normalized))))
+        result (route/attempt source :double {'out :double}
+                              {:scalar-types (:scalar-types options)})
+        original-fn (eval (list 'fn '[rows columns out] (ir-par/expand-par-forms source)))
+        executable-normalized
+        (walk/postwalk #(if (symbol? %) (with-meta % nil) %) normalized)
+        normalized-fn (eval (list 'fn '[rows columns out]
+                                  (ir-par/expand-par-forms executable-normalized)))]
+    (is (some? map-form))
+    (is (not-any? #{'dotimes} (flatten normalized)))
+    (is (= :typed-soac (get-in result [:program :dialect])))
+    (is (:typed-validated (:stats result)))
+    (is (= 1 (count (filter #(and (seq? (:source %))
+                                  (= 'raster.par/map! (first (:source %))))
+                            (get-in result [:program :equations]))))
+        "the host no longer launches one row kernel at a time")
+    (is (not-any? #{'(+ (* row columns) column)} (tree-seq coll? seq map-form))
+        "the proved row-major coordinate is the dense lane for inout ownership")
+    (doseq [[rows columns] [[2 3] [1 4] [0 3] [-1 3] [2 -3]]]
+      (let [size (* (max 0 rows) (max 0 columns))
+            left (double-array (repeat size 1.0))
+            right (double-array (repeat size 1.0))]
+        (is (= (vec (original-fn rows columns left))
+               (vec (normalized-fn rows columns right)))
+            (str "shape " [rows columns])))))
+  (let [options {:dtype :double :array-types {'out :double}
+                 :scalar-types {'rows :long 'columns :long}}
+        wrong-offset '(let* [effect
+                             (dotimes [row rows]
+                               (raster.par/map! out column columns
+                                                :offset (+ (* row columns) 1) double 1.0))]
+                            out)
+        dependent '(let* [effect
+                          (dotimes [row rows]
+                            (raster.par/map! out column row
+                                             :offset (* row row) double 1.0))]
+                         out)]
+    (doseq [source [wrong-offset dependent]]
+      (is (some #{'dotimes} (flatten (frontend/normalize-source source options)))
+          "non-rectangular or non-row-major maps remain explicit host control"))))
 
 (deftest irregular-loop-nests-remain-source-control
   (let [options {:dtype :double :array-types {'out :double}

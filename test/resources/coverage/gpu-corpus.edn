@@ -20,8 +20,9 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/array-copy,
-   :route :error,
-   :error :kernel-body-store-dtype}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/blit-slab!,
    :route :typed-soac,
    :typed-validated true,
@@ -32,8 +33,9 @@
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.array-ops/broadcast-add-dh,
-   :route :error,
-   :error :kernel-body-store-dtype}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/broadcast-add-dt,
    :route :scalar,
    :typed-validated false,
@@ -917,12 +919,12 @@
    :typed-validated true,
    :declines []}
   {:var raster.nn/dense-backward-dW,
-   :route :compatibility,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.nn/dense-backward-dW-into!,
-   :route :compatibility,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.nn/dense-backward-db,
    :route :error,
