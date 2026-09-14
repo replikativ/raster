@@ -125,6 +125,22 @@
   [abi]
   (filterv #(= :scalar (:kind %)) (validate! abi)))
 
+(defn project-pointer-bindings
+  "Attach checked logical composite identities to physical pointer slots.
+
+   `projections` maps a physical compiler value to `{:binding logical :field path}`. Scalar slots
+   and unprojected pointers are unchanged. The result remains the sole ordered signature; this
+   does not manufacture a parallel logical ABI."
+  [abi projections]
+  (validate!
+   (mapv (fn [slot]
+           (if (not= :scalar (:kind slot))
+             (if-let [{:keys [binding field]} (get projections (:name slot))]
+               (assoc slot :binding binding :field field)
+               slot)
+             slot))
+         (validate! abi))))
+
 (defn logical-pointer-slot-groups
   "Ordered logical pointer groups over the physical ABI.
 

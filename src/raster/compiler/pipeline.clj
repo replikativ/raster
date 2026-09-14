@@ -34,6 +34,7 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
@@ -998,13 +999,15 @@
                      :program program :kernel-count (count kernels)
                      :emission-stats stats :fallback :none})))
           (let [form (cond-> form
-                       (or (:scalar-types opts) (:array-types opts))
+                       (or (:scalar-types opts) (:array-types opts) (:buffer-projections opts))
                        (vary-meta assoc :scalar-types (:scalar-types opts)
-                                  :array-types (:array-types opts)))
+                                  :array-types (:array-types opts)
+                                  :buffer-projections (:buffer-projections opts)))
                 result (apply opencl-pass/opencl-pass form
                               (cond-> [:device-id target-device
                                        :dtype (:dtype opts)
-                                       :schedule (:schedule opts)]
+                                       :schedule (:schedule opts)
+                                       :buffer-projections (:buffer-projections opts)]
                                 ;; Resident buffers cannot be consumed by a host fallback merely
                                 ;; because specialization made a small extent a literal.
                                 (:resident-gpu? opts) (into [:min-elements 0])))]
@@ -1853,20 +1856,46 @@
         form-mat (if pre-diagnostic
                    (:form pre-diagnostic)
                    (run-passes raw-form gpu-resident-pre-soa-passes pre-opts))
-        {form-soa :body eff-param-specs :params}
+        {form-soa :body eff-param-specs :params soa-expansion :soa-expansion}
         (if value-fn?
           (soa-lower/soa-lower form-mat param-specs)
-          {:body form-mat :params param-specs})
-        all-params (mapv :sym eff-param-specs)
+          {:body form-mat :params param-specs :soa-expansion {}})
         gpu-param-types (opencl-pass/derive-param-types
                          (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype)
-        array-param-set (set (keys (:array-types gpu-param-types)))
-        array-params (filterv #(contains? array-param-set %) all-params)
-        scalar-params (filterv #(not (contains? array-param-set %)) all-params)
+        original-param-types (opencl-pass/derive-param-types
+                              (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype)
+        original-array-set (set (keys (:array-types original-param-types)))
+        all-params (mapv :sym param-specs)
+        array-params (filterv #(or (contains? soa-expansion %)
+                                   (contains? original-array-set %))
+                              all-params)
+        scalar-params (filterv #(not (contains? (set array-params) %)) all-params)
+        value-specs
+        (into {}
+              (map (fn [[binding {:keys [scalar-tag fields]}]]
+                     (let [leaves
+                           (mapv (fn [{field :name}]
+                                   {:field field
+                                    :dtype (get-in gpu-param-types
+                                                   [:array-types
+                                                    (soa-lower/field-arr-sym binding field)])})
+                                 fields)]
+                       [binding
+                        {:abstract
+                         (abstract-value/tensor
+                          {:dtype {:kind :record :name scalar-tag
+                                   :fields (mapv #(select-keys % [:field :dtype]) leaves)}
+                           :shape [(list 'unknown-dimension binding)]
+                           :representation {:kind :struct-of-arrays :value-type scalar-tag}})
+                         :physical-layout {:kind :ordered-fields
+                                           :field-order (mapv :field leaves)}
+                         :leaves leaves}]))
+              soa-expansion))
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
                            :resident-gpu? true
                            :active-params active-params :dtype effective-dtype
-                           :schedule resolved-schedule}
+                           :schedule resolved-schedule
+                           :buffer-projections (soa-lower/buffer-projections soa-expansion)}
                     param-env (assoc :param-env param-env)
                     source-ns (assoc :source-ns source-ns)
                     gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
@@ -1988,6 +2017,7 @@
        :all-params all-params
        :array-params array-params
        :array-roles array-roles
+       :value-specs value-specs
        :scalar-params scalar-params
        :allocs (mapv (fn [{:keys [sym size-expr]}]
                        {:sym sym :dtype (get buffer-dtypes sym effective-dtype)

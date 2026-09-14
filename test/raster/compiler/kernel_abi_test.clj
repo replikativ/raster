@@ -148,6 +148,20 @@
                             (kabi/slot 'particles_id :output :int :binding 'particles
                                        :field :id)])))))
 
+(deftest scalar-replacement-projects-physical-slots-onto-the-logical-binding
+  (let [abi [(kabi/slot 'particles_x :input :float)
+             (kabi/slot 'particles_id :input :long)
+             (kabi/slot 'out :output :float)
+             (kabi/slot 'n :scalar :long)]
+        projected (kabi/project-pointer-bindings
+                   abi {'particles_x {:binding 'particles :field :x}
+                        'particles_id {:binding 'particles :field :id}})]
+    (is (= '[particles particles out]
+           (mapv #(or (:binding %) (:name %)) (kabi/pointer-slots projected))))
+    (is (= [:x :id nil] (mapv :field (kabi/pointer-slots projected))))
+    (is (= '[particles out] (kabi/pointer-binding-names projected)))
+    (is (= [:float :long :float :long] (mapv :dtype projected)))))
+
 (deftest repeated-unbound-name-remains-positional
   (testing "an in-place generic map may bind the same value as an input and the result"
     (let [abi [(kabi/slot 'x :input :float :role :inout)

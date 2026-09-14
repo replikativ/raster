@@ -300,6 +300,25 @@
                                          [:particles :out {:type :int :value 1}]
                                          (fn [_ value] [value]))))))
 
+(deftest logical-composite-may-project-a-field-subset-per-kernel
+  (let [slot (kabi/slot 'particles_x :input :float
+                        :binding 'particles :field :x :role :operand)
+        group {:binding 'particles :slots [slot]}
+        resident (resident-value/composite
+                  :particles
+                  [{:name :x :value {:dtype :float :resident :x}}
+                   {:name :id :value {:dtype :int :resident :id}}])]
+    (is (= [{:dtype :float :resident :x}]
+           (ze/expand-pointer-binding group resident)))
+    (is (= [{:dtype :float :resident :x}]
+           (ocl/expand-pointer-binding group resident)))
+    (is (= [:seg-x]
+           (ze/expand-pointer-binding
+            group
+            (ze/->GpuSoA 'Particle 'ParticleSoA 8
+                         [{:name :x :dtype :float :seg :seg-x}
+                          {:name :id :dtype :int :seg :seg-id}]))))))
+
 (deftest both-resident-backends-consume-the-same-call-contract
   (let [call (kcall/make artifact args)]
     (doseq [[register! bind!] [[ze/register-kernel! ze/bind-kernel-call]

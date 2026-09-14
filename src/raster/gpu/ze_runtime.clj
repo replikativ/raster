@@ -1209,11 +1209,7 @@
     (resident-value/expand group value)
 
     (gpu-soa? value)
-    (let [fields (:field-segs ^GpuSoA value)]
-      (when-not (= (count slots) (count fields))
-        (throw (ex-info "GpuSoA field count differs from its artifact binding"
-                        {:binding binding :expected (count slots) :actual (count fields)
-                         :slots slots :fields (mapv :name fields)})))
+    (let [fields (resident-value/select-fields group (:field-segs ^GpuSoA value))]
       (doseq [[slot field] (map vector slots fields)]
         (let [expected-name (symbol (str (name binding) "_" (name (:name field))))]
           (when-not (= expected-name (:name slot))

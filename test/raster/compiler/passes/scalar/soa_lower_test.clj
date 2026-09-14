@@ -24,7 +24,10 @@
           env (sl/soa-param-env specs)
           expanded (sl/expand-params specs env)]
       (is (= '[as_re as_im n] (mapv :sym expanded)))
-      (is (= '[doubles doubles long] (mapv :tag expanded))))))
+      (is (= '[doubles doubles long] (mapv :tag expanded)))
+      (is (= {'as_re {:binding 'as :field :re}
+              'as_im {:binding 'as :field :im}}
+             (sl/buffer-projections env))))))
 
 (deftm get-re-soa! [ps :- CplxSoA, out :- (Array double), n :- Long] :- nil
   (dotimes [i n]
