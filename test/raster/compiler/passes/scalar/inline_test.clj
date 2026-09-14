@@ -73,6 +73,13 @@
   (doseq [body ['x 'java.lang.Float/NEGATIVE_INFINITY 42 1.5 nil true]]
     (is (#'inline/inlinable-body? body))))
 
+(deftest lifted-tail-effect-retains-the-statement-binder-contract
+  (let [result (:form (#'inline/inline-one-pass
+                       '(let* [] (raster.par/map-void! i n nil))))
+        binder (first (second result))]
+    (is (:raster.effect/effectful (meta binder)))
+    (is (= 'raster.par/map-void! (-> result second second first)))))
+
 (deftest inlining-preserves-unused-checked-arguments
   (with-redefs-fn {#'inline/try-resolve-deftm
                   (fn [_] {:params ['x] :tags ['int] :walked-body [42]})}

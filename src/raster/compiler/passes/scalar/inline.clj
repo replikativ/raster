@@ -992,8 +992,12 @@
                   (let [head (first (first body-exprs-raw))]
                     (and (symbol? head) (qualified-symbol? head)
                          (not (form/binding-form? (first body-exprs-raw))))))
-           (let [result-sym (with-meta (gensym "body_result_")
-                              (meta (first body-exprs-raw)))]
+           (let [expression (first body-exprs-raw)
+                 result-sym (with-meta
+                              (gensym "body_result_")
+                              (cond-> (meta expression)
+                                (util/effectful? expression)
+                                (assoc :raster.effect/effectful true)))]
              [[[result-sym (first body-exprs-raw)]] [result-sym]])
            [nil body-exprs-raw])
          pairs (concat (partition 2 bindings-vec) extra-body-pairs)
