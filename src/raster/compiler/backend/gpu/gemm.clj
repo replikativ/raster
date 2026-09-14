@@ -901,6 +901,12 @@
                      :vector-width (get spec :vector-width 4)
                      :strategy (or (:strategy spec) :xmx-direct-tile-inputs)))))
 
+(defn- matrix-dynamic-lhs-alternative [spec]
+  (when (matrix-input-fusion-target? spec)
+    (xmx-graph (assoc spec :split-k? false :fuse-lhs-cast? true
+                     :vector-width (get spec :vector-width 4)
+                     :strategy :xmx-direct-dynamic-lhs))))
+
 (defn emit-matrix-input-fusion-alternative
   "Emit an explicit Intel direct-matrix candidate with tile-local FP32→FP16 inputs.
    Binding requires physical A/C disjointness; runtime admission checks the concrete ranges.
@@ -1096,6 +1102,7 @@
         split-expression (requested-splits spec)
         xmx-spec (assoc spec :requested-splits split-expression)
         direct (xmx-graph (assoc xmx-spec :split-k? false))
+        dynamic-lhs (matrix-dynamic-lhs-alternative xmx-spec)
         fused-input (matrix-input-fusion-alternative xmx-spec)
         split? (not (seq epilogue))
         split (when split? (xmx-graph (assoc xmx-spec :split-k? true)))
@@ -1117,6 +1124,7 @@
     {:alternatives (cond-> [direct]
                      split (conj split)
                      (seq explicit-splits) (into explicit-splits)
+                     dynamic-lhs (conj dynamic-lhs)
                      fused-input (conj fused-input))
      :selector selector
      :split-factor-schedules

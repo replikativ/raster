@@ -1307,7 +1307,8 @@
                  (get-in dispatch [:attributes :matrix-graph-decline :reason]))))
         (let [{:keys [abi arguments]} (executable/common-view (kdispatch/default-alternative dispatch))]
           (is (= (if batched? #{:portable-segred :xmx-batched}
-                               #{:portable-segred :xmx-direct :xmx-split-k :xmx-direct-tile-inputs})
+                               #{:portable-segred :xmx-direct :xmx-split-k
+                                 :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs})
                  (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
           (doseq [[dimensions expected]
                   (cond-> [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
@@ -1366,7 +1367,9 @@
                  (kdispatch/alternative-strategy
                   (kdispatch/select-alternative dispatch
                                                 [:a :b :c m n k])))]
-    (is (= [:portable-segred :xmx-direct :xmx-split-k :xmx-direct-tile-inputs] strategies))
+    (is (= [:portable-segred :xmx-direct :xmx-split-k
+            :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs]
+           strategies))
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
     (is (= '[A B C m n k] (:arguments (first (:alternatives dispatch)))))
@@ -1513,7 +1516,8 @@
                      algorithm operation :dtype :float :desc descriptor
                      :precision :mixed-f16-f32 :split-factors [2 8])]
         (is (= #{:portable-segred :xmx-direct :xmx-split-k
-                 :xmx-split-k-2 :xmx-split-k-8 :xmx-direct-tile-inputs}
+                 :xmx-split-k-2 :xmx-split-k-8
+                 :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs}
                (set (map kdispatch/alternative-strategy (:alternatives tunable)))))
         (is (= 8 (get-in tunable [:attributes :candidate-schedules
                                   :xmx-split-k-8 :split-factor])))))
@@ -1556,8 +1560,8 @@
                               (map gpu-gemm/tile-input-strategy (rest tiles)))]
     (is (> (count tiles) 1))
     (is (= (count strategies) (count (set strategies))))
-    (is (= (+ 3 (count tiles)) (count strategies))
-        "portable, materialized direct/split, and one fused-input alternative per tile")
+    (is (= (+ 4 (count tiles)) (count strategies))
+        "portable, materialized direct/split, dynamic-LHS, and one fused-input alternative per tile")
     (is (= tile-strategies (set (filter tile-strategies strategies))))
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
@@ -1918,7 +1922,8 @@
         matrix-graph (kdispatch/alternative scheduled :xmx-direct)
         contract-artifact (-> matrix-graph :nodes last :operation)
         body (get-in contract-artifact [:attributes :kernel-body])]
-    (is (= [:portable-segred :xmx-direct :xmx-direct-tile-inputs]
+    (is (= [:portable-segred :xmx-direct
+            :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs]
            (mapv kdispatch/alternative-strategy (:alternatives scheduled)))
         "split-K waits until its final combine can own the result transform")
     (is (= '[A B C bias scale m n k] (:arguments matrix-graph)))

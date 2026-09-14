@@ -151,6 +151,25 @@
     (is (re-find #"__global const float\* restrict B" (:source artifact)))
     (is (re-find #"\* \(long\)\(1\).*\* \(long\)\(K\)" (:source artifact)))))
 
+(deftest dynamic-lhs-candidate-retains-the-reusable-rhs-layout-graph
+  (let [spec {:id :dynamic-lhs-test :a 'A :b 'B :c 'C
+              :m 16 :n 32 :k 32 :variant :nt :fill-workgroups 16
+              :tile (get-in (stage-graph) [:nodes 1 :operation :schedule :tile])}
+        scheduled (gemm/emit-matrix-alternatives spec)
+        candidate (some #(when (= :xmx-direct-dynamic-lhs (executable/strategy %)) %)
+                        (:alternatives scheduled))
+        stages (mapv (comp last :id) (:nodes candidate))
+        contract (-> candidate :nodes last :operation)
+        matrix-stage (get-in contract [:attributes :scheduled-kernel-body :source])]
+    (is (= [:convert-b :transpose-b :contract] stages))
+    (is (= 2 (count (:temporaries candidate))))
+    (is (= '#{A} (set (keys (:input-value-regions matrix-stage)))))
+    (is (re-find #"__global const float\* restrict A" (:source contract)))
+    (is (re-find #"__global const half\* restrict" (:source contract)))
+    (is (re-find #"convert_half_rte" (:source contract)))
+    (is (= (graph/boundary-contract (first (:alternatives scheduled)))
+           (graph/boundary-contract candidate)))))
+
 (deftest normal-enumeration-retains-checked-input-fusion-without-changing-selection
   (let [spec {:id :enumeration-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32
               :fill-workgroups 16

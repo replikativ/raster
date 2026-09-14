@@ -35,17 +35,17 @@
                   gpu/download (fn [_ id] (get @storage id))
                   gpu/release-kernel-graph! (fn [_ id] (swap! released conj id))]
       (let [result (probe/run! :mock {:timing? true :rounds 2 :warmup-rounds 1})]
-        (is (= 14 (count @calls)))
-        (is (= 2 (count @released)))
-        (is (= {:validation 8 :warmup 2 :measurement 4}
+        (is (= 21 (count @calls)))
+        (is (= 3 (count @released)))
+        (is (= {:validation 12 :warmup 3 :measurement 6}
                (frequencies (map :sampling-phase (:replay-profiles result)))))
-        (is (= [0 0 1 1] (keep :sample-index (:replay-profiles result))))
-        (is (= [7 7] (mapv :replays (:candidates result)))))
+        (is (= [0 0 0 1 1 1] (keep :sample-index (:replay-profiles result))))
+        (is (= [7 7 7] (mapv :replays (:candidates result)))))
       (reset! profile-valid? false)
       (reset! released [])
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"finite device span"
                             (probe/run! :mock {:timing? true :rounds 2 :warmup-rounds 0})))
-      (is (= 2 (count @released)) "failure releases every previously bound candidate"))))
+      (is (= 3 (count @released)) "failure releases every previously bound candidate"))))
 
 (deftest constant-weight-mode-uses-normal-linkplan-initialization-and-cleanup
   (let [state (atom {}) plans (atom []) closed (atom [])]
@@ -73,7 +73,8 @@
                   link/close! #(swap! closed conj %)]
       (let [result (probe/run! :mock {:residency :constant-weights :timing? true
                                      :rounds 2 :warmup-rounds 0})]
-        (is (= 2 (count @plans)))
-        (is (= [1 0] @closed))
+        (is (= 3 (count @plans)))
+        (is (= [2 1 0] @closed))
         (is (false? (get-in result [:scope :weight-conversion-included?])))
-        (is (= [["matrix"] ["matrix"]] (mapv :profiled-replay-kernels (:candidates result))))))))
+        (is (= [["matrix"] ["matrix"] ["matrix"]]
+               (mapv :profiled-replay-kernels (:candidates result))))))))
