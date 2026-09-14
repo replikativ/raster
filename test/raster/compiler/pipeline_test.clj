@@ -78,6 +78,17 @@
       (is (not (#'pipeline/census-exempt-binding?
                 ['result '(raster.par/map-void! i n body)]))))))
 
+(deftest binding-tagging-carries-the-void-statement-contract
+  (doseq [expression ['(dotimes [i n] (clojure.core/aset output i 0.0))
+                      '(raster.par/segmented-fold-map!
+                        [output] [[segment segment-count]] index width
+                        [[sum 0.0 :float width sum]] [(float sum)])]]
+    (let [tagged (#'pipeline/tag-binding-types
+                  (list 'let* ['effect expression] 'output) {})
+          binder (first (second tagged))]
+      (is (:raster.effect/effectful (meta binder))
+          (str "missing statement contract for " (first expression))))))
+
 ;; ================================================================
 ;; Pass registry
 ;; ================================================================

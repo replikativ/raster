@@ -302,7 +302,10 @@
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
                    tag (inf/infer-arg-tag tagged-init env)
-                   tagged-sym (if tag (vary-meta sym assoc :tag tag :raster.type/tag tag) sym)
+                   tagged-sym (cond-> sym
+                                tag (vary-meta assoc :tag tag :raster.type/tag tag)
+                                (util/void-form? tagged-init)
+                                (vary-meta assoc :raster.effect/effectful true))
                    new-env (if tag (assoc env sym tag) env)]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
@@ -455,7 +458,7 @@
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        (let [final (ensure-let*-result current)]
+        (let [final (tag-binding-types (ensure-let*-result current) (:param-env opts))]
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
@@ -477,7 +480,7 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            (let [final (ensure-let*-result current)]
+            (let [final (tag-binding-types (ensure-let*-result current) (:param-env opts))]
               (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})
