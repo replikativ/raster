@@ -17,7 +17,7 @@
             [raster.gpu.ocl-runtime :as ocl]))
 
 (def ^:private compared-strategies
-  [:portable-segred :xmx-direct :xmx-direct-tile-inputs])
+  [:portable-segred :xmx-direct :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs])
 
 (defn- comparison-strategies
   [choice matrix-tiles]
@@ -25,6 +25,7 @@
     (filterv (fn [candidate]
                (let [strategy (executable/strategy candidate)]
                  (or (contains? #{:portable-segred :xmx-direct} strategy)
+                     (str/starts-with? (name strategy) "xmx-direct-dynamic-lhs")
                      (str/starts-with? (name strategy) "xmx-direct-tile-inputs"))))
              (:alternatives choice))
     (mapv #(dispatch/alternative choice %) compared-strategies)))
@@ -116,13 +117,13 @@
       :outputs [:y]})))
 
 (defn run!
-  "Compare portable, materialized XMX and tile-local-input schedules for public nn/linear!.
+  "Compare portable and materialized/partially fused/fully fused XMX schedules for nn/linear!.
 
    Shape is [rows,input-width,output-width]. Inputs are exactly binary16-representable, allowing
-   all three numerical policies to share an exact oracle. `:all-stages` includes materialized
+   every schedule to share an exact oracle. `:all-stages` includes materialized
    transforms on every replay; `:constant-weights` uses the ordinary LinkPlan role contract to
    hoist weight-only transforms into an untimed one-time prologue. `:matrix-tiles :finite`
-   compares the complete compiler-emitted tile-local family; the default keeps the three main
+   compares both compiler-emitted tile-local families; the default keeps the four main
    schedules for a cheaper diagnostic."
   [{:keys [shape revision environment rounds warmup-rounds target residency matrix-tiles]
     :or {shape [32 256 256] rounds 12 warmup-rounds 4 target :ocl:0

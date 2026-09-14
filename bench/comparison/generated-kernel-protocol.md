@@ -91,7 +91,8 @@ REPL:
               :matrix-tiles :default})
 ```
 
-The candidates are the portable segmented contraction, the materialized XMX graph, and the
+The default candidates are the portable segmented contraction, the materialized XMX graph, the
+hybrid XMX graph with a tile-local activation cast and materialized weight layout, and the fully
 tile-local-input XMX graph. All share the same resident activation, transposed model weights,
 bias and output, and exactly binary16-representable inputs. Each candidate must match the same
 independently rounded host oracle before timing. The materialized graph deliberately pays its
@@ -101,10 +102,10 @@ bias are ordinary constants, eligible weight-only cast/transpose nodes execute i
 untimed prologue, and the reported samples cover only steady-state replay. Activations remain
 runtime inputs in both modes. Initialization time is reported separately as binding time and is
 never folded into the replay result.
-Set `:matrix-tiles :finite` to compile and compare the descriptor-derived tile-local schedule
-family in addition to portable and materialized XMX. Candidate identities come from the emitted
-dispatch and cover block-M/N/K, subgroup-M/N and pipeline depth; the probe does not maintain a
-parallel tile registry. Finite search can be combined with either residency regime.
+Set `:matrix-tiles :finite` to compile and compare the descriptor-derived physical tiles for both
+hybrid and fully tile-local input placement. Candidate identities come from the emitted dispatch
+and cover block-M/N/K, subgroup-M/N and pipeline depth; the probe does not maintain a parallel
+tile registry. Finite search can be combined with either residency regime.
 The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
 stationarity diagnostics, and never updates the tuning cache.
 
