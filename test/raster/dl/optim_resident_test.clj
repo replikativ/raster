@@ -57,4 +57,10 @@
     (is (true? (get-in report [:route :typed-validated])))
     (is (= 2 (get-in report [:lowering :typed-reused])))
     (is (zero? (get-in report [:lowering :fallback])))
-    (is (true? (get-in report [:residency :resident?])))))
+    (is (true? (get-in report [:residency :resident?])))
+    (let [report (pipeline/compile-report
+                  #'optim/clip-grad-norm! :target-device :ocl:0 :dtype :float)]
+      (is (= :typed-soac (get-in report [:route :source-dialect])))
+      (is (true? (get-in report [:route :typed-validated])))
+      (is (zero? (get-in report [:lowering :fallback]))
+          "diagnostic and ordinary GPU compilation must use the resident scalar policy too"))))

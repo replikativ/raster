@@ -1394,6 +1394,12 @@ consumers of that rank-zero value, preserves effect-map destinations, and carrie
 a one-element device buffer. Full resident compilation emits two scheduled GPU stages and no
 fallback; this is functional coverage, not a throughput claim.
 
+Resident realization is now the default for non-escaping reduction scalars on every GPU compiler
+entry, including diagnostic/staging compilation. Escaping loss values remain host-visible. This
+removes the former policy split in which the resident-program API compiled RMSNorm, softmax
+backward, and gradient clipping while `show-pipeline` reported contradictory scalar/buffer ABI
+roles for the same typed programs.
+
 ## Fresh-storage initialization through the typed vertical
 
 The analogous OpenCL/Level Zero `invoke-registered-reduce-by-key-kernel` shortcuts are also
