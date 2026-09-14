@@ -279,6 +279,45 @@
         (is (not (dialect/scalar-fold-form? result)))
         (is (= form result))))))
 
+(deftest ordered-fold-may-start-from-an-earlier-typed-local
+  (let [source
+        '(let* [y
+                (raster.par/pmap
+                 row rows float
+                 (let* [^{:raster.type/tag float} negative-limit -1.0e38]
+                   (loop* [^{:raster.type/tag long} i 0
+                           ^{:raster.type/tag float} acc negative-limit]
+                     (if (< (long i) width)
+                       (recur (inc (long i))
+                              (+ acc (clojure.core/aget w i)))
+                       acc))))]
+           y)
+        routed (route/attempt source :float (:array-types options) options)
+        program (-> routed :program :equations first :algorithm)
+        fold (scalar-fold program)
+        broken
+        (util/postwalk-preserving-meta
+         (fn [form]
+           (if (dialect/scalar-fold-form? form)
+             (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)]
+               (util/remake form 'fold (assoc attributes :identity 'missing-identity) lambda))
+             form))
+         program)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (:program routed) {:dtype :float :target-device :ocl:0}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 1)]
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= program (dialect/validate! program)))
+    (is (dialect/scalar-fold-form? fold))
+    (is (symbol? (get-in (dialect/scalar-fold-parts fold) [:attributes :identity])))
+    (is (= -1.0e38
+           (-> program dialect/equations first dialect/operation-parts :lambda
+               dialect/lambda-parts :locals first :init)))
+    (is (= [:kernel-body]
+           (mapv #(get-in % [:attributes :emission-route]) (:kernels emitted))))
+    (is (thrown? clojure.lang.ExceptionInfo (dialect/validate! broken)))))
+
 (deftest nested-recurrences-use-lexical-fold-locals-through-kernel-body
   (let [source (nested-loop-source)
         options {:dtype :float :array-types {'x :float}

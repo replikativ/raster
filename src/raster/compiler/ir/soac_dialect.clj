@@ -425,7 +425,12 @@
   (and (map? value)
        (symbol? (:accumulator value))
        (or (nil? (:index value)) (symbol? (:index value)))
-       (scalar-literal? (:identity value))
+       ;; An ordered recurrence may start from an earlier lexical scalar.  Scope and purity are
+       ;; checked by validate-scalar-fold-scopes!; the scalar lowerer subsequently checks that
+       ;; the resolved value has this Fold's declared dtype.  Requiring a literal here used to
+       ;; leave otherwise closed max/min recurrences as raw loop* source.
+       (or (scalar-literal? (:identity value))
+           (symbol? (:identity value)))
        (keyword? (:dtype value))
        (dtype/known? (:dtype value))
        (= (:dtype value) (dtype/canon (:dtype value)))
@@ -1065,6 +1070,8 @@
                     expected [(:accumulator attributes) (:index attributes)]
                     upper-bound (:upper-bound attributes :exclusive)
                     lower-bound (:lower attributes 0)
+                    identity (:identity attributes)
+                    identity-unbound (util/free-syms identity bound)
                     lower-unbound (util/free-syms lower-bound bound)
                     extent-unbound (util/free-syms (:extent attributes) bound)]
                 (when-not (and (symbol? (:index attributes))
@@ -1073,8 +1080,10 @@
                                (= 2 (count (distinct parameters)))
                                (empty? (set/intersection bound (set parameters)))
                                (= 1 (count results))
+                               (empty? identity-unbound)
                                (empty? lower-unbound)
                                (empty? extent-unbound)
+                               (not (util/effectful? identity))
                                (not (util/effectful? lower-bound))
                                (not (util/effectful? (:extent attributes))))
                   (fail! :typed-soac-scalar-fold
@@ -1082,8 +1091,10 @@
                          {:equation equation-id :fold expression :expected expected
                           :parameters parameters :results results
                           :upper-bound upper-bound
+                          :identity identity :identity-unbound identity-unbound
                           :lower-bound lower-bound :lower-unbound lower-unbound
                           :extent-unbound extent-unbound}))
+                (walk-expression! identity bound)
                 (let [final-bound
                       (reduce
                        (fn [local-bound {:keys [id dtype init] :as local}]
