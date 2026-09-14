@@ -299,7 +299,9 @@
                                         lowerer [:lower :cast :load :compute])))]
                  (segred/lower-element-operations expression options))
         [load promote add narrow] (:operations result)]
-    (is (= [:load :cast :compute :cast] @calls))
+    ;; Reduction admission now delegates the complete source expression to the shared typed SSA
+    ;; lowerer; loads, promotions, arithmetic and the result conversion are one lowering route.
+    (is (= [:lower] @calls))
     (is (= ['(+ i 1)] @coordinates))
     (is (= :int (get-in load [:result :type])))
     (is (= 'active (:predicate load)))

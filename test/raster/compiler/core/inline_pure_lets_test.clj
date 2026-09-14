@@ -95,6 +95,21 @@
       (is (util/effectful? (util/inline-pure-lets (list 'do (list 'clojure.core/identity devirt))))
           "the stamp is still readable after a rewrite pass over the enclosing form"))))
 
+(deftest an-untyped-initializer-inherits-its-authoritative-binder-result-type
+  (let [result (util/inline-pure-lets
+                (list 'let*
+                      [(with-meta 'choice {:raster.type/tag 'double})
+                       '(if predicate (float 1.0) (double 2.0))]
+                      '(double choice)))]
+    (is (= 'double (:raster.type/tag (meta (second result))))))
+  (let [result (util/inline-pure-lets
+                (list 'let*
+                      [(with-meta 'value {:raster.type/tag 'double})
+                       (with-meta '(float 1.0) {:raster.type/tag 'float})]
+                      'value))]
+    (is (= 'float (:raster.type/tag (meta result)))
+        "an initializer's own type wins; beta reduction must not erase a conversion boundary")))
+
 (deftest a-multi-form-body-becomes-do-and-is-never-truncated
   (testing "keeping only (last body) drops the earlier forms — which are exactly the ones held
             for their effects. That was a vanished store, not a missed fusion"

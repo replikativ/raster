@@ -383,12 +383,15 @@
                     expected (canon-type expected)
                     _ (when (and require-source-types? (seq? expression) (not lexical-let?))
                         (source-type expression expected env))
-                    retained (when (seq? expression) (retained-type expression))
-                    operation-type (if (and retained
-                                            (or require-source-types?
-                                                (and (dtype/fp-dtype? expected)
-                                                     (dtype/fp-dtype? retained))))
-                                     retained expected)
+                    retained (retained-type expression)
+                    source-result-type (when require-source-types?
+                                         (authoritative-source-type expression env))
+                    operation-type (if (or source-result-type
+                                           (and retained
+                                                (dtype/fp-dtype? expected)
+                                                (dtype/fp-dtype? retained)))
+                                     (or source-result-type retained)
+                                     expected)
                     lowered (if lexical-let?
                               (lower-let expression operation-type env)
                               (lower-value expression operation-type env))]
