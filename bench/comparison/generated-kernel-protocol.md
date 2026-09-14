@@ -86,14 +86,20 @@ REPL:
 (linear/run! {:shape [32 256 256]
               :revision "<git revision>"
               :environment "<machine/driver identity>"
-              :rounds 12 :warmup-rounds 4})
+              :rounds 12 :warmup-rounds 4
+              :residency :all-stages})
 ```
 
 The candidates are the portable segmented contraction, the materialized XMX graph, and the
 tile-local-input XMX graph. All share the same resident activation, transposed model weights,
 bias and output, and exactly binary16-representable inputs. Each candidate must match the same
 independently rounded host oracle before timing. The materialized graph deliberately pays its
-cast and transpose on every replay; a constant/prepacked-weight comparison is a separate scope.
+cast and transpose on every replay in `:all-stages`. Repeat the same public compilation with
+`:residency :constant-weights` to instantiate each candidate through LinkPlan: model weights and
+bias are ordinary constants, eligible weight-only cast/transpose nodes execute in a one-time
+untimed prologue, and the reported samples cover only steady-state replay. Activations remain
+runtime inputs in both modes. Initialization time is reported separately as binding time and is
+never folded into the replay result.
 The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
 stationarity diagnostics, and never updates the tuning cache.
 
