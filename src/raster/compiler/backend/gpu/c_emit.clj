@@ -197,6 +197,18 @@
          'clojure.core/unchecked-subtract "-"
          'clojure.core/unchecked-inc "+"
          'clojure.core/unchecked-dec "-"
+         ;; The bare forms too. A kernel BODY reaches the emitter devirtualised
+         ;; (.invk with :raster.op/original), so its unchecked ops lower through
+         ;; the intrinsics table; a deftm HELPER with integer parameters does
+         ;; not, and its `(unchecked-multiply seed 1000003)` fell to the
+         ;; `(name op)` default and was emitted as the bare symbol —
+         ;; `(seed unchecked-multiply 1000003)`, an OpenCL syntax error
+         ;; (city.sim.kernel/uniform01, 2026-09-16).
+         'unchecked-add "+"
+         'unchecked-multiply "*"
+         'unchecked-subtract "-"
+         'unchecked-inc "+"
+         'unchecked-dec "-"
          'clojure.core/< "<"
          'clojure.core/> ">"
          'clojure.core/<= "<="
