@@ -105,3 +105,18 @@
            (c-emit/decl-type (with-meta 'value {:raster.type/tag 'not-a-scalar}) 0)
            (catch clojure.lang.ExceptionInfo e
              (:reason (ex-data e)))))))
+
+(deftest bare-unchecked-integer-ops-lower-to-c-operators
+  ;; A deftm helper with integer parameters reaches the emitter with its
+  ;; operators as bare symbols, not devirtualised .invk forms. Every one of
+  ;; them must lower to the C operator; the default `(name op)` fallback once
+  ;; emitted `(seed unchecked-multiply 1000003)` into an OpenCL kernel.
+  (doseq [[form op] [['(unchecked-multiply seed 1000003) "*"]
+                     ['(unchecked-add seed k) "+"]
+                     ['(unchecked-subtract seed k) "-"]
+                     ['(clojure.core/unchecked-multiply seed 1000003) "*"]
+                     ['(unchecked-add-int q 1) "+"]]]
+    (let [src (c-emit/emit-expr form nil #{} false)]
+      (is (re-find (re-pattern (str "\\" op)) src) (str form " → " src))
+      (is (not (re-find #"unchecked" src)) (str form " → " src)))))
+

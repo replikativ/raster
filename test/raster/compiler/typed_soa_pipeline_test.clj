@@ -27,7 +27,9 @@
       (is (= ["x" "id"]
              (mapv :field (get-in program [:value-specs 'particles :leaves]))))
       (is (= 'particles (get-in kernel [:abi 0 :binding])))
-      (is (= "x" (get-in kernel [:abi 0 :field])))
+      ;; ABI field identities may be keywords or strings; link plans compare
+      ;; them by name (`link-plan/field-id`)
+      (is (= "x" (some-> (get-in kernel [:abi 0 :field]) name)))
       (is (= :typed-soac (get-in program [:compiler-report :route :source-dialect])))
       (is (true? (get-in program [:compiler-report :route :typed-validated])))
       (is (= {:kernel-body 1} (get-in program [:compiler-report :emission :routes])))
