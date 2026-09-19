@@ -49,3 +49,15 @@
   (is (not (contains? (:flags (effects/descriptor '(clojure.core/unchecked-int x)))
                       :checked-source-cast))
       "the op descriptor's explicit wrapping cast has no checked exception obligation"))
+
+(deftest cached-descriptors-distinguish-metadata
+  ;; Descriptors are memoized. The source operation of a devirtualized call
+  ;; lives in metadata, which equality ignores, so the cache must not hand one
+  ;; form's descriptor to an equal form with different metadata.
+  (let [form '(.invk raster.numeric/_star__m_long_long-impl rows width)
+        certified (with-meta form {:raster.op/original 'raster.numeric/*
+                                   :raster.type/tag 'long :tag 'long})]
+    (is (= form certified))
+    (is (not (effects/removable-expr? form)))
+    (is (effects/removable-expr? certified))
+    (is (not (effects/removable-expr? form)) "a cached certified result is not reused")))

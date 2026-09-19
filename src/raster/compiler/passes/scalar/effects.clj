@@ -186,6 +186,34 @@
                     (not (proven-total-cast? node))))))
          (tree-seq coll? seq expr))))
 
+(def ^:private descriptor-cache-capacity 65536)
+
+(def ^:private descriptor-cache
+  "Descriptors by expression key, least recently used evicted first. Scalar
+   passes ask about the same expressions many times per fixpoint, and each
+   analysis runs tools.analyzer over the whole expression."
+  (java.util.Collections/synchronizedMap
+   (proxy [java.util.LinkedHashMap] [1024 0.75 true]
+     (removeEldestEntry [_]
+       (> (.size ^java.util.Map this) (long descriptor-cache-capacity))))))
+
+(defn- descriptor-key
+  "Return a digest of `expr` including all of its metadata and `*ns*`.
+
+   Metadata is part of the key because the analysis reads it: devirtualized
+   calls carry their source operation there, and operand type tags decide
+   whether a cast is total. Structural equality alone would ignore both.
+   Unqualified symbols resolve in `*ns*`, so it is part of the key too."
+  ^String [expr]
+  (let [text (binding [*print-meta* true *print-length* nil *print-level* nil
+                       *print-namespace-maps* false]
+               (str (ns-name *ns*) "\n" (pr-str expr)))
+        digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                        (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8))]
+    (.formatHex (java.util.HexFormat/of) digest)))
+
+(declare analyze-descriptor)
+
 (defn descriptor
   "Return the effect descriptor for a compiler IR expression.
 
@@ -193,26 +221,37 @@
    so it can analyze walked IR without var resolution failures.
 
    Conservative default: if beichte fails, returns {:effect :io :flags #{}}
-   (assumed effectful). Only proven-pure expressions get :pure."
+   (assumed effectful). Only proven-pure expressions get :pure. Results are
+   memoized by expression and metadata; the analysis context is fixed once
+   initialized."
   [expr]
   (if (not (seq? expr))
     {:effect :pure :flags #{}}
-    (try
-      (let [semantic-expr (semantic-calls expr)
-            locals (collect-locals semantic-expr)
-            result (b/analyze-full semantic-expr @raster-context locals)
-            result (if (map? result)
-                     (update result :flags #(or % #{}))
-                     {:effect (or result :io) :flags #{}})]
-        (cond-> result
-          (checked-integral-cast? semantic-expr)
-          (update :flags conj :checked-source-cast)))
-      (catch Exception _
-        ;; Conservative: unknown = effectful
-        {:effect :io :flags #{}})
-      (catch StackOverflowError _
-        ;; Deep expressions overflow tools.analyzer — assume effectful
-        {:effect :io :flags #{}}))))
+    (if-let [k (try (descriptor-key expr) (catch StackOverflowError _ nil))]
+      (or (.get ^java.util.Map descriptor-cache k)
+          (let [result (analyze-descriptor expr)]
+            (.put ^java.util.Map descriptor-cache k result)
+            result))
+      (analyze-descriptor expr))))
+
+(defn- analyze-descriptor
+  [expr]
+  (try
+    (let [semantic-expr (semantic-calls expr)
+          locals (collect-locals semantic-expr)
+          result (b/analyze-full semantic-expr @raster-context locals)
+          result (if (map? result)
+                   (update result :flags #(or % #{}))
+                   {:effect (or result :io) :flags #{}})]
+      (cond-> result
+        (checked-integral-cast? semantic-expr)
+        (update :flags conj :checked-source-cast)))
+    (catch Exception _
+      ;; Conservative: unknown = effectful
+      {:effect :io :flags #{}})
+    (catch StackOverflowError _
+      ;; Deep expressions overflow tools.analyzer — assume effectful
+      {:effect :io :flags #{}})))
 
 (defn removable-expr?
   "True if an unused expression can be dropped without changing semantics."
