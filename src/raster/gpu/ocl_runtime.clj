@@ -921,16 +921,18 @@
         _ (when missing
             (throw (ex-info "OpenCL device lacks required compiler extensions"
                             {:reason :opencl-compilation-requirements :missing (set missing)})))]
-    (when-let [standard (:language-standard requirements)] (str "-cl-std=" standard))))
+    ;; A deftm's float division and square root are IEEE single precision on the
+    ;; JVM; OpenCL relaxes both unless asked (see ze-runtime/spirv-build-flags).
+    (str/join " " (cond-> ["-cl-fp32-correctly-rounded-divide-sqrt"]
+                    (:language-standard requirements)
+                    (conj (str "-cl-std=" (:language-standard requirements)))))))
 
 (defn- compile-program!
   "Compile OpenCL C source to a cl_program. Returns the program handle."
   ^MemorySegment [^String source compilation]
   (ensure-init!)
   (let [{:keys [context device arena device-info]} @state
-        options (if-let [options (compilation-options compilation device-info)]
-                  (.allocateFrom ^Arena arena ^String options)
-                  MemorySegment/NULL)
+        options (.allocateFrom ^Arena arena ^String (compilation-options compilation device-info))
         err-seg (.allocate ^Arena arena I32)
         ;; Create string pointer
         src-seg (.allocateFrom ^Arena arena source)

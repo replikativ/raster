@@ -557,17 +557,29 @@
   (.formatHex (java.util.HexFormat/of)
               (.digest (java.security.MessageDigest/getInstance "SHA-256") data)))
 
+(def spirv-build-flags
+  "Build flags for every SPIR-V module. A deftm's float division and square
+  root are IEEE single precision on the JVM; OpenCL relaxes both to a few ulp
+  unless asked, and Level Zero decides when it compiles SPIR-V to native code,
+  so the flag belongs to zeModuleCreate (ocloc's -spv_only output ignores it).
+  On an Arc 140V the relaxed default rounded 72% of float quotients correctly."
+  "-cl-fp32-correctly-rounded-divide-sqrt")
+
 (defn load-module!
   "Load a SPIR-V or native module from bytes. Returns the module handle.
-  Modules are cached by content hash.
-  format: :spirv (default) or :native for pre-compiled ZEBIN."
+  Modules are cached by content hash and build flags.
+  format: :spirv (default) or :native for pre-compiled ZEBIN. SPIR-V modules
+  are built with `spirv-build-flags` unless `build-flags` says otherwise; the
+  same bytes built with different flags are different modules."
   (^MemorySegment [^bytes spv-bytes]
    (load-module! spv-bytes :spirv))
   (^MemorySegment [^bytes spv-bytes format]
+   (load-module! spv-bytes format (when (= format :spirv) spirv-build-flags)))
+  (^MemorySegment [^bytes spv-bytes format build-flags]
    (ensure-init!)
    ;; A 32-bit Arrays/hashCode key could hand one module's handle to another
    ;; module's bytes on a collision; the digest keys the exact bytes.
-   (let [hash [format (bytes-digest spv-bytes)]]
+   (let [hash [format (bytes-digest spv-bytes) build-flags]]
      (if-let [cached (get-in @state [:modules hash])]
        cached
        (let [arena (:arena @state)
@@ -585,6 +597,8 @@
              _ (.set mod-desc I64 24 (long (alength spv-bytes)))
              spv-seg (.allocateFrom arena ValueLayout/JAVA_BYTE spv-bytes)
              _ (.set mod-desc PTR 32 spv-seg)
+             _ (when build-flags
+                 (.set mod-desc PTR 40 (.allocateFrom ^Arena arena ^String build-flags)))
              mod-out (ptr-seg arena)
              _ (ze-call! "zeModuleCreate" @h-zeModuleCreate
                          [ctx dev mod-desc mod-out MemorySegment/NULL])
