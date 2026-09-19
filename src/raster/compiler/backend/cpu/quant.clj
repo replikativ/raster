@@ -107,8 +107,14 @@
         ;; 1. per sub-block scale a = (max-min)/15 and min b
         (dotimes [j subs-per]
           (let [base (+ sbase (* j sub))
-                lo (loop [i 1 m (aget w base)] (if (< i sub) (recur (inc i) (min m (aget w (+ base i)))) m))
-                hi (loop [i 1 m (aget w base)] (if (< i sub) (recur (inc i) (max m (aget w (+ base i)))) m))]
+                ;; Loop locals are primitive only as long or double, and a loop
+                ;; whose branch recurs has no static type; without the double
+                ;; seed and result every comparison boxes and the aset below
+                ;; reflects.
+                lo (double (loop [i 1 m (double (aget w base))]
+                             (if (< i sub) (recur (inc i) (min m (double (aget w (+ base i))))) m)))
+                hi (double (loop [i 1 m (double (aget w base))]
+                             (if (< i sub) (recur (inc i) (max m (double (aget w (+ base i))))) m)))]
             (aset as j (/ (- hi lo) 15.0)) (aset bs j lo)))
         ;; 2. super-block scales-of-scales, quantize sub scales/mins to 6-bit
         (let [amax (areduce as i m 0.0 (max m (aget as i)))

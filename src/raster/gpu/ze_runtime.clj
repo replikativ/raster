@@ -31,7 +31,8 @@
             AddressLayout]
            [java.lang.invoke MethodHandle]
            [java.nio.file Files Path])
-  (:require [raster.compiler.core.types :as types]
+  (:require [clojure.string]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -550,6 +551,12 @@
 
 (def ^:private ZE_MODULE_FORMAT_NATIVE 0x01)
 
+(defn- bytes-digest
+  "Return the lowercase hex SHA-256 of `data`."
+  ^String [^bytes data]
+  (.formatHex (java.util.HexFormat/of)
+              (.digest (java.security.MessageDigest/getInstance "SHA-256") data)))
+
 (defn load-module!
   "Load a SPIR-V or native module from bytes. Returns the module handle.
   Modules are cached by content hash.
@@ -558,7 +565,9 @@
    (load-module! spv-bytes :spirv))
   (^MemorySegment [^bytes spv-bytes format]
    (ensure-init!)
-   (let [hash (java.util.Arrays/hashCode spv-bytes)]
+   ;; A 32-bit Arrays/hashCode key could hand one module's handle to another
+   ;; module's bytes on a collision; the digest keys the exact bytes.
+   (let [hash [format (bytes-digest spv-bytes)]]
      (if-let [cached (get-in @state [:modules hash])]
        cached
        (let [arena (:arena @state)
@@ -1832,6 +1841,50 @@
     (get (:attributes kernel-info) k default)
     (get kernel-info k default)))
 
+(def ^:private generated-identifier
+  "Identifiers shaped like `gensym` output: a lowercase or underscore start and
+  an underscore followed by at least three digits. Code generators name
+  kernel-local temporaries this way, and the digits differ in every compile."
+  #"\b[a-z_][A-Za-z0-9_]*?_\d{3,}\b")
+
+(defn- canonical-locals
+  "Rename generated identifiers in `source` by first appearance.
+
+  The renaming is one-to-one and consistent within the translation unit, so
+  it only renames C identifiers; identical kernels compiled in different binds
+  then have identical text."
+  [^String source]
+  (let [names (atom {})]
+    (clojure.string/replace
+     source generated-identifier
+     (fn [identifier]
+       (or (get @names identifier)
+           (let [renamed (str "__rg" (count @names))]
+             (swap! names assoc identifier renamed)
+             renamed))))))
+
+(defn- canonical-entry
+  "Return `[entry-name source]` for compiling a registered kernel.
+
+  Generated kernels carry a registry name with a per-process suffix, and that
+  name is the kernel's entry point in its source; their temporaries are named
+  the same way. Compiling the text verbatim makes identical kernels differ in
+  every bind, so the SPIR-V and module caches never hit. The entry point is
+  renamed to a name derived from the source with the entry replaced by a
+  placeholder and generated temporaries renamed canonically; identical kernels
+  then compile once, while the registry keeps its unique names and arenas. A
+  source that does not name the kernel is compiled as is."
+  [^String kernel-name ^String source]
+  (let [pattern (re-pattern (str "\\b" (java.util.regex.Pattern/quote kernel-name) "\\b"))]
+    (if (and source (re-find pattern source))
+      (let [placeholder "RASTER_ENTRY_POINT"
+            template (canonical-locals (clojure.string/replace source pattern placeholder))
+            entry (str "rk_" (subs (bytes-digest (.getBytes ^String template
+                                                           java.nio.charset.StandardCharsets/UTF_8))
+                                   0 32))]
+        [entry (clojure.string/replace template placeholder entry)])
+      [kernel-name source])))
+
 (defn- ensure-kernel-loaded!
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."
@@ -1844,7 +1897,11 @@
                        :registered (keys @kernel-registry)})))
     (if (:kernel-handle info)
       info
-      (let [;; Compile SPIR-V if not already done
+      (let [;; Precompiled SPIR-V was built with the registry name as its entry.
+            [entry-name source] (if (:spv-bytes info)
+                                  [kernel-name (:source info)]
+                                  (canonical-entry kernel-name (:source info)))
+            ;; Compile SPIR-V if not already done
             device-hex (:device-id-hex @state)
             spv-bytes (or (:spv-bytes info)
                           (let [cache (delay
@@ -1856,11 +1913,14 @@
                                               src :device device-hex))
                                 get-or-compile (requiring-resolve
                                                 'raster.compiler.support.spirv-cache/get-or-compile)]
-                            (get-or-compile @cache (:source info) compile-fn device-hex)))
+                            (get-or-compile @cache source compile-fn device-hex)))
             module (load-module! spv-bytes)
-            kernel-handle (create-kernel module kernel-name)
+            ;; Identical kernels now share one module, so the entry's handle is
+            ;; its own: registry entries never share mutable argument state.
+            kernel-handle (create-kernel-fresh module entry-name)
             updated (assoc info
                            :spv-bytes spv-bytes
+                           :entry-name entry-name
                            :module module
                            :kernel-handle kernel-handle)]
         (swap! kernel-registry assoc kernel-name updated)
@@ -2349,8 +2409,8 @@
                                     {:kernel-name kernel-name :slot slot :out-elems out-elems
                                      :buffer-elements capacity})))))))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [module]} (ensure-kernel-loaded! kernel-name)
-        kernel-handle (create-kernel-fresh module kernel-name)
+        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
+        kernel-handle (create-kernel-fresh module entry-name)
         native-args (mapv (fn [[slot value]]
                             (if (= :scalar (:kind slot))
                               value
@@ -2393,14 +2453,14 @@
          checked-bound (if split-binding
                          (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
                          {:type :int :value (Math/toIntExact (long n))})
-         {:keys [module] :as loaded} (ensure-kernel-loaded! kernel-name)
+         {:keys [module entry-name] :as loaded} (ensure-kernel-loaded! kernel-name)
          dtype (kernel-info-value loaded :dtype :float)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
          ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
          ;; make every binding of the same kernel clobber the others (the last prepare! wins).
          ;; A fresh handle per binding gives each its own arg state — required for the decode
          ;; pattern (N matmuls share one kernel SOURCE but need N independent arg sets).
-         kernel-handle (create-kernel-fresh module kernel-name)
+         kernel-handle (create-kernel-fresh module entry-name)
          workgroup-size (long (get opts :workgroup-size
                                    (registered-1d-workgroup-size loaded)))
          n (long n)
