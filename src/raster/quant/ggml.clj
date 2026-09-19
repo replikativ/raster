@@ -672,23 +672,19 @@
 ;; Kernel layouts: lossless decodings of ggml blocks for the GPU dot kernels
 ;; ---------------------------------------------------------------------------
 
-(defn- pack-words
-  "Pack signed or unsigned byte-range codes four per int32, little-endian."
-  ^ints [^longs codes]
-  (let [out (int-array (quot (alength codes) 4))]
-    (dotimes [w (alength out)]
-      (aset out w (unchecked-int
-                   (bit-or (bit-and (aget codes (* 4 w)) 0xFF)
-                           (bit-shift-left (bit-and (aget codes (+ (* 4 w) 1)) 0xFF) 8)
-                           (bit-shift-left (bit-and (aget codes (+ (* 4 w) 2)) 0xFF) 16)
-                           (bit-shift-left (bit-and (aget codes (+ (* 4 w) 3)) 0xFF) 24)))))
-    out))
+;; ---------------------------------------------------------------------------
+;; Kernel layouts: lossless decodings of ggml blocks for the GPU dot kernels
+;; ---------------------------------------------------------------------------
 
-(defn- concat-longs ^longs [parts]
-  (let [out (long-array (reduce + (map #(alength ^longs %) parts)))]
-    (reduce (fn [^long o ^longs p] (System/arraycopy p 0 out o (alength p)) (+ o (alength p)))
-            0 parts)
-    out))
+(defn- put-code!
+  "Store code `v` (a signed or unsigned byte value) as byte `e` of packed int32
+  words: four codes per word, little-endian, in element order."
+  [^ints words ^long e ^long v]
+  (let [w (quot e 4)
+        shift (* 8 (rem e 4))]
+    (aset words w (unchecked-int (bit-or (bit-and (long (aget words w))
+                                                  (bit-not (bit-shift-left 0xFF shift)))
+                                         (bit-shift-left (bit-and v 0xFF) shift))))))
 
 (defn kernel-layout
   "Decode `nrows` rows of ggml `format` blocks (each `n` elements) into the
@@ -702,38 +698,93 @@
     :q6_K         {:q int[...] :d float[...] :sc int[16 per block]}"
   [format ^bytes blocks n nrows]
   (let [n (long n) nrows (long nrows)
-        {:keys [block bytes]} (get formats format)
+        {:keys [block bytes]} (or (get formats format)
+                                  (throw (ex-info "Unknown ggml format" {:format format})))
         block (long block) bytes (long bytes)
         nblocks (* nrows (quot n block))
-        offsets (map #(* bytes (long %)) (range nblocks))]
+        q (int-array (quot (* nblocks block) 4))
+        d (float-array nblocks)
+        u8 (fn ^long [^long i] (bit-and (long (aget blocks i)) 0xFF))]
+    (when-not (= (alength blocks) (* nblocks bytes))
+      (throw (ex-info "Block bytes do not match the shape"
+                      {:format format :bytes (alength blocks) :n n :nrows nrows})))
     (case format
-      (:q8_0 :q5_0)
-      {:q (pack-words (concat-longs (map #(if (= format :q8_0)
-                                             (:q (q8-0-block blocks %))
-                                             (q5-0-codes blocks %))
-                                          offsets)))
-       :d (float-array (map #(fp16-bits->fp32 (get-u16 blocks %)) offsets))}
+      :q8_0
+      (do (dotimes [b nblocks]
+            (let [o (* b bytes)]
+              (aset d b (float (fp16-bits->fp32 (get-u16 blocks o))))
+              ;; the 32 int8 codes are already four per little-endian word
+              (dotimes [w 8]
+                (aset q (+ (* b 8) w) (unchecked-int (get-u32 blocks (+ o 2 (* 4 w))))))))
+          {:q q :d d})
+
+      :q5_0
+      (do (dotimes [b nblocks]
+            (let [o (* b bytes)
+                  qh (get-u32 blocks (+ o 2))
+                  e0 (* b 32)]
+              (aset d b (float (fp16-bits->fp32 (get-u16 blocks o))))
+              (dotimes [j 16]
+                (let [v (u8 (+ o 6 j))]
+                  (put-code! q (+ e0 j)
+                             (- (bit-or (bit-and v 0x0F) (bit-shift-left (bit-and (bit-shift-right qh j) 1) 4)) 16))
+                  (put-code! q (+ e0 16 j)
+                             (- (bit-or (bit-shift-right v 4) (bit-and (bit-shift-right qh (+ j 12)) 0x10)) 16))))))
+          {:q q :d d})
 
       :q8_K
-      (let [bs (map #(q8-K-block blocks %) offsets)]
-        {:q (pack-words (concat-longs (map :q bs)))
-         :d (float-array (map :d bs))
-         :bsums (int-array (mapcat #(seq ^longs (:bsums %)) bs))})
+      (let [bsums (int-array (* nblocks 16))
+            bb (.order (ByteBuffer/wrap blocks) ByteOrder/LITTLE_ENDIAN)]
+        (dotimes [b nblocks]
+          (let [o (* b bytes)]
+            (aset d b (.getFloat bb (int o)))
+            (dotimes [w 64]
+              (aset q (+ (* b 64) w) (unchecked-int (get-u32 blocks (+ o 4 (* 4 w))))))
+            (dotimes [j 16]
+              (aset bsums (+ (* b 16) j) (int (.getShort bb (int (+ o 260 (* 2 j)))))))))
+        {:q q :d d :bsums bsums})
 
       :q4_K
-      {:q (pack-words (concat-longs (map #(q4-K-codes blocks %) offsets)))
-       :d (float-array (map #(fp16-bits->fp32 (get-u16 blocks %)) offsets))
-       :dmin (float-array (map #(fp16-bits->fp32 (get-u16 blocks (+ (long %) 2))) offsets))
-       :sc (int-array (mapcat (fn [o] (map #(first (scale-min-k4 blocks (+ (long o) 4) %)) (range 8))) offsets))
-       :m (int-array (mapcat (fn [o] (map #(second (scale-min-k4 blocks (+ (long o) 4) %)) (range 8))) offsets))}
+      (let [dmin (float-array nblocks)
+            sc (int-array (* nblocks 8))
+            m (int-array (* nblocks 8))]
+        (dotimes [b nblocks]
+          (let [o (* b bytes)
+                e0 (* b 256)]
+            (aset d b (float (fp16-bits->fp32 (get-u16 blocks o))))
+            (aset dmin b (float (fp16-bits->fp32 (get-u16 blocks (+ o 2)))))
+            (dotimes [j 8]
+              (let [[s mm] (scale-min-k4 blocks (+ o 4) j)]
+                (aset sc (+ (* b 8) j) (int s))
+                (aset m (+ (* b 8) j) (int mm))))
+            (dotimes [g 4]
+              (dotimes [l 32]
+                (let [v (u8 (+ o 16 (* 32 g) l))]
+                  (put-code! q (+ e0 (* 64 g) l) (bit-and v 0xF))
+                  (put-code! q (+ e0 (* 64 g) 32 l) (bit-shift-right v 4)))))))
+        {:q q :d d :dmin dmin :sc sc :m m})
 
       :q6_K
-      {:q (pack-words (concat-longs (map #(q6-K-codes blocks %) offsets)))
-       :d (float-array (map #(fp16-bits->fp32 (get-u16 blocks (+ (long %) 208))) offsets))
-       :sc (int-array (mapcat (fn [o]
-                                (map (fn [i] (long (aget blocks (+ (long o) 192 (long i)))))
-                                     (range 16)))
-                              offsets))})))
+      (let [sc (int-array (* nblocks 16))]
+        (dotimes [b nblocks]
+          (let [o (* b bytes)
+                e0 (* b 256)]
+            (aset d b (float (fp16-bits->fp32 (get-u16 blocks (+ o 208)))))
+            (dotimes [j 16]
+              (aset sc (+ (* b 16) j) (int (aget blocks (+ o 192 j)))))
+            (dotimes [h 2]
+              (let [qlo (+ o (* 64 h)) qho (+ o 128 (* 32 h)) base (+ e0 (* 128 h))]
+                (dotimes [l 32]
+                  (let [ql0 (u8 (+ qlo l)) ql1 (u8 (+ qlo 32 l)) qh (u8 (+ qho l))]
+                    (put-code! q (+ base l)
+                               (- (bit-or (bit-and ql0 0xF) (bit-shift-left (bit-and qh 3) 4)) 32))
+                    (put-code! q (+ base 32 l)
+                               (- (bit-or (bit-and ql1 0xF) (bit-shift-left (bit-and (bit-shift-right qh 2) 3) 4)) 32))
+                    (put-code! q (+ base 64 l)
+                               (- (bit-or (bit-shift-right ql0 4) (bit-shift-left (bit-and (bit-shift-right qh 4) 3) 4)) 32))
+                    (put-code! q (+ base 96 l)
+                               (- (bit-or (bit-shift-right ql1 4) (bit-shift-left (bit-and (bit-shift-right qh 6) 3) 4)) 32))))))))
+        {:q q :d d :sc sc}))))
 
 (defn read-f32
   "Little-endian float32 values from a byte array."

@@ -88,3 +88,39 @@
         (testing id
           (is (= generic-result-bits (format "%08x" (Float/floatToRawIntBits (float s))))
               (str "got " s)))))))
+
+(defn- code [^ints words ^long e signed?]
+  (let [v (bit-and (bit-shift-right (long (aget words (quot e 4))) (* 8 (rem e 4))) 0xFF)]
+    (if (and signed? (> v 127)) (- v 256) v)))
+
+(defn- dequantize-layout
+  "Floats from a kernel layout, with ggml's to_float arithmetic."
+  ^floats [format layout n]
+  (let [n (long n) out (float-array n)
+        f* (fn ^double [^double a ^double b] (double (float (* a b))))
+        {:keys [q d dmin sc m]} layout]
+    (dotimes [e n]
+      (aset out e
+            (float
+             (case format
+               :q8_0 (f* (double (code q e true)) (aget ^floats d (quot e 32)))
+               :q5_0 (f* (double (code q e true)) (aget ^floats d (quot e 32)))
+               :q4_K (let [b (quot e 256) j (quot (rem e 256) 32)]
+                       (double (float (- (f* (f* (aget ^floats d b) (double (aget ^ints sc (+ (* b 8) j))))
+                                             (double (code q e false)))
+                                         (f* (aget ^floats dmin b) (double (aget ^ints m (+ (* b 8) j))))))))
+               :q6_K (let [b (quot e 256) j (quot (rem e 256) 16)]
+                       (f* (f* (aget ^floats d b) (double (aget ^ints sc (+ (* b 16) j))))
+                           (double (code q e true))))))))
+    out))
+
+(deftest kernel-layouts-decode-losslessly
+  ;; Dequantizing from the kernel layout reproduces ggml's to_float bit for
+  ;; bit, so the layout loses nothing the GPU kernels need.
+  (doseq [{:keys [id n-per-row nrows formats]} (:quantize @manifest)
+          [format {:keys [blocks]}] formats]
+    (let [n (* n-per-row nrows)
+          bs (fixture-bytes blocks)]
+      (testing (str (name format) " " (name id))
+        (is (= (float-bits (ggml/dequantize format bs n))
+               (float-bits (dequantize-layout format (ggml/kernel-layout format bs n-per-row nrows) n))))))))
