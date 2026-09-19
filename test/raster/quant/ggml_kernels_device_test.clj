@@ -5,7 +5,9 @@
   byte for byte against llama.cpp), decoded with `kernel-layout`, and every
   GPU output must equal `ggml/vec-dot` without contraction exactly."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.core :as gpu]
             [raster.quant.ggml :as ggml]
             [raster.quant.ggml-kernels :as gk]))
@@ -98,21 +100,22 @@
      ["tiny" (f (fn [_] (* 1.0e-7 (.nextGaussian r)))) 2 width]
      ["zeros" (f (fn [_] 0.0)) 2 width]]))
 
-(defn- run-quantizer
-  "Run a device activation quantizer and return its output arrays."
-  [kernel ^floats x width nrows outputs]
-  (let [sess (gpu/make-session :ze:0)]
+(defn- run-program
+  "Compile `kernel` as a resident program, run it once on `arguments`, and return
+  the arrays of the parameters listed in `outputs`."
+  [kernel arguments outputs]
+  (let [descriptor (pipeline/compile-gpu-program kernel :ze:0 :dtype :float)
+        sess (gpu/make-session :ze:0)]
     (try
-      (gpu/compile! sess :quant kernel)
-      (gpu/alloc! sess (into {:x [:float (alength x) x]}
-                             (map (fn [[k [dtype n]]] [k [dtype n nil]]))
-                             outputs))
-      (let [units (* nrows (quot width (if (contains? outputs :xbs) 16 32)))]
-        (gpu/prepare! sess :quant (into {"x" :x} (map (fn [[k _]] [(name k) k])) outputs)
-                      [] units {:kernel-phase :quant}))
-      (gpu/invoke-bound! sess :quant)
-      (gpu/sync! sess)
-      (into {} (map (fn [[k _]] [k (gpu/download sess k)])) outputs)
+      (let [by-name (into {} (map (fn [[k v]] [(name k) v])) arguments)
+            args (mapv #(get by-name (name %)) (:all-params descriptor))
+            program (fixture/instantiate! sess descriptor args
+                                          (into {} (for [p (:all-params descriptor)
+                                                         :when (some #(= (name p) (name %)) outputs)]
+                                                     [p :output])))
+            results (fixture/run! program args)
+            by-result (into {} (map (fn [[k v]] [(name k) v])) results)]
+        (into {} (map (fn [k] [k (get by-result (name k))])) outputs))
       (finally (gpu/close-session! sess)))))
 
 (deftest activation-quantizers-match-the-reference
@@ -123,10 +126,12 @@
             [label x nrows width] (activation-inputs width)]
       (let [expected (ggml/kernel-layout fmt (ggml/quantize fmt x width nrows) width nrows)
             nblocks (* nrows (quot width (if (= fmt :q8_K) 256 32)))
-            outputs (cond-> {:xq [:int (alength ^ints (:q expected))]
-                             :xd [:float nblocks]}
-                      (= fmt :q8_K) (assoc :xbs [:int (* 16 nblocks)]))
-            actual (run-quantizer kernel x width nrows outputs)
+            arguments (cond-> {'x x 'xq (int-array (alength ^ints (:q expected)))
+                               'xd (float-array nblocks) 'nblocks nblocks}
+                        (= fmt :q8_K) (assoc 'xbs (int-array (* 16 nblocks))))
+            result (run-program kernel arguments
+                                (cond-> ['xq 'xd] (= fmt :q8_K) (conj 'xbs)))
+            actual {:xq (get result 'xq) :xd (get result 'xd) :xbs (get result 'xbs)}
             float-bits (fn [xs] (mapv #(Float/floatToRawIntBits %) xs))]
         (testing (str (name fmt) " " label)
           (is (= (vec (:q expected)) (vec (:xq actual))) "codes")

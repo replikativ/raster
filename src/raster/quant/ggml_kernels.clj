@@ -271,10 +271,10 @@
                             (list 'float Float/POSITIVE_INFINITY)
                             r))))))
 
-(defn- word-form
-  "Form storing the int32 word of four codes (element order) at `xq[index]`.
-  `code` maps a float product to its integer code form."
-  [index products code]
+(defn- word-value-form
+  "Form for the signed int32 value of four codes (element order); `code` maps a
+  float product to its integer code form."
+  [products code]
   (let [qs (mapv #(local (str "q" %)) (range 4))
         word (local "word")]
     (list 'let (vec (concat (mapcat (fn [q p] [q (list 'long (code p))]) qs products)
@@ -284,11 +284,11 @@
                                         (list 'rn/bit-or (list 'rn/bit-shift-left (list 'rn/bit-and (qs 2) 0xFF) 16)
                                               (list 'rn/bit-shift-left (list 'rn/bit-and (qs 3) 0xFF) 24)))]))
           ;; the word's bit pattern as a signed int32
-          (list 'ra/aset 'xq index
-                (list 'int (list 'if (list '>= word 2147483648) (list '- word 4294967296) word))))))
+          (list 'int (list 'if (list '>= word 2147483648) (list '- word 4294967296) word)))))
 
 (defn- exact-forms
-  "Replace `(rint v)`, `(roundf v)` and `(fp16-round v)` placeholders."
+  "Replace `(rint v)`, `(roundf v)`, `(fp16-round v)`, `(clamp-127 v)` and
+  `(word-q8-0 base id)` / `(word-q8-K base iscale)` placeholders."
   [template]
   (clojure.walk/postwalk
    (fn [form]
@@ -297,83 +297,123 @@
          rint (rint-form (second form))
          roundf (roundf-form (second form))
          fp16-round (fp16-round-form (second form))
+         word-q8-0 (let [[_ base id] form]
+                     (word-value-form (for [k (range 4)]
+                                        (list '* (list 'ra/aget 'x (list '+ base k)) id))
+                                      roundf-form))
+         word-q8-K (let [[_ base iscale] form]
+                     (word-value-form (for [k (range 4)]
+                                        (list '* iscale (list 'ra/aget 'x (list '+ base k))))
+                                      (fn [p] (let [v (local "code")]
+                                                ;; MIN(127, v) as an explicit integer comparison
+                                                (list 'let [v (list 'long (rint-form p))]
+                                                      (list 'if (list '> v 127) 127 v))))))
          form)
        form))
    template))
 
+;; Each map writes one element at its own index, the shape TypedSOAC certifies;
+;; a block's maximum is recomputed where a map needs it.
+
 (defmacro ^:private def-q8-0-quantizer []
-  (let [words (for [w (range 8)]
-                (word-form (list '+ (list '* 'b 8) w)
-                           (for [k (range 4)]
-                             (list '* (list 'ra/aget 'x (list '+ 'base (+ (* 4 w) k))) 'id))
-                           #(list 'roundf %)))]
-    (exact-forms
-     (list 'deftm 'quant-act-q8-0-rows!
-           "quantize_row_q8_0_ref over rows of floats whose width is a multiple of 32: one
-  work-item per 32-element block writes eight code words (element order) and the
-  block's scale as the float its FP16 encoding denotes."
-           '[x :- (Array float), xq :- (Array int), xd :- (Array float), nblocks :- Long]
-           :- 'Void
-           (list 'par/map-void! 'b 'nblocks
-                 (concat
-                  (list 'let '[base (* b 32)
-                               amax (loop [j 0 m (float 0.0)]
-                                      (if (< j 32)
-                                        (let [v (ra/aget x (+ base j))
-                                              a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                          (recur (inc j) (if (> m a) m a)))
-                                        m))
-                               d (/ amax (float 127.0))
-                               id (if (== d (float 0.0)) (float 0.0) (/ (float 1.0) d))]
-                        '(ra/aset xd b (fp16-round d)))
-                  words))))))
+  (exact-forms
+   '(deftm quant-act-q8-0-rows!
+      "quantize_row_q8_0_ref over rows whose width is a multiple of 32: each block's
+      scale as the float its FP16 encoding denotes, and eight code words per block
+      in element order."
+      [x :- (Array float), xq :- (Array int), xd :- (Array float), nblocks :- Long] :- Void
+      (do
+        (par/map-void! b nblocks
+                       (let [base (* b 32)
+                             amax (loop [j 0 m (float 0.0)]
+                                    (if (< j 32)
+                                      (let [v (ra/aget x (+ base j))
+                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                        (recur (inc j) (if (> m a) m a)))
+                                      m))
+                             d (/ amax (float 127.0))]
+                         (ra/aset xd b (fp16-round d))))
+        (par/map-void! i (* nblocks 8)
+                       (let [base (* (quot i 8) 32)
+                             amax (loop [j 0 m (float 0.0)]
+                                    (if (< j 32)
+                                      (let [v (ra/aget x (+ base j))
+                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                        (recur (inc j) (if (> m a) m a)))
+                                      m))
+                             d (/ amax (float 127.0))
+                             id (if (== d (float 0.0)) (float 0.0) (/ (float 1.0) d))]
+                         (ra/aset xq i (word-q8-0 (+ base (* (rem i 8) 4)) id))))))))
 
 (def-q8-0-quantizer)
 
 (defmacro ^:private def-q8-K-quantizer []
-  (let [words (for [w (range 4)]
-                (word-form (list '+ (list '* 'b 64) (list '* 'g 4) w)
-                           (for [k (range 4)]
-                             (list '* 'iscale (list 'ra/aget 'x (list '+ 'gbase (+ (* 4 w) k)))))
-                           #(list 'min 127 (list 'long (list 'rint %)))))]
-    (exact-forms
-     (list 'deftm 'quant-act-q8-K-rows!
-           "quantize_row_q8_K_ref over rows of floats whose width is a multiple of 256: one
-  work-item per 16-element group writes four code words (element order) and the
-  group's code sum; group 0 of each block also writes the float scale 1/iscale,
-  with iscale = -127/max and max the first element of largest magnitude."
-           '[x :- (Array float), xq :- (Array int), xd :- (Array float), xbs :- (Array int),
-             ngroups :- Long]
-           :- 'Void
-           (list 'par/map-void! 'bg 'ngroups
-                 (concat
-                  (list 'let '[b (quot bg 16)
-                               g (rem bg 16)
-                               base (* b 256)
-                               gbase (+ base (* g 16))
-                               amax (loop [j 0 m (float 0.0)]
-                                      (if (< j 256)
-                                        (let [v (ra/aget x (+ base j))
-                                              a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                          (recur (inc j) (if (> m a) m a)))
-                                        m))
-                               ;; ggml keeps the first element of largest magnitude
-                               first-max (loop [j 0 found -1]
-                                           (if (< j 256)
-                                             (let [v (ra/aget x (+ base j))
-                                                   a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                               (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
-                                             found))
-                               mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
-                               iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))
-                               sum (loop [j 0 s 0]
-                                     (if (< j 16)
-                                       (let [p (* iscale (ra/aget x (+ gbase j)))]
-                                         (recur (inc j) (+ s (min 127 (long (rint p))))))
-                                       s))]
-                        '(ra/aset xbs bg (int sum))
-                        '(when (== g 0)
-                           (ra/aset xd b (if (== amax (float 0.0)) (float 0.0) (/ (float 1.0) iscale)))))
-                  words))))))
+  (exact-forms
+   '(deftm quant-act-q8-K-rows!
+      "quantize_row_q8_K_ref over rows whose width is a multiple of 256: each block's
+      float scale 1/iscale with iscale = -127/max (max the first element of largest
+      magnitude), 64 code words per block in element order, and the code sum of
+      each 16 elements."
+      [x :- (Array float), xq :- (Array int), xd :- (Array float), xbs :- (Array int),
+       nblocks :- Long] :- Void
+      (do
+        (par/map-void! b nblocks
+                       (let [base (* b 256)
+                             amax (loop [j 0 m (float 0.0)]
+                                    (if (< j 256)
+                                      (let [v (ra/aget x (+ base j))
+                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                        (recur (inc j) (if (> m a) m a)))
+                                      m))
+                             first-max (loop [j 0 found -1]
+                                         (if (< j 256)
+                                           (let [v (ra/aget x (+ base j))
+                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
+                                           found))
+                             mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
+                             iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))]
+                         (ra/aset xd b (if (== amax (float 0.0)) (float 0.0) (/ (float 1.0) iscale)))))
+        (par/map-void! i (* nblocks 64)
+                       (let [base (* (quot i 64) 256)
+                             amax (loop [j 0 m (float 0.0)]
+                                    (if (< j 256)
+                                      (let [v (ra/aget x (+ base j))
+                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                        (recur (inc j) (if (> m a) m a)))
+                                      m))
+                             first-max (loop [j 0 found -1]
+                                         (if (< j 256)
+                                           (let [v (ra/aget x (+ base j))
+                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
+                                           found))
+                             mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
+                             iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))]
+                         (ra/aset xq i (word-q8-K (+ base (* (rem i 64) 4)) iscale))))
+        (par/map-void! g (* nblocks 16)
+                       (let [base (* (quot g 16) 256)
+                             gbase (+ base (* (rem g 16) 16))
+                             amax (loop [j 0 m (float 0.0)]
+                                    (if (< j 256)
+                                      (let [v (ra/aget x (+ base j))
+                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                        (recur (inc j) (if (> m a) m a)))
+                                      m))
+                             first-max (loop [j 0 found -1]
+                                         (if (< j 256)
+                                           (let [v (ra/aget x (+ base j))
+                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
+                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
+                                           found))
+                             mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
+                             iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))
+                             sum (loop [j 0 s 0]
+                                   (if (< j 16)
+                                     (let [p (* iscale (ra/aget x (+ gbase j)))
+                                           v (long (rint p))]
+                                       (recur (inc j) (+ s (if (> v 127) 127 v))))
+                                     s))]
+                         (ra/aset xbs g (int sum))))))))
 
 (def-q8-K-quantizer)
