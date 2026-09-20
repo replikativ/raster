@@ -26,6 +26,9 @@
     (recur (second expression))
     expression))
 
+(defn- record-name [value]
+  (some-> value class .getSimpleName))
+
 (defn monomial
   "Normalize an extent expression to `{:const n :factors [sym …]}` (factors sorted, repeated
    for powers), or nil when the expression is not a product of non-negative factors.
@@ -34,8 +37,20 @@
    factors. This is the exact empty-nonpositive-domain spelling produced while flattening Clojure
    `dotimes` nests: an executing work item proves that every guarded dimension is positive."
   [expression]
-  (let [expression (strip-cast expression)]
+  (let [expression (strip-cast expression)
+        record (record-name expression)]
     (cond
+      (= "RuntimeValue" record) (monomial (:value expression))
+      (= "IndexCast" record) (monomial (:argument expression))
+      (= "Product" record)
+      (reduce (fn [product operand]
+                (when-let [m (monomial operand)]
+                  (when product
+                    {:const (* (:const product) (:const m))
+                     :factors (vec (sort (concat (:factors product) (:factors m))))})))
+              {:const 1 :factors []}
+              (:factors expression))
+
       (integer? expression) (when (<= 0 expression) {:const (long expression) :factors []})
       (symbol? expression) {:const 1 :factors [expression]}
       (and (seq? expression) (contains? '#{* clojure.core/*} (first expression)))

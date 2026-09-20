@@ -1,7 +1,8 @@
 (ns raster.compiler.ir.index-algebra-test
   "Injectivity facts over mixed-radix index forms: what the frontend may certify as `:unique`."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.ir.index-algebra :as ia]))
+            [raster.compiler.ir.index-algebra :as ia]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (def ^:private rope-locals
   ;; the map extent `batch·seq-len·heads·hdim2` is an exact multiple of every divisor below
@@ -21,6 +22,15 @@
     (is (ia/dominates? (ia/monomial 'head-dim) (ia/monomial 'hdim2)
                        [{:factor 'hdim2 :times {:const 2 :factors []}
                          :le {:const 1 :factors ['head-dim]}}]))))
+
+(deftest launch-storage-products-share-the-index-monomial-algebra
+  (let [extent (launch/product (launch/runtime-value 'rows)
+                               (launch/runtime-value 'columns))
+        locals '[{:id row :init (quot index columns)}
+                 {:id column :init (rem index columns)}]
+        form (ia/index-form '(+ (* row columns) column) 'index extent locals {})]
+    (is (= {:const 1 :factors '[columns rows]} (ia/monomial extent)))
+    (is (ia/injective? form))))
 
 (deftest empty-nonpositive-rectangular-domains-retain-their-product
   (is (= {:const 1 :factors '[columns rows]}
