@@ -83,6 +83,28 @@
                  (cycle (range out)))
            (mapv #(Float/floatToRawIntBits %) y)))))
 
+(deftest q4-k-product-semantics-remain-bit-identical
+  (let [in 256 out 3 nrows 2
+        wfloats (values (* out in) 35 0.05)
+        xfloats (values (* nrows in) 36 1.5)
+        wblocks (ggml/quantize :q4_K wfloats in out)
+        xblocks (ggml/quantize :q8_K xfloats in nrows)
+        wl (ggml/kernel-layout :q4_K wblocks in out)
+        xl (ggml/kernel-layout :q8_K xblocks in nrows)
+        y (float-array (* nrows out))
+        wrow (ggml/row-bytes :q4_K in)
+        xrow (ggml/row-bytes :q8_K in)]
+    (gk/qdot-q4-K-product-rows! (:q xl) (:d xl) (:bsums xl)
+                                (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
+                                y in out nrows)
+    (is (= (mapv (fn [row o]
+                   (Float/floatToRawIntBits
+                    (float (ggml/vec-dot :q4_K (row-bytes wblocks o wrow)
+                                         (row-bytes xblocks row xrow) in))))
+                 (mapcat #(repeat out %) (range nrows))
+                 (cycle (range out)))
+           (mapv #(Float/floatToRawIntBits %) y)))))
+
 (deftest q6-k-product-subgroup-executes-bit-identically-through-equation-first
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "equation-first Q6_K subgroup product")
@@ -107,6 +129,44 @@
                      output
                      (long in) (long out) (long nrows)]
           compilation (equation-first/compile #'gk/qdot-q6-K-product-rows!
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          output-node (some (fn [[id node]]
+                              (when (identical? output (:source node)) id))
+                            (:nodes plan))]
+      (is (= :subgroup-product-ordered-consumer
+             (get-in compilation [:kernels 0 :attributes :kernel-body :schedule :strategy])))
+      (with-open [live (gpu-link/instantiate! plan)]
+        (gpu-link/run! live)
+        (is (= expected
+               (mapv #(Float/floatToRawIntBits %)
+                     (gpu-link/download live output-node))))))))
+
+(deftest q4-k-product-subgroup-executes-bit-identically-through-equation-first
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "equation-first Q4_K subgroup product")
+    (let [in 256 out 3 nrows 2
+          wfloats (values (* out in) 43 0.05)
+          xfloats (values (* nrows in) 44 1.5)
+          wblocks (ggml/quantize :q4_K wfloats in out)
+          xblocks (ggml/quantize :q8_K xfloats in nrows)
+          wl (ggml/kernel-layout :q4_K wblocks in out)
+          xl (ggml/kernel-layout :q8_K xblocks in nrows)
+          output (float-array (* nrows out))
+          wrow (ggml/row-bytes :q4_K in)
+          xrow (ggml/row-bytes :q8_K in)
+          expected (mapv (fn [row o]
+                           (Float/floatToRawIntBits
+                            (float (ggml/vec-dot
+                                    :q4_K (row-bytes wblocks o wrow)
+                                    (row-bytes xblocks row xrow) in))))
+                         (mapcat #(repeat out %) (range nrows))
+                         (cycle (range out)))
+          arguments [(:q xl) (:d xl) (:bsums xl)
+                     (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
+                     output
+                     (long in) (long out) (long nrows)]
+          compilation (equation-first/compile #'gk/qdot-q4-K-product-rows!
                                               {:target :ze:0 :dtype :float})
           plan (equation-first/lower compilation arguments)
           output-node (some (fn [[id node]]

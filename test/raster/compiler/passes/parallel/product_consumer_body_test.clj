@@ -11,6 +11,11 @@
     (:kernel-body
      (candidate/from-program program (#'fixtures/numerical-equations program)))))
 
+(defn- pair-candidate-body []
+  (let [program (#'fixtures/scheduled-product-pair-consumer)]
+    (:kernel-body
+     (candidate/from-program program (#'fixtures/numerical-equations program)))))
+
 (defn- operation-kinds [kernel-body]
   (->> (:operations kernel-body)
        (tree-seq coll? seq)
@@ -43,3 +48,10 @@
           (is (every? #(str/includes? (:source module) %) marker))
           (is (not (str/includes? (:source module) "partials,"))
               "private scratch must not leak into the public ABI"))))))
+
+(deftest product-valued-workgroup-fallback-keeps-independent-typed-scratch
+  (let [kernel-body (pair-candidate-body)]
+    (is (identical? kernel-body (body/validate! kernel-body)))
+    (is (= '[left-partials right-partials] (mapv :id (:allocations kernel-body))))
+    (is (= [:int :int] (mapv :dtype (:allocations kernel-body))))
+    (is (= 64 (get-in kernel-body [:launch :shared-memory-bytes])))))

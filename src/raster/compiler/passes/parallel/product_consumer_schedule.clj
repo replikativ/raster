@@ -36,7 +36,7 @@
         width (when (and desc (= :gpu (:device-type desc))
                          (integer? reduced-width) (pos? reduced-width))
                 (subgroup-width desc reduced-width))
-        subgroup? (and (:subgroup-collective plan)
+        subgroup? (and (seq (:subgroup-collectives plan))
                        width
                        (integer? max-workgroup)
                        (<= width max-workgroup)
@@ -57,7 +57,7 @@
               :workgroup-size (:workgroup-size plan)
               :fallback-reason
               (cond
-                (nil? (:subgroup-collective plan)) :collective-contract-unavailable
+                (empty? (:subgroup-collectives plan)) :collective-contract-unavailable
                 (nil? desc) :hardware-descriptor-unavailable
                 (not= :gpu (:device-type desc)) :gpu-required
                 (nil? width) :subgroup-width-unavailable

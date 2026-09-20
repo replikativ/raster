@@ -134,11 +134,11 @@
     (walk [] (vec axes))))
 
 (defn- consumer-read-requirements
-  [intermediate fold prefix ordered consumer-prefix-binding consumer-locals]
+  [intermediates fold prefix ordered consumer-prefix-binding consumer-locals]
   (let [substitutions (address-substitutions fold prefix consumer-prefix-binding consumer-locals)
         axes (conj (vec prefix) ordered)
         axis-names (set (map :name axes))
-        loads (remove #(= intermediate (descriptor/aget-array-sym %))
+        loads (remove #(contains? intermediates (descriptor/aget-array-sym %))
                       (filter descriptor/aget-call? (tree-seq coll? seq fold)))]
     (reduce
      (fn [requirements load]
@@ -236,11 +236,11 @@
       width)))
 
 (defn- expanded-combine-result
-  [combine]
+  [combine result]
   (let [bindings (partition 2 (:bindings combine))]
     (reduce (fn [result [id init]]
               (util/subst-syms {id init} result))
-            (first (:results combine))
+            result
             (reverse bindings))))
 
 (defn- same-carrier-parameter
@@ -253,7 +253,7 @@
          (= parameter (second expression))) parameter
     :else nil))
 
-(defn- subgroup-collective-contract
+(defn- subgroup-collective-contracts
   "Prove the initial subgroup candidate's exact scalar monoid spelling.
 
    Product-tree legality alone permits an arbitrary certified combine region. A hardware
@@ -263,34 +263,38 @@
   [operator]
   (let [components (:components operator)
         combine (:combine operator)]
-    (when (= 1 (count components))
-      (let [{:keys [dtype neutral]} (first components)
-            dtype (dtype/canon dtype)
-            [left right] (first (:parameters combine))
-            result (expanded-combine-result combine)
-            source-op (descriptor/semantic-op result)
-            op (intrinsics/canonical source-op)
-            args (vec (descriptor/call-args result))
-            carrier-args (mapv (fn [argument]
-                                 (or (same-carrier-parameter argument left dtype)
-                                     (same-carrier-parameter argument right dtype)))
-                               args)
-            identity (when op (descriptor/typed-reduce-identity source-op dtype))
-            overflow (intrinsics/source-overflow-policy source-op)]
-        (when (and (= :+ op)
-                   (contains? #{:byte :int :long} dtype)
-                   (= 2 (count carrier-args))
-                   (= #{left right} (set carrier-args))
-                   (= :wrap overflow)
-                   (= :wrap (get-in operator [:algebra :overflow]))
-                   identity
-                   (constant/equivalent? neutral identity))
-          {:operator op
-           :dtype dtype
-           :neutral (:value (constant/value neutral))
-           :arithmetic {:overflow :wrap}
-           :association :implementation-defined
-           :source-operation source-op})))))
+    (let [contracts
+          (mapv
+           (fn [ordinal {:keys [dtype neutral]}]
+             (let [[left right] (nth (:parameters combine) ordinal)
+                   result (expanded-combine-result combine (nth (:results combine) ordinal))
+                   dtype (dtype/canon dtype)
+                   source-op (descriptor/semantic-op result)
+                   op (intrinsics/canonical source-op)
+                   args (vec (descriptor/call-args result))
+                   carrier-args (mapv (fn [argument]
+                                        (or (same-carrier-parameter argument left dtype)
+                                            (same-carrier-parameter argument right dtype)))
+                                      args)
+                   identity (when op (descriptor/typed-reduce-identity source-op dtype))
+                   overflow (intrinsics/source-overflow-policy source-op)]
+               (when (and (= :+ op)
+                          (contains? #{:byte :int :long} dtype)
+                          (= 2 (count carrier-args))
+                          (= #{left right} (set carrier-args))
+                          (= :wrap overflow)
+                          (= :wrap (get-in operator [:algebra :overflow]))
+                          identity
+                          (constant/equivalent? neutral identity))
+                 {:component ordinal
+                  :operator op
+                  :dtype dtype
+                  :neutral (:value (constant/value neutral))
+                  :arithmetic {:overflow :wrap}
+                  :association :implementation-defined
+                  :source-operation source-op})))
+           (range) components)]
+      (when (every? some? contracts) contracts))))
 
 (defn analyze
   "Derive a target-neutral schedule plan for two numerical producer/consumer equations.
@@ -320,6 +324,7 @@
                       "product-consumer region requires SegRed followed by SegMap"
                       {:operations (mapv record-name operations)}))
         operator (reduction/validate! (:reduction producer))
+        components (:components operator)
         _ (try
             (reduction/validate-product-tree! operator (:schedule producer))
             (catch clojure.lang.ExceptionInfo exception
@@ -329,18 +334,25 @@
                           "product consumer requires an admitted segmented workgroup tree"
                           {:strategy (get-in producer [:schedule :strategy])})
                 (throw exception))))
+        component-results (mapv :result components)
+        _ (when-not (and (every? symbol? component-results)
+                         (= (count component-results) (count (distinct component-results))))
+            (decline! :private-intermediate
+                      "fused product components require distinct materialized results"
+                      {:component-results component-results}))
         intermediate-set (set/intersection (:outputs producer) (:inputs consumer))
-        _ (when-not (and (= 1 (count intermediate-set))
-                         (= intermediate-set (:outputs producer)))
+        intermediates component-results
+        _ (when-not (= (set intermediates) intermediate-set (:outputs producer))
             (decline! :private-intermediate
-                      "producer results must form one private consumer intermediate"
+                      "producer results must form an ordered private consumer product"
                       {:producer-outputs (:outputs producer)
-                       :consumer-inputs (:inputs consumer)}))
-        intermediate (first intermediate-set)
-        _ (when-not (some #(= intermediate (:id %)) (:temporaries graph))
+                       :consumer-inputs (:inputs consumer)
+                       :component-results component-results}))
+        private-temporaries (set (map :id (:temporaries graph)))
+        _ (when-not (every? private-temporaries intermediates)
             (decline! :private-intermediate
-                      "product intermediate must be private to the exact source graph"
-                      {:intermediate intermediate
+                      "product intermediates must be private to the exact source graph"
+                      {:intermediates intermediates
                        :temporaries (mapv :id (:temporaries graph))}))
         folds (ordered-folds (:scalar-region consumer))
         _ (when-not (= 1 (count folds))
@@ -354,13 +366,21 @@
             (decline! :ordered-consumer-fold
                       "consumer product Fold must retain source order"
                       {:attributes fold-attributes}))
-        fold-loads (loads-of intermediate fold)
-        outside-loads (loads-of intermediate (without-product-folds (:scalar-region consumer)))
-        _ (when (or (empty? fold-loads) (seq outside-loads))
+        fold-loads (into {} (map (fn [intermediate]
+                                   [intermediate (loads-of intermediate fold)]))
+                         intermediates)
+        outside-loads (into {} (map (fn [intermediate]
+                                      [intermediate
+                                       (loads-of intermediate
+                                                 (without-product-folds
+                                                  (:scalar-region consumer)))])
+                                    intermediates))
+        _ (when (or (some (comp empty? val) fold-loads)
+                    (some (comp seq val) outside-loads))
             (decline! :intermediate-use
-                      "the private product result may be read only by the ordered consumer Fold"
-                      {:fold-load-count (count fold-loads)
-                       :outside-load-count (count outside-loads)}))
+                      "private product results may be read only by the ordered consumer Fold"
+                      {:fold-load-counts (update-vals fold-loads count)
+                       :outside-load-counts (update-vals outside-loads count)}))
         segments (segop/seg-space-segment-dims (:space producer))
         reduced (segop/seg-space-reduced-dim (:space producer))
         ordered-index (:index fold-attributes)
@@ -385,15 +405,21 @@
         prefix-binding (prefix-axis-binding consumer prefix derived-scalars)
         consumer-locals (get-in consumer [:scalar-region :locals])
         intermediate-offsets
-        (intermediate-load-offsets intermediate fold prefix ordered local
-                                   (:consumer-digits prefix-binding) consumer-locals)
+        (vec
+         (mapcat
+          (fn [component intermediate]
+            (map #(assoc % :component component :intermediate intermediate)
+                 (intermediate-load-offsets intermediate fold prefix ordered local
+                                            (:consumer-digits prefix-binding)
+                                            consumer-locals)))
+          (range) intermediates))
         consumer-requirements
-        (consumer-read-requirements intermediate fold prefix ordered
+        (consumer-read-requirements (set intermediates) fold prefix ordered
                                     (:consumer-digits prefix-binding) consumer-locals)
         cooperative-width (static-cooperative-width local reduced)
         integral-components? (every? #(contains? #{:byte :short :int :long}
                                                    (dtype/canon (:dtype %)))
-                                     (:components operator))
+                                     components)
         _ (when-not integral-components?
             (decline! :inner-exactness
                       "the initial fused schedule requires exact integral inner components"
@@ -403,7 +429,8 @@
      :equations (mapv :id equations)
      :producer producer
      :consumer consumer
-     :intermediate intermediate
+     :intermediate (when (= 1 (count intermediates)) (first intermediates))
+     :intermediates intermediates
      :intermediate-loads intermediate-offsets
      :consumer-read-requirements consumer-requirements
      :axes {:prefix prefix
@@ -412,7 +439,9 @@
             :local local
             :reduced reduced}
      :workgroup-size cooperative-width
-     :subgroup-collective (subgroup-collective-contract operator)
+     :subgroup-collectives (subgroup-collective-contracts operator)
+     :subgroup-collective (when (= 1 (count components))
+                            (first (subgroup-collective-contracts operator)))
      :numerics {:inner {:association :implementation-defined
                         :dtypes (mapv :dtype (:components operator))
                         :overflow (get-in operator [:algebra :overflow])}
