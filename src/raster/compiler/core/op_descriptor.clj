@@ -459,6 +459,8 @@
     'clojure.core/inc 'clojure.core/dec
     'clojure.core/unchecked-add 'clojure.core/unchecked-subtract
     'clojure.core/unchecked-multiply 'clojure.core/unchecked-negate
+    'clojure.core/unchecked-add-int 'clojure.core/unchecked-subtract-int
+    'clojure.core/unchecked-multiply-int 'clojure.core/unchecked-negate-int
     'clojure.core/unchecked-inc 'clojure.core/unchecked-dec
     'clojure.core/max 'clojure.core/min
     'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//
@@ -964,6 +966,17 @@
                       (symbol "raster.numeric" (name base))]
                (contains? #{'min 'max} base) (conj (symbol "Math" (name base))))]
   (register-algebra! v algebra))
+
+;; JVM-width unchecked addition and multiplication are integral monoids: modulo-2^N arithmetic is
+;; exactly associative and commutative. Checked `+`/`*` retain distinct trapping source semantics;
+;; a schedule that needs to reassociate them must therefore ask for one of these spellings (or
+;; carry a separately proven no-overflow range contract).
+(doseq [op '[unchecked-add unchecked-add-int
+             clojure.core/unchecked-add clojure.core/unchecked-add-int]]
+  (register-algebra! op {:associative? true :commutative? true :identity 0}))
+(doseq [op '[unchecked-multiply unchecked-multiply-int
+             clojure.core/unchecked-multiply clojure.core/unchecked-multiply-int]]
+  (register-algebra! op {:associative? true :commutative? true :identity 1}))
 
 (defn typed-reduce-identity
   "The identity element for a reduction op, TYPED for the element dtype — the

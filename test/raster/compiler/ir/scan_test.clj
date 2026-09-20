@@ -45,6 +45,19 @@
                         :lambda '(+ acc (aget values i))}
                        :float)))))
 
+(deftest wrapping-integral-arithmetic-is-an-explicit-monoid
+  (doseq [[combine identity]
+          [['unchecked-add 0] ['unchecked-add-int 0]
+           ['clojure.core/unchecked-add 0] ['clojure.core/unchecked-add-int 0]
+           ['unchecked-multiply 1] ['unchecked-multiply-int 1]
+           ['clojure.core/unchecked-multiply 1]
+           ['clojure.core/unchecked-multiply-int 1]]]
+    (let [certificate (scan/certify-reassociation
+                       {:acc 'acc :init identity :lambda (list combine 'acc 'element)} :int)]
+      (is (scan/associative-scan? certificate))
+      (is (= combine (:combine certificate)))
+      (is (= identity (:identity certificate))))))
+
 (deftest integral-min-max-use-the-exact-bounded-domain-identities
   (is (= Integer/MAX_VALUE (descriptor/typed-reduce-identity 'min :int)))
   (is (= Integer/MIN_VALUE (descriptor/typed-reduce-identity 'max :int)))
