@@ -274,6 +274,40 @@
      :array-types {'values :float 'out :float}
      :scalar-types {'nsegments :int 'width :int})))
 
+(defn- cooperative-segmented-fold-map-artifact
+  [dialect]
+  (let [source
+        '(let* [effect
+                (raster.par/segmented-fold-map!
+                 [out] [[row rows]] index width
+                 [[sum 0.0 :float width
+                   (clojure.core/+
+                    sum
+                    (clojure.core/aget
+                     values (clojure.core/+ (clojure.core/* row width) index)))
+                   {:association :implementation-defined}]]
+                 [(clojure.core/float
+                   (clojure.core/*
+                    sum
+                    (clojure.core/aget
+                     values (clojure.core/+ (clojure.core/* row width) index))))])]
+               effect)
+        program (:program
+                 (typed-route/attempt
+                  source :float {'values :float 'out :float}
+                  {:scalar-types {'rows :long 'width :long}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'values :float 'out :float}
+                             :scalar-types {'rows :long 'width :long}}))
+        operation (first (:operations (first (:equations scheduled))))]
+    (segop-emit/generate-segfoldmap-kernel
+     operation :target-dialect dialect
+     :kernel-name-prefix "cooperative_segmented_fold_map"
+     :array-types {'values :float 'out :float}
+     :scalar-types {'rows :long 'width :long})))
+
 (defn- problem []
   (attention/make
    {:id :c-family-compile-gate
@@ -480,6 +514,8 @@
                             (mixed-contraction-artifact dialect descriptor))
            (write-artifact! directory suffix "segmented-fold-map"
                             (segmented-fold-map-artifact dialect))
+           (write-artifact! directory suffix "cooperative-segmented-fold-map"
+                            (cooperative-segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
            (write-source! directory suffix "layout-cast"

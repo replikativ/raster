@@ -1518,3 +1518,15 @@ region. Host projection keeps the request but preserves sequential interpretatio
 and ordinary loop recurrences are unchanged. The next schedule may therefore assign a workgroup to
 one segment and parallelize only certified reduction axes without recognizing normalization or
 another library operation.
+
+The first such schedule is now implemented for a single certified additive or multiplicative
+fold. One workgroup owns a segment, lanes traverse the fold axis with a strided private partial,
+and a workgroup-memory tree combines those partials before lanes traverse the dense result map.
+KernelBody owns the allocation, barriers, scalar SSA and launch geometry, so the identical body
+emits through OpenCL, CUDA and HIP. Unsupported fold shapes decline rather than silently becoming
+cooperative. The full compiler uses the generic executable ABI for this schedule: unlike the old
+map marker, it does not invent one distinguished element-count scalar and therefore preserves the
+compiler-selected one-group-per-segment `LaunchSpec`. A public Intel OpenCL device test covers
+non-power-of-two and greater-than-workgroup extents; nvcc and hipcc compile the same emitted body in
+the hardware-free fixture gate. RMSNorm and quantized dots remain workload acceptance steps, not
+special cases in this lowering.

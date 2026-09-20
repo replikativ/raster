@@ -623,6 +623,31 @@
             (swap! kernels conj k)
             k))
 
+        emit-artifact-executable!
+        (fn [kernel stat-key result-policy]
+          ;; KernelArtifact launch geometry is part of the executable.  The older map-void marker
+          ;; has one distinguished scalar `n` and reconstructs ceil(n/workgroup-size); cooperative
+          ;; schedules generally have no such scalar (for SegFoldMap the launch is one group per
+          ;; segment).  Put these artifacts through the same generic executable boundary used by
+          ;; graphs and dispatchable contractions so staging and resident replay consume the exact
+          ;; ABI and LaunchSpec selected by scheduling.
+          (let [strategy (or (get-in kernel [:attributes :strategy])
+                             (get-in kernel [:attributes :kernel-body :schedule :strategy])
+                             :scheduled-artifact)
+                artifact (register-kernel! (assoc-in kernel [:attributes :strategy] strategy)
+                                            stat-key)
+                dispatch (kdispatch/make
+                          {:id (str "scheduled-artifact-"
+                                    (Integer/toUnsignedString (hash artifact) 16))
+                           :alternatives [artifact]
+                           :default-strategy strategy
+                           :selector {:kind :fixed-strategy :strategy strategy}
+                           :provenance {:pass :opencl :source-dialect :kernel-body}
+                           :attributes {:operation-family :scheduled-artifact}})]
+            (swap! dispatches conj dispatch)
+            (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                  device-id (:id dispatch) (vec (:arguments artifact)) result-policy)))
+
         emit-nested-map!
         (fn [form]
           ;; Raw host control flow can contain an indexed, RNG or effect map without a surrounding
@@ -938,13 +963,13 @@
                                 stats :segfoldmap
                                 #(and (instance? raster.compiler.ir.segop.SegFoldMap %)
                                       (= :typed-soac (:algorithm-dialect %))))]
-              (let [kernel (segop-cl/generate-segfoldmap-kernel
-                            scheduled
-                            :workgroup-size (or (get-in scheduled [:grid :block-size]) 256)
-                            :scalar-types top-scalar-types
-                            :array-types top-array-types)
-                    k (register-kernel! kernel :ze-maps)]
-                (emit-map-void-invocation k device-id))
+              (emit-artifact-executable!
+               (segop-cl/generate-segfoldmap-kernel
+                scheduled
+                :workgroup-size (or (get-in scheduled [:grid :block-size]) 256)
+                :scalar-types top-scalar-types
+                :array-types top-array-types)
+               :ze-maps :none)
               (throw (ex-info "GPU fold-map source has no verified TypedSOAC schedule"
                               {:reason :unscheduled-segmented-fold-map
                                :target-dialect :opencl :form form})))

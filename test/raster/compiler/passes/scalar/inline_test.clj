@@ -155,6 +155,22 @@
                       (tree-seq coll? seq inlined)))
         (is (= 5 (eval inlined)))))))
 
+(deftest late-dispatch-resolution-preserves-segmented-fold-schedule-requests
+  (let [request {:association :implementation-defined}
+        source
+        `(let* [effect
+                (raster.par/segmented-fold-map!
+                 [out] [[row rows]] index width
+                 [[sum 0.0 :float width
+                   (clojure.core/+ sum (clojure.core/aget values index))
+                   ~request]]
+                 [(clojure.core/float sum)])]
+           effect)
+        resolved (inline/resolve-generic-deftm-calls source)
+        fold (-> resolved second second (nth 5) first)]
+    (is (= 6 (count fold)))
+    (is (= request (nth fold 5)))))
+
 ;; Monomorphic callee taking THREE args (mirrors the concrete-float finetune.train/gblock,
 ;; which takes 38 and was called with 37).
 (deftm arity-callee

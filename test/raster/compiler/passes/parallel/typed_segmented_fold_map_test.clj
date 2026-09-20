@@ -78,6 +78,17 @@
                              :scalar-types {'nsegments :int 'width :int}}))]
     (first (:operations (first (:equations scheduled))))))
 
+(defn- certified-operation []
+  (let [program (:program
+                 (route/attempt certified-source :float {'values :float 'out :float}
+                                {:scalar-types {'rows :long 'width :long}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'values :float 'out :float}
+                             :scalar-types {'rows :long 'width :long}}))]
+    (first (:operations (first (:equations scheduled))))))
+
 (defn- decline-rule
   [thunk]
   (try
@@ -178,6 +189,61 @@
             #(frontend/form->program
               invalid {:dtype :float :array-types {'values :float 'out :float}
                        :scalar-types {'rows :long 'width :long}}))))))
+
+(deftest certified-fold-map-selects-one-workgroup-per-segment
+  (let [operation (certified-operation)
+        options {:array-types {'values :float 'out :float}
+                 :scalar-types {'rows :long 'width :long}}
+        {:keys [kernel-body workgroup-size]} (fold-body/lower operation options)
+        scheduled (fold-body/schedule operation options)
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (operation-tree (:operations kernel-body)))
+        barriers (filter #(instance? raster.compiler.ir.kernel_body.WorkgroupBarrier %)
+                         (operation-tree (:operations kernel-body)))]
+    (is (= :one-workgroup-per-segment (get-in kernel-body [:schedule :strategy])))
+    (is (= :certified (get-in kernel-body [:schedule :association])))
+    (is (= [workgroup-size] (get-in kernel-body [:launch :workgroup-size])))
+    (is (= [(launch/runtime-value 'rows)]
+           (get-in kernel-body [:launch :group-count])))
+    (is (= (* workgroup-size 4)
+           (get-in kernel-body [:launch :shared-memory-bytes])))
+    (is (= [:cooperative-lane-fold :cooperative-final-map]
+           (mapv #(get-in % [:attributes :role]) loops)))
+    (is (= workgroup-size (:step (first loops))))
+    (is (= workgroup-size (:step (second loops))))
+    (is (= (+ 2 (Long/numberOfTrailingZeros (long workgroup-size)))
+           (count barriers))
+        "the tree has one barrier per level plus publication and post-result reuse")
+    (is (= :one-workgroup-per-segment
+           (get-in scheduled [:legality :segment-parallelism])))
+    (is (= :certified-workgroup-tree (get-in scheduled [:numerics :policy])))
+    (is (= :implementation-defined (get-in scheduled [:numerics :reassociation])))))
+
+(deftest one-cooperative-body-emits-for-all-c-family-targets
+  (let [operation (certified-operation)]
+    (doseq [[target expected]
+            [[:opencl-portable :opencl-c]
+             [:cuda :cuda-c]
+             [:hip :hip-cpp]]]
+      (testing (name target)
+        (let [artifact (segop-opencl/generate-segfoldmap-kernel
+                        operation :target-dialect target
+                        :array-types {'values :float 'out :float}
+                        :scalar-types {'rows :long 'width :long})]
+          (is (= expected (:target artifact)))
+          (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+          (is (= :one-workgroup-per-segment
+                 (get-in artifact [:attributes :kernel-body :schedule :strategy])))
+          (is (str/includes? (:source artifact) "foldmap_workgroup_scratch")))))))
+
+(deftest cooperative-fold-map-rejects-a-non-tree-workgroup
+  (is (= :workgroup-size
+         (decline-rule
+          #(fold-body/lower
+            (certified-operation)
+            {:workgroup-size 192
+             :array-types {'values :float 'out :float}
+             :scalar-types {'rows :long 'width :long}})))))
 
 (deftest portable-schedule-is-a-capped-grid-stride-loop-over-three-ordered-loops
   (let [operation (scheduled-operation)
