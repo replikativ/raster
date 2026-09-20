@@ -164,16 +164,38 @@
   [parallel-program equations]
   (let [all-equations (:equations parallel-program)
         positions (into {} (map-indexed (fn [index equation] [(:id equation) index]) all-equations))
-        indices (mapv #(get positions (:id %)) equations)]
+        indices (mapv #(get positions (:id %)) equations)
+        first-index (first indices)
+        last-index (last indices)
+        span (when (and first-index last-index)
+               (subvec all-equations first-index (inc last-index)))
+        numerical (filterv #(not (true? (get-in % [:attributes :host-only]))) span)
+        host-gap (filterv #(true? (get-in % [:attributes :host-only])) span)
+        available-before (into (set (:inputs parallel-program))
+                               (mapcat :results)
+                               (subvec all-equations 0 (or first-index 0)))
+        hoistable?
+        (when (= numerical equations)
+          (:ok
+           (reduce (fn [{:keys [available] :as state} equation]
+                     (if (and (:ok state)
+                              (empty? (:effects equation))
+                              (set/subset? (set (:operands equation)) available))
+                       (-> state
+                           (update :available into (:results equation)))
+                       (assoc state :ok false)))
+                   {:ok true :available available-before}
+                   host-gap)))]
     (when-not (and (seq equations)
                    (every? some? indices)
-                   (= indices (vec (range (first indices) (inc (last indices)))))
-                   (= equations (mapv #(nth all-equations %) indices))
-                   (every? (comp not true? #(get-in % [:attributes :host-only])) equations))
+                   (or (= 1 (count indices)) (apply < indices))
+                   (= equations numerical)
+                   hoistable?)
       (fail! :scheduled-equation-region
-             "a scheduled equation region must be an exact non-empty contiguous numerical slice"
-             {:equations (mapv :id equations) :indices indices}))
-    indices))
+             "a scheduled equation region must be an exact numerical slice with only hoistable scalar gaps"
+             {:equations (mapv :id equations) :indices indices
+              :span (mapv :id span) :host-gap (mapv :id host-gap)}))
+    {:indices indices :host-gap host-gap}))
 
 (defn- region-outputs
   [parallel-program equations indices]
@@ -196,12 +218,12 @@
   [parallel-program equations]
   (let [parallel-program (program/validate! parallel-program)
         equations (vec equations)
-        indices (contiguous-equation-region! parallel-program equations)
+        {:keys [indices host-gap]} (contiguous-equation-region! parallel-program equations)
         first-index (first indices)
         preceding (subvec (:equations parallel-program) 0 first-index)
         scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
         outputs (region-outputs parallel-program equations indices)
-        body-equations (into scalar-prefix equations)]
+        body-equations (vec (concat scalar-prefix host-gap equations))]
     (program/make
      {:dialect :segop
       :source nil
@@ -521,7 +543,7 @@
   [parallel-program equations]
   (let [parallel-program (program/validate! parallel-program)
         equations (vec equations)
-        indices (contiguous-equation-region! parallel-program equations)
+        {:keys [indices]} (contiguous-equation-region! parallel-program equations)
         algorithms (mapv (comp soac/validate! :algorithm) equations)
         equation-forms (vec (mapcat soac/equations algorithms))
         equation-facts (apply merge (map (comp :equations soac/facts) algorithms))

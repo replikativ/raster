@@ -17,11 +17,30 @@
                            (clojure.core/* (clojure.core/aget middle k) 2.0))]
      third-effect))
 
+(def ^:private scalar-gap-source
+  '(let* [first-effect
+          (raster.par/map! tmp i n float (clojure.core/aget x i))
+          ^{:raster.type/tag long} doubled
+          (clojure.core/* (clojure.core/long n) (clojure.core/long 2))
+          second-effect
+          (raster.par/map! out j n float
+                           (clojure.core/+ (clojure.core/aget tmp j)
+                                           (clojure.core/float doubled)))]
+     second-effect))
+
 (defn- scheduled-three-maps []
   (let [options {:dtype :float :target-device :ocl:0
                  :array-types {'x :float 'tmp :float 'middle :float 'out :float}
                  :scalar-types {'n :long}}
         typed (frontend/form->program three-map-source options)
+        envelope (route/program-envelope typed)]
+    (:form (segop-lower/segop-lower-pass envelope options))))
+
+(defn- scheduled-scalar-gap []
+  (let [options {:dtype :float :target-device :ocl:0
+                 :array-types {'x :float 'tmp :float 'out :float}
+                 :scalar-types {'n :long}}
+        typed (frontend/form->program scalar-gap-source options)
         envelope (route/program-envelope typed)]
     (:form (segop-lower/segop-lower-pass envelope options))))
 
@@ -53,3 +72,13 @@
                         scheduled [(first equations) (peek equations)]))))
     (is (= :scheduled-equation-region
            (reason-of #(equation-graph/make-for-equations scheduled []))))))
+
+(deftest pure-scalar-gap-is-hoisted-into-the-region-proof-prefix
+  (let [scheduled (scheduled-scalar-gap)
+        numerical (filterv (comp seq :operations) (:equations scheduled))
+        {:keys [body graph]} (equation-graph/make-for-equations scheduled numerical)]
+    (is (= 2 (count numerical)))
+    (is (= 3 (count (:equations body))))
+    (is (true? (get-in body [:equations 0 :attributes :host-only])))
+    (is (= (mapv :id numerical) (mapv :id (subvec (:equations body) 1))))
+    (is (= 2 (count (:nodes graph))))))
