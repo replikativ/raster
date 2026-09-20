@@ -16,6 +16,7 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.value :as value]))
@@ -747,13 +748,13 @@
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready."
   [executable]
   (let [executable (ensure-live! executable :profile!)]
-    (when (:prepared-program executable)
-      (throw (ex-info "equation-first program profiling requires an aggregate event schedule"
-                      {:reason :link-program-profile-unsupported})))
     (when (seq @(:pending-inputs executable))
       (throw (ex-info "linked executable has inputs or state that have not been initialized"
                       {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
-    (gpu/profile-recorded-graph! (:session executable) (:graph-key executable))))
+    (if-let [prepared (:prepared-program executable)]
+      (parallel-program/profile-prepared!
+       prepared #(gpu/profile-bound-kernel-graph! (:session executable) %))
+      (gpu/profile-recorded-graph! (:session executable) (:graph-key executable)))))
 
 (defn measure!
   "Measure a profiled LinkedExecutable with device events. Stateful plans require the explicit
@@ -763,17 +764,27 @@
         state-nodes (into #{} (keep (fn [[node-id node]]
                                       (when (= :state (:role node)) node-id)))
                           (get-in executable [:plan :nodes]))]
-    (when (:prepared-program executable)
-      (throw (ex-info "equation-first program measurement requires an aggregate event schedule"
-                      {:reason :link-program-measure-unsupported})))
     (when (seq @(:pending-inputs executable))
       (throw (ex-info "linked executable has inputs or state that have not been initialized"
                       {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
     (when (and (seq state-nodes) (nil? before-sample!))
       (throw (ex-info "stateful linked executables require :before-sample! restoration"
                       {:reason :link-stateful-measurement :state-nodes state-nodes})))
-    (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
-           (mapcat identity opts))))
+    (if-let [prepared (:prepared-program executable)]
+      (let [sample! (fn []
+                      (when before-sample! (before-sample!))
+                      (* 1.0e6
+                         (double
+                          (:device-wall-ms
+                           (parallel-program/profile-prepared!
+                            prepared
+                            #(gpu/profile-bound-kernel-graph! (:session executable) %))))))
+            measurement-options (-> opts
+                                    (dissoc :before-sample!)
+                                    (assoc :timing-source :device-event))]
+        (apply measurement/measure! sample! (mapcat identity measurement-options)))
+      (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
+             (mapcat identity opts)))))
 
 (defn download
   "Download one complete contiguous LinkNode view. Debug/host-boundary helper, not invocation."

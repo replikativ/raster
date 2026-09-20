@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
-            [raster.gpu.measurement :as measurement]))
+            [raster.gpu.measurement :as measurement]
+            [raster.gpu.parallel-program :as parallel-program]))
 
 (deftest summarizes-device-samples
   (let [m (measurement/summarize [100.0 200.0 300.0 400.0]
@@ -79,6 +80,39 @@
           :pending-inputs (atom #{}) :closed? (atom false)})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :before-sample!"
                           (link/measure! executable :budget-ms 1)))))
+
+(deftest equation-first-linked-programs-use-aggregate-device-events
+  (let [profiles (atom 0)
+        restores (atom 0)
+        executable
+        (link/map->LinkedExecutable
+         {:plan {:nodes {}}
+          :session :session
+          :prepared-program :prepared
+          :pending-inputs (atom #{})
+          :closed? (atom false)})]
+    (with-redefs [parallel-program/profile-prepared!
+                  (fn [prepared profile-handle!]
+                    (is (= :prepared prepared))
+                    (is (ifn? profile-handle!))
+                    (swap! profiles inc)
+                    {:profile [{:kernel-name "generated" :ms 0.001}]
+                     :kernel-total-ms 0.001
+                     :device-wall-ms 0.002
+                     :host-wall-ms 99.0
+                     :program-graph-count 1})
+                  measurement/measure!
+                  (fn [sample! & options]
+                    {:sample-ns (sample!) :options (apply hash-map options)})]
+      (is (= 0.002 (:device-wall-ms (link/profile! executable))))
+      (let [result (link/measure! executable
+                                  :before-sample! #(swap! restores inc)
+                                  :budget-ms 7)]
+        (is (= 2000.0 (:sample-ns result)))
+        (is (= :device-event (get-in result [:options :timing-source])))
+        (is (= 7 (get-in result [:options :budget-ms])))
+        (is (= 1 @restores)))
+      (is (= 2 @profiles)))))
 
 (deftest bound-graph-profile-preserves-device-span-and-kernel-breakdown
   (let [calls (atom []) session (atom {:device-id :probe})]
