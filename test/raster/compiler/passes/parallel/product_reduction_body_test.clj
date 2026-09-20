@@ -50,7 +50,7 @@
    :element-binding-types {'candidate :float}
    :combine-binding-types {'left-nan :int 'right-nan :int 'better :int}})
 
-(defn- typed-argmax-program [values & [scalar-types materialize-value? scale?]]
+(defn- typed-argmax-program [values & [scalar-types materialize-value? scale? reduce-bound]]
   (let [tag-bindings (fn [bindings dtypes]
                        (vec (mapcat (fn [[id init]]
                                       [(with-meta id {:raster.type/tag
@@ -59,6 +59,7 @@
         ;; Supply the facts normally attached by the walker; the frontend deliberately does not
         ;; infer types from these raw test S-expressions.
         form (-> (vec (argmax-form))
+                 (cond-> reduce-bound (assoc 5 reduce-bound))
                  (cond-> materialize-value? (assoc-in [1 0] 'maxima))
                  (cond-> scale? (update-in [6 1]
                                           #(with-meta (list '* 'alpha %) {:raster.type/tag 'float})))
@@ -71,6 +72,17 @@
                  {:dtype :float :array-types {'values :float 'indices :int 'maxima :float}
                   :values values :scalar-types (or scalar-types (:scalar-types options))})]
     program))
+
+(deftest static-product-extent-sizes-the-tree-without-idle-warps
+  (doseq [[bound expected] [[0 1] [1 1] [8 8] [9 16]]]
+    (let [segred (first (soac-lower/lower-typed-product-reduce
+                         (typed-argmax-program {} (:scalar-types options) false false bound)
+                         :cpu:0 :dtype :float))]
+      (is (= expected (get-in segred [:grid :block-size])))
+      (is (= expected (get-in segred [:schedule :workgroup-size])))
+      (is (= (* expected 8) (get-in segred [:grid :shared-mem-bytes])))
+      (is (= (filterv #(<= % expected) [1 2 4 8 16 32 64 128 256 512 1024])
+             (get-in segred [:schedule :tuning-space :workgroup-size]))))))
 
 (defn typed-argmax-segred
   ([] (typed-argmax-segred (:scalar-types options)))

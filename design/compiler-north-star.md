@@ -489,7 +489,10 @@ canonical `ProductReduction` used by scheduling rather than recovering either re
 The first portable `ReductionSchedule` maps a segmented product to
 strided lane folds, a fixed workgroup-local tree and segment stores. Its workgroup is constrained by
 the target thread limit and the sum of every component's local-memory width, while numerical mode
-and tuning candidates remain inspectable data. `argmax-rows!` therefore emits one mixed-type
+and tuning candidates remain inspectable data. When the reduction extent is static, the schedule
+also caps the group at the smallest covering power of two instead of launching idle warps; short
+quantized chunk products therefore retain the same algebra without inheriting a generic 1024-lane
+tree. `argmax-rows!` therefore emits one mixed-type
 `(value,index)` workgroup tree per row with no compiler-visible global scratch. The semantic ABI
 contains only values, output indices, row count and width; ties select the lowest index, and the first
 NaN outranks numeric values so corruption is visible and deterministic. Its public compile report
