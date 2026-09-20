@@ -1508,3 +1508,13 @@ emits one multi-carry `ForLoop`, while JVM projection binds the returned tuple o
 cover frontend validation, one-loop OpenCL/CUDA/HIP emission, JVM numerical execution, and rejection
 of changed exits and non-unit induction. This is general loop-language coverage, not a layer-norm
 operation rule; algebra certification and parallel schedules remain separate follow-ups.
+
+### 2026-09-20 — certified segmented fold-map association
+
+The general per-segment fold-then-dense-map algebra now carries association per fold. Source must
+explicitly request implementation-defined association; the frontend derives a typed monoid
+certificate and the validator checks the serialized certificate against the retained scalar
+region. Host projection keeps the request but preserves sequential interpretation. Ordered folds
+and ordinary loop recurrences are unchanged. The next schedule may therefore assign a workgroup to
+one segment and parallelize only certified reduction axes without recognizing normalization or
+another library operation.

@@ -315,7 +315,7 @@
                      ((:dtypes attributes) (first result-components))})))
 
 (defn segmented-fold-map-form
-  "Spell one validated ordered fold-map in Raster's interpreted host vocabulary."
+  "Spell one validated fold-map in Raster's interpreted host vocabulary."
   [program equation]
   (let [program (dialect/validate! program)
         [_ equation-id results] equation
@@ -336,9 +336,11 @@
         source-folds
         (mapv (fn [{:keys [attributes lambda]}]
                 (let [{:keys [body-results]} (dialect/lambda-parts lambda)]
-                  [(:accumulator attributes) (:identity attributes) (:dtype attributes)
-                   (:extent attributes)
-                   (util/subst-syms substitutions (first body-results))]))
+                  (cond-> [(:accumulator attributes) (:identity attributes)
+                           (:dtype attributes) (:extent attributes)
+                           (util/subst-syms substitutions (first body-results))]
+                    (= :implementation-defined (:association attributes))
+                    (conj {:association :implementation-defined}))))
               folds)
         form (list 'raster.par/segmented-fold-map!
                    physical-results (:segment-axes attributes)

@@ -469,7 +469,7 @@
        (contains? #{'raster.par/product-reduce! 'par/product-reduce!} (first form))))
 
 (defn par-segmented-fold-map-form?
-  "Check if a form is an ordered segmented fold followed by a dense map."
+  "Check if a form is a segmented fold followed by a dense map."
   [form]
   (and (seq? form)
        (contains? #{'raster.par/segmented-fold-map! 'par/segmented-fold-map!} (first form))))
@@ -681,9 +681,10 @@
                    [segment-bounds' outer-rest] (split-at nsegments outer-rest)
                    map-extent' (first outer-rest)
                    fold-fields (partition 2 (rest outer-rest))
-                   folds' (mapv (fn [acc [identity dtype] [extent step]]
-                                  [acc identity dtype extent step])
-                                accumulators' fold-fields fold-inner)]
+                   folds' (mapv (fn [acc [identity dtype] [extent step] original]
+                                  (cond-> [acc identity dtype extent step]
+                                    (= 6 (count original)) (conj (nth original 5))))
+                                accumulators' fold-fields fold-inner folds)]
                (pl form head (vec outputs')
                    (mapv vector segment-indices' segment-bounds')
                    idx' map-extent' folds' (vec map-results'))))})
@@ -762,7 +763,7 @@
        :algebra algebra})))
 
 (defn extract-par-segmented-fold-map-info
-  "Extract the ordered structural fields of `raster.par/segmented-fold-map!`."
+  "Extract the structural fields of `raster.par/segmented-fold-map!`."
   [form]
   (when (par-segmented-fold-map-form? form)
     (let [[_ outputs segment-axes idx map-extent folds map-results] form]

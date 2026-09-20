@@ -204,7 +204,7 @@
     `(do ~segmented nil)))
 
 (defmacro segmented-fold-map!
-  "Ordered folds followed by a dense map, independently for every segment.
+  "Fold reductions followed by a dense map, independently for every segment.
 
   Form:
     (segmented-fold-map! outputs
@@ -213,10 +213,15 @@
       [[accumulator identity dtype fold-extent step] ...]
       [map-result ...])
 
+  A fold may append `{:association :implementation-defined}` to authorize a target reduction
+  tree.  The typed frontend derives and retains the monoid certificate; this map is a request,
+  never proof supplied by the caller.  Omitting it retains exact source order.
+
   Fold `n` may reference the completed results of folds `0..n-1`. `:element` denotes the
   surrounding tensor element dtype; the typed frontend resolves it before scheduling.  The
   interpreted fallback preserves the declared fold order exactly. Accelerator schedules may
-  parallelize segments, but must not reassociate an ordered fold.
+  parallelize segments, but must not reassociate an ordered fold. Reassociation permission affects
+  only accelerator scheduling; it does not change the sequential host meaning.
 
   The result buffers are dense row-major tensors with shape
   `[segment-bound ... map-extent]`. This is a general row-statistics primitive: softmax,
@@ -230,8 +235,13 @@
           "segmented-fold-map!: segment axes must be [[index bound] ...]")
   (assert (symbol? idx-sym) "segmented-fold-map!: map index must be a symbol")
   (assert (and (vector? folds) (seq folds)
-               (every? #(and (vector? %) (= 5 (count %)) (symbol? (first %))) folds))
-          "segmented-fold-map!: folds must be [[acc identity dtype extent step] ...]")
+               (every? #(and (vector? %) (contains? #{5 6} (count %))
+                              (symbol? (first %))
+                              (or (= 5 (count %))
+                                  (= {:association :implementation-defined} (nth % 5))))
+                       folds))
+          (str "segmented-fold-map!: folds must be [[acc identity dtype extent step] ...] "
+               "with an optional {:association :implementation-defined}"))
   (assert (= (count outputs) (count map-results))
           "segmented-fold-map!: outputs and map results must have equal arity")
   (let [flat-index
@@ -251,7 +261,7 @@
         mapped `(dotimes [~idx-sym (int ~map-extent)] ~@stores)
         folded
         (clojure.core/reduce
-         (fn [body [acc identity dtype fold-extent step]]
+         (fn [body [acc identity dtype fold-extent step _schedule-request]]
            (let [fold-index (gensym "fold_index__")
                  folded-value (gensym "fold_value__")]
              `(let [~folded-value

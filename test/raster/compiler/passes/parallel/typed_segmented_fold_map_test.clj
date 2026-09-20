@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-segmented-fold-map-test
   (:require [clojure.string :as str]
             [clojure.set :as set]
+            [clojure.walk :as walk]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.core.layout :as layout]
@@ -13,11 +14,13 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.par :as par]))
 
@@ -45,6 +48,23 @@
                                   (clojure.core/+ (clojure.core/* segment width) index))
                maximum))
              denominator)])]
+         effect))
+
+(def ^:private certified-source
+  '(let* [effect
+          (raster.par/segmented-fold-map!
+           [out] [[row rows]] index width
+           [[sum 0.0 :float width
+             (clojure.core/+
+              sum
+              (clojure.core/aget values
+                                 (clojure.core/+ (clojure.core/* row width) index)))
+             {:association :implementation-defined}]]
+           [(clojure.core/float
+             (clojure.core/*
+              sum
+              (clojure.core/aget values
+                                 (clojure.core/+ (clojure.core/* row width) index))))])]
          effect))
 
 (defn- scheduled-operation []
@@ -119,6 +139,45 @@
     (is (= '[out] (dialect/physical-results program equation)))
     (is (= :int (:dtype (get-in (dialect/facts program) [:values 'width])))
         "launch dimensions retain their declared ABI representation")))
+
+(deftest reassociation-is-an-explicit-derived-fold-contract
+  (let [options {:dtype :float :array-types {'values :float 'out :float}
+                 :scalar-types {'rows :long 'width :long}}
+        program (frontend/form->program certified-source options)
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        fold (first (:folds operation))
+        attributes (:attributes fold)
+        projected (projection/segmented-fold-map-form program equation)]
+    (is (= :per-fold (get-in operation [:attributes :association])))
+    (is (= :implementation-defined (:association attributes)))
+    (is (scan/associative-scan? (:algebra attributes)))
+    (is (= {:association :implementation-defined}
+           (peek (first (nth projected 5))))
+        "the explicit permission survives the temporary host projection")
+    (is (= program (dialect/validate! program)))
+    (let [declared (:algebra attributes)
+          forged (assoc declared :combine 'clojure.core/*)
+          corrupted (walk/postwalk-replace {declared forged} program)]
+      (is (= :typed-soac-segmented-fold-map-certificate
+             (reason-of #(dialect/validate! corrupted)))
+          "a serialized certificate is checked against the retained scalar region"))
+    (let [values (float-array [1.0 2.0 3.0 4.0])
+          out (float-array 4)
+          run (eval (list 'fn '[values out rows width] projected))]
+      (run values out 2 2)
+      (is (= [3.0 6.0 21.0 28.0] (vec out)))
+      (is (= [1.0 2.0 3.0 4.0] (vec values))))))
+
+(deftest reassociation-request-is-not-a-user-supplied-proof
+  (let [invalid (walk/postwalk-replace
+                 {'clojure.core/+ 'clojure.core/-}
+                 certified-source)]
+    (is (= :segmented-fold-map-not-associative
+           (reason-of
+            #(frontend/form->program
+              invalid {:dtype :float :array-types {'values :float 'out :float}
+                       :scalar-types {'rows :long 'width :long}}))))))
 
 (deftest portable-schedule-is-a-capped-grid-stride-loop-over-three-ordered-loops
   (let [operation (scheduled-operation)
