@@ -4,8 +4,10 @@
             [raster.arrays :as arrays]
             [raster.gpu.link :as link]
             [raster.perf.production-canary :as canary]
+            [raster.runtime.hardware :as hardware]
             [raster.runtime.microbench :as microbench]
             [raster.gpu.compiled :as compiled]
+            [raster.compiler.core.hardware :as compiler-hardware]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.device-probe :as probe]))
 
@@ -52,6 +54,65 @@
     (doseq [v [nil 0 -1 ##NaN ##Inf]]
       (is (= :invalid-measurement
              (canary/verdict sample (assoc-in sample [:measurement :median-ns] v)))))))
+
+(deftest launch-aware-roofline-is-an-explicit-cliff-contract
+  (let [descriptor {:peak-flops {:f32 1.0e12}
+                    :bandwidth-bytes-s 1.0e11
+                    :launch-overhead-ns 1000.0}
+        work {:flops 5120 :warm-bytes 10240 :dtype :f32 :n-kernels 1}
+        pass (canary/roofline-assessment descriptor work {:median-ns 10000.0} 30.0)
+        regression (canary/roofline-assessment descriptor work {:median-ns 50000.0} 30.0)]
+    (is (= :pass (:status pass)))
+    (is (= :regression (:status regression)))
+    (is (= :unmodelled
+           (:status (canary/roofline-assessment {} work {:median-ns 1.0} 30.0))))
+    (is (= :roofline-regression
+           (canary/verdict nil {:identity {} :validated? true
+                                :measurement {:median-ns 50000.0 :stationary? true}
+                                :performance-contract regression})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (canary/roofline-assessment descriptor work {:median-ns 1.0} 0.0)))))
+
+(deftest equation-first-rmsnorm-canary-keeps-validation-and-device-timing-on-public-artifact
+  (let [calls (atom [])]
+    (with-redefs [hardware/init! (constantly nil)
+                  hardware/device-signature (fn [target] {:target target})
+                  compiler-hardware/descriptor-for
+                  (constantly {:peak-flops {:f32 1.0e12}
+                               :bandwidth-bytes-s 1.0e11
+                               :launch-overhead-ns 1000.0})
+                  compiled/lower
+                  (fn [entry args opts]
+                    (swap! calls conj [:lower entry opts])
+                    {:args args :schedule {:compiler :equation-first}})
+                  compiled/instantiate!
+                  (fn [prepared opts]
+                    (swap! calls conj [:instantiate opts])
+                    {:prepared prepared})
+                  compiled/profile
+                  (fn [live]
+                    {:result {:out (canary/rmsnorm-reference
+                                    (get-in live [:prepared :args]))}
+                     :profile [{:kernel-name "generated-rmsnorm" :ms 0.01}]
+                     :kernel-total-ms 0.01 :device-wall-ms 0.01})
+                  compiled/measure
+                  (fn [_ & opts]
+                    (swap! calls conj [:measure (apply hash-map opts)])
+                    {:median-ns 10000.0 :stationary? true :timing-source :device-event})
+                  compiled/ir (constantly [{:convention :kernel-body}])
+                  compiled/close! (fn [_] (swap! calls conj [:close]))]
+      (let [result (canary/rmsnorm! {:target :ze:0 :shape [1 16]
+                                     :environment-tag "fixture" :compiler-revision "test"
+                                     :budget-ms 7.0})
+            lower-options (nth (first @calls) 2)]
+        (is (:validated? result))
+        (is (= :equation-first (:compiler lower-options)))
+        (is (= '[weight] (:constants lower-options)))
+        (is (= {:profile? true} (second (second @calls))))
+        (is (= 7.0 (get-in (nth @calls 2) [1 :budget-ms])))
+        (is (= :device-event (get-in result [:measurement :timing-source])))
+        (is (= :pass (get-in result [:performance-contract :status])))
+        (is (= [:close] (last @calls)))))))
 
 (deftest dynamic-prebound-composition-retains-one-generated-step
   (let [shape [3 4 5]
@@ -105,7 +166,9 @@
         candidates (mapcat :alternatives (:steps evidence))]
     (is (= 'C (get-in p [:descriptor :result-sym])))
     (is (= ['C] (mapv :sym (:out-tree p))))
-    (is (every? #(= :executable (:convention %)) (get-in p [:descriptor :steps])))
+    (is (every? #(contains? #{:contract :executable} (:convention %))
+                (get-in p [:descriptor :steps]))
+        "the public path may retain the typed contraction or its executable wrapper")
     (is (= 1 (:resident-step-count evidence)))
     (is (= 0 (:descriptor-scratch-count evidence)))
     (is (seq candidates))

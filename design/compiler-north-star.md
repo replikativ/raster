@@ -552,9 +552,17 @@ accepted by nvcc (sm_80 PTX) and hipcc (gfx1100 code object) without hardware. A
 transfer-free host-synchronous Gemma-shape comparison (`B=1`, `in=1024`, `out=640`) measured a noisy
 444 microsecond generated median versus 3.48 milliseconds for the legacy one-thread-per-output
 kernel (about 7.8x, with a 101--115 microsecond generated steady floor). This is directional
-evidence, not the durable device-event/roofline gate; system noise was high and both paths still sit
-outside a common measurement route, while the generated path still sits outside the canonical
-resident compiler entry.
+evidence, not the durable Q4_K device-event/roofline gate; system noise was high. The generated path
+now enters the public `Compiled`/`LinkPlan` artifact and aggregate device-event measurement route,
+so the next comparison can measure both candidates under one resident clock without transfers.
+
+The same public equation-first route now closes the generic reassociated segmented fold-map used by
+RMSNorm. One cooperative KernelBody, rather than one serial work item, owns each row; the compiler
+does not recognize normalization. An initial resident Arc OpenCL run at `B=1`, width 640 measured a
+noisy 9.895 microsecond device-event median, versus the earlier 321 microsecond serial path. The
+opt-in canary validates the result, records the exact emitted artifact, and applies a deliberately
+broad 30x launch-aware roofline cliff. Stable-machine baselines remain the regression authority;
+ordinary CI compiles and validates the route but makes no laptop timing claim.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows
