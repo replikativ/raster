@@ -20,8 +20,11 @@
    here hardcodes `:ze`."
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-composition :as link-composition]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pl]
             [raster.gpu.core :as gpu]
@@ -131,7 +134,7 @@
 ;; Pure lowering, composition, and runtime compilation
 ;; ================================================================
 
-(defn lower
+(defn- lower-resident-descriptor
   "Lower a deftm var into a certified, allocation-free `Prepared` artifact.
 
    args  — example args in the descriptor's :all-params order. Supplies BOTH the shapes
@@ -171,6 +174,140 @@
         out-tree (build-out-tree lowering donate outputs result-sym taps)
         donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))]
     (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args)))
+
+(defn- equation-first-value
+  [plan node role]
+  (let [view (get-in plan [:nodes node :view])]
+    {:node node :role role :shape (:shape view) :dtype (:dtype view)}))
+
+(defn- equation-first-output-key
+  [value index total]
+  (cond
+    (= 1 total) :result
+    (instance? clojure.lang.Named value) (keyword (name value))
+    :else (keyword (str "result-" index))))
+
+(defn- lower-equation-first
+  [fn-var args {:keys [target dtype donate constants outputs taps roles]
+                :or {target :ze:0 dtype :float}
+                :as opts}]
+  (let [compilation-options (apply dissoc opts
+                                   [:compiler :donate :constants :outputs :taps :roles
+                                    :profile? :on-non-resident :gemm-precision])
+        compilation (equation-first/compile
+                     fn-var (assoc compilation-options :target target :dtype dtype))
+        raw-plan (equation-first/lower compilation args)
+        attributes (:attributes raw-plan)
+        public-bindings (:public-buffer-bindings attributes)
+        public-defaults (:public-buffer-roles attributes)
+        public-symbols (set (keys public-bindings))
+        requested-symbols (set (concat donate constants (keys roles)))
+        unknown (set/difference requested-symbols public-symbols)
+        _ (when (seq unknown)
+            (throw (ex-info "equation-first roles name non-buffer public parameters"
+                            {:reason :compiled-equation-first-role-symbols
+                             :symbols unknown :available public-symbols})))
+        effective-roles (merge public-defaults
+                               (derive-roles nil donate constants roles))
+        token-roles (into {} (map (fn [[symbol role]]
+                                    [(get public-bindings symbol) role]))
+                          effective-roles)
+        compiler-bindings (:compiler-buffer-bindings attributes)
+        compiler-roles (into {} (keep (fn [[compiler-value token]]
+                                        (when-let [role (get token-roles token)]
+                                          [compiler-value role])))
+                             compiler-bindings)
+        plan (-> (reduce-kv (fn [plan token role]
+                              (assoc-in plan [:nodes token :role] role))
+                            raw-plan token-roles)
+                 (assoc-in [:instances 0 :roles] compiler-roles)
+                 (assoc-in [:attributes :public-buffer-roles] effective-roles)
+                 link-plan/validate!)
+        parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
+        argument-map (zipmap (map :symbol parameters) args)
+        donate-set (set donate)
+        in-tree (vec
+                 (keep (fn [{:keys [symbol]}]
+                         (when-let [node (get public-bindings symbol)]
+                           (merge {:key (keyword (name symbol))
+                                   :sym symbol
+                                   :donate? (contains? donate-set symbol)
+                                   :default (get argument-map symbol)}
+                                  (equation-first-value plan node
+                                                        (get effective-roles symbol)))))
+                       parameters))
+        resolve-node (fn [value]
+                       (or (get public-bindings value)
+                           (get compiler-bindings value)
+                           (throw (ex-info "equation-first output names no resident value"
+                                           {:reason :compiled-equation-first-output
+                                            :value value}))))
+        output-entry (fn [key value from]
+                       (merge {:key key :sym value :from from}
+                              (equation-first-value plan (resolve-node value) nil)))
+        donated-nodes (map-indexed
+                       (fn [_ symbol]
+                         (output-entry (keyword (str (name symbol) "'")) symbol :donated))
+                       donate)
+        explicit-nodes (map-indexed
+                        (fn [_ value]
+                          (output-entry (keyword (name value)) value :output))
+                        outputs)
+        semantic-outputs (vec (:semantic-outputs attributes))
+        semantic-nodes (map-indexed
+                        (fn [index [value _]]
+                          (output-entry
+                           (equation-first-output-key value index (count semantic-outputs))
+                           value :result))
+                        semantic-outputs)
+        tap-nodes (map-indexed
+                   (fn [_ value]
+                     (output-entry (keyword (name value)) value :tap))
+                   taps)
+        out-tree (reduce (fn [entries entry]
+                           (if (some #(and (= (:key %) (:key entry))
+                                           (= (:node %) (:node entry))) entries)
+                             entries
+                             (conj entries entry)))
+                         [] (concat donated-nodes explicit-nodes semantic-nodes tap-nodes))
+        duplicate-keys (->> out-tree (map :key) frequencies
+                            (keep (fn [[key count]] (when (< 1 count) key))) set)
+        _ (when (seq duplicate-keys)
+            (throw (ex-info "equation-first outputs require unique semantic keys"
+                            {:reason :compiled-equation-first-output-keys
+                             :keys duplicate-keys})))
+        lowering (invocation-link/certify plan)
+        steps (mapv (fn [index kernel]
+                      {:convention :kernel-body
+                       :phase (keyword (str "kernel-" index))
+                       :kernel-name (:kernel-name kernel)})
+                    (range) (:kernels compilation))
+        descriptor {:all-params (mapv :symbol parameters)
+                    :array-params (mapv :symbol (filter #(contains? public-bindings (:symbol %))
+                                                       parameters))
+                    :scalar-params (mapv :symbol (remove #(contains? public-bindings (:symbol %))
+                                                        parameters))
+                    :steps steps :result-sym nil :equation-first? true}
+        schedule {:compiler :equation-first :stats (:stats compilation)}
+        donated (into {} (map (fn [symbol]
+                                [(keyword (name symbol))
+                                 (keyword (str (name symbol) "'"))]))
+                      donate)]
+    (->Prepared lowering in-tree out-tree donated schedule target descriptor args)))
+
+(defn lower
+  "Lower a deftm Var into an allocation-free `Prepared` artifact.
+
+   `:compiler :equation-first` selects the typed SOAC→scheduled KernelBody→LinkPlan vertical.
+   `:resident-descriptor` remains the default during migration. Selection is explicit: the
+   equation-first compiler never falls back to a resident descriptor after a coverage failure."
+  [fn-var args {:keys [compiler] :or {compiler :resident-descriptor} :as opts}]
+  (case compiler
+    :resident-descriptor (lower-resident-descriptor fn-var args opts)
+    :equation-first (lower-equation-first fn-var args opts)
+    (throw (ex-info "unknown compiled lowering vertical"
+                    {:reason :compiled-compiler :compiler compiler
+                     :allowed #{:resident-descriptor :equation-first}}))))
 
 (defn instantiate!
   "Instantiate one pure Prepared artifact as a callable Compiled value. All component plans have

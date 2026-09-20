@@ -19,6 +19,18 @@
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-control :as control]))
 
+(defrecord InvocationLinkCertificate
+           [source-dialect target-dialect plan-id target instance-ids public-buffer-bindings
+            public-buffer-roles compiler-buffer-bindings semantic-outputs outputs aliases
+            driver-allocations])
+(defrecord CertifiedInvocationLink [plan certificate])
+
+(defn certificate? [value]
+  (instance? InvocationLinkCertificate value))
+
+(defn certified-link? [value]
+  (instance? CertifiedInvocationLink value))
+
 (defn- fail!
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :ir :invocation-link))))
@@ -372,6 +384,37 @@
         resident-outputs (into [] (remove (comp typed-scalar? val)) (:outputs call))
         output-tokens (set (map val resident-outputs))
         storage (:storage realized)
+        public-buffer-bindings
+        (into {}
+              (keep (fn [{:keys [id symbol]}]
+                      (let [materialized-value (get-in materialized [:values id])
+                            token (when (materialization/materialized-buffer? materialized-value)
+                                    (:id materialized-value))]
+                        (when (contains? storage token) [symbol token]))))
+              (:parameters invocation-plan))
+        overwrite-tokens
+        (into #{} (keep #(get-in realized [:buffers %])) overwrite-inputs)
+        written-program-values
+        (into #{}
+              (filter
+               (fn [compiler-value]
+                 (some (fn [equation]
+                         (when-let [operation (first (:operations equation))]
+                           (contains? #{:write :read-write}
+                                      (graph-buffer-access (:graph operation) compiler-value))))
+                       (:equations parallel-program))))
+              (keys (:buffers call)))
+        written-tokens
+        (into #{} (keep #(get-in realized [:buffers %])) written-program-values)
+        public-buffer-roles
+        (into {}
+              (map (fn [[symbol token]]
+                     [symbol (cond
+                               (contains? overwrite-tokens token) :output
+                               (or (contains? written-tokens token)
+                                   (contains? output-tokens token)) :state
+                               :else :input)]))
+              public-buffer-bindings)
         nodes
         (mapv (fn [[token {:keys [shape source abstract backing]}]]
                 (link/node {:id token :dtype (:dtype abstract) :shape shape :device target
@@ -413,5 +456,56 @@
       :outputs (mapv val resident-outputs)
       :attributes {:source :typed-invocation
                    :invocation-plan invocation-id
+                   :compiler-buffer-bindings (:buffers realized)
+                   :public-buffer-bindings public-buffer-bindings
+                   :public-buffer-roles public-buffer-roles
+                   :semantic-outputs resident-outputs
                    :host-outputs (into {} (filter (comp typed-scalar? val)) (:outputs call))
                    :driver-allocations 0}})))
+
+(defn- derive-certificate
+  [plan]
+  (let [plan (link/validate! plan)
+        attributes (:attributes plan)]
+    (when-not (= :typed-invocation (:source attributes))
+      (fail! :invocation-link-certificate-source
+             "an invocation certificate requires a typed-invocation LinkPlan"
+             {:plan (:id plan) :source (:source attributes)}))
+    (when-not (every? link/program-link-instance? (:instances plan))
+      (fail! :invocation-link-certificate-instances
+             "an invocation certificate requires emitted program instances"
+             {:plan (:id plan) :instances (mapv type (:instances plan))}))
+    (->InvocationLinkCertificate
+     :emitted-parallel-program-call :link-plan (:id plan) (:target plan)
+     (mapv :id (:instances plan))
+     (:public-buffer-bindings attributes)
+     (:public-buffer-roles attributes)
+     (:compiler-buffer-bindings attributes)
+     (:semantic-outputs attributes)
+     (:outputs plan) (:aliases plan)
+     (:driver-allocations attributes))))
+
+(defn verify!
+  "Revalidate a typed invocation LinkPlan and independently rederive its composition witness."
+  [lowering]
+  (when-not (certified-link? lowering)
+    (fail! :invocation-link-certificate-type
+           "expected a CertifiedInvocationLink"
+           {:actual (type lowering)}))
+  (let [plan (link/validate! (:plan lowering))
+        expected (derive-certificate plan)]
+    (when-not (certificate? (:certificate lowering))
+      (fail! :invocation-link-certificate-type
+             "typed invocation lowering requires an InvocationLinkCertificate"
+             {:actual (type (:certificate lowering))}))
+    (when-not (= expected (:certificate lowering))
+      (fail! :invocation-link-certificate
+             "typed invocation certificate does not match its LinkPlan"
+             {:expected expected :actual (:certificate lowering)}))
+    lowering))
+
+(defn certify
+  "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness."
+  [plan]
+  (let [plan (link/validate! plan)]
+    (verify! (->CertifiedInvocationLink plan (derive-certificate plan)))))

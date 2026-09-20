@@ -1,13 +1,16 @@
 (ns raster.compiler.ir.link-composition
-  "Certified, allocation-free composition of independently lowered resident programs.
+  "Certified, allocation-free composition of independently lowered executable programs.
 
-   Composition is a pure LinkPlan rewrite. Component node/allocation/instance identities are
+   Resident descriptors and equation-first emitted programs enter through distinct checked
+   lowering witnesses. Composition is a pure LinkPlan rewrite. Component identities are
    namespaced first; explicit dataflow connections and shared boundary values then canonicalize
    identities; one ordinary LinkPlan is validated last. The runtime therefore allocates and
    records the composite only once and cannot insert an implicit intermediate copy."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]))
 
@@ -28,6 +31,7 @@
 (defn- verify-component! [component]
   (cond
     (resident-plan/certified-plan? component) (resident-plan/verify! component)
+    (invocation-link/certified-link? component) (invocation-link/verify! component)
     (certified-composition? component) (verify! component)
     :else
     (throw (ex-info "link composition components must carry a verified lowering certificate"
@@ -96,9 +100,21 @@
          :leaves (mapv #(update % :node node-mapping) (:leaves value))))
 
 (defn- namespace-instance [composition-id component-id value-mapping instance]
-  (assoc instance
-         :id (namespace-id composition-id component-id :instance (:id instance))
-         :bindings (update-vals (:bindings instance) value-mapping)))
+  (cond
+    (link-plan/link-instance? instance)
+    (assoc instance
+           :id (namespace-id composition-id component-id :instance (:id instance))
+           :bindings (update-vals (:bindings instance) value-mapping))
+
+    (link-plan/program-link-instance? instance)
+    (assoc instance
+           :id (namespace-id composition-id component-id :instance (:id instance))
+           :call (program-call/map-buffers (:call instance) value-mapping))
+
+    :else
+    (throw (ex-info "link composition cannot namespace an unknown instance"
+                    {:reason :link-composition-instance-type
+                     :instance (:id instance) :actual (type instance)}))))
 
 (defn- endpoint-contract [node]
   (let [view (:view node)
