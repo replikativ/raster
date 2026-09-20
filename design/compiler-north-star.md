@@ -529,6 +529,20 @@ missing or insufficient hardware facts retain the portable workgroup tree. Wrapp
 lowered through an unsigned same-width carrier so CUDA/HIP do not acquire signed-overflow undefined
 behaviour. The real Q6_K product/consumer workload executes bit-identically on Intel Arc and joins
 the hardware-free CUDA/HIP equation-first compile corpus.
+The same schedule now accepts an ordered tuple of independently typed product components when every
+private result and every consumer load has a proved component/local-offset correspondence. It emits
+only the component/offset pairs observed by that consumer and backward-slices each straight-line
+scalar SSA element region to those live results. Q4_K consequently remains source-level arithmetic:
+eight integer dot lanes and the two dense q8 block-sum halves become ten wrapping-add subgroup
+collectives, while both compiler-owned partial arrays, unused component values, scratch and barriers
+disappear. Its generated kernel is bit-identical to the ggml-compatible oracle on Intel Arc and is
+accepted by nvcc (sm_80 PTX) and hipcc (gfx1100 code object) without hardware. A preliminary
+transfer-free host-synchronous Gemma-shape comparison (`B=1`, `in=1024`, `out=640`) measured a noisy
+444 microsecond generated median versus 3.48 milliseconds for the legacy one-thread-per-output
+kernel (about 7.8x, with a 101--115 microsecond generated steady floor). This is directional
+evidence, not the durable device-event/roofline gate; system noise was high and both paths still sit
+outside a common measurement route, while the generated path still sits outside the canonical
+resident compiler entry.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows

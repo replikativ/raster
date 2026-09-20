@@ -12,6 +12,7 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -39,18 +40,33 @@
         scheduled-body (get-in plan [:source :body])
         buffers (into {} (map (juxt :id identity))
                       (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        array-types (into {} (map (juxt :id :dtype)) (vals buffers))
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+        producer-requirements
+        (product-regions/dense-read-requirements
+         (:producer plan) {:array-types array-types :scalar-types scalar-types} decline!)
+        requirements
+        (merge-with
+         (fn [left right]
+           (if (extent-expression/equivalent? left right)
+             left
+             (decline! :shared-read-layout
+                       "producer and consumer require incompatible dense capacities"
+                       {:producer left :consumer right})))
+         producer-requirements (:consumer-read-requirements plan))
         requirement-shape
         (fn [expression]
-          (let [scope (set (util/free-syms expression))
-                lowered (index-expression/lower-typed expression scope scalar-types :long decline!)]
-            (index-expression/to-launch-expression lowered decline!)))]
+          (if (launch/expression? expression)
+            expression
+            (let [scope (set (util/free-syms expression))
+                  lowered (index-expression/lower-typed expression scope scalar-types :long decline!)]
+              (index-expression/to-launch-expression lowered decline!))))]
     {:buffers buffers
-     :array-types (into {} (map (juxt :id :dtype)) (vals buffers))
+     :array-types array-types
      :array-shapes
      (into {}
            (map (fn [[id buffer]]
-                  [id [(if-let [requirement (get (:consumer-read-requirements plan) id)]
+                  [id [(if-let [requirement (get requirements id)]
                          (requirement-shape requirement)
                          (:elements buffer))]]))
            buffers)
@@ -63,6 +79,32 @@
 
 (defn- contains-fold? [value]
   (boolean (some dialect/product-fold-form? (tree-seq coll? seq value))))
+
+(defn- scalar-operation-name [operation]
+  (some-> operation class .getSimpleName))
+
+(defn- slice-pure-scalar-operations
+  "Retain the dependency slice for selected SSA results from a straight-line scalar region.
+
+   Loads and computes are pure here: the source product element cannot contain stores. Unknown
+   structured operations conservatively keep the complete region rather than guessing effects."
+  [operations selected-results]
+  (if-not (every? #(contains? #{"ScalarCompute" "ScalarLoad"}
+                              (scalar-operation-name %))
+                  operations)
+    (vec operations)
+    (let [{:keys [kept]}
+          (reduce
+           (fn [{:keys [needed kept] :as state} operation]
+             (let [result-id (some-> operation :result :id)]
+               (if (contains? needed result-id)
+                 {:needed (into (disj needed result-id)
+                                (disj (util/free-syms operation) result-id))
+                  :kept (conj kept operation)}
+                 state)))
+           {:needed (set selected-results) :kept []}
+           (reverse operations))]
+      (vec (reverse kept)))))
 
 (defn- lower-locals
   [lowerer locals substitutions environment]
@@ -87,11 +129,12 @@
 (defn- replace-intermediate-values [plan values value]
   (let [replacement
         (into {}
-              (map (fn [{:keys [load local-offset]}]
-                     [load (or (nth values local-offset nil)
+              (map (fn [{:keys [load local-offset component]}]
+                     [load (or (get values [local-offset component])
                                (decline! :intermediate-local-offset
-                                         "proved intermediate offset exceeds subgroup SSA values"
-                                         {:local-offset local-offset :values values}))]))
+                                         "proved intermediate component/offset exceeds subgroup SSA values"
+                                         {:local-offset local-offset :component component
+                                          :values values}))]))
               (:intermediate-loads plan))]
     (walk/postwalk #(get replacement % %) value)))
 
@@ -142,7 +185,7 @@
   [plan]
   (when-not (= :product-ordered-consumer (:kind plan))
     (decline! :plan "product-consumer body requires an admitted region plan" {:plan plan}))
-  (let [{:keys [producer consumer intermediate workgroup-size]} plan
+  (let [{:keys [producer consumer intermediates workgroup-size]} plan
         {:keys [prefix ordered local reduced]} (:axes plan)
         physical-schedule (or (:physical-schedule plan)
                               {:strategy :product-tree-ordered-consumer
@@ -152,12 +195,11 @@
         physical-workgroup-size (:workgroup-size physical-schedule)
         {:keys [buffers array-types array-shapes scalar-types]} (graph-options plan)
         components (get-in producer [:reduction :components])
-        _ (when-not (= 1 (count components))
+        component-types (mapv (comp dtype/canon :dtype) components)
+        _ (when-not (= (count intermediates) (count components))
             (decline! :producer-components
-                      "the initial fused body requires one private product component"
-                      {:components components}))
-        component (first components)
-        component-type (dtype/canon (:dtype component))
+                      "private product storage must correspond to every component"
+                      {:components components :intermediates intermediates}))
         reduced-width (:bound reduced)
         local-volume (reduce * 1 (map :bound local))
         _ (when-not (= workgroup-size (* local-volume reduced-width))
@@ -166,8 +208,9 @@
                       {:workgroup-size workgroup-size :local-volume local-volume
                        :reduced-width reduced-width}))
         external-inputs (vec (sort-by name
-                                      (disj (set/union (:inputs producer) (:inputs consumer))
-                                            intermediate)))
+                                      (set/difference
+                                       (set/union (:inputs producer) (:inputs consumer))
+                                       (set intermediates))))
         outputs (vec (sort-by name (:outputs consumer)))
         _ (when-not (and (= 1 (count outputs)) (= (first outputs) (:out-sym consumer)))
             (decline! :consumer-output
@@ -239,15 +282,17 @@
                                                              (lower-index bound #{})))))
               (range) local)
         reduced-compute (body/->IndexCompute (:name reduced) reduced-index)
-        producer-value (some-> element :results first)
+        producer-values (some-> element :results vec)
         tree-strides (vec (take-while pos? (iterate #(quot % 2) (quot reduced-width 2))))
         tree-operations
         (when-not subgroup?
           (mapcat
            (fn [stride]
-             (let [left (symbol (str "product-consumer-left-" stride))
-                   right (symbol (str "product-consumer-right-" stride))
-                   merged (combine [left] [right])
+             (let [left (mapv #(symbol (str "product-consumer-left-" stride "-" %))
+                              (range (count components)))
+                   right (mapv #(symbol (str "product-consumer-right-" stride "-" %))
+                               (range (count components)))
+                   merged (combine left right)
                    predicate (keyword (str "product-consumer-tree-" stride))]
                [(body/->ScalarCompute (body/value predicate :predicate)
                                       (body/scalar-expression :lt :predicate
@@ -256,14 +301,19 @@
                 (body/->IfRegion
                  predicate
                  (vec (concat
-                       [(body/->ScalarLoad (body/value left component-type) intermediate [lane-index]
-                                           nil nil :cached)
-                        (body/->ScalarLoad (body/value right component-type) intermediate
-                                           [(body/expression :add lane-index stride)] nil nil :cached)]
+                       (mapcat (fn [left-id right-id component-type intermediate]
+                                 [(body/->ScalarLoad (body/value left-id component-type)
+                                                    intermediate [lane-index] nil nil :cached)
+                                  (body/->ScalarLoad (body/value right-id component-type)
+                                                    intermediate
+                                                    [(body/expression :add lane-index stride)]
+                                                    nil nil :cached)])
+                               left right component-types intermediates)
                        (:operations merged)
-                       [(body/->ScalarStore intermediate [lane-index]
-                                             (first (:results merged)) nil)
-                        (body/->Yield [])]))
+                       (map (fn [intermediate result]
+                              (body/->ScalarStore intermediate [lane-index] result nil))
+                            intermediates (:results merged))
+                       [(body/->Yield [])]))
                  [(body/->Yield [])] [])
                 (barrier)]))
            tree-strides))
@@ -274,28 +324,60 @@
            (body/value reduced-active-id :predicate)
            (body/scalar-expression :lt :predicate
                                    [lane-index (body/literal reduced-width :int)])))
+        subgroup-component-pairs
+        (when subgroup?
+          (->> (:intermediate-loads plan)
+               (map (juxt :local-offset :component))
+               distinct
+               sort
+               vec))
         subgroup-values
         (when subgroup?
-          (mapv #(symbol (str "product-consumer-subgroup-partial-" %))
-                (range local-volume)))
+          (into {}
+                (map (fn [[offset component :as pair]]
+                       [pair (symbol (str "product-consumer-subgroup-partial-"
+                                          offset "-" component))]))
+                subgroup-component-pairs))
         subgroup-operations
         (when subgroup?
-          (let [{:keys [operator neutral arithmetic association]}
-                (:subgroup-collective plan)
+          (let [contracts (:subgroup-collectives plan)
                 width (:subgroup-size physical-schedule)]
             (vec
              (mapcat
-              (fn [offset {:keys [element]} result-id]
-                (let [lane-value (symbol (str "product-consumer-subgroup-element-" offset))]
-                  [(body/->IfRegion
-                    reduced-active-id
-                    (conj (vec (:operations element)) (body/->Yield (:results element)))
-                    [(body/->Yield [(body/literal neutral component-type)])]
-                    [(body/value lane-value component-type)])
-                   (body/->Collective
-                    (body/value result-id component-type) :reduce :subgroup width lane-value
-                    operator nil (body/full-participation) association arithmetic)]))
-              (range local-volume) subgroup-regions subgroup-values))))
+              (fn [offset {:keys [element]}]
+                (let [component-indices
+                      (->> subgroup-component-pairs
+                           (keep (fn [[used-offset component]]
+                                   (when (= offset used-offset) component)))
+                           vec)]
+                  (if (empty? component-indices)
+                    []
+                    (let [lane-values
+                          (mapv #(symbol (str "product-consumer-subgroup-element-"
+                                              offset "-" %))
+                                component-indices)
+                          result-ids (mapv #(get subgroup-values [offset %]) component-indices)
+                          selected-results (mapv #(nth (:results element) %) component-indices)
+                          selected-types (mapv #(nth component-types %) component-indices)
+                          selected-contracts (mapv #(nth contracts %) component-indices)]
+                      (concat
+                       [(body/->IfRegion
+                         reduced-active-id
+                         (conj (slice-pure-scalar-operations (:operations element)
+                                                            selected-results)
+                               (body/->Yield selected-results))
+                         [(body/->Yield
+                           (mapv (fn [{:keys [neutral]} component-type]
+                                   (body/literal neutral component-type))
+                                 selected-contracts selected-types))]
+                         (mapv body/value lane-values selected-types))]
+                       (mapv (fn [result-id lane-value component-type
+                                  {:keys [operator arithmetic association]}]
+                               (body/->Collective
+                                (body/value result-id component-type) :reduce :subgroup width lane-value
+                                operator nil (body/full-participation) association arithmetic))
+                             result-ids lane-values selected-types selected-contracts))))))
+              (range local-volume) subgroup-regions))))
         fold (fold-of consumer)
         {fold-attributes :attributes fold-lambda :lambda} (dialect/product-fold-parts fold)
         {fold-parameters :parameters fold-locals :locals fold-results :body-results}
@@ -317,7 +399,7 @@
                                          (get-in plan [:axes :prefix-binding]) prefix)))
         consumer-prefix-locals (filterv #(not (contains? prefix-aliases (:id %)))
                                         raw-consumer-prefix-locals)
-        consumer-arrays (conj (set (:inputs consumer)) intermediate)
+        consumer-arrays (into (set (:inputs consumer)) intermediates)
         consumer-index-types (merge scalar-types
                                     (into {} (map (fn [{:keys [name]}] [name :long])) prefix)
                                     (into {} (map (fn [{:keys [name]}] [name :long]))
@@ -367,7 +449,10 @@
         fold-environment (merge (:environment prefix-state)
                                 (zipmap carries carry-types)
                                 (when subgroup?
-                                  (zipmap subgroup-values (repeat component-type)))
+                                  (into {}
+                                        (map (fn [[[offset component] id]]
+                                               [id (nth component-types component)]))
+                                        subgroup-values))
                                 {(:name ordered) :long})
         fold-update ((:lower-region consumer-lowerer) rewritten-fold carry-types
                      fold-binding-types fold-environment)
@@ -396,8 +481,11 @@
                (if subgroup?
                  subgroup-operations
                  (concat (:operations element)
-                         [(body/->ScalarStore intermediate [lane-index] producer-value nil)
-                          (barrier)]
+                         (map (fn [intermediate producer-value]
+                                (body/->ScalarStore intermediate [lane-index]
+                                                    producer-value nil))
+                              intermediates producer-values)
+                         [(barrier)]
                          tree-operations))
                [(body/->ScalarCompute (body/value writer :predicate)
                                       (body/scalar-expression :eq :predicate
@@ -429,7 +517,9 @@
                       [(body/->ScalarStore output [group-index] (:result output-value) nil)
                        (body/->Yield [])]))
          [(body/->Yield [])] [])
-        shared-bytes (if subgroup? 0 (* workgroup-size (dtype/bytes-of component-type)))
+        shared-bytes (if subgroup?
+                       0
+                       (* workgroup-size (reduce + (map dtype/bytes-of component-types))))
         kernel-body
         (body/make
          {:id [:product-ordered-consumer (:id producer) (:id consumer)]
@@ -437,10 +527,12 @@
           :stable-reads (mapv body/stable-read external-inputs)
           :allocations (if subgroup?
                          []
-                         [(body/->WorkgroupAllocation
-                           intermediate component-type [workgroup-size]
-                           (layout/row-major [workgroup-size] component-type)
-                           (dtype/bytes-of component-type))])
+                         (mapv (fn [intermediate component-type]
+                                 (body/->WorkgroupAllocation
+                                  intermediate component-type [workgroup-size]
+                                  (layout/row-major [workgroup-size] component-type)
+                                  (dtype/bytes-of component-type)))
+                               intermediates component-types))
           :indices [(body/->IndexBinding group-index :group 0)
                     (body/->IndexBinding lane-index (if subgroup? :lane :local) 0)]
           :operations

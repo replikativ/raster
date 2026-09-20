@@ -93,6 +93,19 @@
         (is (not (str/includes? source "barrier(")) (name dialect))
         (is (not (str/includes? source "__syncthreads")) (name dialect))))))
 
+(deftest certified-product-valued-reduction-emits-one-collective-per-component
+  (let [program (#'fixtures/scheduled-product-pair-consumer)
+        routed (route/schedule
+                (region/analyze program (#'fixtures/numerical-equations program))
+                subgroup-device)
+        kernel-body (get-in routed [:scheduled :body])
+        operations (tree-seq coll? seq (:operations kernel-body))]
+    (is (= :subgroup-product-ordered-consumer
+           (get-in kernel-body [:schedule :strategy])))
+    (is (empty? (:allocations kernel-body)))
+    (is (= 2 (count (filter #(= "Collective" (record-name %)) operations))))
+    (is (not-any? #(= "WorkgroupBarrier" (record-name %)) operations))))
+
 (deftest subgroup-selection-falls-back-when-the-target-cannot-prove-a-legal-width
   (doseq [[label target reason]
           [[:missing nil :hardware-descriptor-unavailable]
@@ -174,3 +187,29 @@
         "the eliminated host allocation never becomes a resident LinkPlan node")
     (is (not-any? #(some #{'partials} (tree-seq coll? seq (:id %)))
                   (vals (:nodes plan))))))
+
+(deftest real-q4-product-dot-reuses-the-product-valued-subgroup-schedule
+  (let [target :ze:q4-subgroup-compile-test
+        _ (runtime-hardware/register-target-device!
+           target {:type :ze
+                   :name "Synthetic Intel Q4 subgroup product compile test"
+                   :capabilities {:subgroup-sizes [16 32]
+                                  :simd-width 16
+                                  :max-workgroup-size 256
+                                  :shared-local-memory 65536}})
+        compilation (equation-first/compile #'ggml-kernels/qdot-q4-K-product-rows!
+                                            {:target target :dtype :float})
+        artifact (first (:kernels compilation))
+        operations (tree-seq coll? seq
+                             (get-in artifact [:attributes :kernel-body :operations]))]
+    (is (= 1 (get-in compilation [:stats :emission :product-consumer-regions-emitted])))
+    (is (= 1 (count (:kernels compilation))))
+    (is (empty? (:temporaries artifact)))
+    (is (= :subgroup-product-ordered-consumer
+           (get-in artifact [:attributes :kernel-body :schedule :strategy])))
+    (is (= 10 (count (filter #(= "Collective" (record-name %)) operations))))
+    (is (= 2 (count (re-seq #"xbs\[" (:source artifact))))
+        "only the two live minimum-correction lanes retain q8 block-sum loads")
+    (is (= 8 (count (re-seq #"wq\[" (:source artifact))))
+        "only the eight live dot lanes retain packed-weight loads")
+    (is (not-any? #(= "WorkgroupBarrier" (record-name %)) operations))))

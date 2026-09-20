@@ -171,6 +171,76 @@
 
 (def-q4-K-dot)
 
+(deftm qdot-q4-K-product-rows!
+  "q4_K × q8_K as a typed product reduction followed by ggml's ordered float fold.
+
+  The local `lane` axis retains ggml's eight exact integer dot lanes; `pair` exposes the two
+  adjacent q8 block sums as a proved dense axis. A second component is the asymmetric minimum
+  correction. Only eight dot and two minimum results are consumed; all other private results
+  disappear under a cooperative product-consumer schedule."
+  [xq :- (Array int), xd :- (Array float), xbs :- (Array int),
+   wq :- (Array int), wd :- (Array float), wdmin :- (Array float),
+   wsc :- (Array int), wm :- (Array int),
+   y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
+  (let [nb (quot in 256)
+        dot-partials (int-array (* (* (* (* nrows out) nb) 8) 2))
+        min-partials (int-array (* (* (* (* nrows out) nb) 8) 2))]
+    (par/product-reduce!
+     [dot-partials min-partials]
+     [[dot-sum 0 :int] [min-sum 0 :int]]
+     [[row nrows] [o out] [b nb] [lane 8] [pair 2]]
+     chunk 8
+     [sc (ra/aget wsc (+ (* (+ (* o nb) b) 8) chunk))
+      min-scale (ra/aget wm (+ (* (+ (* o nb) b) 8) chunk))
+      dot-value
+      (unchecked-multiply-int
+       sc
+       (par/dp4a
+        (ra/aget wq (+ (* (+ (* o nb) b) 64) (+ (* chunk 8) lane)))
+        (ra/aget xq (+ (* (+ (* row nb) b) 64) (+ (* chunk 8) lane))) 0))
+      min-value
+      (unchecked-multiply-int
+       (ra/aget xbs (+ (* (+ (* row nb) b) 16) (+ (* chunk 2) pair))) min-scale)]
+     [dot-value min-value]
+     [[dot-left dot-right] [min-left min-right]]
+     []
+     [(unchecked-add-int dot-left dot-right)
+      (unchecked-add-int min-left min-right)]
+     {:associative? true :commutative? true
+      :overflow :wrap :order :implementation-defined})
+    (par/map-void!
+     ro (* nrows out)
+     (let [row (quot ro out)
+           o (rem ro out)
+           acc
+           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
+                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)
+                  sumf (float 0.0)]
+             (if (< b nb)
+               (let [wb (+ (* o nb) b)
+                     xb (+ (* row nb) b)
+                     base (* (+ (* (+ (* row out) o) nb) b) 16)
+                     d (* (ra/aget wd wb) (ra/aget xd xb))
+                     dmin (* (ra/aget wdmin wb) (ra/aget xd xb))
+                     p0 (* d (float (ra/aget dot-partials (+ base 0))))
+                     p1 (* d (float (ra/aget dot-partials (+ base 2))))
+                     p2 (* d (float (ra/aget dot-partials (+ base 4))))
+                     p3 (* d (float (ra/aget dot-partials (+ base 6))))
+                     p4 (* d (float (ra/aget dot-partials (+ base 8))))
+                     p5 (* d (float (ra/aget dot-partials (+ base 10))))
+                     p6 (* d (float (ra/aget dot-partials (+ base 12))))
+                     p7 (* d (float (ra/aget dot-partials (+ base 14))))
+                     sumi (unchecked-add-int
+                           (ra/aget min-partials (+ base 0))
+                           (ra/aget min-partials (+ base 1)))
+                     pm (* dmin (float sumi))]
+                 (recur (inc b)
+                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
+                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)
+                        (- sumf pm)))
+               (+ (+ (+ (+ (+ (+ (+ (+ sumf s0) s1) s2) s3) s4) s5) s6) s7)))]
+       (ra/aset y ro acc)))))
+
 (deftm qdot-q6-K-product-rows!
   "q6_K weights times q8_K activations through Raster's typed product reduction.
 

@@ -78,7 +78,7 @@
                      :axis-partition (:axes plan)}
           :numerics (numerical-contract plan)
           :provenance {:source-operations (get-in plan [:provenance :source-operations])}
-          :attributes {:private-intermediate (:intermediate plan)}})]
+          :attributes {:private-intermediates (:intermediates plan)}})]
     {:scheduled scheduled :graph refined :refinement witness :plan plan})))
 
 (defn emit
