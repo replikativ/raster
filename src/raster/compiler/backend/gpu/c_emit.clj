@@ -1041,12 +1041,20 @@
 
      (number? expr)
      (let [s (str expr)]
-       (if (and (= *scalar-type* "float")
-                (:float-suffix? *emit-config* true)
-                (or (instance? Double expr) (instance? Float expr))
-                (not (str/ends-with? s "f")))
+       (cond
+         ;; A non-finite literal is C's INFINITY/NAN, never Java's printed form
+         ;; with a float suffix ("Infinityf").
+         (and (or (instance? Double expr) (instance? Float expr))
+              (not (Double/isFinite (double expr))))
+         (normalize-identity-val expr)
+
+         (and (= *scalar-type* "float")
+              (:float-suffix? *emit-config* true)
+              (or (instance? Double expr) (instance? Float expr))
+              (not (str/ends-with? s "f")))
          (str s "f")
-         s))
+
+         :else s))
 
      (symbol? expr)
      (let [n (c-symbol expr)]

@@ -55,8 +55,8 @@
 (deftest opencl-compilation-options-check-exact-device-extension-tokens
   (let [options (ns-resolve 'raster.gpu.ocl-runtime 'compilation-options)
         req {:language-standard "CL3.0" :extensions #{"cl_khr_integer_dot_product"}}]
-    (is (nil? (options {} {})))
-    (is (= "-cl-std=CL3.0"
+    (is (= "-cl-fp32-correctly-rounded-divide-sqrt" (options {} {})))
+    (is (= "-cl-fp32-correctly-rounded-divide-sqrt -cl-std=CL3.0"
            (options req {:extensions "cl_other cl_khr_integer_dot_product\ncl_last"})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lacks required"
                          (options req {:extensions "cl_khr_integer_dot_product_suffix"})))))
