@@ -511,6 +511,11 @@ Product scheduling also flattens any non-empty tuple of semantic segment axes in
 workgroup axis and reconstructs each logical index with checked mixed-radix arithmetic inside the
 body. Batched rows, output channels and quantization blocks therefore remain distinct semantic
 axes without requiring a new kernel convention or a manually flattened source index.
+Product operands need not all traverse that complete axis tuple: the storage proof searches a
+bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
+against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows
+therefore retain exact symbolic capacity checks without a quantization registry or a trusted layout
+annotation; indirect gathers and unmatched coordinates still decline.
 The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
 types: each local is lowered once to SSA and shared across results, without inferring its type from
 a consuming component. `product-reduction-body` expresses lane folds, a fixed
