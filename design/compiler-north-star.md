@@ -180,6 +180,15 @@ from the retained scalar region, and projection preserves the request while the 
 meaning stays sequential. This is the semantic prerequisite for a cooperative workers-per-segment
 schedule; ordinary `loop*` recurrences and unmarked fold-map components remain ordered.
 
+For the certified one-fold subset, target scheduling assigns one workgroup to each segment. Lanes
+stride the reduction axis, combine private partials through an explicit workgroup-memory tree, then
+stride the dense final map using the shared result. Allocation, barriers, reassociated numerics and
+launch geometry are KernelBody facts shared by OpenCL, CUDA and HIP. The schedule is invoked through
+the generic executable ABI because its group count is a semantic segment extent, not the legacy
+map convention's reconstructed scalar bound. Unsupported operators or multi-fold dependencies
+remain on the ordered schedule; no normalization, softmax or quantization name participates in
+selection.
+
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
 typed equation records read/write destination access, and GPU lowering emits that storage exactly
 once as a `KernelABI` `:inout` pointer with semantic role `:result`. Physical access and functional

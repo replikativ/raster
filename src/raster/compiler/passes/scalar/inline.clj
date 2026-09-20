@@ -1704,16 +1704,18 @@
           index-env (into (assoc env idx 'long)
                           (map (fn [[segment _]] [segment 'long]) segment-axes))
           [fold-env folds']
-          (reduce (fn [[current result] [acc init dtype extent step]]
+          (reduce (fn [[current result] [acc init dtype extent step schedule-request]]
                     (let [init' (resolve-dispatch-walk init current)
                           tag (or (case dtype
                                     :float 'float :double 'double :int 'int :long 'long nil)
                                   (inf/infer-arg-tag init' current))
                           step-env (cond-> current tag (assoc acc tag))]
                       [(cond-> current tag (assoc acc tag))
-                       (conj result [acc init' dtype
-                                     (resolve-dispatch-walk extent current)
-                                     (resolve-dispatch-walk step step-env)])]))
+                       (conj result
+                             (cond-> [acc init' dtype
+                                      (resolve-dispatch-walk extent current)
+                                      (resolve-dispatch-walk step step-env)]
+                               schedule-request (conj schedule-request)))]))
                   [index-env []] folds)
           r (list head outputs
                   (mapv (fn [[segment bound]]
