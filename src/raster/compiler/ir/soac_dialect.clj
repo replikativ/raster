@@ -461,7 +461,11 @@
          (= :ordered (:association value)))))
 
 (defn segmented-fold-map-attributes?
-  "Attributes for independent segments containing dependent ordered folds and a final dense map."
+  "Attributes for independent segments containing dependent folds and a final dense map.
+
+   `:ordered` means every fold retains declaration order. `:per-fold` means at least one Fold
+   carries its own checked reassociation certificate; permission never lives on this aggregate
+   marker alone."
   [value]
   (let [axes (:segment-axes value)
         indices (mapv first axes)]
@@ -472,7 +476,7 @@
                  axes)
          (= (count indices) (count (distinct indices)))
          (not (contains? (set indices) (:index value)))
-         (= :ordered (:association value))
+         (contains? #{:ordered :per-fold} (:association value))
          (vector? (:dtypes value)) (seq (:dtypes value))
          (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %)))
                  (:dtypes value)))))
@@ -1695,7 +1699,16 @@
             capture-count (count captures)
             map-parameters parameters
             capture-parameters (vec (take-last capture-count map-parameters))
-            iteration-index (:index attributes)]
+            iteration-index (:index attributes)
+            expected-association
+            (if (every? #(= :ordered (:association %)) fold-attributes)
+              :ordered :per-fold)]
+        (when-not (= expected-association (:association attributes))
+          (fail! :typed-soac-segmented-fold-map-association
+                 "fold-map aggregate association must reflect its per-fold contracts"
+                 {:equation equation-id :declared (:association attributes)
+                  :expected expected-association
+                  :fold-associations (mapv :association fold-attributes)}))
         (when-not (= (count results) (count (:dtypes attributes)))
           (fail! :typed-soac-segmented-fold-map-results
                  "segmented-fold-map result arity must equal its declared result dtype arity"
@@ -1738,22 +1751,29 @@
                                       :unbound unbound}))
                             (conj bound id)))
                         bound fold-locals)]
-            (when-not (= :ordered (:association attributes))
-              (fail! :typed-soac-segmented-fold-map-association
-                     "segmented fold-map folds must preserve declared order"
-                     {:equation equation-id :fold ordinal
-                      :association (:association attributes)}))
+            (when (= :implementation-defined (:association attributes))
+              (let [declared (:algebra attributes)
+                    derived
+                    (scan-ir/certify-reassociation
+                     {:acc (:accumulator attributes) :init (:identity attributes)
+                      :lambda (scalar-converts->source (first fold-results))}
+                     (:dtype attributes))]
+                (when-not (scan-ir/compatible-certificate? declared derived)
+                  (fail! :typed-soac-segmented-fold-map-certificate
+                         "fold-map algebra certificate disagrees with its scalar region"
+                         {:equation equation-id :fold ordinal
+                          :declared declared :derived derived}))))
             (let [unbound-extent
                   (set/difference (util/free-syms (:extent attributes))
                                   (set/union segment-indices (set captures)))]
               (when (seq unbound-extent)
                 (fail! :typed-soac-segmented-fold-map-fold-extent
-                       "ordered fold extents may reference only segment axes and explicit captures"
+                       "fold extents may reference only segment axes and explicit captures"
                        {:equation equation-id :fold ordinal :extent (:extent attributes)
                         :unbound unbound-extent})))
             (when-not (= fold-parameters expected)
               (fail! :typed-soac-segmented-fold-map-fold-parameters
-                     "each ordered fold must receive its accumulator, prior fold results, and captures"
+                     "each fold must receive its accumulator, prior fold results, and captures"
                      {:equation equation-id :fold ordinal :parameters fold-parameters
                       :expected expected}))
             (when-not (= 1 (count fold-results))
@@ -1762,13 +1782,13 @@
                      {:equation equation-id :fold ordinal :results fold-results}))
             (when (some write-form? fold-results)
               (fail! :typed-soac-segmented-fold-map-fold-write
-                     "ordered folds are pure scalar regions"
+                     "folds are pure scalar regions"
                      {:equation equation-id :fold ordinal :results fold-results}))
             (let [unbound (binding [util/*shadowing-locals* (set accumulators)]
                             (util/free-syms (first fold-results) final-bound))]
               (when (seq unbound)
                 (fail! :typed-soac-segmented-fold-map-fold-closure
-                       "ordered fold steps may not reference future folds or implicit state"
+                       "fold steps may not reference future folds or implicit state"
                        {:equation equation-id :fold ordinal :unbound unbound})))))
         (when (some write-form? body-results)
           (fail! :typed-soac-segmented-fold-map-map-write

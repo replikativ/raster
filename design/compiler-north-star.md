@@ -173,6 +173,13 @@ backend fallback: unscheduled source fails loudly. Remaining compatibility opera
 direct typed front end before their source-reparsing lowerers can be deleted; coverage debt may
 retain a materialization boundary, but it cannot weaken fusion legality.
 
+Segmented fold-map now distinguishes ordered folds from folds whose source explicitly requests
+implementation-defined association. The request is not accepted as proof: the direct frontend
+derives the same typed monoid certificate used by reductions and scans, validation re-derives it
+from the retained scalar region, and projection preserves the request while the interpreted host
+meaning stays sequential. This is the semantic prerequisite for a cooperative workers-per-segment
+schedule; ordinary `loop*` recurrences and unmarked fold-map components remain ordered.
+
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
 typed equation records read/write destination access, and GPU lowering emits that storage exactly
 once as a `KernelABI` `:inout` pointer with semantic role `:result`. Physical access and functional

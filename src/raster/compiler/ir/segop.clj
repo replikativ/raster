@@ -75,15 +75,15 @@
 
 (defrecord SegFoldMap
            [id           ;; equation identity
-            space        ;; parallel segment space; one work item owns one segment
-            index        ;; ordered fold/final-map index symbol
+            space        ;; parallel segment space; scheduling chooses the workers per segment
+            index        ;; fold/final-map index symbol
             extent       ;; complete final-map width
-            folds        ;; ordered [{:accumulator :identity :dtype :extent :step} ...]
+            folds        ;; dependent folds, each with an ordered or certified association contract
             map-results  ;; pure final values aligned with outputs
             inputs       ;; stable whole-tensor reads
             outputs      ;; ordered caller-owned dense destinations, aligned with map results
             scalars      ;; extent/index scalar parameters
-            grid         ;; portable one-work-item-per-segment launch plan
+            grid         ;; portable baseline launch plan; target scheduling may refine it
             dtypes       ;; final output dtypes
             aliasing])   ;; :no-write-alias — stable reads are distinct from destinations
 

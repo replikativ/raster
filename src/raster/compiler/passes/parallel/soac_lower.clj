@@ -178,11 +178,12 @@
               :algorithm-equation equation-id)])))
 
 (defn lower-typed-segmented-fold-map
-  "Lower one ordered segmented fold-map to a single semantic SegFoldMap.
+  "Lower one segmented fold-map to a single semantic SegFoldMap.
 
-   The operation remains target-neutral: segments are parallel, folds are explicitly ordered,
-   and the final map covers the complete per-segment extent. A later schedule makes loop/control
-   structure and launch geometry concrete in KernelBody."
+   The operation remains target-neutral: segments are parallel, each fold retains either source
+   order or a checked reassociation certificate, and the final map covers the complete per-segment
+   extent. A later schedule makes loop/control structure and launch geometry concrete in
+   KernelBody."
   [program device-id & {:keys [dtype] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))
@@ -213,7 +214,7 @@
                    (= 'segmented-fold-map kind) (empty? arrays)
                    (= (count results) (count physical-results) (count map-results)
                       (count result-dtypes)))
-      (throw (ex-info "typed fold-map lowering requires one closed ordered equation"
+      (throw (ex-info "typed fold-map lowering requires one closed equation"
                       {:reason :typed-soac-segmented-fold-map-subset
                        :equation equation-id :kind kind :results results
                        :physical-results physical-results})))

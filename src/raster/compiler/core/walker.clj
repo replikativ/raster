@@ -1165,7 +1165,8 @@
                           (ctx-assoc-type ctx idx-sym 'long)
                           segment-axes)
         [fold-env walked-folds]
-        (reduce (fn [[env result] [acc identity component-dtype extent step]]
+        (reduce (fn [[env result] [acc identity component-dtype extent step
+                                   schedule-request]]
                   (let [walked-identity (walk identity env)
                         tag (or (get dtype-tag component-dtype)
                                 (when (= :element component-dtype)
@@ -1175,8 +1176,10 @@
                         fold-ctx (cond-> env tag (ctx-assoc-type acc tag))
                         walked-step (walk step fold-ctx)]
                     [(cond-> env tag (ctx-assoc-type acc tag))
-                     (conj result [acc walked-identity component-dtype
-                                   (walk extent env) walked-step])]))
+                     (conj result
+                           (cond-> [acc walked-identity component-dtype
+                                    (walk extent env) walked-step]
+                             schedule-request (conj schedule-request)))]))
                 [index-env []] folds)
         hinted-outputs
         (mapv (fn [out]

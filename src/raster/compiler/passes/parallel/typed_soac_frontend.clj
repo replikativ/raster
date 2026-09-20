@@ -2032,9 +2032,10 @@
                                       (or elem-type default-dtype :double)
                                       declared)))
           normalized-folds
-          (mapv (fn [[accumulator identity declared-dtype extent step]]
+          (mapv (fn [[accumulator identity declared-dtype extent step schedule-request]]
                   {:accumulator accumulator :identity identity
-                   :dtype (fold-dtype declared-dtype) :extent extent :step step})
+                   :dtype (fold-dtype declared-dtype) :extent extent :step step
+                   :association (or (:association schedule-request) :ordered)})
                 folds)
           all-expressions (vec (concat (map :step normalized-folds) map-results))
           inputs (reduce set/union #{} (map par/collect-aget-arrays all-expressions))
@@ -3841,15 +3842,33 @@
         substitutions (zipmap captures capture-parameters)
         accumulators (mapv :accumulator folds)
         fold-forms
-        (mapv (fn [ordinal {:keys [accumulator identity dtype extent step]}]
-                (list 'fold
-                      {:accumulator accumulator :identity identity :dtype dtype
-                       :extent extent :association :ordered}
-                      (dialect/lambda-form
-                       (vec (concat [accumulator] (subvec accumulators 0 ordinal)
-                                    capture-parameters))
-                       [(util/subst-syms substitutions step)])))
+        (mapv (fn [ordinal {:keys [accumulator identity dtype extent step association]}]
+                (let [step (util/subst-syms substitutions step)
+                      attributes
+                      (cond-> {:accumulator accumulator :identity identity :dtype dtype
+                               :extent extent :association association}
+                        (= :implementation-defined association)
+                        (assoc :algebra
+                               (try
+                                 (scan/certify-reassociation
+                                  {:acc accumulator :init identity
+                                   :lambda (dialect/scalar-converts->source step)}
+                                  dtype)
+                                 (catch clojure.lang.ExceptionInfo exception
+                                   (fail! :segmented-fold-map-not-associative
+                                          "requested fold-map reassociation lacks a typed monoid proof"
+                                          {:fold ordinal :accumulator accumulator :dtype dtype
+                                           :step step :certificate-error
+                                           (ex-data exception)})))))]
+                  (list 'fold attributes
+                        (dialect/lambda-form
+                         (vec (concat [accumulator] (subvec accumulators 0 ordinal)
+                                      capture-parameters))
+                         [step]))))
               (range) folds)
+        operation-association
+        (if (every? #(= :ordered (:association (second %))) fold-forms)
+          :ordered :per-fold)
         map-lambda
         (dialect/lambda-form
          (vec (concat accumulators capture-parameters))
@@ -3857,7 +3876,7 @@
     (list '= id results
           (list 'segmented-fold-map
                 {:segment-axes segment-axes :index index :extent extent
-                 :association :ordered :dtypes result-dtypes
+                 :association operation-association :dtypes result-dtypes
                  :attributes {:stable-array-captures stable
                               :source-operation :raster.par/segmented-fold-map!}}
                 [] captures fold-forms map-lambda))))
