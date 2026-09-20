@@ -188,8 +188,9 @@ independent multi-store `map-void!` bodies become one tuple-valued TypedSOAC `ma
 result IDs remain SSA values, while an ordered checked `:result-storage` vector maps each result to
 its caller-owned destination, access mode, and host-return contract. The effect binder therefore
 retains its real `nil` host semantics instead of masquerading as a tensor result. The scheduled
-SegMap and its ordered ABI are consumed by staged and resident compilation; unsupported raw
-map-void bodies retain the compatibility generator. The front end refuses duplicate destinations,
+SegMap and its ordered ABI are consumed by staged and resident compilation; an unsupported raw
+map-void body fails with its typed scheduling decline and cannot re-enter a source-shaped GPU
+emitter. The front end refuses duplicate destinations,
 uncontracted scatter indices, sibling write/read ordering, and atomics. A destination wrapped in
 `par/unique-index` carries an explicit caller proof of conflict freedom into a TypedSOAC `scatter`;
 the marker is consumed before scalar lowering, while the checked read/write storage contract and

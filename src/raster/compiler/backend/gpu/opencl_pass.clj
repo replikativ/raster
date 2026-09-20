@@ -968,20 +968,16 @@
                                 :array-types top-array-types)
                       k (register-kernel! kernel :ze-maps)]
                     (emit-map-void-invocation k device-id))
-                  ;; A partially scheduled source program still needs a flat resident marker.
-                  ;; Re-scheduling just this binding would introduce private scalar lets after
-                  ;; graph/ABI formation. Keep that explicit compatibility boundary until the
-                  ;; whole host region can be normalized before emission.
                   (if (and (not supplied-program)
                            (or direct-mini-program? parallel-program))
-                    (let [kernel (legacy/generate-par-map-void-kernel
-                                  form :dtype dtype :device-id device-id
-                                  :array-types top-array-types :scalar-types top-scalar-types)
-                          kernel (assoc-in kernel [:attributes :emission-route]
-                                           :compatibility-effect-opencl)
-                          k (register-kernel! kernel :ze-maps)]
-                      (swap! stats update :effect-compatibility (fnil inc 0))
-                      (emit-map-void-invocation k device-id))
+                    (throw
+                     (ex-info
+                      "GPU effect map has no verified TypedSOAC schedule"
+                      {:reason :unscheduled-effect-map
+                       :source form
+                       :target-dialect :kernel-body
+                       :scheduling (:stats direct-schedule)
+                       :fallback :none}))
                     (emit-nested-map! form)))))
 
             ;; par/scan-exclusive
