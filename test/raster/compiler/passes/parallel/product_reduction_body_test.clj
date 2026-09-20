@@ -376,8 +376,9 @@
     (is (= (derive source) (regions/dense-read-requirements source
                                                           (dissoc options :array-shapes) decline!))
         "lowering does not need a fabricated shape")
-    (doseq [coordinate ['offset 0
-                        '(clojure.core/aget indices col)]]
+    (is (= {'values (launch/product 'width)} (derive (change-load 'offset)))
+        "a retained local equal to the reduction axis is a verified broadcast map")
+    (doseq [coordinate [0 '(clojure.core/aget indices col)]]
       (is (thrown? clojure.lang.ExceptionInfo (derive (change-load coordinate)))))
     (let [with-combine-read
           (assoc-in source [:reduction :combine :results 0]

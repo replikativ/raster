@@ -121,9 +121,9 @@
          [(float sum)])]
     effect))
 
-(deftm c-family-product-map!
+(deftm c-family-broadcast-product-map!
   "A short tuple reduction followed by an ordered epilogue over compiler-owned intermediates."
-  [input :- (Array int), output :- (Array int), rows :- Long] :- Void
+  [input :- (Array int), weights :- (Array int), output :- (Array int), rows :- Long] :- Void
   (let [segments (* rows 8)
         partials (int-array segments)]
     (raster.par/product-reduce!
@@ -131,8 +131,11 @@
      [[sum 0 :int]]
      [[row rows] [lane 8]]
      chunk 8
-     [value (raster.arrays/aget input
-                                (+ (* (+ (* row 8) lane) 8) chunk))]
+     [value (unchecked-add-int
+             (raster.arrays/aget input (+ (* (+ (* row 8) lane) 8) chunk))
+             ;; Reduction-major weights are shared across rows. This is the same verified
+             ;; permutation+broadcast shape used by packed matrix/vector products.
+             (raster.arrays/aget weights (+ (* chunk 8) lane)))]
      [value]
      [[left right]]
      []
@@ -474,12 +477,13 @@
 (deftest product-reduction-composes-with-an-ordered-epilogue
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
-                       #'c-family-product-map!
+                       #'c-family-broadcast-product-map!
                        {:target target :dtype :int
                         :values {'input (av/tensor {:dtype :int :shape [64]})
+                                 'weights (av/tensor {:dtype :int :shape [64]})
                                  'output (av/tensor {:dtype :int :shape [1]})}})
           linked (equation-first/lower
-                  compilation [(int-array 64) (int-array 1) 1])]
+                  compilation [(int-array 64) (int-array 64) (int-array 1) 1])]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 2 (count (:kernels compilation))))
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))

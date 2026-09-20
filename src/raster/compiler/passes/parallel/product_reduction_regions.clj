@@ -6,12 +6,33 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
+
+(defn- ordered-axis-selections
+  "All non-empty ordered subsets of a small semantic axis set. The caller bounds axis count."
+  [axes]
+  (letfn [(walk [prefix remaining]
+            (concat (when (seq prefix) [prefix])
+                    (mapcat (fn [axis]
+                              (walk (conj prefix axis)
+                                    (vec (remove #(= axis %) remaining))))
+                            remaining)))]
+    (walk [] (vec axes))))
+
+(defn- matching-indexing-map
+  [axes coordinate index-types]
+  (some (fn [selection]
+          (let [candidate (axis-map/of-groups [selection])]
+            (when (axis-map/bounded-typed-index-matches?
+                   candidate coordinate index-types)
+              [candidate (apply launch/product (map second selection))])))
+        (ordered-axis-selections axes)))
 
 (defn- binding-types [region supplied decline!]
   (reduce (fn [facts id]
@@ -74,15 +95,20 @@
      :axes (conj (mapv (juxt :name :bound) segments) [column width])}))
 
 (defn dense-read-requirements
-  "Derive minimum flat capacities from the actual typed element loads, or decline.
+  "Derive exact flat capacities from verified operand indexing maps, or decline.
 
-   Initially every input load must implement the full row/column AxisMap. Gather, narrower
-   broadcasts, computed SSA coordinates and combine-time reads are not silently called dense.
-   This returns required capacities, not actual allocation sizes or an execution certificate.
-   The row guard and column loop must establish active domains when the body is scheduled."
+   A load may use any permutation/subset of the semantic segment and reduction axes, which covers
+   dense tensors, transposes and broadcasts. Its actual coordinate must equal the selected
+   AxisMap and that map's volume must equal retained physical storage. Gather, computed SSA
+   coordinates and combine-time reads are not silently admitted. This returns required capacities,
+   not an independent execution certificate; the segment guard and lane loop establish the active
+   domains when the body is scheduled."
   [segred options decline!]
   (let [{:keys [element combine index-types axes]} (lower segred options decline!)
-        layout (axis-map/of-axes axes)
+        _ (when (> (count axes) 6)
+            (decline! :indexing-map-rank
+                      "product indexing-map search is bounded to six semantic axes"
+                      {:axes axes}))
         loads (fn [operations]
                 (filter #(= "raster.compiler.ir.kernel_body.ScalarLoad" (some-> % class .getName))
                         (tree-seq coll? seq operations)))
@@ -94,12 +120,23 @@
                                 (mapv #(symbol (str "read-right-" %)) (range arity)))
         _ (when (seq (loads (:operations combine-region)))
             (decline! :combine-read "dense element bounds do not justify combine reads" {}))
-        _ (doseq [{:keys [buffer coordinates]} element-loads]
-            (when-not (and (= 1 (count coordinates))
-                           (axis-map/bounded-typed-index-matches?
-                            layout (first coordinates) index-types))
-              (decline! :dense-read-index
-                        "product input does not have a bounded typed dense index"
-                        {:input buffer :coordinates coordinates})))
-        extent (apply launch/product (map second axes))]
-    (into {} (map (fn [{:keys [buffer]}] [buffer extent])) element-loads)))
+        contracts
+        (mapv (fn [{:keys [buffer coordinates]}]
+                (let [[indexing-map extent]
+                      (when (= 1 (count coordinates))
+                        (matching-indexing-map axes (first coordinates) index-types))]
+                  (when-not indexing-map
+                    (decline! :dense-read-index
+                              "product input has no verified permutation/broadcast indexing map"
+                              {:input buffer :coordinates coordinates :axes axes}))
+                  [buffer extent]))
+              element-loads)]
+    (reduce (fn [requirements [buffer extent]]
+              (if-let [prior (get requirements buffer)]
+                (if (extent-expression/equivalent? prior extent)
+                  requirements
+                  (decline! :input-indexing-map
+                            "one product input is read through incompatible physical maps"
+                            {:input buffer :left prior :right extent}))
+                (assoc requirements buffer extent)))
+            {} contracts)))
