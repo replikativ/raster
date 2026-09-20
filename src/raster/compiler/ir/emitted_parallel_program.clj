@@ -38,7 +38,23 @@
       (and (= 1 (count (:operations equation)))
            (let [operation (first (:operations equation))]
              (and (emitted-equation/emitted-equation? operation)
-                  (= algorithm (:algorithm (emitted-equation/validate! operation)))))))
+                  (let [emitted (emitted-equation/validate! operation)
+                        refinement (:refinement emitted)
+                        compound? (seq (get-in equation
+                                               [:attributes :emitted-source-equations]))
+                        source-graph (:source refinement)
+                        retained-operands
+                        (when source-graph
+                          (set (concat (map :id (:inputs source-graph))
+                                       (map :id (:scalars source-graph)))))
+                        expected-operands
+                        (if compound?
+                          (filterv retained-operands (:inputs (soac/facts algorithm)))
+                          (:inputs (soac/facts algorithm)))]
+                    (and (= algorithm (:algorithm emitted))
+                         (or (not compound?) (some? source-graph))
+                         (= (:operands equation) expected-operands)
+                         (= (:results equation) (soac/outputs algorithm))))))))
 
     :else false))
 
@@ -63,13 +79,21 @@
           (when (emitted-equation/emitted-equation? operation)
             (let [body (:body operation)
                   body-equations (:equations body)
-                  actual-prefix (vec (butlast body-equations))
-                  terminal-body (last body-equations)
+                  actual-prefix (filterv #(true? (get-in % [:attributes :host-only]))
+                                         body-equations)
+                  numerical-body (filterv #(not (true? (get-in % [:attributes :host-only])))
+                                          body-equations)
+                  source-equations (get-in equation [:attributes :emitted-source-equations])
+                  exact-source?
+                  (if source-equations
+                    (= source-equations (mapv :id numerical-body))
+                    (and (= 1 (count numerical-body))
+                         (= (scheduled-equation-view equation)
+                            (scheduled-equation-view (first numerical-body)))))
                   expected-inputs (program/infer-inputs body-equations)
                   expected-effects (reduce set/union #{} (map :effects body-equations))]
               (when-not (and (= host-prefix actual-prefix)
-                             (= (scheduled-equation-view equation)
-                                (scheduled-equation-view terminal-body))
+                             exact-source?
                              (= expected-inputs (:inputs body))
                              (= (:results equation) (:outputs body))
                              (= expected-effects (:effects body)))
@@ -78,6 +102,8 @@
                                  :outer-equation (:id equation)
                                  :expected-prefix (mapv :id host-prefix)
                                  :actual-prefix (mapv :id actual-prefix)
+                                 :expected-source-equations source-equations
+                                 :actual-source-equations (mapv :id numerical-body)
                                  :expected-inputs expected-inputs :actual-inputs (:inputs body)
                                  :ir :emitted-parallel-program})))))
           (recur host-prefix (next remaining)))))))

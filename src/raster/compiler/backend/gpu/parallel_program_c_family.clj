@@ -19,6 +19,8 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.product-consumer-region :as product-consumer-region]
+            [raster.compiler.passes.parallel.product-consumer-route :as product-consumer-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
@@ -135,6 +137,74 @@
              "scheduled equation has no supported retained algorithm"
              {:equation (:id equation) :algorithm algorithm}))))
 
+(defn- product-consumer-plans
+  "Admit non-overlapping consecutive numerical pairs through the generic region proof.
+
+   Declines are ordinary: their equations continue through independent emission. Any unexpected
+   analysis failure remains a compiler error rather than silently selecting another route."
+  [parallel-program]
+  (let [numerical (filterv (comp seq :operations) (:equations parallel-program))]
+    (mapv #(assoc %2 :region-ordinal %1)
+     (range)
+     (loop [remaining numerical plans []]
+      (if (< (count remaining) 2)
+        plans
+        (let [pair (subvec remaining 0 2)
+              result (if (every? (comp soac/program-form? :algorithm) pair)
+                       (try
+                         {:plan (product-consumer-region/analyze parallel-program pair)}
+                         (catch clojure.lang.ExceptionInfo exception
+                           (if (product-consumer-region/declined? exception)
+                             {:declined true}
+                             (throw exception))))
+                       {:declined true})]
+          (if-let [plan (:plan result)]
+            (recur (subvec remaining 2) (conj plans plan))
+            (recur (subvec remaining 1) plans))))))))
+
+(defn- emit-product-consumer
+  [plan opts]
+  (let [target-dialect (get opts :target-dialect :opencl-intel)
+        target-module (c-dialect/target (c-dialect/resolve! target-dialect))
+        routed (product-consumer-route/schedule plan)
+        kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
+        {:keys [emitted refinement]} (product-consumer-route/emit
+                                      kernel-name routed target-dialect)
+        algorithm (get-in plan [:source :algorithm])
+        body (get-in plan [:source :body])
+        facts (soac/facts algorithm)
+        source-graph (get-in routed [:refinement :source])
+        retained-operands (set (concat (map :id (:inputs source-graph))
+                                       (map :id (:scalars source-graph))))
+        operands (filterv retained-operands (:inputs facts))
+        operation (emitted-equation/make
+                   algorithm body emitted
+                   {:refinement refinement
+                    :provenance {:target-dialect target-dialect
+                                 :target-module target-module
+                                 :pass :parallel-program-c-family
+                                 :schedule :product-ordered-consumer}})]
+    (program/->ProgramEquation
+     [:product-ordered-consumer (:equations plan)]
+     [:equation-region (:equations plan)] nil
+     operands (soac/outputs algorithm) algorithm [operation]
+     (:effects facts)
+     {:source-equations (:equations plan)
+      :pass :parallel-program-c-family}
+     {:emitted-source-equations (:equations plan)
+      :schedule :product-ordered-consumer})))
+
+(defn- emit-equations
+  [parallel-program opts]
+  (let [plans (product-consumer-plans parallel-program)
+        by-consumer (into {} (map (fn [plan] [(peek (:equations plan)) plan])) plans)
+        producers (set (map (comp first :equations) plans))]
+    (mapv (fn [equation]
+            (if (contains? by-consumer (:id equation))
+              (emit-product-consumer (get by-consumer (:id equation)) opts)
+              (emit-equation parallel-program equation opts)))
+          (remove #(contains? producers (:id %)) (:equations parallel-program)))))
+
 (defn validate-program!
   [parallel-program]
   (emitted-program/validate! parallel-program))
@@ -150,15 +220,19 @@
          target-dialect (get opts :target-dialect :opencl-intel)
          target-module (c-dialect/target (c-dialect/resolve! target-dialect))
          program-dialect (target-program-dialect target-dialect)
-         equations (mapv #(emit-equation parallel-program % opts)
-                         (:equations parallel-program))
+         equations (emit-equations parallel-program opts)
+         region-count (count (filter #(= :product-ordered-consumer
+                                         (get-in % [:attributes :schedule])) equations))
+         program-inputs (if (pos? region-count)
+                          (program/infer-inputs equations)
+                          (:inputs parallel-program))
          emitted-program
          (validate-program!
           (program/make
            {:dialect program-dialect
             :source (:source parallel-program)
             :values (:values parallel-program)
-            :inputs (:inputs parallel-program)
+            :inputs program-inputs
             :equations equations
             :outputs (:outputs parallel-program)
             :effects (:effects parallel-program)
@@ -179,13 +253,16 @@
                               graphs))]
      {:program emitted-program
       :kernels kernels
-      :stats {:structured-loops-emitted
-              (count (filter (comp emitted-loop/emitted-loop? first :operations) equations))
-              :typed-equations-emitted
-              (count (filter (comp emitted-equation/emitted-equation? first :operations)
-                             equations))
-              :host-scalar-equations
-              (count (filter #(get-in % [:attributes :host-only]) equations))
-              :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
-              :kernel-body-declines
-              (frequencies (keep kernel-body-decline-key kernels))}})))
+      :stats (cond->
+              {:structured-loops-emitted
+               (count (filter (comp emitted-loop/emitted-loop? first :operations) equations))
+               :typed-equations-emitted
+               (count (filter (comp emitted-equation/emitted-equation? first :operations)
+                              equations))
+               :host-scalar-equations
+               (count (filter #(get-in % [:attributes :host-only]) equations))
+               :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
+               :kernel-body-declines
+               (frequencies (keep kernel-body-decline-key kernels))}
+               (pos? region-count)
+               (assoc :product-consumer-regions-emitted region-count))})))

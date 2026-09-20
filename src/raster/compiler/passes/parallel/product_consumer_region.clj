@@ -261,7 +261,15 @@
                       "product-consumer region requires SegRed followed by SegMap"
                       {:operations (mapv record-name operations)}))
         operator (reduction/validate! (:reduction producer))
-        _ (reduction/validate-product-tree! operator (:schedule producer))
+        _ (try
+            (reduction/validate-product-tree! operator (:schedule producer))
+            (catch clojure.lang.ExceptionInfo exception
+              (if (= :product-reduction-schedule-not-emittable
+                     (:reason (ex-data exception)))
+                (decline! :producer-schedule
+                          "product consumer requires an admitted segmented workgroup tree"
+                          {:strategy (get-in producer [:schedule :strategy])})
+                (throw exception))))
         intermediate-set (set/intersection (:outputs producer) (:inputs consumer))
         _ (when-not (and (= 1 (count intermediate-set))
                          (= intermediate-set (:outputs producer)))
