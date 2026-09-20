@@ -69,6 +69,7 @@
         value (witness)]
     (is (refinement/scheduled-graph-refinement? value))
     (is (= :contract (refinement/source-operation value)))
+    (is (= [:contract] (refinement/source-operations value)))
     (is (= refined (refinement/scheduled-graph value)))
     (is (= (graph/boundary-contract source)
            (graph/boundary-contract refined)))
@@ -76,15 +77,19 @@
               (graph/dataflow-contract refined))
         "private topology changes without weakening strict emission equivalence")))
 
-(deftest refinement-rejects-erasure-and-a-non-singleton-source
+(deftest refinement-rejects-erasure-and-accepts-a-semantic-subgraph
   (let [{:keys [a b refined]} (fixtures)
         empty-source (graph/make {:inputs [a b] :nodes []})]
     (is (= :scheduled-graph-refinement-source-cardinality
            (reason-of #(refinement/make
                         {:source empty-source :graph refined :schedule {}}))))
-    (is (= :scheduled-graph-refinement-source-cardinality
-           (reason-of #(refinement/make
-                        {:source refined :graph refined :schedule {}}))))
+    (let [value (refinement/make
+                 {:source refined :graph refined
+                  :schedule {:kind :identity-subgraph-fixture}
+                  :numerics {:mode :exact :policy :identity-subgraph-fixture}})]
+      (is (= [:cast-a :cast-b :matrix] (refinement/source-operations value)))
+      (is (= :scheduled-graph-refinement-source-operation-cardinality
+             (reason-of #(refinement/source-operation value)))))
     (let [{:keys [source]} (fixtures)
           empty-refined (graph/make {:inputs [a b] :nodes []})]
       (is (= :scheduled-graph-refinement-empty

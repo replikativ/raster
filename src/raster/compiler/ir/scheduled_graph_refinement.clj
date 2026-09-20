@@ -1,5 +1,5 @@
 (ns raster.compiler.ir.scheduled-graph-refinement
-  "A checked one-semantic-node to many-scheduled-kernels refinement.
+  "A checked semantic-subgraph to scheduled-kernel-graph refinement.
 
    The witness preserves the graph's exact public boundary while allowing a schedule to introduce
    private temporaries and an ordered kernel DAG.  This IR establishes structural identity; the
@@ -36,9 +36,9 @@
          :keys [schedule numerics provenance attributes]} refinement
         source (graph/validate! source)
         refined (graph/validate! refined)]
-    (when-not (= 1 (count (:nodes source)))
+    (when-not (seq (:nodes source))
       (fail! :scheduled-graph-refinement-source-cardinality
-             "a graph refinement currently requires exactly one semantic source node"
+             "a graph refinement requires a non-empty semantic source graph"
              {:nodes (mapv :id (:nodes source))}))
     (when-not (seq (:nodes refined))
       (fail! :scheduled-graph-refinement-empty
@@ -81,10 +81,27 @@
   (validate!
    (->ScheduledGraphRefinement source graph schedule numerics provenance attributes)))
 
-(defn source-operation
-  "Return the exact semantic operation refined by this witness."
+(defn source-operations
+  "Return the exact ordered semantic operations refined by this witness.
+
+   A fused schedule may refine a dependency-closed semantic subgraph into one kernel. Keeping the
+   complete source operation vector in the certificate prevents that schedule from inventing a
+   composite semantic primitive or dropping an intermediate dependence."
   [refinement]
-  (-> refinement validate! :source :nodes first :operation))
+  (mapv :operation (:nodes (:source (validate! refinement)))))
+
+(defn source-operation
+  "Return the sole semantic operation refined by a singleton witness.
+
+   This compatibility accessor is intentionally strict. Callers scheduling a fused semantic
+   subgraph must consume `source-operations` and prove the complete ordered region."
+  [refinement]
+  (let [operations (source-operations refinement)]
+    (when-not (= 1 (count operations))
+      (fail! :scheduled-graph-refinement-source-operation-cardinality
+             "a singleton source operation was requested from a multi-operation refinement"
+             {:operation-count (count operations)}))
+    (first operations)))
 
 (defn scheduled-graph
   "Return the checked many-kernel schedule graph."
