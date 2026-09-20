@@ -46,8 +46,11 @@
                   (= af :q8_K) (assoc "xbs" (:bsums xl))
                   (= wf :q4_K) (assoc "wdmin" (:dmin wl) "wsc" (:sc wl) "wm" (:m wl))
                   (= wf :q6_K) (assoc "wsc" (:sc wl)))]
-    {:specs (into {} (map (fn [[param arr]] (spec (keyword param) arr))) entries)
+    {:arrays entries
+     :specs (into {} (map (fn [[param arr]] (spec (keyword param) arr))) entries)
      :bindings (into {} (map (fn [[param _]] [param (keyword param)])) entries)}))
+
+(declare run-program)
 
 (deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
   (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-rows! :ze:0 :dtype :float)]
@@ -84,7 +87,7 @@
             xfloats (values (* nrows in) 12 2.0)
             w {:blocks (ggml/quantize wf wfloats in out) :n in :rows out}
             x {:blocks (ggml/quantize af xfloats in nrows) :n in :rows nrows}
-            {:keys [specs bindings]} (buffers wf af w x)
+            {:keys [arrays specs bindings]} (buffers wf af w x)
             wrow (ggml/row-bytes wf in)
             xrow (ggml/row-bytes af in)
             expected (for [row (range nrows) o (range out)]
@@ -93,13 +96,21 @@
                                              (row-bytes (:blocks x) row xrow) in))))
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :dot kernel)
-          (gpu/alloc! sess (assoc specs :y [:float (* nrows out) nil]))
-          (gpu/prepare! sess :dot (assoc bindings "y" :y) [in out] (* nrows out)
-                        {:kernel-phase :dot})
-          (gpu/invoke-bound! sess :dot)
-          (gpu/sync! sess)
-          (let [actual (map #(Float/floatToRawIntBits %) (gpu/download sess :y))
+          (let [actual-values
+                (if (= wf :q6_K)
+                  (:y (run-program kernel
+                                   (assoc arrays "y" (float-array (* nrows out))
+                                                 'in in 'out out 'nrows nrows)
+                                   [:y]))
+                  (do
+                    (gpu/compile! sess :dot kernel)
+                    (gpu/alloc! sess (assoc specs :y [:float (* nrows out) nil]))
+                    (gpu/prepare! sess :dot (assoc bindings "y" :y) [in out] (* nrows out)
+                                  {:kernel-phase :dot})
+                    (gpu/invoke-bound! sess :dot)
+                    (gpu/sync! sess)
+                    (gpu/download sess :y)))
+                actual (map #(Float/floatToRawIntBits %) actual-values)
                 mismatches (count (remove true? (map = expected actual)))]
             (testing (str (name wf) " x " (name af))
               (when (= wf :q4_K)
