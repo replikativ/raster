@@ -676,6 +676,31 @@
 ;; Kernel layouts: lossless decodings of ggml blocks for the GPU dot kernels
 ;; ---------------------------------------------------------------------------
 
+(defn code-position
+  "Where element `e` of a super-block format sits in the packed words.
+
+  ggml's K-quant dot keeps eight int32 lanes, lane `l` taking the elements
+  congruent to `l` modulo 8. Lane-major packing puts the four elements one lane
+  takes from a 32-element chunk in one word, so the GPU reads that lane's chunk
+  as a single dp4a instead of four byte extractions. The chunk also shares a
+  scale (q4_K) or a scale pair (q6_K), so nothing else has to move."
+  ^long [^long e]
+  (let [block (quot e 256) r (rem e 256)
+        chunk (quot r 32) within (rem r 32)]
+    (+ (* block 256)
+       (* 4 (+ (* chunk 8) (rem within 8)))
+       (quot within 8))))
+
+(defn- put-lane-code!
+  "Store code `v` at element `e`'s lane-major position."
+  [^ints words ^long e ^long v]
+  (let [p (code-position e)
+        w (quot p 4)
+        shift (* 8 (rem p 4))]
+    (aset words w (unchecked-int (bit-or (bit-and (long (aget words w))
+                                                  (bit-not (bit-shift-left 0xFF shift)))
+                                         (bit-shift-left (bit-and v 0xFF) shift))))))
+
 (defn- put-code!
   "Store code `v` (a signed or unsigned byte value) as byte `e` of packed int32
   words: four codes per word, little-endian, in element order."
@@ -690,7 +715,9 @@
   "Decode `nrows` rows of ggml `format` blocks (each `n` elements) into the
   arrays the GPU dot kernels read. Every value is exact: FP16 scales become the
   floats they denote, packed 6-bit scales become ints, and codes are packed
-  four int8 per int32 word in element order.
+  four int8 per int32 word: in element order for the 32-element formats, and
+  lane-major (see `code-position`) for the super-block formats, whose dot reads
+  a whole lane-chunk per dp4a.
 
     :q8_0, :q5_0  {:q int[n/4 per row] :d float[n/32 per row]}
     :q8_K         {:q int[...] :d float[n/256 per row] :bsums int[16 per block]}
@@ -738,8 +765,8 @@
         (dotimes [b nblocks]
           (let [o (* b bytes)]
             (aset d b (.getFloat bb (int o)))
-            (dotimes [w 64]
-              (aset q (+ (* b 64) w) (unchecked-int (get-u32 blocks (+ o 4 (* 4 w))))))
+            (dotimes [e 256]
+              (put-lane-code! q (+ (* b 256) e) (long (aget blocks (+ o 4 e)))))
             (dotimes [j 16]
               (aset bsums (+ (* b 16) j) (int (.getShort bb (int (+ o 260 (* 2 j)))))))))
         {:q q :d d :bsums bsums})
@@ -760,8 +787,8 @@
             (dotimes [g 4]
               (dotimes [l 32]
                 (let [v (u8 (+ o 16 (* 32 g) l))]
-                  (put-code! q (+ e0 (* 64 g) l) (bit-and v 0xF))
-                  (put-code! q (+ e0 (* 64 g) 32 l) (bit-shift-right v 4)))))))
+                  (put-lane-code! q (+ e0 (* 64 g) l) (bit-and v 0xF))
+                  (put-lane-code! q (+ e0 (* 64 g) 32 l) (bit-shift-right v 4)))))))
         {:q q :d d :dmin dmin :sc sc :m m})
 
       :q6_K
@@ -776,14 +803,14 @@
               (let [qlo (+ o (* 64 h)) qho (+ o 128 (* 32 h)) base (+ e0 (* 128 h))]
                 (dotimes [l 32]
                   (let [ql0 (u8 (+ qlo l)) ql1 (u8 (+ qlo 32 l)) qh (u8 (+ qho l))]
-                    (put-code! q (+ base l)
-                               (- (bit-or (bit-and ql0 0xF) (bit-shift-left (bit-and qh 3) 4)) 32))
-                    (put-code! q (+ base 32 l)
-                               (- (bit-or (bit-and ql1 0xF) (bit-shift-left (bit-and (bit-shift-right qh 2) 3) 4)) 32))
-                    (put-code! q (+ base 64 l)
-                               (- (bit-or (bit-shift-right ql0 4) (bit-shift-left (bit-and (bit-shift-right qh 4) 3) 4)) 32))
-                    (put-code! q (+ base 96 l)
-                               (- (bit-or (bit-shift-right ql1 4) (bit-shift-left (bit-and (bit-shift-right qh 6) 3) 4)) 32))))))))
+                    (put-lane-code! q (+ base l)
+                                    (- (bit-or (bit-and ql0 0xF) (bit-shift-left (bit-and qh 3) 4)) 32))
+                    (put-lane-code! q (+ base 32 l)
+                                    (- (bit-or (bit-and ql1 0xF) (bit-shift-left (bit-and (bit-shift-right qh 2) 3) 4)) 32))
+                    (put-lane-code! q (+ base 64 l)
+                                    (- (bit-or (bit-shift-right ql0 4) (bit-shift-left (bit-and (bit-shift-right qh 4) 3) 4)) 32))
+                    (put-lane-code! q (+ base 96 l)
+                                    (- (bit-or (bit-shift-right ql1 4) (bit-shift-left (bit-and (bit-shift-right qh 6) 3) 4)) 32))))))))
         {:q q :d d :sc sc}))))
 
 (defn read-f32

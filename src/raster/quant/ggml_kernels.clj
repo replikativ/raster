@@ -26,43 +26,49 @@
 ;; `lane-form` generates each lane's loop with plain, lane-unique locals, and
 ;; `k-quant-dot` splices them into a quoted kernel template.
 
-(defn- s8-form
-  "Form for signed byte `k` of int32 word `w`, bound to local `v`."
-  [v w k]
-  (list 'let [v (list 'bit-and (list 'bit-shift-right w (list '* 8 k)) 0xFF)]
-        (list 'if (list '> v 127) (list '- v 256) v)))
-
-(defn- u8-form
-  "Form for unsigned byte `k` of int32 word `w`."
-  [_ w k]
-  (list 'bit-and (list 'bit-shift-right w (list '* 8 k)) 0xFF))
-
 (defn- lane-form
-  "Form for ggml's int32 lane `l` of one K-quant super-block: element l of each
-  of the 32 eight-element chunks times the chunk's scale. `chunks-per-scale` is
-  4 for q4_K (a 6-bit scale per 32 elements) and 2 for q6_K (an int8 scale per
-  16). Reads the template's `wq`, `xq`, `wsc`, `ww`, `xw` and `scb`."
-  [l weight-code chunks-per-scale]
+  "Form for ggml's int32 lane `l` of one K-quant super-block.
+
+  The layout is lane-major (`ggml/code-position`), so the four elements this
+  lane takes from a 32-element chunk are one word and one dp4a. `scales-per-chunk`
+  is 1 for q4_K, whose 6-bit scale spans the whole chunk, and 2 for q6_K, whose
+  int8 scales split it: there the word's halves are masked apart and scaled
+  separately, which costs a second dp4a but keeps the packing shared. The sum is
+  the same integer either way, so the float lanes above are untouched. Reads the
+  template's `wq`, `xq`, `wsc`, `ww`, `xw` and `scb`."
+  [l scales-per-chunk]
   (let [n #(symbol (str % "-l" l))
-        c (n "c") acc (n "acc") e (n "e") wv (n "wv") xv (n "xv") sc (n "sc")]
+        c (n "c") acc (n "acc") w (n "w") wv (n "wv") xv (n "xv")
+        lo (n "lo") hi (n "hi")]
     (list 'loop [c 0 acc 0]
-          (list 'if (list '< c 32)
-                (list 'let [e (list '+ (list '* c 8) l)
-                            wv (weight-code (n "wbyte") (list 'ra/aget 'wq (list '+ 'ww (list 'quot e 4)))
-                                            (list 'rem e 4))
-                            xv (s8-form (n "xbyte") (list 'ra/aget 'xq (list '+ 'xw (list 'quot e 4)))
-                                        (list 'rem e 4))
-                            sc (list 'ra/aget 'wsc (list '+ 'scb (list 'quot c chunks-per-scale)))]
-                      (list 'recur (list 'inc c) (list '+ acc (list '* sc (list '* wv xv)))))
+          (list 'if (list '< c 8)
+                (list 'let
+                      (into [w (list '+ (list '* c 8) l)]
+                            (if (= 1 scales-per-chunk)
+                              [wv (list 'ra/aget 'wq (list '+ 'ww w))
+                               xv (list 'ra/aget 'xq (list '+ 'xw w))]
+                              [wv (list 'ra/aget 'wq (list '+ 'ww w))
+                               xv (list 'ra/aget 'xq (list '+ 'xw w))
+                               lo (list 'rn/bit-and wv (int 0xFFFF))
+                               hi (list 'rn/bit-and wv (int -65536))]))
+                      (list 'recur (list 'inc c)
+                            (if (= 1 scales-per-chunk)
+                              (list '+ acc (list '* (list 'ra/aget 'wsc (list '+ 'scb c))
+                                                 (list 'par/dp4a wv xv 0)))
+                              (list '+ acc
+                                    (list '+ (list '* (list 'ra/aget 'wsc (list '+ 'scb (list '* c 2)))
+                                                   (list 'par/dp4a lo xv 0))
+                                          (list '* (list 'ra/aget 'wsc (list '+ 'scb (list '+ (list '* c 2) 1)))
+                                                (list 'par/dp4a hi xv 0)))))))
                 acc))))
 
 (defn- k-quant-dot
   "Splice lanes into `template`, replacing each `(lane l)` placeholder."
-  [template weight-code chunks-per-scale]
+  [template scales-per-chunk]
   (clojure.walk/postwalk
    (fn [form]
      (if (and (seq? form) (= 'lane (first form)))
-       (lane-form (second form) weight-code chunks-per-scale)
+       (lane-form (second form) scales-per-chunk)
        form))
    template))
 
@@ -161,7 +167,7 @@
                                         (- sumf pm)))
                                (+ (+ (+ (+ (+ (+ (+ (+ sumf s0) s1) s2) s3) s4) s5) s6) s7)))]
                        (ra/aset y ro acc))))
-   u8-form 4))
+   1))
 
 (def-q4-K-dot)
 
@@ -199,7 +205,7 @@
                                         (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
                                (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
                        (ra/aset y ro acc))))
-   s8-form 2))
+   2))
 
 (def-q6-K-dot)
 
@@ -301,9 +307,9 @@
                      (word-value-form (for [k (range 4)]
                                         (list '* (list 'ra/aget 'x (list '+ base k)) id))
                                       roundf-form))
-         word-q8-K (let [[_ base iscale] form]
+         word-q8-K (let [[_ base iscale stride] form]
                      (word-value-form (for [k (range 4)]
-                                        (list '* iscale (list 'ra/aget 'x (list '+ base k))))
+                                        (list '* iscale (list 'ra/aget 'x (list '+ base (* k stride)))))
                                       (fn [p] (let [v (local "code")]
                                                 ;; MIN(127, v) as an explicit integer comparison
                                                 (list 'let [v (list 'long (rint-form p))]
@@ -352,8 +358,8 @@
    '(deftm quant-act-q8-K-rows!
       "quantize_row_q8_K_ref over rows whose width is a multiple of 256: each block's
       float scale 1/iscale with iscale = -127/max (max the first element of largest
-      magnitude), 64 code words per block in element order, and the code sum of
-      each 16 elements."
+      magnitude), 64 code words per block in the lane-major order the K-quant
+      dots read (`ggml/code-position`), and the code sum of each 16 elements."
       [x :- (Array float), xq :- (Array int), xd :- (Array float), xbs :- (Array int),
        nblocks :- Long] :- Void
       (do
@@ -390,7 +396,11 @@
                                            found))
                              mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
                              iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))]
-                         (ra/aset xq i (word-q8-K (+ base (* (rem i 64) 4)) iscale))))
+                         ;; word (rem i 64) is chunk (quot w 8), lane (rem w 8):
+                         ;; that lane's four elements of the chunk, eight apart
+                         (ra/aset xq i (word-q8-K (+ base (+ (* (quot (rem i 64) 8) 32)
+                                                             (rem (rem i 64) 8)))
+                                                  iscale 8))))
         (par/map-void! g (* nblocks 16)
                        (let [base (* (quot g 16) 256)
                              gbase (+ base (* (rem g 16) 16))

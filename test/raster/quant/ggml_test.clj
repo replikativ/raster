@@ -89,8 +89,12 @@
           (is (= generic-result-bits (format "%08x" (Float/floatToRawIntBits (float s))))
               (str "got " s)))))))
 
-(defn- code [^ints words ^long e signed?]
-  (let [v (bit-and (bit-shift-right (long (aget words (quot e 4))) (* 8 (rem e 4))) 0xFF)]
+(defn- code
+  "Code of element `e`. `lane-major?` is true for the super-block formats,
+  whose packing groups a lane's chunk into one word."
+  [^ints words ^long e signed? lane-major?]
+  (let [p (if lane-major? (ggml/code-position e) e)
+        v (bit-and (bit-shift-right (long (aget words (quot p 4))) (* 8 (rem p 4))) 0xFF)]
     (if (and signed? (> v 127)) (- v 256) v)))
 
 (defn- dequantize-layout
@@ -103,15 +107,15 @@
       (aset out e
             (float
              (case format
-               :q8_0 (f* (double (code q e true)) (aget ^floats d (quot e 32)))
-               :q5_0 (f* (double (code q e true)) (aget ^floats d (quot e 32)))
+               :q8_0 (f* (double (code q e true false)) (aget ^floats d (quot e 32)))
+               :q5_0 (f* (double (code q e true false)) (aget ^floats d (quot e 32)))
                :q4_K (let [b (quot e 256) j (quot (rem e 256) 32)]
                        (double (float (- (f* (f* (aget ^floats d b) (double (aget ^ints sc (+ (* b 8) j))))
-                                             (double (code q e false)))
+                                             (double (code q e false true)))
                                          (f* (aget ^floats dmin b) (double (aget ^ints m (+ (* b 8) j))))))))
                :q6_K (let [b (quot e 256) j (quot (rem e 256) 16)]
                        (f* (f* (aget ^floats d b) (double (aget ^ints sc (+ (* b 16) j))))
-                           (double (code q e true))))))))
+                           (double (code q e true true))))))))
     out))
 
 (deftest kernel-layouts-decode-losslessly
