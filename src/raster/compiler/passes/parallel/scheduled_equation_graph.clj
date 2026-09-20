@@ -160,6 +160,67 @@
               bindings))
           {} equations))
 
+(defn- contiguous-equation-region!
+  [parallel-program equations]
+  (let [all-equations (:equations parallel-program)
+        positions (into {} (map-indexed (fn [index equation] [(:id equation) index]) all-equations))
+        indices (mapv #(get positions (:id %)) equations)]
+    (when-not (and (seq equations)
+                   (every? some? indices)
+                   (= indices (vec (range (first indices) (inc (last indices)))))
+                   (= equations (mapv #(nth all-equations %) indices))
+                   (every? (comp not true? #(get-in % [:attributes :host-only])) equations))
+      (fail! :scheduled-equation-region
+             "a scheduled equation region must be an exact non-empty contiguous numerical slice"
+             {:equations (mapv :id equations) :indices indices}))
+    indices))
+
+(defn- region-outputs
+  [parallel-program equations indices]
+  (let [selected-ids (set (map :id equations))
+        later-equations (drop (inc (last indices)) (:equations parallel-program))
+        escaping (set/union (set (:outputs parallel-program))
+                            (into #{} (mapcat :operands) later-equations))
+        terminal-results (set (:results (peek equations)))]
+    (into []
+          (filter #(or (contains? escaping %) (contains? terminal-results %)))
+          (mapcat :results equations))))
+
+(defn body-for-equations
+  "Return the dependency-closed scheduled program slice for a numerical equation region.
+
+   The equations must be an exact contiguous slice. Earlier host-scalar definitions are retained
+   as proof terms, while only terminal or escaping numerical results remain on the region boundary.
+   This is the graph-level seam used by schedules that refine several semantic equations into one
+   kernel; it does not itself authorize fusion or change their operations."
+  [parallel-program equations]
+  (let [parallel-program (program/validate! parallel-program)
+        equations (vec equations)
+        indices (contiguous-equation-region! parallel-program equations)
+        first-index (first indices)
+        preceding (subvec (:equations parallel-program) 0 first-index)
+        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
+        outputs (region-outputs parallel-program equations indices)
+        body-equations (into scalar-prefix equations)]
+    (program/make
+     {:dialect :segop
+      :source nil
+      :values (:values parallel-program)
+      :inputs (program/infer-inputs body-equations)
+      :equations body-equations
+      :outputs outputs
+      :effects (reduce set/union #{} (map :effects body-equations))
+      :diagnostics []
+      :provenance {:source-dialect :typed-soac
+                   :pass :scheduled-equation-graph}
+      :attributes {:host-control :explicit-typed-algorithm
+                   :equation-region (mapv :id equations)}
+      :operation? segop/segop-node?
+      :algorithm? (fn [candidate algorithm]
+                    (and (= algorithm (soac/validate! algorithm))
+                         (= (:operands candidate) (:inputs (soac/facts algorithm)))
+                         (= (:results candidate) (soac/outputs algorithm))))})))
+
 (defn body-for-equation
   "Return the dependency-closed scheduled program slice for one numerical equation.
 
@@ -168,34 +229,7 @@
    target emission and compatibility backend entry; neither may discard or reconstruct that
    prefix independently."
   [parallel-program equation]
-  (let [;; The enclosing program may also contain scheduled structured loops. Validate its
-        ;; envelope here; the extracted numerical slice below has strict SegOp legality.
-        parallel-program (program/validate! parallel-program)
-        retained (some #(when (= (:id %) (:id equation)) %) (:equations parallel-program))
-        _ (when-not (= retained equation)
-            (fail! :scheduled-equation-membership
-                   "scheduled equation is not an exact member of its parallel program"
-                   {:equation (:id equation)}))
-        preceding (take-while #(not= (:id %) (:id equation)) (:equations parallel-program))
-        scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
-        equations (conj scalar-prefix equation)]
-    (program/make
-     {:dialect :segop
-      :source nil
-      :values (:values parallel-program)
-      :inputs (program/infer-inputs equations)
-      :equations equations
-      :outputs (:results equation)
-      :effects (reduce set/union #{} (map :effects equations))
-      :diagnostics []
-      :provenance {:source-dialect :typed-soac
-                   :pass :scheduled-equation-graph}
-      :attributes {:host-control :explicit-typed-algorithm}
-      :operation? segop/segop-node?
-      :algorithm? (fn [candidate algorithm]
-                    (and (= algorithm (soac/validate! algorithm))
-                         (= (:operands candidate) (:inputs (soac/facts algorithm)))
-                         (= (:results candidate) (soac/outputs algorithm))))})))
+  (body-for-equations parallel-program [equation]))
 
 (defn- typed-host-scalar-equation?
   [values equation algorithm]
@@ -477,6 +511,46 @@
              "graph differs from its retained algorithm and scheduled body"
              {:expected expected :actual kernel-graph})))
   kernel-graph)
+
+(defn algorithm-for-equations
+  "Compose the exact retained TypedSOAC algorithms for a contiguous scheduled equation region.
+
+   Equation forms and equation facts are copied from the independently validated per-equation
+   algorithms. The enclosing ParallelProgram supplies only the authoritative value table and
+   boundary analysis; no source form is reparsed and no numerical operation is synthesized."
+  [parallel-program equations]
+  (let [parallel-program (program/validate! parallel-program)
+        equations (vec equations)
+        indices (contiguous-equation-region! parallel-program equations)
+        algorithms (mapv (comp soac/validate! :algorithm) equations)
+        equation-forms (vec (mapcat soac/equations algorithms))
+        equation-facts (apply merge (map (comp :equations soac/facts) algorithms))
+        inputs (program/infer-inputs equations)
+        outputs (region-outputs parallel-program equations indices)
+        effects (reduce set/union #{} (map (comp :effects soac/facts) algorithms))]
+    (soac/make
+     (soac/default-program-facts
+      {:values (:values parallel-program)
+       :inputs inputs
+       :equations equation-facts
+       :effects effects
+       :provenance {:source-dialect :typed-soac
+                    :pass :scheduled-equation-region}
+       :attributes {:equation-region (mapv :id equations)}})
+     equation-forms outputs)))
+
+(defn make-for-equations
+  "Derive one exact scheduled KernelGraph for a contiguous TypedSOAC equation region.
+
+   This constructs the unfused semantic source graph. A later schedule may replace that graph with
+   one kernel only through a checked ScheduledGraphRefinement that preserves its public boundary."
+  [parallel-program equations]
+  (let [equations (vec equations)
+        body (body-for-equations parallel-program equations)
+        algorithm (algorithm-for-equations parallel-program equations)]
+    {:algorithm algorithm
+     :body body
+     :graph (make algorithm body)}))
 
 (defn make-for-equation
   "Derive the exact scheduled KernelGraph for one TypedSOAC numerical equation.

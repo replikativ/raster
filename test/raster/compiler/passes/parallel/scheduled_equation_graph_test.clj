@@ -1,0 +1,55 @@
+(ns raster.compiler.passes.parallel.scheduled-equation-graph-test
+  (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]))
+
+(def ^:private three-map-source
+  '(let* [first-effect
+          (raster.par/map! tmp i n float (clojure.core/aget x i))
+          second-effect
+          (raster.par/map! middle j n float
+                           (clojure.core/+ (clojure.core/aget tmp j) 1.0))
+          third-effect
+          (raster.par/map! out k n float
+                           (clojure.core/* (clojure.core/aget middle k) 2.0))]
+     third-effect))
+
+(defn- scheduled-three-maps []
+  (let [options {:dtype :float :target-device :ocl:0
+                 :array-types {'x :float 'tmp :float 'middle :float 'out :float}
+                 :scalar-types {'n :long}}
+        typed (frontend/form->program three-map-source options)
+        envelope (route/program-envelope typed)]
+    (:form (segop-lower/segop-lower-pass envelope options))))
+
+(defn- reason-of [thunk]
+  (try
+    (thunk)
+    nil
+    (catch clojure.lang.ExceptionInfo exception
+      (:reason (ex-data exception)))))
+
+(deftest contiguous-equations-form-one-exact-semantic-source-graph
+  (let [scheduled (scheduled-three-maps)
+        equations (subvec (:equations scheduled) 0 2)
+        {:keys [algorithm body graph]} (equation-graph/make-for-equations scheduled equations)]
+    (is (= [0 1] (get-in body [:attributes :equation-region])))
+    (is (= [0 1] (get-in (soac/facts algorithm) [:attributes :equation-region])))
+    (is (= 2 (count (soac/equations algorithm))))
+    (is (= (:results (peek equations)) (soac/outputs algorithm)))
+    (is (= 2 (count (:nodes graph))))
+    (is (= #{'x} (set (map :id (:inputs graph)))))
+    (is (= #{'middle} (set (map :id (:outputs graph)))))
+    (is (= #{'tmp} (set (map :id (:temporaries graph)))))))
+
+(deftest equation-region-must-be-an-exact-contiguous-slice
+  (let [scheduled (scheduled-three-maps)
+        equations (:equations scheduled)]
+    (is (= :scheduled-equation-region
+           (reason-of #(equation-graph/make-for-equations
+                        scheduled [(first equations) (peek equations)]))))
+    (is (= :scheduled-equation-region
+           (reason-of #(equation-graph/make-for-equations scheduled []))))))
