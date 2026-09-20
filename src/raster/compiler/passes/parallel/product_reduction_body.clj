@@ -9,6 +9,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
@@ -251,14 +252,21 @@
   (let [options (graph-options node kernel-graph algorithm scheduled-body)
         candidate (scheduled/validate-against-node! candidate node kernel-graph)
         source (:operation node)
-        rows (segop/seg-space-num-segments-expr (:space source))
+        scalar-definitions (equation-graph/derived-scalar-expressions
+                            (:values scheduled-body)
+                            (take-while #(true? (get-in % [:attributes :host-only]))
+                                        (:equations scheduled-body)))
+        expand-derived #(util/subst-syms scalar-definitions %)
+        rows (extent-expression/canonical
+              (expand-derived (segop/seg-space-num-segments-expr (:space source))))
         buffers (into {} (map (juxt :id identity))
                       (concat (:inputs kernel-graph) (:outputs kernel-graph)
                               (:temporaries kernel-graph)))]
     (doseq [{:keys [result dtype]} (get-in source [:reduction :components]) :when result]
       (let [buffer (get buffers result)]
         ;; The initial certificate requires exact equality, not an unproved capacity inequality.
-        (when-not (and (= rows (:elements buffer)) (= dtype (:dtype buffer)))
+        (when-not (and (= rows (some-> buffer :elements extent-expression/canonical))
+                       (= dtype (:dtype buffer)))
           (decline! :graph-output-storage
                     "product output must retain the exact segment extent and component dtype"
                     {:output result :rows rows :dtype dtype :buffer buffer}))))

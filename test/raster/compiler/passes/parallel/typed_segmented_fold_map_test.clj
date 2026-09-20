@@ -6,6 +6,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -195,10 +196,8 @@
           operations))
 
 (deftest launch-and-kernel-index-maximum-have-one-canonical-storage-form
-  (let [canonical-extent (ns-resolve 'raster.compiler.passes.parallel.segfoldmap-body
-                                     'canonical-extent)]
-    (is (= (canonical-extent (launch/maximum 'n 1))
-           (canonical-extent (body/expression :max 'n 1))))))
+  (is (extent-expression/equivalent? (launch/maximum 'n 1)
+                                     (body/expression :max 'n 1))))
 
 (deftest interpreted-segmented-fold-map-preserves-dependent-fold-order
   (let [values (float-array [1.0 3.0, 2.0 2.0])
