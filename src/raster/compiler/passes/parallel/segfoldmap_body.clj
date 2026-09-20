@@ -701,14 +701,20 @@
                    :policy :certified-workgroup-tree
                    :rounding :implementation-defined
                    :accumulators
-                   (mapv (fn [fold]
-                           (let [fold-dtype (dtype/canon (:dtype fold))]
-                             {:value (:accumulator fold)
-                              :dtype fold-dtype
-                              :rounding (if (dtype/integral? fold-dtype)
-                                          :exact :implementation-defined)
-                              :policy :certified-workgroup-tree}))
-                         (:folds segfold))
+                   (mapv (fn [fold operator]
+                           (let [fold-dtype (dtype/canon (:dtype fold))
+                                 overflow (when (and (dtype/integral? fold-dtype)
+                                                     (contains? #{:+ :*} operator))
+                                            (intrinsics/source-overflow-policy
+                                             (get-in fold [:algebra :combine])))]
+                             (cond->
+                               {:value (:accumulator fold)
+                                :dtype fold-dtype
+                                :rounding (if (dtype/integral? fold-dtype)
+                                            :exact :implementation-defined)
+                                :policy :certified-workgroup-tree}
+                               overflow (assoc :overflow overflow))))
+                         (:folds segfold) operators)
                    :accumulator-dtypes (mapv (comp dtype/canon :dtype) (:folds segfold))
                    :reassociation :implementation-defined}
                   (= 1 (count (:folds segfold)))

@@ -333,6 +333,7 @@
            (mapv #(get-in % [:attributes :role]) loops)))
     (is (= [0 1] (mapv #(get-in % [:attributes :fold]) (butlast loops))))
     (is (= [:int :float] (get-in scheduled [:numerics :accumulator-dtypes])))
+    (is (= :wrap (get-in scheduled [:numerics :accumulators 0 :overflow])))
     (is (= '[counts values sum-out maximum-out]
            (get-in scheduled [:attributes :array-params])))
     (is (= [:+ :max] (get-in scheduled [:attributes :reduction-operators])))))
