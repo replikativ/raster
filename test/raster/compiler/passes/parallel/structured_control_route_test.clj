@@ -833,6 +833,42 @@
            (reason-of #(program-runtime/run-prepared! prepared))))
     (is (nil? (program-runtime/release-prepared! prepared)))))
 
+(deftest prepared-parallel-program-profiles-the-exact-replay-order
+  (let [call (:call (prepared-mixed-call 3))
+        ordinal (atom 0)
+        prepared
+        (program-runtime/prepare-with!
+         call
+         {:bind! (fn [key _graph _buffers _scalars] {:key key})
+          :run! (fn [_])
+          :release! (fn [_])})]
+    (try
+      (let [profile
+            (program-runtime/profile-prepared!
+             prepared
+             (fn [handle]
+               (let [n (double (swap! ordinal inc))]
+                 {:profile [{:kernel-name (pr-str (:key handle)) :ms (/ n 2.0)}]
+                  :kernel-total-ms (/ n 2.0)
+                  :device-wall-ms n
+                  :host-wall-ms 1000.0})))]
+        (is (= 4 (:program-graph-count profile))
+            "three loop launches and the suffix are four scheduled graph replays")
+        (is (= 4 (count (:profile profile))))
+        (is (= 5.0 (:kernel-total-ms profile)))
+        (is (= 10.0 (:device-wall-ms profile)))
+        (is (not= 4000.0 (:host-wall-ms profile))
+            "aggregate host wall time is observed once, never summed from callback metadata"))
+      (is (= :parallel-program-profile-span
+             (reason-of
+              #(program-runtime/profile-prepared!
+                prepared
+                (fn [_] {:profile [] :kernel-total-ms 0.0 :device-wall-ms nil})))))
+      (finally
+        (program-runtime/release-prepared! prepared)))
+    (is (= :parallel-program-closed
+           (reason-of #(program-runtime/profile-prepared! prepared (fn [_] {})))))))
+
 (deftest structured-loop-preparation-stays-constant-for-huge-trip-counts
   (let [call (:call (prepared-mixed-call 1000000000))]
     (is (= 4 (count (program-runtime/staging-plan call :execution)))

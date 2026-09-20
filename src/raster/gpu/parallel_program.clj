@@ -21,6 +21,16 @@
   (and value (= "raster.gpu.parallel_program.PreparedParallelProgram"
                 (.getName (class value)))))
 
+(defn- ensure-prepared!
+  [prepared operation]
+  (when-not (prepared-parallel-program? prepared)
+    (throw (ex-info (str operation " requires a PreparedParallelProgram")
+                    {:operation operation :actual (type prepared)})))
+  (when @(:closed? prepared)
+    (throw (ex-info "prepared parallel program is closed"
+                    {:reason :parallel-program-closed :operation operation})))
+  prepared)
+
 (defn- loop-staging-plan
   [step execution-id step-index]
   (when (and (get-in step [:scalars :iteration]) (> (:trip-count step) 1))
@@ -145,23 +155,24 @@
             (try (release! (get @handles key)) (catch Throwable _)))
           (throw error))))))
 
-(defn run-prepared!
-  "Replay one PreparedParallelProgram and return its resident output bindings."
-  [prepared]
-  (when-not (prepared-parallel-program? prepared)
-    (throw (ex-info "run-prepared! requires a PreparedParallelProgram"
-                    {:actual (type prepared)})))
-  (when @(:closed? prepared)
-    (throw (ex-info "prepared parallel program is closed"
-                    {:reason :parallel-program-closed})))
-  (let [{:keys [call plan handles]} prepared]
+(defn- visit-handles!
+  [prepared operation visit!]
+  (ensure-prepared! prepared operation)
+  (when-not (ifn? visit!)
+    (throw (ex-info "prepared program handle visitor must be callable"
+                    {:reason :parallel-program-handle-visitor
+                     :operation operation :actual (type visit!)})))
+  (let [{:keys [call plan handles]} prepared
+        results (volatile! (transient []))
+        visit-key! (fn [key]
+                     (vswap! results conj! (visit! (get handles key))))]
     (doseq [[step-index step] (map-indexed vector (:steps call))]
       (cond
         (program-call/evaluated-host-equation? step)
         nil
 
         (program-call/emitted-equation-call? step)
-        ((:run! prepared) (get handles (get-in plan [:step-keys step-index])))
+        (visit-key! (get-in plan [:step-keys step-index]))
 
         (loop-call/structured-loop-call? step)
         (doseq [iteration (range (:trip-count step))]
@@ -173,8 +184,39 @@
                       "structured loop escaped its certified bounded carry rotation"
                       {:reason :parallel-program-unbounded-loop-binding
                        :step-index step-index :iteration iteration})))
-            ((:run! prepared) (get handles key))))))
+            (visit-key! key)))))
+    (persistent! @results)))
+
+(defn run-prepared!
+  "Replay one PreparedParallelProgram and return its resident output bindings."
+  [prepared]
+  (visit-handles! prepared :run-prepared! (:run! prepared))
+  (let [{:keys [call]} prepared]
     (:outputs call)))
+
+(defn profile-prepared!
+  "Replay a prepared program in exact program order through `profile-handle!` and aggregate its
+   device-event intervals. Every handle callback must consume/reset one completed profiling replay;
+   no host duration is substituted for device time. Repeated loop handles remain repeated samples
+   in the aggregate because they are distinct launches in the program schedule."
+  [prepared profile-handle!]
+  (let [started (System/nanoTime)
+        profiles (visit-handles! prepared :profile-prepared! profile-handle!)
+        finished (System/nanoTime)
+        finite-nonnegative? #(and (number? %)
+                                  (Double/isFinite (double %))
+                                  (not (neg? (double %))))]
+    (doseq [[index profile] (map-indexed vector profiles)
+            field [:kernel-total-ms :device-wall-ms]]
+      (when-not (finite-nonnegative? (get profile field))
+        (throw (ex-info "prepared program profiling requires finite device-event spans"
+                        {:reason :parallel-program-profile-span
+                         :graph-index index :field field :value (get profile field)}))))
+    {:profile (vec (mapcat :profile profiles))
+     :kernel-total-ms (reduce + 0.0 (map :kernel-total-ms profiles))
+     :device-wall-ms (reduce + 0.0 (map :device-wall-ms profiles))
+     :host-wall-ms (/ (- finished started) 1.0e6)
+     :program-graph-count (count profiles)}))
 
 (defn release-prepared!
   "Release every prepared graph in reverse binding order. Idempotent."
