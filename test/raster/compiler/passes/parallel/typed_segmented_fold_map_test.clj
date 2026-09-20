@@ -86,6 +86,27 @@
     'Float/NEGATIVE_INFINITY 'Float/POSITIVE_INFINITY}
    certified-maximum-source))
 
+(def ^:private certified-multi-fold-source
+  '(let* [effect
+          (raster.par/segmented-fold-map!
+           [sum-out maximum-out] [[row rows]] index 1
+           [[sum 0 :int width
+             (clojure.core/unchecked-add-int
+              sum
+              (clojure.core/aget counts
+                                 (clojure.core/+ (clojure.core/* row width) index)))
+             {:association :implementation-defined}]
+            [maximum Float/NEGATIVE_INFINITY :float width
+             (clojure.core/max
+              maximum
+              (clojure.core/+
+               (clojure.core/aget values
+                                  (clojure.core/+ (clojure.core/* row width) index))
+               (clojure.core/float sum)))
+             {:association :implementation-defined}]]
+           [(clojure.core/float sum) maximum])]
+         effect))
+
 (defn- scheduled-operation []
   (let [program (:program
                  (route/attempt source :float {'values :float 'out :float}
@@ -130,6 +151,19 @@
                     program {:dtype :float :target-device :ocl:0
                              :array-types {'values :float 'out :float}
                              :scalar-types {'rows :long 'width :long}}))]
+    (first (:operations (first (:equations scheduled))))))
+
+(defn- certified-multi-fold-operation []
+  (let [array-types {'counts :int 'values :float
+                     'sum-out :float 'maximum-out :float}
+        scalar-types {'rows :long 'width :long}
+        program (:program
+                 (route/attempt certified-multi-fold-source :float array-types
+                                {:scalar-types scalar-types}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types array-types :scalar-types scalar-types}))]
     (first (:operations (first (:equations scheduled))))))
 
 (defn- decline-rule
@@ -278,6 +312,78 @@
           (is (= :one-workgroup-per-segment
                  (get-in artifact [:attributes :kernel-body :schedule :strategy])))
           (is (str/includes? (:source artifact) "foldmap_workgroup_scratch")))))))
+
+(deftest multiple-certified-folds-share-one-cooperative-segment-schedule
+  (let [operation (certified-multi-fold-operation)
+        options {:array-types {'counts :int 'values :float
+                               'sum-out :float 'maximum-out :float}
+                 :scalar-types {'rows :long 'width :long}}
+        {:keys [kernel-body operators workgroup-size]} (fold-body/lower operation options)
+        scheduled (fold-body/schedule operation options)
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (operation-tree (:operations kernel-body)))
+        allocations (:allocations kernel-body)]
+    (is (= [:+ :max] operators))
+    (is (= [:+ :max] (get-in kernel-body [:schedule :reduction-operators])))
+    (is (= 2 (get-in kernel-body [:schedule :fold-count])))
+    (is (= [:int :float] (mapv :dtype allocations)))
+    (is (= (* workgroup-size (+ 4 4))
+           (get-in kernel-body [:launch :shared-memory-bytes])))
+    (is (= [:cooperative-lane-fold :cooperative-lane-fold :cooperative-final-map]
+           (mapv #(get-in % [:attributes :role]) loops)))
+    (is (= [0 1] (mapv #(get-in % [:attributes :fold]) (butlast loops))))
+    (is (= [:int :float] (get-in scheduled [:numerics :accumulator-dtypes])))
+    (is (= :wrap (get-in scheduled [:numerics :accumulators 0 :overflow])))
+    (is (= '[counts values sum-out maximum-out]
+           (get-in scheduled [:attributes :array-params])))
+    (is (= [:+ :max] (get-in scheduled [:attributes :reduction-operators])))))
+
+(deftest checked-integral-addition-is-not-silently-reassociated
+  (let [checked-source (walk/postwalk-replace
+                        {'clojure.core/unchecked-add-int 'clojure.core/+}
+                        certified-multi-fold-source)
+        array-types {'counts :int 'values :float
+                     'sum-out :float 'maximum-out :float}
+        scalar-types {'rows :long 'width :long}
+        program (:program (route/attempt checked-source :float array-types
+                                         {:scalar-types scalar-types}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types array-types :scalar-types scalar-types}))
+        operation (first (:operations (first (:equations scheduled))))]
+    (is (= :integral-monoid-overflow
+           (decline-rule #(fold-body/lower operation
+                                           {:array-types array-types
+                                            :scalar-types scalar-types}))))))
+
+(deftest static-multi-fold-extent-caps-the-cooperative-workgroup
+  (let [operation (update (certified-multi-fold-operation) :folds
+                          #(mapv (fn [fold] (assoc fold :extent 8)) %))
+        {:keys [kernel-body workgroup-size]}
+        (fold-body/lower operation
+                         {:array-types {'counts :int 'values :float
+                                        'sum-out :float 'maximum-out :float}
+                          :scalar-types {'rows :long 'width :long}})]
+    (is (= 8 workgroup-size))
+    (is (= [8 8] (mapv (comp first :shape) (:allocations kernel-body))))
+    (is (= 64 (get-in kernel-body [:launch :shared-memory-bytes])))))
+
+(deftest multiple-certified-folds-retain-lexical-dependence-in-projection
+  (let [program (frontend/form->program
+                 certified-multi-fold-source
+                 {:dtype :float
+                  :array-types {'counts :int 'values :float
+                                'sum-out :float 'maximum-out :float}
+                  :scalar-types {'rows :long 'width :long}})
+        projected (projection/segmented-fold-map-form
+                   program (first (dialect/equations program)))
+        [_ outputs _ _ _ folds results] projected]
+    (is (= '[sum-out maximum-out] outputs))
+    (is (= '[sum maximum] (mapv first folds)))
+    (is (some #{'sum} (tree-seq coll? seq (nth (second folds) 4)))
+        "the second certified fold still consumes the first completed fold")
+    (is (= '[(clojure.core/float sum) maximum] results))))
 
 (deftest cooperative-maximum-materializes-its-typed-infinity-identity
   (let [operation (certified-maximum-operation)

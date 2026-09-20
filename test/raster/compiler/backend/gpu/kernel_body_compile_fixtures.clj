@@ -70,6 +70,23 @@
   (let [effect (raster.par/butterfly! re im index half wr wi base)]
     re))
 
+(deftm public-c-family-cooperative-mixed-folds!
+  "Two certified folds share one segment schedule while retaining independent typed monoids."
+  [counts :- (Array int), values :- (Array float),
+   sum-out :- (Array float), maximum-out :- (Array float),
+   rows :- Long, width :- Long] :- Void
+  (raster.par/segmented-fold-map!
+   [sum-out maximum-out] [[row rows]] index 1
+   [[sum 0 :int width
+     (unchecked-add-int
+      sum (raster.arrays/aget counts (+ (* row width) index)))
+     {:association :implementation-defined}]
+    [maximum Float/NEGATIVE_INFINITY :float width
+     (max maximum
+          (+ (raster.arrays/aget values (+ (* row width) index)) (float sum)))
+     {:association :implementation-defined}]]
+   [(float sum) maximum]))
+
 (deftm public-c-family-dot
   "Public equation-first workload compiled by nvcc/hipcc without a physical device."
   (All [T] [left :- (Array T) right :- (Array T) n :- Long] :- Double
@@ -401,6 +418,9 @@
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-nn/rms-norm-reassociated! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'public-c-family-cooperative-mixed-folds!
+                 {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

@@ -330,7 +330,8 @@
    order without reassociation. Stable reads and distinct writes are derived from the body rather
    than inferred by a target emitter."
   [segfold options]
-  (let [{:keys [kernel-body segment-count inputs outputs scalars]} (lower-ordered segfold options)
+  (let [{:keys [kernel-body segment-count outputs scalars] inputs :arrays}
+        (lower-ordered segfold options)
         arguments (mapv (fn [parameter]
                           (if (= '_nseg (:id parameter)) segment-count (:id parameter)))
                         (:parameters kernel-body))]
@@ -359,12 +360,13 @@
                    :aliasing :no-write-alias}})))
 
 (defn- lower-cooperative
-  "Assign one workgroup to each segment of a single certified fold-map.
+  "Assign one workgroup to each segment of a certified fold-map.
 
-   Lanes traverse the fold axis strided by workgroup size, combine their private partials through
-   a portable shared-memory tree, then traverse the dense final map cooperatively. This is a
-   schedule for the general SegFoldMap algebra; no normalization or tensor-library operation is
-   recognized here."
+   Each fold retains its own checked monoid, extent, dtype and lexical dependence on completed
+   earlier folds. Lanes traverse that fold's axis strided by workgroup size and combine private
+   partials through a portable shared-memory tree. After all folds complete, lanes traverse the
+   dense final map cooperatively. This is a schedule for the general SegFoldMap algebra; no
+   normalization, quantization format, or tensor-library operation is recognized here."
   [segfold {:keys [workgroup-size array-types scalar-types]
             :or {array-types {} scalar-types {}}}]
   (when-not (instance? raster.compiler.ir.segop.SegFoldMap segfold)
@@ -376,29 +378,30 @@
         segment-dims (segop/seg-space-segment-dims space)
         mapped-dim (segop/seg-space-reduced-dim space)
         folds (vec (:folds segfold))
-        _ (when-not (= 1 (count folds))
-            (decline! :cooperative-fold-count
-                      "the first cooperative fold-map schedule requires exactly one fold"
-                      {:operation (:id segfold) :fold-count (count folds)}))
-        fold (first folds)
         source-workgroup-size (or (:block-size source-grid) 256)
-        ;; Do not launch more lanes than a static fold can use. Dynamic folds retain the
+        ;; Do not launch more lanes than the largest static fold can use. Dynamic folds retain the
         ;; hardware-selected size; an explicit caller override is a testing/tuning decision and
         ;; is preserved exactly. The next power of two keeps the shared tree structurally valid.
-        static-fold-extent (some-> (:extent fold) numeric-constant/value :value)
+        static-fold-extents (mapv #(some-> (:extent %) numeric-constant/value :value) folds)
+        all-fold-extents-static? (every? #(and (integer? %) (not (neg? %)))
+                                         static-fold-extents)
+        largest-static-fold-extent (when all-fold-extents-static?
+                                     (reduce max 1 static-fold-extents))
         workgroup-size (or requested-workgroup-size
-                           (if (and (integer? static-fold-extent) (pos? static-fold-extent))
-                             (capped-ceiling-power-of-two static-fold-extent
+                           (if largest-static-fold-extent
+                             (capped-ceiling-power-of-two largest-static-fold-extent
                                                           source-workgroup-size)
                              source-workgroup-size))
-        _ (when-not (= :implementation-defined (:association fold))
-            (decline! :fold-association
-                      "cooperative fold-map scheduling requires an explicit reassociation contract"
-                      {:operation (:id segfold) :association (:association fold)}))
-        _ (when (seq (:locals fold))
-            (decline! :fold-locals
-                      "the first cooperative fold-map schedule requires an expression-only fold"
-                      {:operation (:id segfold) :locals (:locals fold)}))
+        _ (doseq [[ordinal fold] (map-indexed vector folds)]
+            (when-not (= :implementation-defined (:association fold))
+              (decline! :fold-association
+                        "every fold in a cooperative fold-map requires an explicit reassociation contract"
+                        {:operation (:id segfold) :fold ordinal
+                         :association (:association fold)}))
+            (when (seq (:locals fold))
+              (decline! :fold-locals
+                        "cooperative fold-map scheduling requires expression-only folds"
+                        {:operation (:id segfold) :fold ordinal :locals (:locals fold)})))
         _ (when-not (and (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size))))
             (decline! :workgroup-size
@@ -432,11 +435,12 @@
                        :dtypes (:dtypes segfold) :map-results (:map-results segfold)}))
         output-dtypes (mapv dtype/canon (:dtypes segfold))
         default-dtype (or (first output-dtypes) :float)
-        fold-dtype (dtype/canon (:dtype fold))
-        _ (when-not (contains? #{:float :double :int :long} fold-dtype)
-            (decline! :fold-dtype
-                      "cooperative fold-map requires a scalar arithmetic accumulator"
-                      {:operation (:id segfold) :dtype fold-dtype}))
+        fold-dtypes (mapv (comp dtype/canon :dtype) folds)
+        _ (doseq [[ordinal fold-dtype] (map-indexed vector fold-dtypes)]
+            (when-not (contains? #{:float :double :int :long} fold-dtype)
+              (decline! :fold-dtype
+                        "cooperative fold-map requires scalar arithmetic accumulators"
+                        {:operation (:id segfold) :fold ordinal :dtype fold-dtype})))
         array-types (into {}
                           (map (fn [id]
                                  [id (dtype/canon (or (get array-types id)
@@ -452,15 +456,17 @@
                            scalars)
         segment-count-source (segop/seg-space-num-segments-expr space)
         source-index (:index segfold)
-        reduce-index 'foldmap-reduce-index
+        reduce-indices (mapv #(symbol (str "foldmap-reduce-index-" %)) (range (count folds)))
         map-index 'foldmap-map-index
         segment-index 'foldmap-segment
         axis-symbols (set (concat (map :name segment-dims) [source-index]))
         index-scope (into (set/union axis-symbols
-                                     #{reduce-index map-index segment-index})
+                                     (set reduce-indices)
+                                     #{map-index segment-index})
                           scalars)
         index-value-types (merge (zipmap axis-symbols (repeat :long))
-                                 {reduce-index :long map-index :long segment-index :long}
+                                 (zipmap reduce-indices (repeat :long))
+                                 {map-index :long segment-index :long}
                                  scalar-types)
         lower-index (fn lower-index
                       ([expression] (lower-index expression #{}))
@@ -471,7 +477,6 @@
                         index-value-types)))
         segment-count (lower-index segment-count-source)
         map-extent (lower-index (:bound mapped-dim))
-        fold-extent (lower-index (:extent fold))
         total-elements (body/expression :mul segment-count map-extent)
         group-count (index-expression/to-launch-expression segment-count decline!)
         segment-axis-computes
@@ -506,84 +511,122 @@
                        :arrays (set inputs) :index-scope index-scope
                        :lower-index lower-index :predicate nil
                        :id-prefix "cooperative-foldmap" :decline! decline!})
-        concrete-step (dialect/scalar-converts->source (:step fold))
-        derived
-        (try
-          (scan/certify-reassociation
-           {:acc (:accumulator fold) :init (:identity fold) :lambda concrete-step}
-           fold-dtype)
-          (catch clojure.lang.ExceptionInfo exception
-            (decline! :certified-monoid
-                      "cooperative fold-map could not rederive its scalar monoid"
-                      {:operation (:id segfold) :certificate-error (ex-data exception)})))
-        _ (when-not (scan/compatible-certificate? (:algebra fold) derived)
-            (decline! :certified-monoid
-                      "cooperative fold-map algebra disagrees with its scalar region"
-                      {:operation (:id segfold) :declared (:algebra fold) :derived derived}))
-        operator (intrinsics/canonical (:combine derived))
-        _ (when-not (contains? #{:+ :* :min :max} operator)
-            (decline! :cooperative-operator
-                      "cooperative fold-map scheduling requires a supported scalar monoid"
-                      {:operation (:id segfold) :operator operator}))
-        identity (numeric-constant/literal-or-original (:identity fold))
-        _ (when-not (number? identity)
-            (decline! :literal-identity
-                      "cooperative fold-map requires a literal scalar identity"
-                      {:operation (:id segfold) :identity identity}))
-        element (util/subst-syms {source-index reduce-index} (:element derived))
-        element-lowered ((:lower scalar-lower) element fold-dtype
-                         (assoc base-env reduce-index :long))
-        lane-accumulator 'foldmap-lane-accumulator
-        next-lane-accumulator 'foldmap-next-lane-accumulator
-        lane-result 'foldmap-lane-result
-        completed-fold (:accumulator fold)
-        scratch 'foldmap-workgroup-scratch
         barrier (fn [] (body/->WorkgroupBarrier
                         :workgroup #{:workgroup} :acquire-release
                         (body/full-participation)))
         strides (take-while pos? (iterate #(quot % 2) (quot workgroup-size 2)))
-        tree-stages
-        (mapcat
-         (fn [stride]
-           (let [mask (keyword (str "foldmap-reduce-stride-" stride))
-                 left (symbol (str "foldmap-tree-left-" stride))
-                 right (symbol (str "foldmap-tree-right-" stride))
-                 combined (symbol (str "foldmap-tree-combined-" stride))]
-             [(body/->ScalarLoad (body/value left fold-dtype) scratch ['foldmap-lane]
-                                 mask (body/literal identity fold-dtype) :cached)
-              (body/->ScalarLoad
-               (body/value right fold-dtype) scratch
-               [(body/expression :add 'foldmap-lane stride)]
-               mask (body/literal identity fold-dtype) :cached)
-              (body/->ScalarCompute
-               (body/value combined fold-dtype)
-               (body/scalar-expression operator fold-dtype [left right]))
-              (body/->ScalarStore scratch ['foldmap-lane] combined mask)
-              (barrier)]))
-         strides)
-        lane-fold
-        (body/->ForLoop
-         (body/value reduce-index :long)
-         (body/index-cast 'foldmap-lane :long :exact) fold-extent workgroup-size
-         [(body/->LoopArg (body/value lane-accumulator fold-dtype)
-                          (body/literal identity fold-dtype))]
-         (vec (concat
-               (:operations element-lowered)
-               [(body/->ScalarCompute
-                 (body/value next-lane-accumulator fold-dtype)
-                 (body/scalar-expression
-                  operator fold-dtype [lane-accumulator (:result element-lowered)]))
-                (body/->Yield [next-lane-accumulator])]))
-         [(body/value lane-result fold-dtype)]
-         {:association :implementation-defined :role :cooperative-lane-fold})
+        fold-state
+        (reduce
+         (fn [{:keys [operations env allocations operators]} [ordinal fold fold-dtype reduce-index]]
+           (let [concrete-step (dialect/scalar-converts->source (:step fold))
+                 derived
+                 (try
+                   (scan/certify-reassociation
+                    {:acc (:accumulator fold) :init (:identity fold) :lambda concrete-step}
+                    fold-dtype)
+                   (catch clojure.lang.ExceptionInfo exception
+                     (decline! :certified-monoid
+                               "cooperative fold-map could not rederive its scalar monoid"
+                               {:operation (:id segfold) :fold ordinal
+                                :certificate-error (ex-data exception)})))
+                 _ (when-not (scan/compatible-certificate? (:algebra fold) derived)
+                     (decline! :certified-monoid
+                               "cooperative fold-map algebra disagrees with its scalar region"
+                               {:operation (:id segfold) :fold ordinal
+                                :declared (:algebra fold) :derived derived}))
+                 operator (intrinsics/canonical (:combine derived))
+                 _ (when-not (contains? #{:+ :* :min :max} operator)
+                     (decline! :cooperative-operator
+                               "cooperative fold-map scheduling requires a supported scalar monoid"
+                               {:operation (:id segfold) :fold ordinal :operator operator}))
+                 integral-arithmetic? (and (contains? #{:int :long} fold-dtype)
+                                           (contains? #{:+ :*} operator))
+                 overflow (when integral-arithmetic?
+                            (intrinsics/source-overflow-policy (:combine derived)))
+                 _ (when (and integral-arithmetic? (nil? overflow))
+                     (decline! :integral-monoid-overflow
+                               "reassociated integral arithmetic requires an explicit wrapping combine"
+                               {:operation (:id segfold) :fold ordinal
+                                :combine (:combine derived) :dtype fold-dtype}))
+                 combine-options (cond-> {} overflow (assoc :overflow overflow))
+                 identity (numeric-constant/literal-or-original (:identity fold))
+                 _ (when-not (number? identity)
+                     (decline! :literal-identity
+                               "cooperative fold-map requires literal scalar identities"
+                               {:operation (:id segfold) :fold ordinal :identity identity}))
+                 fold-extent (lower-index (:extent fold))
+                 element (util/subst-syms {source-index reduce-index} (:element derived))
+                 element-lowered ((:lower scalar-lower) element fold-dtype
+                                  (assoc env reduce-index :long))
+                 name-with-ordinal #(symbol (str % "-" ordinal))
+                 lane-accumulator (name-with-ordinal "foldmap-lane-accumulator")
+                 next-lane-accumulator (name-with-ordinal "foldmap-next-lane-accumulator")
+                 lane-result (name-with-ordinal "foldmap-lane-result")
+                 completed-fold (:accumulator fold)
+                 scratch (name-with-ordinal "foldmap-workgroup-scratch")
+                 tree-stages
+                 (mapcat
+                  (fn [stride]
+                    (let [mask (keyword (str "foldmap-reduce-stride-" stride))
+                          left (symbol (str "foldmap-tree-left-" ordinal "-" stride))
+                          right (symbol (str "foldmap-tree-right-" ordinal "-" stride))
+                          combined (symbol (str "foldmap-tree-combined-" ordinal "-" stride))]
+                      [(body/->ScalarLoad (body/value left fold-dtype) scratch ['foldmap-lane]
+                                          mask (body/literal identity fold-dtype) :cached)
+                       (body/->ScalarLoad
+                        (body/value right fold-dtype) scratch
+                        [(body/expression :add 'foldmap-lane stride)]
+                        mask (body/literal identity fold-dtype) :cached)
+                       (body/->ScalarCompute
+                        (body/value combined fold-dtype)
+                        (body/scalar-expression operator fold-dtype [left right]
+                                                combine-options))
+                       (body/->ScalarStore scratch ['foldmap-lane] combined mask)
+                       (barrier)]))
+                  strides)
+                 lane-fold
+                 (body/->ForLoop
+                  (body/value reduce-index :long)
+                  (body/index-cast 'foldmap-lane :long :exact) fold-extent workgroup-size
+                  [(body/->LoopArg (body/value lane-accumulator fold-dtype)
+                                   (body/literal identity fold-dtype))]
+                  (vec (concat
+                        (:operations element-lowered)
+                        [(body/->ScalarCompute
+                          (body/value next-lane-accumulator fold-dtype)
+                          (body/scalar-expression
+                           operator fold-dtype [lane-accumulator (:result element-lowered)]
+                           combine-options))
+                         (body/->Yield [next-lane-accumulator])]))
+                  [(body/value lane-result fold-dtype)]
+                  {:association :implementation-defined :role :cooperative-lane-fold
+                   :fold ordinal})]
+             {:operations (into operations
+                                (concat [lane-fold
+                                         (body/->ScalarStore scratch ['foldmap-lane]
+                                                             lane-result nil)
+                                         (barrier)]
+                                        tree-stages
+                                        [(body/->ScalarLoad
+                                          (body/value completed-fold fold-dtype)
+                                          scratch [0] nil nil :cached)
+                                         (barrier)]))
+              :env (assoc env completed-fold fold-dtype)
+              :allocations (conj allocations
+                                 (body/->WorkgroupAllocation
+                                  scratch fold-dtype [workgroup-size]
+                                  (layout/row-major [workgroup-size] fold-dtype)
+                                  (dtype/bytes-of fold-dtype)))
+              :operators (conj operators operator)}))
+         {:operations [] :env base-env :allocations [] :operators []}
+         (map vector (range) folds fold-dtypes reduce-indices))
         map-coordinate (body/expression :add base-coordinate map-index)
         map-operations
         (mapcat
          (fn [_ordinal output output-dtype expression]
            (let [expression (util/subst-syms {source-index map-index} expression)
                  lowered ((:lower scalar-lower) expression output-dtype
-                                                (assoc base-env map-index :long
-                                                       completed-fold fold-dtype))]
+                                                (assoc (:env fold-state) map-index :long))]
              (concat (:operations lowered)
                      [(body/->ScalarStore output [map-coordinate]
                                           (:result lowered) nil)])))
@@ -599,10 +642,7 @@
          {:id [:segmented-fold-map (:id segfold) :cooperative-workgroup]
           :parameters parameters
           :stable-reads (mapv body/stable-read inputs)
-          :allocations [(body/->WorkgroupAllocation
-                         scratch fold-dtype [workgroup-size]
-                         (layout/row-major [workgroup-size] fold-dtype)
-                         (dtype/bytes-of fold-dtype))]
+          :allocations (:allocations fold-state)
           :indices (vec (concat
                          [(body/->IndexBinding 'foldmap-group :group 0)
                           (body/->IndexBinding 'foldmap-lane :local 0)
@@ -614,27 +654,20 @@
                          (body/->Mask (keyword (str "foldmap-reduce-stride-" stride))
                                       [(body/predicate :lt 'foldmap-lane stride)]))
                        strides)
-          :operations (vec (concat
-                            [lane-fold
-                             (body/->ScalarStore scratch ['foldmap-lane] lane-result nil)
-                             (barrier)]
-                            tree-stages
-                            [(body/->ScalarLoad
-                              (body/value completed-fold fold-dtype) scratch [0] nil nil :cached)
-                             ;; Every lane must consume scratch[0] before the next use of the
-                             ;; allocation. Keep this barrier even in the one-fold schedule so
-                             ;; extending it to dependent certified folds cannot introduce a race.
-                             (barrier)
-                             final-map]))
+          :operations (conj (vec (:operations fold-state)) final-map)
           :schedule {:strategy :one-workgroup-per-segment
                      :association :certified
                      :workgroup-size workgroup-size
-                     :reduction-operator operator
+                     :reduction-operator (when (= 1 (count folds))
+                                           (first (:operators fold-state)))
+                     :reduction-operators (:operators fold-state)
+                     :fold-count (count folds)
                      :mapped-traversal :strided}
           :launch (launch/spec
                    {:workgroup-size [workgroup-size]
                     :group-count [group-count]
-                    :shared-memory-bytes (* workgroup-size (dtype/bytes-of fold-dtype))})
+                    :shared-memory-bytes
+                    (* workgroup-size (reduce + (map dtype/bytes-of fold-dtypes)))})
           :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                        :segop-id (:id segfold)}
           :attributes {:kind :cooperative-segmented-fold-map
@@ -642,11 +675,11 @@
                        :no-write-alias true}})]
     {:kernel-body kernel-body :arrays inputs :outputs outputs :scalars scalars
      :segment-count segment-count :map-extent map-extent
-     :workgroup-size workgroup-size :operator operator}))
+     :workgroup-size workgroup-size :operators (:operators fold-state)}))
 
 (defn- schedule-cooperative
   [segfold options]
-  (let [{:keys [kernel-body inputs outputs scalars operator]}
+  (let [{:keys [kernel-body outputs scalars operators] inputs :arrays}
         (lower-cooperative segfold options)
         arguments (mapv :id (:parameters kernel-body))]
     (scheduled-body/make
@@ -663,17 +696,37 @@
                  :association :certified
                  :power-of-two-workgroup true
                  :aliasing :no-write-alias}
-      :numerics {:mode :reassociated
-                 :policy :certified-workgroup-tree
-                 :rounding :implementation-defined
-                 :accumulator-dtype (dtype/canon (:dtype (first (:folds segfold))))
-                 :reassociation :implementation-defined}
+      :numerics (cond->
+                  {:mode :reassociated
+                   :policy :certified-workgroup-tree
+                   :rounding :implementation-defined
+                   :accumulators
+                   (mapv (fn [fold operator]
+                           (let [fold-dtype (dtype/canon (:dtype fold))
+                                 overflow (when (and (dtype/integral? fold-dtype)
+                                                     (contains? #{:+ :*} operator))
+                                            (intrinsics/source-overflow-policy
+                                             (get-in fold [:algebra :combine])))]
+                             (cond->
+                               {:value (:accumulator fold)
+                                :dtype fold-dtype
+                                :rounding (if (dtype/integral? fold-dtype)
+                                            :exact :implementation-defined)
+                                :policy :certified-workgroup-tree}
+                               overflow (assoc :overflow overflow))))
+                         (:folds segfold) operators)
+                   :accumulator-dtypes (mapv (comp dtype/canon :dtype) (:folds segfold))
+                   :reassociation :implementation-defined}
+                  (= 1 (count (:folds segfold)))
+                  (assoc :accumulator-dtype
+                         (dtype/canon (:dtype (first (:folds segfold))))))
       :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                    :segop-id (:id segfold)}
       :attributes {:array-params (vec (concat inputs outputs))
                    :scalar-params scalars
                    :dtype (first (:dtypes segfold))
-                   :reduction-operator operator
+                   :reduction-operator (when (= 1 (count operators)) (first operators))
+                   :reduction-operators operators
                    :aliasing :no-write-alias}})))
 
 (defn- cooperative-source?

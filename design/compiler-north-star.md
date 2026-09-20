@@ -180,14 +180,19 @@ from the retained scalar region, and projection preserves the request while the 
 meaning stays sequential. This is the semantic prerequisite for a cooperative workers-per-segment
 schedule; ordinary `loop*` recurrences and unmarked fold-map components remain ordered.
 
-For the certified one-fold subset, target scheduling assigns one workgroup to each segment. Lanes
-stride the reduction axis, combine private partials through an explicit workgroup-memory tree, then
-stride the dense final map using the shared result. Allocation, barriers, reassociated numerics and
-launch geometry are KernelBody facts shared by OpenCL, CUDA and HIP. The schedule is invoked through
-the generic executable ABI because its group count is a semantic segment extent, not the legacy
-map convention's reconstructed scalar bound. Unsupported operators or multi-fold dependencies
-remain on the ordered schedule; no normalization, softmax or quantization name participates in
-selection.
+For certified folds, target scheduling assigns one workgroup to each segment. Lanes stride each
+reduction axis, combine private partials through an explicit workgroup-memory tree, then stride the
+dense final map using the completed results. A segment may contain several folds with distinct
+dtypes and monoids; declaration order and lexical dependencies between completed folds remain
+explicit while each independently certified fold owns its tree and workgroup allocation.
+Allocation, barriers, per-component reassociated numerics and launch geometry are KernelBody facts
+shared by OpenCL, CUDA and HIP. The schedule is invoked through the generic executable ABI because
+its group count is a semantic segment extent, not the legacy map convention's reconstructed scalar
+bound. Unsupported operators or any fold without explicit reassociation permission are refused as
+a mixed cooperative schedule; no normalization, softmax or quantization name participates in
+selection. Modulo-width `unchecked-add` and `unchecked-multiply` are explicit integral monoids.
+Checked integral arithmetic is not silently reassociated across its possible overflow trap; it
+requires either the wrapping spelling or a future checked no-overflow range certificate.
 
 The same algebra now schedules `min`/`max` monoids and materializes their typed infinite identities
 before KernelBody construction. Static fold extents cap the power-of-two workgroup size, so a
