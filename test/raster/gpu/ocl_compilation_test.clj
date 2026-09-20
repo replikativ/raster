@@ -44,10 +44,11 @@
       (with-redefs-fn replacements
         (fn []
           (is (= program (compile! "source" {})))
-          (is (= [:create [:build nil]] @calls))
+          (is (= [:create [:build "-cl-fp32-correctly-rounded-divide-sqrt"]] @calls))
           (reset! calls [])
           (is (= program (compile! "source" {:language-standard "CL3.0"})))
-          (is (= [:create [:build "-cl-std=CL3.0"]] @calls))
+          (is (= [:create [:build "-cl-fp32-correctly-rounded-divide-sqrt -cl-std=CL3.0"]]
+                 @calls))
           (reset! calls [])
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"lacks required"
                                (compile! "source" {:language-standard "CL3.0"
@@ -60,5 +61,7 @@
             (is (thrown-with-msg? clojure.lang.ExceptionInfo
                                  (if diagnostic-failure #"diagnostic failure" #"clBuildProgram failed: oops")
                                  (compile! "invalid source" {})))
-            (is (= [:create [:build nil] [:release program]] @calls)
+            (is (= [:create [:build "-cl-fp32-correctly-rounded-divide-sqrt"]
+                    [:release program]]
+                   @calls)
                 "failed builds release exactly once, even when log retrieval throws")))))))
