@@ -398,18 +398,23 @@
       (is (= 1 (get-in emitted [:stats :fallback])))
       (is (= "0\n1\n" (with-out-str (is (nil? (eval (:form emitted))))))))))
 
-(deftest declined-raw-effect-scheduling-is-reported-once
+(deftest declined-raw-effect-scheduling-fails-once-without-source-emission
   (let [attempts (atom 0)]
-    (with-redefs [segop-lower/schedule-single-program (fn [& _] (swap! attempts inc) {})]
-      (let [emitted (opencl-pass/opencl-pass
-                     '(if enabled (raster.par/map-void! i n (aset out i (aget x i))) nil)
-                     :dtype :float :min-elements 0
-                     :array-types {'out :float 'x :float}
-                     :scalar-types {'n :int 'enabled :boolean})]
+    (with-redefs [segop-lower/schedule-single-program (fn [& _] (swap! attempts inc) {})
+                  par-opencl/generate-par-map-void-kernel
+                  (fn [& _] (throw (ex-info "source effect emitter reached" {})))]
+      (let [failure
+            (try
+              (opencl-pass/opencl-pass
+               '(if enabled (raster.par/map-void! i n (aset out i (aget x i))) nil)
+               :dtype :float :min-elements 0
+               :array-types {'out :float 'x :float}
+               :scalar-types {'n :int 'enabled :boolean})
+              (catch clojure.lang.ExceptionInfo error error))]
         (is (= 1 @attempts))
-        (is (= 1 (get-in emitted [:stats :effect-compatibility])))
-        (is (= [:compatibility-effect-opencl]
-               (mapv kart/emission-route (:kernels emitted))))))))
+        (is (= :unscheduled-effect-map (:reason (ex-data failure))))
+        (is (= :kernel-body (:target-dialect (ex-data failure))))
+        (is (= :none (:fallback (ex-data failure))))))))
 
 (deftest direct-soa-effects-scalar-replace-before-typed-scheduling
   (with-redefs [types/soa-registry
