@@ -53,7 +53,8 @@
 (declare run-program)
 
 (deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
-  (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-rows! :ze:0 :dtype :float)]
+  (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-product-rows!
+                                                 :ze:0 :dtype :float)]
     (is (= [{:sym 'partials :dtype :int}]
            (mapv #(select-keys % [:sym :dtype]) (:allocs descriptor))))
     (is (= [:executable :map-void] (mapv :convention (:steps descriptor))))
@@ -70,7 +71,8 @@
         y (float-array (* nrows out))
         wrow (ggml/row-bytes :q6_K in)
         xrow (ggml/row-bytes :q8_K in)]
-    (gk/qdot-q6-K-rows! (:q xl) (:d xl) (:q wl) (:d wl) (:sc wl) y in out nrows)
+    (gk/qdot-q6-K-product-rows! (:q xl) (:d xl) (:q wl) (:d wl) (:sc wl)
+                                y in out nrows)
     (is (= (mapv (fn [row o]
                    (Float/floatToRawIntBits
                     (float (ggml/vec-dot :q6_K (row-bytes wblocks o wrow)
@@ -96,9 +98,10 @@
                                              (row-bytes (:blocks x) row xrow) in))))
             sess (gpu/make-session :ze:0)]
         (try
-          (let [actual-values
+          (let [execution-kernel (if (= wf :q6_K) #'gk/qdot-q6-K-product-rows! kernel)
+                actual-values
                 (if (= wf :q6_K)
-                  (:y (run-program kernel
+                  (:y (run-program execution-kernel
                                    (assoc arrays "y" (float-array (* nrows out))
                                                  'in in 'out out 'nrows nrows)
                                    [:y]))

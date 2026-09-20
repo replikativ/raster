@@ -171,7 +171,7 @@
 
 (def-q4-K-dot)
 
-(deftm qdot-q6-K-rows!
+(deftm qdot-q6-K-product-rows!
   "q6_K weights times q8_K activations through Raster's typed product reduction.
 
   Each `(row,output,super-block,lane,half)` product is an exact wrapping int32 reduction over
@@ -231,6 +231,43 @@
                         (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
                (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
        (ra/aset y ro acc)))))
+
+(defmacro ^:private def-q6-K-dot []
+  (k-quant-dot
+   '(deftm qdot-q6-K-rows!
+      "Current single-stage Q6_K schedule. The typed product form is retained separately until
+      product/epilogue fusion removes its measured intermediate-workgroup regression."
+      [xq :- (Array int), xd :- (Array float),
+       wq :- (Array int), wd :- (Array float), wsc :- (Array int),
+       y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
+      (par/map-void! ro (* nrows out)
+                     (let [row (quot ro out)
+                           o (rem ro out)
+                           nb (quot in 256)
+                           acc
+                           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
+                                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)]
+                             (if (< b nb)
+                               (let [wb (+ (* o nb) b)
+                                     xb (+ (* row nb) b)
+                                     xw (* xb 64)
+                                     ww (* wb 64)
+                                     scb (* wb 16)
+                                     d (* (ra/aget wd wb) (ra/aget xd xb))
+                                     l0 (lane 0) l1 (lane 1) l2 (lane 2) l3 (lane 3)
+                                     l4 (lane 4) l5 (lane 5) l6 (lane 6) l7 (lane 7)
+                                     p0 (* d (float l0)) p1 (* d (float l1))
+                                     p2 (* d (float l2)) p3 (* d (float l3))
+                                     p4 (* d (float l4)) p5 (* d (float l5))
+                                     p6 (* d (float l6)) p7 (* d (float l7))]
+                                 (recur (inc b)
+                                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
+                                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
+                               (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
+                       (ra/aset y ro acc))))
+   2))
+
+(def-q6-K-dot)
 
 ;; ---------------------------------------------------------------------------
 ;; Activation quantizers: ggml's quantize_row_q8_0_ref and quantize_row_q8_K_ref
