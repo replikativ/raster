@@ -697,7 +697,7 @@
 
 (defn- split-combine-values
   [operation]
-  (let [operation (if (instance? raster.compiler.ir.segop.SegRed operation)
+  (let [operation (if (segop/seg-red? operation)
                     operation
                     (throw (ex-info "split combine emission requires a SegRed stage"
                                     {:reason :gemm-stage-lowering :operation operation})))
@@ -728,7 +728,7 @@
       (gemm-artifact operation (str prefix "_" (name phase))
                      :matrix-contract target-dialect scalar-types)
 
-      (instance? raster.compiler.ir.segop.SegRed operation)
+      (segop/seg-red? operation)
       (let [{:keys [partials output mn splits]} (split-combine-values operation)]
         (combine-artifact (str prefix "_" (name phase)) operation
                           partials output mn splits target-dialect scalar-types))

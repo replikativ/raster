@@ -68,7 +68,7 @@
 (defn- validate-scalar-segred!
   "Validate the complete semantic/schedule subset implemented by the portable workgroup tree."
   [segred out-sym array-types]
-  (when-not (instance? raster.compiler.ir.segop.SegRed segred)
+  (when-not (segop/seg-red? segred)
     (throw (ex-info "scalar reduction scheduling requires a SegRed"
                     {:reason :raster/bug :operation segred})))
   (let [operator (try
@@ -800,7 +800,7 @@
   [scheduled node kernel-graph]
   (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
         source (:source scheduled)
-        _ (when-not (instance? raster.compiler.ir.segop.SegRed source)
+        _ (when-not (segop/seg-red? source)
             (decline! :schedule-source
                       "scalar reduction storage closure requires an exact SegRed source"
                       {:source source :node (:id node)}))

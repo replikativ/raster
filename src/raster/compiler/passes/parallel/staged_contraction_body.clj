@@ -113,7 +113,7 @@
         operation (:operation node)]
     (require! (and (= 1 (count equations))
                    (some #{node} (:nodes graph))
-                   (instance? raster.compiler.ir.segop.SegContract operation))
+                   (segop/seg-contract? operation))
               :typed-node {:node node})
     (let [equation (first equations)
           {:keys [facts bindings scalar-types]} (projection/contraction-binding algorithm equation)

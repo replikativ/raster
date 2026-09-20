@@ -420,7 +420,7 @@
                          (swap! stats update :segop-reused (fnil inc 0))
                          so))
           par->segmap (fn [form]
-                        (or (take-bound #(instance? raster.compiler.ir.segop.SegMap %))
+                        (or (take-bound segop/seg-map?)
                             (try
                               (let [par-info (par/extract-par-map-info form)
                                     dtype (or (:elem-type par-info)
@@ -445,7 +445,7 @@
                               ;; Raw implementation exceptions must escape, as on the GPU boundary.
                               (catch clojure.lang.ExceptionInfo _ nil))))
           par->segred (fn [form]
-                        (or (take-bound #(instance? raster.compiler.ir.segop.SegRed %))
+                        (or (take-bound segop/seg-red?)
                             (try
                               (let [par-info (par/extract-par-reduce-info form)
                                     dtype (or (:elem-type par-info) :double)
@@ -498,7 +498,7 @@
               (par/par-stencil-form? form)
               (let [{:keys [radius]} (par/extract-par-stencil-info form)
                     scheduled (take-bound
-                               #(instance? raster.compiler.ir.segop.SegStencil %))
+                               segop/seg-stencil?)
                     simd-form (when scheduled (compile-segstencil scheduled))]
                 (cond
                   simd-form
@@ -538,7 +538,7 @@
               ;; SegMap while executing an exact sequential read/modify/write loop on the JVM.
               (par/par-map-void-form? form)
               (let [scheduled (take-bound
-                               #(and (instance? raster.compiler.ir.segop.SegMap %)
+                               #(and (segop/seg-map? %)
                                      (nil? (:out-sym %))))]
                 (if-let [scalar-form (some-> scheduled segop-simd/compile-effect-segmap)]
                   (do (swap! stats update :scalar-effect-maps (fnil inc 0))

@@ -111,7 +111,7 @@
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
   [segmap {:keys [workgroup-size array-types scalar-types array-shapes]
            :or {workgroup-size 256 array-types {} scalar-types {}}}]
-  (when-not (instance? raster.compiler.ir.segop.SegMap segmap)
+  (when-not (segop/seg-map? segmap)
     (throw (ex-info "map KernelBody lowering requires SegMap"
                     {:reason :raster/bug :operation segmap})))
   (let [space (:space segmap)

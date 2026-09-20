@@ -70,7 +70,7 @@
   "Apply the portable one-work-item-per-segment schedule to a SegFoldMap."
   [segfold {:keys [workgroup-size array-types scalar-types]
             :or {array-types {} scalar-types {}}}]
-  (when-not (instance? raster.compiler.ir.segop.SegFoldMap segfold)
+  (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "fold-map KernelBody lowering requires SegFoldMap"
                     {:reason :raster/bug :operation segfold})))
   (let [space (:space segfold)
@@ -370,7 +370,7 @@
    normalization, quantization format, or tensor-library operation is recognized here."
   [segfold {:keys [workgroup-size array-types scalar-types]
             :or {array-types {} scalar-types {}}}]
-  (when-not (instance? raster.compiler.ir.segop.SegFoldMap segfold)
+  (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "cooperative fold-map lowering requires SegFoldMap"
                     {:reason :raster/bug :operation segfold})))
   (let [space (:space segfold)
@@ -772,7 +772,7 @@
   ([scheduled node kernel-graph closed-algorithm closed-body]
    (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
          source (:source scheduled)
-         _ (when-not (instance? raster.compiler.ir.segop.SegFoldMap source)
+         _ (when-not (segop/seg-fold-map? source)
              (throw (ex-info "fold-map storage closure requires an exact SegFoldMap source"
                              {:reason :segfoldmap-schedule-source :source source})))
          buffers (into {} (map (juxt :id identity))

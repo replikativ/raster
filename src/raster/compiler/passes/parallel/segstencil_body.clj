@@ -43,7 +43,7 @@
    value and perform one final store, so no target emitter reconstructs boundary semantics."
   [stencil {:keys [workgroup-size array-types scalar-types]
             :or {workgroup-size 256 array-types {} scalar-types {}}}]
-  (when-not (instance? raster.compiler.ir.segop.SegStencil stencil)
+  (when-not (segop/seg-stencil? stencil)
     (throw (ex-info "stencil KernelBody lowering requires SegStencil"
                     {:reason :raster/bug :operation stencil})))
   (let [dimensions (get-in stencil [:space :dims])

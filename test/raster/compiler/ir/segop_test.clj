@@ -38,10 +38,14 @@
           grid (segop/->KernelGrid 1 256 0)
           seg-map (segop/->SegMap 0 space level '(* (aget a i) 2.0)
                                   nil #{'a} #{'out} #{} grid
-                                  :double 'out nil)]
+                                  :double 'out nil)
+          contract (segop/->SegContract 1 {} :double :ze:0)]
       (is (segop/segop? seg-map))
-      (is (segop/segop-node? (segop/->SegContract 1 {} :double :ze:0)))
-      (is (not (segop/segop? (segop/->SegContract 1 {} :double :ze:0)))
+      (is (segop/seg-map? seg-map))
+      (is (not (segop/seg-red? seg-map)))
+      (is (segop/seg-contract? contract))
+      (is (segop/segop-node? contract))
+      (is (not (segop/segop? contract))
           "a contract is legal SegOp dialect input but not yet a scheduled KernelGraph operation")
       (is (not (segop/segop? {:not "a segop"}))))))
 
