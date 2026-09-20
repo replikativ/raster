@@ -67,6 +67,25 @@
                                  (clojure.core/+ (clojure.core/* row width) index))))])]
          effect))
 
+(def ^:private certified-maximum-source
+  '(let* [effect
+          (raster.par/segmented-fold-map!
+           [out] [[row rows]] index 1
+           [[maximum Float/NEGATIVE_INFINITY :float width
+             (clojure.core/max
+              maximum
+              (clojure.core/aget values
+                                 (clojure.core/+ (clojure.core/* row width) index)))
+             {:association :implementation-defined}]]
+           [(clojure.core/float maximum)])]
+         effect))
+
+(def ^:private certified-minimum-source
+  (walk/postwalk-replace
+   {'clojure.core/max 'clojure.core/min
+    'Float/NEGATIVE_INFINITY 'Float/POSITIVE_INFINITY}
+   certified-maximum-source))
+
 (defn- scheduled-operation []
   (let [program (:program
                  (route/attempt source :float {'values :float 'out :float}
@@ -81,6 +100,30 @@
 (defn- certified-operation []
   (let [program (:program
                  (route/attempt certified-source :float {'values :float 'out :float}
+                                {:scalar-types {'rows :long 'width :long}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'values :float 'out :float}
+                             :scalar-types {'rows :long 'width :long}}))]
+    (first (:operations (first (:equations scheduled))))))
+
+(defn- certified-maximum-operation []
+  (let [program (:program
+                 (route/attempt certified-maximum-source :float
+                                {'values :float 'out :float}
+                                {:scalar-types {'rows :long 'width :long}}))
+        scheduled (:form
+                   (segop-lower/segop-lower-pass
+                    program {:dtype :float :target-device :ocl:0
+                             :array-types {'values :float 'out :float}
+                             :scalar-types {'rows :long 'width :long}}))]
+    (first (:operations (first (:equations scheduled))))))
+
+(defn- certified-minimum-operation []
+  (let [program (:program
+                 (route/attempt certified-minimum-source :float
+                                {'values :float 'out :float}
                                 {:scalar-types {'rows :long 'width :long}}))
         scheduled (:form
                    (segop-lower/segop-lower-pass
@@ -235,6 +278,36 @@
           (is (= :one-workgroup-per-segment
                  (get-in artifact [:attributes :kernel-body :schedule :strategy])))
           (is (str/includes? (:source artifact) "foldmap_workgroup_scratch")))))))
+
+(deftest cooperative-maximum-materializes-its-typed-infinity-identity
+  (let [operation (certified-maximum-operation)
+        scheduled (fold-body/schedule
+                   operation {:array-types {'values :float 'out :float}
+                              :scalar-types {'rows :long 'width :long}})
+        source (:source
+                (segop-opencl/generate-segfoldmap-kernel
+                 operation :target-dialect :opencl-portable
+                 :array-types {'values :float 'out :float}
+                 :scalar-types {'rows :long 'width :long}))]
+    (is (= :max (get-in scheduled [:body :schedule :reduction-operator])))
+    (is (= :max (get-in scheduled [:attributes :reduction-operator])))
+    (is (str/includes? source "-INFINITY"))
+    (is (str/includes? source "fmax("))))
+
+(deftest cooperative-minimum-materializes-its-typed-infinity-identity
+  (let [operation (certified-minimum-operation)
+        scheduled (fold-body/schedule
+                   operation {:array-types {'values :float 'out :float}
+                              :scalar-types {'rows :long 'width :long}})
+        source (:source
+                (segop-opencl/generate-segfoldmap-kernel
+                 operation :target-dialect :opencl-portable
+                 :array-types {'values :float 'out :float}
+                 :scalar-types {'rows :long 'width :long}))]
+    (is (= :min (get-in scheduled [:body :schedule :reduction-operator])))
+    (is (= :min (get-in scheduled [:attributes :reduction-operator])))
+    (is (str/includes? source "INFINITY"))
+    (is (str/includes? source "fmin("))))
 
 (deftest cooperative-fold-map-rejects-a-non-tree-workgroup
   (is (= :workgroup-size

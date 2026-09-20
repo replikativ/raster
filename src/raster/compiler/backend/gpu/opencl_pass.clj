@@ -966,7 +966,6 @@
               (emit-artifact-executable!
                (segop-cl/generate-segfoldmap-kernel
                 scheduled
-                :workgroup-size (or (get-in scheduled [:grid :block-size]) 256)
                 :scalar-types top-scalar-types
                 :array-types top-array-types)
                :ze-maps :none)

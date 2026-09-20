@@ -152,6 +152,56 @@
                (subvec (vec bsums) (* row nsub) (* (inc row) nsub)))
             (str "activation block sums row " row))))))
 
+(deftest cooperative-q8k-quantization-removes-reduction-scratch
+  (let [nrows 3 in 512 n (* nrows in)
+        x (gen n 171)
+        expected-xp (int-array (quot n 4))
+        expected-xs (float-array (* nrows (quot in 256)))
+        expected-bsums (int-array (quot n 32))
+        submax (float-array (quot n 32))
+        actual-xp (int-array (alength expected-xp))
+        actual-xs (float-array (alength expected-xs))
+        actual-bsums (int-array (alength expected-bsums))]
+    (qk/quant-act-q8k-rows-gpu! x expected-xp expected-xs expected-bsums submax in nrows)
+    (qk/quant-act-q8k-cooperative-rows-gpu! x actual-xp actual-xs actual-bsums in nrows)
+    (is (= (vec expected-xp) (vec actual-xp)))
+    (is (= (vec expected-xs) (vec actual-xs)))
+    (is (= (vec expected-bsums) (vec actual-bsums)))))
+
+(deftest cooperative-padded-q8k-matches-the-compatibility-layout
+  (let [nrows 3 width 640 padded-in 768 n (* nrows padded-in)
+        dense (gen (* nrows width) 173)
+        padded (pad-rows dense nrows width padded-in)
+        expected-xp (int-array (quot n 4))
+        expected-xs (float-array (* nrows (quot padded-in 256)))
+        expected-bsums (int-array (quot n 32))
+        submax (float-array (quot n 32))
+        actual-xp (int-array (alength expected-xp))
+        actual-xs (float-array (alength expected-xs))
+        actual-bsums (int-array (alength expected-bsums))]
+    (qk/quant-act-q8k-rows-gpu! padded expected-xp expected-xs expected-bsums submax
+                                padded-in nrows)
+    (qk/quant-act-q8k-cooperative-padded-rows-gpu!
+     dense actual-xp actual-xs actual-bsums width padded-in nrows)
+    (is (= (vec expected-xp) (vec actual-xp)))
+    (is (= (vec expected-xs) (vec actual-xs)))
+    (is (= (vec expected-bsums) (vec actual-bsums)))))
+
+(deftest cooperative-q8k-retains-the-legacy-halfway-rounding-point
+  ;; This seed contains a value for which recomputing id from the rounded public FP32 scale changes
+  ;; one byte and its sub-block sum. Keep the exact private-maximum arithmetic contract explicit.
+  (let [in 256 x (gen in 1238)
+        expected-xp (int-array 64) expected-xs (float-array 1)
+        expected-bsums (int-array 8) submax (float-array 8)
+        actual-xp (int-array 64) actual-xs (float-array 1) actual-bsums (int-array 8)]
+    (qk/quant-act-q8k-rows-gpu!
+     x expected-xp expected-xs expected-bsums submax in 1)
+    (qk/quant-act-q8k-cooperative-rows-gpu!
+     x actual-xp actual-xs actual-bsums in 1)
+    (is (= (vec expected-xp) (vec actual-xp)))
+    (is (= (vec expected-xs) (vec actual-xs)))
+    (is (= (vec expected-bsums) (vec actual-bsums)))))
+
 (deftest q8k-padded-row-quantization-does-not-materialize-layout-padding
   (let [nrows 3 width 640 padded-in 768
         nsub (quot padded-in 32) nsb (quot padded-in 256)
@@ -286,6 +336,30 @@
         "Q4_K row projection reaches the target-neutral integer-dot intrinsic")
     (is (not (re-find #"\\bdouble\\b" (:source (first projection-kernels))))
         "the float projection does not accidentally promote accumulation to FP64")))
+
+(deftest cooperative-q8k-is-four-typed-general-schedules
+  (doseq [quantizer [#'qk/quant-act-q8k-cooperative-rows-gpu!
+                     #'qk/quant-act-q8k-cooperative-padded-rows-gpu!]]
+    (let [compiled (pipeline/show-pipeline quantizer :target-device :ze:0 :dtype :float)
+          kernels (:kernels compiled)
+          report (report/from-pipeline compiled)
+          descriptor (pipeline/compile-gpu-program quantizer :ze:0 :dtype :float)]
+      (is (= {:backend :opencl :source-dialect :typed-soac
+              :typed-validated true :declines []}
+             (:route report)))
+      (is (= 4 (count kernels)))
+      (is (= [:one-workgroup-per-segment
+              :one-work-item-per-element
+              :one-work-item-per-element
+              :one-work-item-per-element]
+             (mapv #(get-in % [:attributes :kernel-body :schedule :strategy]) kernels)))
+      (is (= [256] (get-in (first kernels) [:launch :workgroup-size]))
+          "the static 256-element max fold does not waste a 1024-lane workgroup")
+      (is (= {:kernel-body 4} (get-in report [:emission :routes])))
+      (is (empty? (get-in report [:emission :declines])))
+      (is (= [{:sym 'maxes :dtype :float}]
+             (mapv #(select-keys % [:sym :dtype]) (:allocs descriptor)))
+          "one compiler-owned maximum per super-block replaces caller-managed 8x submax"))))
 
 (deftest sibling-dp4a-contractions-preserve-typed-soac-through-opencl
   (let [q6-pipeline (pipeline/show-pipeline #'qk/qmatmul-q6k-dp4a!

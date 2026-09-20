@@ -11,7 +11,8 @@
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 (defn- pack-i8 ^ints [^bytes b]
   (let [w (quot (alength b) 4) out (int-array w)]
@@ -46,6 +47,34 @@
 
 (defn- maxerr [^floats a ^floats b]
   (reduce max 0.0 (map (fn [x y] (Math/abs (double (- x y)))) (seq a) (seq b))))
+
+(deftest cooperative-q8k-runs-as-one-resident-typed-program
+  (when (gpu-available?)
+    (let [rows 3 in 512 n (* rows in)
+          x (gen n 211)
+          expected-xp (int-array (quot n 4))
+          expected-xs (float-array (* rows (quot in 256)))
+          expected-bsums (int-array (quot n 32))
+          actual-xp (int-array (alength expected-xp))
+          actual-xs (float-array (alength expected-xs))
+          actual-bsums (int-array (alength expected-bsums))
+          _ (qk/quant-act-q8k-cooperative-rows-gpu!
+             x expected-xp expected-xs expected-bsums in rows)
+          descriptor (pipeline/compile-gpu-program
+                      #'qk/quant-act-q8k-cooperative-rows-gpu! :ze:0 :dtype :float)
+          arguments [x actual-xp actual-xs actual-bsums (long in) (long rows)]]
+      (is (= [:executable :map-void :map-void :map-void]
+             (mapv :convention (:steps descriptor))))
+      (gpu/with-gpu-session [session :ze:0]
+        (let [program (fixture/instantiate!
+                       session descriptor arguments
+                       {'x :input 'xp :output 'xs :output 'bsums :output})]
+          (try
+            (let [result (fixture/run! program arguments)]
+              (is (= (vec expected-xp) (vec (get result 'xp))))
+              (is (= (vec expected-xs) (vec (get result 'xs))))
+              (is (= (vec expected-bsums) (vec (get result 'bsums)))))
+            (finally (fixture/close! program))))))))
 
 (deftest rms-norm-gpu-lowers
   (when (gpu-available?)
