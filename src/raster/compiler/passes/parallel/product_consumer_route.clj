@@ -74,9 +74,18 @@
   [kernel-name {:keys [scheduled graph refinement] :as routed} target-dialect]
   (let [artifact (target/emit-artifact kernel-name scheduled target-dialect)
         public-interface (graph/public-interface (:abi artifact) (:arguments artifact))
+        pairs (mapv vector (:abi public-interface) (:arguments public-interface))
+        pointers (filterv (fn [[slot _]] (not= :scalar (:kind slot))) pairs)
+        scalar-by-value (into {} (map (fn [[slot value]] [value [slot value]]))
+                              (filter (fn [[slot _]] (= :scalar (:kind slot))) pairs))
+        ordered-scalars (mapv #(get scalar-by-value (:id %)) (:scalars graph))
+        interface-pairs (into pointers ordered-scalars)
         emitted (-> graph
-                    (assoc :abi (:abi public-interface)
-                           :arguments (:arguments public-interface))
+                    ;; A node body may choose a target-convenient scalar parameter order. The
+                    ;; executable graph retains its independently checked public scalar order;
+                    ;; node binding is by stable argument identity, never by this position.
+                    (assoc :abi (mapv first interface-pairs)
+                           :arguments (mapv second interface-pairs))
                     (assoc-in [:nodes 0 :operation] artifact)
                     (assoc-in [:attributes :scheduled-graph-refinement] refinement)
                     executable/validate!)]

@@ -6,7 +6,8 @@
    arrays become initialized LinkNodes, physical equation results and loop carry rotations become
    owned nodes, and the emitted call enters LinkPlan as a ProgramLinkInstance. No driver object,
    kernel name, or legacy resident descriptor participates."
-  (:require [raster.compiler.ir.abstract-value :as av]
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -187,12 +188,53 @@
                                               scalars buffers storage)) id))))
         (keys program-buffers))))
 
+(defn- required-materialized-buffers
+  "Return materialized array values still referenced by the emitted program.
+
+   A graph refinement may eliminate a source-level allocation entirely (for example, product
+   partials replaced by workgroup storage). The invocation plan intentionally predates scheduling,
+   so it can still materialize that binding. Only graph-boundary arrays, host array operands,
+   outputs, and buffers needed to resolve their `(extent x)` shapes survive into the LinkPlan."
+  [parallel-program]
+  (let [values (:values parallel-program)
+        array-value? #(seq (:shape (get values %)))
+        graph-values
+        (into #{}
+              (mapcat (fn [equation]
+                        (when-let [operation (first (:operations equation))]
+                          (let [kernel-graph (:graph operation)]
+                            (concat (map :id (:inputs kernel-graph))
+                                    (map :id (:outputs kernel-graph)))))))
+              (:equations parallel-program))
+        host-values
+        (into #{}
+              (comp (filter #(true? (get-in % [:attributes :host-only])))
+                    (mapcat :operands)
+                    (filter array-value?))
+              (:equations parallel-program))
+        output-values (into #{} (filter array-value?) (:outputs parallel-program))
+        initial (into graph-values (concat host-values output-values))]
+    (loop [required initial]
+      (let [dependencies
+            (into #{}
+                  (comp (mapcat #(get-in values [% :shape]))
+                        (keep (fn [dimension]
+                                (when (and (seq? dimension)
+                                           (= 'extent (first dimension))
+                                           (= 2 (count dimension)))
+                                  (second dimension)))))
+                  required)
+            expanded (into required dependencies)]
+        (if (= required expanded) required (recur expanded))))))
+
 (defn- add-materialized-inputs
-  [state materialized program-values overwrite-inputs]
+  [state materialized program-values overwrite-inputs required-buffers]
   (reduce-kv
    (fn [state compiler-value buffer]
-     (let [token (:id buffer)
-           expected (get program-values compiler-value)]
+     (if-not (contains? required-buffers compiler-value)
+       state
+       (let [token (:id buffer)
+             expected (get program-values compiler-value)]
        (when-not expected
          (fail! :invocation-link-program-input
                 "materialized buffer names a value absent from the emitted program"
@@ -208,7 +250,7 @@
          (-> state
              (assoc-in [:buffers compiler-value] token)
              (add-storage token compiler-value expected (:shape buffer)
-                          (:source buffer) initialization)))))
+                          (:source buffer) initialization))))))
    state (:program-buffers materialized)))
 
 (defn- lower-loop-storage
@@ -294,19 +336,20 @@
                    {:destinations (vec providers)}))
         invocation-plan (:plan materialized)
         invocation-id (:id invocation-plan)
-        _ (when-not (= (set (:program-inputs invocation-plan))
-                       (set (:inputs parallel-program)))
+        _ (when-not (set/subset? (set (:inputs parallel-program))
+                                 (set (:program-inputs invocation-plan)))
             (fail! :invocation-link-program-boundary
-                   "materialized invocation and emitted program have different input boundaries"
+                   "emitted program introduced inputs outside its semantic invocation boundary"
                    {:invocation-inputs (:program-inputs invocation-plan)
                     :program-inputs (:inputs parallel-program)}))
         scalars (:program-scalars materialized)
         shape-scalars (merge (invocation-shape-scalars materialized) scalars)
         overwrite-inputs (write-before-read-inputs parallel-program
                                                    materialized shape-scalars)
+        required-buffers (required-materialized-buffers parallel-program)
         initial (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
                                          materialized (:values parallel-program)
-                                         overwrite-inputs)
+                                         overwrite-inputs required-buffers)
         realized (reduce #(lower-equation-storage %1 invocation-id %2
                                                   (:values parallel-program) shape-scalars)
                          initial (:equations parallel-program))
