@@ -6,11 +6,14 @@
   GPU output must equal `ggml/vec-dot` without contraction exactly."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.descriptor-fixture :as fixture]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
+            [raster.gpu.value :as value]
             [raster.quant.ggml :as ggml]
             [raster.quant.ggml-kernels :as gk]))
 
@@ -142,7 +145,7 @@
                (mapv #(Float/floatToRawIntBits %)
                      (gpu-link/download live output-node))))))))
 
-(deftest q4-k-product-subgroup-executes-bit-identically-through-equation-first
+(deftest q4-k-product-subgroup-executes-bit-identically-through-public-compiled-artifact
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "equation-first Q4_K subgroup product")
     (let [in 256 out 3 nrows 2
@@ -166,19 +169,20 @@
                      (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
                      output
                      (long in) (long out) (long nrows)]
-          compilation (equation-first/compile #'gk/qdot-q4-K-product-rows!
-                                              {:target :ze:0 :dtype :float})
-          plan (equation-first/lower compilation arguments)
-          output-node (some (fn [[id node]]
-                              (when (identical? output (:source node)) id))
-                            (:nodes plan))]
-      (is (= :subgroup-product-ordered-consumer
-             (get-in compilation [:kernels 0 :attributes :kernel-body :schedule :strategy])))
-      (with-open [live (gpu-link/instantiate! plan)]
-        (gpu-link/run! live)
-        (is (= expected
-               (mapv #(Float/floatToRawIntBits %)
-                     (gpu-link/download live output-node))))))))
+          prepared (compiled/lower #'gk/qdot-q4-K-product-rows! arguments
+                                   {:compiler :equation-first
+                                    :target :ze:0 :dtype :float
+                                    :outputs '[y]})
+          live (compiled/instantiate! prepared)]
+      (try
+        (let [result (live {})]
+          (is (invocation-link/certified-link? (:lowering prepared)))
+          (is (= :kernel-body (get-in prepared [:descriptor :steps 0 :convention])))
+          (is (= expected
+                 (mapv #(Float/floatToRawIntBits %)
+                       (value/->host (:y result))))))
+        (finally
+          (compiled/close! live))))))
 
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?

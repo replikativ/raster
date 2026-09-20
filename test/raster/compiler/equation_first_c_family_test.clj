@@ -9,8 +9,10 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
@@ -103,6 +105,14 @@
     (raster.arrays/aget output
                         (if (< (inc index) n) (inc index) (long 0))))))
 
+(deftm c-family-lane-owned-inout!
+  [output :- (Array float) n :- Long] :- Void
+  (raster.par/map-void!
+   index n
+   (raster.arrays/aset output index
+                       (raster.numeric/+ (raster.arrays/aget output index)
+                                         (float 1.0)))))
+
 (deftm c-family-stencil
   [input :- (Array float) n :- Long] :- (Array float)
   (let [output (float-array n)]
@@ -188,12 +198,92 @@
         (is (every? #(str/includes? (:source %) "__global__ void") kernels))
         (is (not-any? #(re-find #"__kernel|get_global_id|get_local_id" (:source %)) kernels))
         (is (= 0 (get-in linked [:attributes :driver-allocations])))
+        (is (= #{'left 'right}
+               (set (keys (get-in linked [:attributes :public-buffer-bindings])))))
+        (is (= {'left :input 'right :input}
+               (get-in linked [:attributes :public-buffer-roles])))
         (is (= 1 (count (:outputs linked))))
         (is (= (set (:outputs linked))
                (:complete-writes (link-plan/initialization-contract linked)))
             "a scalar reduction establishes its complete one-element result")
         (is (= (:emitted compilation)
                (emitted-program/validate! (:emitted compilation))))))))
+
+(deftest equation-first-link-retains-public-output-and-state-roles
+  (let [output (float-array 8)
+        effect-plan
+        (equation-first/lower
+         (equation-first/compile #'c-family-effect-map!
+                                 {:target cuda-target :dtype :float})
+         [(float-array 8) output (long-array 8) 8])
+        state-plan
+        (equation-first/lower
+         (equation-first/compile #'c-family-lane-owned-inout!
+                                 {:target cuda-target :dtype :float})
+         [output 8])]
+    (is (= {'input :input 'left :output 'right :output}
+           (get-in effect-plan [:attributes :public-buffer-roles])))
+    (is (= {'output :state}
+           (get-in state-plan [:attributes :public-buffer-roles])))
+    (is (= (get-in effect-plan [:attributes :public-buffer-bindings 'left])
+           (some (fn [[id node]] (when (identical? output (:source node)) id))
+                 (:nodes effect-plan))))))
+
+(deftest compiled-artifact-consumes-the-equation-first-link-contract
+  (let [input (float-array 8)
+        output (float-array 8)
+        functional (compiled/lower #'c-family-elementwise [input 8]
+                                   {:compiler :equation-first
+                                    :target cuda-target :dtype :float})
+        effect (compiled/lower #'c-family-effect-map!
+                               [input output (long-array 8) 8]
+                               {:compiler :equation-first
+                                :target cuda-target :dtype :float
+                                :outputs '[left right]})
+        state (compiled/lower #'c-family-lane-owned-inout! [output 8]
+                              {:compiler :equation-first
+                               :target cuda-target :dtype :float})]
+    (is (every? compiled/prepared? [functional effect state]))
+    (is (every? #(true? (get-in % [:descriptor :equation-first?]))
+                [functional effect state]))
+    (is (= [[:input :input]]
+           (mapv (juxt :key :role) (:in-tree functional))))
+    (is (= [:result] (mapv :key (:out-tree functional))))
+    (is (= [[:input :input] [:left :output] [:right :output]]
+           (mapv (juxt :key :role) (:in-tree effect))))
+    (is (= [:left :right] (mapv :key (:out-tree effect))))
+    (is (= [[:output :state]]
+           (mapv (juxt :key :role) (:in-tree state))))
+    (is (every? link-plan/link-plan?
+                (map compiled/plan [functional effect state])))
+    (is (invocation-link/certificate? (compiled/certificate functional)))
+    (is (= :invocation-link-certificate
+           (:reason
+            (reason-of
+             #(invocation-link/verify!
+               (assoc-in (:lowering functional)
+                         [:plan :attributes :public-buffer-roles 'input]
+                         :state))))))
+    (is (every? #(zero? (get-in (compiled/certificate %)
+                                [:driver-allocations]))
+                [functional effect state]))))
+
+(deftest equation-first-compiled-artifacts-compose-before-allocation
+  (let [prepare #(compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                 {:compiler :equation-first
+                                  :target cuda-target :dtype :float})
+        composite (compiled/compose
+                   {:id :equation-first-pipeline
+                    :components [{:id :first :program (prepare)}
+                                 {:id :second :program (prepare)}]
+                    :connections [{:from [:first :result]
+                                   :to [:second :input]}]
+                    :outputs [{:key :result :from [:second :result]}]})]
+    (is (compiled/prepared? composite))
+    (is (= [[:first :input]] (mapv :key (:in-tree composite))))
+    (is (= [:result] (mapv :key (:out-tree composite))))
+    (is (= 2 (count (:instances (compiled/plan composite)))))
+    (is (= 0 (get-in (compiled/certificate composite) [:driver-allocations] 0)))))
 
 (deftest public-softmax-backward-keeps-the-reduction-resident
   (doseq [target [cuda-target hip-target]]
