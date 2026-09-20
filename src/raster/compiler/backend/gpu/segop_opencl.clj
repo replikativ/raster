@@ -739,7 +739,7 @@
                       (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
         temporary-ids (set (map :id (:temporaries graph)))
         output-ids (set (map :id (:outputs graph)))
-        first-scan (some #(when (instance? raster.compiler.ir.segop.SegScan (:operation %))
+        first-scan (some #(when (segop/seg-scan? (:operation %))
                             (:operation %))
                          (:nodes graph))
         scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
@@ -828,7 +828,7 @@
          graph
          (fn [{:keys [id operation] :as node}]
            (cond
-             (instance? raster.compiler.ir.segop.SegMap operation)
+             (segop/seg-map? operation)
              (generate-scheduled-segmap-kernel
               operation :dtype (:dtype operation)
               :scalar-types scalar-types :array-types array-types
@@ -837,7 +837,7 @@
               :target-dialect target-dialect
               :kernel-name-prefix "graph_segmap")
 
-             (instance? raster.compiler.ir.segop.SegStencil operation)
+             (segop/seg-stencil? operation)
              (generate-segstencil-kernel-body
               operation :scalar-types scalar-types :array-types array-types
               :target-dialect target-dialect
@@ -974,7 +974,7 @@
                  (kernel-body-c-dialect/resolve! target-dialect))]
     (cond
       (and (seq (:nodes graph))
-           (every? #(instance? raster.compiler.ir.segop.SegContract (:operation %))
+           (every? #(segop/seg-contract? (:operation %))
                    (:nodes graph)))
       (generate-staged-contraction-graph graph opts)
 
@@ -982,8 +982,8 @@
       (apply generate-scan-kernel-graph graph (mapcat identity opts))
 
       (and (seq (:nodes graph))
-           (every? #(or (instance? raster.compiler.ir.segop.SegMap (:operation %))
-                        (instance? raster.compiler.ir.segop.SegStencil (:operation %)))
+           (every? #(or (segop/seg-map? (:operation %))
+                        (segop/seg-stencil? (:operation %)))
                    (:nodes graph)))
       (try
         (generate-elementwise-kernel-graph graph opts)
@@ -998,12 +998,12 @@
             (throw exception))))
 
       (and (seq (:nodes graph))
-           (every? #(instance? raster.compiler.ir.segop.SegRed (:operation %))
+           (every? #(segop/seg-red? (:operation %))
                    (:nodes graph)))
       (generate-reduction-kernel-graph graph opts)
 
       (and (seq (:nodes graph))
-           (every? #(instance? raster.compiler.ir.segop.SegFoldMap (:operation %))
+           (every? #(segop/seg-fold-map? (:operation %))
                    (:nodes graph)))
       (generate-fold-map-kernel-graph graph opts)
 

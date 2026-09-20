@@ -37,7 +37,7 @@
   "Lower one segmented SegRed with retained input shapes and scalar/region binding dtypes.
    Address arithmetic must already carry the long-width facts required by lower-typed."
   [segred {:keys [array-types array-shapes scalar-types] :as options}]
-  (when-not (instance? raster.compiler.ir.segop.SegRed segred)
+  (when-not (segop/seg-red? segred)
     (decline! :source "product body requires a retained SegRed" {:source segred}))
   (let [operator (reduction/validate! (:reduction segred))
         source-schedule (reduction/validate-product-tree! operator (:schedule segred))

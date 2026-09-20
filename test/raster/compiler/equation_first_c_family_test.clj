@@ -18,6 +18,7 @@
             [raster.dl.attention :as attention]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.loss :as loss]
+            [raster.dl.nn :as dl-nn]
             [raster.numeric]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]
@@ -497,6 +498,24 @@
              (get-in kernel [:attributes :kernel-body :attributes :kind])))
       (is (some #(= "IfRegion" (some-> % class .getSimpleName)) operations))
       (is (not (str/includes? (:source kernel) "case*")))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-reassociated-rmsnorm-is-one-cooperative-c-family-artifact
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'dl-nn/rms-norm-reassociated! {:target target :dtype :float})
+          linked (equation-first/lower
+                  compilation
+                  [(float-array 640) (float-array 640) (float-array 640)
+                   1 640 1.0e-6 1.0])
+          kernel (first (:kernels compilation))]
+      (is (= 1 (count (:kernels compilation))))
+      (is (= module-target (:target kernel)))
+      (is (= :cooperative-segmented-fold-map
+             (get-in kernel [:attributes :kernel-body :attributes :kind])))
+      (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest portable-inout-map-refuses-a-cross-lane-read

@@ -229,7 +229,7 @@
    counted as `:segop-relowered`. SegMap is a full conversion: a missing rule is an illegal
    operation, never permission to select a second emitter."
   [stats result-id form dtype device-id scalar-types array-types]
-  (or (take-bound-segop stats :segmap #(instance? raster.compiler.ir.segop.SegMap %))
+  (or (take-bound-segop stats :segmap segop/seg-map?)
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segmap form dtype :none
                              #(let [scheduled
@@ -254,7 +254,7 @@
   "The SegRed for a par/reduce form. Reduction is a FULL conversion: absence is an illegal
    operation at the SegOp boundary, never permission to select a second emitter."
   [stats form dtype device-id scalar-types array-types]
-  (or (take-bound-segop stats :segred #(instance? raster.compiler.ir.segop.SegRed %))
+  (or (take-bound-segop stats :segred segop/seg-red?)
       (do (swap! stats update :segop-relowered (fnil inc 0))
           (or (segop-attempt stats :segred form dtype :none
                              #(let [sym (gensym "red_")
@@ -372,7 +372,7 @@
 
 (defn- graph-reduction-equation? [equation]
   (and (seq (:operations equation))
-       (every? #(and (instance? raster.compiler.ir.segop.SegRed %)
+       (every? #(and (segop/seg-red? %)
                      (or (= :product (:phase %))
                          (and (empty? (segop/seg-space-segment-dims (:space %)))
                               (reduction/scalar? (:reduction %)))))
@@ -840,14 +840,14 @@
                   ;; scheduled operation (door C), route from the form and count it.
                   bound-sr (take-bound-segop
                             stats :segred-contraction
-                            #(and (instance? raster.compiler.ir.segop.SegRed %)
+                            #(and (segop/seg-red? %)
                                   (= :contraction (:phase %))
                                   (= :hardware-contraction-candidates
                                      (get-in % [:schedule :strategy]))))
                   bound-sc (when-not bound-sr
                              (take-bound-segop
                               stats :segcontract
-                              #(instance? raster.compiler.ir.segop.SegContract %)))
+                              segop/seg-contract?))
                   bound-operation (or bound-sr bound-sc)
                   typed-algorithm
                   (when bound-sr
@@ -961,7 +961,7 @@
             (par/par-segmented-fold-map-form? form)
             (if-let [scheduled (take-bound-segop
                                 stats :segfoldmap
-                                #(and (instance? raster.compiler.ir.segop.SegFoldMap %)
+                                #(and (segop/seg-fold-map? %)
                                       (= :typed-soac (:algorithm-dialect %))))]
               (emit-artifact-executable!
                (segop-cl/generate-segfoldmap-kernel
@@ -983,7 +983,7 @@
                     (par/expand-par-map-void! form))
                 (if-let [scheduled (take-bound-segop
                                  stats :segmap
-                                 #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                 #(and (segop/seg-map? %)
                                        (= :typed-soac (:algorithm-dialect %))))]
                   (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                                 scheduled
@@ -1016,7 +1016,7 @@
             (par/par-rng-fill-form? form)
             (if-let [scheduled (take-bound-segop
                                 stats :segmap
-                                #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                #(and (segop/seg-map? %)
                                       (= :typed-soac (:algorithm-dialect %))))]
               (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                             scheduled :dtype (:dtype scheduled)
@@ -1029,7 +1029,7 @@
             (par/par-active-ids-form? form)
             (if-let [scheduled (take-bound-segop
                                 stats :segmap
-                                #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                #(and (segop/seg-map? %)
                                       (= :typed-soac (:algorithm-dialect %))))]
               (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                             scheduled :dtype (:dtype scheduled)
@@ -1042,7 +1042,7 @@
             (par/par-stencil-form? form)
             (if-let [scheduled (take-bound-segop
                                 stats :segstencil
-                                #(and (instance? raster.compiler.ir.segop.SegStencil %)
+                                #(and (segop/seg-stencil? %)
                                       (= :typed-soac (:algorithm-dialect %))))]
               (let [kernel (segop-cl/generate-segstencil-kernel-body
                             scheduled :scalar-types top-scalar-types
@@ -1150,16 +1150,14 @@
                                                 [sym (if scheduled
                                                        (do
                                                          (when (and equation
-                                                                    (every? #(instance?
-                                                                              raster.compiler.ir.segop.SegRed %)
+                                                                    (every? segop/seg-red?
                                                                             (:operations equation)))
                                                            (swap! stats update :segop-reused
                                                                   (fnil inc 0)))
                                                          (emit-scheduled-graph!
                                                           scheduled
                                                           (when (and equation
-                                                                     (every? #(instance?
-                                                                               raster.compiler.ir.segop.SegRed %)
+                                                                     (every? segop/seg-red?
                                                                              (:operations equation)))
                                                             :ze-reduces)
                                                           (boolean (host-scalar-result?

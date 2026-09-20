@@ -229,7 +229,7 @@
                    (get-in equation [:attributes :kernel-graph :temporaries]))]
        (reduce
         (fn [values operation]
-          (if (and (instance? raster.compiler.ir.segop.SegRed operation)
+          (if (and (segop/seg-red? operation)
                    (= :block-local (:phase operation)))
             (let [grid (:grid operation)
                   reduced-bound (-> operation :space segop/seg-space-reduced-dim :bound)

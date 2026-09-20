@@ -10,7 +10,7 @@
    The map schedule establishes 0<=index<bound at each :map-active load. Indirect/local-SSA
    coordinates, effects and unknown domains decline. Returned counts are minimum capacities."
   [operation options]
-  (when (and (instance? raster.compiler.ir.segop.SegMap operation)
+  (when (and (segop/seg-map? operation)
              (:out-sym operation)
              (= 1 (count (get-in operation [:space :dims])))
              (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))

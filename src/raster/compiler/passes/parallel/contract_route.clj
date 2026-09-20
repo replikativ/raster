@@ -655,7 +655,7 @@
    cannot accept a SegRed borrowed from another equation."
   [program operation]
   (let [program (soac-dialect/validate! program)
-        _ (when-not (instance? raster.compiler.ir.segop.SegRed operation)
+        _ (when-not (segop/seg-red? operation)
             (throw (ex-info "typed contraction route requires a scheduled SegRed"
                             {:reason :typed-contraction-operation :operation operation})))
         operation-id (:id operation)

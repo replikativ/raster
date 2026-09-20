@@ -137,28 +137,34 @@
 ;; Predicates
 ;; ================================================================
 
+(defn- record-kind?
+  [class-name value]
+  (and value (= class-name (.getName (class value)))))
+
+(defn seg-map? [value] (record-kind? "raster.compiler.ir.segop.SegMap" value))
+(defn seg-stencil? [value] (record-kind? "raster.compiler.ir.segop.SegStencil" value))
+(defn seg-fold-map? [value] (record-kind? "raster.compiler.ir.segop.SegFoldMap" value))
+(defn seg-red? [value] (record-kind? "raster.compiler.ir.segop.SegRed" value))
+(defn seg-scan? [value] (record-kind? "raster.compiler.ir.segop.SegScan" value))
+(defn seg-contract? [value] (record-kind? "raster.compiler.ir.segop.SegContract" value))
+
 (defn segop?
   "Check if a value is a generic SegOp record across Typed Clojure child classloaders."
   [x]
-  (and x
-       (contains? #{"raster.compiler.ir.segop.SegMap"
-                    "raster.compiler.ir.segop.SegStencil"
-                    "raster.compiler.ir.segop.SegFoldMap"
-                    "raster.compiler.ir.segop.SegRed"
-                    "raster.compiler.ir.segop.SegScan"}
-                  (.getName (class x)))))
+  (boolean (or (seg-map? x) (seg-stencil? x) (seg-fold-map? x)
+               (seg-red? x) (seg-scan? x))))
 
 (defn segop-node?
   "Any operation legal in the SegOp dialect, including a semantic SegContract that must be routed
    before it can become an executable KernelGraph operation."
   [x]
   (or (segop? x)
-      (and x (= "raster.compiler.ir.segop.SegContract" (.getName (class x))))))
+      (seg-contract? x)))
 
 (defn operation-inputs
   "Physical tensor inputs of a scheduled operation, including a SegContract schedule view."
   [operation]
-  (if (instance? SegContract operation)
+  (if (seg-contract? operation)
     (into #{} (map #(get (:bindings operation) % %))
           (:reads (contraction-facts/dependencies (:facts operation))))
     (or (:inputs operation) #{})))
@@ -166,7 +172,7 @@
 (defn operation-outputs
   "Physical tensor outputs of a scheduled operation, including a SegContract schedule view."
   [operation]
-  (if (instance? SegContract operation)
+  (if (seg-contract? operation)
     #{(let [out (get-in operation [:facts :out])] (get (:bindings operation) out out))}
     (set (or (:outputs operation) #{}))))
 
@@ -187,7 +193,7 @@
    A SegContract deliberately stores only verified contraction facts, so its scalar ABI is a
    checked projection of axis bounds rather than a duplicate record field."
   [operation]
-  (if (instance? SegContract operation)
+  (if (seg-contract? operation)
     (into #{} (map #(get (:bindings operation) % %))
           (:scalars (contraction-facts/dependencies (:facts operation))))
     (let [space (:space operation)
