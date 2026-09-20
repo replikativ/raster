@@ -790,8 +790,9 @@
 
    This is only a structural recognition boundary. It does not assert associativity or
    commutativity; the owning typed region must retain source order or separately certify each
-   component algebra before selecting a parallel product-reduction schedule. The exit must be
-   the carry tuple in binding order, ruling out post-loop projections and ambiguous aggregates."
+   component algebra before selecting a parallel product-reduction schedule. The exit is retained
+   explicitly: a later typed normalization may project the final carries without hiding that
+   projection inside the recurrence."
   [loop-form]
   (when (and (seq? loop-form) (contains? loop-heads (first loop-form))
              (= 3 (count loop-form)) (vector? (second loop-form))
@@ -825,7 +826,8 @@
                   carry-inits (mapv #(second (nth pairs %)) carry-slots)
                   update-exprs (mapv #(nth recur-args %) carry-slots)
                   scoped (mapv #(scoped-recur-value then-branch %) update-exprs)]
-              (when (and (= else-branch carry-syms) (every? some? scoped))
+              (when (and (not (contains-sym? else-branch index-sym))
+                         (every? some? scoped))
                 {:index-sym index-sym
                  :index-init index-init
                  :index-slot index-slot
@@ -837,6 +839,7 @@
                  :recur-form recur-form
                  :carry-syms carry-syms
                  :carry-inits carry-inits
+                 :exit-expr else-branch
                  :update-exprs update-exprs
                  :scoped-update-exprs scoped}))))))))
 

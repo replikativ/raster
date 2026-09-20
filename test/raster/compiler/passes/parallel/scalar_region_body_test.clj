@@ -636,12 +636,21 @@
     (is (every? #(and (seq? %) (= 'let* (first %)))
                 (:scoped-update-exprs matched))))
   (doseq [form ['(loop* [i 0 a 0.0 b 0.0]
-                  (if (< i n) (recur (inc i) (+ a 1.0) (+ b 1.0)) [b a]))
-                '(loop* [i 0 a 0.0 b 0.0]
                   (if (< i n) (recur (+ i 2) (+ a 1.0) (+ b 1.0)) [a b]))
+                '(loop* [i 0 a 0.0 b 0.0]
+                  (if (< i n) (recur (inc i) (+ a 1.0) (+ b 1.0)) i))
                 '(loop* [i 0 a 0.0]
                   (if (< i n) (recur (inc i) (+ a 1.0)) a))]]
     (is (nil? (patterns/match-ordered-product-loop form)))))
+
+(deftest ordered-product-loop-retains-a-pure-exit-projection
+  (let [matched (patterns/match-ordered-product-loop
+                 '(loop* [i 0 a 0.0 b 0.0]
+                    (if (< i n)
+                      (recur (inc i) (+ a 1.0) (+ b 2.0))
+                      (+ a b))))]
+    (is (= '[a b] (:carry-syms matched)))
+    (is (= '(+ a b) (:exit-expr matched)))))
 
 (deftest ordered-loop-admission-does-not-drop-effects-or-swap-recur-slots
   (doseq [form ['(loop [r 1 acc 0.0]
