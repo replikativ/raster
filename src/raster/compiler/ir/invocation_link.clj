@@ -212,8 +212,17 @@
                     (mapcat :operands)
                     (filter array-value?))
               (:equations parallel-program))
+        loop-initials
+        (into #{}
+              (mapcat (fn [equation]
+                        (let [operation (first (:operations equation))]
+                          (when (emitted-loop/emitted-loop? operation)
+                            (map :initial
+                                 (control/carried
+                                  (get-in operation [:schedule :algorithm])))))))
+              (:equations parallel-program))
         output-values (into #{} (filter array-value?) (:outputs parallel-program))
-        initial (into graph-values (concat host-values output-values))]
+        initial (into graph-values (concat host-values loop-initials output-values))]
     (loop [required initial]
       (let [dependencies
             (into #{}

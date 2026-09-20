@@ -327,7 +327,14 @@ also distinguishes a compiler-certified `:no-overflow` operation from a semantic
 targets emit the former as signed arithmetic. CUDA and HIP lower the latter through checked
 same-width unsigned predicates followed by PTX/LLVM target traps; OpenCL targets explicitly decline
 it because OpenCL C has no standard trap primitive. Schedule-local scan extent subtraction
-is the first proved operation. Source-derived address algebra is not blanket-certified: it still
+is the first proved operation. Subgroup reductions likewise carry a mandatory arithmetic contract
+in addition to their physical association: floating reductions state IEEE overflow, exact integral
+operators state exact arithmetic, and wrapping integral add/multiply state modular arithmetic.
+OpenCL builtins and CUDA/HIP shuffle trees lower the wrapping case through a same-width unsigned
+carrier and bit-preserving signed result, so a reassociation proof cannot accidentally reintroduce
+signed-C overflow undefined behaviour. Broadcasts carry neither reduction association nor an
+arithmetic contract.
+Source-derived address algebra is not blanket-certified: it still
 awaits AxisMap/range proofs. Whole-kernel
 workgroup allocations now have static typed shapes, named
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte

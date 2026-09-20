@@ -484,7 +484,7 @@
     {})
    (body/->Collective
     (body/value 'dot :float) :reduce :subgroup subgroup-size 'partial-dot :+ nil
-    (body/full-participation) :implementation-defined)
+    (body/full-participation) :implementation-defined {:overflow :ieee})
    (compute 'logit :float (expr :* :float 'dot (lit (:scale problem) :float)))])
 
 (defn- reference-dot-operations
@@ -832,7 +832,8 @@
        [(body/value partial-dot :float)] {})
       (body/->Collective
        (body/value dot :float) :reduce :subgroup (:workgroup-size scheduled)
-       partial-dot :+ nil (body/full-participation) :implementation-defined)
+       partial-dot :+ nil (body/full-participation) :implementation-defined
+       {:overflow :ieee})
       (compute logit :float (expr :* :float dot (lit (:scale problem) :float)))]}))
 
 (defn- staged-values
