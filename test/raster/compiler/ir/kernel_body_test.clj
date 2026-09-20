@@ -363,7 +363,7 @@
   [input]
   (body/->Collective
    (body/value 'sum :float) :reduce :subgroup 16 input :+ nil
-   (body/full-participation) :implementation-defined))
+   (body/full-participation) :implementation-defined {:overflow :ieee}))
 
 (deftest typed-scalar-memory-control-and-collectives-share-one-body
   (let [predicate (body/->ScalarCompute
@@ -639,7 +639,13 @@
           [(load-x)
            (body/->Collective
             (body/value 'sum :float) :reduce :subgroup 8 'x-value :+ nil
-            (body/full-participation) :implementation-defined)]))))
+            (body/full-participation) :implementation-defined {:overflow :ieee})]))))
+  (testing "collective arithmetic cannot silently change the source dtype semantics"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"arithmetic contract disagrees"
+         (scalar-body
+          [(load-x)
+           (assoc (reduce-x 'x-value) :arithmetic {:overflow :wrap})]))))
   (testing "broadcast source lanes are statically in range"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"statically in range"
@@ -647,7 +653,7 @@
           [(load-x)
            (body/->Collective
             (body/value 'shared :float) :broadcast :subgroup 16 'x-value nil 16
-            (body/full-participation) nil)]))))
+            (body/full-participation) nil nil)]))))
   (testing "broadcasts do not claim a reduction association"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"no reduction association"
@@ -655,7 +661,7 @@
           [(load-x)
            (body/->Collective
             (body/value 'shared :float) :broadcast :subgroup 16 'x-value nil 0
-            (body/full-participation) :implementation-defined)])))))
+            (body/full-participation) :implementation-defined nil)])))))
 
 (deftest memory-loads-cannot-prove-convergence-without-alias-facts
   (is (thrown-with-msg?
@@ -939,7 +945,7 @@
           [(load-x)
            (body/->Collective
             (body/value 'bad :float) :reduce :subgroup 16 'x-value :bit-and nil
-            (body/full-participation) :implementation-defined)])))))
+            (body/full-participation) :implementation-defined {:overflow :ieee})])))))
 
 (deftest scalar-ssa-cannot-shadow-typed-loop-indices
   (is (thrown-with-msg?

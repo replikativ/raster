@@ -86,10 +86,10 @@
         {:unroll true})
        (body/->Collective
         (body/value subgroup-sum :float) :reduce :subgroup 16 loop-result :+ nil
-        (body/full-participation) :implementation-defined)
+        (body/full-participation) :implementation-defined {:overflow :ieee})
        (body/->Collective
         (body/value shared-sum :float) :broadcast :subgroup 16 subgroup-sum nil 0
-        (body/full-participation) nil)
+        (body/full-participation) nil nil)
        (body/->ScalarCompute
         (body/value output-value :half)
         (body/cast-expression shared-sum :half :nearest-even :ieee))
@@ -98,6 +98,25 @@
       :launch (launch/spec {:workgroup-size [16] :group-count [2]})
       :provenance {:dialect :test}
       :attributes {:kind :scalar}})))
+
+(defn- wrapping-collective-body []
+  (body/make
+   {:id :wrapping-collective-test
+    :parameters [(body/->KernelParameter 'value :scalar :int [] nil nil :value)
+                 (body/->KernelParameter 'out :output :int [1] :global
+                                         (layout/row-major [1] :int) :result)]
+    :indices [(body/->IndexBinding 'lane :lane 0)]
+    :masks [(body/->Mask :lane-zero [(body/predicate :eq 'lane 0)])]
+    :operations [(body/->Collective
+                  (body/value 'sum :int) :reduce :subgroup 16 'value :+ nil
+                  (body/full-participation) :implementation-defined {:overflow :wrap})
+                 (body/->ScalarStore 'out [0] 'sum :lane-zero)]
+    :schedule {:subgroup-size 16}
+    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(declare command-available? compile-c-family-source)
 
 (defn workgroup-kernel-body
   "Small production-shaped fixture shared with the hardware-free vendor compiler gates."
@@ -263,6 +282,33 @@
         (let [result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                "-fsyntax-only" "-" :in source)]
           (is (zero? (:exit result)) (:err result)))))))
+
+(deftest wrapping-integral-collectives-use-unsigned-carriers
+  (doseq [[target unsigned bitcast]
+          [[:opencl-portable "uint rstr_sum__unsigned_collective"
+            "as_int(rstr_sum__unsigned_collective)"]
+           [:cuda "unsigned int rstr_sum__unsigned_collective"
+            "raster_bitcast_u32_i32(rstr_sum__unsigned_collective)"]
+           [:hip "unsigned int rstr_sum__unsigned_collective"
+            "raster_bitcast_u32_i32(rstr_sum__unsigned_collective)"]]]
+    (let [source (opencl/emit-scalar-kernel
+                  "wrapping_collective" (wrapping-collective-body)
+                  {:target-dialect target})]
+      (is (str/includes? source unsigned) (name target))
+      (is (str/includes? source bitcast) (name target))
+      (is (not (str/includes? source "int rstr_sum = rstr_value;")) (name target))
+      (when-let [compiler ({:cuda "nvcc" :hip "hipcc"} target)]
+        (when (command-available? compiler)
+          (let [{:keys [exit err]} (compile-c-family-source target source)]
+            (is (zero? exit) err))))))
+  (testing "the portable OpenCL spelling type-checks"
+    (when (command-available? "clang")
+      (let [source (opencl/emit-scalar-kernel
+                    "wrapping_collective" (wrapping-collective-body)
+                    {:target-dialect :opencl-portable})
+            {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+        (is (zero? exit) err)))))
 
 (deftest target-lowering-refuses-unrepresentable-numerical-contracts
   (let [kernel (scalar-kernel-body)

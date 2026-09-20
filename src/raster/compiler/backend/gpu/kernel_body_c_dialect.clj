@@ -75,6 +75,39 @@
     ({:byte "uint8_t" :int "unsigned int" :long "unsigned long long"}
      (dtype/canon type))))
 
+(defn wrapping-carrier-expression
+  "Convert a signed integral value to its same-width unsigned modular carrier."
+  [dialect expression type]
+  (str "(" (unsigned-type-name dialect type) ")(" expression ")"))
+
+(defn wrapping-signed-name
+  [type]
+  (str "raster_bitcast_"
+       ({:byte "u8_i8" :int "u32_i32" :long "u64_i64"} (dtype/canon type))))
+
+(defn wrapping-signed-expression
+  "Reinterpret an unsigned modular carrier as the corresponding signed value."
+  [dialect expression type]
+  (let [type (dtype/canon type)]
+    (if (opencl? dialect)
+      (str ({:byte "as_char" :int "as_int" :long "as_long"} type)
+           "(" expression ")")
+      (str (wrapping-signed-name type) "(" expression ")"))))
+
+(defn wrapping-signed-helper-source
+  "Emit the CUDA/HIP bit-preserving unsigned-to-signed conversion used after a modular collective."
+  [dialect type]
+  (when-not (opencl? dialect)
+    (let [type (dtype/canon type)
+          signed (type-name dialect type)
+          unsigned (unsigned-type-name dialect type)
+          helper (wrapping-signed-name type)]
+      (str "inline " signed " " helper "(" unsigned " value) {\n"
+           "  union { " unsigned " u; " signed " s; } bits;\n"
+           "  bits.u = value;\n"
+           "  return bits.s;\n"
+           "}\n"))))
+
 (defn parameter-declaration
   [dialect parameter c-name]
   (if (= :scalar (:kind parameter))

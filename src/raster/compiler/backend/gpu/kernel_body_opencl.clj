@@ -429,6 +429,17 @@
        distinct
        (sort-by pr-str)))
 
+(defn- wrapping-collective-requirements
+  [operations]
+  (->> (tree-seq coll? seq operations)
+       (keep (fn [operation]
+               (when (and (record-kind? "Collective" operation)
+                          (= :reduce (:kind operation))
+                          (= :wrap (get-in operation [:arithmetic :overflow])))
+                 (dtype/canon (get-in operation [:result :type])))))
+       distinct
+       (sort-by pr-str)))
+
 (defn- scalar-defined-ids
   [operations]
   (mapcat
@@ -1263,7 +1274,24 @@
 
             :reduce
             (let [operator (intrinsics/canonical (:operator operation))
-                  association (:association operation)]
+                  association (:association operation)
+                  wrapping? (= :wrap (get-in operation [:arithmetic :overflow]))
+                  carrier-name (str result-name "__unsigned_collective")
+                  working-name (if wrapping? carrier-name result-name)
+                  working-type (if wrapping?
+                                 (c-dialect/unsigned-type-name *scalar-dialect* result-type)
+                                 (target-type result-type))
+                  working-input (if wrapping?
+                                  (c-dialect/wrapping-carrier-expression
+                                   *scalar-dialect* input result-type)
+                                  input)
+                  finish (when wrapping?
+                           (indent-lines
+                            depth
+                            (str (target-type result-type) " " result-name " = "
+                                 (c-dialect/wrapping-signed-expression
+                                  *scalar-dialect* working-name result-type)
+                                 ";")))]
               (if (c-dialect/opencl? *scalar-dialect*)
                 (let [_ (when-not (= :implementation-defined association)
                           (throw
@@ -1276,9 +1304,10 @@
                     (throw (ex-info "OpenCL has no matching subgroup reduction builtin"
                                     {:reason :kernel-body-opencl-collective
                                      :operator (:operator operation)})))
-                  (indent-lines depth
-                                (str (target-type result-type) " " result-name " = "
-                                     builtin "(" input ");")))
+                  (str (indent-lines depth
+                                     (str working-type " " working-name " = "
+                                          builtin "(" working-input ");"))
+                       finish))
                 (let [distances (if (= :implementation-defined association)
                                   (when (zero? (bit-and width (dec width)))
                                     (vec (take-while pos?
@@ -1291,11 +1320,11 @@
                                            :width width :association association})))
                       combine (fn [rhs]
                                 (case operator
-                                  :+ (str result-name " += " rhs ";")
-                                  :* (str result-name " *= " rhs ";")
-                                  :bit-and (str result-name " &= " rhs ";")
-                                  :bit-or (str result-name " |= " rhs ";")
-                                  :bit-xor (str result-name " ^= " rhs ";")
+                                  :+ (str working-name " += " rhs ";")
+                                  :* (str working-name " *= " rhs ";")
+                                  :bit-and (str working-name " &= " rhs ";")
+                                  :bit-or (str working-name " |= " rhs ";")
+                                  :bit-xor (str working-name " ^= " rhs ";")
                                   (:min :max)
                                   (let [fn-name (case [operator result-type]
                                                   [:min :float] "fminf"
@@ -1308,23 +1337,24 @@
                                                       {:reason :kernel-body-c-collective
                                                        :dialect (:id *scalar-dialect*)
                                                        :operator operator :dtype result-type})))
-                                    (str result-name " = " fn-name "(" result-name ", " rhs ");"))
+                                    (str working-name " = " fn-name "(" working-name ", " rhs ");"))
                                   (throw (ex-info "CUDA/HIP has no matching subgroup reduction"
                                                   {:reason :kernel-body-c-collective
                                                    :dialect (:id *scalar-dialect*)
                                                    :operator operator}))))]
                   (str (indent-lines depth
-                                     (str (target-type result-type) " " result-name " = " input ";"))
+                                     (str working-type " " working-name " = " working-input ";"))
                        (apply str
                               (for [distance distances]
                                 (indent-lines depth
                                               (combine
                                                (c-dialect/shuffle-down-expression
-                                                *scalar-dialect* result-name distance width)))))
+                                                *scalar-dialect* working-name distance width)))))
                        (indent-lines depth
-                                     (str result-name " = "
+                                     (str working-name " = "
                                           (c-dialect/broadcast-expression
-                                           *scalar-dialect* result-name 0 width) ";")))))))]
+                                           *scalar-dialect* working-name 0 width) ";"))
+                       finish)))))]
       [source next-context])
 
     (record-kind? "WorkgroupBarrier" operation)
@@ -1549,6 +1579,11 @@
                             (c-dialect/trapping-integral-cast-helper-source
                              *scalar-dialect* source-type result-type))
                           (trapping-cast-requirements operations value-types)))
+              (apply str
+                     (keep (fn [type]
+                             (c-dialect/wrapping-signed-helper-source
+                              *scalar-dialect* type))
+                           (wrapping-collective-requirements operations)))
               (when (and (c-dialect/opencl? *scalar-dialect*)
                          (str/includes? operation-source "atomic_add_float("))
                 ce/opencl-atomic-add-float-helper)

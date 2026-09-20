@@ -315,7 +315,7 @@
                            [(body/value 'local-dot dtype)])
           (body/->Collective (body/value 'dot dtype) :reduce :subgroup width
                              'local-dot :+ nil (body/full-participation)
-                             :implementation-defined)
+                             :implementation-defined {:overflow :ieee})
           (compute 'score-owner :predicate
                    (conjunction 'visible (expr :eq :predicate 'lane-long (lit 0 :long))))
           (body/->IfRegion
@@ -330,7 +330,7 @@
             (yield 'local-weight-value)]
            [(yield zero)] [(body/value 'local-weight dtype)])
           (body/->Collective (body/value 'weight dtype) :broadcast :subgroup width
-                             'local-weight nil 0 (body/full-participation) nil)
+                             'local-weight nil 0 (body/full-participation) nil nil)
           (compute 'denominator-next dtype (expr :+ dtype 'denominator-state 'weight))
           (compute 'value-active :predicate (conjunction 'active 'visible))
           (body/->IfRegion

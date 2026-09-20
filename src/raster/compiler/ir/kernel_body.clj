@@ -50,7 +50,7 @@
             attributes])
 (defrecord Participation [kind])
 (defrecord Collective
-           [result kind scope width input operator source-lane participation association])
+           [result kind scope width input operator source-lane participation association arithmetic])
 (defrecord WorkgroupBarrier [scope memory-spaces semantics participation])
 (defrecord AsyncWorkgroupCopy
            [id source source-coordinates destination destination-coordinates elements
@@ -893,15 +893,17 @@
           :reduce
           (when-not (and (keyword? (:operator operation))
                          (nil? (:source-lane operation))
+                         (map? (:arithmetic operation))
                          (collective-association? (:association operation)
                                                   (:width operation)))
-            (throw (ex-info "subgroup reduction requires an operator and no source lane"
+            (throw (ex-info "subgroup reduction requires an operator, arithmetic contract, and no source lane"
                             {:operation operation})))
           :broadcast
           (when-not (and (nil? (:operator operation))
                          (nil? (:association operation))
+                         (nil? (:arithmetic operation))
                          (expression? (:source-lane operation)))
-            (throw (ex-info "subgroup broadcast requires a source lane and no reduction association"
+            (throw (ex-info "subgroup broadcast requires a source lane and no reduction association or arithmetic contract"
                             {:operation operation})))))
 
       (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
@@ -1802,12 +1804,25 @@
                          :workgroup-width workgroup-width :scheduled-width scheduled-width})))
       (case (:kind operation)
         :reduce
-        (let [operator (intrinsics/canonical (:operator operation))]
+        (let [operator (intrinsics/canonical (:operator operation))
+              arithmetic (:arithmetic operation)
+              floating? (dtype/fp-dtype? (:type input))
+              integral? (dtype/integral? (:type input))
+              expected-arithmetic
+              (cond
+                floating? {:overflow :ieee}
+                (and integral? (contains? #{:+ :*} operator)) {:overflow :wrap}
+                integral? {:overflow :exact})]
           (when-not (and (contains? #{:+ :* :min :max :bit-and :bit-or :bit-xor} operator)
                          (intrinsics/accepts-scalar-dtype? operator (:type input)))
             (throw (ex-info "subgroup reduction operator is not associative for its input dtype"
                             {:reason :kernel-body-collective-operator
-                             :operator (:operator operation) :input-type (:type input)}))))
+                             :operator (:operator operation) :input-type (:type input)})))
+          (when-not (= expected-arithmetic arithmetic)
+            (throw (ex-info "subgroup reduction arithmetic contract disagrees with its operator and dtype"
+                            {:reason :kernel-body-collective-arithmetic
+                             :operator operator :input-type (:type input)
+                             :expected expected-arithmetic :actual arithmetic}))))
         :broadcast
         (let [lane (:source-lane operation)]
           (when-not (and (integer? lane) (<= 0 lane) (< lane width))
