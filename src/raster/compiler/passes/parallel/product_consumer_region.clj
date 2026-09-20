@@ -67,6 +67,13 @@
           (first digits)
           (map vector (rest digits) (rest bounds))))
 
+(defn- extent-product [bounds]
+  (case (count bounds)
+    0 1
+    1 (first bounds)
+    (with-meta (apply list 'clojure.core/* bounds)
+      {:raster.type/tag 'long :tag 'long})))
+
 (defn- expand-locals
   "Expand the consumer's ordered scalar locals as pure source expressions.  The scalar-region
    validator has already established their SSA order; this projection is used only for an affine
@@ -77,12 +84,9 @@
             (assoc bindings id (util/subst-syms bindings init)))
           initial locals)))
 
-(defn- intermediate-load-offsets
-  [intermediate fold prefix ordered local consumer-prefix-binding consumer-locals]
-  (let [loads (loads-of intermediate fold)
-        local-volume (reduce * 1 (map :bound local))
-        axes (set (conj (mapv :name prefix) (:name ordered)))
-        consumer->producer
+(defn- address-substitutions
+  [fold prefix consumer-prefix-binding consumer-locals]
+  (let [consumer->producer
         (into {}
               (mapv (fn [consumer-digit producer-axis]
                       (when-not (symbol? consumer-digit)
@@ -91,9 +95,16 @@
                                   {:digit consumer-digit :axis producer-axis}))
                       [consumer-digit (:name producer-axis)])
                     consumer-prefix-binding prefix))
-        fold-locals (:locals (dialect/lambda-parts (:lambda (ordered-fold-parts fold))))
-        substitutions (-> (merge (expand-locals consumer-locals) consumer->producer)
-                          (expand-locals fold-locals))
+        fold-locals (:locals (dialect/lambda-parts (:lambda (ordered-fold-parts fold))))]
+    (-> (merge (expand-locals consumer-locals) consumer->producer)
+        (expand-locals fold-locals))))
+
+(defn- intermediate-load-offsets
+  [intermediate fold prefix ordered local consumer-prefix-binding consumer-locals]
+  (let [loads (loads-of intermediate fold)
+        local-volume (reduce * 1 (map :bound local))
+        axes (set (conj (mapv :name prefix) (:name ordered)))
+        substitutions (address-substitutions fold prefix consumer-prefix-binding consumer-locals)
         expected (fn [offset]
                    (row-major-expression
                     (conj (mapv :name prefix) (:name ordered) offset)
@@ -110,6 +121,48 @@
                       :local-volume local-volume :matching-offsets matches}))
          {:load load :expanded-coordinate coordinate :local-offset (first matches)}))
      loads)))
+
+(defn- ordered-axis-selections [axes]
+  (letfn [(walk [prefix remaining]
+            (concat (when (seq prefix) [prefix])
+                    (mapcat (fn [axis]
+                              (walk (conj prefix axis)
+                                    (vec (remove #(= axis %) remaining))))
+                            remaining)))]
+    (walk [] (vec axes))))
+
+(defn- consumer-read-requirements
+  [intermediate fold prefix ordered consumer-prefix-binding consumer-locals]
+  (let [substitutions (address-substitutions fold prefix consumer-prefix-binding consumer-locals)
+        axes (conj (vec prefix) ordered)
+        axis-names (set (map :name axes))
+        loads (remove #(= intermediate (descriptor/aget-array-sym %))
+                      (filter descriptor/aget-call? (tree-seq coll? seq fold)))]
+    (reduce
+     (fn [requirements load]
+       (let [buffer (descriptor/aget-array-sym load)
+             coordinate (util/subst-syms substitutions (descriptor/aget-index load))
+             matches
+             (keep (fn [selection]
+                     (let [digits (mapv :name selection)
+                           bounds (mapv :bound selection)]
+                       (when (axis-map/index= coordinate
+                                             (row-major-expression digits bounds) axis-names)
+                         (extent-product bounds))))
+                   (ordered-axis-selections axes))
+             extents (vec (distinct matches))]
+         (when-not (= 1 (count extents))
+           (decline! :consumer-read-layout
+                     "consumer input load has no unique dense axis projection"
+                     {:load load :expanded-coordinate coordinate :matches extents}))
+         (if-let [prior (get requirements buffer)]
+           (if (extent-expression/equivalent? prior (first extents))
+             requirements
+             (decline! :consumer-read-layout
+                       "consumer input uses incompatible dense projections"
+                       {:buffer buffer :left prior :right (first extents)}))
+           (assoc requirements buffer (first extents)))))
+     {} loads)))
 
 (defn- permutations [values]
   (if (empty? values)
@@ -267,6 +320,9 @@
         intermediate-offsets
         (intermediate-load-offsets intermediate fold prefix ordered local
                                    (:consumer-digits prefix-binding) consumer-locals)
+        consumer-requirements
+        (consumer-read-requirements intermediate fold prefix ordered
+                                    (:consumer-digits prefix-binding) consumer-locals)
         cooperative-width (static-cooperative-width local reduced)
         integral-components? (every? #(contains? #{:byte :short :int :long}
                                                    (dtype/canon (:dtype %)))
@@ -282,6 +338,7 @@
      :consumer consumer
      :intermediate intermediate
      :intermediate-loads intermediate-offsets
+     :consumer-read-requirements consumer-requirements
      :axes {:prefix prefix
             :prefix-binding (:consumer-digits prefix-binding)
             :ordered ordered
