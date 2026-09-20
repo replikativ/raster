@@ -265,8 +265,9 @@
                      (output-entry (keyword (name value)) value :tap))
                    taps)
         out-tree (reduce (fn [entries entry]
-                           (if (some #(and (= (:key %) (:key entry))
-                                           (= (:node %) (:node entry))) entries)
+                           ;; One physical result has one value wrapper/lifetime. An explicit,
+                           ;; donated, or tap key takes precedence over the implicit result key.
+                           (if (some #(= (:node %) (:node entry)) entries)
                              entries
                              (conj entries entry)))
                          [] (concat donated-nodes explicit-nodes semantic-nodes tap-nodes))
