@@ -12,12 +12,25 @@
             [raster.compiler.passes.parallel.product-consumer-region :as region]
             [raster.compiler.passes.parallel.product-consumer-region-test :as fixtures]
             [raster.compiler.passes.parallel.product-consumer-route :as route]
-            [raster.quant.ggml-kernels :as ggml-kernels]))
+            [raster.quant.ggml-kernels :as ggml-kernels]
+            [raster.runtime.hardware :as runtime-hardware]))
 
-(defn- routed-region []
-  (let [program (#'fixtures/scheduled-product-consumer)]
-    (route/schedule
-     (region/analyze program (#'fixtures/numerical-equations program)))))
+(def ^:private subgroup-device
+  {:device-type :gpu
+   :execution {:preferred-subgroup-size 16
+               :subgroup-sizes #{16 32}
+               :max-workgroup-size 256}})
+
+(defn- routed-region
+  ([] (routed-region nil))
+  ([target-device]
+   (let [program (#'fixtures/scheduled-product-consumer)]
+     (route/schedule
+      (region/analyze program (#'fixtures/numerical-equations program))
+      target-device))))
+
+(defn- record-name [value]
+  (some-> value class .getSimpleName))
 
 (deftest exact-two-node-region-refines-to-one-cooperative-node
   (let [{scheduled-body :scheduled scheduled-graph :graph witness :refinement}
@@ -55,6 +68,45 @@
           (is (= (:refinement routed)
                  (get-in emitted [:attributes :scheduled-graph-refinement]))))))))
 
+(deftest certified-additive-product-selects-an-all-register-subgroup-body
+  (let [{:keys [scheduled refinement] :as routed} (routed-region subgroup-device)
+        kernel-body (:body scheduled)
+        operations (tree-seq coll? seq (:operations kernel-body))]
+    (is (= :subgroup-product-ordered-consumer
+           (get-in kernel-body [:schedule :strategy])))
+    (is (= 16 (get-in kernel-body [:schedule :subgroup-size])))
+    (is (empty? (:allocations kernel-body)))
+    (is (= 1 (count (filter #(= "Collective" (record-name %)) operations))))
+    (is (not-any? #(= "WorkgroupBarrier" (record-name %)) operations))
+    (is (not-any? #(= 'partials (:buffer %)) operations))
+    (is (= :subgroup-product-ordered-consumer
+           (get-in refinement [:schedule :strategy])))
+    (is (= :proved-local-offset
+           (get-in refinement [:schedule :intermediate-substitution])))
+    (doseq [[dialect reduction]
+            [[:opencl-portable "sub_group_reduce_add"]
+             [:cuda "__shfl_down_sync"]
+             [:hip "__shfl_down"]]]
+      (let [source (get-in (route/emit "product_consumer_subgroup" routed dialect)
+                           [:artifact :source])]
+        (is (str/includes? source reduction) (name dialect))
+        (is (not (str/includes? source "barrier(")) (name dialect))
+        (is (not (str/includes? source "__syncthreads")) (name dialect))))))
+
+(deftest subgroup-selection-falls-back-when-the-target-cannot-prove-a-legal-width
+  (doseq [[label target reason]
+          [[:missing nil :hardware-descriptor-unavailable]
+           [:too-narrow (assoc-in subgroup-device [:execution :subgroup-sizes] #{4})
+            :subgroup-width-unavailable]
+           [:workgroup-limit (assoc-in subgroup-device [:execution :max-workgroup-size] 8)
+            :subgroup-infeasible]]]
+    (let [{:keys [scheduled plan]} (routed-region target)]
+      (is (= :product-tree-ordered-consumer
+             (get-in scheduled [:body :schedule :strategy]))
+          (name label))
+      (is (= reason (get-in plan [:physical-schedule :fallback-reason]))
+          (name label)))))
+
 (deftest equation-first-emission-selects-the-certified-region
   (let [scheduled (assoc (#'fixtures/scheduled-product-consumer)
                          :dialect :scheduled-parallel)
@@ -75,9 +127,17 @@
     (is (= ['input 'weights 'output 'rows] (:arguments (first kernels))))))
 
 (deftest real-q6-product-dot-emits-one-allocation-free-kernel
-  (let [compilation
+  (let [target :ze:q6-subgroup-compile-test
+        _ (runtime-hardware/register-target-device!
+           target {:type :ze
+                   :name "Synthetic Intel subgroup product compile test"
+                   :capabilities {:subgroup-sizes [16 32]
+                                  :simd-width 16
+                                  :max-workgroup-size 256
+                                  :shared-local-memory 65536}})
+        compilation
         (equation-first/compile #'ggml-kernels/qdot-q6-K-product-rows!
-                                {:target :ze:0 :dtype :float})
+                                {:target target :dtype :float})
         fused (peek (get-in compilation [:emitted :equations]))
         emitted-equation (first (:operations fused))
         artifact (first (:kernels compilation))
@@ -96,6 +156,12 @@
         "the refined emitted program boundary no longer advertises eliminated storage")
     (is (= 1 (count (:kernels compilation))))
     (is (empty? (:temporaries artifact)))
+    (is (= :subgroup-product-ordered-consumer
+           (get-in artifact [:attributes :kernel-body :schedule :strategy])))
+    (is (= 16 (count (filter #(= "Collective" (record-name %))
+                             (tree-seq coll? seq
+                                       (get-in artifact
+                                               [:attributes :kernel-body :operations]))))))
     (is (= [3 5] (get-in fused [:attributes :emitted-source-equations])))
     (is (= '[wd wq wsc xd xq y in nrows out nb rstr_extent_3]
            (get-in emitted-equation [:graph :arguments]))

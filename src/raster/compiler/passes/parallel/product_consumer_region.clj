@@ -5,7 +5,9 @@
    does not fuse or emit a kernel. A later body refinement may use the returned axis partition only
    after replaying this analysis against the same source graph."
   (:require [clojure.set :as set]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -233,6 +235,63 @@
                   {:width width :bounds bounds}))
       width)))
 
+(defn- expanded-combine-result
+  [combine]
+  (let [bindings (partition 2 (:bindings combine))]
+    (reduce (fn [result [id init]]
+              (util/subst-syms {id init} result))
+            (first (:results combine))
+            (reverse bindings))))
+
+(defn- same-carrier-parameter
+  [expression parameter carrier]
+  (cond
+    (= expression parameter) parameter
+    (and (seq? expression) (= 2 (count expression))
+         (= carrier
+            (some-> (descriptor/cast-result-tag (first expression)) keyword dtype/canon))
+         (= parameter (second expression))) parameter
+    :else nil))
+
+(defn- subgroup-collective-contract
+  "Prove the initial subgroup candidate's exact scalar monoid spelling.
+
+   Product-tree legality alone permits an arbitrary certified combine region. A hardware
+   collective is narrower: it implements one registered binary operator directly. Keep that
+   structural obligation in the target-neutral region proof so target selection never guesses an
+   operator from a quantization or workload name."
+  [operator]
+  (let [components (:components operator)
+        combine (:combine operator)]
+    (when (= 1 (count components))
+      (let [{:keys [dtype neutral]} (first components)
+            dtype (dtype/canon dtype)
+            [left right] (first (:parameters combine))
+            result (expanded-combine-result combine)
+            source-op (descriptor/semantic-op result)
+            op (intrinsics/canonical source-op)
+            args (vec (descriptor/call-args result))
+            carrier-args (mapv (fn [argument]
+                                 (or (same-carrier-parameter argument left dtype)
+                                     (same-carrier-parameter argument right dtype)))
+                               args)
+            identity (when op (descriptor/typed-reduce-identity source-op dtype))
+            overflow (intrinsics/source-overflow-policy source-op)]
+        (when (and (= :+ op)
+                   (contains? #{:byte :int :long} dtype)
+                   (= 2 (count carrier-args))
+                   (= #{left right} (set carrier-args))
+                   (= :wrap overflow)
+                   (= :wrap (get-in operator [:algebra :overflow]))
+                   identity
+                   (constant/equivalent? neutral identity))
+          {:operator op
+           :dtype dtype
+           :neutral (:value (constant/value neutral))
+           :arithmetic {:overflow :wrap}
+           :association :implementation-defined
+           :source-operation source-op})))))
+
 (defn analyze
   "Derive a target-neutral schedule plan for two numerical producer/consumer equations.
 
@@ -353,6 +412,7 @@
             :local local
             :reduced reduced}
      :workgroup-size cooperative-width
+     :subgroup-collective (subgroup-collective-contract operator)
      :numerics {:inner {:association :implementation-defined
                         :dtypes (mapv :dtype (:components operator))
                         :overflow (get-in operator [:algebra :overflow])}

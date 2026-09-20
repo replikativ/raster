@@ -8,7 +8,8 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
-            [raster.compiler.passes.parallel.product-consumer-body :as body]))
+            [raster.compiler.passes.parallel.product-consumer-body :as body]
+            [raster.compiler.passes.parallel.product-consumer-schedule :as schedule]))
 
 (defn- compound-source [plan]
   {:kind :product-ordered-consumer
@@ -21,14 +22,18 @@
    :accumulators
    (mapv (fn [ordinal dtype]
            {:value [:inner-product ordinal]
-            :dtype dtype :rounding :exact :policy :declared-product-tree})
+            :dtype dtype :rounding :exact
+            :overflow (get-in plan [:numerics :inner :overflow])
+            :policy :declared-product-tree})
          (range) (get-in plan [:numerics :inner :dtypes]))
    :ordered-consumer (get-in plan [:numerics :outer])})
 
 (defn schedule
   "Build one ScheduledKernelBody and graph refinement from an admitted region plan."
-  [plan]
-  (let [{kernel-body :kernel-body arguments :arguments} (body/lower plan)
+  ([plan] (schedule plan nil))
+  ([plan target-device]
+  (let [plan (schedule/select plan target-device)
+        {kernel-body :kernel-body arguments :arguments} (body/lower plan)
         source (compound-source plan)
         scheduled
         (scheduled/make
@@ -62,12 +67,19 @@
         (refinement/make
          {:source source-graph :graph refined
           :schedule {:kind :product-tree-ordered-consumer
-                     :workgroup-size (:workgroup-size plan)
+                     :strategy (get-in plan [:physical-schedule :strategy])
+                     :workgroup-size (get-in plan [:physical-schedule :workgroup-size])
+                     :subgroup-size (get-in plan [:physical-schedule :subgroup-size])
+                     :active-lanes (get-in plan [:physical-schedule :active-lanes])
+                     :neutral-padding (get-in plan [:physical-schedule :neutral-padding])
+                     :local-unrolling (get-in plan [:physical-schedule :local-unrolling])
+                     :intermediate-substitution
+                     (get-in plan [:physical-schedule :intermediate-substitution])
                      :axis-partition (:axes plan)}
           :numerics (numerical-contract plan)
           :provenance {:source-operations (get-in plan [:provenance :source-operations])}
           :attributes {:private-intermediate (:intermediate plan)}})]
-    {:scheduled scheduled :graph refined :refinement witness :plan plan}))
+    {:scheduled scheduled :graph refined :refinement witness :plan plan})))
 
 (defn emit
   "Project a scheduled product-consumer region to one executable C-family graph."

@@ -5,10 +5,12 @@
   byte for byte against llama.cpp), decoded with `kernel-layout`, and every
   GPU output must equal `ggml/vec-dot` without contraction exactly."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.quant.ggml :as ggml]
             [raster.quant.ggml-kernels :as gk]))
 
@@ -80,6 +82,43 @@
                  (mapcat #(repeat out %) (range nrows))
                  (cycle (range out)))
            (mapv #(Float/floatToRawIntBits %) y)))))
+
+(deftest q6-k-product-subgroup-executes-bit-identically-through-equation-first
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "equation-first Q6_K subgroup product")
+    (let [in 256 out 3 nrows 2
+          wfloats (values (* out in) 41 0.05)
+          xfloats (values (* nrows in) 42 1.5)
+          wblocks (ggml/quantize :q6_K wfloats in out)
+          xblocks (ggml/quantize :q8_K xfloats in nrows)
+          wl (ggml/kernel-layout :q6_K wblocks in out)
+          xl (ggml/kernel-layout :q8_K xblocks in nrows)
+          output (float-array (* nrows out))
+          wrow (ggml/row-bytes :q6_K in)
+          xrow (ggml/row-bytes :q8_K in)
+          expected (mapv (fn [row o]
+                           (Float/floatToRawIntBits
+                            (float (ggml/vec-dot
+                                    :q6_K (row-bytes wblocks o wrow)
+                                    (row-bytes xblocks row xrow) in))))
+                         (mapcat #(repeat out %) (range nrows))
+                         (cycle (range out)))
+          arguments [(:q xl) (:d xl) (:q wl) (:d wl) (:sc wl)
+                     output
+                     (long in) (long out) (long nrows)]
+          compilation (equation-first/compile #'gk/qdot-q6-K-product-rows!
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          output-node (some (fn [[id node]]
+                              (when (identical? output (:source node)) id))
+                            (:nodes plan))]
+      (is (= :subgroup-product-ordered-consumer
+             (get-in compilation [:kernels 0 :attributes :kernel-body :schedule :strategy])))
+      (with-open [live (gpu-link/instantiate! plan)]
+        (gpu-link/run! live)
+        (is (= expected
+               (mapv #(Float/floatToRawIntBits %)
+                     (gpu-link/download live output-node))))))))
 
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?

@@ -84,6 +84,26 @@
               (:intermediate-loads plan))]
     (walk/postwalk #(get replacement % %) value)))
 
+(defn- replace-intermediate-values [plan values value]
+  (let [replacement
+        (into {}
+              (map (fn [{:keys [load local-offset]}]
+                     [load (or (nth values local-offset nil)
+                               (decline! :intermediate-local-offset
+                                         "proved intermediate offset exceeds subgroup SSA values"
+                                         {:local-offset local-offset :values values}))]))
+              (:intermediate-loads plan))]
+    (walk/postwalk #(get replacement % %) value)))
+
+(defn- local-offset-substitutions [axes offset]
+  (loop [remaining (reverse (vec axes))
+         value offset
+         substitutions {}]
+    (if-let [{:keys [name bound]} (first remaining)]
+      (recur (next remaining) (quot value bound)
+             (assoc substitutions name (mod value bound)))
+      substitutions)))
+
 (defn- replace-fold-components [fold carries value]
   (walk/postwalk
    (fn [form]
@@ -124,6 +144,12 @@
     (decline! :plan "product-consumer body requires an admitted region plan" {:plan plan}))
   (let [{:keys [producer consumer intermediate workgroup-size]} plan
         {:keys [prefix ordered local reduced]} (:axes plan)
+        physical-schedule (or (:physical-schedule plan)
+                              {:strategy :product-tree-ordered-consumer
+                               :workgroup-size workgroup-size})
+        strategy (:strategy physical-schedule)
+        subgroup? (= :subgroup-product-ordered-consumer strategy)
+        physical-workgroup-size (:workgroup-size physical-schedule)
         {:keys [buffers array-types array-shapes scalar-types]} (graph-options plan)
         components (get-in producer [:reduction :components])
         _ (when-not (= 1 (count components))
@@ -171,7 +197,20 @@
                                                     (set/union index-scope locals)
                                                     index-types :long decline!))
         producer-options {:array-types array-types :scalar-types scalar-types}
-        {:keys [element combine]} (product-regions/lower producer producer-options decline!)
+        workgroup-regions (when-not subgroup?
+                            (product-regions/lower producer producer-options decline!))
+        element (:element workgroup-regions)
+        combine (:combine workgroup-regions)
+        subgroup-regions
+        (when subgroup?
+          (mapv (fn [offset]
+                  (product-regions/lower
+                   producer
+                   (assoc producer-options
+                          :axis-substitutions (local-offset-substitutions local offset)
+                          :id-prefix (str "product-subgroup-" offset))
+                   decline!))
+                (range local-volume)))
         group-index 'product-consumer-group
         lane-index 'product-consumer-lane
         lane-long (body/index-cast lane-index :long :exact)
@@ -200,33 +239,63 @@
                                                              (lower-index bound #{})))))
               (range) local)
         reduced-compute (body/->IndexCompute (:name reduced) reduced-index)
-        producer-value (first (:results element))
+        producer-value (some-> element :results first)
         tree-strides (vec (take-while pos? (iterate #(quot % 2) (quot reduced-width 2))))
         tree-operations
-        (mapcat
-         (fn [stride]
-           (let [left (symbol (str "product-consumer-left-" stride))
-                 right (symbol (str "product-consumer-right-" stride))
-                 merged (combine [left] [right])
-                 predicate (keyword (str "product-consumer-tree-" stride))]
-             [(body/->ScalarCompute (body/value predicate :predicate)
-                                    (body/scalar-expression :lt :predicate
-                                                            [(:name reduced)
-                                                             (body/literal stride :long)]))
-              (body/->IfRegion
-               predicate
-               (vec (concat
-                     [(body/->ScalarLoad (body/value left component-type) intermediate [lane-index]
-                                         nil nil :cached)
-                      (body/->ScalarLoad (body/value right component-type) intermediate
-                                         [(body/expression :add lane-index stride)] nil nil :cached)]
-                     (:operations merged)
-                     [(body/->ScalarStore intermediate [lane-index]
-                                           (first (:results merged)) nil)
-                      (body/->Yield [])]))
-               [(body/->Yield [])] [])
-              (barrier)]))
-         tree-strides)
+        (when-not subgroup?
+          (mapcat
+           (fn [stride]
+             (let [left (symbol (str "product-consumer-left-" stride))
+                   right (symbol (str "product-consumer-right-" stride))
+                   merged (combine [left] [right])
+                   predicate (keyword (str "product-consumer-tree-" stride))]
+               [(body/->ScalarCompute (body/value predicate :predicate)
+                                      (body/scalar-expression :lt :predicate
+                                                              [(:name reduced)
+                                                               (body/literal stride :long)]))
+                (body/->IfRegion
+                 predicate
+                 (vec (concat
+                       [(body/->ScalarLoad (body/value left component-type) intermediate [lane-index]
+                                           nil nil :cached)
+                        (body/->ScalarLoad (body/value right component-type) intermediate
+                                           [(body/expression :add lane-index stride)] nil nil :cached)]
+                       (:operations merged)
+                       [(body/->ScalarStore intermediate [lane-index]
+                                             (first (:results merged)) nil)
+                        (body/->Yield [])]))
+                 [(body/->Yield [])] [])
+                (barrier)]))
+           tree-strides))
+        reduced-active-id :product-consumer-reduced-active
+        reduced-active-operation
+        (when subgroup?
+          (body/->ScalarCompute
+           (body/value reduced-active-id :predicate)
+           (body/scalar-expression :lt :predicate
+                                   [lane-index (body/literal reduced-width :int)])))
+        subgroup-values
+        (when subgroup?
+          (mapv #(symbol (str "product-consumer-subgroup-partial-" %))
+                (range local-volume)))
+        subgroup-operations
+        (when subgroup?
+          (let [{:keys [operator neutral arithmetic association]}
+                (:subgroup-collective plan)
+                width (:subgroup-size physical-schedule)]
+            (vec
+             (mapcat
+              (fn [offset {:keys [element]} result-id]
+                (let [lane-value (symbol (str "product-consumer-subgroup-element-" offset))]
+                  [(body/->IfRegion
+                    reduced-active-id
+                    (conj (vec (:operations element)) (body/->Yield (:results element)))
+                    [(body/->Yield [(body/literal neutral component-type)])]
+                    [(body/value lane-value component-type)])
+                   (body/->Collective
+                    (body/value result-id component-type) :reduce :subgroup width lane-value
+                    operator nil (body/full-participation) association arithmetic)]))
+              (range local-volume) subgroup-regions subgroup-values))))
         fold (fold-of consumer)
         {fold-attributes :attributes fold-lambda :lambda} (dialect/product-fold-parts fold)
         {fold-parameters :parameters fold-locals :locals fold-results :body-results}
@@ -288,12 +357,17 @@
                                   (zipmap (butlast fold-parameters) carries)
                                   {(last fold-parameters) (:name ordered)})
         rewritten-fold
-        (->> {:bindings (vec (mapcat (juxt :id :init) fold-locals)) :results fold-results}
-             (replace-intermediate-loads plan reduced-width)
-             (util/subst-syms fold-substitutions))
+        (let [region {:bindings (vec (mapcat (juxt :id :init) fold-locals))
+                      :results fold-results}]
+          (->> (if subgroup?
+                 (replace-intermediate-values plan subgroup-values region)
+                 (replace-intermediate-loads plan reduced-width region))
+               (util/subst-syms fold-substitutions)))
         fold-binding-types (into {} (map (juxt :id (comp dtype/canon :dtype))) fold-locals)
         fold-environment (merge (:environment prefix-state)
                                 (zipmap carries carry-types)
+                                (when subgroup?
+                                  (zipmap subgroup-values (repeat component-type)))
                                 {(:name ordered) :long})
         fold-update ((:lower-region consumer-lowerer) rewritten-fold carry-types
                      fold-binding-types fold-environment)
@@ -319,19 +393,22 @@
          (consumer-lower-index (:extent fold-attributes) #{}) 1
          (mapv #(body/->LoopArg (body/value %1 %2) %3) carries carry-types identities)
          (vec (concat
-               (:operations element)
-               [(body/->ScalarStore intermediate [lane-index] producer-value nil)
-                (barrier)]
-               tree-operations
+               (if subgroup?
+                 subgroup-operations
+                 (concat (:operations element)
+                         [(body/->ScalarStore intermediate [lane-index] producer-value nil)
+                          (barrier)]
+                         tree-operations))
                [(body/->ScalarCompute (body/value writer :predicate)
                                       (body/scalar-expression :eq :predicate
                                                               [lane-index (body/literal 0 :int)]))
-                writer-update
-                (barrier)
-                (body/->Yield updated-carries)]))
+                writer-update]
+               (when-not subgroup? [(barrier)])
+               [(body/->Yield updated-carries)]))
          (mapv body/value loop-results carry-types)
          {:association :ordered :source-order true
-          :inner-reduction :implementation-defined})
+          :inner-reduction :implementation-defined
+          :inner-schedule strategy})
         tail-locals (subvec (vec (get-in consumer [:scalar-region :locals]))
                             consumer-prefix-count)
         tail-locals (mapv #(update % :init (partial replace-fold-components fold loop-results))
@@ -352,25 +429,28 @@
                       [(body/->ScalarStore output [group-index] (:result output-value) nil)
                        (body/->Yield [])]))
          [(body/->Yield [])] [])
-        shared-bytes (* workgroup-size (dtype/bytes-of component-type))
+        shared-bytes (if subgroup? 0 (* workgroup-size (dtype/bytes-of component-type)))
         kernel-body
         (body/make
          {:id [:product-ordered-consumer (:id producer) (:id consumer)]
           :parameters parameters
           :stable-reads (mapv body/stable-read external-inputs)
-          :allocations [(body/->WorkgroupAllocation
-                         intermediate component-type [workgroup-size]
-                         (layout/row-major [workgroup-size] component-type)
-                         (dtype/bytes-of component-type))]
+          :allocations (if subgroup?
+                         []
+                         [(body/->WorkgroupAllocation
+                           intermediate component-type [workgroup-size]
+                           (layout/row-major [workgroup-size] component-type)
+                           (dtype/bytes-of component-type))])
           :indices [(body/->IndexBinding group-index :group 0)
-                    (body/->IndexBinding lane-index :local 0)]
+                    (body/->IndexBinding lane-index (if subgroup? :lane :local) 0)]
           :operations
           (vec
            (concat
             (:operations active-domain)
             (guard-positive-domain
              (:predicates active-domain)
-             (concat prefix-computes local-computes [reduced-compute]
+             (concat prefix-computes (when-not subgroup? local-computes) [reduced-compute]
+                     (when reduced-active-operation [reduced-active-operation])
                      (:operations prefix-state)
                      [ordered-loop
                       (body/->ScalarCompute
@@ -378,16 +458,20 @@
                        (body/scalar-expression :eq :predicate
                                                [lane-index (body/literal 0 :int)]))
                       final-writer]))))
-          :schedule {:strategy :product-tree-ordered-consumer
-                     :workgroup-size workgroup-size
-                     :axis-partition (:axes plan)}
+          :schedule (cond-> {:strategy strategy
+                             :workgroup-size physical-workgroup-size
+                             :axis-partition (:axes plan)}
+                      subgroup? (assoc :subgroup-size (:subgroup-size physical-schedule)
+                                       :local-unrolling (:local-unrolling physical-schedule)
+                                       :neutral-padding (:neutral-padding physical-schedule)))
           :launch (launch/spec
-                   {:workgroup-size [workgroup-size]
+                   {:workgroup-size [physical-workgroup-size]
                     :group-count [(launch/maximum 1 launch-prefix-count)]
                     :shared-memory-bytes shared-bytes})
           :provenance {:dialect :kernel-body :source-dialect :segop
                        :source-operations [(:id producer) (:id consumer)]}
           :attributes {:kind :product-ordered-consumer
+                       :physical-schedule physical-schedule
                        :inner-numerics (get-in plan [:numerics :inner])
                        :outer-numerics (get-in plan [:numerics :outer])}})]
     {:kernel-body kernel-body
