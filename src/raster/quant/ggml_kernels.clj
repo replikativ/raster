@@ -171,43 +171,66 @@
 
 (def-q4-K-dot)
 
-(defmacro ^:private def-q6-K-dot []
-  (k-quant-dot
-   '(deftm qdot-q6-K-rows!
-      "q6_K weights (codes q-32) times q8_K activations: ggml_vec_dot_q6_K_q8_K_generic.
-      Per super-block eight exact int lanes and `sums[l] += (dw*dx)*lane[l]`; the
-      lanes are summed in order at the end."
-      [xq :- (Array int), xd :- (Array float),
-       wq :- (Array int), wd :- (Array float), wsc :- (Array int),
-       y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
-      (par/map-void! ro (* nrows out)
-                     (let [row (quot ro out)
-                           o (rem ro out)
-                           nb (quot in 256)
-                           acc
-                           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
-                                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)]
-                             (if (< b nb)
-                               (let [wb (+ (* o nb) b)
-                                     xb (+ (* row nb) b)
-                                     xw (* xb 64)
-                                     ww (* wb 64)
-                                     scb (* wb 16)
-                                     d (* (ra/aget wd wb) (ra/aget xd xb))
-                                     l0 (lane 0) l1 (lane 1) l2 (lane 2) l3 (lane 3)
-                                     l4 (lane 4) l5 (lane 5) l6 (lane 6) l7 (lane 7)
-                                     p0 (* d (float l0)) p1 (* d (float l1))
-                                     p2 (* d (float l2)) p3 (* d (float l3))
-                                     p4 (* d (float l4)) p5 (* d (float l5))
-                                     p6 (* d (float l6)) p7 (* d (float l7))]
-                                 (recur (inc b)
-                                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
-                                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
-                               (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
-                       (ra/aset y ro acc))))
-   2))
+(deftm qdot-q6-K-rows!
+  "q6_K weights times q8_K activations through Raster's typed product reduction.
 
-(def-q6-K-dot)
+  Each `(row,output,super-block,lane,half)` product is an exact wrapping int32 reduction over
+  eight packed words.  `half` makes the two q6 scale lanes an explicit semantic axis, so every
+  packed-weight, activation, and scale access has a verified broadcast/permutation AxisMap.
+  The following ordered map applies the per-super-block floating scale and preserves ggml's
+  fixed eight-lane floating addition order."
+  [xq :- (Array int), xd :- (Array float),
+   wq :- (Array int), wd :- (Array float), wsc :- (Array int),
+   y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
+  (let [nb (quot in 256)
+        partials (int-array (* (* (* (* nrows out) nb) 8) 2))]
+    (par/product-reduce!
+     [partials]
+     [[sum 0 :int]]
+     [[row nrows] [o out] [b nb] [lane 8] [half 2]]
+     chunk 8
+     [weight-word (ra/aget wq (+ (* (+ (* o nb) b) 64) (+ (* chunk 8) lane)))
+      activation-word (ra/aget xq (+ (* (+ (* row nb) b) 64) (+ (* chunk 8) lane)))
+      half-mask (unchecked-int (bit-shift-left 65535 (* half 16)))
+      contribution
+      (unchecked-multiply-int
+       (ra/aget wsc (+ (* (+ (* o nb) b) 16) (+ (* chunk 2) half)))
+       (par/dp4a (rn/bit-and weight-word half-mask) activation-word 0))]
+     [contribution]
+     [[left right]]
+     []
+     [(unchecked-add-int left right)]
+     {:associative? true :commutative? true
+      :overflow :wrap :order :implementation-defined})
+    (par/map-void!
+     ro (* nrows out)
+     (let [row (quot ro out)
+           o (rem ro out)
+           acc
+           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
+                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)]
+             (if (< b nb)
+               (let [wb (+ (* o nb) b)
+                     xb (+ (* row nb) b)
+                     base (* (* (+ (* (+ (* row out) o) nb) b) 8) 2)
+                     d (* (ra/aget wd wb) (ra/aget xd xb))
+                     l0 (unchecked-add-int (ra/aget partials (+ base 0)) (ra/aget partials (+ base 1)))
+                     l1 (unchecked-add-int (ra/aget partials (+ base 2)) (ra/aget partials (+ base 3)))
+                     l2 (unchecked-add-int (ra/aget partials (+ base 4)) (ra/aget partials (+ base 5)))
+                     l3 (unchecked-add-int (ra/aget partials (+ base 6)) (ra/aget partials (+ base 7)))
+                     l4 (unchecked-add-int (ra/aget partials (+ base 8)) (ra/aget partials (+ base 9)))
+                     l5 (unchecked-add-int (ra/aget partials (+ base 10)) (ra/aget partials (+ base 11)))
+                     l6 (unchecked-add-int (ra/aget partials (+ base 12)) (ra/aget partials (+ base 13)))
+                     l7 (unchecked-add-int (ra/aget partials (+ base 14)) (ra/aget partials (+ base 15)))
+                     p0 (* d (float l0)) p1 (* d (float l1))
+                     p2 (* d (float l2)) p3 (* d (float l3))
+                     p4 (* d (float l4)) p5 (* d (float l5))
+                     p6 (* d (float l6)) p7 (* d (float l7))]
+                 (recur (inc b)
+                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
+                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
+               (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
+       (ra/aset y ro acc)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Activation quantizers: ggml's quantize_row_q8_0_ref and quantize_row_q8_K_ref

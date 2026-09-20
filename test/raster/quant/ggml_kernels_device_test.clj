@@ -49,6 +49,33 @@
     {:specs (into {} (map (fn [[param arr]] (spec (keyword param) arr))) entries)
      :bindings (into {} (map (fn [[param _]] [param (keyword param)])) entries)}))
 
+(deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
+  (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-rows! :ze:0 :dtype :float)]
+    (is (= [{:sym 'partials :dtype :int}]
+           (mapv #(select-keys % [:sym :dtype]) (:allocs descriptor))))
+    (is (= [:executable :map-void] (mapv :convention (:steps descriptor))))
+    (is (= '[xq xd wq wd wsc y in out nrows] (:all-params descriptor)))))
+
+(deftest q6-k-product-semantics-remain-bit-identical
+  (let [in 256 out 3 nrows 2
+        wfloats (values (* out in) 31 0.05)
+        xfloats (values (* nrows in) 32 1.5)
+        wblocks (ggml/quantize :q6_K wfloats in out)
+        xblocks (ggml/quantize :q8_K xfloats in nrows)
+        wl (ggml/kernel-layout :q6_K wblocks in out)
+        xl (ggml/kernel-layout :q8_K xblocks in nrows)
+        y (float-array (* nrows out))
+        wrow (ggml/row-bytes :q6_K in)
+        xrow (ggml/row-bytes :q8_K in)]
+    (gk/qdot-q6-K-rows! (:q xl) (:d xl) (:q wl) (:d wl) (:sc wl) y in out nrows)
+    (is (= (mapv (fn [row o]
+                   (Float/floatToRawIntBits
+                    (float (ggml/vec-dot :q6_K (row-bytes wblocks o wrow)
+                                         (row-bytes xblocks row xrow) in))))
+                 (mapcat #(repeat out %) (range nrows))
+                 (cycle (range out)))
+           (mapv #(Float/floatToRawIntBits %) y)))))
+
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "ggml dot kernels")
