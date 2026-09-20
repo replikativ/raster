@@ -51,8 +51,8 @@
            row rows float
            (let* [sums
                   (loop* [i 0
-                          ^{:raster.type/tag float} sum 0.0
-                          ^{:raster.type/tag float} squares 0.0]
+                          ^{:raster.type/tag float} sum (float 0.0)
+                          ^{:raster.type/tag float} squares (float 0.0)]
                     (if (< (long i) width)
                       (let* [^{:raster.type/tag float} value
                              (clojure.core/aget x (+ (* row width) i))]
@@ -65,6 +65,24 @@
                   ^{:raster.type/tag float} square-result
                   (clojure.core/nth sums (long 1))]
              (+ sum-result square-result)))]
+     y))
+
+(def ^:private projected-product-fold-map
+  '(let* [y
+          (raster.par/pmap
+           row rows float
+           (let* [^{:raster.type/tag float} total
+                  (loop* [i 0
+                          ^{:raster.type/tag float} sum 0.0
+                          ^{:raster.type/tag float} squares 0.0]
+                    (if (< (long i) width)
+                      (let* [^{:raster.type/tag float} value
+                             (clojure.core/aget x (+ (* row width) i))]
+                        (recur (inc (long i))
+                               ^{:raster.type/tag float} (+ sum value)
+                               ^{:raster.type/tag float} (+ squares (* value value))))
+                      ^{:raster.type/tag float} (+ sum squares)))]
+             total))]
      y))
 
 (deftest mapped-product-recurrence-reaches-one-gpu-loop
@@ -101,6 +119,26 @@
         "JVM has one outer map loop and one shared product loop")
     (is (= [20.0 92.0]
            (mapv double (execute (float-array [1 2 3 4 5 6]) 2 3))))))
+
+(deftest projected-multi-carry-recurrence-stays-on-the-typed-kernel-body-route
+  (let [options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'rows :long 'width :long}}
+        routed (route/attempt projected-product-fold-map :float (:array-types options) options)
+        program (:program routed)
+        algorithm (-> program :equations first :algorithm)
+        scheduled (segop-lower/segop-lower-pass
+                   program {:dtype :float :target-device :ocl:0})
+        emitted (opencl-pass/opencl-pass (:form scheduled) :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        artifact (first (:kernels emitted))]
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= 2 (count (filter dialect/product-fold-form?
+                            (tree-seq coll? seq algorithm)))))
+    (is (= 1 (count (:kernels emitted))))
+    (is (= :portable-segmap
+           (get-in artifact [:attributes :kernel-body :attributes :kind])))
+    (is (= 1 (count (re-seq #"for \(long [^ ]*product_fold_index_"
+                            (:source artifact)))))))
 
 (deftest public-layer-norm-backward-reuses-the-product-region
   (let [pipeline (pipeline/show-pipeline #'dl-nn/layer-norm-backward-dx

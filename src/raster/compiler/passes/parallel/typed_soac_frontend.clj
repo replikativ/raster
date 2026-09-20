@@ -10,6 +10,7 @@
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -298,38 +299,77 @@
                  (every? :dtype locals))
         locals))))
 
-(defn- source-product-fold
+(defn- source-product-fold-info
   "Translate an exact multi-carry source recurrence into one typed product Fold term.
 
    This retains source order. It deliberately supplies no component algebra: reassociation is a
    separate proof, while the portable sequential schedule is correct for every admitted update."
   [expression]
   (when-let [{:keys [carry-syms carry-inits index-sym index-init bound-expr bound-mode
-                     then-branch update-exprs]}
+                     then-branch update-exprs exit-expr] :as matched}
              (patterns/match-ordered-product-loop expression)]
     (let [dtypes (mapv (fn [carry init]
                          (some-> (retained-local-dtype carry init) dtype/canon))
                        carry-syms carry-inits)
+          identities (mapv numeric-constant/literal-or-original carry-inits)
           [_ local-bindings] (when (and (seq? then-branch)
                                         (form/let-head? (first then-branch)))
                                then-branch)
           locals (if local-bindings (typed-region-locals local-bindings) [])]
       (when (and (every? some? dtypes) (some? locals)
-                 (every? dialect/scalar-literal? carry-inits)
+                 (every? dialect/scalar-literal? identities)
                  (not-any? util/effectful?
                            (concat carry-inits [index-init bound-expr] update-exprs
-                                   (map :init locals))))
-        (list 'product-fold
-              (cond-> {:accumulators carry-syms :identities carry-inits :dtypes dtypes
-                       :index index-sym :lower index-init :extent bound-expr
-                       :association :ordered}
-                (= :inclusive bound-mode) (assoc :upper-bound :inclusive))
-              (dialect/lambda-form
-               (conj carry-syms index-sym)
-               (mapv (fn [{:keys [id dtype init]}]
-                       (dialect/local-value id dtype init))
-                     locals)
-               update-exprs))))))
+                                   (map :init locals) [exit-expr])))
+        {:product
+         (list 'product-fold
+               (cond-> {:accumulators carry-syms :identities identities :dtypes dtypes
+                        :index index-sym :lower index-init :extent bound-expr
+                        :association :ordered}
+                 (= :inclusive bound-mode) (assoc :upper-bound :inclusive))
+               (dialect/lambda-form
+                (conj carry-syms index-sym)
+                (mapv (fn [{:keys [id dtype init]}]
+                        (dialect/local-value id dtype init))
+                      locals)
+                update-exprs))
+         :matched matched
+         :dtypes dtypes}))))
+
+(defn- fresh-projected-id
+  [base occupied]
+  (first (remove occupied
+                 (cons (symbol base)
+                       (map #(symbol (str base "_" %)) (range 1 Long/MAX_VALUE))))))
+
+(defn- projected-product-pairs
+  "Expose an ordered multi-carry recurrence as component locals followed by its pure exit.
+
+   Generated component IDs are deterministic and typed. The original loop result binding remains
+   the sole name visible to the surrounding scalar region, so this is alpha-equivalent scalar
+   normalization rather than a new fusion or reassociation rule."
+  [aggregate expression occupied]
+  (when-let [{:keys [product matched dtypes]} (source-product-fold-info expression)]
+    (let [{:keys [carry-syms exit-expr]} matched
+          component-ids
+          (:ids
+           (reduce (fn [{:keys [ids occupied]} [ordinal dtype]]
+                     (let [candidate (fresh-projected-id
+                                      (str (name aggregate) "__product_" ordinal) occupied)
+                           typed (with-meta candidate
+                                   {:tag (dtype/scalar-tag-for-dtype dtype)
+                                    :raster.type/tag (dtype/scalar-tag-for-dtype dtype)})]
+                       {:ids (conj ids typed) :occupied (conj occupied candidate)}))
+                   {:ids [] :occupied occupied}
+                   (map vector (range) dtypes)))
+          components
+          (mapv (fn [id ordinal dtype]
+                  [id (with-meta (list 'product-component product ordinal)
+                        {:tag (dtype/scalar-tag-for-dtype dtype)
+                         :raster.type/tag (dtype/scalar-tag-for-dtype dtype)})])
+                component-ids (range) dtypes)
+          exit (util/subst-syms (zipmap carry-syms component-ids) exit-expr)]
+      (conj components [aggregate exit]))))
 
 (defn- product-component-alias
   [aggregate expression component-count]
@@ -341,20 +381,21 @@
       ordinal)))
 
 (defn- expand-product-loop-locals
-  "Replace `[tuple (loop* ...), c0 (nth tuple 0), ...]` by scalar component locals that
-   project one shared product Fold. Static complete projection is required; an aggregate that
-   otherwise escapes remains outside the typed scalar subset."
+  "Expose one ordered multi-carry loop as a shared product Fold plus its exit projection.
+
+   The historical tuple/nth spelling retains the caller's component names. A scalar exit keeps
+   the original aggregate binding and receives deterministic private component locals."
   [bindings results]
   (let [pairs (vec (partition 2 bindings))
         candidate (first (keep-indexed
                           (fn [i [_ expression]]
-                            (when-let [product (and (seq? expression)
-                                                   (source-product-fold expression))]
-                              [i product]))
+                            (when-let [info (and (seq? expression)
+                                                (source-product-fold-info expression))]
+                              [i info]))
                           pairs))]
     (if-not candidate
       bindings
-      (let [[product-index product] candidate
+      (let [[product-index {:keys [product matched]}] candidate
             aggregate (first (nth pairs product-index))
             component-count (count (get-in (dialect/product-fold-parts product)
                                            [:attributes :dtypes]))
@@ -371,13 +412,17 @@
                                               (when (and (not= i product-index)
                                                          (not (contains? alias-indices i)))
                                                 expression))
-                                            pairs))]
-        (when (and (= (set (range component-count)) (set (keys aliases)))
-                   (not-any? #(contains? (util/free-syms % #{}) aggregate) remaining))
-          (vec
-           (mapcat
-            (fn [i pair]
-              (if (= i product-index)
+                                            pairs))
+            tuple-projection? (and (= (:exit-expr matched) (:carry-syms matched))
+                                   (= (set (range component-count)) (set (keys aliases)))
+                                   (not-any? #(contains? (util/free-syms % #{}) aggregate)
+                                             remaining))
+            occupied (set (map first pairs))]
+        (vec
+         (mapcat
+          (fn [i pair]
+            (if (= i product-index)
+              (if tuple-projection?
                 (mapcat
                  (fn [ordinal]
                    (let [id (get-in aliases [ordinal :id])
@@ -387,8 +432,9 @@
                                            [:attributes :dtypes]) ordinal))]
                      [id (with-meta component {:tag tag :raster.type/tag tag})]))
                  (range component-count))
-                (when-not (contains? alias-indices i) pair)))
-            (range) pairs)))))))
+                (mapcat identity (projected-product-pairs aggregate (second pair) occupied)))
+              (when-not (and tuple-projection? (contains? alias-indices i)) pair)))
+          (range) pairs))))))
 
 (defn- typed-map-region
   "Preserve a map's typed lexical spine instead of expanding shared expressions."
@@ -400,7 +446,20 @@
       (when (and (= 1 (count results)) (some? locals)
                  (every? (comp simple-symbol? :id) locals))
         {:locals locals :body (first results)}))
-    {:locals [] :body expression}))
+    (if-let [{:keys [matched]} (and (seq? expression)
+                                    (source-product-fold-info expression))]
+      (let [occupied (util/free-syms expression #{})
+            aggregate-id (fresh-projected-id "rstr_product_result" occupied)
+            result-dtype (retained-local-dtype aggregate-id (:exit-expr matched))
+            aggregate (when result-dtype
+                        (with-meta aggregate-id
+                          {:tag (dtype/scalar-tag-for-dtype result-dtype)
+                           :raster.type/tag (dtype/scalar-tag-for-dtype result-dtype)}))
+            pairs (when aggregate (projected-product-pairs aggregate expression occupied))
+            locals (when pairs (typed-region-locals (vec (mapcat identity pairs))))]
+        (when (some? locals)
+          {:locals locals :body aggregate}))
+      {:locals [] :body expression})))
 
 (defn- substitute-store
   [substitutions store]
