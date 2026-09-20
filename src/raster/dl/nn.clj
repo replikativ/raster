@@ -549,12 +549,10 @@
 ;; (f64 agrees to ~1e-15, f32 to ~1e-6 relative). Use rms-norm when you need the
 ;; row-serial summation order.
 ;;
-;; WHY TWO DEFTMS AND NOT ONE OP WITH A SCHEDULE: raster has no schedule-selection
-;; mechanism yet (task S6 — schedule-as-data). Until it does, the honest spelling is
-;; two ops with the same semantics and different decompositions, chosen at the call
-;; site by target: CPU/decode calls rms-norm, a GPU-compiled block calls
-;; rms-norm-chunked. Do NOT "fix" this by teaching a backend pass to rewrite one into
-;; the other — this pair is the concrete motivating case for the schedule work.
+;; This explicit three-kernel decomposition predates certified schedule selection and remains a
+;; useful chunk-count experiment. `rms-norm-reassociated!` below is the current compiler-owned
+;; schedule: one semantic SegFoldMap, no materialized partials, and one emitted kernel. Keep this
+;; variant only while its independently selectable chunking is useful for measurements.
 ;; ----------------------------------------------------------------
 
 (deftm rms-norm-chunked
@@ -602,36 +600,45 @@
                                                 (+ gain-offset (aget weight i))))))
          out)))
 
-;; Single-ROW Stage-A rms-norm: the functional par/reduce + par/map form.
-;; rms-norm! parallelizes over ROWS (one work-item per row, serial feature
-;; reduce — the right shape for multi-row/prefill); this variant is for the
-;; rows=1 decode case, where rms-norm! degenerates to ONE work-item. Here the
-;; feature reduce itself is parallel: on the GPU-resident graph the reduce
-;; result is realized as a resident 1-elem buffer and its scalar chain (inv)
-;; is fused into the consuming map — ~4x better occupancy than the 1-work-item
-;; serial reduce (validated on the gemma-3 resident decode graph).
+;; Reassociated float RMSNorm. This is the same per-row numerical formula as rms-norm!, with an
+;; explicit implementation-defined association contract for the sum of squares. The compiler may
+;; therefore assign one workgroup to a row, reduce feature-lane partials through workgroup memory,
+;; and apply the completed scale in the same kernel. The operation remains a general SegFoldMap;
+;; neither the frontend nor the schedule recognizes RMSNorm.
 ;;
 ;; Concrete-float ON PURPOSE (not (All [T])): this is a float GPU kernel, so
 ;; the reduce accumulator and every FP scalar must be float. Threading double
 ;; eps/gain-offset/literals through it would leave raster.numeric ops
 ;; undevirtualized (float x double has no monomorphic overload) → on GPU that
 ;; cannot lower to OpenCL C → garbage output. The Double params are cast to
-;; float at entry, keeping the whole dataflow float-typed.
+;; float at entry, keeping the whole dataflow float-typed. Interpreted/JVM execution retains the
+;; declaration-order fold; only a target schedule may realize the certified reassociation.
+(deftm rms-norm-reassociated!
+  [x :- (Array float) weight :- (Array float) out :- (Array float)
+   rows :- Long features :- Long eps :- Double gain-offset :- Double] :- Void
+  (raster.par/segmented-fold-map!
+   [out] [[row rows]] i features
+   [[ss 0.0 :float features
+     (raster.numeric/+ ss
+                       (raster.numeric/*
+                        (raster.arrays/aget x (clojure.core/+ (clojure.core/* row features) i))
+                        (raster.arrays/aget x (clojure.core/+ (clojure.core/* row features) i))))
+     {:association :implementation-defined}]]
+   [(raster.numeric/*
+     (raster.numeric/*
+      (raster.arrays/aget x (clojure.core/+ (clojure.core/* row features) i))
+      (raster.numeric//
+       (float 1.0)
+       (raster.numeric/sqrt
+        (raster.numeric/+ (raster.numeric// ss (float features)) (float eps)))))
+     (raster.numeric/+ (float gain-offset) (raster.arrays/aget weight i)))]))
+
+;; Compatibility surface for generated decode programs. It deliberately delegates to the same
+;; multi-row algebra; there is no one-row kernel or schedule to maintain.
 (deftm rms-norm-1row!
   [x :- (Array float) weight :- (Array float) out :- (Array float)
    features :- Long eps :- Double gain-offset :- Double] :- Void
-  (let [ss  (raster.par/reduce acc (float 0.0) i features
-                               (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
-                                                                       (raster.arrays/aget x i))))
-        inv (raster.numeric// (float 1.0)
-                              (raster.numeric/sqrt
-                               (raster.numeric/+ (raster.numeric// ss (float features))
-                                                 (float eps))))]
-    (raster.par/map-void! j features
-                          (raster.arrays/aset out j
-                                              (raster.numeric/* (raster.numeric/* (raster.arrays/aget x j) inv)
-                                                                (raster.numeric/+ (float gain-offset)
-                                                                                  (raster.arrays/aget weight j)))))))
+  (rms-norm-reassociated! x weight out 1 features eps gain-offset))
 
 ;; --- Bias-free linear + gated MLP (modern decoder LMs) ---
 ;; Modern LLMs (Llama, Qwen, Gemma, Mistral) use bias-free projections.

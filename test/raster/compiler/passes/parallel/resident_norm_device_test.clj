@@ -1,6 +1,5 @@
 (ns raster.compiler.passes.parallel.resident-norm-device-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.equation-first :as equation-first]
             [raster.nn :as numerical-nn]
@@ -11,14 +10,15 @@
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.device-probe :as opencl-probe]))
 
-(deftest public-rmsnorm-has-a-resident-reduction-and-map
+(deftest public-rmsnorm-is-one-cooperative-executable
   (doseq [target [:ocl:0 :ze:0]]
-    (let [descriptor (pipeline/compile-gpu-program #'nn/rms-norm-1row! target :dtype :float)
-          reduction (:artifact (first (:steps descriptor)))]
-      (is (= [:executable :map-void] (mapv :convention (:steps descriptor))))
-      (is (graph/kernel-graph? reduction))
-      (is (= 2 (count (:nodes reduction))))
-      (is (= 1 (count (:allocs descriptor))) "only the completed scalar crosses stages"))))
+    (doseq [norm-var [#'nn/rms-norm-reassociated! #'nn/rms-norm-1row!]]
+      (let [descriptor (pipeline/compile-gpu-program norm-var target :dtype :float)]
+        (is (= [:executable] (mapv :convention (:steps descriptor))))
+        (is (= :one-workgroup-per-segment
+               (get-in descriptor [:steps 0 :artifact :attributes
+                                   :kernel-body :schedule :strategy])))
+        (is (empty? (:allocs descriptor)) "the completed fold stays inside one kernel")))))
 
 (deftest public-softmax-backward-composes-resident-reduction-and-map
   (if @opencl-probe/opencl-available?
@@ -64,23 +64,41 @@
     (opencl-probe/opencl-skip! "public dense input gradient shape-only input")))
 
 (defn- run-norm! [target]
-  (let [descriptor (pipeline/compile-gpu-program #'nn/rms-norm-1row! target :dtype :float)]
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'nn/rms-norm-reassociated! target :dtype :float)]
     (gpu/with-gpu-session [session target]
-      (doseq [width [1 17 513]]
-        (let [x (float-array (map #(float (/ (- (mod % 11) 5) 7.0)) (range width)))
+      (doseq [[rows width] [[1 1] [1 17] [1 513] [3 17]]]
+        (let [x (float-array (map #(float (/ (- (mod % 11) 5) 7.0))
+                                  (range (* rows width))))
               weights (float-array (map #(float (/ (inc (mod % 7)) 9.0)) (range width)))
-              output (float-array width)
+              output (float-array (* rows width))
               eps 0.0001
               gain 1.0
-              arguments [x weights output (long width) eps gain]
-              inverse (/ 1.0 (Math/sqrt (+ eps (/ (reduce + (map #(* (double %) %) x)) width))))
-              expected (mapv #(* %1 inverse (+ gain %2)) x weights)
+              arguments [x weights output (long rows) (long width) eps gain]
+              expected
+              (vec
+               (mapcat
+                (fn [row]
+                  (let [base (* row width)
+                        inverse (/ 1.0
+                                   (Math/sqrt
+                                    (+ eps
+                                       (/ (reduce +
+                                                  (map (fn [i]
+                                                         (let [v (double (aget x (+ base i)))]
+                                                           (* v v)))
+                                                       (range width)))
+                                          width))))]
+                    (mapv (fn [i]
+                            (* (aget x (+ base i)) inverse (+ gain (aget weights i))))
+                          (range width))))
+                (range rows)))
               program (fixture/instantiate! session descriptor arguments
                                             {'x :input 'weight :input 'out :output})]
           (try
             (dotimes [_ 2]
               (let [actual (get (fixture/run! program arguments) 'out)]
-                (is (= width (count actual)))
+                (is (= (* rows width) (count actual)))
                 (doseq [[want got] (map vector expected actual)]
                   (is (< (Math/abs (- want got)) 0.00001)))))
             (finally (fixture/close! program))))))))
