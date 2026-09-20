@@ -502,6 +502,11 @@ semantic primitives.
 
 The dense row-product workgroup schedule now uses KernelBody through the common graph emitter,
 preserving simultaneous tuple updates, hidden components, independent dtypes and logical ABI.
+It composes with a following ordered map through ordinary compiler-owned tensor storage: the
+product and epilogue remain separate semantic equations and emit as one dependency-ordered graph,
+with no host round trip or public scratch argument. Source, KernelBody and KernelLaunch spell
+symbolic extents differently, so their exact-equality checks share one deliberately small
+commutative extent algebra rather than relying on record/S-expression identity.
 The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
 types: each local is lowered once to SSA and shared across results, without inferring its type from
 a consuming component. `product-reduction-body` expresses lane folds, a fixed

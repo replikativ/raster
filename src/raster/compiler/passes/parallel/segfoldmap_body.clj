@@ -10,6 +10,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scan :as scan]
@@ -747,69 +748,6 @@
     (schedule-cooperative segfold options)
     (schedule-ordered segfold options)))
 
-(defn- record-name
-  [value]
-  (some-> value class .getSimpleName))
-
-(defn- canonical-commutative
-  [operator arguments]
-  (let [arguments (mapcat (fn [argument]
-                            (if (and (vector? argument) (= operator (first argument)))
-                              (second argument)
-                              [argument]))
-                          arguments)
-        identity (case operator :mul [:leaf 1] :add [:leaf 0] nil)
-        arguments (if identity (remove #{identity} arguments) arguments)
-        arguments (vec (sort-by pr-str arguments))]
-    (case (count arguments)
-      0 (or identity [operator []])
-      1 (first arguments)
-      [operator arguments])))
-
-(declare canonical-extent)
-
-(defn- canonical-operation
-  [operator arguments]
-  (let [arguments (mapv canonical-extent arguments)]
-    (case operator
-      (:mul :add :min :max) (canonical-commutative operator arguments)
-      [operator arguments])))
-
-(defn- canonical-extent
-  "Normalize source, KernelBody, and KernelLaunch integer extent spellings for equality only."
-  [expression]
-  (case (record-name expression)
-    "RuntimeValue" (canonical-extent (:value expression))
-    "Product" (canonical-operation :mul (:factors expression))
-    "Sum" (canonical-operation :add (:terms expression))
-    "Minimum" (canonical-operation :min (:values expression))
-    "Maximum" (canonical-operation :max (:values expression))
-    "CeilDiv" (canonical-operation :ceil-div [(:value expression) (:divisor expression)])
-    "FloorDiv" (canonical-operation :floor-div [(:value expression) (:divisor expression)])
-    "AlignUp" (canonical-operation :align-up [(:value expression) (:alignment expression)])
-    "IndexExpr" (canonical-operation (:op expression) (:arguments expression))
-    "IndexCast" (canonical-extent (:argument expression))
-    (cond
-      (and (seq? expression)
-           (contains? '#{int long double clojure.core/int clojure.core/long
-                         clojure.core/double}
-                      (first expression))
-           (= 2 (count expression)))
-      (canonical-extent (second expression))
-
-      (seq? expression)
-      (let [operator ({'* :mul 'clojure.core/* :mul
-                       '+ :add 'clojure.core/+ :add
-                       'min :min 'clojure.core/min :min
-                       'max :max 'clojure.core/max :max
-                       'quot :floor-div 'clojure.core/quot :floor-div}
-                      (first expression))]
-        (if operator
-          (canonical-operation operator (rest expression))
-          [:leaf expression]))
-
-      :else [:leaf expression])))
-
 (defn- closed-derived-storage-scalars
   [kernel-graph closed-algorithm closed-body]
   (when-not (= (some? closed-algorithm) (some? closed-body))
@@ -847,7 +785,7 @@
          derived-scalars (closed-derived-storage-scalars
                           kernel-graph closed-algorithm closed-body)
          expand-derived #(util/subst-syms derived-scalars %)
-         expected-elements (canonical-extent
+         expected-elements (extent-expression/canonical
                             (expand-derived
                              (list '* (segop/seg-space-num-segments-expr (:space source))
                                    (:extent source))))]
@@ -855,12 +793,12 @@
              :when (not= :scalar (:kind parameter))]
        (let [buffer (get buffers argument)
              parameter-elements
-             (canonical-operation
+             (extent-expression/operation
               :mul (map #(-> %
                              (launch/rebind-expression bindings)
                              expand-derived)
                         (:shape parameter)))
-             graph-elements (some-> buffer :elements canonical-extent)]
+             graph-elements (some-> buffer :elements extent-expression/canonical)]
          (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
            (throw (ex-info "fold-map KernelBody pointer dtype differs from its graph buffer"
                            {:reason :segfoldmap-storage-dtype :parameter (:id parameter)

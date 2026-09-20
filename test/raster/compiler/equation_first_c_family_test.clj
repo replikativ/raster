@@ -121,6 +121,34 @@
          [(float sum)])]
     effect))
 
+(deftm c-family-product-map!
+  "A short tuple reduction followed by an ordered epilogue over compiler-owned intermediates."
+  [input :- (Array int), output :- (Array int), rows :- Long] :- Void
+  (let [segments (* rows 8)
+        partials (int-array segments)]
+    (raster.par/product-reduce!
+     [partials]
+     [[sum 0 :int]]
+     [[segment segments]]
+     chunk 8
+     [value (raster.arrays/aget input (+ (* segment 8) chunk))]
+     [value]
+     [[left right]]
+     []
+     [(unchecked-add-int left right)]
+     {:associative? true :commutative? true
+      :overflow :wrap :order :implementation-defined})
+    (raster.par/map-void!
+     row rows
+     (let [base (* row 8)
+           total (loop [lane 0 sum 0]
+                   (if (< lane 8)
+                     (recur (inc lane)
+                            (unchecked-add-int
+                             sum (raster.arrays/aget partials (+ base lane))))
+                     sum))]
+       (raster.arrays/aset output row total)))))
+
 (defn- reason-of
   [thunk]
   (try
@@ -440,6 +468,22 @@
                   compilation [(float-array 8) 2 4])]
       (is (= [module-target] (mapv :target (:kernels compilation))))
       (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest product-reduction-composes-with-an-ordered-epilogue
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'c-family-product-map!
+                       {:target target :dtype :int
+                        :values {'input (av/tensor {:dtype :int :shape [64]})
+                                 'output (av/tensor {:dtype :int :shape [1]})}})
+          linked (equation-first/lower
+                  compilation [(int-array 64) (int-array 1) 1])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 2 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= [8] (get-in compilation
+                         [:kernels 0 :attributes :kernel-body :launch :workgroup-size])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
 (deftest counted-softmax-initializers-use-the-public-c-family-boundary
