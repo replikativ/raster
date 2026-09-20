@@ -518,6 +518,17 @@ Product scheduling also flattens any non-empty tuple of semantic segment axes in
 workgroup axis and reconstructs each logical index with checked mixed-radix arithmetic inside the
 body. Batched rows, output channels and quantization blocks therefore remain distinct semantic
 axes without requiring a new kernel convention or a manually flattened source index.
+An admitted single-component wrapping integral additive product may additionally select an
+all-register subgroup schedule from stated target capabilities. One subgroup owns each semantic
+prefix output, lanes cover the reduced axis, inactive lanes contribute the proved identity, and a
+small static local suffix is unrolled into independent SSA values. The following ordered consumer
+runs in lane zero and reads those values directly, so the compiler eliminates both the global
+intermediate and the workgroup scratch/barriers without introducing a quantization opcode. The
+selection records the subgroup width, padding and local-offset substitution in its refinement;
+missing or insufficient hardware facts retain the portable workgroup tree. Wrapping addition is
+lowered through an unsigned same-width carrier so CUDA/HIP do not acquire signed-overflow undefined
+behaviour. The real Q6_K product/consumer workload executes bit-identically on Intel Arc and joins
+the hardware-free CUDA/HIP equation-first compile corpus.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows

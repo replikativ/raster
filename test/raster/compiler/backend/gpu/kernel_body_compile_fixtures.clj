@@ -47,6 +47,7 @@
             [raster.linalg.contract :as contract]
             [raster.numeric]
             [raster.par]
+            [raster.quant.ggml-kernels :as ggml-kernels]
             [raster.quant.kernels-k :as qk]
             [raster.runtime.hardware :as hardware]))
 
@@ -454,6 +455,9 @@
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
+                 {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'ggml-kernels/qdot-q6-K-product-rows!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))

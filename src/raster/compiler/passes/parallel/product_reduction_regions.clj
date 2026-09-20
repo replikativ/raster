@@ -49,7 +49,9 @@
 (defn lower
   "Lower element once and provide a shared combine lowerer with deterministic fresh SSA IDs.
    The caller supplies its decline mechanism and retained array/scalar/local dtype facts."
-  [segred {:keys [array-types scalar-types element-binding-types combine-binding-types]} decline!]
+  [segred {:keys [array-types scalar-types element-binding-types combine-binding-types
+                  axis-substitutions id-prefix]
+           :or {axis-substitutions {} id-prefix "product"}} decline!]
   (let [operator (reduction/validate! (:reduction segred))
         segments (segop/seg-space-segment-dims (:space segred))
         _ (when (empty? segments)
@@ -77,8 +79,10 @@
         lowerer (scalar/make-lowerer
                  {:arrays (set (:inputs segred)) :array-types array-types :scalar-types index-types
                   :scalar-ranges (cond-> {} column-range (assoc column column-range))
-                  :lower-index lower-index :id-prefix "product" :decline! decline!})
-        element-region (reduction/element-region operator)
+                  :lower-index lower-index :id-prefix id-prefix :decline! decline!})
+        element-region (-> (reduction/element-region operator)
+                           (update :bindings #(util/subst-syms axis-substitutions %))
+                           (update :results #(util/subst-syms axis-substitutions %)))
         combine-region (reduction/combine-region operator)
         element-types (binding-types element-region element-binding-types decline!)
         combine-types (binding-types combine-region combine-binding-types decline!)

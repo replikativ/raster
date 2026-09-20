@@ -7,6 +7,7 @@
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -166,7 +167,12 @@
   [plan opts]
   (let [target-dialect (get opts :target-dialect :opencl-intel)
         target-module (c-dialect/target (c-dialect/resolve! target-dialect))
-        routed (product-consumer-route/schedule plan)
+        target-device (:target-device opts)
+        target-description (cond
+                             (map? target-device) target-device
+                             target-device (hardware/descriptor-for target-device)
+                             :else nil)
+        routed (product-consumer-route/schedule plan target-description)
         kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
         {:keys [emitted refinement]} (product-consumer-route/emit
                                       kernel-name routed target-dialect)
