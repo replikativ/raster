@@ -469,6 +469,18 @@ validated plan; one later instantiation therefore removes even the device copy. 
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 
+The equation-first vertical now enters this same artifact layer directly. Invocation lowering
+retains ordered public-symbol→storage and compiler-SSA→storage projections, derives public
+input/output/state roles from typed access and complete-write proofs, and wraps its
+`ProgramLinkInstance` in a revalidated typed-invocation certificate. `Compiled` selects this route
+explicitly with `:compiler :equation-first`; a coverage decline cannot silently retry the resident
+descriptor compiler. Its ordinary `Prepared` values compose with each other before allocation:
+composition namespaces every nested emitted-program buffer binding and revalidates the resulting
+`LinkPlan`. The generated Q4_K product/consumer kernel is the first production quant workload
+executed through this public value path. The legacy resident-descriptor choice remains the default
+only while the remaining public workload coverage is audited; it is no longer required by the
+artifact, linker, or runtime representation.
+
 Pretrained-rstr's batch boundary is the current concrete shape test: weights bind once to shared
 constant nodes, while residual, scratch, position, logits and token storage are lane-local nodes or
 disjoint views. Packed Q/K/V and attention views already fit LinkPlan. The first projection slice now
