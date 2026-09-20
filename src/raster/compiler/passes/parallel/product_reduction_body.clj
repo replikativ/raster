@@ -27,7 +27,11 @@
   (case (count values)
     0 1
     1 (first values)
-    (apply list 'clojure.core/* values)))
+    ;; Multi-segment indices are reconstructed in signed-long arithmetic. This expression is
+    ;; compiler-generated exact index algebra, so retain that width explicitly instead of asking
+    ;; the launch lowerer to infer a compound source type from its operands.
+    (with-meta (apply list 'clojure.core/* values)
+      {:raster.type/tag 'long :tag 'long})))
 
 (defn lower
   "Lower one segmented SegRed with retained input shapes and scalar/region binding dtypes.

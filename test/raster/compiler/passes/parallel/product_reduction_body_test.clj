@@ -91,6 +91,26 @@
     (first (soac-lower/lower-typed-product-reduce
             (typed-argmax-program {} scalar-types) :cpu:0 :dtype :float)))))
 
+(deftest multi-axis-index-reconstruction-retains-generated-long-products
+  (let [scalar-types {'nrows :long 'outputs :long 'blocks :long 'width :long}
+        base (typed-argmax-segred scalar-types)
+        space (assoc (:space base) :dims [{:name 'row :bound 'nrows}
+                                          {:name 'output :bound 'outputs}
+                                          {:name 'block :bound 'blocks}
+                                          {:name 'lane :bound 8}
+                                          {:name 'half :bound 2}
+                                          {:name 'col :bound 'width}])
+        rows (raster.compiler.ir.segop/seg-space-num-segments-expr space)
+        source (-> base
+                   (assoc :space space)
+                   (assoc-in [:grid :num-blocks] (list 'max 1 rows)))
+        scheduled (product/schedule source (assoc options :scalar-types scalar-types))
+        operations (get-in scheduled [:body :operations 1 :then-operations])]
+    (is (= '[row output block lane half]
+           (mapv :id (take 5 operations))))
+    (is (every? #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                (take 5 operations)))))
+
 (defn typed-local-address-segred
   ([] (typed-local-address-segred (:scalar-types options)))
   ([scalar-types]
