@@ -28,6 +28,7 @@
   (:import [java.lang.foreign
             Arena FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout
+            ValueLayout$OfInt ValueLayout$OfLong ValueLayout$OfDouble
             AddressLayout]
            [java.lang.invoke MethodHandle]
            [java.nio.file Files Path])
@@ -128,10 +129,15 @@
 ;; Layout helpers
 ;; ================================================================
 
-(def ^:private PTR ValueLayout/ADDRESS)
-(def ^:private I32 ValueLayout/JAVA_INT)
-(def ^:private I64 ValueLayout/JAVA_LONG)
-(def ^:private F64 ValueLayout/JAVA_DOUBLE)
+;; The concrete layout type on each var matters for speed, not just tidiness:
+;; MemorySegment's get/set are overloaded per layout type, so an untyped layout
+;; makes every FFI struct access reflective. That cost lands on the launch path,
+;; which writes the group count before each dispatch (measured: 162us per launch
+;; reflective, ~5us hinted).
+(def ^:private ^AddressLayout PTR ValueLayout/ADDRESS)
+(def ^:private ^ValueLayout$OfInt I32 ValueLayout/JAVA_INT)
+(def ^:private ^ValueLayout$OfLong I64 ValueLayout/JAVA_LONG)
+(def ^:private ^ValueLayout$OfDouble F64 ValueLayout/JAVA_DOUBLE)
 
 (defn- ptr-seg
   "Allocate a pointer-sized segment in the given arena."
