@@ -1530,3 +1530,12 @@ compiler-selected one-group-per-segment `LaunchSpec`. A public Intel OpenCL devi
 non-power-of-two and greater-than-workgroup extents; nvcc and hipcc compile the same emitted body in
 the hardware-free fixture gate. RMSNorm and quantized dots remain workload acceptance steps, not
 special cases in this lowering.
+
+The first workload acceptance expresses float RMSNorm itself as the same general SegFoldMap. The
+multi-row operation and its one-row compatibility entry both compile to one cooperative executable
+with no compiler allocation; host interpretation remains ordered. Intel Arc device-event
+measurement at one row and width 640 observed a 169.8 microsecond ordered median versus a 3.1
+microsecond cooperative median. The run was non-stationary and is recorded as directional local
+evidence, not a portable throughput claim. Correctness covers widths 1, 17 and 513 plus a three-row
+case, and the actual library kernel is part of the nvcc/hipcc fixture corpus. This validates the
+algebra/schedule seam on a real decode bottleneck without introducing an RMSNorm compiler rule.

@@ -656,7 +656,7 @@
       (is (= 15 (alength w))))))
 
 ;; ================================================================
-;; rms-norm-1row! (single-row Stage-A par/reduce form) tests
+;; reassociated RMSNorm (general SegFoldMap plus one-row compatibility surface)
 ;; ================================================================
 
 (deftest rms-norm-1row-test
@@ -678,3 +678,16 @@
             (str "elem " i)))
       (is (some #(> (Math/abs (aget out-1row (int %))) 0.1) (range n))
           "non-degenerate output"))))
+
+(deftest rms-norm-reassociated-multirow-test
+  (testing "the sequential host interpretation matches rms-norm! across rows"
+    (let [rows 3 features 17
+          x (float-array (map #(float (/ (- (mod % 13) 6) 7.0))
+                              (range (* rows features))))
+          w (float-array (map #(float (/ (inc (mod % 5)) 11.0)) (range features)))
+          expected (float-array (* rows features))
+          actual (float-array (* rows features))]
+      (nn/rms-norm! x w expected rows features 1.0e-4 1.0)
+      (nn/rms-norm-reassociated! x w actual rows features 1.0e-4 1.0)
+      (is (every? #(< (Math/abs (double %)) 1.0e-5)
+                  (map - expected actual))))))
