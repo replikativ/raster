@@ -430,6 +430,12 @@
       (:kernels (equation-first/compile
                  #'qk/quant-act-q8k-padded-rows-gpu! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'qk/quant-act-q8k-cooperative-rows-gpu!
+                 {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
+                 {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-decode-attention-buf!

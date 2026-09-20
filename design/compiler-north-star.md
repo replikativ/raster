@@ -189,6 +189,19 @@ map convention's reconstructed scalar bound. Unsupported operators or multi-fold
 remain on the ordered schedule; no normalization, softmax or quantization name participates in
 selection.
 
+The same algebra now schedules `min`/`max` monoids and materializes their typed infinite identities
+before KernelBody construction. Static fold extents cap the power-of-two workgroup size, so a
+256-element Q8_K scale fold uses 256 lanes even when the device's generic reduction grid was sized
+at 1024. The cooperative dense and padded Q8_K entry points express scale discovery as an ordinary
+flattened `(row,super-block)` SegFoldMap and packed words/sub-block sums/public scales as dense
+maps. The compiler owns
+one maximum per super-block so quantized bytes retain the prior arithmetic order; this is eight
+times smaller than the caller-managed `submax` array and is reusable by ordinary memory planning.
+No quantizer-specific compiler route is involved. The older scratch ABI
+remains an explicit compatibility surface until downstream callers migrate. Floating min/max use
+the target intrinsic policy over the operation's declared finite numerical domain; arbitrary NaN
+payload or signed-zero equivalence is not silently claimed as an algebraic theorem.
+
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
 typed equation records read/write destination access, and GPU lowering emits that storage exactly
 once as a `KernelABI` `:inout` pointer with semantic role `:result`. Physical access and functional

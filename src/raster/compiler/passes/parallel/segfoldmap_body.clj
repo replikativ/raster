@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.segfoldmap-body
-  "Portable KernelBody schedule for ordered segmented fold-map operations.
+  "Portable KernelBody schedules for ordered and certified-reassociated segmented fold-map operations.
 
    One work item owns one independent segment. Each fold is a sequential, loop-carried region in
    declared order; completed fold values feed later folds and the final dense map. This is the
@@ -8,6 +8,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -40,6 +41,11 @@
     (instance? raster.compiler.ir.kernel_body.IndexCast expression)
     (static-index-integer (:argument expression))
     :else nil))
+
+(defn- capped-ceiling-power-of-two
+  [n cap]
+  (loop [power 1]
+    (if (or (>= power n) (>= power cap)) power (recur (* 2 power)))))
 
 (defn- widen-index-expression
   "Make portable address arithmetic uniformly 64-bit without changing scalar ABI types."
@@ -366,7 +372,7 @@
                     {:reason :raster/bug :operation segfold})))
   (let [space (:space segfold)
         source-grid (:grid segfold)
-        workgroup-size (or workgroup-size (:block-size source-grid) 256)
+        requested-workgroup-size workgroup-size
         segment-dims (segop/seg-space-segment-dims space)
         mapped-dim (segop/seg-space-reduced-dim space)
         folds (vec (:folds segfold))
@@ -375,6 +381,16 @@
                       "the first cooperative fold-map schedule requires exactly one fold"
                       {:operation (:id segfold) :fold-count (count folds)}))
         fold (first folds)
+        source-workgroup-size (or (:block-size source-grid) 256)
+        ;; Do not launch more lanes than a static fold can use. Dynamic folds retain the
+        ;; hardware-selected size; an explicit caller override is a testing/tuning decision and
+        ;; is preserved exactly. The next power of two keeps the shared tree structurally valid.
+        static-fold-extent (some-> (:extent fold) numeric-constant/value :value)
+        workgroup-size (or requested-workgroup-size
+                           (if (and (integer? static-fold-extent) (pos? static-fold-extent))
+                             (capped-ceiling-power-of-two static-fold-extent
+                                                          source-workgroup-size)
+                             source-workgroup-size))
         _ (when-not (= :implementation-defined (:association fold))
             (decline! :fold-association
                       "cooperative fold-map scheduling requires an explicit reassociation contract"
@@ -505,11 +521,11 @@
                       "cooperative fold-map algebra disagrees with its scalar region"
                       {:operation (:id segfold) :declared (:algebra fold) :derived derived}))
         operator (intrinsics/canonical (:combine derived))
-        _ (when-not (contains? #{:+ :*} operator)
+        _ (when-not (contains? #{:+ :* :min :max} operator)
             (decline! :cooperative-operator
-                      "the first cooperative fold-map schedule emits addition and multiplication"
+                      "cooperative fold-map scheduling requires a supported scalar monoid"
                       {:operation (:id segfold) :operator operator}))
-        identity (:identity fold)
+        identity (numeric-constant/literal-or-original (:identity fold))
         _ (when-not (number? identity)
             (decline! :literal-identity
                       "cooperative fold-map requires a literal scalar identity"
@@ -688,8 +704,14 @@
                             (if (and (vector? argument) (= operator (first argument)))
                               (second argument)
                               [argument]))
-                          arguments)]
-    [operator (vec (sort-by pr-str arguments))]))
+                          arguments)
+        identity (case operator :mul [:leaf 1] :add [:leaf 0] nil)
+        arguments (if identity (remove #{identity} arguments) arguments)
+        arguments (vec (sort-by pr-str arguments))]
+    (case (count arguments)
+      0 (or identity [operator []])
+      1 (first arguments)
+      [operator arguments])))
 
 (declare canonical-extent)
 

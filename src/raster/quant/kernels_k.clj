@@ -217,6 +217,145 @@
                                   s))]
                        (ra/aset bsums sidx (unchecked-int bs)))))))
 
+;; Cooperative Q8_K quantization.  The scale computation is deliberately expressed as the
+;; general SegFoldMap algebra rather than as a quantizer-specific kernel: every flattened
+;; `(row,sb)` is a segment, the 256-element maximum is the fold, and the single mapped result is
+;; its maximum. The
+;; compiler may only distribute that fold because the source explicitly accepts the registered
+;; max monoid's implementation-defined association.  The following ordinary maps own disjoint
+;; packed words, sub-block sums and public scales. Compared with the compatibility API this removes
+;; caller-managed `submax` and the eight-way redundant rescan. The compiler owns one float maximum
+;; per super-block (eight times smaller than `submax`) so packing retains exact legacy arithmetic:
+;; computing quantized bytes from the rounded public scale changes rare halfway cases.
+;;
+;; Floating max follows the target intrinsic policy already used by Raster GPU scalar kernels.
+;; Q8_K's public numerical domain is finite activations; NaN payload/propagation is not promised
+;; by this quantization format and must be rejected or sanitized by a higher-level policy.
+(deftm quant-act-q8k-cooperative-rows-gpu!
+  "Q8_K activation quantization over dense row-major `[nrows,in]` without caller scratch.
+  `in` must be a multiple of 256.  The compiler assigns one cooperative workgroup to each
+  256-element scale segment, followed by independently parallel packing, sum and scale maps."
+  [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   in :- Long, nrows :- Long] :- Void
+  (let [scale-segments (quot (long in) 256)
+        scale-count (* (long nrows) scale-segments)
+        maxes (float-array scale-count)]
+    (par/segmented-fold-map!
+     [maxes] [[segment scale-count]] k 1
+     [[mx Float/NEGATIVE_INFINITY :float 256
+       (Math/max mx
+                 (Math/abs
+                  (float (ra/aget x
+                                  (+ (* (quot segment scale-segments) (long in))
+                                     (* (rem segment scale-segments) 256) k)))))
+       {:association :implementation-defined}]]
+     [(float mx)])
+    ;; One pointwise owner per packed word keeps the write-conflict proof structural.
+    (par/map-void! wi (* (long nrows) (quot (long in) 4))
+                   (let [nsb (quot (long in) 256)
+                         sb (rem (quot wi 64) nsb)
+                         row (quot wi (quot (long in) 4))
+                         mx (ra/aget maxes (+ (* row nsb) sb))
+                         d (/ (double mx) 127.0)
+                         id (if (> d 0.0) (/ 1.0 d) 0.0)
+                         e (* wi 4)
+                         q0 (math/round (* (double (ra/aget x e)) (double id)))
+                         q1 (math/round (* (double (ra/aget x (+ e 1))) (double id)))
+                         q2 (math/round (* (double (ra/aget x (+ e 2))) (double id)))
+                         q3 (math/round (* (double (ra/aget x (+ e 3))) (double id)))
+                         word (rn/bit-or
+                               (rn/bit-or (rn/bit-and q0 0xFF)
+                                          (rn/bit-shift-left (rn/bit-and q1 0xFF) 8))
+                               (rn/bit-or (rn/bit-shift-left (rn/bit-and q2 0xFF) 16)
+                                          (rn/bit-shift-left (rn/bit-and q3 0xFF) 24)))]
+                     (ra/aset xp wi (unchecked-int word))))
+    ;; Derive the sub-block sums from the packed representation.  This avoids both another float
+    ;; quantization and a scratch array while retaining one dense destination owner per sub-block.
+    (par/map-void! si (* (long nrows) (quot (long in) 32))
+                   (let [base (* si 8)
+                         bs (loop [w 0 s 0]
+                              (if (< w 8)
+                                (let [word (long (ra/aget xp (+ base w)))
+                                      u0 (rn/bit-and word 0xFF)
+                                      u1 (rn/bit-and (rn/unsigned-bit-shift-right word 8) 0xFF)
+                                      u2 (rn/bit-and (rn/unsigned-bit-shift-right word 16) 0xFF)
+                                      u3 (rn/bit-and (rn/unsigned-bit-shift-right word 24) 0xFF)
+                                      q0 (if (> u0 127) (- u0 256) u0)
+                                      q1 (if (> u1 127) (- u1 256) u1)
+                                      q2 (if (> u2 127) (- u2 256) u2)
+                                      q3 (if (> u3 127) (- u3 256) u3)]
+                                  (recur (inc w) (+ s q0 q1 q2 q3)))
+                                s))]
+                     (ra/aset bsums si (unchecked-int bs))))
+    (par/map-void! scale-index scale-count
+                   (ra/aset xs scale-index
+                            (float (/ (double (ra/aget maxes scale-index)) 127.0))))))
+
+(deftm quant-act-q8k-cooperative-padded-rows-gpu!
+  "Q8_K activation quantization from dense `[nrows,width]` into rows padded to `padded-in`,
+  without materializing input padding or exposing reduction scratch to the caller."
+  [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   width :- Long, padded-in :- Long, nrows :- Long] :- Void
+  (let [scale-segments (quot (long padded-in) 256)
+        scale-count (* (long nrows) scale-segments)
+        maxes (float-array scale-count)]
+    (par/segmented-fold-map!
+     [maxes] [[segment scale-count]] k 1
+     [[mx Float/NEGATIVE_INFINITY :float 256
+       (Math/max mx
+                 (let [row (quot segment scale-segments)
+                       sb (rem segment scale-segments)
+                       col (+ (* sb 256) k)]
+                   (if (< col (long width))
+                     (Math/abs (float (ra/aget x (+ (* row (long width)) col))))
+                     (float 0.0))))
+       {:association :implementation-defined}]]
+     [(float mx)])
+    (par/map-void! wi (* (long nrows) (quot (long padded-in) 4))
+                   (let [nsb (quot (long padded-in) 256)
+                         words-per-row (quot (long padded-in) 4)
+                         row (quot wi words-per-row)
+                         row-word (rem wi words-per-row)
+                         sb (quot row-word 64)
+                         mx (ra/aget maxes (+ (* row nsb) sb))
+                         d (/ (double mx) 127.0)
+                         id (if (> d 0.0) (/ 1.0 d) 0.0)
+                         col (* row-word 4)
+                         xbase (* row (long width))
+                         q0 (if (< col (long width))
+                              (math/round (* (double (ra/aget x (+ xbase col))) (double id))) 0)
+                         q1 (if (< (+ col 1) (long width))
+                              (math/round (* (double (ra/aget x (+ xbase col 1))) (double id))) 0)
+                         q2 (if (< (+ col 2) (long width))
+                              (math/round (* (double (ra/aget x (+ xbase col 2))) (double id))) 0)
+                         q3 (if (< (+ col 3) (long width))
+                              (math/round (* (double (ra/aget x (+ xbase col 3))) (double id))) 0)
+                         word (rn/bit-or
+                               (rn/bit-or (rn/bit-and q0 0xFF)
+                                          (rn/bit-shift-left (rn/bit-and q1 0xFF) 8))
+                               (rn/bit-or (rn/bit-shift-left (rn/bit-and q2 0xFF) 16)
+                                          (rn/bit-shift-left (rn/bit-and q3 0xFF) 24)))]
+                     (ra/aset xp wi (unchecked-int word))))
+    (par/map-void! si (* (long nrows) (quot (long padded-in) 32))
+                   (let [base (* si 8)
+                         bs (loop [w 0 s 0]
+                              (if (< w 8)
+                                (let [word (long (ra/aget xp (+ base w)))
+                                      u0 (rn/bit-and word 0xFF)
+                                      u1 (rn/bit-and (rn/unsigned-bit-shift-right word 8) 0xFF)
+                                      u2 (rn/bit-and (rn/unsigned-bit-shift-right word 16) 0xFF)
+                                      u3 (rn/bit-and (rn/unsigned-bit-shift-right word 24) 0xFF)
+                                      q0 (if (> u0 127) (- u0 256) u0)
+                                      q1 (if (> u1 127) (- u1 256) u1)
+                                      q2 (if (> u2 127) (- u2 256) u2)
+                                      q3 (if (> u3 127) (- u3 256) u3)]
+                                  (recur (inc w) (+ s q0 q1 q2 q3)))
+                                s))]
+                     (ra/aset bsums si (unchecked-int bs))))
+    (par/map-void! scale-index scale-count
+                   (ra/aset xs scale-index
+                            (float (/ (double (ra/aget maxes scale-index)) 127.0))))))
+
 ;; ---- dp4a int8-GEMV core (the format-agnostic hardware-accelerated path) ----
 ;; int8×int8 GEMV over int32-packed lanes: y[o] = Σ_w dp4a(wp[o*kw+w], xp[w]). par/dp4a
 ;; lowers to the portable rstr_dp4a helper which the OpenCL/C compiler pattern-matches to
