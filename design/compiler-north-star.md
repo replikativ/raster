@@ -507,6 +507,10 @@ product and epilogue remain separate semantic equations and emit as one dependen
 with no host round trip or public scratch argument. Source, KernelBody and KernelLaunch spell
 symbolic extents differently, so their exact-equality checks share one deliberately small
 commutative extent algebra rather than relying on record/S-expression identity.
+Product scheduling also flattens any non-empty tuple of semantic segment axes into the physical
+workgroup axis and reconstructs each logical index with checked mixed-radix arithmetic inside the
+body. Batched rows, output channels and quantization blocks therefore remain distinct semantic
+axes without requiring a new kernel convention or a manually flattened source index.
 The shared scalar lowerer now accepts ordered multi-result regions with explicit retained binding
 types: each local is lowered once to SSA and shared across results, without inferring its type from
 a consuming component. `product-reduction-body` expresses lane folds, a fixed

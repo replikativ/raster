@@ -129,9 +129,10 @@
     (raster.par/product-reduce!
      [partials]
      [[sum 0 :int]]
-     [[segment segments]]
+     [[row rows] [lane 8]]
      chunk 8
-     [value (raster.arrays/aget input (+ (* segment 8) chunk))]
+     [value (raster.arrays/aget input
+                                (+ (* (+ (* row 8) lane) 8) chunk))]
      [value]
      [[left right]]
      []

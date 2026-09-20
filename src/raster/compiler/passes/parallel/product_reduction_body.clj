@@ -15,6 +15,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as regions]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
@@ -22,8 +23,14 @@
   (throw (ex-info message (assoc data :reason :product-kernel-body-declined
                                  :missing-rule rule :fallback :none))))
 
+(defn- product-expression [values]
+  (case (count values)
+    0 1
+    1 (first values)
+    (apply list 'clojure.core/* values)))
+
 (defn lower
-  "Lower one row-segmented SegRed with retained input shapes and scalar/region binding dtypes.
+  "Lower one segmented SegRed with retained input shapes and scalar/region binding dtypes.
    Address arithmetic must already carry the long-width facts required by lower-typed."
   [segred {:keys [array-types array-shapes scalar-types] :as options}]
   (when-not (instance? raster.compiler.ir.segop.SegRed segred)
@@ -31,10 +38,11 @@
   (let [operator (reduction/validate! (:reduction segred))
         source-schedule (reduction/validate-product-tree! operator (:schedule segred))
         segments (segop/seg-space-segment-dims (:space segred))
-        _ (when-not (= 1 (count segments))
-            (decline! :segment-rank "initial product body requires one row segment axis"
+        _ (when (empty? segments)
+            (decline! :segment-rank "product body requires at least one segment axis"
                       {:segments segments}))
-        {row :name rows :bound} (first segments)
+        single-segment? (= 1 (count segments))
+        rows (segop/seg-space-num-segments-expr (:space segred))
         {column :name width :bound} (segop/seg-space-reduced-dim (:space segred))
         components (:components operator)
         types (mapv :dtype components)
@@ -49,11 +57,13 @@
         inputs (vec (sort-by name (:inputs segred)))
         outputs (vec (keep :result components))
         scalars (vec (sort-by name (set/union (set (:scalars segred))
-                                             (util/free-syms rows) (util/free-syms width))))
+                                             (set (mapcat util/free-syms
+                                                          (conj (mapv :bound segments)
+                                                                width))))))
         _ (doseq [id scalars]
             (when-not (get scalar-types id)
               (decline! :scalar-dtype "product scalar requires retained dtype" {:scalar id})))
-        _ (doseq [bound [rows width]]
+        _ (doseq [bound (conj (mapv :bound segments) width)]
             (when-not (and (or (integer? bound) (symbol? bound))
                            (contains? #{:int :long}
                                       (launch/typed-expression-dtype bound scalar-types))
@@ -61,7 +71,9 @@
               (decline! :bound-dtype
                         "product body requires nonnegative integral row/column bounds"
                         {:bound bound})))
-        rows-type (launch/typed-expression-dtype rows scalar-types)
+        rows-type (if single-segment?
+                    (launch/typed-expression-dtype (:bound (first segments)) scalar-types)
+                    :long)
         _ (doseq [id inputs]
             (when-not (and (get array-types id) (seq (get array-shapes id)))
               (decline! :input-storage "product input requires retained dtype and extent"
@@ -83,6 +95,28 @@
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar rows-type [] nil nil :bound)]))
         {:keys [element combine lower-index]} (regions/lower segred options decline!)
+        row-factors (when-not single-segment?
+                      (mapv #(index-expression/to-launch-expression
+                              (lower-index (:bound %) #{}) decline!)
+                            segments))
+        rows-argument (if single-segment?
+                        (:bound (first segments))
+                        (apply launch/product row-factors))
+        segment-index (if single-segment? (:name (first segments)) 'product-segment)
+        segment-long (body/index-cast segment-index :long :exact)
+        segment-axis-computes
+        (if single-segment?
+          []
+          (mapv
+           (fn [position {:keys [name bound]}]
+             (let [following (subvec (vec segments) (inc position))
+                   divisor (product-expression (mapv :bound following))
+                   quotient (if (= 1 divisor) segment-long
+                                (body/expression :floor-div segment-long
+                                                 (lower-index divisor #{})))]
+               (body/->IndexCompute
+                name (body/expression :mod quotient (lower-index bound #{})))))
+           (range) segments))
         neutrals (mapv (fn [{:keys [neutral dtype]}]
                          (if-let [evidence (constant/value neutral)]
                            (body/literal (:value evidence) dtype)
@@ -130,17 +164,18 @@
           :allocations (mapv #(body/->WorkgroupAllocation %1 %2 [wg]
                                                          (layout/row-major [wg] %2)
                                                          (dtype/bytes-of %2)) scratches types)
-          :indices [(body/->IndexBinding row :group 0)
+          :indices [(body/->IndexBinding segment-index :group 0)
                     (body/->IndexBinding 'product-lane :local 0)]
           :operations
           [(body/->ScalarCompute
             (body/value :product-active :predicate)
             (body/scalar-expression :lt :predicate
-                                    [(body/cast-expression row :long :exact :exact)
+                                    [(body/cast-expression segment-index :long :exact :exact)
                                      (body/cast-expression '_n_bound :long :exact :exact)]))
            (body/->IfRegion
             :product-active
             (conj (vec (concat
+                segment-axis-computes
                 [(body/->ForLoop
                   (body/value column :long) (body/index-cast 'product-lane :long :exact)
                   (lower-index width #{}) wg
@@ -159,7 +194,7 @@
                         (fn [{:keys [result dtype]} scratch value]
                           (when result
                             [(body/->ScalarLoad (body/value value dtype) scratch [0] nil nil :cached)
-                             (body/->ScalarStore result [row] value nil)]))
+                             (body/->ScalarStore result [segment-index] value nil)]))
                         components scratches (ids "product-final"))) (body/->Yield []))
                   [(body/->Yield [])] [])])) (body/->Yield []))
             [(body/->Yield [])] [])]
@@ -169,7 +204,8 @@
                                 :shared-memory-bytes scratch-bytes})
           :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
           :attributes {:kind :product-reduction :component-dtypes types}})]
-    {:kernel-body kernel-body :rows rows :inputs inputs :outputs outputs :scalars scalars}))
+    {:kernel-body kernel-body :rows rows-argument
+     :inputs inputs :outputs outputs :scalars scalars}))
 
 (defn schedule [segred options]
   (let [{:keys [kernel-body rows]} (lower segred options)

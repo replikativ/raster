@@ -31,12 +31,15 @@
   [segred {:keys [array-types scalar-types element-binding-types combine-binding-types]} decline!]
   (let [operator (reduction/validate! (:reduction segred))
         segments (segop/seg-space-segment-dims (:space segred))
-        _ (when-not (= 1 (count segments))
-            (decline! :segment-rank "product region requires one row axis" {:segments segments}))
-        {row :name rows :bound} (first segments)
+        _ (when (empty? segments)
+            (decline! :segment-rank "product region requires at least one segment axis"
+                      {:segments segments}))
         {column :name width :bound} (segop/seg-space-reduced-dim (:space segred))
         types (mapv :dtype (:components operator))
-        index-types (assoc scalar-types row :int column :long)
+        index-types (into (assoc scalar-types column :long)
+                          (map (fn [{:keys [name]}]
+                                 [name (if (= 1 (count segments)) :int :long)]))
+                          segments)
         width-type (launch/typed-expression-dtype width scalar-types)
         width-range (if (integer? width)
                       (scalar-range/literal width width-type)
@@ -68,7 +71,7 @@
                     ((:lower-region lowerer) region types combine-types env)))]
     {:element ((:lower-region lowerer) element-region types element-types index-types)
      :combine combine :lower-index lower-index :index-types index-types
-     :axes [[row rows] [column width]]}))
+     :axes (conj (mapv (juxt :name :bound) segments) [column width])}))
 
 (defn dense-read-requirements
   "Derive minimum flat capacities from the actual typed element loads, or decline.
