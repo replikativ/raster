@@ -977,33 +977,21 @@
 
 (deftm flat-embed-d-space-emb
   "Backward for space-emb: d_se[spaces[v]*d+j] += dy[v*d+j]"
-  [dy :- (Array double) spaces :- (Array long)
-   n-vars :- Long emb-dim :- Long n-spaces :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-spaces emb-dim))]
-    (dotimes [v n-vars]
-      (let [sp (aget spaces v)]
-        (dotimes [d emb-dim]
-          (let [se-idx (+ (* sp (int emb-dim)) d)]
-            (aset out se-idx
-                  (+ (aget out se-idx)
-                     (aget dy (+ (* v (int emb-dim)) d))))))))
-    out))
+  (All [T] [dy :- (Array T) spaces :- (Array long)
+            n-vars :- Long emb-dim :- Long n-spaces :- Long]
+       :- (Array T)
+       (let [out (alloc-like dy (* n-spaces emb-dim))]
+         (par/scatter! out dy spaces n-vars emb-dim)
+         out)))
 
 (deftm flat-embed-d-state-emb
   "Backward for state-emb: d_ste[states[v]*d+j] += dy[v*d+j]"
-  [dy :- (Array double) states :- (Array long)
-   n-vars :- Long emb-dim :- Long n-states :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-states emb-dim))]
-    (dotimes [v n-vars]
-      (let [st (aget states v)]
-        (dotimes [d emb-dim]
-          (let [ste-idx (+ (* st (int emb-dim)) d)]
-            (aset out ste-idx
-                  (+ (aget out ste-idx)
-                     (aget dy (+ (* v (int emb-dim)) d))))))))
-    out))
+  (All [T] [dy :- (Array T) states :- (Array long)
+            n-vars :- Long emb-dim :- Long n-states :- Long]
+       :- (Array T)
+       (let [out (alloc-like dy (* n-states emb-dim))]
+         (par/scatter! out dy states n-vars emb-dim)
+         out)))
 
 ;; ================================================================
 ;; dot-rows: out[v] = h[v,:] · W + bias[0]

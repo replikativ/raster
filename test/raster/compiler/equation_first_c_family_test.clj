@@ -752,6 +752,19 @@
                   (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
+(deftest public-embedding-table-adjoints-use-portable-additive-scatters
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]
+          kernel [#'array-ops/flat-embed-d-space-emb
+                  #'array-ops/flat-embed-d-state-emb]]
+    (let [compilation (equation-first/compile kernel {:target target :dtype :float})]
+      (is (seq (:kernels compilation)))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
+                  (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
 (deftest product-reduction-composes-with-an-ordered-epilogue
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
