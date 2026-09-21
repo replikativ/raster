@@ -170,6 +170,77 @@
     (finally
       (compiled/clear-compilation-cache!))))
 
+(deftest structural-compilation-cache-converges-after-nested-specialization
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [calls (atom 0)
+          first? (atom true)
+          first-report (atom nil)
+          key-for-revision (fn [revision] [:nested-specialization revision])
+          compile! (fn []
+                     (swap! calls inc)
+                     (when (compare-and-set! first? true false)
+                       (dispatch/bump-compiler-definition-revision!))
+                     :template)
+          first-value
+          (binding [compiled/*compilation-template-observer* #(reset! first-report %)]
+            (#'compiled/stable-compilation-template
+             key-for-revision :resident-descriptor compile!))
+          second-report (atom nil)
+          second-value
+          (binding [compiled/*compilation-template-observer* #(reset! second-report %)]
+            (#'compiled/stable-compilation-template
+             key-for-revision :resident-descriptor compile!))]
+      (is (= [:template :template] [first-value second-value]))
+      (is (= 2 @calls)
+          "the first request recompiles under the installed specialization epoch; the next hits")
+      (is (= 2 (:stabilization-attempts @first-report)))
+      (is (false? (:cache-hit? @first-report)))
+      (is (= 1 (:stabilization-attempts @second-report)))
+      (is (true? (:cache-hit? @second-report)))
+      (is (= {:hits 1 :misses 2 :compilations 2 :failures 0
+              :entries 1 :entries-by-compiler {:resident-descriptor 1}}
+             (dissoc (compiled/compilation-cache-stats) :compile-nanos))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
+(deftest structural-compilation-cache-fails-loud-on-an-unstable-epoch
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [calls (atom 0)
+          error (try
+                  (#'compiled/stable-compilation-template
+                   (fn [revision] [:unstable revision])
+                   :resident-descriptor
+                   (fn []
+                     (swap! calls inc)
+                     (dispatch/bump-compiler-definition-revision!)
+                     :never-stable))
+                  (catch clojure.lang.ExceptionInfo error error))]
+      (is (= :compilation-template-unstable (:reason (ex-data error))))
+      (is (= 8 @calls))
+      (is (zero? (:entries (compiled/compilation-cache-stats)))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
+(deftest stable-template-preserves-failure-observation-and-does-not-cache-errors
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [report (atom nil)
+          error (binding [compiled/*compilation-template-observer* #(reset! report %)]
+                  (try
+                    (#'compiled/stable-compilation-template
+                     (fn [revision] [:failure revision])
+                     :resident-descriptor
+                     #(throw (ex-info "compile failed" {:reason :expected-failure})))
+                    (catch clojure.lang.ExceptionInfo error error)))]
+      (is (= :expected-failure (:reason (ex-data error))))
+      (is (false? (:success? @report)))
+      (is (zero? (:entries (compiled/compilation-cache-stats))))
+      (is (= 1 (:failures (compiled/compilation-cache-stats)))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
 (deftest compiler-visible-redefinition-invalidates-structural-templates
   (compiled/clear-compilation-cache!)
   (try

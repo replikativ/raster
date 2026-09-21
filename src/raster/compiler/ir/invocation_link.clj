@@ -508,4 +508,7 @@
   "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness."
   [plan]
   (let [plan (link/validate! plan)]
-    (verify! (->CertifiedInvocationLink plan (derive-certificate plan)))))
+    ;; Construction and certificate derivation share the same validated immutable plan. External
+    ;; boundaries retain `verify!` for independent re-derivation; repeating it here proves no new
+    ;; fact and made every equation-first preparation pay for the certificate twice.
+    (->CertifiedInvocationLink plan (derive-certificate plan))))

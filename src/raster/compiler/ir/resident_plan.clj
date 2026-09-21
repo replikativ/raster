@@ -343,4 +343,7 @@
                :aliases aliases
                :attributes (assoc attributes :lowered-from :resident-program)})
         lowering (->CertifiedResidentPlan plan (derive-certificate plan))]
-    (verify! lowering)))
+    ;; `plan` and its certificate are constructed together from the same validated inputs. The
+    ;; public `verify!` boundary independently re-derives this witness when it later crosses into
+    ;; composition, a cache, or the runtime; immediately doing the same work here is redundant.
+    lowering))

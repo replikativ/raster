@@ -440,6 +440,11 @@
 (defn compose
   "Compose certified LinkPlans before allocation and return a checkable witness.
 
+   Construction derives and validates the plan and certificate together once. `verify!` remains
+   the independent re-derivation boundary for artifacts received from a cache, wire, or caller;
+   invoking it immediately on this freshly constructed immutable value would repeat the complete
+   composition without adding an independent fact.
+
    `components` is an ordered vector of `{:id component-id :lowering certified-lowering}`.
    `specification` requires ordered `:outputs` and optionally contains:
    - `:connections` — `{:from [producer-id output-value] :to [consumer-id input-value]}`;
@@ -452,4 +457,4 @@
   (let [specification (select-keys request [:connections :shares :outputs :attributes])
         {:keys [plan certificate components specification]}
         (derive-composition id components specification)]
-    (verify! (->CertifiedLinkComposition plan certificate components specification))))
+    (->CertifiedLinkComposition plan certificate components specification)))
