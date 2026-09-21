@@ -481,8 +481,10 @@ misses, semantic specializations and invalidations. Their stable request fingerp
 typed binary digest of pure compiler data: it is independent of map/set order, source locations,
 printing and runtime identity. Hot-reload guards such as Var-root identity and the compiler-definition
 revision remain separate and process-local. A request fingerprint is not yet permission to persist an
-artifact: the transitive resolved-source dependency graph and compiler-build fingerprint must be
-certified first, and unsupported runtime values make persistence fail closed. The remaining
+artifact. Packaged Raster builds now carry a validated build manifest covering the exact Git
+revision, dependency coordinates, Java version and Clojure version; source checkouts and builds with
+unversioned dependencies fail closed. The transitive resolved-source dependency graph must still be
+certified before persistence, and unsupported runtime values also make persistence fail closed. The remaining
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 
