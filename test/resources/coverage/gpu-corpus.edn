@@ -2,9 +2,8 @@
  :dtype :float,
  :summary
  {:total 237,
-  :typed-soac 194,
+  :typed-soac 195,
   :scalar 36,
-  :compatibility 1,
   :host-only 5,
   :typed-structured-control 1},
  :vars
@@ -529,10 +528,9 @@
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.nn/col2im-2d!,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.nn/conv1d,
    :route :typed-soac,
    :typed-validated true,

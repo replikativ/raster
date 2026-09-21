@@ -201,6 +201,39 @@
                (vec (gpu-link/download executable (first (:outputs plan))))))
         (finally (gpu-link/close! executable))))))
 
+(deftest col2im-2d-into-is-one-output-owned-gather-kernel
+  (when-gpu "col2im-2d-output-owned-gather"
+    (let [batch 2, channels 2, height 4, width 5
+          kernel-height 3, kernel-width 2
+          stride-height 2, stride-width 1, pad-height 1, pad-width 0
+          height-out (+ 1 (quot (+ height (* 2 pad-height) (- kernel-height))
+                                stride-height))
+          width-out (+ 1 (quot (+ width (* 2 pad-width) (- kernel-width))
+                               stride-width))
+          columns (float-array
+                   (map #(float (- (mod % 13) 6))
+                        (range (* channels kernel-height kernel-width
+                                  batch height-out width-out))))
+          expected (nn/col2im-2d columns batch channels height width
+                                 kernel-height kernel-width stride-height stride-width
+                                 pad-height pad-width)
+          output (float-array (* batch channels height width))
+          arguments [columns output batch channels height width
+                     kernel-height kernel-width stride-height stride-width
+                     pad-height pad-width]
+          compilation (equation-first/compile #'nn/col2im-2d!
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          executable (gpu-link/instantiate! plan)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation)))
+          "unique output ownership removes the zero-fill/scatter pair")
+      (try
+        (gpu-link/run! executable)
+        (is (= (vec expected)
+               (vec (gpu-link/download executable (first (:outputs plan))))))
+        (finally (gpu-link/close! executable))))))
+
 (deftest heat-2d-counted-stores-execute-through-the-direct-vertical
   (when-gpu "heat-2d-counted-store-execution"
     (doseq [[nx ny] [[2 3] [5 7]]]
