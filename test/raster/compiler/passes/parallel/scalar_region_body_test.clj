@@ -101,10 +101,11 @@
                           ((:cast legacy) {:operations [] :result 'x :type :long} :int 'x)))
                    [:expression :options]))
         "an implicit conversion without a strict owner retains the legacy wrap policy")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                          (lower '(clojure.core/int f) :int {'f :double})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                          (lower '(clojure.core/unchecked-int f) :int {'f :double})))
+    (doseq [form ['(clojure.core/int f) '(clojure.core/unchecked-int f)]]
+      (is (= {:rounding :toward-zero :overflow :saturate}
+             (get-in (last (:operations (lower form :int {'f :double})))
+                     [:expression :options]))
+          "checked and unchecked integer casts share Java's floating narrowing semantics"))
     (let [widened (lower '(clojure.core/long i) :long {'i :int})
           identity-cast (lower '(clojure.core/int i) :int {'i :int})]
       (is (= {:rounding :exact :overflow :exact}
