@@ -2,8 +2,8 @@
  :dtype :float,
  :summary
  {:total 236,
-  :typed-soac 202,
-  :scalar 28,
+  :typed-soac 206,
+  :scalar 24,
   :host-only 5,
   :typed-structured-control 1},
  :vars
@@ -73,19 +73,17 @@
    :declines
    [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.array-ops/flat-embed-d-values,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/flat-embed-dWe,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/flat-embed-dbe,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/flat-embed-op,
    :route :typed-soac,
    :typed-validated true,
@@ -165,8 +163,8 @@
    :declines [],
    :effect-orders {:sequential 1}}
   {:var raster.dl.array-ops/scatter-mul-add-d-coeffs,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/scatter-mul-add-d-src,
    :route :typed-soac,
