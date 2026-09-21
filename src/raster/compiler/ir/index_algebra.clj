@@ -14,7 +14,34 @@
 
    See .internal/design/index_algebra.md for the derivation."
   (:require [clojure.set :as set]
-            [clojure.walk]))
+            [clojure.walk]
+            [raster.compiler.core.op-descriptor :as descriptor]))
+
+(defn canonical-arithmetic
+  "Project walked numeric dispatch into the exact integer-ring vocabulary used by this algebra.
+
+   Typed walking deliberately preserves `.invk` calls for executable dispatch.  Index proofs must
+   instead compare the retained semantic operator.  Only addition, subtraction, multiplication,
+   integral casts, and quotient/remainder are projected; every other operation remains opaque and
+   therefore cannot accidentally strengthen an ownership proof."
+  [expression]
+  (if (seq? expression)
+    (let [operation (descriptor/semantic-op expression)
+          arguments (mapv canonical-arithmetic (descriptor/call-args expression))
+          canonical (cond
+                      (descriptor/addition-op? operation) 'clojure.core/+
+                      (descriptor/subtraction-op? operation) 'clojure.core/-
+                      (descriptor/multiplication-op? operation) 'clojure.core/*
+                      :else nil)
+          algebra-wrapper? (or (descriptor/cast-op? operation)
+                               (contains? '#{quot clojure.core/quot rem clojure.core/rem
+                                             mod clojure.core/mod}
+                                          operation))]
+      (cond
+        canonical (with-meta (list* canonical arguments) (meta expression))
+        algebra-wrapper? (with-meta (list* (first expression) arguments) (meta expression))
+        :else expression))
+    expression))
 
 ;; ---------------------------------------------------------------------------------------------
 ;; Monomials over symbolic extents

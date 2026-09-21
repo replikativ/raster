@@ -154,6 +154,23 @@
     (is (< (rel-err fused ref) 1e-5)
         (str "fused batched-causal-sdpa vs GEMM reference relerr " (rel-err fused ref)))))
 
+(deftest causal-sdpa-typed-contractions-are-resident
+  ;; The compositional single-head spelling deliberately keeps QK and WV as contractions around
+  ;; two effect maps.  Ownership analysis must prove the causal mask and row-softmax writes
+  ;; unique, and matrix scheduling must keep a tensor named K distinct from its K dimension.
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "causal-sdpa-typed-contractions")
+    (let [seq-len 8 hd 16 n (* seq-len hd)
+          Q (rnd n 901) K (rnd n 902) V (rnd n 903)
+          cpu (attn/causal-scaled-dot-product-attn Q K V seq-len hd hd)
+          {:keys [descriptor out]}
+          (run-resident #'attn/causal-scaled-dot-product-attn
+                        [Q K V seq-len hd hd])]
+      (is (= [:executable :map-void :map-void :executable]
+             (mapv :convention (:steps descriptor))))
+      (is (< (rel-err out cpu) 5e-3)
+          (str "typed causal SDPA relerr " (rel-err out cpu))))))
+
 (deftest fused-causal-sdpa-resident
   ;; batched-causal-sdpa forward lowers to resident :map-void kernels ONLY (scores /
   ;; row-softmax / W·V accumulation — no GEMM, no host scalar-let) and matches CPU.
