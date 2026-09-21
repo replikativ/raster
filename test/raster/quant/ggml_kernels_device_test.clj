@@ -60,7 +60,7 @@
 (declare run-program)
 
 (deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
-  (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-product-rows!
+  (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-rows!
                                                  :ze:0 :dtype :float)
         executable (get-in descriptor [:steps 0 :artifact])
         lowering (resident-plan/lower
@@ -92,8 +92,8 @@
         y (float-array (* nrows out))
         wrow (ggml/row-bytes :q6_K in)
         xrow (ggml/row-bytes :q8_K in)]
-    (gk/qdot-q6-K-product-rows! (:q xl) (:d xl) (:q wl) (:d wl) (:sc wl)
-                                y in out nrows)
+    (gk/qdot-q6-K-rows! (:q xl) (:d xl) (:q wl) (:d wl) (:sc wl)
+                        y in out nrows)
     (is (= (mapv (fn [row o]
                    (Float/floatToRawIntBits
                     (float (ggml/vec-dot :q6_K (row-bytes wblocks o wrow)
@@ -113,9 +113,9 @@
         y (float-array (* nrows out))
         wrow (ggml/row-bytes :q4_K in)
         xrow (ggml/row-bytes :q8_K in)]
-    (gk/qdot-q4-K-product-rows! (:q xl) (:d xl) (:bsums xl)
-                                (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
-                                y in out nrows)
+    (gk/qdot-q4-K-rows! (:q xl) (:d xl) (:bsums xl)
+                        (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
+                        y in out nrows)
     (is (= (mapv (fn [row o]
                    (Float/floatToRawIntBits
                     (float (ggml/vec-dot :q4_K (row-bytes wblocks o wrow)
@@ -147,7 +147,7 @@
           arguments [(:q xl) (:d xl) (:q wl) (:d wl) (:sc wl)
                      output
                      (long in) (long out) (long nrows)]
-          compilation (equation-first/compile #'gk/qdot-q6-K-product-rows!
+          compilation (equation-first/compile #'gk/qdot-q6-K-rows!
                                               {:target :ze:0 :dtype :float})
           plan (equation-first/lower compilation arguments)
           output-node (some (fn [[id node]]
@@ -185,7 +185,7 @@
                      (:q wl) (:d wl) (:dmin wl) (:sc wl) (:m wl)
                      output
                      (long in) (long out) (long nrows)]
-          prepared (compiled/lower #'gk/qdot-q4-K-product-rows! arguments
+          prepared (compiled/lower #'gk/qdot-q4-K-rows! arguments
                                    {:compiler :equation-first
                                     :target :ze:0 :dtype :float
                                     :outputs '[y]})
@@ -208,45 +208,32 @@
             xfloats (values (* nrows in) 12 2.0)
             w {:blocks (ggml/quantize wf wfloats in out) :n in :rows out}
             x {:blocks (ggml/quantize af xfloats in nrows) :n in :rows nrows}
-            {:keys [arrays specs bindings]} (buffers wf af w x)
+            {:keys [arrays]} (buffers wf af w x)
             wrow (ggml/row-bytes wf in)
             xrow (ggml/row-bytes af in)
             expected (for [row (range nrows) o (range out)]
                        (Float/floatToRawIntBits
                         (float (ggml/vec-dot wf (row-bytes (:blocks w) o wrow)
-                                             (row-bytes (:blocks x) row xrow) in))))
-            sess (gpu/make-session :ze:0)]
-        (try
-          (let [execution-kernel (if (= wf :q6_K) #'gk/qdot-q6-K-product-rows! kernel)
-                actual-values
-                (if (= wf :q6_K)
-                  (:y (run-program execution-kernel
-                                   (assoc arrays "y" (float-array (* nrows out))
-                                                 'in in 'out out 'nrows nrows)
-                                   [:y]))
-                  (do
-                    (gpu/compile! sess :dot kernel)
-                    (gpu/alloc! sess (assoc specs :y [:float (* nrows out) nil]))
-                    (gpu/prepare! sess :dot (assoc bindings "y" :y) [in out] (* nrows out)
-                                  {:kernel-phase :dot})
-                    (gpu/invoke-bound! sess :dot)
-                    (gpu/sync! sess)
-                    (gpu/download sess :y)))
-                actual (map #(Float/floatToRawIntBits %) actual-values)
-                mismatches (count (remove true? (map = expected actual)))]
-            (testing (str (name wf) " x " (name af))
-              (when (= wf :q4_K)
-                (is (some false? (for [row (range nrows) o (range out)]
-                                   (= (ggml/vec-dot wf (row-bytes (:blocks w) o wrow)
-                                                    (row-bytes (:blocks x) row xrow) in)
-                                      (ggml/vec-dot wf (row-bytes (:blocks w) o wrow)
-                                                    (row-bytes (:blocks x) row xrow) in
-                                                    {:contract? true}))))
-                    "the data tells FMA contraction apart, so equality rules it out"))
-              (is (zero? mismatches)
-                  (str mismatches " of " (* nrows out) " outputs differ; first "
-                       (first (remove (fn [[e a]] (= e a)) (map vector expected actual)))))))
-          (finally (gpu/close-session! sess)))))))
+                                             (row-bytes (:blocks x) row xrow) in))))]
+        (let [actual-values
+              (:y (run-program kernel
+                               (assoc arrays "y" (float-array (* nrows out))
+                                      'in in 'out out 'nrows nrows)
+                               [:y]))
+              actual (map #(Float/floatToRawIntBits %) actual-values)
+              mismatches (count (remove true? (map = expected actual)))]
+          (testing (str (name wf) " x " (name af))
+            (when (= wf :q4_K)
+              (is (some false? (for [row (range nrows) o (range out)]
+                                 (= (ggml/vec-dot wf (row-bytes (:blocks w) o wrow)
+                                                  (row-bytes (:blocks x) row xrow) in)
+                                    (ggml/vec-dot wf (row-bytes (:blocks w) o wrow)
+                                                  (row-bytes (:blocks x) row xrow) in
+                                                  {:contract? true}))))
+                  "the data tells FMA contraction apart, so equality rules it out"))
+            (is (zero? mismatches)
+                (str mismatches " of " (* nrows out) " outputs differ; first "
+                     (first (remove (fn [[e a]] (= e a)) (map vector expected actual)))))))))))
 
 (defn- activation-inputs
   "[label floats nrows width] cases for the activation quantizers."
