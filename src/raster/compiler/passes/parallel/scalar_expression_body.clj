@@ -343,7 +343,13 @@
                                 :reject (scalar-conversion/policy source target :trap)
                                 nil (if conversion-policy
                                       (conversion-policy source target)
-                                      (scalar-conversion/policy source target :wrap)))
+                                      ;; The historical fallback wraps implicit integral
+                                      ;; narrowing only. Floating narrowing is source-cast
+                                      ;; semantics and must not leak into a result/local coercion.
+                                      (if (and (not (dtype/fp-dtype? source))
+                                               (not (dtype/fp-dtype? target)))
+                                        (scalar-conversion/policy source target :wrap)
+                                        (scalar-conversion/policy source target))))
                               (decline! :cast-policy
                                         "scalar cast has no portable rounding and overflow policy"
                                         {:expression expression :source source :target target})))

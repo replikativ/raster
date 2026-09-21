@@ -101,10 +101,11 @@
                           ((:cast legacy) {:operations [] :result 'x :type :long} :int 'x)))
                    [:expression :options]))
         "an implicit conversion without a strict owner retains the legacy wrap policy")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                          (lower '(clojure.core/int f) :int {'f :double})))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conversion policy|overflow policy"
-                          (lower '(clojure.core/unchecked-int f) :int {'f :double})))
+    (doseq [form ['(clojure.core/int f) '(clojure.core/unchecked-int f)]]
+      (is (= {:rounding :toward-zero :overflow :saturate}
+             (get-in (last (:operations (lower form :int {'f :double})))
+                     [:expression :options]))
+          "checked and unchecked integer casts share Java's floating narrowing semantics"))
     (let [widened (lower '(clojure.core/long i) :long {'i :int})
           identity-cast (lower '(clojure.core/int i) :int {'i :int})]
       (is (= {:rounding :exact :overflow :exact}
@@ -275,11 +276,17 @@
     (is (= (set types) (set (keys dtype/dtype-info))))
     (doseq [[row source] (map-indexed vector types)
             [column target] (map-indexed vector types)]
-      (let [policy (get-in expected [row column])]
-        (is (= policy (conversion/policy source target :wrap)) (str source " → " target))
+      (let [policy (get-in expected [row column])
+            explicit-fp-integral (when (and (contains? #{:float :double} source)
+                                             (contains? #{:int :long} target))
+                                    [:toward-zero :saturate])]
+        (is (= (or explicit-fp-integral policy)
+               (conversion/policy source target :wrap))
+            (str source " → " target))
         (is (= (when-not (= wrap policy) policy) (conversion/policy source target))
             (str "default rejecting owner: " source " → " target))
-        (is (= (if (= wrap policy) trap policy) (conversion/policy source target :trap))
+        (is (= (or explicit-fp-integral (if (= wrap policy) trap policy))
+               (conversion/policy source target :trap))
             (str "explicit checked source cast: " source " → " target))))
     (is (= exact (conversion/policy :i32 :f64)))
     (is (= ieee (conversion/policy :f64 :f16)))
@@ -575,6 +582,14 @@
     (is (= :int (:type checked)))
     (is (= 'value (first (get-in (last (:operations checked)) [:expression :arguments])))
         "the typed term preserves its declared-source operand")))
+
+(deftest floating-source-casts-retain-jvm-saturation-semantics
+  (let [lower (:lower (lowerer))]
+    (doseq [[form expected] [['(long value) :long] ['(int value) :int]]]
+      (let [lowered (lower form expected {'value :float})
+            options (get-in (last (:operations lowered)) [:expression :options])]
+        (is (= {:rounding :toward-zero :overflow :saturate} options))
+        (is (= expected (:type lowered)))))))
 
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]
