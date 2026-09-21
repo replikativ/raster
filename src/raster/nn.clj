@@ -129,10 +129,10 @@
 (deftm softmax
   "Numerically stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))."
   (All [T] [x :- (Array T)] :- (Array T)
-       (let [;; Float infinity is also an exact Double identity after widening, while unlike the
-             ;; reader's Double `##-Inf` it remains a legal checked primitive cast in a Float
-             ;; specialization.
-             max-x (reduce! [m (float Float/NEGATIVE_INFINITY)] [x] (n/max m x))
+       (let [;; The reduction walker specializes this literal to the input element type.  Raster's
+             ;; canonical IEEE conversion accepts the resulting `(float ##-Inf)` for Float while
+             ;; retaining Double identity in the Double specialization.
+             max-x (reduce! [m ##-Inf] [x] (n/max m x))
              out (broadcast [x] (m/exp (- x max-x)))
              sum-exp (reduce! [s 0.0] [out] (+ s out))
              inv-sum (/ 1.0 sum-exp)]

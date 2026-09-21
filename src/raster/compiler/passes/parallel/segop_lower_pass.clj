@@ -196,14 +196,15 @@
    left right))
 
 (defn- ensure-use-compatible!
-  [id definition inferred-use]
+  [id definition inferred-use context]
   (let [facets [:kind :dtype :representation]
         defined (select-keys definition facets)
         inferred (select-keys inferred-use facets)]
     (when-not (= defined inferred)
       (throw (ex-info "parallel equation use is incompatible with its defining value"
-                      {:reason :parallel-program-use-type-conflict
-                       :id id :definition defined :use inferred}))))
+                      (merge {:reason :parallel-program-use-type-conflict
+                              :id id :definition defined :use inferred}
+                             context)))))
   definition)
 
 (defn- declare-scheduled-temporaries
@@ -273,7 +274,11 @@
                            ;; contract. Only infer contracts for external program inputs here.
                            (if-let [definition (get values value-id)]
                              (do (ensure-use-compatible! value-id definition
-                                                         (get operand-values source-id))
+                                                         (get operand-values source-id)
+                                                         {:source-id source-id
+                                                          :equation-id (:id equation)
+                                                          :equation-site (:site equation)
+                                                          :equation-source (:source equation)})
                                  values)
                              (merge-values values {value-id (get operand-values source-id)})))
                          (:values state)
