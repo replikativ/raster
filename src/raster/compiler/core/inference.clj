@@ -843,6 +843,8 @@
                 (contains? '#{floats doubles ints longs bytes} at)))
          (map vector (:tags entry) arg-tags))))
 
+(declare var-ref-tag)
+
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
@@ -859,6 +861,12 @@
    (when-let [table (get-dispatch-table fn-sym)]
      (let [arg-tags (mapv (fn [form extra]
                             (or (when (symbol? form) (type-env-tag type-env form))
+                                ;; A qualified primitive constant Var is typed by its declaration,
+                                ;; just like the same reference in infer-arg-tag.  This keeps
+                                ;; overload resolution independent of whether constant folding has
+                                ;; already replaced the reference with its value.
+                                (when (and (symbol? form) (namespace form))
+                                  (var-ref-tag form))
                                 (literal-tag form)
                                 (hint-tag form)
                                 ;; Cast expressions: (double x), (long x), etc.

@@ -1,7 +1,7 @@
 {:target-device :ocl:0,
  :dtype :float,
  :summary
- {:total 238, :typed-soac 188, :scalar 38, :compatibility 6, :error 6},
+ {:total 238, :typed-soac 189, :scalar 39, :compatibility 6, :error 4},
  :vars
  [{:var raster.dl.array-ops/argmax-rows!,
    :route :typed-soac,
@@ -439,9 +439,9 @@
    :typed-validated false,
    :declines []}
   {:var raster.dl.diffusion/cosine-beta-schedule,
-   :route :error,
-   :error
-   "fixpoint edge typedness violation on GPU target: 0 non-exempt untagged binding(s) {}; 6 undevirtualized dispatch call(s)"}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.diffusion/ddpm-sample-step,
    :route :typed-soac,
    :typed-validated true,
@@ -926,9 +926,9 @@
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.optim/cosine-lr,
-   :route :error,
-   :error
-   "fixpoint edge typedness violation on GPU target: 0 non-exempt untagged binding(s) {}; 2 undevirtualized dispatch call(s)"}
+   :route :scalar,
+   :typed-validated false,
+   :declines []}
   {:var raster.dl.optim/ema-update!,
    :route :typed-soac,
    :typed-validated true,

@@ -252,7 +252,7 @@
 ;; clamp + polynomial in u², only +/*//min/max → a pure SIMD lane chain). A libm
 ;; m/tanh call stays scalar inside the broadcast (dtanh_stub) and blocks the map.
 (deftm gelu (All [T] [x :- (Array T) n :- Long] :- (Array T)
-                 (let [c (n/sqrt (/ 2.0 n/pi))]
+                 (let [c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                    (broadcast [x]
                               (let [u  (n/min 9.0 (n/max -9.0 (* c (+ x (* 0.044715 x x x)))))
                                     u2 (* u u)
@@ -274,7 +274,7 @@
 (deftm gelu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long]
                           :- (Array T)
                           (let [dx (alloc-like dy n)
-                                c (n/sqrt (/ 2.0 n/pi))]
+                                c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                             (dotimes [i n]
                               (let [xi (aget x i)
                                     inner (* c (+ xi (* 0.044715 xi xi xi)))
@@ -295,7 +295,7 @@
 ;; this one directly (o4c double-backward law).
 (deftm gelu-second-deriv (All [T] [x :- (Array T) n :- Long] :- (Array T)
                               (let [dd (alloc-like x n)
-                                    c (n/sqrt (/ 2.0 n/pi))]
+                                    c (n/oftype x (n/sqrt (/ 2.0 n/pi)))]
                                 (dotimes [i n]
                                   (let [xi (aget x i)
                                         u (* c (+ xi (* 0.044715 xi xi xi)))
