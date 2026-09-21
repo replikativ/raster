@@ -61,6 +61,12 @@
       (is (approx= 25.0 (aget out 4)))
       (is (approx= 36.0 (aget out 5))))))
 
+(deftest broadcast-add-dt-is-one-reduction-per-feature
+  (let [dy (double-array [1.0 2.0 3.0
+                          4.0 5.0 6.0])]
+    (is (= [5.0 7.0 9.0]
+           (vec (ops/broadcast-add-dt dy 2 3))))))
+
 ;; ================================================================
 ;; Generic primitive forward tests
 ;; ================================================================
