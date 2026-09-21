@@ -42,11 +42,13 @@
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-opencl :as parallel-program-opencl]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as parallel-program-c-family]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
@@ -915,6 +917,47 @@
         (catch Exception e
           (println "Warning: could not register GPU kernel dispatches:" (.getMessage e)))))))
 
+(declare gpu-resident-emission-passes)
+
+(defn- resident-product-program
+  "Try the equation-first emitter for a resident TypedSOAC product/consumer region.
+
+   Absence is not a decline of the semantic program: it means the ordinary resident suffix still
+   owns this compilation.  Once the generic region proof admits at least one fused pair, however,
+  its emitted graph is authoritative and is projected through the existing executable marker ABI."
+  [semantic opts]
+  (let [public-parameters (set (or (:public-parameters opts) (:active-params opts)))
+        representable (set/union (set (keys (:values semantic)))
+                                 (set (keys (:array-types opts)))
+                                 (set (keys (:scalar-types opts))))]
+    ;; A value-type public parameter may already have been scalar-replaced into physical leaves.
+    ;; Until typed invocation represents that composite boundary directly, this optional route
+    ;; must abstain before promotion; the unchanged resident suffix owns the SoA program.
+    (when (and (= :typed-soac (:dialect semantic))
+               (set/subset? public-parameters representable))
+      (let [typed (structured-route/promote-soac-program semantic opts)
+          scheduled (structured-route/schedule-program typed opts)
+          plans (parallel-program-c-family/product-consumer-plans scheduled)]
+      (when (seq plans)
+        (let [target-device (:target-device opts)
+              target-dialect (if (= :ocl (device/device-type target-device))
+                               :opencl-portable :opencl-intel)
+              emission (parallel-program-c-family/emit-program
+                        scheduled (assoc opts :target-dialect target-dialect))]
+          ;; The descriptor extractor's single `:result-sym` cannot yet represent a retained
+          ;; multi-result functional boundary. Effect programs with explicit result storage—the
+          ;; projection and quantizer use case—have no such ambiguity.
+          (when (empty? (get-in emission [:program :outputs]))
+            (let [projection (resident-projection/project (:program emission) target-device)]
+              (register-gpu-kernels! (:kernels projection) target-device)
+              (register-gpu-dispatches! (:dispatches projection) target-device)
+              (assoc projection
+                     :stats (:stats emission)
+                     :semantic semantic
+                     :scheduled scheduled
+                     :emitted-program (:program emission)
+                     :backend :opencl)))))))))
+
 (defn- pass-materialize
   "Materialize pure par/map forms into alloc + par/map! for backend consumption.
   Pure par/map forms are value-producing with no output buffer. This pass
@@ -1204,10 +1247,13 @@
    known. Equation-first and resident compilation share this exact semantic suffix."
   [:soac-fuse :materialize])
 
+(def gpu-resident-emission-passes
+  "Scheduling, target emission, and compatibility cleanup after the semantic boundary."
+  [:compound-detect :segop-lower :backend :resolve-alength :mem-merge])
+
 (def gpu-resident-post-soa-passes
   "Typed semantic construction, scheduling and emission after GPU scalar replacement."
-  (into gpu-semantic-post-soa-passes
-        [:compound-detect :segop-lower :backend :resolve-alength :mem-merge]))
+  (into gpu-semantic-post-soa-passes gpu-resident-emission-passes))
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline
@@ -1906,16 +1952,40 @@
                     source-ns (assoc :source-ns source-ns)
                     gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
                                            :array-types (:array-types gpu-param-types)))
-        post-diagnostic (when compiler-report?
-                          (run-passes-diagnostic form-soa gpu-resident-post-soa-passes
-                                                 post-opts :write-read-fused))
-        form (if post-diagnostic
-               (:form post-diagnostic)
-               (run-passes form-soa gpu-resident-post-soa-passes post-opts :write-read-fused))
+        ;; A certified product reduction followed by its ordered consumer has a stronger
+        ;; equation-first graph schedule than the compatibility backend's independent kernels.
+        ;; Project that graph onto the resident executable marker before entering the legacy
+        ;; extraction suffix.  All non-admitted programs continue through the unchanged path.
+        semantic-diagnostic (when compiler-report?
+                              (run-passes-diagnostic form-soa gpu-semantic-post-soa-passes
+                                                     post-opts :write-read-fused))
+        semantic (if semantic-diagnostic
+                   (:form semantic-diagnostic)
+                   (run-passes form-soa gpu-semantic-post-soa-passes
+                               post-opts :write-read-fused))
+        resident-product (resident-product-program semantic post-opts)
+        emission-diagnostic (when (and compiler-report? (nil? resident-product))
+                              (run-passes-diagnostic semantic gpu-resident-emission-passes
+                                                     post-opts :materialized))
+        form (cond
+               resident-product (:form resident-product)
+               emission-diagnostic (:form emission-diagnostic)
+               :else (run-passes semantic gpu-resident-emission-passes
+                                 post-opts :materialized))
         compiler-diagnostic
         (when compiler-report?
-          {:stages (merge (:stages pre-diagnostic) (:stages post-diagnostic))
-           :stats (merge (:stats pre-diagnostic) (:stats post-diagnostic))})
+          (if resident-product
+            {:stages (merge (:stages pre-diagnostic) (:stages semantic-diagnostic)
+                            {:materialized (:semantic resident-product)
+                             :segop-lowered (:scheduled resident-product)
+                             :emitted-program (:emitted-program resident-product)
+                             :kernels (:kernels resident-product)})
+             :stats (merge (:stats pre-diagnostic) (:stats semantic-diagnostic)
+                           {:backend-applied (:stats resident-product)})}
+            {:stages (merge (:stages pre-diagnostic) (:stages semantic-diagnostic)
+                            (:stages emission-diagnostic))
+             :stats (merge (:stats pre-diagnostic) (:stats semantic-diagnostic)
+                           (:stats emission-diagnostic))}))
         ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
         ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes
         ;; every parameter gradient look live. By here the vector is gone and only the

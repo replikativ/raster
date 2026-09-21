@@ -526,10 +526,15 @@
         (doseq [buffer (concat (:inputs selected) (:outputs selected))
                 :let [node-id (get node-by-executable-buffer (:id buffer))
                       node (get nodes node-id)
-                      expected (when (some? (:elements buffer))
-                                 (kgcall/resolve-integer scalar-values (:elements buffer)))
                       capacity (quot (get-in node [:view :byte-length])
-                                     (dtype/bytes-of (get-in node [:view :dtype])))]
+                                     (dtype/bytes-of (get-in node [:view :dtype])))
+                      expected (when (some? (:elements buffer))
+                                 ;; A buffer's own `(extent x)` is supplied by its bound view,
+                                 ;; not by a redundant public scalar ABI slot.
+                                 (if (= (list 'extent (:id buffer)) (:elements buffer))
+                                   capacity
+                                   (kgcall/resolve-integer scalar-values
+                                                           (:elements buffer))))]
                 :when expected]
           (when (> (long expected) (long capacity))
             (throw (ex-info "selected kernel graph extent exceeds its linked node view"
