@@ -38,7 +38,11 @@
         ;; softmax over seq_k dimension for each query
                                           _ (dotimes [i seq-q]
                                               (let [offset (* i (int seq-k))
-                                                    max-s (loop [j 0 m (n/neg-inf-val (aget scores 0))]
+                                                    ;; A typed literal is a value fact. Reading
+                                                    ;; scores[0] merely to choose float/double
+                                                    ;; would introduce a cross-row memory
+                                                    ;; dependency while other rows normalize it.
+                                                    max-s (loop [j 0 m (n/oftype scores -1.0e38)]
                                                             (if (< j seq-k)
                                                               (recur (inc j) (n/max m (aget scores (+ offset j))))
                                                               m))

@@ -171,6 +171,24 @@
       (is (< (rel-err out cpu) 5e-3)
           (str "typed causal SDPA relerr " (rel-err out cpu))))))
 
+(deftest noncausal-sdpa-typed-contractions-are-resident
+  ;; Rectangular attention exercises distinct query/key sequence dimensions.  Its softmax seed is
+  ;; a typed constant, not a read of scores[0] that would race other rows' normalization writes.
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "noncausal-sdpa-typed-contractions")
+    (let [seq-q 8 seq-k 12 dk 16 dv 16
+          Q (rnd (* seq-q dk) 911)
+          K (rnd (* seq-k dk) 912)
+          V (rnd (* seq-k dv) 913)
+          cpu (attn/scaled-dot-product-attn Q K V seq-q seq-k dk dv)
+          {:keys [descriptor out]}
+          (run-resident #'attn/scaled-dot-product-attn
+                        [Q K V seq-q seq-k dk dv])]
+      (is (= [:executable :map :map-void :executable]
+             (mapv :convention (:steps descriptor))))
+      (is (< (rel-err out cpu) 5e-3)
+          (str "typed noncausal SDPA relerr " (rel-err out cpu))))))
+
 (deftest fused-causal-sdpa-resident
   ;; batched-causal-sdpa forward lowers to resident :map-void kernels ONLY (scores /
   ;; row-softmax / W·V accumulation — no GEMM, no host scalar-let) and matches CPU.
