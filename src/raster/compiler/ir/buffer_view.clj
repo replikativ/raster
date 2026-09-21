@@ -145,6 +145,32 @@
          (< (:byte-offset a) (byte-end b))
          (< (:byte-offset b) (byte-end a)))))
 
+(defn overlapping-id-pairs
+  "Return every unordered pair of entry identities whose BufferViews overlap.
+
+   `entries` is a sequence of `[id view]`. Views are validated once, partitioned by their
+   device-scoped allocation identity, and compared only inside that partition. This preserves
+   the exact `overlaps?` relation without making alias discovery quadratic in the number of
+   unrelated allocations in a whole program."
+  [entries]
+  (let [entries (mapv (fn [[id view]] [id (validate-view! view)]) entries)
+        by-allocation (group-by (fn [[_ view]] (allocation-key (:allocation view))) entries)]
+    (vec
+     (mapcat
+      (fn [[_ allocation-entries]]
+        (let [allocation-entries (vec allocation-entries)
+              n (count allocation-entries)]
+          (for [left-index (range n)
+                right-index (range (inc left-index) n)
+                :let [[left-id left] (nth allocation-entries left-index)
+                      [right-id right] (nth allocation-entries right-index)]
+                :when (and (pos? (:byte-length left))
+                           (pos? (:byte-length right))
+                           (< (:byte-offset left) (+' (:byte-offset right) (:byte-length right)))
+                           (< (:byte-offset right) (+' (:byte-offset left) (:byte-length left))))]
+            [left-id right-id])))
+      by-allocation))))
+
 (defn disjoint? [a b] (not (overlaps? a b)))
 
 (defn same-range?
