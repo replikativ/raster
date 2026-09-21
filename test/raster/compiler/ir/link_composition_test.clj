@@ -153,6 +153,23 @@
     (is (= [(get (:node-mapping certificate) [:second [:second 'y]])]
            (:outputs plan)))))
 
+(deftest construction-derives-once-and-explicit-verification-rederives
+  (let [derive-var (ns-resolve 'raster.compiler.ir.link-composition
+                               'derive-composition)
+        derive @derive-var
+        calls (atom 0)]
+    (with-redefs-fn
+      {derive-var (fn [& arguments]
+                    (swap! calls inc)
+                    (apply derive arguments))}
+      (fn []
+        (let [lowering (composed 8)]
+          (is (= 1 @calls)
+              "trusted construction must not immediately repeat the complete derivation")
+          (is (identical? lowering (composition/verify! lowering)))
+          (is (= 2 @calls)
+              "the public verification boundary independently re-derives the witness"))))))
+
 (deftest composite-values-compose-atomically-before-allocation
   (let [n 16
         producer (resident/lower {:id :split :target :ze:0
