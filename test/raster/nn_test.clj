@@ -70,3 +70,10 @@
     (let [p (double-array [0.1 0.7 0.2])
           t (double-array [0 1 0])]
       (is (approx= (- (Math/log 0.7)) (nn/cross-entropy p t))))))
+
+(deftest softmax-cross-entropy-doubles-test
+  (let [logits (double-array [1.0 2.0 3.0])
+        target (double-array [0.0 1.0 0.0])
+        [loss probabilities] (nn/softmax-cross-entropy logits target)]
+    (is (approx= (- (Math/log (aget ^doubles probabilities 1))) loss))
+    (is (approx= 1.0 (reduce + probabilities)))))

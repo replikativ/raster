@@ -327,6 +327,26 @@
                 (:kernels compilation))
           "the max tree preserves Math/Raster NaN and signed-zero semantics"))))
 
+(deftest public-loss-composition-keeps-device-results-resident
+  (doseq [target [cuda-target hip-target]
+          [operation arguments expected-kernels expected-outputs]
+          [[#'nn/cross-entropy
+            [(float-array [0.1 0.7 0.2]) (float-array [0.0 1.0 0.0])] 2 1]
+           [#'nn/softmax-cross-entropy
+            [(float-array [1.0 2.0 3.0]) (float-array [0.0 1.0 0.0])] 8 2]
+           [#'nn/loss-fn
+            [(float-array [0.1 0.2 0.3 0.4 0.5 0.6]) (float-array [0.0 0.0])
+             (float-array [0.1 0.2 0.3 0.4]) (float-array [0.0 0.0])
+             (float-array [1.0 2.0 3.0]) (float-array [0.0 1.0])]
+            9 1]]]
+    (let [compilation (equation-first/compile operation {:target target :dtype :float})
+          linked (equation-first/lower compilation arguments)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= expected-kernels (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= expected-outputs (count (:outputs linked))))
+      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
