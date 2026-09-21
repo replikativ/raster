@@ -1430,7 +1430,7 @@
 ;; Weight initialization utilities
 ;; ================================================================
 
-(deftm he-init [rows :- Long cols :- Long] :- (Array double)
+(deftm ^{:raster.compiler/host-only true} he-init [rows :- Long cols :- Long] :- (Array double)
   (let [scale (Math/sqrt (/ 6.0 cols))
         n (* rows cols)
         data (double-array n)
@@ -1439,7 +1439,7 @@
       (aset data i (* scale (- (* 2.0 (.nextDouble rng)) 1.0))))
     data))
 
-(deftm xavier-init [rows :- Long cols :- Long] :- (Array double)
+(deftm ^{:raster.compiler/host-only true} xavier-init [rows :- Long cols :- Long] :- (Array double)
   (let [scale (Math/sqrt (/ 6.0 (+ rows cols)))
         n (* rows cols)
         data (double-array n)

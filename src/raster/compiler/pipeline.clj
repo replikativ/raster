@@ -21,6 +21,7 @@
   (:require [clojure.string]
             [clojure.pprint :as pp]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.scalar.cse :as cse]
@@ -1847,6 +1848,14 @@
    conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
+  (when (dispatch/host-only? f-var)
+    (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
+                    {:reason :gpu-compiler-host-only
+                     :function (if (var? f-var)
+                                 (symbol (str (ns-name (:ns (meta f-var))))
+                                         (str (:name (meta f-var))))
+                                 f-var)
+                     :device device-id})))
   (when-not (contains? #{:mixed-f16-f32 :f32-scalar} gemm-precision)
     (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
                          " (expected :mixed-f16-f32 or :f32-scalar)")
@@ -1859,6 +1868,14 @@
                            nil device-id schedule {:precision gemm-precision})
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
+        _ (when (dispatch/host-only? resolved-var)
+            (throw (ex-info "GPU specialization resolved to an explicitly host-only deftm method"
+                            {:reason :gpu-compiler-host-only
+                             :function (if (var? resolved-var)
+                                         (symbol (str (ns-name (:ns (meta resolved-var))))
+                                                 (str (:name (meta resolved-var))))
+                                         resolved-var)
+                             :device device-id :dtype dtype})))
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
         active-params (clean-params params)

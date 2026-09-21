@@ -27,7 +27,9 @@
                                                           (* -2.0 (aget u i))
                                                           (aget u (+ i 1))))))))
 
-(deftm solve-fixed-step
+;; This higher-order driver owns a JVM callback and mutable solver cache. Its numerical RHS kernels
+;; may target devices, but the orchestration loop itself is deliberately not a device kernel.
+(deftm ^{:raster.compiler/host-only true} solve-fixed-step
   "Simple fixed-step ODE solver loop. Returns {:u final-state :iterations N}.
   f: (fn [du u t]) writes into du in-place."
   [f :- (Fn [(Array double) (Array double) Double] Double), u0 :- (Array double), t0 :- Double, tf :- Double, dt :- Double, cache]

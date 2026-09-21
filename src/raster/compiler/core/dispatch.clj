@@ -726,16 +726,11 @@
         (println (str "WARNING: TC annotation failed for " simple-name ": " (.getMessage e)))))))
 
 ;; ================================================================
-;; ^:no-inline opacity — the SINGLE source of truth
+;; Compiler-facing deftm metadata — one source of truth across generic and mangled vars
 ;; ================================================================
 
-(defn no-inline?
-  "True if a deftm var (or the symbol naming it) is ^:no-inline — directly, or via its
-   `_m_` dispatch parent (devirtualized impl/method names carry the mangle, e.g.
-   `foo_m_double-impl` → parent `foo`). The one predicate every pass consults for inline
-   opacity: the scalar inliner and the JVM bytecode backend call THIS rather than each
-   re-parsing the `_m_` convention. Accepts a Var or a (qualified) symbol."
-  [v-or-sym]
+(defn- deftm-metadata-flag?
+  [v-or-sym flag]
   (let [[the-ns base-name direct-var]
         (cond
           (var? v-or-sym)
@@ -745,11 +740,27 @@
            (try (resolve v-or-sym) (catch Exception _ nil))]
           :else [nil nil nil])]
     (boolean
-     (or (some-> direct-var meta :no-inline)
+     (or (some-> direct-var meta flag)
          (when (and the-ns base-name)
            (when-let [idx (str/index-of base-name "_m_")]
              (when-let [parent (ns-resolve the-ns (symbol (subs base-name 0 idx)))]
-               (:no-inline (meta parent)))))))))
+               (get (meta parent) flag))))))))
+
+(defn no-inline?
+  "True if a deftm var (or the symbol naming it) is ^:no-inline — directly, or via its
+   `_m_` dispatch parent (devirtualized impl/method names carry the mangle, e.g.
+   `foo_m_double-impl` → parent `foo`). The one predicate every pass consults for inline
+   opacity: the scalar inliner and the JVM bytecode backend call THIS rather than each
+   re-parsing the `_m_` convention. Accepts a Var or a (qualified) symbol."
+  [v-or-sym]
+  (deftm-metadata-flag? v-or-sym :no-inline))
+
+(defn host-only?
+  "True when a deftm explicitly declares that its semantics require host values or effects.
+   The contract follows mangled specializations exactly like ^:no-inline; GPU compiler entry
+   points reject it before walking or target emission."
+  [v-or-sym]
+  (deftm-metadata-flag? v-or-sym :raster.compiler/host-only))
 
 ;; ================================================================
 ;; register-method!
@@ -797,7 +808,12 @@
            ;; Boxed invoke is the correct slow path; compiled code uses .invk.
            arglists (vec (for [[_arity methods] @table-atom
                                {:keys [tags]} methods]
-                           (mapv #(symbol (str "arg" %)) (range (count tags)))))]
+                           (mapv #(symbol (str "arg" %)) (range (count tags)))))
+           methods (mapcat val @table-atom)
+           all-host-only? (and (seq methods)
+                               (every? #(true? (get-in % [:warning-meta
+                                                          :raster.compiler/host-only]))
+                                       methods))]
        (alter-meta! v assoc
                     :raster.core/generic-function true
                     :raster.core/dispatch-table table-atom
@@ -807,6 +823,11 @@
                     ;; names simple-name = (symbol (name fn-name)) strips the meta — so
                     ;; without this the flag would silently drop and the op be inlinable.
                     :no-inline (:no-inline (meta fn-name))
+                    ;; Host orchestration (JVM RNG objects, higher-order solver callbacks, mutable
+                    ;; caches) is an explicit source capability, not failed GPU coverage. A
+                    ;; generic is host-only only when every registered specialization is; the
+                    ;; mangled method var retains its own capability independently.
+                    :raster.compiler/host-only all-host-only?
                     :arglists (seq arglists))
        (clear-specialization-cache! k)
        (emit-tc-ann! target-ns-obj simple-name table-atom)

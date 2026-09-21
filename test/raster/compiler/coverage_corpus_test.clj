@@ -9,7 +9,10 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.coverage :as coverage]
             [raster.dl.attention :as attention]
+            [raster.dl.nn :as dl-nn]
             [raster.compiler.pipeline :as pipeline]
+            [raster.nn :as nn]
+            [raster.ode.pde :as pde]
             [raster.gpu.device-probe :as device-probe]))
 
 (deftest corpus-does-not-leave-the-typed-route
@@ -57,6 +60,23 @@
                  #'attention/scaled-dot-product-attn :float))
       "an overloaded parametric deftm still uses the requested corpus specialization"))
 
+(deftest explicit-host-orchestration-is-not-probed-as-device-coverage
+  (with-redefs [pipeline/show-pipeline
+                (fn [& _] (throw (AssertionError. "host-only source reached GPU compilation")))]
+    (doseq [v [#'nn/xavier-init! #'nn/kaiming-init!
+               #'dl-nn/xavier-init #'dl-nn/he-init
+               #'pde/solve-fixed-step]]
+      (is (= {:route :host-only :host-contract :explicit}
+             (select-keys (coverage/report-var v {:target-device :ocl:0})
+                          [:route :host-contract]))))))
+
+(deftest gpu-front-door-rejects-explicit-host-orchestration
+  (is (= :gpu-compiler-host-only
+         (:reason (ex-data (try
+                             (pipeline/compile-gpu-program
+                              #'pde/solve-fixed-step :ze:debug :dtype :double)
+                             (catch clojure.lang.ExceptionInfo error error)))))))
+
 (deftest unique-scatter-retains-independent-effect-ratchet-evidence
   (let [algorithm (list 'soac-program {}
                         [(list '= 0 ['result]
@@ -82,6 +102,14 @@
                     (report {:sequential 1})))))
         "an established independent effect remains a protected performance fact")))
 
+(deftest host-only-is-honest-without-erasing-established-device-coverage
+  (let [host-row {:var 'orchestrator :route :host-only :host-contract :explicit}
+        typed-row {:var 'orchestrator :route :typed-soac :typed-validated true}]
+    (is (empty? (coverage/ratchet-violations {:vars [host-row]} {:vars [host-row]})))
+    (is (= :route-downgraded
+           (:violation (first (coverage/ratchet-violations
+                               {:vars [typed-row]} {:vars [host-row]})))))))
+
 (deftest emitted-artifact-summary-does-not-change-the-portable-ratchet
   (let [rows [{:var 'a :route :typed-soac :typed-validated true :declines []
                :emission-declines 0 :emission {:routes {:kernel-body 2} :declines []}}
@@ -102,6 +130,7 @@
 
 (deftest residual-rows-name-only-compatibility-and-errors
   (let [rows [{:var 'typed :route :typed-soac}
+              {:var 'host :route :host-only}
               {:var 'compatible :route :compatibility :declines [{:reason :legacy}]}
               {:var 'scalar :route :scalar}
               {:var 'broken :route :error :error :unsupported}]]
