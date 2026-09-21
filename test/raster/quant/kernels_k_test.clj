@@ -3,12 +3,15 @@
    dequant-matmul reference — proving the registry's formats reach a working C kernel via
    the SAME composable path the legacy Q4_0 uses (and that the GPU/OpenCL path will reuse).
    Single-call correctness; no spin-pool, no Valhalla."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing]]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.report :as report]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as pack]
             [raster.compiler.backend.cpu.quant :as q]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.runtime.hardware :as runtime-hardware]))
 
 (defn- clang-available? []
   (try
@@ -243,16 +246,47 @@
         xs (float-array (* nrows (quot in 256)))
         bsums (int-array (* nrows (quot in 32)))
         submax (float-array (* nrows (quot in 32)))
-        actual (float-array (* nrows out))]
+        actual (float-array (* nrows out))
+        product-actual (float-array (* nrows out))]
     (qk/quant-act-q8k-rows-gpu! x xp xs bsums submax in nrows)
     (qk/qmatmul-q4k-dp4a-rows! xp xs bsums wp da db aq bq actual in out nrows)
+    (qk/qmatmul-q4k-product-rows! xp xs bsums wp da db aq bq product-actual in out nrows)
     (dotimes [row nrows]
       (let [{:keys [xq xs bsums]} (q/quantize-act-q8k (float-row x row in) in q/q4-K)
             expected (float-array out)]
         (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq expected in out 0 out)
         (dotimes [o out]
+          (is (= (Float/floatToRawIntBits (aget actual (+ (* row out) o)))
+                 (Float/floatToRawIntBits (aget product-actual (+ (* row out) o))))
+              (str "product Q4_K preserves compatibility rounding for row " row
+                   ", output " o))
           (is (< (Math/abs (- (aget actual (+ (* row out) o)) (aget expected o))) 1e-3)
-              (str "Q4_K row " row ", output " o)))))))
+              (str "Q4_K row " row ", output " o))
+          (is (< (Math/abs (- (aget product-actual (+ (* row out) o)) (aget expected o))) 1e-3)
+              (str "product Q4_K row " row ", output " o)))))))
+
+(deftest q4k-product-preserves-the-public-abi-and-fuses-through-the-general-schedule
+  (let [target :ze:q4k-legacy-abi-product-test
+        _ (runtime-hardware/register-target-device!
+           target {:type :ze
+                   :name "Synthetic Intel Q4_K public-ABI product test"
+                   :capabilities {:subgroup-sizes [16 32]
+                                  :simd-width 16
+                                  :max-workgroup-size 256
+                                  :shared-local-memory 65536}})
+        compilation (equation-first/compile #'qk/qmatmul-q4k-product-rows!
+                                            {:target target :dtype :float})
+        artifact (first (:kernels compilation))]
+    (is (= 1 (count (:kernels compilation))))
+    (is (= 1 (get-in compilation [:stats :emission :product-consumer-regions-emitted])))
+    (is (= :subgroup-product-ordered-consumer
+           (get-in artifact [:attributes :kernel-body :schedule :strategy])))
+    (is (empty? (:temporaries artifact)))
+    (is (set/subset? '#{aq bq bsums da db wp xp xs y in nrows out}
+                     (set (:arguments artifact))))
+    (is (not-any? '#{dot-partials aq-partials bq-partials sum-partials}
+                  (:arguments artifact))
+        "compiler-owned partial arrays do not escape the existing public ABI")))
 
 (deftest i8-activation-packing-uses-typed-kernel-body
   (let [compiled (pipeline/show-pipeline #'qk/quant-act-i8-rows-gpu!

@@ -456,6 +456,8 @@
       (:kernels (equation-first/compile
                  #'qk/qmatmul-q4k-dp4a-rows! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'qk/qmatmul-q4k-product-rows! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'qk/quant-act-i8-rows-gpu! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'qk/quant-act-q8k-rows-gpu! {:target device-id :dtype :float}))

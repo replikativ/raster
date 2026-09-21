@@ -11,8 +11,10 @@
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
-            [raster.gpu.descriptor-fixture :as fixture]))
+            [raster.gpu.descriptor-fixture :as fixture]
+            [raster.gpu.value :as value]))
 
 (defn- pack-i8 ^ints [^bytes b]
   (let [w (quot (alength b) 4) out (int-array w)]
@@ -347,6 +349,37 @@
           (gpu/replay! sess)
           (is (< (maxerr yref (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
+
+(deftest q4k-public-abi-product-runs-as-one-cooperative-compiled-kernel
+  (when (gpu-available?)
+    (let [nrows 2 in 256 out 7
+          x (gen (* nrows in) 181)
+          weights (gen (* out in) 182)
+          {:keys [wq da db aq bq]} (q/quantize-weight-q4k weights q/q4-K)
+          wp (bytes->ints-le wq)
+          xp (int-array (* nrows (quot in 4)))
+          xs (float-array (* nrows (quot in 256)))
+          bsums (int-array (* nrows (quot in 32)))
+          submax (float-array (* nrows (quot in 32)))
+          expected (float-array (* nrows out))
+          output (float-array (* nrows out))]
+      (qk/quant-act-q8k-rows-gpu! x xp xs bsums submax in nrows)
+      (qk/qmatmul-q4k-product-rows! xp xs bsums wp da db aq bq expected in out nrows)
+      (let [prepared (compiled/lower
+                      #'qk/qmatmul-q4k-product-rows!
+                      [xp xs bsums wp da db aq bq output
+                       (long in) (long out) (long nrows)]
+                      {:compiler :equation-first :target :ze:0 :dtype :float
+                       :outputs '[y] :constants '[xp xs bsums wp da db aq bq]})
+            live (compiled/instantiate! prepared)]
+        (try
+          (is (= 1 (count (get-in prepared [:descriptor :steps]))))
+          (is (= 1 (get-in prepared [:schedule :stats :emission
+                                     :product-consumer-regions-emitted])))
+          (let [result (live {})]
+            (is (< (maxerr expected (value/->host (:y result))) 1e-5)))
+          (finally
+            (compiled/close! live)))))))
 
 (deftest q4k-dp4a-command-graph
   (when (gpu-available?)

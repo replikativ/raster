@@ -3656,11 +3656,12 @@
                  (patterns/match-ordered-reduce-loop expression))]
         (let [fold-dtype (some-> default-dtype dtype/canon)
               carry-dtype (some-> (retained-local-dtype acc-sym acc-init) dtype/canon)
+              identity (numeric-constant/literal-or-original acc-init)
               step-region (when fold-dtype
                             (canonical-fold-step-region scoped-update-expr fold-dtype))]
           (if (and step-region fold-dtype (or (nil? carry-dtype) (= fold-dtype carry-dtype))
                    (= else-expr acc-sym)
-                   (or (dialect/scalar-literal? acc-init) (symbol? acc-init))
+                   (or (dialect/scalar-literal? identity) (symbol? identity))
                    (not (util/effectful? acc-init))
                    (not (util/effectful? index-init))
                    (not (util/effectful? bound-expr))
@@ -3668,7 +3669,7 @@
             (util/remake
              expression
              'fold
-             (cond-> {:accumulator acc-sym :index index-sym :identity acc-init
+             (cond-> {:accumulator acc-sym :index index-sym :identity identity
                       :lower index-init
                       :dtype fold-dtype :extent bound-expr :association :ordered}
                (= :inclusive bound-mode) (assoc :upper-bound :inclusive))

@@ -380,9 +380,9 @@
 ;; Activation xq packed element-order to int32 (xp). Nibbles 0..15 are positive int8, so the
 ;; signed dp4a equals the unsigned-nibble × signed-act dpbusd of the composable kernel.
 (deftm qmatmul-q4k-dp4a-rows!
-  "Q4_K projection for shared weights and row-major Q8_K activations. Each work-item owns one
-  `(row,output-channel)` pair. Only activation and result leaves carry a row offset; packed
-  weights and their scale/min metadata are shared across rows."
+  "Compatibility Q4_K projection for shared weights and row-major Q8_K activations. Each
+  work-item owns one `(row,output-channel)` pair. The product-scheduled sibling below preserves
+  this ABI while callers migrate to the equation-first compiled artifact."
   [xp :- (Array int), xs :- (Array float), bsums :- (Array int),
    wp :- (Array int), da :- (Array float), db :- (Array float),
    aq :- (Array byte), bq :- (Array byte),
@@ -393,7 +393,7 @@
                        nsb (quot (long in) 256)
                        nsub (quot (long in) 32)
                        xiw (quot (long in) 4)
-                       wiw (quot (long in) 8)           ; weight int32 words per row (in/2 bytes / 4)
+                       wiw (quot (long in) 8)
                        ^long wb (* (long o) wiw)
                        ^long sbb (* (long o) nsb)
                        ^long subb (* (long o) nsub)
@@ -405,8 +405,8 @@
                                (let [dav (ra/aget da (+ sbb sb))
                                      dbv (ra/aget db (+ sbb sb))
                                      dact (ra/aget xs (+ xsb-base sb))
-                                     wsb (+ wb (* sb 32))   ; 32 int words / super-block
-                                     xsb (+ xb (* sb 64))   ; 64 act words / super-block
+                                     wsb (+ wb (* sb 32))
+                                     xsb (+ xb (* sb 64))
                                      ssum (loop [j 0 s (float 0.0)]
                                             (if (< j 8)
                                               (let [sidx (+ (* sb 8) j)
@@ -422,15 +422,130 @@
                                                                  d2 (par/dp4a hi (ra/aget xp (+ xj 4 r)) d1)]
                                                              (recur (inc r) d2))
                                                            d))]
-                                                (recur (inc j) (+ s (* aj (float dp)) (* bj (float (ra/aget bsums (+ bsum-base sidx)))))))
+                                                (recur (inc j)
+                                                       (+ s (* aj (float dp))
+                                                          (* bj (float (ra/aget bsums
+                                                                               (+ bsum-base sidx)))))))
                                               s))]
                                  (recur (inc sb) (+ a (* dact ssum))))
                                a))]
-                   ;; `ro = row*out + o` by the quotient/remainder definitions above. Keep the
-                   ;; canonical 1:1 destination explicit: TypedSOAC can then certify this effectful
-                   ;; map as a SegMap instead of sending quantized arithmetic through the legacy
-                   ;; map-void emitter.
                    (ra/aset y ro acc))))
+
+(deftm qmatmul-q4k-product-rows!
+  "Q4_K projection for shared weights and row-major Q8_K activations.
+
+  The exact integer dot for every `(row,output,super-block,sub-block)` is an ordinary typed
+  product reduction.  Its ordered consumer retains the established Q4_K floating scale/min
+  fold, so a cooperative target schedule may reassociate only the wrapping Int32 additions.
+  Activation/result leaves carry a row offset; packed weights and metadata remain shared."
+  [xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   wp :- (Array int), da :- (Array float), db :- (Array float),
+   aq :- (Array byte), bq :- (Array byte),
+   y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
+  (let [nsb (quot in 256)
+        dot-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
+        aq-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
+        bq-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
+        sum-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))]
+    (par/product-reduce!
+     [dot-partials aq-partials bq-partials sum-partials]
+     [[dot-sum 0 :int] [a-scale 0 :int] [b-scale 0 :int] [block-sum 0 :int]]
+     [[row nrows] [o out] [sb nsb] [j 8] [half 2]]
+     r 4
+     [wi (ra/aget wp (+ (* (+ (* o nsb) sb) 32) (* j 4) r))
+      decoded (rn/bit-and (rn/bit-shift-right wi (* half 4))
+                          (unchecked-int 0x0F0F0F0F))
+      dot-value
+      (par/dp4a
+       decoded
+       (ra/aget xp (+ (* (+ (* row nsb) sb) 64) (* j 8) (* half 4) r))
+       0)
+      aq-value
+      (if (zero? half)
+        (if (zero? r)
+          (int (ra/aget aq (+ (* (+ (* o nsb) sb) 8) j)))
+          0)
+        0)
+      bq-value
+      (if (zero? half)
+        (if (zero? r)
+          (int (ra/aget bq (+ (* (+ (* o nsb) sb) 8) j)))
+          0)
+        0)
+      block-sum-value
+      (if (zero? half)
+        (if (zero? r)
+          (ra/aget bsums (+ (* (+ (* row nsb) sb) 8) j))
+          0)
+        0)]
+     [dot-value aq-value bq-value block-sum-value]
+     [[dot-left dot-right] [aq-left aq-right] [bq-left bq-right] [sum-left sum-right]]
+     []
+     [(unchecked-add-int dot-left dot-right)
+      (unchecked-add-int aq-left aq-right)
+      (unchecked-add-int bq-left bq-right)
+      (unchecked-add-int sum-left sum-right)]
+     {:associative? true :commutative? true
+      :overflow :wrap :order :implementation-defined})
+    (par/map-void!
+     ro (* nrows out)
+     (let [row (quot ro out)
+           o (rem ro out)
+           acc (loop [sb 0 a (float 0.0)]
+                 (if (< sb nsb)
+                   (let [dav (ra/aget da (+ (* o nsb) sb))
+                         dbv (ra/aget db (+ (* o nsb) sb))
+                         dact (ra/aget xs (+ (* row nsb) sb))
+                         ;; Canonical row-major spelling exposes `[row,o,sb]` directly to the
+                         ;; retained producer/consumer AxisMap; the trailing sixteen values are
+                         ;; the statically unrolled `[j,half]` product suffix.
+                         dot-base (* (+ (* (+ (* row out) o) nsb) sb) 16)
+                         d0 (* (* dav (float (ra/aget aq-partials (+ dot-base 0))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 0))
+                                                         (ra/aget dot-partials (+ dot-base 1)))))
+                         m0 (* (* dbv (float (ra/aget bq-partials (+ dot-base 0))))
+                               (float (ra/aget sum-partials (+ dot-base 0))))
+                         d1 (* (* dav (float (ra/aget aq-partials (+ dot-base 2))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 2))
+                                                         (ra/aget dot-partials (+ dot-base 3)))))
+                         m1 (* (* dbv (float (ra/aget bq-partials (+ dot-base 2))))
+                               (float (ra/aget sum-partials (+ dot-base 2))))
+                         d2 (* (* dav (float (ra/aget aq-partials (+ dot-base 4))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 4))
+                                                         (ra/aget dot-partials (+ dot-base 5)))))
+                         m2 (* (* dbv (float (ra/aget bq-partials (+ dot-base 4))))
+                               (float (ra/aget sum-partials (+ dot-base 4))))
+                         d3 (* (* dav (float (ra/aget aq-partials (+ dot-base 6))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 6))
+                                                         (ra/aget dot-partials (+ dot-base 7)))))
+                         m3 (* (* dbv (float (ra/aget bq-partials (+ dot-base 6))))
+                               (float (ra/aget sum-partials (+ dot-base 6))))
+                         d4 (* (* dav (float (ra/aget aq-partials (+ dot-base 8))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 8))
+                                                         (ra/aget dot-partials (+ dot-base 9)))))
+                         m4 (* (* dbv (float (ra/aget bq-partials (+ dot-base 8))))
+                               (float (ra/aget sum-partials (+ dot-base 8))))
+                         d5 (* (* dav (float (ra/aget aq-partials (+ dot-base 10))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 10))
+                                                         (ra/aget dot-partials (+ dot-base 11)))))
+                         m5 (* (* dbv (float (ra/aget bq-partials (+ dot-base 10))))
+                               (float (ra/aget sum-partials (+ dot-base 10))))
+                         d6 (* (* dav (float (ra/aget aq-partials (+ dot-base 12))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 12))
+                                                         (ra/aget dot-partials (+ dot-base 13)))))
+                         m6 (* (* dbv (float (ra/aget bq-partials (+ dot-base 12))))
+                               (float (ra/aget sum-partials (+ dot-base 12))))
+                         d7 (* (* dav (float (ra/aget aq-partials (+ dot-base 14))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 14))
+                                                         (ra/aget dot-partials (+ dot-base 15)))))
+                         m7 (* (* dbv (float (ra/aget bq-partials (+ dot-base 14))))
+                               (float (ra/aget sum-partials (+ dot-base 14))))
+                         ssum (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+
+                                    (float 0.0) d0) m0) d1) m1) d2) m2) d3) m3)
+                                    d4) m4) d5) m5) d6) m6) d7) m7)]
+                     (recur (inc sb) (+ a (* dact ssum))))
+                   a))]
+       (ra/aset y ro acc)))))
 
 ;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).
 (deftm qmatmul-q6k-gpu!
