@@ -223,6 +223,24 @@
     (finally
       (compiled/clear-compilation-cache!))))
 
+(deftest stable-template-preserves-failure-observation-and-does-not-cache-errors
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [report (atom nil)
+          error (binding [compiled/*compilation-template-observer* #(reset! report %)]
+                  (try
+                    (#'compiled/stable-compilation-template
+                     (fn [revision] [:failure revision])
+                     :resident-descriptor
+                     #(throw (ex-info "compile failed" {:reason :expected-failure})))
+                    (catch clojure.lang.ExceptionInfo error error)))]
+      (is (= :expected-failure (:reason (ex-data error))))
+      (is (false? (:success? @report)))
+      (is (zero? (:entries (compiled/compilation-cache-stats))))
+      (is (= 1 (:failures (compiled/compilation-cache-stats)))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
 (deftest compiler-visible-redefinition-invalidates-structural-templates
   (compiled/clear-compilation-cache!)
   (try

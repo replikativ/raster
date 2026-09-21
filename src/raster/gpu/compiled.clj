@@ -175,8 +175,15 @@
       (let [revision-before (dispatch/compiler-definition-revision)
             report (atom nil)
             key (key-for-revision revision-before)
-            value (binding [*compilation-template-observer* #(reset! report %)]
-                    (cached-compilation-template key compiler thunk))
+            outcome (try
+                      {:value
+                       (binding [*compilation-template-observer* #(reset! report %)]
+                         (cached-compilation-template key compiler thunk))}
+                      (catch Throwable error {:error error}))
+            _ (when-let [error (:error outcome)]
+                (when request-observer (request-observer @report))
+                (throw error))
+            value (:value outcome)
             revision-after (dispatch/compiler-definition-revision)
             _ (when (not= revision-before revision-after)
                 ;; No future request can legally use an entry built across an epoch change. A
