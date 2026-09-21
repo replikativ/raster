@@ -35,6 +35,33 @@
           (aset grad i (/ (- f+ f0) eps)))))
     grad))
 
+(deftest col2im-2d-into-gathers-every-overlapping-column
+  (doseq [[batch channels height width kernel-height kernel-width
+            stride-height stride-width pad-height pad-width]
+          [[1 1 3 3 2 2 1 1 0 0]
+           [2 2 4 5 3 2 2 1 1 0]
+           [1 2 5 4 2 3 1 2 0 1]]]
+    (let [height-out (+ 1 (quot (+ height (* 2 pad-height) (- kernel-height))
+                                stride-height))
+          width-out (+ 1 (quot (+ width (* 2 pad-width) (- kernel-width))
+                               stride-width))
+          columns (double-array
+                   (map #(double (- (mod % 13) 6))
+                        (range (* channels kernel-height kernel-width
+                                  batch height-out width-out))))
+          expected (nn/col2im-2d columns batch channels height width
+                                 kernel-height kernel-width stride-height stride-width
+                                 pad-height pad-width)
+          actual (double-array (* batch channels height width))
+          returned (nn/col2im-2d! columns actual batch channels height width
+                                  kernel-height kernel-width stride-height stride-width
+                                  pad-height pad-width)]
+      (is (identical? actual returned) "the in-place API returns its caller-owned destination")
+      (is (= (vec expected) (vec actual))
+          (str "output-centric gather preserves col2im order for "
+               [batch channels height width kernel-height kernel-width
+                stride-height stride-width pad-height pad-width])))))
+
 ;; ================================================================
 ;; Matmul tests
 ;; ================================================================

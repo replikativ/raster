@@ -1069,8 +1069,13 @@
                                                                (aget cols (+ (* row col-cols) col)))))))))))))
                                     dx)))
 
-;; In-place col2im-2d: writes into pre-allocated dx
-;; Fast path: stride=1, pad=0 avoids bounds checking
+;; In-place col2im-2d: one independent gather reduction per output element.
+;;
+;; The former source traversed columns and scattered overlapping contributions into dx.  It also
+;; selected a special scatter nest for stride=1/pad=0 with a host scalar `if`; neither branch was
+;; a legal independent GPU program.  Inverting the relation gives every output element unique
+;; ownership and leaves the kernel footprint as ordinary map(reduce), so scheduling—not this API—
+;; decides whether the kernel footprint is reduced serially, by a subgroup, or by a workgroup.
 (deftm ^:no-inline col2im-2d! (All [T] [cols :- (Array T) dx :- (Array T)
                                         batch :- Long c-in :- Long
                                         h :- Long w :- Long kh :- Long kw :- Long
@@ -1079,49 +1084,40 @@
                                    (let [h-out (+ 1 (quot (+ h (* 2 pad-h) (- kh)) stride-h))
                                          w-out (+ 1 (quot (+ w (* 2 pad-w) (- kw)) stride-w))
                                          col-cols (* batch h-out w-out)
-                                         n-dx (* batch c-in h w)]
-    ;; Zero the output (polymorphic — works for double[] and float[])
-                                     (dotimes [i n-dx] (aset dx i 0.0))
-                                     (if (and (== stride-h 1) (== stride-w 1) (== pad-h 0) (== pad-w 0))
-      ;; FAST PATH: no bounds checking, accumulate directly
-                                       (let [hw (* h w)
-                                             chw (* c-in hw)
-                                             hw-out (* h-out w-out)]
-                                         (dotimes [c c-in]
-                                           (dotimes [khi kh]
-                                             (dotimes [kwi kw]
-                                               (let [row (+ (* c (int (* kh kw))) (* khi (int kw)) kwi)]
-                                                 (dotimes [bi batch]
-                                                   (dotimes [oh h-out]
-                                                     (dotimes [ow w-out]
-                                                       (let [x-idx (+ (* bi (int chw)) (* c (int hw))
-                                                                      (* (+ khi oh) (int w)) (+ kwi ow))
-                                                             col-idx (+ (* row (int col-cols))
-                                                                        (* bi (int hw-out))
-                                                                        (* oh (int w-out)) ow)]
-                                                         (aset dx x-idx
-                                                               (+ (aget dx x-idx)
-                                                                  (aget cols col-idx))))))))))))
-      ;; GENERIC PATH
-                                       (dotimes [bi batch]
-                                         (dotimes [c c-in]
-                                           (dotimes [khi kh]
-                                             (dotimes [kwi kw]
-                                               (dotimes [oh h-out]
-                                                 (dotimes [ow w-out]
-                                                   (let [ih (+ (- (* oh (int stride-h)) pad-h) khi)
-                                                         iw (+ (- (* ow (int stride-w)) pad-w) kwi)]
-                                                     (when (and (>= ih 0) (< ih h) (>= iw 0) (< iw w))
-                                                       (let [row (+ (* c (int (* kh kw))) (* khi (int kw)) kwi)
-                                                             col (+ (* bi (int (* h-out w-out)))
-                                                                    (* oh (int w-out)) ow)
-                                                             x-idx (+ (* bi (int (* c-in h w)))
-                                                                      (* c (int (* h w)))
-                                                                      (* ih (int w)) iw)]
-                                                         (aset dx x-idx
-                                                               (+ (aget dx x-idx)
-                                                                  (aget cols (+ (* row col-cols) col))))))))))))))
-                                     dx)))
+                                         hw (* h w)
+                                         chw (* c-in hw)
+                                         hw-out (* h-out w-out)
+                                         kernel-elements (* kh kw)
+                                         n-dx (* batch chw)]
+                                     (raster.par/map!
+                                      dx x-idx n-dx nil
+                                      (let [bi (quot x-idx chw)
+                                            channel-pixel (rem x-idx chw)
+                                            c (quot channel-pixel hw)
+                                            pixel (rem channel-pixel hw)
+                                            ih (quot pixel w)
+                                            iw (rem pixel w)]
+                                        (raster.par/reduce
+                                         acc 0.0 kernel-index kernel-elements
+                                         (let [khi (quot kernel-index kw)
+                                               kwi (rem kernel-index kw)
+                                               oh-numerator (+ ih pad-h (- khi))
+                                               ow-numerator (+ iw pad-w (- kwi))
+                                               oh (quot oh-numerator stride-h)
+                                               ow (quot ow-numerator stride-w)]
+                                           (+ acc
+                                              (if (and (>= oh-numerator 0)
+                                                       (>= ow-numerator 0)
+                                                       (== (rem oh-numerator stride-h) 0)
+                                                       (== (rem ow-numerator stride-w) 0)
+                                                       (< oh h-out)
+                                                       (< ow w-out))
+                                                (let [row (+ (* c (int kernel-elements))
+                                                             (* khi (int kw)) kwi)
+                                                      col (+ (* bi (int hw-out))
+                                                             (* oh (int w-out)) ow)]
+                                                  (aget cols (+ (* row col-cols) col)))
+                                                0.0)))))))))
 
 ;; Conv2d: x:[B,C_in,H,W], W:[C_out,C_in,kH,kW], b:[C_out]
 (deftm ^:no-inline conv2d (All [T] [x :- (Array T) W :- (Array T) b :- (Array T)
