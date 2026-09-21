@@ -90,6 +90,28 @@
           (is (= 2 @calls)
               "the public verification boundary independently re-derives the witness"))))))
 
+(deftest source-free-resident-templates-rebind-only-compatible-invocation-facts
+  (let [first-x (float-array 8)
+        first-w (float-array 8)
+        lowering (resident/lower
+                  {:id :rebind :target :ze:0 :descriptor (descriptor)
+                   :arguments [first-x first-w 8] :roles {'w :constant}})
+        template (resident/source-free-template lowering)
+        second-x (float-array 8)
+        second-w (float-array 8)
+        rebound (resident/bind-template template [second-x second-w 8])]
+    (is (every? nil? (map :source (vals (get-in template [:plan :nodes]))))
+        "the cached structural template retains no model arrays")
+    (is (= [] (get-in template [:plan :instances 0 :arguments])))
+    (is (identical? second-x (get-in rebound [:plan :nodes [:rebind 'x] :source])))
+    (is (identical? second-w (get-in rebound [:plan :nodes [:rebind 'w] :source])))
+    (is (= [second-x second-w 8] (get-in rebound [:plan :instances 0 :arguments])))
+    (is (= :resident-plan-template-scalars
+           (reason-of #(resident/bind-template template [second-x second-w 7]))))
+    (is (= :resident-plan-template-array
+           (reason-of #(resident/bind-template template
+                                               [(float-array 7) second-w 8]))))))
+
 (deftest external-ownership-is-not-mistaken-for-host-initialization
   (let [lowering (resident/lower
                   {:id :external :target :ze:0 :descriptor (descriptor)

@@ -173,6 +173,33 @@
     (finally
       (compiled/clear-compilation-cache!))))
 
+(deftest repeated-shapes-rebind-a-source-free-resident-plan-template
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [first-x (float-array 16)
+          first-w (float-array 16)
+          second-x (float-array 16)
+          second-w (float-array 16)]
+      (with-redefs [pipeline/compile-gpu-program (fn [& _] (descriptor))]
+        (let [first (compiled/lower #'component [first-x first-w 16] {:target :ze:0})
+              second (compiled/lower #'component [second-x second-w 16] {:target :ze:0})]
+          (is (false? (get-in first [:preparation-report :resident-plan-template :cache-hit?])))
+          (is (true? (get-in second [:preparation-report :resident-plan-template :cache-hit?])))
+          (is (identical? second-x (get-in second [:lowering :plan :nodes
+                                                   (get-in second [:lowering :certificate
+                                                                   :bindings 'x]) :source])))
+          (is (identical? second-w (get-in second [:lowering :plan :nodes
+                                                   (get-in second [:lowering :certificate
+                                                                   :bindings 'w]) :source])))
+          (is (every? (fn [entry]
+                        (let [template @entry]
+                          (and (every? nil? (map :source (vals (get-in template [:plan :nodes]))))
+                               (= [] (get-in template [:plan :instances 0 :arguments])))))
+                      (vals @(var-get #'compiled/resident-plan-template-cache)))
+              "the cache retains structure but no caller arrays"))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
 (deftest structural-compilation-cache-is-single-flight
   (compiled/clear-compilation-cache!)
   (try

@@ -86,6 +86,7 @@
 ;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
 ;; process-local cache or leak between instances.
 (defonce ^:private compilation-template-cache (atom {}))
+(defonce ^:private resident-plan-template-cache (atom {}))
 (defonce ^:private compilation-template-stats
   (atom {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0}))
 
@@ -98,6 +99,7 @@
    results belong to their respective caches and are deliberately unaffected."
   []
   (reset! compilation-template-cache {})
+  (reset! resident-plan-template-cache {})
   (reset! compilation-template-stats
           {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0})
   nil)
@@ -109,6 +111,23 @@
     (assoc @compilation-template-stats
            :entries (count entries)
            :entries-by-compiler (frequencies (map (comp :compiler val) entries)))))
+
+(defn- cached-resident-plan-template
+  [key thunk]
+  (let [candidate (delay (resident-plan/source-free-template (thunk)))
+        [before after]
+        (swap-vals! resident-plan-template-cache
+                    #(if (contains? % key) % (assoc % key candidate)))
+        hit? (contains? before key)
+        started (System/nanoTime)
+        entry (get after key)]
+    (try
+      {:template @entry :cache-hit? hit?
+       :resolution-ns (- (System/nanoTime) started)}
+      (catch Throwable error
+        (swap! resident-plan-template-cache
+               #(if (identical? entry (get % key)) (dissoc % key) %))
+        (throw error)))))
 
 (defn- qualified-var-symbol [v]
   (let [{:keys [ns name]} (meta v)]
@@ -354,10 +373,17 @@
         public-symbols (vec (distinct (concat donate outputs
                                               (when result-sym [result-sym]) taps)))
         lowering-started (System/nanoTime)
-        lowering (resident-plan/lower
-                  {:id (compilation-id fn-var target dtype prog args)
-                   :target target :descriptor prog :arguments args
-                   :roles eff-roles :outputs public-symbols})
+        plan-id (compilation-id fn-var target dtype prog args)
+        plan-template-key [::resident-plan-template
+                           (template-key (get @template-report :compiler-revision))
+                           plan-id eff-roles public-symbols]
+        plan-template-report
+        (cached-resident-plan-template
+         plan-template-key
+         #(resident-plan/lower
+           {:id plan-id :target target :descriptor prog :arguments args
+            :roles eff-roles :outputs public-symbols}))
+        lowering (resident-plan/bind-template (:template plan-template-report) args)
         lowering-ns (- (System/nanoTime) lowering-started)
         in-tree  (build-in-tree lowering prog args donate)
         out-tree (build-out-tree lowering donate outputs result-sym taps)
@@ -366,6 +392,7 @@
                 :timing-source :host-monotonic
                 :total-ns (- (System/nanoTime) preparation-started)
                 :template @template-report
+                :resident-plan-template (dissoc plan-template-report :template)
                 :link-plan-lowering-ns lowering-ns
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]

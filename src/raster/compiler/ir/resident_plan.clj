@@ -226,6 +226,90 @@
                        :expected expected :actual certificate})))
     lowering))
 
+(defn ^:no-doc source-free-template
+  "Remove invocation-specific host sources from a freshly certified resident lowering.
+
+   The returned value is an internal structural template, not an independently trusted artifact:
+   callers must retain it only behind the compiler template cache and instantiate it through
+   `bind-template`. Descriptor code, realized views, effects and the certificate are unchanged."
+  [lowering]
+  (when-not (certified-plan? lowering)
+    (throw (ex-info "resident plan template requires a certified lowering"
+                    {:reason :resident-plan-template-type :actual (type lowering)})))
+  (update lowering :plan
+          (fn [plan]
+            (-> plan
+                (update :nodes update-vals #(assoc % :source nil))
+                (update :instances
+                        (fn [instances]
+                          (mapv #(assoc % :arguments []) instances)))))))
+
+(defn ^:no-doc bind-template
+  "Bind current primitive-array sources to a source-free resident plan template.
+
+   This checks the complete descriptor argument partition, scalar environment, logical field
+   order, dtype and realized element extent before installing sources. Those are precisely the
+   invocation-varying facts; the cached topology/effects were validated when the template was
+   constructed. The certificate remains valid because it intentionally witnesses contracts, not
+   host object identities or contents."
+  [template arguments]
+  (when-not (certified-plan? template)
+    (throw (ex-info "resident plan binding requires a certified template"
+                    {:reason :resident-plan-template-type :actual (type template)})))
+  (let [plan (:plan template)
+        instances (:instances plan)
+        _ (when-not (= 1 (count instances))
+            (throw (ex-info "resident plan template requires exactly one instance"
+                            {:reason :resident-plan-template-instances
+                             :instances (count instances)})))
+        instance (first instances)
+        descriptor (:descriptor instance)
+        argument-map (descriptor-environment! descriptor arguments)
+        scalar-values (select-keys argument-map (:scalar-params descriptor))
+        expected-scalars (:scalars (:certificate template))
+        _ (when-not (= expected-scalars scalar-values)
+            (throw (ex-info "resident plan template scalar specialization changed"
+                            {:reason :resident-plan-template-scalars
+                             :expected expected-scalars :actual scalar-values})))
+        value-specs (or (:value-specs descriptor) {})
+        nodes
+        (reduce
+         (fn [nodes symbol]
+           (let [value-id (get-in template [:certificate :bindings symbol])
+                 logical-leaves (get-in plan [:values value-id :leaves])
+                 source-leaves (parameter-leaves symbol (get argument-map symbol)
+                                                 (get value-specs symbol))]
+             (when-not (= (count logical-leaves) (count source-leaves))
+               (throw (ex-info "resident plan template field count changed"
+                               {:reason :resident-plan-template-fields :symbol symbol
+                                :expected (mapv :name logical-leaves)
+                                :actual (mapv :field source-leaves)})))
+             (reduce
+              (fn [nodes [{:keys [name node]} {:keys [field dtype elements source]}]]
+                (let [target (get nodes node)
+                      target-dtype (dtype/canon (get-in target [:view :dtype]))
+                      target-elements (reduce *' 1 (get-in target [:view :shape]))]
+                  (when-not (and (= name field)
+                                 (= target-dtype (dtype/canon dtype))
+                                 (= target-elements elements))
+                    (throw (ex-info "resident plan template array specialization changed"
+                                    {:reason :resident-plan-template-array
+                                     :symbol symbol :field field
+                                     :expected {:name name :dtype target-dtype
+                                                :elements target-elements}
+                                     :actual {:name field :dtype (dtype/canon dtype)
+                                              :elements elements}})))
+                  (assoc nodes node
+                         (cond-> (assoc target :source nil)
+                           (= :owned (get-in target [:view :allocation :ownership]))
+                           (assoc :source source)))))
+              nodes (map vector logical-leaves source-leaves))))
+         (:nodes plan) (:array-params descriptor))
+        bound-plan (assoc plan :nodes nodes
+                          :instances [(assoc instance :arguments (vec arguments)
+                                             :scalars scalar-values)])]
+    (->CertifiedResidentPlan bound-plan (:certificate template))))
+
 (defn lower
   "Lower one resident descriptor and its specialization arguments to a certified LinkPlan.
 
