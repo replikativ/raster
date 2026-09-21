@@ -444,7 +444,7 @@
         ;; attention scores are the common case); graph binding maps these identities back to
         ;; m/n/k.  Buffer views must reference this body-local scope, not the outer aliases.
         [M N K :as dimension-parameters]
-        (matrix-dimension-parameters m n k [a b c batch z])
+        (contraction-schedule/allocate-dimension-parameters [a b c batch z])
         a-view 'batch-lhs-view
         b-view 'batch-rhs-view
         c-view 'batch-result-view
