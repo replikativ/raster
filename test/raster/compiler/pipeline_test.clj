@@ -1,6 +1,7 @@
 (ns raster.compiler.pipeline-test
   (:require [clojure.set :as set]
             [clojure.test :refer [deftest testing is]]
+            [pattern.nanopass.dialect :as nanopass]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.ad.flatten :as flat]
@@ -198,6 +199,22 @@
     ;; Numbers, symbols, strings are valid terminals in the Walked dialect
     (is (dialects/valid-walked? 42))
     (is (dialects/valid-walked? 'x))))
+
+(deftest walked-binding-validation-short-circuits-the-formal-grammar
+  (testing "the already-authoritative structural fallback does not traverse a large program"
+    (with-redefs [nanopass/valid? (fn [& _]
+                                    (throw (ex-info "formal grammar was invoked" {})))]
+      (is (dialects/valid-walked?
+           '(let* [a (* x y)
+                   b (+ a 1.0)]
+              b)))))
+  (testing "non-binding expressions retain formal dialect validation"
+    (let [calls (atom [])]
+      (with-redefs [nanopass/valid? (fn [dialect value]
+                                      (swap! calls conj [dialect value])
+                                      true)]
+        (is (dialects/valid-walked? 42))
+        (is (= [[dialects/Walked 42]] @calls))))))
 
 (deftest valid-flattened-test
   (testing "valid flattened forms"
