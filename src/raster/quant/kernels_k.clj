@@ -444,45 +444,54 @@
    y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
   (let [nsb (quot in 256)
         dot-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
-        min-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))]
+        aq-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
+        bq-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))
+        sum-partials (int-array (* (* (* (* nrows out) nsb) 8) 2))]
     (par/product-reduce!
-     [dot-partials min-partials]
-     [[dot-sum 0 :int] [min-sum 0 :int]]
+     [dot-partials aq-partials bq-partials sum-partials]
+     [[dot-sum 0 :int] [a-scale 0 :int] [b-scale 0 :int] [block-sum 0 :int]]
      [[row nrows] [o out] [sb nsb] [j 8] [half 2]]
      r 4
      [wi (ra/aget wp (+ (* (+ (* o nsb) sb) 32) (* j 4) r))
       decoded (rn/bit-and (rn/bit-shift-right wi (* half 4))
                           (unchecked-int 0x0F0F0F0F))
       dot-value
-      (unchecked-multiply-int
-       (int (ra/aget aq (+ (* (+ (* o nsb) sb) 8) j)))
-       (par/dp4a
-        decoded
-        (ra/aget xp (+ (* (+ (* row nsb) sb) 64) (* j 8) (* half 4) r))
-        0))
-      min-value
+      (par/dp4a
+       decoded
+       (ra/aget xp (+ (* (+ (* row nsb) sb) 64) (* j 8) (* half 4) r))
+       0)
+      aq-value
       (if (zero? half)
         (if (zero? r)
-          (unchecked-multiply-int
-           (int (ra/aget bq (+ (* (+ (* o nsb) sb) 8) j)))
-           (ra/aget bsums (+ (* (+ (* row nsb) sb) 8) j)))
+          (int (ra/aget aq (+ (* (+ (* o nsb) sb) 8) j)))
+          0)
+        0)
+      bq-value
+      (if (zero? half)
+        (if (zero? r)
+          (int (ra/aget bq (+ (* (+ (* o nsb) sb) 8) j)))
+          0)
+        0)
+      block-sum-value
+      (if (zero? half)
+        (if (zero? r)
+          (ra/aget bsums (+ (* (+ (* row nsb) sb) 8) j))
           0)
         0)]
-     [dot-value min-value]
-     [[dot-left dot-right] [min-left min-right]]
+     [dot-value aq-value bq-value block-sum-value]
+     [[dot-left dot-right] [aq-left aq-right] [bq-left bq-right] [sum-left sum-right]]
      []
      [(unchecked-add-int dot-left dot-right)
-      (unchecked-add-int min-left min-right)]
+      (unchecked-add-int aq-left aq-right)
+      (unchecked-add-int bq-left bq-right)
+      (unchecked-add-int sum-left sum-right)]
      {:associative? true :commutative? true
       :overflow :wrap :order :implementation-defined})
     (par/map-void!
      ro (* nrows out)
      (let [row (quot ro out)
            o (rem ro out)
-           acc (loop [sb 0 s0 (float 0.0) s1 (float 0.0)
-                      s2 (float 0.0) s3 (float 0.0)
-                      s4 (float 0.0) s5 (float 0.0)
-                      s6 (float 0.0) s7 (float 0.0)]
+           acc (loop [sb 0 a (float 0.0)]
                  (if (< sb nsb)
                    (let [dav (ra/aget da (+ (* o nsb) sb))
                          dbv (ra/aget db (+ (* o nsb) sb))
@@ -491,50 +500,51 @@
                          ;; retained producer/consumer AxisMap; the trailing sixteen values are
                          ;; the statically unrolled `[j,half]` product suffix.
                          dot-base (* (+ (* (+ (* row out) o) nsb) sb) 16)
-                         p0 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 0))
-                                                 (ra/aget dot-partials (+ dot-base 1)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 0))))))
-                         p1 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 2))
-                                                 (ra/aget dot-partials (+ dot-base 3)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 2))))))
-                         p2 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 4))
-                                                 (ra/aget dot-partials (+ dot-base 5)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 4))))))
-                         p3 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 6))
-                                                 (ra/aget dot-partials (+ dot-base 7)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 6))))))
-                         p4 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 8))
-                                                 (ra/aget dot-partials (+ dot-base 9)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 8))))))
-                         p5 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 10))
-                                                 (ra/aget dot-partials (+ dot-base 11)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 10))))))
-                         p6 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 12))
-                                                 (ra/aget dot-partials (+ dot-base 13)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 12))))))
-                         p7 (* dact
-                               (+ (* dav (float (unchecked-add-int
-                                                 (ra/aget dot-partials (+ dot-base 14))
-                                                 (ra/aget dot-partials (+ dot-base 15)))))
-                                  (* dbv (float (ra/aget min-partials (+ dot-base 14))))))]
-                     (recur (inc sb)
-                            (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
-                            (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
-                   (+ (+ (+ (+ (+ (+ (+ s0 s1) s2) s3) s4) s5) s6) s7)))]
+                         d0 (* (* dav (float (ra/aget aq-partials (+ dot-base 0))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 0))
+                                                         (ra/aget dot-partials (+ dot-base 1)))))
+                         m0 (* (* dbv (float (ra/aget bq-partials (+ dot-base 0))))
+                               (float (ra/aget sum-partials (+ dot-base 0))))
+                         d1 (* (* dav (float (ra/aget aq-partials (+ dot-base 2))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 2))
+                                                         (ra/aget dot-partials (+ dot-base 3)))))
+                         m1 (* (* dbv (float (ra/aget bq-partials (+ dot-base 2))))
+                               (float (ra/aget sum-partials (+ dot-base 2))))
+                         d2 (* (* dav (float (ra/aget aq-partials (+ dot-base 4))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 4))
+                                                         (ra/aget dot-partials (+ dot-base 5)))))
+                         m2 (* (* dbv (float (ra/aget bq-partials (+ dot-base 4))))
+                               (float (ra/aget sum-partials (+ dot-base 4))))
+                         d3 (* (* dav (float (ra/aget aq-partials (+ dot-base 6))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 6))
+                                                         (ra/aget dot-partials (+ dot-base 7)))))
+                         m3 (* (* dbv (float (ra/aget bq-partials (+ dot-base 6))))
+                               (float (ra/aget sum-partials (+ dot-base 6))))
+                         d4 (* (* dav (float (ra/aget aq-partials (+ dot-base 8))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 8))
+                                                         (ra/aget dot-partials (+ dot-base 9)))))
+                         m4 (* (* dbv (float (ra/aget bq-partials (+ dot-base 8))))
+                               (float (ra/aget sum-partials (+ dot-base 8))))
+                         d5 (* (* dav (float (ra/aget aq-partials (+ dot-base 10))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 10))
+                                                         (ra/aget dot-partials (+ dot-base 11)))))
+                         m5 (* (* dbv (float (ra/aget bq-partials (+ dot-base 10))))
+                               (float (ra/aget sum-partials (+ dot-base 10))))
+                         d6 (* (* dav (float (ra/aget aq-partials (+ dot-base 12))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 12))
+                                                         (ra/aget dot-partials (+ dot-base 13)))))
+                         m6 (* (* dbv (float (ra/aget bq-partials (+ dot-base 12))))
+                               (float (ra/aget sum-partials (+ dot-base 12))))
+                         d7 (* (* dav (float (ra/aget aq-partials (+ dot-base 14))))
+                               (float (unchecked-add-int (ra/aget dot-partials (+ dot-base 14))
+                                                         (ra/aget dot-partials (+ dot-base 15)))))
+                         m7 (* (* dbv (float (ra/aget bq-partials (+ dot-base 14))))
+                               (float (ra/aget sum-partials (+ dot-base 14))))
+                         ssum (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+ (+
+                                    (float 0.0) d0) m0) d1) m1) d2) m2) d3) m3)
+                                    d4) m4) d5) m5) d6) m6) d7) m7)]
+                     (recur (inc sb) (+ a (* dact ssum))))
+                   a))]
        (ra/aset y ro acc)))))
 
 ;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).

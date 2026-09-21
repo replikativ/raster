@@ -256,6 +256,10 @@
             expected (float-array out)]
         (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq expected in out 0 out)
         (dotimes [o out]
+          (is (= (Float/floatToRawIntBits (aget actual (+ (* row out) o)))
+                 (Float/floatToRawIntBits (aget product-actual (+ (* row out) o))))
+              (str "product Q4_K preserves compatibility rounding for row " row
+                   ", output " o))
           (is (< (Math/abs (- (aget actual (+ (* row out) o)) (aget expected o))) 1e-3)
               (str "Q4_K row " row ", output " o))
           (is (< (Math/abs (- (aget product-actual (+ (* row out) o)) (aget expected o))) 1e-3)
@@ -280,7 +284,8 @@
     (is (empty? (:temporaries artifact)))
     (is (set/subset? '#{aq bq bsums da db wp xp xs y in nrows out}
                      (set (:arguments artifact))))
-    (is (not-any? '#{dot-partials min-partials} (:arguments artifact))
+    (is (not-any? '#{dot-partials aq-partials bq-partials sum-partials}
+                  (:arguments artifact))
         "compiler-owned partial arrays do not escape the existing public ABI")))
 
 (deftest i8-activation-packing-uses-typed-kernel-body

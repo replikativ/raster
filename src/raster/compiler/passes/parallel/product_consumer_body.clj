@@ -73,12 +73,20 @@
      :scalar-types scalar-types
      :values (:values scheduled-body)}))
 
+(defn- ordered-fold-form? [value]
+  (or (dialect/scalar-fold-form? value) (dialect/product-fold-form? value)))
+
+(defn- ordered-fold-parts [value]
+  (if (dialect/product-fold-form? value)
+    (dialect/product-fold-parts value)
+    (dialect/scalar-fold-parts value)))
+
 (defn- fold-of [consumer]
   (->> (tree-seq coll? seq (:scalar-region consumer))
-       (filter dialect/product-fold-form?) distinct first))
+       (filter ordered-fold-form?) distinct first))
 
 (defn- contains-fold? [value]
-  (boolean (some dialect/product-fold-form? (tree-seq coll? seq value))))
+  (boolean (some ordered-fold-form? (tree-seq coll? seq value))))
 
 (defn- scalar-operation-name [operation]
   (some-> operation class .getSimpleName))
@@ -150,13 +158,21 @@
 (defn- replace-fold-components [fold carries value]
   (walk/postwalk
    (fn [form]
-     (if (and (dialect/product-component-form? form) (= fold (second form)))
+     (cond
+       (and (dialect/scalar-fold-form? fold) (= fold form))
+       (or (first carries)
+           (decline! :consumer-component
+                     "scalar ordered fold requires one lowered carry"
+                     {:carries carries}))
+
+       (and (dialect/product-component-form? form) (= fold (second form)))
        (let [ordinal (nth form 2)]
          (or (nth carries ordinal nil)
              (decline! :consumer-component
                        "consumer projection references a missing ordered-fold component"
                        {:ordinal ordinal :carries carries})))
-       form))
+
+       :else form))
    value))
 
 (defn- barrier []
@@ -379,10 +395,11 @@
                              result-ids lane-values selected-types selected-contracts))))))
               (range local-volume) subgroup-regions))))
         fold (fold-of consumer)
-        {fold-attributes :attributes fold-lambda :lambda} (dialect/product-fold-parts fold)
+        {fold-attributes :attributes fold-lambda :lambda} (ordered-fold-parts fold)
         {fold-parameters :parameters fold-locals :locals fold-results :body-results}
         (dialect/lambda-parts fold-lambda)
-        carry-types (mapv dtype/canon (:dtypes fold-attributes))
+        carry-types (mapv dtype/canon
+                          (or (:dtypes fold-attributes) [(:dtype fold-attributes)]))
         carries (mapv #(symbol (str "product-consumer-carry-" %)) (range (count carry-types)))
         updated-carries (mapv #(symbol (str "product-consumer-updated-" %))
                               (range (count carry-types)))
@@ -470,7 +487,7 @@
                   (decline! :consumer-identity
                             "ordered consumer identity requires checked literal evidence"
                             {:identity identity :dtype type})))
-              (:identities fold-attributes) carry-types)
+              (or (:identities fold-attributes) [(:identity fold-attributes)]) carry-types)
         ordered-loop
         (body/->ForLoop
          (body/value (:name ordered) :long)
