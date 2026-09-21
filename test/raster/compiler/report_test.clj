@@ -7,7 +7,9 @@
         (report/from-pipeline
          {:backend :opencl
           :soac-fused-stats {:route :typed-soac :typed-validated true
-                             :vertical 2 :horizontal 1 :iterations 3}
+                             :vertical 2 :horizontal 1 :iterations 3
+                             :placements [{:decision :materialize}
+                                          {:decision :recompute}]}
           :segop-lowered-stats {:segops-lowered 2 :kernel-graphs-lowered 1
                                 :structured-loops-scheduled 1
                                 :typed-soac-reused 3 :typed-scalar-equations 4}
@@ -28,7 +30,7 @@
                         :kind :segop-declined
                         :reason :missing-rule}]}
            (:route normalized)))
-    (is (= {:vertical 2 :horizontal 1 :iterations 3 :placements 0}
+    (is (= {:vertical 2 :horizontal 1 :iterations 3 :placements 2}
            (:fusion normalized)))
     (is (= {:segops 2 :kernel-graphs 1 :structured-loops 1
             :typed-reused 3 :typed-scalar-equations 4
