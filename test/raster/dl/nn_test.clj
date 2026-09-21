@@ -317,6 +317,13 @@
       (is (approx= 0.0 (aget y 2)))
       (is (approx= 2.0 (aget y 4)))))
 
+  (testing "leaky-relu! writes and returns the caller-owned output"
+    (let [x (double-array [-2 -1 0 1 2])
+          out (double-array 5)
+          result (nn/leaky-relu! x out 5 0.01)]
+      (is (identical? out result))
+      (is (arr-approx= out (double-array [-0.02 -0.01 0.0 1.0 2.0])))))
+
   (testing "leaky-relu gradient"
     (let [x (double-array [0.5 -0.5 1.0])
           rrfn (tmpl/template-pullback 'raster.dl.nn/leaky-relu)
