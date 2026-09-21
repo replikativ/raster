@@ -159,6 +159,54 @@
                #(if (identical? entry (get % key)) (dissoc % key) %))
         (throw error)))))
 
+(def ^:private max-template-stabilization-attempts 8)
+
+(defn- stable-compilation-template
+  "Resolve one cached template in a compiler-definition epoch that remains unchanged for the
+   complete compilation. Compilation may legitimately install nested deftm specializations and
+   advance the epoch. In that case the result belongs only to the old key: retry under the new
+   epoch instead of unsafely aliasing it. Concurrent hot reloads obey the same rule.
+
+   This makes a single preparation request converge the cache while preserving the invariant that
+   every returned template was produced during a stable compiler-definition interval."
+  [key-for-revision compiler thunk]
+  (let [request-observer *compilation-template-observer*]
+    (loop [attempt 1]
+      (let [revision-before (dispatch/compiler-definition-revision)
+            report (atom nil)
+            key (key-for-revision revision-before)
+            value (binding [*compilation-template-observer* #(reset! report %)]
+                    (cached-compilation-template key compiler thunk))
+            revision-after (dispatch/compiler-definition-revision)
+            _ (when (not= revision-before revision-after)
+                ;; No future request can legally use an entry built across an epoch change. A
+                ;; concurrent waiter already holds its delay and will independently retry.
+                (swap! compilation-template-cache dissoc key))]
+        (if (= revision-before revision-after)
+          (do
+            (when request-observer
+              (request-observer
+               (assoc @report
+                      :stabilization-attempts attempt
+                      :compiler-revision revision-after)))
+            value)
+          (if (< attempt max-template-stabilization-attempts)
+            (recur (inc attempt))
+            (let [error
+                  (ex-info "compiler definitions did not stabilize while caching a template"
+                           {:reason :compilation-template-unstable
+                            :compiler compiler
+                            :attempts attempt
+                            :revision-before revision-before
+                            :revision-after revision-after})]
+              (when request-observer
+                (request-observer
+                 (assoc @report :success? false
+                        :stabilization-attempts attempt
+                        :compiler-revision-before revision-before
+                        :compiler-revision-after revision-after)))
+              (throw error))))))))
+
 ;; ================================================================
 ;; Role derivation (§4.2) and tree construction
 ;; ================================================================
@@ -258,16 +306,17 @@
           ;; the RESOLVED schedule is read back off the descriptor below (never the raw
           ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
           schedule (conj :schedule schedule))
-        template-key [::resident-template
-                      (source-specialization-identity fn-var dtype)
-                      (dispatch/compiler-definition-revision)
-                      (target-specialization-identity target)
-                      {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
-                       :on-non-resident on-non-resident :schedule schedule}
-                      ;; Keeps with-redefs and hot compiler reloads honest.
-                      (System/identityHashCode @#'pl/compile-gpu-program)]
+        template-key (fn [revision]
+                       [::resident-template
+                        (source-specialization-identity fn-var dtype)
+                        revision
+                        (target-specialization-identity target)
+                        {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
+                         :on-non-resident on-non-resident :schedule schedule}
+                        ;; Keeps with-redefs and hot compiler reloads honest.
+                        (System/identityHashCode @#'pl/compile-gpu-program)])
         prog (binding [*compilation-template-observer* #(reset! template-report %)]
-               (cached-compilation-template
+               (stable-compilation-template
                 template-key :resident-descriptor
                 #(apply pl/compile-gpu-program fn-var target compile-arguments)))
         _ (when-not prog
@@ -321,14 +370,15 @@
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident :gemm-precision])
         compilation-options (assoc compilation-options :target target :dtype dtype)
-        template-key [::equation-first-template
-                      (source-specialization-identity fn-var dtype)
-                      (dispatch/compiler-definition-revision)
-                      (target-specialization-identity target)
-                      compilation-options
-                      (System/identityHashCode @#'equation-first/compile)]
+        template-key (fn [revision]
+                       [::equation-first-template
+                        (source-specialization-identity fn-var dtype)
+                        revision
+                        (target-specialization-identity target)
+                        compilation-options
+                        (System/identityHashCode @#'equation-first/compile)])
         compilation (binding [*compilation-template-observer* #(reset! template-report %)]
-                      (cached-compilation-template
+                      (stable-compilation-template
                        template-key :equation-first
                        #(equation-first/compile fn-var compilation-options)))
         lowering-started (System/nanoTime)
