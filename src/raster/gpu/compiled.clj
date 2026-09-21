@@ -22,6 +22,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.build-manifest :as build-manifest]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.invocation-link :as invocation-link]
@@ -163,11 +164,11 @@
                 (when source-body (semantic-fingerprint/fingerprint source-body))}]
     {:semantic stable
      ;; Direct source identity is useful for explanations, but persistence additionally requires
-     ;; the transitive resolved Var dependency graph and a compiler-build fingerprint. Until those
-     ;; are certified, every entry remains explicitly process-local.
+     ;; the transitive resolved Var dependency graph. Until that graph is certified, every entry
+     ;; remains explicitly process-local; the packaged build identity is added separately below.
      :persistent-cache-eligible? false
      :persistence-blockers
-     (cond-> #{:transitive-source-dependencies :compiler-build-fingerprint}
+     (cond-> #{:transitive-source-dependencies}
        (nil? source-body) (conj :retained-deftm-source))
      ;; Redefinition with textually equal source must not retain compiler state tied to an old Var
      ;; root (for example a changed closed-over helper or dispatch table).
@@ -194,8 +195,16 @@
 
 (defn- template-cache-key
   [kind source revision target options pipeline-identity]
-  (let [semantic-request {:schema template-identity-schema
+  (let [build (build-manifest/current-identity)
+        build-fingerprint (:fingerprint build)
+        build-blockers
+        (cond
+          (nil? build) #{:compiler-build-fingerprint}
+          (not (:complete? build)) (:blockers build)
+          :else #{})
+        semantic-request {:schema template-identity-schema
                           :kind kind
+                          :compiler-build-fingerprint build-fingerprint
                           :source (:semantic source)
                           :target (:semantic target)
                           :options options}
@@ -204,7 +213,8 @@
         semantic-id (fingerprint-or-nil semantic-request)
         family-id (fingerprint-or-nil family-request)
         persistence-blockers
-        (cond-> (into (:persistence-blockers source) (:persistence-blockers target))
+        (cond-> (into build-blockers
+                      (into (:persistence-blockers source) (:persistence-blockers target)))
           (nil? semantic-id) (conj :unsupported-semantic-option)
           (nil? family-id) (conj :unsupported-source-identity))]
     {:kind kind

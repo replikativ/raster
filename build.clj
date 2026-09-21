@@ -8,7 +8,8 @@
     clj -T:build release
     clj -T:build install"
   (:refer-clojure :exclude [test])
-  (:require [clojure.tools.build.api :as b]
+  (:require [clojure.java.io :as io]
+            [clojure.tools.build.api :as b]
             [borkdude.gh-release-artifact :as gh]
             [deps-deploy.deps-deploy :as dd])
   (:import [clojure.lang ExceptionInfo]))
@@ -20,6 +21,27 @@
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
+
+(defn- dependency-coordinate [[library coordinate]]
+  [library
+   (cond
+     (:mvn/version coordinate) {:mvn/version (:mvn/version coordinate)}
+     (:git/sha coordinate) {:git/sha (:git/sha coordinate)}
+     :else {:unversioned true})])
+
+(defn- compiler-build-manifest []
+  {:schema-version 1
+   :library lib
+   :version version
+   :revision current-commit
+   :runtime {:java-version (System/getProperty "java.version")
+             :clojure-version (clojure-version)}
+   :dependencies (into (sorted-map) (map dependency-coordinate) (:libs basis))})
+
+(defn- write-compiler-build-manifest! []
+  (let [file (io/file class-dir "raster" "compiler-build.edn")]
+    (io/make-parents file)
+    (spit file (str (pr-str (compiler-build-manifest)) "\n"))))
 
 (defn clean
   [_]
@@ -35,6 +57,7 @@
                 :src-dirs ["src"]})
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
+  (write-compiler-build-manifest!)
   (b/jar {:class-dir class-dir
           :jar-file jar-file}))
 
