@@ -13,12 +13,14 @@
      A3 — frozen weights are :constant (captured at bind), never per-call inputs.
      A4 — multi-output: the out-tree projects all 14 donated adapters as DeviceArrays."
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.gemma-train-resident-test :as g]
             [raster.dl.nn :as nn]
+            [raster.par :as par]
             [raster.gpu.compiled :as r]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.value :as v]))
@@ -36,6 +38,18 @@
   [x :- (Array float) bias :- (Array float) n :- Long] :- (Array float)
   (let [sum (nn/residual-add x bias n)]
     (nn/hadamard sum x n)))
+
+(deftm artifact-write!
+  [x :- (Array float) out :- (Array float) n :- Long] :- Void
+  (par/map-void! i n
+    (arrays/aset out i (arrays/aget x i))))
+
+(deftest effect-only-descriptor-projects-explicit-pointer-output
+  (let [prepared (r/lower #'artifact-write! [(float-array 4) (float-array 4) 4]
+                          {:target :ocl:0 :outputs '[out] :on-non-resident :throw})]
+    (is (= ['out] (mapv :sym (:out-tree prepared))))
+    (is (= [:output] (mapv :from (:out-tree prepared))))
+    (is (not-any? #(re-find #"^body_result_" (name (:sym %))) (:out-tree prepared)))))
 
 (deftest a2-donation-invalidation
   (testing "an ::owned value is live and readable until consumed"

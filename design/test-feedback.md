@@ -49,10 +49,10 @@ Landing order:
 ## What current performance evidence does not establish
 
 Passing correctness, route/allocation checks and nvcc/hipcc compilation does not establish GPU
-speed or parity with vendor GEMM implementations. The current `:perf` canary times a plain
-Clojure loop, not a Raster-compiled function. The retained cold GEMM benchmark invokes the
-independent source oracle rather than the production TypedSOAC route. Neither is a sufficient
-performance regression gate for the current compiler-generated GEMM implementation.
+speed or parity with vendor implementations. The public canaries now cover small generated GEMM
+and cooperative RMSNorm artifacts, and an opt-in Q4_K comparison covers the generated and serial
+schedules. These remain cliff detectors, not sufficient performance regression evidence for the
+full compiler or sustained parity with tuned vendor libraries.
 
 Next performance work must benchmark the public compilation/LinkPlan route with explicit
 shape, dtype, selected schedule, target/driver identity, cold compilation, warm device execution,
@@ -63,9 +63,9 @@ merely to accept a slowdown.
 
 ## Opt-in production-route canaries
 
-`clojure -M:test:production-canary /path/to/options.edn` runs either `:case :cpu`
-(Raster AOT sum-of-squares) or `:case :gemm` (public compiled/lower, instantiate, resident
-LinkPlan replay of a 64×64×64 contraction). Example options:
+`clojure -M:test:production-canary /path/to/options.edn` runs `:case :cpu` (Raster AOT
+sum-of-squares), `:case :gemm` (public compiled/lower, instantiate, resident LinkPlan replay),
+or `:case :rmsnorm` (the equation-first cooperative fold-map). Example options:
 
 ```clojure
 {:case :gemm :target :ocl:0
@@ -80,11 +80,17 @@ the CPU route and, in the OpenCL lane, the resident GEMM route with timing repla
 replay: these are correctness checks, not performance gates. There is no GPU timing claim
 when hardware is unavailable.
 
-The GPU metric is **host-synchronized warm resident replay**, including runtime submission
-overhead, not device-only kernel latency or peak GEMM throughput. Compilation and binding
-are reported separately; upload/download are outside timed replay. This tiny shape catches
-route/runtime regressions but does not establish SOTA performance. Device-event profiling of
-equation-first prepared programs is not yet supported by `link/measure!`.
+The GEMM metric remains **host-synchronized warm resident replay**, including runtime submission
+overhead. The RMSNorm metric is the aggregate device-event span of its equation-first prepared
+program. Compilation and binding are reported separately; uploads/downloads are outside both
+timed replays. These small shapes catch route/runtime or gross serialization regressions but do
+not establish SOTA performance.
+
+The separate `raster.perf.q4-comparison/run!` probe interleaves the public equation-first Q4_K
+product-reduction artifact with the serial resident-descriptor source schedule. It requires
+bit-identical ggml oracle results on every replay and measures aggregate device-event spans only;
+it never promotes a schedule. Its default `[1 1024 640]` shape is intentionally opt-in and should
+be run on a stable machine with explicit compiler and environment identities.
 
 The comparison identity includes shape, dtype, numerical policy, device/host/JVM signatures,
 timing scope and an explicit machine/driver tag. Compiler revision and emitted executable

@@ -163,7 +163,11 @@
             (throw (ex-info "compile: compile-gpu-program returned nil — a step fell back to host (non-resident). Pass :on-non-resident :throw to see which."
                             {:fn fn-var :target target})))
         eff-roles (derive-roles prog donate constants roles)
-        result-sym (:result-sym prog)
+        ;; Effect-only deftm descriptors may retain a synthetic scalar `body_result_*` even
+        ;; though the resident ABI returns Void. Only pointer results are projectable device
+        ;; values; explicit written buffers remain available through :outputs.
+        pointer-symbols (link-plan/descriptor-pointer-symbols prog)
+        result-sym (when (contains? pointer-symbols (:result-sym prog)) (:result-sym prog))
         public-symbols (vec (distinct (concat donate outputs
                                               (when result-sym [result-sym]) taps)))
         lowering (resident-plan/lower
