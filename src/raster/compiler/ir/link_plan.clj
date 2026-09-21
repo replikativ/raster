@@ -551,17 +551,6 @@
                       {:reason :link-alias-pair :alias pair})))
     pair))
 
-(defn- unordered-pairs
-  "Enumerate each unordered pair once without imposing a printable order on identities.
-   Link identities may embed full compilation keys, so `pr-str` is not a viable hot-path
-   comparator for the quadratic overlap checks below."
-  [entries]
-  (let [entries (vec entries)
-        n (count entries)]
-    (for [left-index (range n)
-          right-index (range (inc left-index) n)]
-      [(nth entries left-index) (nth entries right-index)])))
-
 (defn- validate-plan-structure! [plan]
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
@@ -1023,16 +1012,21 @@
 
 (defn- analyze-effects! [{:keys [nodes outputs aliases] :as plan}]
   (let [step-facts (instance-access-facts plan)
-        initialized (volatile! (into #{}
-                                     (keep (fn [[id {:keys [role source]}]]
-                                             ;; Ownership answers who releases storage, not whether
-                                             ;; the storage contains a value. In particular, an
-                                             ;; imported :internal node still needs an ordered writer.
-                                             (when (or source
-                                                       (contains? #{:input :constant :state} role))
-                                               id)))
-                                     nodes))
-        initially-initialized (sort-by pr-str @initialized)
+        ;; Preserve the plan's local node traversal for covering-view checks.  Rendering identities
+        ;; is neither a semantic ordering nor an acceptable cost here; composed identities may
+        ;; retain arbitrarily rich provenance. Canonical identity/order belongs to the enclosing
+        ;; plan and certificate rather than being reconstructed from diagnostics here.
+        initially-initialized
+        (into []
+              (keep (fn [[id {:keys [role source]}]]
+                      ;; Ownership answers who releases storage, not whether the storage contains
+                      ;; a value. In particular, an imported :internal node still needs an ordered
+                      ;; writer.
+                      (when (or source (contains? #{:input :constant :state} role)) id)))
+              nodes)
+        initially-initialized-by-allocation
+        (group-by #(get-in nodes [% :view :allocation :id]) initially-initialized)
+        initialized (volatile! (set initially-initialized))
         written (volatile! #{})
         complete (volatile! #{})
         required (volatile! #{})
@@ -1054,7 +1048,8 @@
                              (let [cover (get-in nodes [initialized-id :view])]
                                (when (bview/contains-contiguous-view? cover view)
                                  (caller-initialization! initialized-id node-id))))
-                           initially-initialized)))))]
+                           (get initially-initialized-by-allocation
+                                (get-in view [:allocation :id])))))))]
     (doseq [{:keys [instance step phase facts produced-views partial-writes complete-writes]} step-facts]
       (let [by-node (reduce (fn [m {:keys [node access]}]
                               (update m node merge-access access)) {} facts)]
@@ -1090,14 +1085,22 @@
               (when (or full? (initialized-view? node-id))
                 (vswap! initialized conj node-id)
                 (vswap! written conj node-id)))))
-        (doseq [[[left-id left-access] [right-id right-access]]
-                (unordered-pairs by-node)
-                :when (contains? aliases #{left-id right-id})
+        ;; Alias declarations are already the complete overlap graph.  Walk that sparse relation
+        ;; instead of enumerating every pair of accesses merely to ask whether it is an alias.
+        ;; Besides being O(aliases) rather than O(accesses^2), this keeps printable provenance out
+        ;; of executable validation: node identities need equality and hashing here, never a
+        ;; `pr-str`-derived total order. Canonical serialization belongs to the plan/certificate
+        ;; boundary, not this dataflow analysis.
+        (doseq [pair aliases
+                :let [[left-id right-id] (vec pair)
+                      left-access (get by-node left-id)
+                      right-access (get by-node right-id)]
+                :when (and left-access right-access)
                 :when (or (contains? #{:write :read-write} left-access)
                           (contains? #{:write :read-write} right-access))]
           (throw (ex-info "one linked kernel step cannot access overlapping aliases when either writes"
                           {:reason :link-same-step-alias-hazard :instance instance :step step
-                           :phase phase :nodes #{left-id right-id}}))))
+                           :phase phase :nodes pair}))))
       ;; Only prefix-producing semantic operations contribute these checked views.
       ;; A write through the larger pointer does not establish the untouched tail.
       (vswap! initialized into produced-views)
