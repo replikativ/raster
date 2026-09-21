@@ -40,12 +40,8 @@
 (deftm compute-alphas-cumprod (All [T] [betas :- (Array T)] :- (Array T)
                                    (let [n (alength betas)
                                          alphas-cumprod (n/similar betas)]
-                                     (loop [i 0 prod 1.0]
-                                       (when (< i n)
-                                         (let [a (n/* prod (n/- 1.0 (aget betas i)))]
-                                           (aset alphas-cumprod i a)
-                                           (recur (inc i) a))))
-                                     alphas-cumprod)))
+                                     (par/scan alphas-cumprod prod 1.0 i n nil
+                                               (n/* prod (n/- 1.0 (aget betas i)))))))
 
 ;; ================================================================
 ;; Forward noise process: q(x_t | x_0) = sqrt(alpha_bar_t)*x_0 + sqrt(1-alpha_bar_t)*eps
