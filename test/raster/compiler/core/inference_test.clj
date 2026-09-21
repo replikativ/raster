@@ -106,6 +106,14 @@
   (testing "returns nil for unknown fn"
     (is (nil? (inf/try-resolve-call 'no.such/fn '(x y) (type-env {'x 'double 'y 'double}))))))
 
+(deftest declared-constant-vars-participate-in-overload-resolution
+  (testing "resolution does not depend on constant folding having run first"
+    (let [result (inf/try-resolve-call 'raster.numeric/*
+                                       '(0.5 raster.numeric/pi)
+                                       {})]
+      (is (= '[double double] (:tags result)))
+      (is (contains? result :typed-iface)))))
+
 ;; ================================================================
 ;; generic-fn?
 ;; ================================================================

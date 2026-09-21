@@ -12,6 +12,8 @@
   (:require [clojure.test :refer [deftest testing is]]
             [raster.tooling.inspect :as inspect]
             [raster.compiler.pipeline :as pipeline]
+            [raster.dl.diffusion :as diffusion]
+            [raster.dl.optim :as optim]
             [raster.spatial.nndescent :as nnd]))
 
 ;; NOTE: the UMAP-layer devirt cases (optimize-layout-chunk!, graph kernels) moved
@@ -46,6 +48,13 @@
             (str v " has " dispatched " undevirtualized dispatch op(s) ("
                  devirtualized " devirtualized) — type-transport regression on the "
                  "lazy-JIT path; check that TC binding types reach the walker"))))))
+
+(deftest numeric-constant-vars-do-not-block-devirtualization
+  (testing "a declared constant such as pi types its enclosing arithmetic and cosine"
+    (doseq [v [#'optim/cosine-lr #'diffusion/cosine-beta-schedule]]
+      (let [{:keys [dispatched]} (dispatch-counts v :double)]
+        (is (zero? dispatched)
+            (str v " lost the declared type of raster.numeric/pi"))))))
 
 ;; NOTE: analyze-devirtualization currently only detects un-devirtualized
 ;; raster.numeric/raster.math ops, NOT un-devirtualized user-deftm calls (e.g.
