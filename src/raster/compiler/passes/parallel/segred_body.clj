@@ -625,8 +625,10 @@
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input dtype ['_n_bound] :global
-                     (layout/row-major ['_n_bound] dtype) :operand)
+                     % :input dtype [(if (contains? resident-scalar-captures %) 1 '_n_bound)] :global
+                     (layout/row-major [(if (contains? resident-scalar-captures %) 1 '_n_bound)]
+                                       dtype)
+                     :operand)
                    arrays)
               [(body/->KernelParameter output :output dtype [group-count] :global
                                        (layout/row-major [group-count] dtype) :result)]
@@ -868,7 +870,9 @@
         realized-launch (scheduled-body/realized-launch scheduled)
         group-count (get-in realized-launch [:group-count 0])
         workgroup-size (get-in source [:grid :block-size])
-        shared-memory-bytes (get-in source [:grid :shared-mem-bytes])]
+        shared-memory-bytes (get-in source [:grid :shared-mem-bytes])
+        resident-scalar-captures
+        (set (get-in source [:reduction :attributes :resident-scalar-captures]))]
     (doseq [[parameter argument] (map vector parameters arguments)
             :when (not= :scalar (:kind parameter))]
       (let [buffer (get buffers argument)
@@ -878,9 +882,10 @@
                                 0 1
                                 1 (first realized-shape)
                                 (apply launch/product realized-shape))
-            source-elements (if (= :result (:role parameter))
-                              output-elements
-                              (:bound (segop/seg-space-reduced-dim (:space source))))]
+            source-elements (cond
+                              (= :result (:role parameter)) output-elements
+                              (contains? resident-scalar-captures (:id parameter)) 1
+                              :else (:bound (segop/seg-space-reduced-dim (:space source))))]
         (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
           (decline! :storage-dtype
                     "scalar SegRed pointer dtype differs from its KernelGraph buffer"
