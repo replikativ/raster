@@ -349,6 +349,13 @@
            (:reason (ex-data (try (make-plan #{#{:x :out}})
                                   (catch clojure.lang.ExceptionInfo e e))))))))
 
+(deftest alias-free-effect-validation-does-not-render-node-identities
+  (with-redefs [clojure.core/pr-str
+                (fn [& values]
+                  (throw (ex-info "validation rendered an operational identity"
+                                  {:values values})))]
+    (is (link/link-plan? (valid-plan)))))
+
 (deftest retired-scatter-descriptors-require-an-executable-interface
   (let [descriptor {:dtype :float
                     :all-params '[out src index n]
