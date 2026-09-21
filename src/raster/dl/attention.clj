@@ -2153,9 +2153,14 @@
                                                                       rest0 (rem idx per-i)
                                                                       hq (quot rest0 nrows)
                                                                       j (rem rest0 nrows)
-                                                                      row (clojure.core/+ (clojure.core/* i n-q) hq)]
-                                                                  (if (or (> (clojure.core/- i j) (dec left))
-                                                                          (and (< i j) (> (clojure.core/- j i) (dec right))))
+                                                                      row (clojure.core/+ (clojure.core/* i n-q) hq)
+                                                                      ;; Keep masking as one typed comparison: `or`/`and` macro
+                                                                      ;; temporaries can lose their Boolean tag at GPU fixpoints.
+                                                                      distance (if (< i j)
+                                                                                 (clojure.core/- j i)
+                                                                                 (clojure.core/- i j))
+                                                                      limit (if (< i j) (dec right) (dec left))]
+                                                                  (if (> distance limit)
                                                                     (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
                                                                     (let [hkv (quot hq group)
                                                                           qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
