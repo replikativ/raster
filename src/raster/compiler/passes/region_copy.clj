@@ -35,6 +35,12 @@
    `src src-off dst dst-off len` in every spelling."
   '#{raster.arrays/acopy! System/arraycopy java.lang.System/arraycopy})
 
+(def ^:private discarded-body-ops
+  "Parallel forms whose body is evaluated only for effects. This is an evaluation-context fact,
+   not an operation-specific lowering: a region copy here has the same discarded result as a
+   copy in a `dotimes` body or an unused let binding."
+  '#{raster.par/map-void!})
+
 (defn- array-tag
   "The array type tag a fact states for `array`: the tag on its binder or deftm parameter."
   [environment array]
@@ -104,8 +110,38 @@
                 (with-meta (apply list 'do (map #(statement % environment) (rest expression)))
                   (meta expression))
 
+                (form/binding-form? expression)
+                (binding-form expression environment true)
+
                 :else
                 (walk expression environment)))
+            (binding-form [expression environment discarded-body?]
+              (let [[head bindings & body] expression
+                    pairs (vec (partition 2 bindings))
+                    inits (mapv second pairs)
+                    ;; everything evaluated after binding k
+                    later (fn [k] (list* 'do (concat (drop (inc k) inits) body)))
+                    [environment pairs]
+                    (reduce (fn [[environment pairs] [k [symbol init]]]
+                              (let [call (copy-call init environment)
+                                    ;; a binder nothing reads (an effect binding) discards its
+                                    ;; value: its init is a statement, conditionals included;
+                                    ;; a copy that returns nothing is a statement anywhere
+                                    unused? (not (contains? (util/free-syms (later k)) symbol))
+                                    init (if (or unused?
+                                                 (and call (not (:returns-destination? call))))
+                                           (statement init environment)
+                                           (walk init environment))
+                                    environment (cond-> environment
+                                                  (binder-tag symbol)
+                                                  (assoc symbol (binder-tag symbol)))]
+                                [environment (conj pairs [symbol init])]))
+                            [environment []]
+                            (map-indexed vector pairs))
+                    body-walker (if discarded-body? statement walk)]
+                (with-meta (apply list head (vec (mapcat identity pairs))
+                                  (map #(body-walker % environment) body))
+                  (meta expression))))
             (walk [expression environment]
               (cond
                 (not (seq? expression)) expression
@@ -122,32 +158,16 @@
                   (with-meta (apply list 'dotimes bindings (map #(statement % environment) body))
                     (meta expression)))
 
-                (form/binding-form? expression)
-                (let [[head bindings & body] expression
-                      pairs (vec (partition 2 bindings))
-                      inits (mapv second pairs)
-                      ;; everything evaluated after binding k
-                      later (fn [k] (list* 'do (concat (drop (inc k) inits) body)))
-                      [environment pairs]
-                      (reduce (fn [[environment pairs] [k [symbol init]]]
-                                (let [call (copy-call init environment)
-                                      ;; a binder nothing reads (an effect binding) discards its
-                                      ;; value: its init is a statement, conditionals included;
-                                      ;; a copy that returns nothing is a statement anywhere
-                                      unused? (not (contains? (util/free-syms (later k)) symbol))
-                                      init (if (or unused?
-                                                   (and call (not (:returns-destination? call))))
-                                             (statement init environment)
-                                             (walk init environment))
-                                      environment (cond-> environment
-                                                    (binder-tag symbol)
-                                                    (assoc symbol (binder-tag symbol)))]
-                                  [environment (conj pairs [symbol init])]))
-                              [environment []]
-                              (map-indexed vector pairs))]
-                  (with-meta (apply list head (vec (mapcat identity pairs))
-                                    (map #(walk % environment) body))
+                (and (contains? discarded-body-ops (descriptor/semantic-op expression))
+                     (= 3 (count (descriptor/call-args expression))))
+                (let [[index bound body] (descriptor/call-args expression)]
+                  (with-meta (list (first expression) index
+                                   (walk bound environment)
+                                   (statement body environment))
                     (meta expression)))
+
+                (form/binding-form? expression)
+                (binding-form expression environment false)
 
                 :else
                 (with-meta (apply list (map #(walk % environment) expression)) (meta expression))))]
