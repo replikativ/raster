@@ -2,8 +2,8 @@
  :dtype :float,
  :summary
  {:total 236,
-  :typed-soac 197,
-  :scalar 33,
+  :typed-soac 199,
+  :scalar 31,
   :host-only 5,
   :typed-structured-control 1},
  :vars
@@ -46,14 +46,13 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/dot-rows,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/dot-rows-dW,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/dot-rows-dbias,
    :route :typed-soac,
    :typed-validated true,
