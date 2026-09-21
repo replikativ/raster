@@ -347,6 +347,17 @@
       (is (= expected-outputs (count (:outputs linked))))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
+(deftest public-array-clone-is-a-generated-identity-map
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'nn/dense-backward-db {:target target :dtype :float})
+          linked (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= 1 (count (:outputs linked))))
+      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
