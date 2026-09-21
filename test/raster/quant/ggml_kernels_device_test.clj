@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.descriptor-fixture :as fixture]
@@ -240,8 +241,10 @@
         f (fn [g] (let [a (float-array n)] (dotimes [i n] (aset a i (float (g i)))) a))]
     [["gaussian" (f (fn [_] (* 2.0 (.nextGaussian r)))) 2 width]
      ["ties" (f (fn [i] (if (zero? (mod i 32)) 127.0 (+ 0.5 (- (mod (* 7 i) 200) 100))))) 2 width]
+     ["signed-tie" (f (fn [i] (case (mod i 256) 0 -127.0 1 127.0 (* 0.25 (.nextGaussian r))))) 2 width]
      ["negative-max" (f (fn [i] (if (zero? (mod i 32)) -3.0 (* 0.5 (.nextGaussian r))))) 2 width]
      ["tiny" (f (fn [_] (* 1.0e-7 (.nextGaussian r)))) 2 width]
+     ["negative-zero" (f (fn [_] -0.0)) 2 width]
      ["zeros" (f (fn [_] 0.0)) 2 width]]))
 
 (defn- run-program
@@ -265,11 +268,30 @@
 (deftest activation-quantizers-have-hardware-free-kernelbody-emission
   (doseq [kernel [#'gk/quant-act-q8-0-rows! #'gk/quant-act-q8-K-rows!]]
     (let [compiled (pipeline/compile-gpu-program kernel :ze:debug :dtype :float)
-          artifacts (mapv :artifact (:steps compiled))]
+          artifacts (mapv :artifact (:steps compiled))
+          kernels (mapcat kexec/artifacts artifacts)]
       (is (seq artifacts))
       (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
-                  artifacts)
+                  kernels)
           (str (:name (meta kernel)) " must not depend on the GPU execution gate")))))
+
+(deftest cooperative-activation-quantizers-retain-reference-semantics-on-jvm
+  (doseq [[fmt kernel width] [[:q8_0 gk/quant-act-q8-0-rows! 640]
+                              [:q8_K gk/quant-act-q8-K-rows! 1024]]
+          [label x nrows width] (activation-inputs width)]
+    (let [expected (ggml/kernel-layout fmt (ggml/quantize fmt x width nrows) width nrows)
+          nblocks (* nrows (quot width (if (= fmt :q8_K) 256 32)))
+          xq (int-array (alength ^ints (:q expected)))
+          xd (float-array nblocks)
+          xbs (when (= fmt :q8_K) (int-array (* 16 nblocks)))]
+      (if xbs
+        (kernel x xq xd xbs nblocks)
+        (kernel x xq xd nblocks))
+      (is (= (vec ^ints (:q expected)) (vec xq)) (str fmt " " label " codes"))
+      (is (= (vec ^floats (:d expected)) (vec xd)) (str fmt " " label " scales"))
+      (when xbs
+        (is (= (vec ^ints (:bsums expected)) (vec xbs))
+            (str fmt " " label " block sums"))))))
 
 (deftest activation-quantizers-match-the-reference
   (if-not @gp/gpu-available?

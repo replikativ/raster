@@ -448,8 +448,11 @@
        form))
    template))
 
-;; Each map writes one element at its own index, the shape TypedSOAC certifies;
-;; a block's maximum is recomputed where a map needs it.
+;; Scale discovery is a product reduction, not a serial loop hidden inside every output map.
+;; The value/index pair makes ggml's tie rule explicit and associative: q8_0 retains the last
+;; maximum (observable for signed zero), while q8_K retains the first maximum so it can recover
+;; the sign of the scale. NaNs rank below finite magnitudes, matching the old zero-seeded loops.
+;; Packing remains ordinary disjoint maps and retains the exact rounding forms below.
 
 (defmacro ^:private def-q8-0-quantizer []
   (exact-forms
@@ -458,25 +461,35 @@
       scale as the float its FP16 encoding denotes, and eight code words per block
       in element order."
       [x :- (Array float), xq :- (Array int), xd :- (Array float), nblocks :- Long] :- Void
-      (do
+      (let [maxes (float-array nblocks)
+            max-indices (int-array nblocks)]
+        (par/product-reduce!
+         [maxes nil]
+         [[best (float 0.0) :float] [best-index (int -1) :int]]
+         [[b nblocks]] j 32
+         [v (ra/aget x (+ (* b 32) j))
+          candidate (Math/abs (float v))]
+         [candidate (int j)]
+         [[left right] [left-index right-index]]
+         [left-valid (int (if (== left left) 1 0))
+          right-valid (int (if (== right right) 1 0))
+          better (int (if (== right-valid 1)
+                        (if (== left-valid 1)
+                          (if (> right left) 1
+                            (if (== right left) (if (> right-index left-index) 1 0) 0))
+                          1)
+                        0))]
+         [(if (== better 1) right left)
+          (if (== better 1) right-index left-index)]
+         {:associative? true :commutative? true
+          :order {:nan :lowest :tie :highest-index}})
         (par/map-void! b nblocks
-                       (let [base (* b 32)
-                             amax (loop [j 0 m (float 0.0)]
-                                    (if (< j 32)
-                                      (let [v (ra/aget x (+ base j))
-                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                        (recur (inc j) (if (> m a) m a)))
-                                      m))
+                       (let [amax (ra/aget maxes b)
                              d (/ amax (float 127.0))]
                          (ra/aset xd b (fp16-round d))))
         (par/map-void! i (* nblocks 8)
                        (let [base (* (quot i 8) 32)
-                             amax (loop [j 0 m (float 0.0)]
-                                    (if (< j 32)
-                                      (let [v (ra/aget x (+ base j))
-                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                        (recur (inc j) (if (> m a) m a)))
-                                      m))
+                             amax (ra/aget maxes (quot i 8))
                              d (/ amax (float 127.0))
                              id (if (== d (float 0.0)) (float 0.0) (/ (float 1.0) d))]
                          (ra/aset xq i (word-q8-0 (+ base (* (rem i 8) 4)) id))))))))
@@ -492,38 +505,40 @@
       dots read (`ggml/code-position`), and the code sum of each 16 elements."
       [x :- (Array float), xq :- (Array int), xd :- (Array float), xbs :- (Array int),
        nblocks :- Long] :- Void
-      (do
+      (let [maxes (float-array nblocks)
+            max-indices (int-array nblocks)]
+        (par/product-reduce!
+         [maxes max-indices]
+         [[best (float 0.0) :float] [best-index (int Integer/MAX_VALUE) :int]]
+         [[b nblocks]] j 256
+         [v (ra/aget x (+ (* b 256) j))
+          candidate (Math/abs (float v))]
+         [candidate (int j)]
+         [[left right] [left-index right-index]]
+         [left-valid (int (if (== left left) 1 0))
+          right-valid (int (if (== right right) 1 0))
+          better (int (if (== right-valid 1)
+                        (if (== left-valid 1)
+                          (if (> right left) 1
+                            (if (== right left) (if (< right-index left-index) 1 0) 0))
+                          1)
+                        0))]
+         [(if (== better 1) right left)
+          (if (== better 1) right-index left-index)]
+         {:associative? true :commutative? true
+          :order {:nan :lowest :tie :lowest-index}})
         (par/map-void! b nblocks
                        (let [base (* b 256)
-                             amax (loop [j 0 m (float 0.0)]
-                                    (if (< j 256)
-                                      (let [v (ra/aget x (+ base j))
-                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                        (recur (inc j) (if (> m a) m a)))
-                                      m))
-                             first-max (loop [j 0 found -1]
-                                         (if (< j 256)
-                                           (let [v (ra/aget x (+ base j))
-                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
-                                           found))
+                             amax (ra/aget maxes b)
+                             first-max (ra/aget max-indices b)
                              mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
                              iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))]
                          (ra/aset xd b (if (== amax (float 0.0)) (float 0.0) (/ (float 1.0) iscale)))))
         (par/map-void! i (* nblocks 64)
                        (let [base (* (quot i 64) 256)
-                             amax (loop [j 0 m (float 0.0)]
-                                    (if (< j 256)
-                                      (let [v (ra/aget x (+ base j))
-                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                        (recur (inc j) (if (> m a) m a)))
-                                      m))
-                             first-max (loop [j 0 found -1]
-                                         (if (< j 256)
-                                           (let [v (ra/aget x (+ base j))
-                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
-                                           found))
+                             block (quot i 64)
+                             amax (ra/aget maxes block)
+                             first-max (ra/aget max-indices block)
                              mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
                              iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))]
                          ;; word (rem i 64) is chunk (quot w 8), lane (rem w 8):
@@ -534,18 +549,9 @@
         (par/map-void! g (* nblocks 16)
                        (let [base (* (quot g 16) 256)
                              gbase (+ base (* (rem g 16) 16))
-                             amax (loop [j 0 m (float 0.0)]
-                                    (if (< j 256)
-                                      (let [v (ra/aget x (+ base j))
-                                            a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                        (recur (inc j) (if (> m a) m a)))
-                                      m))
-                             first-max (loop [j 0 found -1]
-                                         (if (< j 256)
-                                           (let [v (ra/aget x (+ base j))
-                                                 a (if (< v (float 0.0)) (- (float 0.0) v) v)]
-                                             (recur (inc j) (if (< found 0) (if (== a amax) j found) found)))
-                                           found))
+                             block (quot g 16)
+                             amax (ra/aget maxes block)
+                             first-max (ra/aget max-indices block)
                              mx (if (== amax (float 0.0)) (float 0.0) (ra/aget x (+ base first-max)))
                              iscale (if (== amax (float 0.0)) (float 0.0) (/ (float -127.0) mx))
                              sum (loop [j 0 s 0]
