@@ -1259,19 +1259,23 @@
                                              (let [hw-out (* h-out w-out)
                                                    chw-out (* c-out hw-out)
                                                    bhw (* batch hw-out)
-                                                   elements (* c-out bhw)]
-                                               ;; dy[B,C,HW] -> dy-cols[C,B,HW].  The destination
-                                               ;; linear index owns its complete coordinate, so
-                                               ;; this is an ordinary full-overwrite permutation.
-                                               (raster.par/map!
-                                                dy-cols dst elements nil
-                                                (let [co (quot dst bhw)
-                                                      within-channel (rem dst bhw)
-                                                      bi (quot within-channel hw-out)
-                                                      spatial (rem within-channel hw-out)
+                                                   blocks (* c-out batch)]
+                                               ;; dy[B,C,HW] -> dy-cols[C,B,HW].  At runtime each
+                                               ;; independent block remains a JVM arraycopy; the
+                                               ;; compiler's general region-copy pass spells the
+                                               ;; same body as typed stores for accelerator
+                                               ;; scheduling.  This preserves both representations
+                                               ;; without a target branch in the numerical API.
+                                               (raster.par/map-void!
+                                                block blocks
+                                                (let [co (quot block batch)
+                                                      bi (rem block batch)
                                                       src (+ (* bi (int chw-out))
-                                                             (* co (int hw-out)) spatial)]
-                                                  (aget dy src))))))
+                                                             (* co (int hw-out)))
+                                                      dst (+ (* co (int bhw))
+                                                             (* bi (int hw-out)))]
+                                                  (System/arraycopy dy src dy-cols dst hw-out)))
+                                               dy-cols)))
 
 ;; dW = dy_cols @ cols^T via BLAS NT
 (deftm ^:no-inline conv2d-backward-dW-into! (All [T]

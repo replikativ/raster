@@ -62,7 +62,7 @@
                [batch channels height width kernel-height kernel-width
                 stride-height stride-width pad-height pad-width])))))
 
-(deftest conv2d-gradient-layout-is-an-output-owned-permutation
+(deftest conv2d-gradient-layout-copies-independent-output-blocks
   (let [batch 2, channels 3, height-out 2, width-out 4
         spatial (* height-out width-out)
         input (double-array (map double (range (* batch channels spatial))))

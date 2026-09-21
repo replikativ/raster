@@ -183,7 +183,7 @@
                (vec (gpu-link/download executable (first (:outputs plan))))))
         (finally (gpu-link/close! executable))))))
 
-(deftest conv2d-gradient-layout-is-one-typed-permutation-kernel
+(deftest conv2d-gradient-layout-is-one-typed-region-copy-kernel
   (when-gpu "conv2d-gradient-layout-map"
     (let [batch 2, channels 3, height-out 2, width-out 4
           spatial (* height-out width-out)
