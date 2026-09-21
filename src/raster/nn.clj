@@ -141,14 +141,11 @@
 (deftm cross-entropy
   "Cross-entropy loss: -sum(t * log(p)). p = predicted probabilities, t = targets."
   (All [T] [p :- (Array T) t :- (Array T)] :- T
-       (let [n (alength p)]
-         (loop [i 0 loss 0.0]
-           (if (< i n)
-             (let [ti (aget t i)]
-               (if (zero? ti)
-                 (recur (inc i) loss)
-                 (recur (inc i) (- loss (* ti (m/log (n/max 1e-15 (aget p i))))))))
-             loss)))))
+       (reduce! [loss 0.0] [p t]
+                (+ loss
+                   (if (zero? t)
+                     0.0
+                     (- (* t (m/log (n/max 1e-15 p)))))))))
 
 (deftm softmax-cross-entropy
   "Combined softmax + cross-entropy. Returns [loss, softmax-output]."
