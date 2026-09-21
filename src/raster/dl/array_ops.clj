@@ -95,13 +95,10 @@
   [dy :- (Array double) batch :- Long dim :- Long]
   :- (Array double)
   (let [out (double-array dim)]
-    (dotimes [b batch]
-      (dotimes [d dim]
-        (let [idx (+ (* b (int dim)) d)]
-          (aset out d
-                (+ (aget out d)
-                   (aget dy idx))))))
-    out))
+    (par/map!
+     out d dim nil
+     (par/reduce acc 0.0 b batch
+                 (+ acc (aget dy (+ (* b (int dim)) d)))))))
 
 ;; ================================================================
 ;; GENERIC PRIMITIVES
