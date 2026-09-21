@@ -28,6 +28,7 @@
 
 (def ^:private cuda-target :cuda:equation-first-source-test)
 (def ^:private hip-target :hip:equation-first-source-test)
+(def ^:private ocl-target :ocl:equation-first-source-test)
 
 (use-fixtures
   :once
@@ -52,6 +53,15 @@
                      :max-workgroup-size 1024
                      :shared-local-memory 65536
                      :total-eus 60}})
+    (hardware/register-target-device!
+     ocl-target
+     {:type :ocl
+      :name "Synthetic portable OpenCL equation-first source target"
+      :capabilities {:warp-size 32
+                     :subgroup-sizes [16 32]
+                     :max-workgroup-size 1024
+                     :shared-local-memory 65536
+                     :total-eus 32}})
     (f)))
 
 (deftm c-family-dot
@@ -303,7 +313,7 @@
       (is (= 1 (count (:outputs linked)))))))
 
 (deftest public-softmax-is-a-complete-typed-soac-program
-  (doseq [target [cuda-target hip-target]]
+  (doseq [target [cuda-target hip-target ocl-target]]
     (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})
           semantic (:semantic compilation)
           linked (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])]

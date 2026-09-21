@@ -427,6 +427,7 @@
    their own retained facts. Admission remains here; accepted loads, conversions and arithmetic
    over typed child values use the same SSA builder as maps and ordered fold-maps."
   [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
+                      lower-load-index
                       load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         expression (inline-scalar-bindings expression)
@@ -467,6 +468,11 @@
                   :source-region expression
                   ;; Only this adapter's already-approved coordinates reach KernelBody.
                   :lower-index lower-coordinate
+                  :lower-load-index
+                  (fn [array source-coordinate scope]
+                    (or (when lower-load-index
+                          (lower-load-index array source-coordinate scope))
+                        (lower-coordinate source-coordinate scope)))
                   :predicate load-predicate
                   :load-other (fn [storage-dtype]
                                 (if load-other
@@ -518,6 +524,10 @@
                       {:segred-id (:id segred) :dtype dtype :bound bound
                        :workgroup-size workgroup-size :arrays arrays :scalars scalars}))
         {:keys [operator identity element numerical-policy]} (scalar-plan segred)
+        resident-scalar-captures
+        (set (filter (set arrays)
+                     (get-in segred [:reduction :attributes
+                                     :resident-scalar-captures])))
         contraction-coordinate-proof?
         (when coordinate-proof
           (let [view (when (contraction-facts/facts? coordinate-proof)
@@ -562,6 +572,12 @@
           :declared-result-dtype dtype
           :arrays (set arrays) :scalars (set scalars)
           :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
+          :lower-load-index
+          (fn [array source-coordinate _scope]
+            (let [source-coordinate (strip-index-cast source-coordinate)]
+              (when (and (contains? resident-scalar-captures array)
+                         (constant/zero-value? source-coordinate))
+                (body/index-cast 0 :long :exact))))
           :coordinate-lower
           (fn [source-coordinate]
             ;; The first complete vertical proves every input has at least `bound` elements.
