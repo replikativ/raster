@@ -183,6 +183,31 @@
                (vec (gpu-link/download executable (first (:outputs plan))))))
         (finally (gpu-link/close! executable))))))
 
+(deftest conv2d-gradient-layout-is-one-typed-permutation-kernel
+  (when-gpu "conv2d-gradient-layout-map"
+    (let [batch 2, channels 3, height-out 2, width-out 4
+          spatial (* height-out width-out)
+          input (float-array (map float (range (* batch channels spatial))))
+          expected (float-array
+                    (for [channel (range channels)
+                          batch-index (range batch)
+                          element (range spatial)]
+                      (aget input (+ (* batch-index channels spatial)
+                                     (* channel spatial) element))))
+          output (float-array (repeat (count expected) -1.0))
+          arguments [input output batch channels height-out width-out]
+          compilation (equation-first/compile #'nn/conv2d-rearrange-dy!
+                                              {:target :ze:0 :dtype :float})
+          plan (equation-first/lower compilation arguments)
+          executable (gpu-link/instantiate! plan)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (try
+        (gpu-link/run! executable)
+        (is (= (vec expected)
+               (vec (gpu-link/download executable (first (:outputs plan))))))
+        (finally (gpu-link/close! executable))))))
+
 (deftest col2im-2d-overlap-reduction-executes-through-the-direct-vertical
   (when-gpu "col2im-2d-overlap-reduction"
     (let [columns (float-array (map float (range 1 17)))

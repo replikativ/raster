@@ -62,6 +62,22 @@
                [batch channels height width kernel-height kernel-width
                 stride-height stride-width pad-height pad-width])))))
 
+(deftest conv2d-gradient-layout-is-an-output-owned-permutation
+  (let [batch 2, channels 3, height-out 2, width-out 4
+        spatial (* height-out width-out)
+        input (double-array (map double (range (* batch channels spatial))))
+        expected (double-array
+                  (for [channel (range channels)
+                        batch-index (range batch)
+                        element (range spatial)]
+                    (aget input (+ (* batch-index channels spatial)
+                                   (* channel spatial) element))))
+        actual (double-array (repeat (count expected) -1.0))
+        returned (nn/conv2d-rearrange-dy! input actual batch channels
+                                          height-out width-out)]
+    (is (identical? actual returned))
+    (is (= (vec expected) (vec actual)))))
+
 ;; ================================================================
 ;; Matmul tests
 ;; ================================================================
