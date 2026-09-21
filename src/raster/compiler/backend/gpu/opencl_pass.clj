@@ -801,7 +801,11 @@
             ;; === par/map! — SegOp path ===
             (par/par-map-form? form)
             (let [{:keys [bound]} (par/extract-par-map-info form)]
-              (if (and (number? bound) (< bound min-elements))
+              ;; A retained typed schedule may expose substantial cooperative work behind a
+              ;; small outer result domain (one row reduction is the canonical case).  The
+              ;; source-only threshold has no evidence about that work and must not discard the
+              ;; scheduled SegMap. Keep the shortcut only for the raw compatibility entry.
+              (if (and (not supplied-program) (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
                 (let [segmap (source->segmap stats
@@ -978,7 +982,9 @@
             ;; par/map-void!
             (par/par-map-void-form? form)
             (let [{:keys [bound]} (par/extract-par-map-void-info form)]
-              (if (and (number? bound) (< bound min-elements))
+              ;; As for value maps, a small effect domain is not evidence that the scheduled
+              ;; body is small. A supplied typed program owns placement and must reach emission.
+              (if (and (not supplied-program) (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map-void! form))
                 (if-let [scheduled (take-bound-segop
