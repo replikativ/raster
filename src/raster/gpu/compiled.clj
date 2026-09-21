@@ -163,9 +163,9 @@
 
 (defn- stable-compilation-template
   "Resolve one cached template in a compiler-definition epoch that remains unchanged for the
-   complete compilation. Compilation may legitimately install nested deftm specializations and
-   advance the epoch. In that case the result belongs only to the old key: retry under the new
-   epoch instead of unsafely aliasing it. Concurrent hot reloads obey the same rule.
+   complete compilation. Derived deftm specializations do not change this semantic epoch, but a
+   concurrent source/type/dispatch redefinition may. In that case the result belongs only to the
+   old key: retry under the new epoch instead of unsafely aliasing it.
 
    This makes a single preparation request converge the cache while preserving the invariant that
    every returned template was produced during a stable compiler-definition interval."

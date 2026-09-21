@@ -9,12 +9,28 @@
   e.g. UMAP's cos-dist/init-leaves over float data. Fix derefs the Var so the
   field holds the compiled IFn__ instance."
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.core :refer [deftm]]
+            [raster.core :as rcore :refer [deftm]]
+            [raster.compiler.core.dispatch :as dispatch]
             ;; deftm bodies use raster.numeric/raster.arrays ops — load them so a
             ;; single-ns test run can bytecode-compile the specializations.
             [raster.numeric]
             [raster.arrays]
             [raster.par]))
+
+(deftm derived-epoch-probe
+  "A private float specialization used to distinguish derived compiler state from source edits."
+  (All [T] [a :- (Array T) i :- Long] :- T
+       (raster.arrays/aget a i)))
+
+(deftest derived-parametric-specialization-preserves-semantic-epoch
+  (testing "materializing a dtype from an already-versioned template is cache population"
+    (let [before (dispatch/compiler-definition-revision)
+          resolved (rcore/resolve-deftm-var #'derived-epoch-probe
+                                            {:dtype :float :ambiguity :throw})
+          after (dispatch/compiler-definition-revision)]
+      (is (var? resolved))
+      (is (= before after)
+          "a derived float method must not invalidate unrelated compiler templates"))))
 
 (deftm pdot
   "Parametric dot product — instantiated per element type."
