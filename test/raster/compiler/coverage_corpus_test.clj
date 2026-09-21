@@ -8,6 +8,7 @@
    `scripts/update-coverage-baseline.sh` after an intended change."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.coverage :as coverage]
+            [raster.dl.attention :as attention]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.device-probe :as device-probe]))
 
@@ -47,6 +48,14 @@
         (is (= {:verified-segmap-opencl 1} (get-in row [:emission :routes])))
         (is (= :unsupported-loop (get-in row [:emission :declines 0 :reason])))
         (is (= 1 (:emission-declines row)))))))
+
+(deftest coverage-uses-the-retained-dtype-of-an-unambiguous-deftm
+  (is (= :double (#'coverage/effective-corpus-dtype
+                  #'attention/scaled-dot-product-attn-jvp :float))
+      "an unambiguous fixed-double deftm is measured at its real dtype")
+  (is (= :float (#'coverage/effective-corpus-dtype
+                 #'attention/scaled-dot-product-attn :float))
+      "an overloaded parametric deftm still uses the requested corpus specialization"))
 
 (deftest unique-scatter-retains-independent-effect-ratchet-evidence
   (let [algorithm (list 'soac-program {}
