@@ -28,6 +28,7 @@
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
@@ -88,7 +89,10 @@
 (defonce ^:private compilation-template-cache (atom {}))
 (defonce ^:private resident-plan-template-cache (atom {}))
 (defonce ^:private compilation-template-stats
-  (atom {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0}))
+  (atom {:hits 0 :misses 0 :misses-by-reason {}
+         :compilations 0 :failures 0 :compile-nanos 0}))
+
+(def ^:private template-identity-schema :raster.compiled/template-identity-v1)
 
 (def ^:dynamic *compilation-template-observer*
   "Internal per-request observer. It receives only cache/timing facts, never source or artifacts."
@@ -101,7 +105,8 @@
   (reset! compilation-template-cache {})
   (reset! resident-plan-template-cache {})
   (reset! compilation-template-stats
-          {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0})
+          {:hits 0 :misses 0 :misses-by-reason {}
+           :compilations 0 :failures 0 :compile-nanos 0})
   nil)
 
 (defn compilation-cache-stats
@@ -112,6 +117,14 @@
            :entries (count entries)
            :entries-by-compiler (frequencies (map (comp :compiler val) entries)))))
 
+(defn- resident-plan-miss-reason [entries key]
+  (if (and (:compiler-template-fingerprint key)
+           (some #(= (:compiler-template-fingerprint %)
+                     (:compiler-template-fingerprint key))
+                 (keys entries)))
+    :specialization
+    :compulsory))
+
 (defn- cached-resident-plan-template
   [key thunk]
   (let [candidate (delay (resident-plan/source-free-template (thunk)))
@@ -119,10 +132,12 @@
         (swap-vals! resident-plan-template-cache
                     #(if (contains? % key) % (assoc % key candidate)))
         hit? (contains? before key)
+        miss-reason (when-not hit? (resident-plan-miss-reason before key))
         started (System/nanoTime)
         entry (get after key)]
     (try
       {:template @entry :cache-hit? hit?
+       :miss-reason miss-reason
        :resolution-ns (- (System/nanoTime) started)}
       (catch Throwable error
         (swap! resident-plan-template-cache
@@ -139,19 +154,84 @@
                        (rcore/resolve-deftm-var fn-var {:dtype dtype :ambiguity :throw})
                        (catch clojure.lang.ExceptionInfo _ nil))
                      fn-var)
-        metadata (meta resolved)]
-    {:requested (qualified-var-symbol fn-var)
-     :resolved (qualified-var-symbol resolved)
-     :tags (:raster.core/deftm-tags metadata)
-     :source-hash (hash (:raster.core/deftm-source-body metadata))
+        metadata (meta resolved)
+        source-body (:raster.core/deftm-source-body metadata)
+        stable {:requested (qualified-var-symbol fn-var)
+                :resolved (qualified-var-symbol resolved)
+                :tags (:raster.core/deftm-tags metadata)
+                :source-body-fingerprint
+                (when source-body (semantic-fingerprint/fingerprint source-body))}]
+    {:semantic stable
+     ;; Direct source identity is useful for explanations, but persistence additionally requires
+     ;; the transitive resolved Var dependency graph and a compiler-build fingerprint. Until those
+     ;; are certified, every entry remains explicitly process-local.
+     :persistent-cache-eligible? false
+     :persistence-blockers
+     (cond-> #{:transitive-source-dependencies :compiler-build-fingerprint}
+       (nil? source-body) (conj :retained-deftm-source))
      ;; Redefinition with textually equal source must not retain compiler state tied to an old Var
      ;; root (for example a changed closed-over helper or dispatch table).
      :root-identity (System/identityHashCode @resolved)}))
 
 (defn- target-specialization-identity [target]
-  [target
-   (try (hash (hardware/descriptor-for target))
-        (catch Throwable _ nil))])
+  (try
+    {:semantic {:target target
+                :descriptor-fingerprint
+                (semantic-fingerprint/fingerprint (hardware/descriptor-for target))}
+     :persistent-cache-eligible? true
+     :persistence-blockers #{}}
+    (catch Exception _
+      {:semantic {:target target :descriptor-fingerprint nil}
+       :persistent-cache-eligible? false
+       :persistence-blockers #{:target-descriptor}})))
+
+(defn- fingerprint-or-nil [value]
+  (try (semantic-fingerprint/fingerprint value)
+       (catch clojure.lang.ExceptionInfo error
+         (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+           nil
+           (throw error)))))
+
+(defn- template-cache-key
+  [kind source revision target options pipeline-identity]
+  (let [semantic-request {:schema template-identity-schema
+                          :kind kind
+                          :source (:semantic source)
+                          :target (:semantic target)
+                          :options options}
+        family-request {:schema template-identity-schema
+                        :kind kind :source (:semantic source)}
+        semantic-id (fingerprint-or-nil semantic-request)
+        family-id (fingerprint-or-nil family-request)
+        persistence-blockers
+        (cond-> (into (:persistence-blockers source) (:persistence-blockers target))
+          (nil? semantic-id) (conj :unsupported-semantic-option)
+          (nil? family-id) (conj :unsupported-source-identity))]
+    {:kind kind
+     ;; Retain the structural value as the in-process equality fallback when callers supply an
+     ;; unsupported option. Such entries are never eligible for persistence.
+     :semantic-request semantic-request
+     :semantic-fingerprint semantic-id
+     :family-fingerprint family-id
+     :persistent-cache-eligible?
+     (and (empty? persistence-blockers) semantic-id family-id
+          (:persistent-cache-eligible? source)
+          (:persistent-cache-eligible? target))
+     :persistence-blockers persistence-blockers
+     :guards {:compiler-revision revision
+              :source-root-identity (:root-identity source)
+              :pipeline-identity pipeline-identity}}))
+
+(defn- compilation-miss-reason [entries key]
+  (let [keys (keys entries)
+        semantic-id (:semantic-fingerprint key)
+        family-id (:family-fingerprint key)]
+    (cond
+      (and semantic-id
+           (some #(= semantic-id (:semantic-fingerprint %)) keys)) :invalidation
+      (and family-id
+           (some #(= family-id (:family-fingerprint %)) keys)) :specialization
+      :else :compulsory)))
 
 (defn- cached-compilation-template
   [key compiler thunk]
@@ -173,20 +253,31 @@
         (swap-vals! compilation-template-cache
                     #(if (contains? % key) % (assoc % key candidate)))
         hit? (contains? before key)
+        miss-reason (when-not hit? (compilation-miss-reason before key))
         entry (get after key)
         resolution-started (System/nanoTime)]
     (swap! compilation-template-stats update (if hit? :hits :misses) inc)
+    (when miss-reason
+      (swap! compilation-template-stats update-in [:misses-by-reason miss-reason] (fnil inc 0)))
     (try
       (let [value @(:value entry)]
         (when *compilation-template-observer*
           (*compilation-template-observer*
            {:compiler compiler :cache-hit? hit? :success? true
+            :miss-reason miss-reason
+            :semantic-fingerprint (:semantic-fingerprint key)
+            :persistent-cache-eligible? (:persistent-cache-eligible? key)
+            :persistence-blockers (:persistence-blockers key)
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         value)
       (catch Throwable error
         (when *compilation-template-observer*
           (*compilation-template-observer*
            {:compiler compiler :cache-hit? hit? :success? false
+            :miss-reason miss-reason
+            :semantic-fingerprint (:semantic-fingerprint key)
+            :persistent-cache-eligible? (:persistent-cache-eligible? key)
+            :persistence-blockers (:persistence-blockers key)
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         ;; A failed compilation is not a durable negative result: a hot reload or newly registered
         ;; specialization may make the same request valid on its next attempt.
@@ -348,15 +439,17 @@
           ;; the RESOLVED schedule is read back off the descriptor below (never the raw
           ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
           schedule (conj :schedule schedule))
-        template-key (fn [revision]
-                       [::resident-template
-                        (source-specialization-identity fn-var dtype)
-                        revision
-                        (target-specialization-identity target)
-                        {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
-                         :on-non-resident on-non-resident :schedule schedule}
-                        ;; Keeps with-redefs and hot compiler reloads honest.
-                        (System/identityHashCode @#'pl/compile-gpu-program)])
+        template-key
+        (fn [revision]
+          (template-cache-key
+           ::resident-template
+           (source-specialization-identity fn-var dtype)
+           revision
+           (target-specialization-identity target)
+           {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
+            :on-non-resident on-non-resident :schedule schedule}
+           ;; Keeps with-redefs and hot compiler reloads honest.
+           (System/identityHashCode @#'pl/compile-gpu-program)))
         prog (binding [*compilation-template-observer* #(reset! template-report %)]
                (stable-compilation-template
                 template-key :resident-descriptor
@@ -374,9 +467,12 @@
                                               (when result-sym [result-sym]) taps)))
         lowering-started (System/nanoTime)
         plan-id (compilation-id fn-var target dtype prog args)
-        plan-template-key [::resident-plan-template
-                           (template-key (get @template-report :compiler-revision))
-                           plan-id eff-roles public-symbols]
+        compiler-template-key (template-key (get @template-report :compiler-revision))
+        plan-template-key
+        {:kind ::resident-plan-template
+         :compiler-template-key compiler-template-key
+         :compiler-template-fingerprint (:semantic-fingerprint compiler-template-key)
+         :plan-id plan-id :roles eff-roles :public-symbols public-symbols}
         plan-template-report
         (cached-resident-plan-template
          plan-template-key
@@ -421,13 +517,15 @@
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident :gemm-precision])
         compilation-options (assoc compilation-options :target target :dtype dtype)
-        template-key (fn [revision]
-                       [::equation-first-template
-                        (source-specialization-identity fn-var dtype)
-                        revision
-                        (target-specialization-identity target)
-                        compilation-options
-                        (System/identityHashCode @#'equation-first/compile)])
+        template-key
+        (fn [revision]
+          (template-cache-key
+           ::equation-first-template
+           (source-specialization-identity fn-var dtype)
+           revision
+           (target-specialization-identity target)
+           compilation-options
+           (System/identityHashCode @#'equation-first/compile)))
         compilation (binding [*compilation-template-observer* #(reset! template-report %)]
                       (stable-compilation-template
                        template-key :equation-first

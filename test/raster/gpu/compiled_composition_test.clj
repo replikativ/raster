@@ -160,15 +160,35 @@
               stats (compiled/compilation-cache-stats)]
           (is (= 1 @compilations)
               "symbolic compilation is shared across concrete sizes and buffer identities")
-          (is (= {:hits 1 :misses 1 :compilations 1 :failures 0
+          (is (= {:hits 1 :misses 1 :misses-by-reason {:compulsory 1}
+                  :compilations 1 :failures 0
                   :entries 1 :entries-by-compiler {:resident-descriptor 1}}
                  (dissoc stats :compile-nanos)))
           (is (= first-input (get-in first [:in-tree 0 :default])))
           (is (= second-input (get-in second [:in-tree 0 :default])))
           (is (false? (get-in (compiled/preparation-report first)
                               [:template :cache-hit?])))
+          (is (= :compulsory (get-in (compiled/preparation-report first)
+                                     [:template :miss-reason])))
+          (is (string? (get-in (compiled/preparation-report first)
+                               [:template :semantic-fingerprint])))
+          (is (false? (get-in (compiled/preparation-report first)
+                              [:template :persistent-cache-eligible?]))
+              "an ordinary Var without retained deftm source is process-cache-only")
+          (is (contains? (get-in (compiled/preparation-report first)
+                                 [:template :persistence-blockers])
+                         :retained-deftm-source))
           (is (true? (get-in (compiled/preparation-report second)
                              [:template :cache-hit?])))
+          (is (nil? (get-in (compiled/preparation-report second)
+                            [:template :miss-reason])))
+          (is (= :compulsory
+                 (get-in (compiled/preparation-report first)
+                         [:resident-plan-template :miss-reason])))
+          (is (= :specialization
+                 (get-in (compiled/preparation-report second)
+                         [:resident-plan-template :miss-reason]))
+              "a new bound shape is not a failed compiler-template reuse")
           (is (every? #(and (integer? %) (not (neg? %)))
                       ((juxt :total-ns :link-plan-lowering-ns)
                        (compiled/preparation-report second))))
@@ -223,7 +243,8 @@
         (deliver release true)
         (is (= [:template :template] [@first-result @second-result]))
         (is (= 1 @calls))
-        (is (= {:hits 1 :misses 1 :compilations 1 :failures 0
+        (is (= {:hits 1 :misses 1 :misses-by-reason {:compulsory 1}
+                :compilations 1 :failures 0
                 :entries 1 :entries-by-compiler {:resident-descriptor 1}}
                (dissoc (compiled/compilation-cache-stats) :compile-nanos)))))
     (finally
@@ -257,7 +278,8 @@
       (is (false? (:cache-hit? @first-report)))
       (is (= 1 (:stabilization-attempts @second-report)))
       (is (true? (:cache-hit? @second-report)))
-      (is (= {:hits 1 :misses 2 :compilations 2 :failures 0
+      (is (= {:hits 1 :misses 2 :misses-by-reason {:compulsory 2}
+              :compilations 2 :failures 0
               :entries 1 :entries-by-compiler {:resident-descriptor 1}}
              (dissoc (compiled/compilation-cache-stats) :compile-nanos))))
     (finally
@@ -309,10 +331,12 @@
                     (fn [& _] (swap! compilations inc) (descriptor))]
         (compiled/lower #'component arguments {:target :ze:0})
         (dispatch/bump-compiler-definition-revision!)
-        (compiled/lower #'component arguments {:target :ze:0})
-        (is (= 2 @compilations)
-            "a changed inlined callee cannot reuse a pre-redefinition template")
-        (is (= 2 (:entries (compiled/compilation-cache-stats))))))
+        (let [second (compiled/lower #'component arguments {:target :ze:0})]
+          (is (= 2 @compilations)
+              "a changed inlined callee cannot reuse a pre-redefinition template")
+          (is (= :invalidation
+                 (get-in (compiled/preparation-report second) [:template :miss-reason])))
+          (is (= 2 (:entries (compiled/compilation-cache-stats)))))))
     (finally
       (compiled/clear-compilation-cache!))))
 
