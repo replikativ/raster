@@ -926,8 +926,16 @@
    owns this compilation.  Once the generic region proof admits at least one fused pair, however,
   its emitted graph is authoritative and is projected through the existing executable marker ABI."
   [semantic opts]
-  (when (= :typed-soac (:dialect semantic))
-    (let [typed (structured-route/promote-soac-program semantic opts)
+  (let [public-parameters (set (or (:public-parameters opts) (:active-params opts)))
+        representable (set/union (set (keys (:values semantic)))
+                                 (set (keys (:array-types opts)))
+                                 (set (keys (:scalar-types opts))))]
+    ;; A value-type public parameter may already have been scalar-replaced into physical leaves.
+    ;; Until typed invocation represents that composite boundary directly, this optional route
+    ;; must abstain before promotion; the unchanged resident suffix owns the SoA program.
+    (when (and (= :typed-soac (:dialect semantic))
+               (set/subset? public-parameters representable))
+      (let [typed (structured-route/promote-soac-program semantic opts)
           scheduled (structured-route/schedule-program typed opts)
           plans (parallel-program-c-family/product-consumer-plans scheduled)]
       (when (seq plans)
@@ -948,7 +956,7 @@
                      :semantic semantic
                      :scheduled scheduled
                      :emitted-program (:program emission)
-                     :backend :opencl))))))))
+                     :backend :opencl)))))))))
 
 (defn- pass-materialize
   "Materialize pure par/map forms into alloc + par/map! for backend consumption.
