@@ -16,6 +16,18 @@
   [a :- Double, b :- Double] :- Double
   (raster.numeric/+ a b))
 
+(deftm ^{:raster.compiler/host-only true} host-orchestrator
+  [x :- Double] :- Double
+  x)
+
+(deftm ^{:raster.compiler/host-only true} mixed-capability
+  [x :- Double] :- Double
+  x)
+
+(deftm mixed-capability
+  [x :- Long] :- Long
+  x)
+
 (deftest no-inline-predicate
   (testing "^:no-inline lands on the generic var (var + qualified symbol)"
     (is (dispatch/no-inline? #'opaque-op))
@@ -31,3 +43,20 @@
   (testing "non-deftm / unresolvable symbols are not opaque"
     (is (not (dispatch/no-inline? 'some.unknown.ns/nope)))
     (is (not (dispatch/no-inline? 'not-qualified)))))
+
+(deftest host-only-predicate
+  (testing "the source capability lands on generic and devirtualized identities"
+    (is (dispatch/host-only? #'host-orchestrator))
+    (is (dispatch/host-only? 'raster.compiler.no-inline-test/host-orchestrator))
+    (is (dispatch/host-only?
+         'raster.compiler.no-inline-test/host-orchestrator_m_double)))
+  (testing "ordinary and unresolved functions are not classified as host-only"
+    (is (not (dispatch/host-only? #'plain-op)))
+    (is (not (dispatch/host-only? 'some.unknown.ns/nope))))
+  (testing "capability is specialization-local for mixed multiple dispatch"
+    (let [source-ns (the-ns 'raster.compiler.no-inline-test)
+          host-method (ns-resolve source-ns 'mixed-capability_m_double)
+          device-method (ns-resolve source-ns 'mixed-capability_m_long)]
+      (is (not (dispatch/host-only? #'mixed-capability)))
+      (is (dispatch/host-only? host-method))
+      (is (not (dispatch/host-only? device-method))))))

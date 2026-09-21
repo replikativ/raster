@@ -182,6 +182,12 @@
     (catch clojure.lang.ExceptionInfo exception
       (ex-data exception))))
 
+(deftest equation-first-rejects-explicit-host-orchestration-before-lowering
+  (is (= :equation-first-host-only
+         (:reason (reason-of #(equation-first/compile
+                              #'pde/solve-fixed-step
+                              {:target cuda-target :dtype :double}))))))
+
 (defn- nested-operations
   [operations]
   (mapcat (fn [operation]

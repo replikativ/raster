@@ -14,13 +14,15 @@
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.core :as rcore]))
 
 (defrecord EquationFirstCompilation
            [id function target dtype source-ns options semantic scheduled emitted kernels stats])
@@ -111,7 +113,16 @@
    (when-not (var? f-var)
      (fail! :equation-first-function "equation-first compilation requires a deftm Var"
             {:function f-var :actual (type f-var)}))
-   (let [compiler-options (compiler-options f-var target dtype
+   (when (dispatch/host-only? f-var)
+     (fail! :equation-first-host-only
+            "equation-first GPU compilation was requested for an explicitly host-only deftm"
+            {:function (function-symbol f-var) :target target}))
+   (let [resolved-var (or (rcore/resolve-deftm-var f-var {:dtype dtype :ambiguity :throw}) f-var)
+         _ (when (dispatch/host-only? resolved-var)
+             (fail! :equation-first-host-only
+                    "equation-first specialization resolved to an explicitly host-only method"
+                    {:function (function-symbol resolved-var) :target target :dtype dtype}))
+         compiler-options (compiler-options f-var target dtype
                                             (dissoc options :target))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))

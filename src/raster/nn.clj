@@ -162,7 +162,11 @@
 ;; Weight initialization
 ;; ================================================================
 
-(deftm xavier-init! (All [T]
+;; These APIs intentionally consume a stateful JVM RandomGenerator. They remain host orchestration;
+;; a future device initializer must use Raster's stateless counter/key RNG contract so results are
+;; invariant under workgroup scheduling, sharding, checkpoint, and replay.
+
+(deftm ^{:raster.compiler/host-only true} xavier-init! (All [T]
                          [rng :- Object, fan-in :- Long, fan-out :- Long, out :- (Array T)] :- (Array T)
                          "Xavier/Glorot uniform initialization. Fills out with U[-limit, limit]
   where limit = sqrt(6 / (fan-in + fan-out)).
@@ -174,7 +178,7 @@
                              (aset out i (- (* (aget out i) 2.0 limit) limit)))
                            out)))
 
-(deftm kaiming-init! (All [T]
+(deftm ^{:raster.compiler/host-only true} kaiming-init! (All [T]
                           [rng :- Object, fan-in :- Long, out :- (Array T)] :- (Array T)
                           "Kaiming/He normal initialization for ReLU networks. Fills out with
   N(0, sqrt(2/fan-in)). Returns out for chaining."

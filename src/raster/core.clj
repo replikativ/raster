@@ -809,7 +809,9 @@
                           ::deftm-source-ns '~(symbol (str *ns*))
                           ::deftm-source-body (:source-body reg#)
                           ::deftm-walked-body (:walked-body reg#)
-                          ::deftm-walked-body-typed (:walked-body-typed reg#)))
+                          ::deftm-walked-body-typed (:walked-body-typed reg#)
+                          :raster.compiler/host-only
+                          ~(boolean (:raster.compiler/host-only (meta fn-name)))))
            ~(when ret-tag
               `(alter-meta! (var ~mangled) assoc ::return-tag '~ret-tag))
            ~(when (seq fn-param-checks)

@@ -4,7 +4,7 @@
    The compiler's coverage claim is measured, not asserted: every source `deftm` in the corpus
    namespaces is compiled through the diagnostic pipeline for a GPU target and the normalized
    report records which route it took (`:typed-soac`, `:typed-structured-control`,
-   `:compatibility`, `:scalar`), every
+   explicit `:host-only`, `:compatibility`, `:scalar`), every
    route decline with its reason and operation, and any hard error. A committed baseline turns
    this into a ratchet (`ratchet-violations`): a function that took the typed route may not fall
    back, and a function that compiled may not start failing.
@@ -98,22 +98,25 @@
   [v {:keys [target-device dtype] :or {dtype :float}}]
   (let [effective-dtype (effective-corpus-dtype v dtype)
         row {:var (var-symbol v) :dtype effective-dtype}]
-    (try
-      (let [pipeline (pipeline/show-pipeline v :target-device target-device
-                                             :dtype effective-dtype)
-            report (report/from-pipeline pipeline)
-            orders (effect-order-facts pipeline)]
-        (cond-> (assoc row
-                       :route (get-in report [:route :source-dialect])
-                       :typed-validated (boolean (get-in report [:route :typed-validated]))
-                       :declines (decline-facts (get-in report [:route :declines]))
-                       ;; TypedSOAC frontend coverage does not imply KernelBody emission.
-                       ;; Retain the existing normalized emitter evidence from this SAME compile.
-                       :emission (:emission report)
-                       :emission-declines (count (get-in report [:emission :declines])))
-          (seq orders) (assoc :effect-orders orders)))
-      (catch Throwable t
-        (assoc row :route :error :error (error-reason t))))))
+    (if (dispatch/host-only? v)
+      (assoc row :route :host-only :typed-validated false
+             :declines [] :host-contract :explicit)
+      (try
+        (let [pipeline (pipeline/show-pipeline v :target-device target-device
+                                               :dtype effective-dtype)
+              report (report/from-pipeline pipeline)
+              orders (effect-order-facts pipeline)]
+          (cond-> (assoc row
+                         :route (get-in report [:route :source-dialect])
+                         :typed-validated (boolean (get-in report [:route :typed-validated]))
+                         :declines (decline-facts (get-in report [:route :declines]))
+                         ;; TypedSOAC frontend coverage does not imply KernelBody emission.
+                         ;; Retain the existing normalized emitter evidence from this SAME compile.
+                         :emission (:emission report)
+                         :emission-declines (count (get-in report [:emission :declines])))
+            (seq orders) (assoc :effect-orders orders)))
+        (catch Throwable t
+          (assoc row :route :error :error (error-reason t)))))))
 
 (defn corpus-report
   "Route facts for every corpus var, with a summary by route."
@@ -132,7 +135,10 @@
 
 (def route-rank
   "Routes ordered from best to worst; a move down this order is a regression."
-  {:typed-soac 0 :typed-structured-control 0 :compatibility 1 :scalar 2 :error 3})
+  {:typed-soac 0 :typed-structured-control 0
+   ;; Explicit host capability is honest and supported, but adding it to an established typed
+   ;; device program is still a coverage regression.
+   :host-only 1 :compatibility 1 :scalar 2 :error 3})
 
 (defn ratchet-violations
   "Ways in which `report` regressed against `baseline`.
