@@ -3,7 +3,8 @@
    source schedule. Both candidates use the public Compiled lifecycle; no result promotes a
    schedule or changes runtime policy."
   (:refer-clojure :exclude [run!])
-  (:require [raster.gpu.compiled :as compiled]
+  (:require [raster.compiler.reference.ggml-q4 :as serial-reference]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
             [raster.quant.ggml :as ggml]
@@ -12,10 +13,10 @@
 
 (def candidate-specs
   [{:id :generated-product
-    :entry #'kernels/qdot-q4-K-product-rows!
+    :entry #'kernels/qdot-q4-K-rows!
     :compiler :equation-first}
    {:id :serial-source
-    :entry #'kernels/qdot-q4-K-rows!
+    :entry #'serial-reference/serial-qdot-q4-K-rows!
     :compiler :resident-descriptor}])
 
 (defn validate-options!

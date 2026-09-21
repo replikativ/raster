@@ -149,7 +149,7 @@
                                   :max-workgroup-size 256
                                   :shared-local-memory 65536}})
         compilation
-        (equation-first/compile #'ggml-kernels/qdot-q6-K-product-rows!
+        (equation-first/compile #'ggml-kernels/qdot-q6-K-rows!
                                 {:target target :dtype :float})
         fused (peek (get-in compilation [:emitted :equations]))
         emitted-equation (first (:operations fused))
@@ -197,7 +197,7 @@
                                   :simd-width 16
                                   :max-workgroup-size 256
                                   :shared-local-memory 65536}})
-        compilation (equation-first/compile #'ggml-kernels/qdot-q4-K-product-rows!
+        compilation (equation-first/compile #'ggml-kernels/qdot-q4-K-rows!
                                             {:target target :dtype :float})
         artifact (first (:kernels compilation))
         operations (tree-seq coll? seq

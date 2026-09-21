@@ -472,10 +472,10 @@
                  #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
-                 #'ggml-kernels/qdot-q6-K-product-rows!
+                 #'ggml-kernels/qdot-q6-K-rows!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
-                 #'ggml-kernels/qdot-q4-K-product-rows!
+                 #'ggml-kernels/qdot-q4-K-rows!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
