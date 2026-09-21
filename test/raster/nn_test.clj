@@ -85,3 +85,8 @@
     (is (not (identical? gradient copied)))
     (aset ^doubles copied 0 9.0)
     (is (= 1.0 (aget ^doubles gradient 0)))))
+
+(deftest allocating-dense-weight-gradient-is-row-major
+  (is (= [3.0 4.0 5.0 6.0 8.0 10.0]
+         (vec (nn/dense-backward-dW (double-array [1.0 2.0])
+                                    (double-array [3.0 4.0 5.0]))))))

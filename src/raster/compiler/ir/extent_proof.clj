@@ -15,11 +15,16 @@
   (cond
     (symbol? form) (get environment form)
     (and (integer? form) (<= 0 form Long/MAX_VALUE))
-    {:dtype :long :product (algebra/monomial form)}
+    {:dtype :long :product (algebra/monomial form) :nonnegative true}
     (seq? form)
     (let [op (descriptor/semantic-op form)
           operands (mapv #(expression environment %) (descriptor/call-args form))]
       (cond
+        (and (descriptor/alength-op? op) (= 1 (count operands)))
+        ;; Array length is the source-language proof that a later guarded rectangular domain is
+        ;; nonnegative. Its SSA result receives its own monomial identity in `advance` below.
+        {:dtype :long :nonnegative true}
+
         (and (descriptor/cast-op? op) (= 1 (count operands)))
         (let [operand (first operands)
               target (some-> (descriptor/cast-result-tag op) dtype/dtype-for-scalar-tag)]
@@ -29,8 +34,23 @@
         ;; Raster's Integer multiplication wraps; its Long specialization is checked.
         (and (descriptor/multiplication-op? op) (seq operands)
              (every? #(and (= :long (:dtype %)) (:product %)) operands))
-        (try {:dtype :long :product (apply algebra/product (map :product operands))}
-             (catch ArithmeticException _ nil))))))
+        (try {:dtype :long :product (apply algebra/product (map :product operands))
+              :nonnegative (every? :nonnegative operands)}
+             (catch ArithmeticException _ nil))
+
+        ;; `positive-product` retains Clojure dotimes' empty-domain behavior as nested
+        ;; `(if (< d 1) 0 product)` guards. It equals the mathematical product only when every
+        ;; factor is proved nonnegative (for example, each came from alength); arbitrary public
+        ;; Long scalars must not acquire that assumption.
+        (algebra/monomial form)
+        (let [{:keys [const factors]} (algebra/monomial form)
+              factors (mapv #(expression environment %) factors)]
+          (when (every? #(and (= :long (:dtype %)) (:product %) (:nonnegative %)) factors)
+            (try {:dtype :long
+                  :product (apply algebra/product
+                                  (algebra/monomial const) (map :product factors))
+                  :nonnegative true}
+                 (catch ArithmeticException _ nil))))))))
 
 (defn- opaque-value [id value]
   (when (and (= :tensor (:kind value)) (= [] (:shape value))
@@ -69,7 +89,11 @@
                                             (when (= dtype (:dtype proof)) proof))))
                                  local-env locals)]
            (reduce (fn [env [id form]]
-                     (let [proof (expression local-env form)]
+                     (let [proof (expression local-env form)
+                           proof (when proof
+                                   (cond-> proof
+                                     (nil? (:product proof))
+                                     (assoc :product (algebra/monomial id))))]
                        (if (and proof (= (:dtype (get env id)) (:dtype proof)))
                          (assoc env id proof) env)))
                    after (map vector (nth equation 2) body-results)))))))

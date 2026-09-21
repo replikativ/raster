@@ -23,6 +23,28 @@
     (is (not (proof/same-volume? environment 9 [8])))
     (is (proof/same-volume? environment 8 [2 4]))))
 
+(deftest guarded-rectangular-products-require-nonnegative-factor-proofs
+  (let [guarded '(if (< m 1) 0 (if (< n 1) 0 (* m n)))
+        nonnegative (update-vals environment #(assoc % :nonnegative true))]
+    (is (proof/same-volume? nonnegative guarded '[m n]))
+    (is (not (proof/same-volume? environment guarded '[m n]))
+        "arbitrary public Long dimensions may be negative")))
+
+(deftest array-length-results-carry-a-nonnegative-extent-witness
+  (let [equation '(= length [n]
+                     (scalar {:dtypes [:long]} [input]
+                             (lambda [array] (region [] [(clojure.core/alength array)]))))
+        facts (dialect/default-program-facts
+               {:inputs '[input]
+                :values {'input (av/tensor {:dtype :float :shape ['?]})
+                         'n (av/tensor {:dtype :long :shape []})}
+                :equations {'length (dialect/default-equation-facts {})}})
+        environment (proof/advance (proof/initial-environment
+                                    (dialect/make facts [equation] '[n]))
+                                   facts equation)]
+    (is (true? (:nonnegative (get environment 'n))))
+    (is (proof/same-volume? environment 'n '[n]))))
+
 (deftest scalar-witnesses-become-available-only-after-their-definition
   (let [equation '(= product [p]
                      (scalar {:dtypes [:long]} [m n]
