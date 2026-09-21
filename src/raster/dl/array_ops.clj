@@ -1073,12 +1073,9 @@
   "Backward for bias: dbias[0] = sum_v(dy[v])"
   [dy :- (Array double) n-rows :- Long]
   :- (Array double)
-  (let [out (double-array 1)]
-    (loop [v 0 acc 0.0]
-      (if (< v n-rows)
-        (recur (inc v) (+ acc (aget dy v)))
-        (aset out 0 acc)))
-    out))
+  (par/map [output 1]
+           (par/reduce acc 0.0 v n-rows
+                       (+ acc (aget dy v)))))
 
 ;; ================================================================
 ;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]!=1)

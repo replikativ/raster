@@ -13,6 +13,7 @@
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.dl.array-ops :as array-ops]
             [raster.dl.nn :as dl-nn]
             [raster.nn :as nn]))
 
@@ -418,3 +419,13 @@
            (:lowering report)))
     (is (= (vec (apply nn/predict-fn args))
            (vec (apply fast args))))))
+
+(deftest allocated-singleton-reduction-is-an-ordinary-typed-map-reduce
+  (let [report (pipeline/compile-report
+                #'array-ops/dot-rows-dbias :target-device :ocl:0 :dtype :double)
+        result (array-ops/dot-rows-dbias (double-array [1.25 -2.0 4.5 0.25]) 4)]
+    (is (= [4.0] (vec result)))
+    (is (= :typed-soac (get-in report [:route :source-dialect])))
+    (is (true? (get-in report [:route :typed-validated])))
+    (is (= {:kernel-body 1} (get-in report [:emission :routes])))
+    (is (empty? (get-in report [:emission :declines])))))
