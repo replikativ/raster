@@ -71,6 +71,25 @@
     (is (identical? x (get-in plan [:nodes :x :source])))
     (is (= :allocation (get-in certificate [:values 'y :origin])))))
 
+(deftest trusted-resident-construction-derives-once
+  (let [derive-var (ns-resolve 'raster.compiler.ir.resident-plan 'derive-certificate)
+        derive @derive-var
+        calls (atom 0)]
+    (with-redefs-fn
+      {derive-var (fn [plan]
+                    (swap! calls inc)
+                    (derive plan))}
+      (fn []
+        (let [x (float-array 8)
+              lowering (resident/lower
+                        {:id :single-derivation :target :ze:0
+                         :descriptor (descriptor) :arguments [x (float-array 8) 8]})]
+          (is (= 1 @calls)
+              "trusted construction must not immediately re-derive its immutable witness")
+          (is (identical? lowering (resident/verify! lowering)))
+          (is (= 2 @calls)
+              "the public verification boundary independently re-derives the witness"))))))
+
 (deftest external-ownership-is-not-mistaken-for-host-initialization
   (let [lowering (resident/lower
                   {:id :external :target :ze:0 :descriptor (descriptor)
