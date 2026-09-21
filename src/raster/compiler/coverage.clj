@@ -14,9 +14,12 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pp]
+            [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
-            [raster.compiler.report :as report]))
+            [raster.compiler.report :as report]
+            [raster.core :as rcore]))
 
 (def default-namespaces
   "Corpus namespaces: the deep-learning substrate, the ODE/PDE surface and the NN primitives."
@@ -76,12 +79,28 @@
                        (and (= 'scatter kind) (= :unique (:conflict attributes))))]
          (if (= 'scatter kind) :independent (:iteration-order attributes)))))))
 
+(defn- effective-corpus-dtype
+  "Use a fixed deftm's retained element dtype; use the requested corpus dtype for an overloaded
+   or parametric deftm.  Compiling an unambiguous `(Array double)` function under `:float` does
+   not test a real specialization and can falsely classify otherwise covered source as scalar."
+  [v requested-dtype]
+  (if (contains? @dispatch/parametric-registry (var-symbol v))
+    (or requested-dtype :float)
+    (let [resolved (try
+                     (rcore/resolve-deftm-var v {:dtype nil})
+                     (catch clojure.lang.ExceptionInfo _ nil))]
+      (or (some-> resolved meta :raster.core/deftm-tags dtype/infer-dtype-from-tags)
+          requested-dtype
+          :float))))
+
 (defn report-var
   "Compile one source deftm for `target-device` at `dtype` and reduce its report to route facts."
   [v {:keys [target-device dtype] :or {dtype :float}}]
-  (let [row {:var (var-symbol v)}]
+  (let [effective-dtype (effective-corpus-dtype v dtype)
+        row {:var (var-symbol v) :dtype effective-dtype}]
     (try
-      (let [pipeline (pipeline/show-pipeline v :target-device target-device :dtype dtype)
+      (let [pipeline (pipeline/show-pipeline v :target-device target-device
+                                             :dtype effective-dtype)
             report (report/from-pipeline pipeline)
             orders (effect-order-facts pipeline)]
         (cond-> (assoc row
