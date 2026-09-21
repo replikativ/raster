@@ -631,20 +631,19 @@
    n-a :- Long n-b :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
   :- (Array double)
-  (let [out (double-array (* n-pairs n-slices))]
-    (dotimes [e n-pairs]
-      (let [ia (aget idx-a e)
-            ib (aget idx-b e)]
-        (dotimes [s n-slices]
-          (let [off-a (+ (* ia (int total-dim)) (* s (int slice-dim)))
-                off-b (+ (* ib (int total-dim)) (* s (int slice-dim)))]
-            (loop [d 0 acc 0.0]
-              (if (< d slice-dim)
-                (recur (inc d)
-                       (+ acc (* (aget A (+ off-a d))
-                                 (aget B (+ off-b d)))))
-                (aset out (+ (* e (int n-slices)) s) acc)))))))
-    out))
+  (let [n-out (* n-pairs n-slices)
+        out (double-array n-out)]
+    (par/map!
+     out o n-out nil
+     (let [e (quot o n-slices)
+           s (rem o n-slices)
+           ia (aget idx-a e)
+           ib (aget idx-b e)
+           off-a (+ (* ia (int total-dim)) (* s (int slice-dim)))
+           off-b (+ (* ib (int total-dim)) (* s (int slice-dim)))]
+       (par/reduce acc 0.0 d slice-dim
+                   (+ acc (* (aget A (+ off-a d))
+                             (aget B (+ off-b d)))))))))
 
 (deftm indexed-dot-dA
   "Backward for A in indexed-dot.
