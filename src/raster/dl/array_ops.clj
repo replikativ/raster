@@ -813,13 +813,10 @@
   [src :- (Array double) n-rows :- Long n-cols :- Long]
   :- (Array double)
   (let [out (double-array n-cols)]
-    (dotimes [b n-rows]
-      (dotimes [d n-cols]
-        (let [idx (+ (* b (int n-cols)) d)]
-          (aset out d
-                (+ (aget out d)
-                   (aget src idx))))))
-    out))
+    (par/map!
+     out d n-cols nil
+     (par/reduce acc 0.0 b n-rows
+                 (+ acc (aget src (+ (* b (int n-cols)) d)))))))
 
 (deftm reduce-axis-backward
   "Backward for reduce-axis: broadcast dy to each row.
