@@ -88,6 +88,19 @@
     (is (= {:region-copies-expanded 1} stats))
     (is (= 'dotimes (first (nth conditional 2))))))
 
+(deftest a-copy-in-an-effect-map-body-is-a-statement
+  (let [form '(let* [effect (raster.par/map-void!
+                             block blocks
+                             (let* [src-off (* block width)
+                                    dst-off (* block width)]
+                               (java.lang.System/arraycopy src src-off dst dst-off width)))]
+                dst)
+        {:keys [form stats]}
+        (region-copy/expand-region-copies form :param-env '{src doubles dst doubles})]
+    (is (= {:region-copies-expanded 1} stats))
+    (is (some #(and (seq? %) (= 'dotimes (first %)))
+              (tree-seq coll? seq form)))))
+
 (deftest disagreeing-element-tags-keep-the-call
   ;; float[] → double[] is not one copy (the JVM rejects the call); nothing to spell
   (let [call '(java.lang.System/arraycopy src (int 0) out (int 0) n)

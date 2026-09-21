@@ -1258,15 +1258,24 @@
                                               batch :- Long c-out :- Long h-out :- Long w-out :- Long] :- (Array T)
                                              (let [hw-out (* h-out w-out)
                                                    chw-out (* c-out hw-out)
-                                                   bhw (* batch hw-out)]
-    ;; Rearrange dy[B, c_out, hw] -> dy_cols[c_out, B*hw]
-    ;; Tight copy per (co, bi) block — sequential memory access
-                                               (dotimes [co c-out]
-                                                 (dotimes [bi batch]
-                                                   (let [src-base (+ (* bi (int chw-out)) (* co (int hw-out)))
-                                                         dst-base (+ (* co (int bhw)) (* bi (int hw-out)))]
-                                                     (System/arraycopy dy src-base dy-cols dst-base hw-out)))))
-                                             dy-cols))
+                                                   bhw (* batch hw-out)
+                                                   blocks (* c-out batch)]
+                                               ;; dy[B,C,HW] -> dy-cols[C,B,HW].  At runtime each
+                                               ;; independent block remains a JVM arraycopy; the
+                                               ;; compiler's general region-copy pass spells the
+                                               ;; same body as typed stores for accelerator
+                                               ;; scheduling.  This preserves both representations
+                                               ;; without a target branch in the numerical API.
+                                               (raster.par/map-void!
+                                                block blocks
+                                                (let [co (quot block batch)
+                                                      bi (rem block batch)
+                                                      src (+ (* bi (int chw-out))
+                                                             (* co (int hw-out)))
+                                                      dst (+ (* co (int bhw))
+                                                             (* bi (int hw-out)))]
+                                                  (System/arraycopy dy src dy-cols dst hw-out)))
+                                               dy-cols)))
 
 ;; dW = dy_cols @ cols^T via BLAS NT
 (deftm ^:no-inline conv2d-backward-dW-into! (All [T]
