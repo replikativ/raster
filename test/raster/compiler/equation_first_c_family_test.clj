@@ -17,6 +17,7 @@
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
             [raster.dl.array-ops :as array-ops]
+            [raster.dl.diffusion :as diffusion]
             [raster.dl.loss :as loss]
             [raster.dl.nn :as dl-nn]
             [raster.numeric]
@@ -710,6 +711,58 @@
       (is (= 1 (count (:kernels compilation))))
       (is (= :kernel-body
              (get-in compilation [:kernels 0 :attributes :emission-route])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-segment-div-z-adjoint-is-a-portable-segmented-reduction
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile #'array-ops/segment-div-dZ
+                                              {:target target :dtype :double})]
+      (is (= [module-target] (mapv :target (:kernels compilation))))
+      (is (= 1 (count (:kernels compilation))))
+      (is (= :kernel-body
+             (get-in compilation [:kernels 0 :attributes :emission-route])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-output-owned-adjoints-are-portable-segmented-reductions
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]
+          kernel [#'array-ops/scatter-mul-add-d-coeffs
+                  #'array-ops/flat-embed-d-values
+                  #'array-ops/flat-embed-dWe
+                  #'array-ops/flat-embed-dbe]]
+    (let [compilation (equation-first/compile kernel {:target target :dtype :double})]
+      (is (= [module-target] (mapv :target (:kernels compilation))))
+      (is (= 1 (count (:kernels compilation))))
+      (is (= :kernel-body
+             (get-in compilation [:kernels 0 :attributes :emission-route])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-diffusion-cumulative-product-is-a-portable-scan
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile #'diffusion/compute-alphas-cumprod
+                                              {:target target :dtype :float})]
+      (is (= 3 (count (:kernels compilation))))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
+                  (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest public-embedding-table-adjoints-use-portable-additive-scatters
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]
+          kernel [#'array-ops/flat-embed-d-space-emb
+                  #'array-ops/flat-embed-d-state-emb]]
+    (let [compilation (equation-first/compile kernel {:target target :dtype :float})]
+      (is (seq (:kernels compilation)))
+      (is (every? #(= module-target (:target %)) (:kernels compilation)))
+      (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
+                  (:kernels compilation)))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest product-reduction-composes-with-an-ordered-epilogue

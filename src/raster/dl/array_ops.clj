@@ -732,20 +732,19 @@
    dst-indices :- (Array long) src-indices :- (Array long)
    n-pairs :- Long slice-dim :- Long total-dim :- Long n-slices :- Long]
   :- (Array double)
-  (let [out (double-array (* n-pairs n-slices))]
-    (dotimes [e n-pairs]
-      (let [dst-node (aget dst-indices e)
-            src-node (aget src-indices e)]
-        (dotimes [s n-slices]
-          (let [off-dst (+ (* dst-node (int total-dim)) (* s (int slice-dim)))
-                off-src (+ (* src-node (int total-dim)) (* s (int slice-dim)))]
-            (loop [d 0 acc 0.0]
-              (if (< d slice-dim)
-                (recur (inc d)
-                       (+ acc (* (aget dy (+ off-dst d))
-                                 (aget src (+ off-src d)))))
-                (aset out (+ (* e (int n-slices)) s) acc)))))))
-    out))
+  (let [n-out (* n-pairs n-slices)
+        out (double-array n-out)]
+    (par/map!
+     out o n-out nil
+     (let [e (quot o n-slices)
+           s (rem o n-slices)
+           dst-node (aget dst-indices e)
+           src-node (aget src-indices e)
+           off-dst (+ (* dst-node (int total-dim)) (* s (int slice-dim)))
+           off-src (+ (* src-node (int total-dim)) (* s (int slice-dim)))]
+       (par/reduce acc 0.0 d slice-dim
+                   (+ acc (* (aget dy (+ off-dst d))
+                             (aget src (+ off-src d)))))))))
 
 (deftm scatter-mul-add-d-src
   "Backward for src in scatter-mul-add.
@@ -898,21 +897,19 @@
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
   :- (Array double)
   (let [dk (quot emb-dim n-heads)
-        dZ (double-array (* n-nodes n-heads))]
-    (dotimes [node n-nodes]
-      (dotimes [head n-heads]
-        (let [z-idx (+ (* node (int n-heads)) head)
-              z (+ (aget Z z-idx) eps)
-              z2 (* z z)
-              off (+ (* node (int emb-dim)) (* head (int dk)))]
-          (loop [d 0 acc 0.0]
-            (if (< d dk)
-              (let [idx (+ off d)]
-                (recur (inc d)
-                       (+ acc (* (aget dy idx)
-                                 (aget wV idx)))))
-              (aset dZ z-idx (- (/ acc z2))))))))
-    dZ))
+        n-segments (* n-nodes n-heads)
+        dZ (double-array n-segments)]
+    (par/map!
+     dZ z-idx n-segments nil
+     (let [node (quot z-idx n-heads)
+           head (rem z-idx n-heads)
+           z (+ (aget Z z-idx) eps)
+           z2 (* z z)
+           off (+ (* node (int emb-dim)) (* head (int dk)))]
+       (- (/ (par/reduce acc 0.0 d dk
+                          (+ acc (* (aget dy (+ off d))
+                                    (aget wV (+ off d)))))
+             z2))))))
 
 ;; ================================================================
 ;; flat-embed-op: out[v*d+j] = values[v]*We[j] + be[j]
@@ -949,15 +946,12 @@
    n-vars :- Long emb-dim :- Long]
   :- (Array double)
   (let [out (double-array n-vars)]
-    (dotimes [v n-vars]
-      (let [off (* v (int emb-dim))]
-        (loop [d 0 acc 0.0]
-          (if (< d emb-dim)
-            (recur (inc d)
+    (par/map!
+     out v n-vars nil
+     (let [off (* v (int emb-dim))]
+       (par/reduce acc 0.0 d emb-dim
                    (+ acc (* (aget dy (+ off d))
-                             (aget We d))))
-            (aset out v acc)))))
-    out))
+                             (aget We d))))))))
 
 (deftm flat-embed-dWe
   "Backward for We: dWe[j] = sum_v(dy[v*d+j] * values[v])"
@@ -965,55 +959,39 @@
    n-vars :- Long emb-dim :- Long]
   :- (Array double)
   (let [out (double-array emb-dim)]
-    (dotimes [v n-vars]
-      (let [val-v (aget values v)]
-        (dotimes [d emb-dim]
-          (aset out d
-                (+ (aget out d)
-                   (* (aget dy (+ (* v (int emb-dim)) d)) val-v))))))
-    out))
+    (par/map!
+     out d emb-dim nil
+     (par/reduce acc 0.0 v n-vars
+                 (+ acc (* (aget dy (+ (* v (int emb-dim)) d))
+                           (aget values v)))))))
 
 (deftm flat-embed-dbe
   "Backward for be: dbe[j] = sum_v(dy[v*d+j])"
   [dy :- (Array double) n-vars :- Long emb-dim :- Long]
   :- (Array double)
   (let [out (double-array emb-dim)]
-    (dotimes [v n-vars]
-      (dotimes [d emb-dim]
-        (aset out d
-              (+ (aget out d)
-                 (aget dy (+ (* v (int emb-dim)) d))))))
-    out))
+    (par/map!
+     out d emb-dim nil
+     (par/reduce acc 0.0 v n-vars
+                 (+ acc (aget dy (+ (* v (int emb-dim)) d)))))))
 
 (deftm flat-embed-d-space-emb
   "Backward for space-emb: d_se[spaces[v]*d+j] += dy[v*d+j]"
-  [dy :- (Array double) spaces :- (Array long)
-   n-vars :- Long emb-dim :- Long n-spaces :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-spaces emb-dim))]
-    (dotimes [v n-vars]
-      (let [sp (aget spaces v)]
-        (dotimes [d emb-dim]
-          (let [se-idx (+ (* sp (int emb-dim)) d)]
-            (aset out se-idx
-                  (+ (aget out se-idx)
-                     (aget dy (+ (* v (int emb-dim)) d))))))))
-    out))
+  (All [T] [dy :- (Array T) spaces :- (Array long)
+            n-vars :- Long emb-dim :- Long n-spaces :- Long]
+       :- (Array T)
+       (let [out (alloc-like dy (* n-spaces emb-dim))]
+         (par/scatter! out dy spaces n-vars emb-dim)
+         out)))
 
 (deftm flat-embed-d-state-emb
   "Backward for state-emb: d_ste[states[v]*d+j] += dy[v*d+j]"
-  [dy :- (Array double) states :- (Array long)
-   n-vars :- Long emb-dim :- Long n-states :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-states emb-dim))]
-    (dotimes [v n-vars]
-      (let [st (aget states v)]
-        (dotimes [d emb-dim]
-          (let [ste-idx (+ (* st (int emb-dim)) d)]
-            (aset out ste-idx
-                  (+ (aget out ste-idx)
-                     (aget dy (+ (* v (int emb-dim)) d))))))))
-    out))
+  (All [T] [dy :- (Array T) states :- (Array long)
+            n-vars :- Long emb-dim :- Long n-states :- Long]
+       :- (Array T)
+       (let [out (alloc-like dy (* n-states emb-dim))]
+         (par/scatter! out dy states n-vars emb-dim)
+         out)))
 
 ;; ================================================================
 ;; dot-rows: out[v] = h[v,:] · W + bias[0]
