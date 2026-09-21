@@ -684,10 +684,11 @@
           (throw (ex-info "runtime link allocations cannot be reinterpreted across dtypes"
                           {:reason :link-allocation-reinterpret :allocation allocation-id
                            :dtypes dtypes})))))
-    (doseq [[left-id left] nodes
-            [right-id right] nodes
-            :when (neg? (compare (pr-str left-id) (pr-str right-id)))
-            :when (bview/overlaps? (:view left) (:view right))]
+    (doseq [[left-id right-id]
+            (bview/overlapping-id-pairs
+             (map (fn [[id node]] [id (:view node)]) nodes))
+            :let [left (get nodes left-id)
+                  right (get nodes right-id)]]
       (let [pair #{left-id right-id}]
         (when-not (contains? aliases pair)
           (throw (ex-info "overlapping link nodes require an explicit alias declaration"

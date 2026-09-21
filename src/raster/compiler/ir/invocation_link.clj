@@ -449,10 +449,9 @@
       :nodes nodes
       :values values
       :instances [instance]
-      :aliases (into #{} (for [left nodes right nodes
-                              :when (and (not= (:id left) (:id right))
-                                         (bview/overlaps? (:view left) (:view right)))]
-                          #{(:id left) (:id right)}))
+      :aliases (into #{} (map set)
+                     (bview/overlapping-id-pairs
+                      (map (juxt :id :view) nodes)))
       :outputs (mapv val resident-outputs)
       :attributes {:source :typed-invocation
                    :invocation-plan invocation-id

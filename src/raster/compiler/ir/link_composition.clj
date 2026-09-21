@@ -390,12 +390,9 @@
                                               instance))
                         (get-in lowering [:plan :instances])))
                  components))
-        aliases (into #{}
-                      (for [[left-id left] nodes
-                            [right-id right] nodes
-                            :when (neg? (compare (pr-str left-id) (pr-str right-id)))
-                            :when (bview/overlaps? (:view left) (:view right))]
-                        #{left-id right-id}))
+        aliases (into #{} (map set)
+                      (bview/overlapping-id-pairs
+                       (map (fn [[id node]] [id (:view node)]) nodes)))
         output-value-ids (mapv value-mapping outputs)
         output-ids (vec (mapcat #(map :node (get-in values [% :leaves])) output-value-ids))
         plan (link-plan/make

@@ -34,6 +34,20 @@
     (is (not (view/overlaps? empty base)))
     (is (view/disjoint? base empty))))
 
+(deftest overlapping-pairs-are-local-to-one-device-allocation
+  (let [other-allocation (assoc allocation :id :other)
+        whole (view/view allocation {:id :whole :dtype :float :shape [16]})
+        prefix (view/view allocation {:id :prefix :dtype :float :shape [8]})
+        tail (view/view allocation {:id :tail :dtype :float :byte-offset 32 :shape [8]})
+        empty (view/view allocation {:id :empty :dtype :float :shape [0]})
+        unrelated (view/view other-allocation {:id :unrelated :dtype :float :shape [16]})]
+    (is (= #{#{:whole :prefix} #{:whole :tail}}
+           (into #{} (map set)
+                 (view/overlapping-id-pairs
+                  [[:whole whole] [:prefix prefix] [:tail tail]
+                   [:empty empty] [:unrelated unrelated]]))))
+    (is (= [] (view/overlapping-id-pairs [])))))
+
 (deftest regional-writes-preserve-untouched-initialization
   (let [base (view/view allocation {:dtype :double :shape [8]})
         cut (view/view allocation {:dtype :double :byte-offset 16 :shape [2]})
