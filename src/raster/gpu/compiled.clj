@@ -20,13 +20,16 @@
    here hardcodes `:ze`."
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pl]
+            [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.value :as v]))
@@ -61,6 +64,85 @@
 
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
+
+;; Compilation templates are immutable and argument-independent.  LinkPlan lowering below still
+;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
+;; process-local cache or leak between instances.
+(defonce ^:private compilation-template-cache (atom {}))
+(defonce ^:private compilation-template-stats
+  (atom {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0}))
+
+(defn clear-compilation-cache!
+  "Clear reusable compiler templates and their counters. Runtime modules, buffers, and tuning
+   results belong to their respective caches and are deliberately unaffected."
+  []
+  (reset! compilation-template-cache {})
+  (reset! compilation-template-stats
+          {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0})
+  nil)
+
+(defn compilation-cache-stats
+  "Small, source-free instrumentation for structural compilation reuse."
+  []
+  (let [entries @compilation-template-cache]
+    (assoc @compilation-template-stats
+           :entries (count entries)
+           :entries-by-compiler (frequencies (map (comp :compiler val) entries)))))
+
+(defn- qualified-var-symbol [v]
+  (let [{:keys [ns name]} (meta v)]
+    (when (and ns name) (symbol (str (ns-name ns)) (str name)))))
+
+(defn- source-specialization-identity
+  [fn-var dtype]
+  (let [resolved (or (try
+                       (rcore/resolve-deftm-var fn-var {:dtype dtype :ambiguity :throw})
+                       (catch clojure.lang.ExceptionInfo _ nil))
+                     fn-var)
+        metadata (meta resolved)]
+    {:requested (qualified-var-symbol fn-var)
+     :resolved (qualified-var-symbol resolved)
+     :tags (:raster.core/deftm-tags metadata)
+     :source-hash (hash (:raster.core/deftm-source-body metadata))
+     ;; Redefinition with textually equal source must not retain compiler state tied to an old Var
+     ;; root (for example a changed closed-over helper or dispatch table).
+     :root-identity (System/identityHashCode @resolved)}))
+
+(defn- target-specialization-identity [target]
+  [target
+   (try (hash (hardware/descriptor-for target))
+        (catch Throwable _ nil))])
+
+(defn- cached-compilation-template
+  [key compiler thunk]
+  (let [candidate
+        {:compiler compiler
+         :value (delay
+                  (let [started (System/nanoTime)]
+                    (try
+                      (let [value (thunk)]
+                        (swap! compilation-template-stats update :compilations inc)
+                        value)
+                      (catch Throwable error
+                        (swap! compilation-template-stats update :failures inc)
+                        (throw error))
+                      (finally
+                        (swap! compilation-template-stats update :compile-nanos +
+                               (- (System/nanoTime) started))))))}
+        [before after]
+        (swap-vals! compilation-template-cache
+                    #(if (contains? % key) % (assoc % key candidate)))
+        hit? (contains? before key)
+        entry (get after key)]
+    (swap! compilation-template-stats update (if hit? :hits :misses) inc)
+    (try
+      @(:value entry)
+      (catch Throwable error
+        ;; A failed compilation is not a durable negative result: a hot reload or newly registered
+        ;; specialization may make the same request valid on its next attempt.
+        (swap! compilation-template-cache
+               #(if (identical? entry (get % key)) (dissoc % key) %))
+        (throw error)))))
 
 ;; ================================================================
 ;; Role derivation (§4.2) and tree construction
@@ -152,13 +234,24 @@
   [fn-var args {:keys [target dtype donate constants outputs taps roles
                        gemm-precision on-non-resident schedule]
                 :or {target :ze:0 dtype :float on-non-resident :nil}}]
-  (let [prog (apply pl/compile-gpu-program fn-var target
-                    (cond-> [:dtype dtype :on-non-resident on-non-resident]
-                      gemm-precision (conj :gemm-precision gemm-precision)
-                      ;; forward the S6 schedule so it is resolved + gated by compile-gpu-program;
-                      ;; the RESOLVED schedule is read back off the descriptor below (never the raw
-                      ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
-                      schedule (conj :schedule schedule)))
+  (let [compile-arguments
+        (cond-> [:dtype dtype :on-non-resident on-non-resident]
+          gemm-precision (conj :gemm-precision gemm-precision)
+          ;; forward the S6 schedule so it is resolved + gated by compile-gpu-program;
+          ;; the RESOLVED schedule is read back off the descriptor below (never the raw
+          ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
+          schedule (conj :schedule schedule))
+        template-key [::resident-template
+                      (source-specialization-identity fn-var dtype)
+                      (dispatch/compiler-definition-revision)
+                      (target-specialization-identity target)
+                      {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
+                       :on-non-resident on-non-resident :schedule schedule}
+                      ;; Keeps with-redefs and hot compiler reloads honest.
+                      (System/identityHashCode @#'pl/compile-gpu-program)]
+        prog (cached-compilation-template
+              template-key :resident-descriptor
+              #(apply pl/compile-gpu-program fn-var target compile-arguments))
         _ (when-not prog
             (throw (ex-info "compile: compile-gpu-program returned nil — a step fell back to host (non-resident). Pass :on-non-resident :throw to see which."
                             {:fn fn-var :target target})))
@@ -198,8 +291,16 @@
   (let [compilation-options (apply dissoc opts
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident :gemm-precision])
-        compilation (equation-first/compile
-                     fn-var (assoc compilation-options :target target :dtype dtype))
+        compilation-options (assoc compilation-options :target target :dtype dtype)
+        template-key [::equation-first-template
+                      (source-specialization-identity fn-var dtype)
+                      (dispatch/compiler-definition-revision)
+                      (target-specialization-identity target)
+                      compilation-options
+                      (System/identityHashCode @#'equation-first/compile)]
+        compilation (cached-compilation-template
+                     template-key :equation-first
+                     #(equation-first/compile fn-var compilation-options))
         raw-plan (equation-first/lower compilation args)
         attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)

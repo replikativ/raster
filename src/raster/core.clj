@@ -573,6 +573,7 @@
                               ::deftm-source-ns '~(symbol (str *ns*))
                               ::deftm-params '~(vec clean-params)
                               ::deftm-tags '~tags))
+               (dispatch/bump-compiler-definition-revision!)
                (var ~name)))
         ;; Multi-arity or walk failed — store only params/tags
         (if clean-params
@@ -581,6 +582,7 @@
                             ::deftm-source-ns '~(symbol (str *ns*))
                             ::deftm-params '~(vec clean-params)
                             ::deftm-tags '~tags)
+               (dispatch/bump-compiler-definition-revision!)
                (var ~name))
           defn-form)))))
 
@@ -1417,6 +1419,7 @@
           reducible? (::reducible m)
           fn-name (symbol (clojure.core/name (:name m)))]
       (alter-var-root fn-var (constantly (dispatch/make-dispatch-fn fn-name table-atom reducible?))))
+    (dispatch/bump-compiler-definition-revision!)
     fn-var))
 
 (defn remove-method!
@@ -1438,6 +1441,7 @@
           reducible? (::reducible m)
           fn-name (symbol (clojure.core/name (:name m)))]
       (alter-var-root fn-var (constantly (dispatch/make-dispatch-fn fn-name table-atom reducible?))))
+    (dispatch/bump-compiler-definition-revision!)
     fn-var))
 
 (defn ^:no-doc specialize-fn!

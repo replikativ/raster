@@ -1,5 +1,6 @@
 (ns raster.gpu.compiled-composition-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -85,6 +86,75 @@
     (is (= 2 (count (:instances plan))))
     (is (= 2 (count (compiled/ir composite))))
     (is (= {:map 2} (:steps (compiled/cache-key composite))))))
+
+(deftest repeated-lowerings-share-only-the-immutable-compilation-template
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [compilations (atom 0)
+          first-input (float-array 16)
+          second-input (float-array 32)
+          first-weight (float-array 16)
+          second-weight (float-array 32)]
+      (with-redefs [pipeline/compile-gpu-program
+                    (fn [& _] (swap! compilations inc) (descriptor))]
+        (let [first (compiled/lower #'component [first-input first-weight 16]
+                                    {:target :ze:0 :constants '[w]})
+              second (compiled/lower #'component [second-input second-weight 32]
+                                     {:target :ze:0 :constants '[w]
+                                      :gemm-precision :mixed-f16-f32})
+              stats (compiled/compilation-cache-stats)]
+          (is (= 1 @compilations)
+              "symbolic compilation is shared across concrete sizes and buffer identities")
+          (is (= {:hits 1 :misses 1 :compilations 1 :failures 0
+                  :entries 1 :entries-by-compiler {:resident-descriptor 1}}
+                 (dissoc stats :compile-nanos)))
+          (is (= first-input (get-in first [:in-tree 0 :default])))
+          (is (= second-input (get-in second [:in-tree 0 :default])))
+          (is (not= (:lowering first) (:lowering second))
+              "argument-dependent LinkPlan certification remains per invocation"))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
+(deftest structural-compilation-cache-is-single-flight
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [started (promise)
+          release (promise)
+          calls (atom 0)
+          compile! (fn []
+                     (swap! calls inc)
+                     (deliver started true)
+                     @release
+                     :template)
+          first-result (future (#'compiled/cached-compilation-template
+                                :same :resident-descriptor compile!))]
+      @started
+      (let [second-result (future (#'compiled/cached-compilation-template
+                                   :same :resident-descriptor compile!))]
+        (deliver release true)
+        (is (= [:template :template] [@first-result @second-result]))
+        (is (= 1 @calls))
+        (is (= {:hits 1 :misses 1 :compilations 1 :failures 0
+                :entries 1 :entries-by-compiler {:resident-descriptor 1}}
+               (dissoc (compiled/compilation-cache-stats) :compile-nanos)))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
+(deftest compiler-visible-redefinition-invalidates-structural-templates
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [compilations (atom 0)
+          arguments [(float-array 16) (float-array 16) 16]]
+      (with-redefs [pipeline/compile-gpu-program
+                    (fn [& _] (swap! compilations inc) (descriptor))]
+        (compiled/lower #'component arguments {:target :ze:0})
+        (dispatch/bump-compiler-definition-revision!)
+        (compiled/lower #'component arguments {:target :ze:0})
+        (is (= 2 @compilations)
+            "a changed inlined callee cannot reuse a pre-redefinition template")
+        (is (= 2 (:entries (compiled/compilation-cache-stats))))))
+    (finally
+      (compiled/clear-compilation-cache!))))
 
 (deftest already-instantiated-artifacts-are-too-late-to-compose-zero-copy
   (is (= :compiled-composition-component

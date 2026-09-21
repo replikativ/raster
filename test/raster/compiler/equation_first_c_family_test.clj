@@ -280,21 +280,28 @@
                 [functional effect state]))))
 
 (deftest equation-first-compiled-artifacts-compose-before-allocation
-  (let [prepare #(compiled/lower #'c-family-elementwise [(float-array 8) 8]
-                                 {:compiler :equation-first
-                                  :target cuda-target :dtype :float})
-        composite (compiled/compose
-                   {:id :equation-first-pipeline
-                    :components [{:id :first :program (prepare)}
-                                 {:id :second :program (prepare)}]
-                    :connections [{:from [:first :result]
-                                   :to [:second :input]}]
-                    :outputs [{:key :result :from [:second :result]}]})]
-    (is (compiled/prepared? composite))
-    (is (= [[:first :input]] (mapv :key (:in-tree composite))))
-    (is (= [:result] (mapv :key (:out-tree composite))))
-    (is (= 2 (count (:instances (compiled/plan composite)))))
-    (is (= 0 (get-in (compiled/certificate composite) [:driver-allocations] 0)))))
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [prepare #(compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                   {:compiler :equation-first
+                                    :target cuda-target :dtype :float})
+          composite (compiled/compose
+                     {:id :equation-first-pipeline
+                      :components [{:id :first :program (prepare)}
+                                   {:id :second :program (prepare)}]
+                      :connections [{:from [:first :result]
+                                     :to [:second :input]}]
+                      :outputs [{:key :result :from [:second :result]}]})]
+      (is (compiled/prepared? composite))
+      (is (= [[:first :input]] (mapv :key (:in-tree composite))))
+      (is (= [:result] (mapv :key (:out-tree composite))))
+      (is (= 2 (count (:instances (compiled/plan composite)))))
+      (is (= 0 (get-in (compiled/certificate composite) [:driver-allocations] 0)))
+      (is (= {:hits 1 :misses 1 :compilations 1 :failures 0
+              :entries 1 :entries-by-compiler {:equation-first 1}}
+             (dissoc (compiled/compilation-cache-stats) :compile-nanos))))
+    (finally
+      (compiled/clear-compilation-cache!))))
 
 (deftest public-softmax-backward-keeps-the-reduction-resident
   (doseq [target [cuda-target hip-target]]
