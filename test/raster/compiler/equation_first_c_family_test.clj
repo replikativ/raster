@@ -712,6 +712,18 @@
              (get-in compilation [:kernels 0 :attributes :emission-route])))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
+(deftest public-segment-div-z-adjoint-is-a-portable-segmented-reduction
+  (doseq [[target module-target]
+          [[cuda-target :cuda-c]
+           [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile #'array-ops/segment-div-dZ
+                                              {:target target :dtype :double})]
+      (is (= [module-target] (mapv :target (:kernels compilation))))
+      (is (= 1 (count (:kernels compilation))))
+      (is (= :kernel-body
+             (get-in compilation [:kernels 0 :attributes :emission-route])))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
 (deftest product-reduction-composes-with-an-ordered-epilogue
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

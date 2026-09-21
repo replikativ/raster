@@ -898,21 +898,19 @@
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
   :- (Array double)
   (let [dk (quot emb-dim n-heads)
-        dZ (double-array (* n-nodes n-heads))]
-    (dotimes [node n-nodes]
-      (dotimes [head n-heads]
-        (let [z-idx (+ (* node (int n-heads)) head)
-              z (+ (aget Z z-idx) eps)
-              z2 (* z z)
-              off (+ (* node (int emb-dim)) (* head (int dk)))]
-          (loop [d 0 acc 0.0]
-            (if (< d dk)
-              (let [idx (+ off d)]
-                (recur (inc d)
-                       (+ acc (* (aget dy idx)
-                                 (aget wV idx)))))
-              (aset dZ z-idx (- (/ acc z2))))))))
-    dZ))
+        n-segments (* n-nodes n-heads)
+        dZ (double-array n-segments)]
+    (par/map!
+     dZ z-idx n-segments nil
+     (let [node (quot z-idx n-heads)
+           head (rem z-idx n-heads)
+           z (+ (aget Z z-idx) eps)
+           z2 (* z z)
+           off (+ (* node (int emb-dim)) (* head (int dk)))]
+       (- (/ (par/reduce acc 0.0 d dk
+                          (+ acc (* (aget dy (+ off d))
+                                    (aget wV (+ off d)))))
+             z2))))))
 
 ;; ================================================================
 ;; flat-embed-op: out[v*d+j] = values[v]*We[j] + be[j]
