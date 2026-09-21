@@ -3406,6 +3406,53 @@
                                (:scalar-dtype %)))))
             descriptions)))
 
+(defn- copy-allocation-source
+  [expression]
+  (when (and (seq? expression)
+             (descriptor/copy-allocation-op? (descriptor/semantic-op expression))
+             (= 1 (count (descriptor/call-args expression)))
+             (symbol? (first (descriptor/call-args expression))))
+    (first (descriptor/call-args expression))))
+
+(defn- copy-allocations->maps
+  "Represent a primitive array clone as fresh storage plus an identity map.
+
+   This normalization is local to TypedSOAC admission: JVM source execution keeps its native
+   clone semantics, while device compilation exposes the copy as a fusible functional map. The
+   source array's retained dtype chooses the store conversion; unknown/object storage remains an
+   honest admission decline rather than acquiring a guessed GPU representation."
+  [source array-types]
+  (if (and (seq? source) (contains? #{'let 'let*} (first source)))
+    (let [[head bindings & body] source
+          occupied (set (filter symbol? (tree-seq coll? seq source)))
+          fresh (fn [prefix]
+                  (first (remove occupied
+                                 (map #(symbol (str prefix %)) (range)))))]
+      (with-meta
+        (list* head
+               (vec
+                (mapcat
+                 (fn [[ordinal [destination expression]]]
+                   (if-let [source-array (copy-allocation-source expression)]
+                     (let [storage-dtype
+                           (or (some-> (get array-types source-array) dtype/canon)
+                               (some-> source-array types/sym-type-tag
+                                       dtype/dtype-for-array-tag dtype/canon))
+                           cast (some-> storage-dtype dtype/scalar-tag-for-dtype)
+                           index (fresh (str "rstr_copy_index_" ordinal "_"))
+                           effect (fresh (str "rstr_copy_effect_" ordinal "_"))
+                           extent (list 'clojure.core/alength source-array)]
+                       (if cast
+                         [destination (list 'raster.arrays/alloc-like source-array extent)
+                          effect (list 'raster.par/map! destination index extent cast
+                                       (list 'clojure.core/aget source-array index))]
+                         [destination expression]))
+                     [destination expression]))
+                 (map-indexed vector (partition 2 bindings))))
+               body)
+        (meta source)))
+    source))
+
 (defn normalize-source
   "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
 
@@ -3428,7 +3475,7 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* source scalar-types)))))
+       (normalize-source* (copy-allocations->maps source array-types) scalar-types)))))
 
 (declare coverage-decline*)
 

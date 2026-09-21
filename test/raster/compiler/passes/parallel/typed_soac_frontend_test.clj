@@ -28,6 +28,18 @@
     (is (= ['long 'long] (mapv #(get (meta %) :raster.type/tag) locals)))
     (is (some? (#'frontend/typed-map-region (:value-expr matched))))))
 
+(deftest primitive-array-clones-normalize-to-fresh-identity-maps
+  (let [source '(let* [result (clojure.core/aclone input)] result)
+        options {:dtype :float :array-types {'input :float}}
+        normalized (frontend/normalize-source source options)]
+    (is (some #{'raster.arrays/alloc-like} (flatten normalized)))
+    (is (some #{'raster.par/map!} (flatten normalized)))
+    (is (not-any? #{'clojure.core/aclone} (flatten normalized)))
+    (is (= normalized (frontend/normalize-source normalized options))
+        "copy normalization is stable across compiler fixpoints")
+    (is (= source (frontend/normalize-source source {:dtype :float}))
+        "an untyped/object clone does not acquire a guessed device representation")))
+
 (deftest map-let-spines-become-typed-locals
   (let [body '(let* [^float p1 (* (aget x i) (aget x i))
                     ^float p2 (* p1 p1)

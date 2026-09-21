@@ -409,6 +409,8 @@
       (:kernels (equation-first/compile
                  #'nn/loss-fn {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'nn/dense-backward-db {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'checked-casts/narrow-rows! {:target device-id :dtype :long}))

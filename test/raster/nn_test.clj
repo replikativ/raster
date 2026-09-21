@@ -77,3 +77,11 @@
         [loss probabilities] (nn/softmax-cross-entropy logits target)]
     (is (approx= (- (Math/log (aget ^doubles probabilities 1))) loss))
     (is (approx= 1.0 (reduce + probabilities)))))
+
+(deftest dense-backward-db-returns-an-independent-copy
+  (let [gradient (double-array [1.0 2.0 3.0])
+        copied (nn/dense-backward-db gradient)]
+    (is (= (vec gradient) (vec copied)))
+    (is (not (identical? gradient copied)))
+    (aset ^doubles copied 0 9.0)
+    (is (= 1.0 (aget ^doubles gradient 0)))))
