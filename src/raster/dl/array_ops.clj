@@ -1027,17 +1027,13 @@
   [h :- (Array double) W :- (Array double) bias :- (Array double)
    n-rows :- Long dim :- Long]
   :- (Array double)
-  (let [out (double-array n-rows)
-        b0 (aget bias 0)]
-    (dotimes [v n-rows]
-      (let [off (* v (int dim))]
-        (loop [d 0 acc 0.0]
-          (if (< d dim)
-            (recur (inc d)
-                   (+ acc (* (aget h (+ off d))
-                             (aget W d))))
-            (aset out v (+ acc b0))))))
-    out))
+  (let [out (double-array n-rows)]
+    (par/map!
+     out v n-rows nil
+     (+ (par/reduce acc 0.0 d dim
+                    (+ acc (* (aget h (+ (* v (int dim)) d))
+                              (aget W d))))
+        (aget bias 0)))))
 
 (deftm dot-rows-dh
   "Backward for h: dh[v*d+j] = dy[v] * W[j]"
@@ -1058,13 +1054,11 @@
    n-rows :- Long dim :- Long]
   :- (Array double)
   (let [out (double-array dim)]
-    (dotimes [v n-rows]
-      (let [dy-v (aget dy v)]
-        (dotimes [d dim]
-          (aset out d
-                (+ (aget out d)
-                   (* dy-v (aget h (+ (* v (int dim)) d))))))))
-    out))
+    (par/map!
+     out d dim nil
+     (par/reduce acc 0.0 v n-rows
+                 (+ acc (* (aget dy v)
+                           (aget h (+ (* v (int dim)) d))))))))
 
 (deftm dot-rows-dbias
   "Backward for bias: dbias[0] = sum_v(dy[v])"
