@@ -50,6 +50,7 @@
             target       ;; device-id + (future) HardwareDescriptor
             descriptor   ;; raw descriptor or inspectable composite descriptor
             args         ;; captured specialization arguments (empty for a composite)
+            preparation-report ;; compact host-side lowering/cache/certification timings
             live-outputs] ;; atom holding the DeviceArrays projected by the LAST invocation. They
                           ;; alias resident buffers the next replay overwrites, so they are
                           ;; invalidated (marked dead) at the start of the next invoke and at close!
@@ -60,7 +61,7 @@
   (applyTo [this argseq] (apply invoke-compiled this argseq)))
 
 (defrecord Prepared
-           [lowering in-tree out-tree donated schedule target descriptor args])
+           [lowering in-tree out-tree donated schedule target descriptor args preparation-report])
 
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
@@ -71,6 +72,10 @@
 (defonce ^:private compilation-template-cache (atom {}))
 (defonce ^:private compilation-template-stats
   (atom {:hits 0 :misses 0 :compilations 0 :failures 0 :compile-nanos 0}))
+
+(def ^:dynamic *compilation-template-observer*
+  "Internal per-request observer. It receives only cache/timing facts, never source or artifacts."
+  nil)
 
 (defn clear-compilation-cache!
   "Clear reusable compiler templates and their counters. Runtime modules, buffers, and tuning
@@ -133,11 +138,21 @@
         (swap-vals! compilation-template-cache
                     #(if (contains? % key) % (assoc % key candidate)))
         hit? (contains? before key)
-        entry (get after key)]
+        entry (get after key)
+        resolution-started (System/nanoTime)]
     (swap! compilation-template-stats update (if hit? :hits :misses) inc)
     (try
-      @(:value entry)
+      (let [value @(:value entry)]
+        (when *compilation-template-observer*
+          (*compilation-template-observer*
+           {:compiler compiler :cache-hit? hit? :success? true
+            :resolution-ns (- (System/nanoTime) resolution-started)}))
+        value)
       (catch Throwable error
+        (when *compilation-template-observer*
+          (*compilation-template-observer*
+           {:compiler compiler :cache-hit? hit? :success? false
+            :resolution-ns (- (System/nanoTime) resolution-started)}))
         ;; A failed compilation is not a durable negative result: a hot reload or newly registered
         ;; specialization may make the same request valid on its next attempt.
         (swap! compilation-template-cache
@@ -234,7 +249,9 @@
   [fn-var args {:keys [target dtype donate constants outputs taps roles
                        gemm-precision on-non-resident schedule]
                 :or {target :ze:0 dtype :float on-non-resident :nil}}]
-  (let [compile-arguments
+  (let [preparation-started (System/nanoTime)
+        template-report (atom nil)
+        compile-arguments
         (cond-> [:dtype dtype :on-non-resident on-non-resident]
           gemm-precision (conj :gemm-precision gemm-precision)
           ;; forward the S6 schedule so it is resolved + gated by compile-gpu-program;
@@ -249,9 +266,10 @@
                        :on-non-resident on-non-resident :schedule schedule}
                       ;; Keeps with-redefs and hot compiler reloads honest.
                       (System/identityHashCode @#'pl/compile-gpu-program)]
-        prog (cached-compilation-template
-              template-key :resident-descriptor
-              #(apply pl/compile-gpu-program fn-var target compile-arguments))
+        prog (binding [*compilation-template-observer* #(reset! template-report %)]
+               (cached-compilation-template
+                template-key :resident-descriptor
+                #(apply pl/compile-gpu-program fn-var target compile-arguments)))
         _ (when-not prog
             (throw (ex-info "compile: compile-gpu-program returned nil — a step fell back to host (non-resident). Pass :on-non-resident :throw to see which."
                             {:fn fn-var :target target})))
@@ -263,14 +281,23 @@
         result-sym (when (contains? pointer-symbols (:result-sym prog)) (:result-sym prog))
         public-symbols (vec (distinct (concat donate outputs
                                               (when result-sym [result-sym]) taps)))
+        lowering-started (System/nanoTime)
         lowering (resident-plan/lower
                   {:id (compilation-id fn-var target dtype prog args)
                    :target target :descriptor prog :arguments args
                    :roles eff-roles :outputs public-symbols})
+        lowering-ns (- (System/nanoTime) lowering-started)
         in-tree  (build-in-tree lowering prog args donate)
         out-tree (build-out-tree lowering donate outputs result-sym taps)
-        donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))]
-    (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args)))
+        donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))
+        report {:kind :resident-descriptor
+                :timing-source :host-monotonic
+                :total-ns (- (System/nanoTime) preparation-started)
+                :template @template-report
+                :link-plan-lowering-ns lowering-ns
+                :nodes (count (get-in lowering [:plan :nodes]))
+                :instances (count (get-in lowering [:plan :instances]))}]
+    (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args report)))
 
 (defn- equation-first-value
   [plan node role]
@@ -288,7 +315,9 @@
   [fn-var args {:keys [target dtype donate constants outputs taps roles]
                 :or {target :ze:0 dtype :float}
                 :as opts}]
-  (let [compilation-options (apply dissoc opts
+  (let [preparation-started (System/nanoTime)
+        template-report (atom nil)
+        compilation-options (apply dissoc opts
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident :gemm-precision])
         compilation-options (assoc compilation-options :target target :dtype dtype)
@@ -298,9 +327,11 @@
                       (target-specialization-identity target)
                       compilation-options
                       (System/identityHashCode @#'equation-first/compile)]
-        compilation (cached-compilation-template
-                     template-key :equation-first
-                     #(equation-first/compile fn-var compilation-options))
+        compilation (binding [*compilation-template-observer* #(reset! template-report %)]
+                      (cached-compilation-template
+                       template-key :equation-first
+                       #(equation-first/compile fn-var compilation-options)))
+        lowering-started (System/nanoTime)
         raw-plan (equation-first/lower compilation args)
         attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
@@ -383,6 +414,7 @@
                             {:reason :compiled-equation-first-output-keys
                              :keys duplicate-keys})))
         lowering (invocation-link/certify plan)
+        lowering-ns (- (System/nanoTime) lowering-started)
         steps (mapv (fn [index kernel]
                       {:convention :kernel-body
                        :phase (keyword (str "kernel-" index))
@@ -398,8 +430,15 @@
         donated (into {} (map (fn [symbol]
                                 [(keyword (name symbol))
                                  (keyword (str (name symbol) "'"))]))
-                      donate)]
-    (->Prepared lowering in-tree out-tree donated schedule target descriptor args)))
+                      donate)
+        report {:kind :equation-first
+                :timing-source :host-monotonic
+                :total-ns (- (System/nanoTime) preparation-started)
+                :template @template-report
+                :link-plan-lowering-ns lowering-ns
+                :nodes (count (get-in lowering [:plan :nodes]))
+                :instances (count (get-in lowering [:plan :instances]))}]
+    (->Prepared lowering in-tree out-tree donated schedule target descriptor args report)))
 
 (defn lower
   "Lower a deftm Var into an allocation-free `Prepared` artifact.
@@ -423,10 +462,21 @@
    (when-not (prepared? prepared)
      (throw (ex-info "instantiate! requires an allocation-free Prepared artifact"
                      {:reason :compiled-prepared-type :actual (type prepared)})))
-   (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args]} prepared
+   (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args
+                 preparation-report]} prepared
          executable (gpu-link/instantiate! (:plan lowering) opts)]
      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
+                 preparation-report
                  (atom nil)))))
+
+(defn preparation-report
+  "Return compact host-side template-cache and LinkPlan preparation facts for a Prepared or
+   instantiated Compiled artifact. Composite reports retain their component reports."
+  [artifact]
+  (when-not (or (prepared? artifact) (compiled? artifact))
+    (throw (ex-info "preparation-report requires a Prepared or Compiled artifact"
+                    {:reason :compiled-preparation-report-type :actual (type artifact)})))
+  (:preparation-report artifact))
 
 (defn instantiation-report
   "Return the compact host-side construction report for an instantiated Compiled artifact."
@@ -465,7 +515,8 @@
    can certify cross-component state threading."
   [{:keys [id components connections shares outputs attributes]
     :or {connections [] shares [] attributes {}}}]
-  (let [components (mapv (fn [component]
+  (let [preparation-started (System/nanoTime)
+        components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
                                           (prepared? (:program component)))
                              (throw (ex-info
@@ -555,9 +606,17 @@
         descriptor {:all-params [] :array-params [] :scalar-params []
                     :steps (vec (mapcat (comp :steps :descriptor :program) components))
                     :result-sym nil :composite? true}
-        schedules (mapv (comp :schedule :program) components)]
+        schedules (mapv (comp :schedule :program) components)
+        report {:kind :composition
+                :timing-source :host-monotonic
+                :total-ns (- (System/nanoTime) preparation-started)
+                :components (mapv (fn [{:keys [id program]}]
+                                    {:id id :report (:preparation-report program)})
+                                  components)
+                :nodes (count (get-in low-level [:plan :nodes]))
+                :instances (count (get-in low-level [:plan :instances]))}]
     (->Prepared low-level in-tree out-tree {} schedules (:target (:plan low-level))
-                descriptor [])))
+                descriptor [] report)))
 
 (defn compile
   "Lower and instantiate a deftm as one callable Compiled artifact. Use `lower`, `compose`, then

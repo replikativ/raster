@@ -35,6 +35,16 @@
            (:reason (ex-data (try (compiled/instantiation-report {})
                                   (catch clojure.lang.ExceptionInfo error error))))))))
 
+(deftest preparation-report-is-available-before-and-after-instantiation
+  (let [report {:kind :resident-descriptor :timing-source :host-monotonic}
+        prepared (compiled/map->Prepared {:preparation-report report})
+        artifact (compiled/map->Compiled {:preparation-report report})]
+    (is (= report (compiled/preparation-report prepared)))
+    (is (= report (compiled/preparation-report artifact)))
+    (is (= :compiled-preparation-report-type
+           (:reason (ex-data (try (compiled/preparation-report {})
+                                  (catch clojure.lang.ExceptionInfo error error))))))))
+
 (def ^:private kernel
   (artifact/make
    {:kernel-name "compiled_composition_axpy"
@@ -93,6 +103,10 @@
     (is (= [[:first :x] [:first :w]] (mapv :key (:in-tree composite))))
     (is (= [:result] (mapv :key (:out-tree composite))))
     (is (= 2 (count (:instances plan))))
+    (is (= :composition (:kind (compiled/preparation-report composite))))
+    (is (= [:first :second]
+           (mapv :id (:components (compiled/preparation-report composite)))))
+    (is (pos? (:total-ns (compiled/preparation-report composite))))
     (is (= 2 (count (compiled/ir composite))))
     (is (= {:map 2} (:steps (compiled/cache-key composite))))))
 
@@ -119,6 +133,13 @@
                  (dissoc stats :compile-nanos)))
           (is (= first-input (get-in first [:in-tree 0 :default])))
           (is (= second-input (get-in second [:in-tree 0 :default])))
+          (is (false? (get-in (compiled/preparation-report first)
+                              [:template :cache-hit?])))
+          (is (true? (get-in (compiled/preparation-report second)
+                             [:template :cache-hit?])))
+          (is (every? #(and (integer? %) (not (neg? %)))
+                      ((juxt :total-ns :link-plan-lowering-ns)
+                       (compiled/preparation-report second))))
           (is (not= (:lowering first) (:lowering second))
               "argument-dependent LinkPlan certification remains per invocation"))))
     (finally
