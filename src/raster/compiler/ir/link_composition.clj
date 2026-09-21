@@ -94,32 +94,32 @@
 (defn- namespace-id [composition-id component-id kind id]
   [composition-id component-id kind id])
 
-(defn- namespace-node [composition-id component-id node]
+(defn- namespace-node [composition-id component-id namespaced-id node]
   (let [view (:view node)
         allocation (:allocation view)]
     (assoc node
-           :id (namespace-id composition-id component-id :node (:id node))
+           :id namespaced-id
            :view (assoc view
                         :id (namespace-id composition-id component-id :view (:id view))
                         :allocation
                         (assoc allocation :id (namespace-id composition-id component-id
                                                             :allocation (:id allocation)))))))
 
-(defn- namespace-value [composition-id component-id node-mapping value]
+(defn- namespace-value [namespaced-id node-mapping value]
   (assoc value
-         :id (namespace-id composition-id component-id :value (:id value))
+         :id namespaced-id
          :leaves (mapv #(update % :node node-mapping) (:leaves value))))
 
-(defn- namespace-instance [composition-id component-id value-mapping instance]
+(defn- namespace-instance [namespaced-id value-mapping instance]
   (cond
     (link-plan/link-instance? instance)
     (assoc instance
-           :id (namespace-id composition-id component-id :instance (:id instance))
+           :id namespaced-id
            :bindings (update-vals (:bindings instance) value-mapping))
 
     (link-plan/program-link-instance? instance)
     (assoc instance
-           :id (namespace-id composition-id component-id :instance (:id instance))
+           :id namespaced-id
            :call (program-call/map-buffers (:call instance) value-mapping))
 
     :else
@@ -277,33 +277,41 @@
         node-mapping0
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
-                        (map (fn [node-id]
-                               [[component-id node-id]
-                                (namespace-id id component-id :node node-id)])
-                             (keys (get-in lowering [:plan :nodes]))))
+                        ;; Source identities retain complete compiler provenance and may be large.
+                        ;; The certificate keeps them as mapping keys; the composed plan itself
+                        ;; uses deterministic local ordinals so validation does not repeatedly
+                        ;; hash whole compilation keys.
+                        (map-indexed
+                         (fn [index node-id]
+                           [[component-id node-id]
+                            (namespace-id id component-id :node index)])
+                         (sort-by pr-str (keys (get-in lowering [:plan :nodes])))))
                       components))
         nodes0
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
                         (map (fn [[_ node]]
-                               (let [node (namespace-node id component-id node)]
+                               (let [node (namespace-node
+                                           id component-id
+                                           (get node-mapping0 [component-id (:id node)]) node)]
                                  [(:id node) node]))
                              (get-in lowering [:plan :nodes])))
                       components))
         value-mapping0
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
-                        (map (fn [value-id]
-                               [[component-id value-id]
-                                (namespace-id id component-id :value value-id)])
-                             (keys (get-in lowering [:plan :values]))))
+                        (map-indexed
+                         (fn [index value-id]
+                           [[component-id value-id]
+                            (namespace-id id component-id :value index)])
+                         (sort-by pr-str (keys (get-in lowering [:plan :values])))))
                       components))
         values0
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
                         (map (fn [[_ value]]
                                (let [value (namespace-value
-                                            id component-id
+                                            (get value-mapping0 [component-id (:id value)])
                                             #(get node-mapping0 [component-id %]) value)]
                                  [(:id value) value]))
                              (get-in lowering [:plan :values])))
@@ -388,19 +396,20 @@
         instance-mapping
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
-                        (map (fn [instance]
-                               [[component-id (:id instance)]
-                                (namespace-id id component-id :instance (:id instance))])
-                             (get-in lowering [:plan :instances])))
+                        (map-indexed
+                         (fn [index instance]
+                           [[component-id (:id instance)]
+                            (namespace-id id component-id :instance index)])
+                         (get-in lowering [:plan :instances])))
                       components))
         instances
         (vec
          (mapcat (fn [{component-id :id lowering :lowering}]
                    (map (fn [instance]
-                          (namespace-instance id component-id
-                                              (comp resolve-value
-                                                    #(get value-mapping0 [component-id %]))
-                                              instance))
+                          (namespace-instance
+                           (get instance-mapping [component-id (:id instance)])
+                           (comp resolve-value #(get value-mapping0 [component-id %]))
+                           instance))
                         (get-in lowering [:plan :instances])))
                  components))
         aliases (into #{} (map set)
