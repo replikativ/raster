@@ -73,6 +73,22 @@
                                            {:id (:id dispatch) :owner owner
                                             :references references
                                             :scalar-arguments scalar-arguments})))))
+        validate-comparison! (fn [owner {:keys [expression op value] :as condition}]
+                               (when-not (= #{:expression :op :value}
+                                            (set (keys condition)))
+                                 (throw (ex-info
+                                         "kernel dispatch comparison has invalid fields"
+                                         {:id (:id dispatch) :owner owner
+                                          :condition condition})))
+                               (validate-expression! owner expression)
+                               (when-not (contains? precondition/comparison-ops op)
+                                 (throw (ex-info
+                                         "kernel dispatch comparison has an invalid operator"
+                                         {:id (:id dispatch) :owner owner :op op})))
+                               (when-not (finite-number? value)
+                                 (throw (ex-info
+                                         "kernel dispatch comparison requires a finite value"
+                                         {:id (:id dispatch) :owner owner :value value}))))
         validate-argument! (fn []
                              (let [indexes (keep-indexed
                                             (fn [index value] (when (= argument value) index))
@@ -112,13 +128,26 @@
           (when-not (= #{:expression :op :value :strategy} (set (keys rule)))
             (throw (ex-info "kernel dispatch expression case has invalid fields"
                             {:id (:id dispatch) :index index :rule rule})))
-          (validate-expression! [:cases index] (:expression rule))
-          (when-not (contains? precondition/comparison-ops (:op rule))
-            (throw (ex-info "kernel dispatch expression case has an invalid comparison"
-                            {:id (:id dispatch) :index index :op (:op rule)})))
-          (when-not (finite-number? (:value rule))
-            (throw (ex-info "kernel dispatch expression case requires a finite comparison value"
-                            {:id (:id dispatch) :index index :value (:value rule)})))
+          (validate-comparison! [:cases index]
+                                (select-keys rule [:expression :op :value]))
+          (validate-selector-strategy! dispatch strategies [:cases index] (:strategy rule))))
+
+      :runtime-predicate-cases
+      (let [cases (get-in dispatch [:selector :cases])
+            default (get-in dispatch [:selector :default])]
+        (when-not (and (vector? cases) (seq cases))
+          (throw (ex-info "kernel dispatch predicate cases must be a non-empty ordered vector"
+                          {:id (:id dispatch) :cases cases})))
+        (validate-selector-strategy! dispatch strategies :default default)
+        (doseq [[index rule] (map-indexed vector cases)]
+          (when-not (= #{:conditions :strategy} (set (keys rule)))
+            (throw (ex-info "kernel dispatch predicate case has invalid fields"
+                            {:id (:id dispatch) :index index :rule rule})))
+          (when-not (and (vector? (:conditions rule)) (seq (:conditions rule)))
+            (throw (ex-info "kernel dispatch predicate case requires non-empty conditions"
+                            {:id (:id dispatch) :index index :rule rule})))
+          (doseq [[condition-index condition] (map-indexed vector (:conditions rule))]
+            (validate-comparison! [:cases index :conditions condition-index] condition))
           (validate-selector-strategy! dispatch strategies [:cases index] (:strategy rule))))
 
       :runtime-scalar-ranges
@@ -263,9 +292,11 @@
                        :fixed-strategy nil
                        :runtime-expression-threshold
                        (klaunch/resolve-expression environment expression)
-                       :runtime-expression-cases nil
+                       (:runtime-expression-cases :runtime-predicate-cases) nil
                        (runtime-number (nth runtime-arguments (first indexes))))]
-           (when (and (not (contains? #{:runtime-expression-cases :fixed-strategy} kind))
+           (when (and (not (contains? #{:runtime-expression-cases
+                                        :runtime-predicate-cases
+                                        :fixed-strategy} kind))
                       (not (number? value)))
              (throw (ex-info "kernel dispatch selector requires a numeric runtime scalar"
                              {:id (:id dispatch) :argument argument :value value})))
@@ -286,6 +317,18 @@
                                  op
                                  (klaunch/resolve-expression environment expression)
                                  value)
+                            strategy))
+                        (get-in dispatch [:selector :cases]))
+                  (get-in dispatch [:selector :default]))
+
+              :runtime-predicate-cases
+              (or (some (fn [{:keys [conditions strategy]}]
+                          (when (every? (fn [{:keys [expression op value]}]
+                                          (precondition/compare-value?
+                                           op
+                                           (klaunch/resolve-expression environment expression)
+                                           value))
+                                        conditions)
                             strategy))
                         (get-in dispatch [:selector :cases]))
                   (get-in dispatch [:selector :default]))
