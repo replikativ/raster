@@ -1644,64 +1644,6 @@
                                               (aset out d (+ (aget out d) (* w (aget cache-V (+ (* j dv) d))))))))
                                         out))))
 
-(deftm causal-multi-head-attention-cached! (All [T]
-                                                [x :- (Array T)         ;; [d_model] single token embedding
-                                                 Wq :- (Array T) bq :- (Array T)
-                                                 Wk :- (Array T) bk :- (Array T)
-                                                 Wv :- (Array T) bv :- (Array T)
-                                                 Wo :- (Array T) bo :- (Array T)
-                                                 cache-K :- (Array T)   ;; [n_heads * max_seq * dk] flat
-                                                 cache-V :- (Array T)   ;; [n_heads * max_seq * dk] flat
-                                                 cache-pos :- Long
-                                                 d-model :- Long n-heads :- Long max-seq :- Long]
-                                                :- (Array T)
-                                                (let [dk (quot d-model n-heads)
-        ;; Project single token: x:[d_model] -> Q,K,V:[d_model]
-                                                      Q (nn/linear x Wq bq 1 d-model d-model)
-                                                      K (nn/linear x Wk bk 1 d-model d-model)
-                                                      V (nn/linear x Wv bv 1 d-model d-model)
-        ;; Process each head with its own cache slice
-                                                      concat-out (alloc-like x d-model)
-                                                      head-cache-size (* max-seq dk)]
-                                                  (dotimes [h n-heads]
-                                                    (let [h-offset (* h (int dk))
-                                                          cache-k-offset (* h head-cache-size)
-                                                          cache-v-offset (* h head-cache-size)
-            ;; Extract head h from Q, K, V
-                                                          Qh (alloc-like Q dk)
-                                                          Kh (alloc-like K dk)
-                                                          Vh (alloc-like V dk)]
-                                                      (dotimes [d dk]
-                                                        (aset Qh d (aget Q (+ h-offset d)))
-                                                        (aset Kh d (aget K (+ h-offset d)))
-                                                        (aset Vh d (aget V (+ h-offset d))))
-        ;; Slice into this head's cache region
-        ;; We need to pass the full cache arrays + compute offsets inside
-        ;; Since deftm can't do array slicing, use a per-head cache view
-        ;; by offsetting manually. For now, allocate per-head caches and
-        ;; copy in/out. A more optimized version would use offset arithmetic.
-                                                      (let [head-ck (alloc-like cache-K (* max-seq dk))
-                                                            head-cv (alloc-like cache-V (* max-seq dk))]
-          ;; Copy existing cache for this head
-                                                        (dotimes [i (* cache-pos dk)]
-                                                          (aset head-ck i (aget cache-K (+ cache-k-offset i))))
-                                                        (dotimes [i (* cache-pos dk)]
-                                                          (aset head-cv i (aget cache-V (+ cache-v-offset i))))
-          ;; Run cached attention
-                                                        (let [head-out (causal-attn-with-cache! Qh Kh Vh head-ck head-cv cache-pos dk dk)]
-            ;; Copy updated cache back
-                                                          (let [new-k-base (* cache-pos dk)]
-                                                            (dotimes [d dk]
-                                                              (aset cache-K (+ cache-k-offset new-k-base d)
-                                                                    (aget head-ck (+ new-k-base d)))
-                                                              (aset cache-V (+ cache-v-offset new-k-base d)
-                                                                    (aget head-cv (+ new-k-base d)))))
-            ;; Copy head output to concatenated output
-                                                          (dotimes [d dk]
-                                                            (aset concat-out (+ h-offset d) (aget head-out d)))))))
-    ;; Output projection: concat-out:[d_model] -> out:[d_model]
-                                                  (nn/linear concat-out Wo bo 1 d-model d-model))))
-
 (defn prefill-cache!
   "Fill KV caches from a full sequence using non-cached forward pass.
   Returns the output of the last layer for continued generation.
