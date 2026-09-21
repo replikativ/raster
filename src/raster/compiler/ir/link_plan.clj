@@ -551,6 +551,17 @@
                       {:reason :link-alias-pair :alias pair})))
     pair))
 
+(defn- unordered-pairs
+  "Enumerate each unordered pair once without imposing a printable order on identities.
+   Link identities may embed full compilation keys, so `pr-str` is not a viable hot-path
+   comparator for the quadratic overlap checks below."
+  [entries]
+  (let [entries (vec entries)
+        n (count entries)]
+    (for [left-index (range n)
+          right-index (range (inc left-index) n)]
+      [(nth entries left-index) (nth entries right-index)])))
+
 (defn- validate-plan-structure! [plan]
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
@@ -1079,9 +1090,8 @@
               (when (or full? (initialized-view? node-id))
                 (vswap! initialized conj node-id)
                 (vswap! written conj node-id)))))
-        (doseq [[left-id left-access] by-node
-                [right-id right-access] by-node
-                :when (neg? (compare (pr-str left-id) (pr-str right-id)))
+        (doseq [[[left-id left-access] [right-id right-access]]
+                (unordered-pairs by-node)
                 :when (contains? aliases #{left-id right-id})
                 :when (or (contains? #{:write :read-write} left-access)
                           (contains? #{:write :read-write} right-access))]
