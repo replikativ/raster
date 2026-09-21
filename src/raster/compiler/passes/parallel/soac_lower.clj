@@ -449,6 +449,11 @@
           accumulator-dtype (or (first (:dtypes attributes)) dtype :double)
           stable-array-captures (set (get-in attributes
                                              [:attributes :stable-array-captures]))
+          values (:values (soac-dialect/facts program))
+          resident-scalar-captures
+          (set (filter #(= :resident-scalar-buffer
+                           (get-in values [% :representation :kind]))
+                       stable-array-captures))
           scalar-captures (set (remove stable-array-captures captures))
           result-region
           (scalar-region-lower/from-typed-result-transform (:result-transform attributes))
@@ -462,7 +467,8 @@
                      :certification-step-result
                      (soac-dialect/scalar-converts->source step-result)
                      :algebra (or (first (:algebra attributes)) {})
-                     :attributes (cond-> {:source :typed-soac :equation equation-id}
+                     :attributes (cond-> {:source :typed-soac :equation equation-id
+                                          :resident-scalar-captures resident-scalar-captures}
                                    result-region (assoc :result-region result-region))})
           description {:id equation-id
                        :sym result
@@ -525,6 +531,12 @@
           step-results (mapv #(util/subst-syms substitutions %) body-results)
           facts (soac-dialect/facts program)
           physical-results (soac-dialect/physical-results facts equation)
+          values (:values facts)
+          stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
+          resident-scalar-captures
+          (set (filter #(= :resident-scalar-buffer
+                           (get-in values [% :representation :kind]))
+                       stable-captures))
           components
           (mapv (fn [ordinal accumulator neutral component-dtype result]
                   {:id (keyword (str "component-" ordinal))
@@ -543,7 +555,8 @@
                           {:accumulator accumulator :neutral neutral :dtype dtype :result result
                            :index reduced-index :step-result (first step-results)
                            :algebra (first (:algebra attributes))
-                           :attributes (cond-> {:source :typed-soac :equation equation-id}
+                           :attributes (cond-> {:source :typed-soac :equation equation-id
+                                                :resident-scalar-captures resident-scalar-captures}
                                          (:result-transform attributes)
                                          (assoc :result-region
                                                 (scalar-region-lower/from-typed-result-transform
@@ -555,8 +568,6 @@
                        :algebra {:components (:algebra attributes)}
                        :attributes {:source :typed-soac :equation equation-id
                                     :segmented true}}))
-          values (:values facts)
-          stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
           inputs (set/union (set arrays) stable-captures)
           axis-indices (set (concat (map first segment-axes) [reduced-index]))
           bound-symbols (reduce set/union #{}

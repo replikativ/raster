@@ -129,18 +129,12 @@
 (deftm softmax
   "Numerically stable softmax: exp(x - max(x)) / sum(exp(x - max(x)))."
   (All [T] [x :- (Array T)] :- (Array T)
-       (let [n (alength x)
-             out (n/similar x)
-             max-x (loop [i 0 m ##-Inf]
-                     (if (< i n)
-                       (recur (inc i) (n/max m (aget x i)))
-                       m))
-             sum-exp (loop [i 0 s 0.0]
-                       (if (< i n)
-                         (let [e (m/exp (- (aget x i) max-x))]
-                           (raster.arrays/aset out i e)
-                           (recur (inc i) (+ s e)))
-                         s))
+       (let [;; The reduction walker specializes this literal to the input element type.  Raster's
+             ;; canonical IEEE conversion accepts the resulting `(float ##-Inf)` for Float while
+             ;; retaining Double identity in the Double specialization.
+             max-x (reduce! [m ##-Inf] [x] (n/max m x))
+             out (broadcast [x] (m/exp (- x max-x)))
+             sum-exp (reduce! [s 0.0] [out] (+ s out))
              inv-sum (/ 1.0 sum-exp)]
          (broadcast [out] (* out inv-sum)))))
 

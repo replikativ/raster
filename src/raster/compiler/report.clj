@@ -11,7 +11,17 @@
 
 (defn- counter
   [m k]
-  (long (or (get m k) 0)))
+  (let [value (get m k)]
+    (cond
+      (nil? value) 0
+      (number? value) (long value)
+      ;; Some passes retain one immutable witness per decision instead of maintaining a
+      ;; parallel integer counter.  The report schema projects both representations to the
+      ;; same count without discarding the richer pass evidence.
+      (coll? value) (long (count value))
+      :else
+      (throw (ex-info "compiler statistic is neither a number nor a witness collection"
+                      {:reason :invalid-compiler-statistic :key k :value value})))))
 
 (defn- decline-key?
   [k]

@@ -5,8 +5,9 @@
   (:require [raster.compiler.core.op-descriptor :as descriptor]))
 
 (defn value
-  "Return {:value number} for a supported constant, nil otherwise. Primitive casts use
-   Clojure's checked source semantics, including floating rounding and range failures.
+  "Return {:value number} for a supported constant, nil otherwise. Integral casts use
+   Clojure's checked source semantics. Floating casts use Raster's canonical IEEE conversion
+   policy (including infinity on finite overflow), matching scalar-conversion and target IR.
    No arbitrary function resolution, eval, or inference registry is involved."
   [expression]
   (cond
@@ -33,17 +34,24 @@
     (and (seq? expression) (= 2 (count expression)))
     (when-let [tag (descriptor/cast-result-tag (first expression))]
       (when-let [operand (value (second expression))]
-        (try
-          {:value (case tag
-                    byte (byte (:value operand))
-                    int (if (= :wrap (descriptor/cast-integral-narrowing (first expression)))
-                          (unchecked-int (:value operand))
-                          (int (:value operand)))
-                    long (long (:value operand))
-                    float (float (:value operand))
-                    double (double (:value operand)))}
-          (catch IllegalArgumentException _ nil)
-          (catch ArithmeticException _ nil))))
+        (let [operand-value (:value operand)]
+          ;; `value` is deliberately a proof boundary. Never allow malformed/redefined evidence
+          ;; to turn constant discovery into a host ClassCastException during diagnostic builds.
+          (when (number? operand-value)
+            (try
+              {:value (case tag
+                        byte (byte operand-value)
+                        int (if (= :wrap (descriptor/cast-integral-narrowing (first expression)))
+                              (unchecked-int operand-value)
+                              (int operand-value))
+                        long (long operand-value)
+                        ;; Clojure's `float` function is a checked host conversion and rejects
+                        ;; Double infinities/overflow. Raster's typed scalar conversion is IEEE
+                        ;; nearest-even, as are the GPU/JVM primitive instructions we emit.
+                        float (.floatValue ^Number operand-value)
+                        double (.doubleValue ^Number operand-value))}
+              (catch IllegalArgumentException _ nil)
+              (catch ArithmeticException _ nil))))))
     :else nil))
 
 (defn literal-or-original

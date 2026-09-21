@@ -28,6 +28,7 @@
 
 (def ^:private cuda-target :cuda:equation-first-source-test)
 (def ^:private hip-target :hip:equation-first-source-test)
+(def ^:private ocl-target :ocl:equation-first-source-test)
 
 (use-fixtures
   :once
@@ -52,6 +53,15 @@
                      :max-workgroup-size 1024
                      :shared-local-memory 65536
                      :total-eus 60}})
+    (hardware/register-target-device!
+     ocl-target
+     {:type :ocl
+      :name "Synthetic portable OpenCL equation-first source target"
+      :capabilities {:warp-size 32
+                     :subgroup-sizes [16 32]
+                     :max-workgroup-size 1024
+                     :shared-local-memory 65536
+                     :total-eus 32}})
     (f)))
 
 (deftm c-family-dot
@@ -301,6 +311,21 @@
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
       (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs linked)))))))
+
+(deftest public-softmax-is-a-complete-typed-soac-program
+  (doseq [target [cuda-target hip-target ocl-target]]
+    (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})
+          semantic (:semantic compilation)
+          linked (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])]
+      (is (= :typed-parallel (:dialect semantic)))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (seq (get-in semantic [:attributes :invocation-plan :steps])))
+      (is (link-plan/link-plan? linked))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (some #(and (str/includes? (:source %) "isnan(")
+                      (str/includes? (:source %) "fmax"))
+                (:kernels compilation))
+          "the max tree preserves Math/Raster NaN and signed-zero semantics"))))
 
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]

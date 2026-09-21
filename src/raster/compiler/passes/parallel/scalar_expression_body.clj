@@ -54,7 +54,7 @@
    operator, result dtype, already-converted argument vector and explicit operation options.
    `:fresh-binding` reserves an SSA identity for an owner's structured-control binder.
    These typed entries leave admission and proofs to the owner and final KernelBody validation."
-  [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index predicate id-prefix decline!
+  [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index lower-load-index predicate id-prefix decline!
            conversion-policy load-other source-region require-source-types?]
     :or {id-prefix "scalar" scalar-ranges {}}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
@@ -76,6 +76,12 @@
                     (if (contains? @reserved id)
                       (recur)
                       (do (swap! reserved conj id) id)))))
+        ;; A schedule may have an array-specific coordinate proof (for example, a resident
+        ;; one-element reduction result broadcast into a later fold). Keep that storage fact in
+        ;; the owning schedule rather than teaching this shared scalar language about layouts.
+        lower-load-index (or lower-load-index
+                             (fn [_array expression scope]
+                               (lower-index expression scope)))
         validated-scalar-ranges
         (into {}
               (map (fn [[id range]]
@@ -154,7 +160,7 @@
                 (some-> expression dialect/scalar-convert-parts
                         :attributes :target-dtype canon-type)
 
-                (and (seq? expression) (= 2 (count expression))
+                (and (seq? expression) (= 1 (count (descriptor/call-args expression)))
                      (contains? '#{pos? neg? zero? clojure.core/pos? clojure.core/neg?
                                    clojure.core/zero? raster.numeric/pos? raster.numeric/neg?
                                    raster.numeric/zero?}
@@ -486,7 +492,7 @@
                           coordinate-expression
                           (if coordinate-value
                             (:result coordinate-value)
-                            (lower-index coordinate (set (keys env))))
+                            (lower-load-index array coordinate (set (keys env))))
                           loaded (load-ssa array [coordinate-expression])]
                       (update loaded :operations #(into (vec (:operations coordinate-value)) %))))
 
@@ -580,7 +586,7 @@
                                 [(body/value result result-type)]))
                          :result result :type result-type :range range})))
 
-                  (and (seq? expression) (= 2 (count expression))
+                  (and (seq? expression) (= 1 (count (descriptor/call-args expression)))
                        (contains? '#{pos? neg? zero? clojure.core/pos? clojure.core/neg?
                                      clojure.core/zero? raster.numeric/pos? raster.numeric/neg?
                                      raster.numeric/zero?}
@@ -588,7 +594,11 @@
                   (let [source-operation (descriptor/semantic-op expression)
                         operator (case (name source-operation)
                                    "pos?" :gt "neg?" :lt "zero?" :eq)
-                        operand-expression (second expression)
+                        ;; Walked deftm calls use `(.invk implementation operand)`, while direct
+                        ;; source calls use `(zero? operand)`. The descriptor is the one canonical
+                        ;; call-shape projection; raw `second` would mistake the implementation
+                        ;; Var for the operand only on the walked path.
+                        operand-expression (first (descriptor/call-args expression))
                         operand-type (canon-type
                                       (or (authoritative-source-type operand-expression env)
                                           (decline! :scalar-source-type

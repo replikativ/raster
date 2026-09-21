@@ -46,6 +46,7 @@
             [raster.dl.nn :as dl-nn]
             [raster.linalg.contract :as contract]
             [raster.numeric]
+            [raster.nn :as nn]
             [raster.par]
             [raster.quant.ggml-kernels :as ggml-kernels]
             [raster.quant.kernels-k :as qk]
@@ -401,6 +402,8 @@
                  #'staged-public/byte-products-float-accumulation! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-dot {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'nn/softmax {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'public-c-family-long-state {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

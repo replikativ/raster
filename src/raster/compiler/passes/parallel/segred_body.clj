@@ -60,7 +60,8 @@
       :numerical-mode (select-keys (if (scan/associative-scan? (:algebra operator))
                                      (:algebra operator)
                                      (first (:components (:algebra operator))))
-                                   [:order :reassociation :overflow])
+                                   [:order :reassociation :overflow
+                                    :nan-policy :signed-zero-policy])
       :attributes {:phase phase
                    :group-count (:num-blocks grid)
                    :shared-memory-bytes shared-memory-bytes}})))
@@ -266,7 +267,31 @@
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
     {:operator operator :identity (constant/literal-or-original init) :element element
+     :numerical-policy (select-keys derived [:nan-policy :signed-zero-policy])
      :accumulator acc}))
+
+(defn- reduction-combine-expression
+  "Build one scalar combine while preserving the certificate's floating min/max policy.
+
+  C-family fmin/fmax implement the required signed-zero tie but suppress a single NaN. The
+  explicit selects restore Raster/Math NaN propagation before the target intrinsic is reached."
+  [operator dtype left right numerical-policy]
+  (let [base (body/scalar-expression operator dtype [left right])]
+    (if (contains? #{:min :max} operator)
+      (let [expected {:nan-policy :propagate
+                      :signed-zero-policy (if (= :min operator)
+                                            :prefer-negative :prefer-positive)}]
+        (when-not (= expected numerical-policy)
+          (decline! :floating-minmax-semantics
+                    "portable scalar reduction needs an explicit supported NaN and signed-zero policy for min/max"
+                    {:operator operator :expected expected :actual numerical-policy}))
+        (body/scalar-expression
+         :select dtype
+         [(body/scalar-expression :isnan :predicate [left]) left
+          (body/scalar-expression
+           :select dtype
+           [(body/scalar-expression :isnan :predicate [right]) right base])]))
+      base)))
 
 (defn capped-group-count
   "Construct the canonical non-empty occupancy-capped scalar-reduction grid."
@@ -402,6 +427,7 @@
    their own retained facts. Admission remains here; accepted loads, conversions and arithmetic
    over typed child values use the same SSA builder as maps and ordered fold-maps."
   [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
+                      lower-load-index
                       load-predicate load-other declared-result-dtype]}]
   (let [dtype (dtype/canon dtype)
         expression (inline-scalar-bindings expression)
@@ -442,6 +468,11 @@
                   :source-region expression
                   ;; Only this adapter's already-approved coordinates reach KernelBody.
                   :lower-index lower-coordinate
+                  :lower-load-index
+                  (fn [array source-coordinate scope]
+                    (or (when lower-load-index
+                          (lower-load-index array source-coordinate scope))
+                        (lower-coordinate source-coordinate scope)))
                   :predicate load-predicate
                   :load-other (fn [storage-dtype]
                                 (if load-other
@@ -492,7 +523,11 @@
                       "KernelBody scalar reduction requires a static power-of-two workgroup and uniform tensor storage"
                       {:segred-id (:id segred) :dtype dtype :bound bound
                        :workgroup-size workgroup-size :arrays arrays :scalars scalars}))
-        {:keys [operator identity element]} (scalar-plan segred)
+        {:keys [operator identity element numerical-policy]} (scalar-plan segred)
+        resident-scalar-captures
+        (set (filter (set arrays)
+                     (get-in segred [:reduction :attributes
+                                     :resident-scalar-captures])))
         contraction-coordinate-proof?
         (when coordinate-proof
           (let [view (when (contraction-facts/facts? coordinate-proof)
@@ -518,10 +553,6 @@
                          :index index :bound bound :arrays arrays
                          :operator operator :identity identity :element element}))
             true))
-        _ (when (contains? #{:min :max} operator)
-            (decline! :floating-minmax-semantics
-                      "portable scalar reduction needs an explicit NaN and signed-zero policy for min/max"
-                      {:segred-id (:id segred) :operator operator}))
         identity (constant/literal-or-original identity)
         _ (when-not (number? identity)
             (decline! :literal-identity
@@ -541,6 +572,12 @@
           :declared-result-dtype dtype
           :arrays (set arrays) :scalars (set scalars)
           :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
+          :lower-load-index
+          (fn [array source-coordinate _scope]
+            (let [source-coordinate (strip-index-cast source-coordinate)]
+              (when (and (contains? resident-scalar-captures array)
+                         (constant/zero-value? source-coordinate))
+                (body/index-cast 0 :long :exact))))
           :coordinate-lower
           (fn [source-coordinate]
             ;; The first complete vertical proves every input has at least `bound` elements.
@@ -580,7 +617,7 @@
                mask (body/literal identity dtype) :cached)
               (body/->ScalarCompute
                (body/value combined dtype)
-               (body/scalar-expression operator dtype [left right]))
+               (reduction-combine-expression operator dtype left right numerical-policy))
               (body/->ScalarStore scratch ['local-index] combined mask)
               (barrier)]))
          (take-while pos? (iterate #(quot % 2) (quot workgroup-size 2))))
@@ -588,8 +625,10 @@
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input dtype ['_n_bound] :global
-                     (layout/row-major ['_n_bound] dtype) :operand)
+                     % :input dtype [(if (contains? resident-scalar-captures %) 1 '_n_bound)] :global
+                     (layout/row-major [(if (contains? resident-scalar-captures %) 1 '_n_bound)]
+                                       dtype)
+                     :operand)
                    arrays)
               [(body/->KernelParameter output :output dtype [group-count] :global
                                        (layout/row-major [group-count] dtype) :result)]
@@ -667,8 +706,8 @@
                                     operations
                                     [(body/->ScalarCompute
                                       (body/value next-lane-accumulator dtype)
-                                      (body/scalar-expression
-                                       operator dtype [lane-accumulator result]))
+                                      (reduction-combine-expression
+                                       operator dtype lane-accumulator result numerical-policy))
                                      (body/->Yield [next-lane-accumulator])]))
                               [(body/value lane-result dtype)]
                               {})
@@ -690,7 +729,7 @@
                        :segop-id (:id segred)
                        :algorithm-dialect (:algorithm-dialect segred)}
           :attributes {:kind :scalar-reduction :identity identity
-                       :operator operator}})]
+                       :operator operator :numerical-policy numerical-policy}})]
     {:kernel-body kernel-body
      :operator operator
      :identity identity
@@ -746,7 +785,7 @@
                        (map vector (:parameters kernel-body) arguments)))
         phase (:phase segred)
         output-elements (launch/rebind-expression group-count {'_n_bound bound})
-        c-op ({:+ "+" :* "*"} operator)
+        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)
         result-dtype (dtype/canon (or (:result-dtype result-region) (:dtype segred)))]
     (when-not c-op
       (decline! :certified-monoid
@@ -831,7 +870,9 @@
         realized-launch (scheduled-body/realized-launch scheduled)
         group-count (get-in realized-launch [:group-count 0])
         workgroup-size (get-in source [:grid :block-size])
-        shared-memory-bytes (get-in source [:grid :shared-mem-bytes])]
+        shared-memory-bytes (get-in source [:grid :shared-mem-bytes])
+        resident-scalar-captures
+        (set (get-in source [:reduction :attributes :resident-scalar-captures]))]
     (doseq [[parameter argument] (map vector parameters arguments)
             :when (not= :scalar (:kind parameter))]
       (let [buffer (get buffers argument)
@@ -841,9 +882,10 @@
                                 0 1
                                 1 (first realized-shape)
                                 (apply launch/product realized-shape))
-            source-elements (if (= :result (:role parameter))
-                              output-elements
-                              (:bound (segop/seg-space-reduced-dim (:space source))))]
+            source-elements (cond
+                              (= :result (:role parameter)) output-elements
+                              (contains? resident-scalar-captures (:id parameter)) 1
+                              :else (:bound (segop/seg-space-reduced-dim (:space source))))]
         (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
           (decline! :storage-dtype
                     "scalar SegRed pointer dtype differs from its KernelGraph buffer"

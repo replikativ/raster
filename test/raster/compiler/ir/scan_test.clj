@@ -75,6 +75,20 @@
     (catch clojure.lang.ExceptionInfo exception
       (is (= :scan-nonidentity-init (:reason (ex-data exception)))))))
 
+(deftest floating-min-max-certificates-retain-their-exceptional-value-policy
+  (let [maximum (scan/certify-reassociation
+                 {:acc 'acc :init '(float Double/NEGATIVE_INFINITY)
+                  :lambda '(raster.numeric/max acc element)}
+                 :float)
+        minimum (scan/certify-reassociation
+                 {:acc 'acc :init 'Double/POSITIVE_INFINITY
+                  :lambda '(raster.numeric/min acc element)}
+                 :double)]
+    (is (= {:nan-policy :propagate :signed-zero-policy :prefer-positive}
+           (select-keys maximum [:nan-policy :signed-zero-policy])))
+    (is (= {:nan-policy :propagate :signed-zero-policy :prefer-negative}
+           (select-keys minimum [:nan-policy :signed-zero-policy])))))
+
 (deftest reassociation-certification-uses-the-shared-pure-let-rewrite
   (let [facts (scan/certify-reassociation
                {:acc 'acc :init 0.0

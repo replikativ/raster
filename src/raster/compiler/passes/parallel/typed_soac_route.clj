@@ -121,6 +121,26 @@
           body)
     body))
 
+(defn- materialize-functional-result-transform
+  "Project a completed functional reduction's typed scalar transform back to host source.
+
+   Device schedules execute this region at their terminal store.  JVM scalar/SIMD lowering still
+   consumes the materialized host expression, so dropping the region there would return the raw
+   accumulator (for example `sum(exp(x-max))` instead of its reciprocal).  Full reductions cannot
+   have tensor operands; their remaining captures are already typed scalar SSA values."
+  [reduction-source transform]
+  (if-not transform
+    reduction-source
+    (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
+          substitutions
+          (into {(first parameters) reduction-source}
+                (map (juxt :parameter :value) (:scalars transform)))]
+      (when (seq (:operands transform))
+        (throw (ex-info "functional scalar reduction result transforms cannot read tensor operands"
+                        {:reason :typed-soac-functional-result-transform-operands
+                         :transform transform})))
+      (util/subst-syms substitutions (first body-results)))))
+
 (defn- allocation-pair
   [values result extent]
   (let [dtype (:dtype (get values result))
@@ -401,14 +421,19 @@
             storage (get-in placement-facts [:attributes :result-storage])
             resident-destination (when resident? (:destination (first storage)))
             body (materialize-region region-locals (first bodies))
+            reduction-source
+            (if resident?
+              ;; reduce-into owns its explicit one-element destination first. The scheduled
+              ;; terminal store applies any result transform before writing that destination.
+              (list 'raster.par/reduce-into (or resident-destination result) accumulator
+                    (first (:identities attributes)) (:index attributes)
+                    (:extent attributes) body)
+              (list 'raster.par/reduce accumulator (first (:identities attributes))
+                    (:index attributes) (:extent attributes) body))
             source (if resident?
-                     ;; reduce-into owns its explicit one-element destination first. The
-                     ;; functional reduction algorithm itself remains unchanged.
-                     (list 'raster.par/reduce-into (or resident-destination result) accumulator
-                           (first (:identities attributes)) (:index attributes)
-                           (:extent attributes) body)
-                     (list 'raster.par/reduce accumulator (first (:identities attributes))
-                           (:index attributes) (:extent attributes) body))]
+                     reduction-source
+                     (materialize-functional-result-transform
+                      reduction-source (:result-transform attributes)))]
         (if resident?
           (let [effect (gensym (str "typed_soac_reduce_" equation-id "__"))]
             {:equation-id equation-id

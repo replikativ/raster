@@ -34,6 +34,18 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared value"
                          (lower 'Float/UNKNOWN :float {})))))
 
+(deftest walked-numeric-predicates-project-their-real-operand
+  (let [lower (:lower (lowerer))
+        expression (with-meta '(.invk raster.numeric/zero?_m_float-impl
+                                      (float (clojure.core/aget x i)))
+                     {:raster.op/original 'raster.numeric/zero?})
+        lowered (lower expression
+                       :predicate {'i :int})]
+    (is (= :predicate (:type lowered)))
+    (is (= :eq (get-in lowered [:operations (dec (count (:operations lowered)))
+                                :expression :op])))
+    (is (= :float (get-in lowered [:operations 0 :result :type])))))
+
 (deftest java-round-keeps-overload-separate-from-consumer-type
   (let [lower (:lower (lowerer))
         widened (lower '(Math/round (aget x i)) :long {'i :int})

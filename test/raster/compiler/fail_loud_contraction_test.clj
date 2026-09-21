@@ -112,16 +112,16 @@
       (is (= "*" (:c-op r)))
       (is (= 1.0 (:identity-val r))
           "the product identity must not become the sum identity")))
-  (testing "floating max cannot silently acquire C fmax's different NaN semantics"
-    (try
-      (cr/route-contraction
-       '(raster.par/contract O [] [[l 8]] (* (aget a l) (aget b l))
-                             :combine max :init Double/NEGATIVE_INFINITY)
-       :dtype :double)
-      (is false "requires an explicit floating min/max numerical policy")
-      (catch clojure.lang.ExceptionInfo exception
-        (is (= :floating-minmax-semantics
-               (get-in (ex-data exception) [:kernel-body-decline :missing-rule])))))))
+  (testing "floating max explicitly restores Math semantics around C fmax"
+    (let [routed
+          (cr/route-contraction
+           '(raster.par/contract O [] [[l 8]] (* (aget a l) (aget b l))
+                                 :combine max :init Double/NEGATIVE_INFINITY)
+           :dtype :double)]
+      (is (= :full-reduce (:strategy routed)))
+      (is (= "fmax" (:c-op routed)))
+      (is (.contains ^String (:source routed) "isnan("))
+      (is (.contains ^String (:source routed) "fmax(")))))
 
 (deftest fp64-result-transform-uses-the-typed-register-tiled-store
   (testing "an f64 two-free/one-contract result transform executes on the register-tiled leaf"

@@ -2060,6 +2060,8 @@
         combine (case c-op
                   "*" *
                   "+" +
+                  "fmin" #(Math/min %1 %2)
+                  "fmax" #(Math/max %1 %2)
                   (throw (ex-info "staged reduction has an unknown certified combine operator"
                                   {:operator c-op :dtype result-dtype})))]
     (reduce (fn [acc partial]
