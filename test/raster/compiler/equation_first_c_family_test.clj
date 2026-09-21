@@ -293,9 +293,9 @@
           derive @derive-var
           calls (atom 0)]
       (with-redefs-fn
-        {derive-var (fn [plan]
+        {derive-var (fn [plan effect-evidence]
                       (swap! calls inc)
-                      (derive plan))}
+                      (derive plan effect-evidence))}
         (fn []
           (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]
                                          {:compiler :equation-first

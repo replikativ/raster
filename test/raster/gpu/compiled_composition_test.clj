@@ -122,10 +122,14 @@
                               {:id :second :program second}]
                  :connections [{:from [:first :y] :to [:second :x]}]
                  :shares [[[:first :w] [:second :w]]]
-                 :outputs [{:key :result :from [:second :y]}]}]
-    (with-redefs [resident-plan/verify!
-                  (fn [_] (throw (AssertionError. "fresh Prepared was redundantly verified")))]
-      (is (compiled/prepared? (compiled/compose request))))
+                 :outputs [{:key :result :from [:second :y]}]}
+        facts-var (ns-resolve 'raster.compiler.ir.link-plan 'instance-access-facts)]
+    (with-redefs-fn
+      {#'resident-plan/verify!
+       (fn [_] (throw (AssertionError. "fresh Prepared was redundantly verified")))
+       facts-var
+       (fn [_] (throw (AssertionError. "certified component ABIs were reparsed")))}
+      #(is (compiled/prepared? (compiled/compose request))))
     (let [copied (assoc first :preparation-report {:copied true})
           calls (atom 0)
           original resident-plan/verify!]

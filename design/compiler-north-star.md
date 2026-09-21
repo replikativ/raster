@@ -468,7 +468,15 @@ specialization environment required by descriptor shape closures, while runtime 
 come only from certified node bindings. Independently lowered `Prepared` artifacts now compose
 before allocation through semantic input/output keys. The composition certificate namespaces
 component identities, unifies explicit dataflow and shared constant/input nodes, and re-derives one
-validated plan; one later instantiation therefore removes even the device copy. The remaining
+validated plan; one later instantiation therefore removes even the device copy. LinkPlan validation
+also retains its ordered executable effect facts and initialization contract as certificate evidence.
+Composition remaps that evidence into the composite identity space and rechecks cross-component
+dataflow, aliases, complete writes and outputs without reparsing every already-certified executable
+ABI. Modified or externally supplied artifacts still rederive the evidence. On the 29-component,
+674-node Laya encoder this reduced warm preparation from 10.38 seconds to 351 milliseconds and cold
+preparation from 57.8 to 46.75 seconds; the graph shape was unchanged. Printable provenance is not an
+operational ordering: local graph identities, canonical compilation fingerprints and diagnostic
+provenance are distinct compiler concerns. The remaining
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 

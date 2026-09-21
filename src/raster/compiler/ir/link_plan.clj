@@ -30,6 +30,8 @@
 (defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
 (defrecord ProgramLinkInstance [id call roles attributes])
 (defrecord LinkPlan [id target nodes values instances outputs aliases attributes])
+(defrecord LinkEffectEvidence
+           [source-dialect target-dialect plan-id target step-facts initialization])
 
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
@@ -48,6 +50,9 @@
 
 (defn link-value? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkValue" (.getName (class x)))))
+
+(defn effect-evidence? [x]
+  (and x (= "raster.compiler.ir.link_plan.LinkEffectEvidence" (.getName (class x)))))
 
 (defn- shape-elements [shape]
   (reduce * 1 shape))
@@ -1010,8 +1015,10 @@
              (validate-program-instance-bindings! nodes values %))
           instances))
 
-(defn- analyze-effects! [{:keys [nodes outputs aliases] :as plan}]
-  (let [step-facts (instance-access-facts plan)
+(defn- analyze-effects!
+  ([plan] (analyze-effects! plan (vec (instance-access-facts plan))))
+  ([{:keys [nodes outputs aliases]} step-facts]
+   (let [step-facts (vec step-facts)
         ;; Preserve the plan's local node traversal for covering-view checks.  Rendering identities
         ;; is neither a semantic ordering nor an acceptable cost here; composed identities may
         ;; retain arbitrarily rich provenance. Canonical identity/order belongs to the enclosing
@@ -1111,19 +1118,43 @@
                     (initialized-view? node-id))
         (throw (ex-info "link plan exports a node with no value"
                         {:reason :link-unproduced-output :node node-id}))))
-    {:requires @required
-     :initializers (into #{} (keep (fn [[id node]] (when (:source node) id))) nodes)
-     :produces @written :complete-writes @complete :reads @reads :writes @writes
-     :outputs (set outputs)}))
+     {:requires @required
+      :initializers (into #{} (keep (fn [[id node]] (when (:source node) id))) nodes)
+      :produces @written :complete-writes @complete :reads @reads :writes @writes
+      :outputs (set outputs)})))
 
-(defn- validate-effects! [plan]
-  (analyze-effects! plan)
-  plan)
+(defn ^:no-doc validate-with-effect-evidence!
+  "Validate a LinkPlan and retain the exact ordered effect facts derived from its executable ABIs.
+   The evidence is immutable compiler data: it allocates no storage and contacts no driver."
+  [plan]
+  (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
+        step-facts (vec (instance-access-facts plan))
+        initialization (analyze-effects! plan step-facts)]
+    {:plan plan
+     :effect-evidence
+     (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
+                           step-facts initialization)}))
+
+(defn ^:no-doc validate-with-certified-effect-facts!
+  "Validate plan structure and derive a new effect witness from already certified step facts.
+
+   The facts must have been remapped from immediately verified component evidence. This is the
+   composition operation for effect evidence: all cross-component initialization, output and alias
+   obligations are rechecked against the newly composed nodes, while executable ABIs are not
+   reparsed. Arbitrary plans must use `validate!`."
+  [plan step-facts]
+  (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
+        step-facts (vec step-facts)
+        initialization (analyze-effects! plan step-facts)]
+    {:plan plan
+     :effect-evidence
+     (->LinkEffectEvidence :certified-component-effects :link-effects
+                           (:id plan) (:target plan) step-facts initialization)}))
 
 (defn validate!
   "Validate a LinkPlan without allocating storage, registering kernels, or contacting a driver."
   [plan]
-  (-> plan validate-plan-structure! validate-allocations-and-aliases! validate-effects!))
+  (:plan (validate-with-effect-evidence! plan)))
 
 (defn initialization-contract
   "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.
@@ -1157,6 +1188,24 @@
               (update accesses (get node-values node) merge-access access))
             {} (mapcat :facts (instance-access-facts plan)))))
 
+(defn- normalize-plan
+  [{:keys [id target nodes values instances outputs aliases attributes]
+    :or {outputs [] aliases #{} attributes {}}}]
+  (let [nodes (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))
+        values (normalize-values nodes values)
+        aliases (into #{} (map canonical-alias-pair) aliases)]
+    (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases attributes)))
+
+(defn ^:no-doc make-with-effect-evidence
+  "Construct and validate a LinkPlan while retaining its derived effect witness."
+  [request]
+  (validate-with-effect-evidence! (normalize-plan request)))
+
+(defn ^:no-doc make-with-certified-effect-facts
+  "Construct a LinkPlan by composing step facts from immediately verified component evidence."
+  [request step-facts]
+  (validate-with-certified-effect-facts! (normalize-plan request) step-facts))
+
 (defn make
   "Construct and purely validate a LinkPlan.
 
@@ -1164,13 +1213,8 @@
    nodes into ordered logical LinkValues; every unclaimed node receives an implicit one-leaf value
    with the same identity. `:aliases` explicitly declares overlapping views. Instance order and
    each descriptor's step order define the current serial dependency schedule."
-  [{:keys [id target nodes values instances outputs aliases attributes]
-    :or {outputs [] aliases #{} attributes {}}}]
-  (let [nodes (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))
-        values (normalize-values nodes values)
-        aliases (into #{} (map canonical-alias-pair) aliases)]
-    (validate! (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases
-                           attributes))))
+  [request]
+  (:plan (make-with-effect-evidence request)))
 
 (defn borrow-owned-storage
   "Project a local plan's owned allocations into storage borrowed from an enclosing execution.
