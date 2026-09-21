@@ -286,6 +286,27 @@
                                 [:driver-allocations]))
                 [functional effect state]))))
 
+(deftest trusted-equation-first-construction-derives-its-link-witness-once
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [derive-var (ns-resolve 'raster.compiler.ir.invocation-link 'derive-certificate)
+          derive @derive-var
+          calls (atom 0)]
+      (with-redefs-fn
+        {derive-var (fn [plan]
+                      (swap! calls inc)
+                      (derive plan))}
+        (fn []
+          (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                         {:compiler :equation-first
+                                          :target cuda-target :dtype :float})
+                lowering (:lowering prepared)]
+            (is (= 1 @calls))
+            (is (identical? lowering (invocation-link/verify! lowering)))
+            (is (= 2 @calls))))))
+    (finally
+      (compiled/clear-compilation-cache!))))
+
 (deftest equation-first-compiled-artifacts-compose-before-allocation
   (compiled/clear-compilation-cache!)
   (try
