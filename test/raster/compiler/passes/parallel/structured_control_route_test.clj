@@ -27,11 +27,23 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.report :as report]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]))
+
+(deftest diagnostic-pipeline-reports-an-emitted-structured-program
+  (let [diagnostic (pipeline/show-pipeline
+                    #'pde/heat-loss-rk4 :target-device :ocl:0 :dtype :double)
+        compiler-report (report/from-pipeline diagnostic)]
+    (is (= :typed-structured-control (get-in compiler-report [:route :source-dialect])))
+    (is (true? (get-in compiler-report [:route :typed-validated])))
+    (is (pos? (get-in compiler-report [:emission :kernel-count])))
+    (is (= #{:kernel-body}
+           (set (keys (get-in compiler-report [:emission :routes])))))
+    (is (= :opencl-parallel (:dialect (:emitted-program diagnostic))))))
 
 (deftest wrapping-casts-do-not-prove-shape-projections
   (is (= 'xs (#'route/shape-projection-source '(clojure.core/long (alength xs)))))
