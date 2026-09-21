@@ -988,16 +988,20 @@
                  (= :scheduled-parallel (:dialect form)))
           (let [{:keys [program kernels stats]}
                 (parallel-program-opencl/emit-program form opts)]
-            ;; Emission is complete and source-independent here. The ordinary compile-aot entry
-            ;; cannot guess physical buffers, scalar values, or loop scratch for the checked
-            ;; whole-program call; doing so would reintroduce the source/ABI binder this vertical
-            ;; removed. The resident-call integration is the next explicit compiler boundary.
-            (throw (ex-info
-                    "emitted parallel program requires an explicit checked runtime call"
-                    {:reason :emitted-parallel-program-call-required
-                     :target-dialect :opencl-parallel
-                     :program program :kernel-count (count kernels)
-                     :emission-stats stats :fallback :none})))
+            ;; Emission is complete and source-independent here. Diagnostics retain that immutable
+            ;; program and its artifacts so coverage describes the real equation-first vertical.
+            ;; The ordinary compile-aot entry still cannot guess physical buffers, scalar values,
+            ;; or loop scratch for the checked whole-program call; doing so would reintroduce the
+            ;; source/ABI binder this vertical removed.
+            (if (:diagnostic? opts)
+              {:form (:source program) :stats stats :kernels kernels
+               :emitted-program program :backend :opencl}
+              (throw (ex-info
+                      "emitted parallel program requires an explicit checked runtime call"
+                      {:reason :emitted-parallel-program-call-required
+                       :target-dialect :opencl-parallel
+                       :program program :kernel-count (count kernels)
+                       :emission-stats stats :fallback :none}))))
           (let [form (cond-> form
                        (or (:scalar-types opts) (:array-types opts) (:buffer-projections opts))
                        (vary-meta assoc :scalar-types (:scalar-types opts)
@@ -1235,6 +1239,8 @@
                      (assoc-in [:stages :backend-type] (:backend result)))
                    (cond-> (and (map? result) (:kernels result))
                      (assoc-in [:stages :kernels] (:kernels result)))
+                   (cond-> (and (map? result) (:emitted-program result))
+                     (assoc-in [:stages :emitted-program] (:emitted-program result)))
                    (cond-> (and (map? result) (:cuda-result result))
                      (assoc-in [:stages :cuda-result] (:cuda-result result))))))
            {:form form :stages {} :stats {} :dialect start-dialect} passes)))
@@ -2404,6 +2410,7 @@
                          (:raster.core/deftm-tags (meta resolved-var))
                          effective-dtype)
         opts (cond-> {:inline? inline?
+                      :diagnostic? true
                       :active-params active-params
                       :simd? simd? :target-device target-device
                       :dtype effective-dtype}

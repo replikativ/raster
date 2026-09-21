@@ -3,7 +3,8 @@
 
    The compiler's coverage claim is measured, not asserted: every source `deftm` in the corpus
    namespaces is compiled through the diagnostic pipeline for a GPU target and the normalized
-   report records which route it took (`:typed-soac`, `:compatibility`, `:scalar`), every
+   report records which route it took (`:typed-soac`, `:typed-structured-control`,
+   `:compatibility`, `:scalar`), every
    route decline with its reason and operation, and any hard error. A committed baseline turns
    this into a ratchet (`ratchet-violations`): a function that took the typed route may not fall
    back, and a function that compiled may not start failing.
@@ -112,7 +113,7 @@
 
 (def route-rank
   "Routes ordered from best to worst; a move down this order is a regression."
-  {:typed-soac 0 :compatibility 1 :scalar 2 :error 3})
+  {:typed-soac 0 :typed-structured-control 0 :compatibility 1 :scalar 2 :error 3})
 
 (defn ratchet-violations
   "Ways in which `report` regressed against `baseline`.
