@@ -423,6 +423,17 @@
 
 (defonce dispatch-tables (atom {}))
 
+;; Process-local compiler-visible definition epoch. Compilation-template caches capture this after
+;; specialization so a REPL redefinition of an inlined callee cannot reuse stale generated code.
+(defonce ^:private compiler-definition-revision* (atom 0))
+
+(defn compiler-definition-revision [] @compiler-definition-revision*)
+
+(defn bump-compiler-definition-revision!
+  "Record a change to source/type/dispatch state that can affect compiler inlining or routing."
+  []
+  (swap! compiler-definition-revision* inc))
+
 (defn- gf-key [ns-sym fn-name]
   (symbol (str ns-sym) (str fn-name)))
 
@@ -761,6 +772,7 @@
          table-atom (get-or-create-table! k)]
      (add-method! simple-name table-atom tags specialized-fn typed-impl typed-iface typed-target-fn warning-meta
                   (ns-name ns-obj))
+     (bump-compiler-definition-revision!)
      ;; Register tag→Class mappings globally
      (doseq [tag tags]
        (let [cls (binding [*ns* ns-obj] (types/tag->check-class tag))]
@@ -813,6 +825,7 @@
                          (if make-td (make-td fn-name table-atom dfn) dfn))
                        (catch Exception _ dfn))]
     (alter-var-root fn-var (constantly dispatch-obj)))
+  (bump-compiler-definition-revision!)
   fn-var)
 
 ;; ================================================================
@@ -849,7 +862,9 @@
   "Register a parametric value type's type variables for dispatch unification.
    Called by defvalue (All [T]) at macro expansion time."
   [base-name type-vars]
-  (swap! parametric-value-type-vars assoc base-name (vec type-vars)))
+  (let [registered (swap! parametric-value-type-vars assoc base-name (vec type-vars))]
+    (bump-compiler-definition-revision!)
+    registered))
 
 (def ^:private array-element-types
   "Map from JVM array class to element type tag."
@@ -1146,14 +1161,17 @@
         anns-key (vec annotations)]
     ;; Replace existing entry with matching annotations (REPL reload safety),
     ;; or append if no match exists.
-    (swap! parametric-registry update fn-name
-           (fn [entries]
-             (let [entries (or entries [])
-                   idx (some (fn [[i e]] (when (= (:annotations e) anns-key) i))
-                             (map-indexed vector entries))]
-               (if idx
-                 (assoc entries idx new-entry)
-                 (conj entries new-entry)))))))
+    (let [registered
+          (swap! parametric-registry update fn-name
+                 (fn [entries]
+                   (let [entries (or entries [])
+                         idx (some (fn [[i e]] (when (= (:annotations e) anns-key) i))
+                                   (map-indexed vector entries))]
+                     (if idx
+                       (assoc entries idx new-entry)
+                       (conj entries new-entry)))))]
+      (bump-compiler-definition-revision!)
+      registered)))
 
 ;; Callback for parametric specialization. Set by core.clj during loading.
 ;; Breaks the dispatch↔core cycle: dispatch defines the protocol,
