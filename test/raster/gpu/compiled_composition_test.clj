@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as gpu-link]))
@@ -109,6 +110,33 @@
     (is (pos? (:total-ns (compiled/preparation-report composite))))
     (is (= 2 (count (compiled/ir composite))))
     (is (= {:map 2} (:steps (compiled/cache-key composite))))))
+
+(deftest exact-prepared-values-compose-without-rederiving-component-certificates
+  (let [weight (float-array 16)
+        prepare #(compiled/lower #'component [(float-array 16) weight 16]
+                                 {:target :ze:0 :constants '[w]})
+        [first second] (with-redefs [pipeline/compile-gpu-program (fn [& _] (descriptor))]
+                         [(prepare) (prepare)])
+        request {:id :sealed-components
+                 :components [{:id :first :program first}
+                              {:id :second :program second}]
+                 :connections [{:from [:first :y] :to [:second :x]}]
+                 :shares [[[:first :w] [:second :w]]]
+                 :outputs [{:key :result :from [:second :y]}]}]
+    (with-redefs [resident-plan/verify!
+                  (fn [_] (throw (AssertionError. "fresh Prepared was redundantly verified")))]
+      (is (compiled/prepared? (compiled/compose request))))
+    (let [copied (assoc first :preparation-report {:copied true})
+          calls (atom 0)
+          original resident-plan/verify!]
+      (with-redefs [resident-plan/verify! (fn [lowering]
+                                           (swap! calls inc)
+                                           (original lowering))]
+        (is (compiled/prepared?
+             (compiled/compose
+              (assoc-in request [:components 0 :program] copied))))
+        (is (= 2 @calls)
+            "copying one sealed component makes the whole public composition verify independently")))))
 
 (deftest repeated-lowerings-share-only-the-immutable-compilation-template
   (compiled/clear-compilation-cache!)

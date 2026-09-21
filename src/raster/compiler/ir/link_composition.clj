@@ -37,14 +37,25 @@
     (throw (ex-info "link composition components must carry a verified lowering certificate"
                     {:reason :link-composition-component-type :actual (type component)}))))
 
-(defn- normalize-components! [components]
+(defn- certified-component! [component]
+  (when-not (or (resident-plan/certified-plan? component)
+                (invocation-link/certified-link? component)
+                (certified-composition? component))
+    (throw (ex-info "link composition components must carry a certified lowering"
+                    {:reason :link-composition-component-type :actual (type component)})))
+  component)
+
+(defn- normalize-components! [components verify-components?]
   (let [components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
                                           (contains? component :lowering))
                              (throw (ex-info "each link component requires :id and :lowering"
                                              {:reason :link-composition-component
                                               :component component})))
-                           (update component :lowering verify-component!))
+                           (update component :lowering
+                                   (if verify-components?
+                                     verify-component!
+                                     certified-component!)))
                          components)
         ids (mapv :id components)]
     (when (empty? components)
@@ -236,13 +247,15 @@
        (apply mapv (fn [& leaves] (mapv :node leaves)) leaf-vectors)))
    value-groups))
 
+(def ^:dynamic ^:private *verify-components?* true)
+
 (defn- derive-composition
   [id components {:keys [connections shares outputs attributes]
                   :or {connections [] shares [] attributes {}} :as specification}]
   (when (nil? id)
     (throw (ex-info "link composition requires a stable plan identity"
                     {:reason :link-composition-id})))
-  (let [components (normalize-components! components)
+  (let [components (normalize-components! components *verify-components?*)
         component-plans (into {} (map (juxt :id (comp :plan :lowering))) components)
         targets (set (map :target (vals component-plans)))
         _ (when-not (= 1 (count targets))
@@ -454,4 +467,16 @@
   (let [specification (select-keys request [:connections :shares :outputs :attributes])
         {:keys [plan certificate components specification]}
         (derive-composition id components specification)]
+    (->CertifiedLinkComposition plan certificate components specification)))
+
+(defn ^:no-doc compose-prevalidated
+  "Internal construction path for exact, identity-sealed Prepared values created by
+   raster.gpu.compiled. It skips only component certificate re-derivation; the complete composed
+   LinkPlan and all cross-component boundaries are still independently validated. Callers without
+   that in-process provenance must use `compose`."
+  [{:keys [id components] :as request}]
+  (let [specification (select-keys request [:connections :shares :outputs :attributes])
+        {:keys [plan certificate components specification]}
+        (binding [*verify-components?* false]
+          (derive-composition id components specification))]
     (->CertifiedLinkComposition plan certificate components specification)))
