@@ -956,8 +956,13 @@
 (doseq [[base algebra]
         {'+       {:associative? true :commutative? true :identity 0}
          '*       {:associative? true :commutative? true :identity 1}
-         'min     {:associative? true :commutative? true :identity nil}
-         'max     {:associative? true :commutative? true :identity nil}
+         ;; Match java.lang.Math and Raster's scalar API: either NaN propagates, while a
+         ;; zero tie chooses the sign that is the mathematical min/max. Target fmin/fmax alone
+         ;; has a different one-NaN rule, so reductions retain these policies as proof data.
+         'min     {:associative? true :commutative? true :identity nil
+                   :nan-policy :propagate :signed-zero-policy :prefer-negative}
+         'max     {:associative? true :commutative? true :identity nil
+                   :nan-policy :propagate :signed-zero-policy :prefer-positive}
          'bit-and {:associative? true :commutative? true :identity -1}
          'bit-or  {:associative? true :commutative? true :identity 0}
          'bit-xor {:associative? true :commutative? true :identity 0}}

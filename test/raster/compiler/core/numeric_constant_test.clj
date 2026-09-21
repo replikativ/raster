@@ -9,6 +9,10 @@
   (is (not (constant/equivalent? '(float 2147483647) 2147483647)))
   (is (not (constant/equivalent? (list 'double Long/MAX_VALUE) Long/MAX_VALUE)))
   (is (constant/equivalent? '(double (float 1)) 1))
+  (is (constant/equivalent? '(float Double/NEGATIVE_INFINITY)
+                            'Float/NEGATIVE_INFINITY))
+  (is (constant/equivalent? '(float 1.0e300)
+                            'Float/POSITIVE_INFINITY))
   (is (= (Double/doubleToRawLongBits -0.0)
          (Double/doubleToRawLongBits (:value (constant/value '(double -0.0)))))))
 

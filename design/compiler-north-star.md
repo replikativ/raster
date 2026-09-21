@@ -203,9 +203,12 @@ maps. The compiler owns
 one maximum per super-block so quantized bytes retain the prior arithmetic order; this is eight
 times smaller than the caller-managed `submax` array and is reusable by ordinary memory planning.
 No quantizer-specific compiler route is involved. The older scratch ABI
-remains an explicit compatibility surface until downstream callers migrate. Floating min/max use
-the target intrinsic policy over the operation's declared finite numerical domain; arbitrary NaN
-payload or signed-zero equivalence is not silently claimed as an algebraic theorem.
+remains an explicit compatibility surface until downstream callers migrate. Floating min/max
+certificates now state Raster/`java.lang.Math` exceptional-value semantics: either NaN propagates,
+and a zero tie prefers negative zero for min or positive zero for max. KernelBody restores the
+NaN rule explicitly around target `fmin`/`fmax`, whose signed-zero rule supplies the second fact.
+NaN payload identity remains unspecified under reassociation; the compiler claims propagation,
+not which payload wins when several NaNs are present.
 
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
 typed equation records read/write destination access, and GPU lowering emits that storage exactly

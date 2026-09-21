@@ -84,12 +84,16 @@
         (throw (ex-info "parallel reduction element expression is impure or has unknown effects"
                         {:reason (reason operation "element-impure-or-unknown")
                          :element element :body lambda :reduction-op reduction-op})))
-      (let [identity (descriptor/typed-reduce-identity combine dtype)]
+      (let [identity (descriptor/typed-reduce-identity combine dtype)
+            algebra (descriptor/algebra-facet combine)]
         (when-not (constant/equivalent? init identity)
           (throw (ex-info "parallel reduction with a non-identity init requires a distinct schedule"
                           {:reason (reason operation "nonidentity-init")
                            :combine combine :init init :identity identity :dtype dtype})))
-        (->AssociativeScan acc init combine element identity dtype)))))
+        (cond-> (->AssociativeScan acc init combine element identity dtype)
+          (:nan-policy algebra) (assoc :nan-policy (:nan-policy algebra))
+          (:signed-zero-policy algebra)
+          (assoc :signed-zero-policy (:signed-zero-policy algebra)))))))
 
 (defn certify-reassociation
   "Certify a scalar recurrence for parallel reassociation.
@@ -115,6 +119,8 @@
        (= (:dtype declared) (:dtype derived))
        (= (some-> (:combine declared) name symbol)
           (some-> (:combine derived) name symbol))
+       (= (:nan-policy declared) (:nan-policy derived))
+       (= (:signed-zero-policy declared) (:signed-zero-policy derived))
        (constant/equivalent? (:init declared) (:init derived))
        (constant/equivalent? (:identity declared) (:identity derived))))
 

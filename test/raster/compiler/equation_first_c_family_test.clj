@@ -302,6 +302,21 @@
       (is (= 0 (get-in linked [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs linked)))))))
 
+(deftest public-softmax-is-a-complete-typed-soac-program
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})
+          semantic (:semantic compilation)
+          linked (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])]
+      (is (= :typed-parallel (:dialect semantic)))
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (seq (get-in semantic [:attributes :invocation-plan :steps])))
+      (is (link-plan/link-plan? linked))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (some #(and (str/includes? (:source %) "isnan(")
+                      (str/includes? (:source %) "fmax"))
+                (:kernels compilation))
+          "the max tree preserves Math/Raster NaN and signed-zero semantics"))))
+
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

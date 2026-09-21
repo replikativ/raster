@@ -60,7 +60,8 @@
       :numerical-mode (select-keys (if (scan/associative-scan? (:algebra operator))
                                      (:algebra operator)
                                      (first (:components (:algebra operator))))
-                                   [:order :reassociation :overflow])
+                                   [:order :reassociation :overflow
+                                    :nan-policy :signed-zero-policy])
       :attributes {:phase phase
                    :group-count (:num-blocks grid)
                    :shared-memory-bytes shared-memory-bytes}})))
@@ -266,7 +267,31 @@
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
     {:operator operator :identity (constant/literal-or-original init) :element element
+     :numerical-policy (select-keys derived [:nan-policy :signed-zero-policy])
      :accumulator acc}))
+
+(defn- reduction-combine-expression
+  "Build one scalar combine while preserving the certificate's floating min/max policy.
+
+  C-family fmin/fmax implement the required signed-zero tie but suppress a single NaN. The
+  explicit selects restore Raster/Math NaN propagation before the target intrinsic is reached."
+  [operator dtype left right numerical-policy]
+  (let [base (body/scalar-expression operator dtype [left right])]
+    (if (contains? #{:min :max} operator)
+      (let [expected {:nan-policy :propagate
+                      :signed-zero-policy (if (= :min operator)
+                                            :prefer-negative :prefer-positive)}]
+        (when-not (= expected numerical-policy)
+          (decline! :floating-minmax-semantics
+                    "portable scalar reduction needs an explicit supported NaN and signed-zero policy for min/max"
+                    {:operator operator :expected expected :actual numerical-policy}))
+        (body/scalar-expression
+         :select dtype
+         [(body/scalar-expression :isnan :predicate [left]) left
+          (body/scalar-expression
+           :select dtype
+           [(body/scalar-expression :isnan :predicate [right]) right base])]))
+      base)))
 
 (defn capped-group-count
   "Construct the canonical non-empty occupancy-capped scalar-reduction grid."
@@ -492,7 +517,7 @@
                       "KernelBody scalar reduction requires a static power-of-two workgroup and uniform tensor storage"
                       {:segred-id (:id segred) :dtype dtype :bound bound
                        :workgroup-size workgroup-size :arrays arrays :scalars scalars}))
-        {:keys [operator identity element]} (scalar-plan segred)
+        {:keys [operator identity element numerical-policy]} (scalar-plan segred)
         contraction-coordinate-proof?
         (when coordinate-proof
           (let [view (when (contraction-facts/facts? coordinate-proof)
@@ -518,10 +543,6 @@
                          :index index :bound bound :arrays arrays
                          :operator operator :identity identity :element element}))
             true))
-        _ (when (contains? #{:min :max} operator)
-            (decline! :floating-minmax-semantics
-                      "portable scalar reduction needs an explicit NaN and signed-zero policy for min/max"
-                      {:segred-id (:id segred) :operator operator}))
         identity (constant/literal-or-original identity)
         _ (when-not (number? identity)
             (decline! :literal-identity
@@ -580,7 +601,7 @@
                mask (body/literal identity dtype) :cached)
               (body/->ScalarCompute
                (body/value combined dtype)
-               (body/scalar-expression operator dtype [left right]))
+               (reduction-combine-expression operator dtype left right numerical-policy))
               (body/->ScalarStore scratch ['local-index] combined mask)
               (barrier)]))
          (take-while pos? (iterate #(quot % 2) (quot workgroup-size 2))))
@@ -667,8 +688,8 @@
                                     operations
                                     [(body/->ScalarCompute
                                       (body/value next-lane-accumulator dtype)
-                                      (body/scalar-expression
-                                       operator dtype [lane-accumulator result]))
+                                      (reduction-combine-expression
+                                       operator dtype lane-accumulator result numerical-policy))
                                      (body/->Yield [next-lane-accumulator])]))
                               [(body/value lane-result dtype)]
                               {})
@@ -690,7 +711,7 @@
                        :segop-id (:id segred)
                        :algorithm-dialect (:algorithm-dialect segred)}
           :attributes {:kind :scalar-reduction :identity identity
-                       :operator operator}})]
+                       :operator operator :numerical-policy numerical-policy}})]
     {:kernel-body kernel-body
      :operator operator
      :identity identity
@@ -746,7 +767,7 @@
                        (map vector (:parameters kernel-body) arguments)))
         phase (:phase segred)
         output-elements (launch/rebind-expression group-count {'_n_bound bound})
-        c-op ({:+ "+" :* "*"} operator)
+        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)
         result-dtype (dtype/canon (or (:result-dtype result-region) (:dtype segred)))]
     (when-not c-op
       (decline! :certified-monoid
