@@ -275,11 +275,17 @@
     (is (= (set types) (set (keys dtype/dtype-info))))
     (doseq [[row source] (map-indexed vector types)
             [column target] (map-indexed vector types)]
-      (let [policy (get-in expected [row column])]
-        (is (= policy (conversion/policy source target :wrap)) (str source " → " target))
+      (let [policy (get-in expected [row column])
+            explicit-fp-integral (when (and (contains? #{:float :double} source)
+                                             (contains? #{:int :long} target))
+                                    [:toward-zero :saturate])]
+        (is (= (or explicit-fp-integral policy)
+               (conversion/policy source target :wrap))
+            (str source " → " target))
         (is (= (when-not (= wrap policy) policy) (conversion/policy source target))
             (str "default rejecting owner: " source " → " target))
-        (is (= (if (= wrap policy) trap policy) (conversion/policy source target :trap))
+        (is (= (or explicit-fp-integral (if (= wrap policy) trap policy))
+               (conversion/policy source target :trap))
             (str "explicit checked source cast: " source " → " target))))
     (is (= exact (conversion/policy :i32 :f64)))
     (is (= ieee (conversion/policy :f64 :f16)))
