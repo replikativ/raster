@@ -15,7 +15,8 @@
 
    Integral narrowing is rejected unless the caller explicitly requests :wrap or :trap. Those
    options distinguish representation wrapping from a checked source conversion; the default
-   remains rejection. Floating-to-integral conversions remain unsupported. Identity callers may
+   remains rejection. Floating-to-integral source casts use the JVM/Clojure boundary contract:
+   truncate toward zero, map NaN to zero, and saturate out-of-range values. Identity callers may
    elide the returned exact conversion. Unknown dtypes or policy options fail loudly."
   ([source target] (policy source target :reject))
   ([source target integral-narrowing]
@@ -42,6 +43,9 @@
        (if (and (= :double target) (<= (dtype/bytes-of source) 4))
          [:exact :exact]
          [:nearest-even (if (= :half target) :ieee :exact)])
+
+       (and fp-source? (not fp-target?))
+       [:toward-zero :saturate]
 
        :else nil))))
 

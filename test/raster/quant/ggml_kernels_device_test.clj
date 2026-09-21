@@ -262,6 +262,15 @@
         (into {} (map (fn [k] [k (get by-result (name k))])) outputs))
       (finally (gpu/close-session! sess)))))
 
+(deftest activation-quantizers-have-hardware-free-kernelbody-emission
+  (doseq [kernel [#'gk/quant-act-q8-0-rows! #'gk/quant-act-q8-K-rows!]]
+    (let [compiled (pipeline/compile-gpu-program kernel :ze:debug :dtype :float)
+          artifacts (mapv :artifact (:steps compiled))]
+      (is (seq artifacts))
+      (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
+                  artifacts)
+          (str (:name (meta kernel)) " must not depend on the GPU execution gate")))))
+
 (deftest activation-quantizers-match-the-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "ggml activation quantizers")

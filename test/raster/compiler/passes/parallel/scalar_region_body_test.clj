@@ -576,6 +576,14 @@
     (is (= 'value (first (get-in (last (:operations checked)) [:expression :arguments])))
         "the typed term preserves its declared-source operand")))
 
+(deftest floating-source-casts-retain-jvm-saturation-semantics
+  (let [lower (:lower (lowerer))]
+    (doseq [[form expected] [['(long value) :long] ['(int value) :int]]]
+      (let [lowered (lower form expected {'value :float})
+            options (get-in (last (:operations lowered)) [:expression :options])]
+        (is (= {:rounding :toward-zero :overflow :saturate} options))
+        (is (= expected (:type lowered)))))))
+
 (deftest unary-subtraction-retains-floating-sign-and-integral-overflow
   (doseq [type [:float :double :int :long]]
     (let [lower (:lower-region (lowerer))
