@@ -168,9 +168,16 @@
                     {:id :composite-add :target :ze:0 :descriptor descriptor
                      :arguments [{:a x-a :b x-b} n]})
           executable (gpu-link/instantiate! (:plan lowering))
+          construction (gpu-link/instantiation-report executable)
           sum-node [:composite-add 'y :sum]
           difference-node [:composite-add 'y :difference]]
       (try
+        (is (= :host-monotonic (:timing-source construction)))
+        (is (pos? (:total-ns construction)))
+        (is (every? #(and (integer? %) (not (neg? %)))
+                    (vals (:phases-ns construction))))
+        (is (= 1 (:instances construction)))
+        (is (= 1 (:bound-phases construction)))
         (gpu-link/run! executable)
         (is (= (vec expected-sum) (vec (gpu-link/download executable sum-node))))
         (is (= (vec expected-difference)

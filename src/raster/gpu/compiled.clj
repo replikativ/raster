@@ -428,6 +428,14 @@
      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
                  (atom nil)))))
 
+(defn instantiation-report
+  "Return the compact host-side construction report for an instantiated Compiled artifact."
+  [compiled]
+  (when-not (compiled? compiled)
+    (throw (ex-info "instantiation-report requires a Compiled artifact"
+                    {:reason :compiled-instantiation-report-type :actual (type compiled)})))
+  (gpu-link/instantiation-report (:executable compiled)))
+
 (defn- semantic-entry! [components side [component-id key :as reference]]
   (when-not (and (vector? reference) (= 2 (count reference)))
     (throw (ex-info "a semantic artifact reference is [component-id key]"

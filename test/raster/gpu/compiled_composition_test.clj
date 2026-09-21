@@ -26,6 +26,15 @@
     (reset! (:closed? live) true)
     (is (thrown? clojure.lang.ExceptionInfo (compiled/execution-info compiled)))))
 
+(deftest compiled-artifact-projects-the-link-instantiation-report
+  (let [report {:timing-source :host-monotonic :total-ns 42}
+        live (gpu-link/map->LinkedExecutable {:instantiation-report report})
+        artifact (compiled/map->Compiled {:executable live})]
+    (is (= report (compiled/instantiation-report artifact)))
+    (is (= :compiled-instantiation-report-type
+           (:reason (ex-data (try (compiled/instantiation-report {})
+                                  (catch clojure.lang.ExceptionInfo error error))))))))
+
 (def ^:private kernel
   (artifact/make
    {:kernel-name "compiled_composition_axpy"
