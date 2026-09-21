@@ -427,12 +427,25 @@
 ;; specialization so a REPL redefinition of an inlined callee cannot reuse stale generated code.
 (defonce ^:private compiler-definition-revision* (atom 0))
 
+(def ^:dynamic *installing-derived-specialization*
+  "True only while the compiler materializes a concrete method from an already registered
+   parametric template.  Such a method is derived cache state: the template registration has
+   already versioned its semantics, and installing another concrete dtype must not invalidate
+   unrelated compiled artifacts.  The binding is thread-local, so a concurrent source reload
+   still advances the global definition revision."
+  false)
+
 (defn compiler-definition-revision [] @compiler-definition-revision*)
 
 (defn bump-compiler-definition-revision!
-  "Record a change to source/type/dispatch state that can affect compiler inlining or routing."
+  "Record a semantic change to source/type/dispatch state that can affect compiler inlining or
+   routing. Concrete methods materialized from an already-versioned parametric template are
+   deliberately excluded: they add a cached implementation without changing that template's
+   meaning."
   []
-  (swap! compiler-definition-revision* inc))
+  (if *installing-derived-specialization*
+    @compiler-definition-revision*
+    (swap! compiler-definition-revision* inc)))
 
 (defn- gf-key [ns-sym fn-name]
   (symbol (str ns-sym) (str fn-name)))

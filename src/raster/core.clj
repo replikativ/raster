@@ -1534,7 +1534,8 @@
   the invoke(Object) path is a bytecoded unboxing bridge (like manual deftm),
   not a Clojure-compiled fn with TC type hints that break array interop."
   [fn-name template bindings args]
-  (let [{:keys [annotations ret-annotation params body source-ns]} template
+  (binding [dispatch/*installing-derived-specialization* true]
+    (let [{:keys [annotations ret-annotation params body source-ns]} template
         ;; Specialize parametric value types (defvalue with All [T])
         ;; Value-class specialization tag: any NON-double binding (float/int/long
         ;; or a non-primitive like Sym). double uses the base specialization;
@@ -1736,7 +1737,7 @@
                 ;; (compile-time specialization).
                 impl-var))
             (finally
-              (.setContextClassLoader (Thread/currentThread) prev-tcl))))))))
+              (.setContextClassLoader (Thread/currentThread) prev-tcl)))))))))
 
 (defn- parametric-specialize!
   "Runtime dispatch entry: register the concrete specialization for these arg
