@@ -235,11 +235,15 @@
 ;; structural checks (for edge cases like AD output shape).
 
 (defn valid-walked?
-  "Check if form is a valid walked S-expression."
+  "Check if form is a valid walked S-expression.
+
+   Walked compiler programs are binding forms.  The structural fallback has always admitted
+   those forms, so test it before invoking the substantially more expensive formal grammar.
+   This changes no accepted value: `or` is commutative here and neither predicate has effects."
   [form]
-  (or (valid? Walked form)
-      ;; Fallback: at minimum check structural shape
-      (form/binding-form? form)))
+  (or (form/binding-form? form)
+      ;; Terminals and non-binding expression probes still use the formal grammar.
+      (valid? Walked form)))
 
 (defn validate-walked
   "Validate a walked form. Returns :ok or error details."
