@@ -444,6 +444,38 @@
            dispatch
            {:kind :runtime-expression-cases
             :cases [{:expression 'not-in-the-abi :op :> :value 0 :strategy :reference}]
+           :default :subgroup-score-reuse})))))
+
+(deftest ordered-predicate-cases-require-every-checked-condition
+  (let [scheduled
+        (kdispatch/with-selector
+          dispatch
+          {:kind :runtime-predicate-cases
+           :cases [{:conditions [{:expression 'width :op :>= :value 128}
+                                 {:expression 'width :op :< :value 256}]
+                    :strategy :subgroup-score-reuse}]
+           :default :reference})
+        select #(kdispatch/alternative-strategy
+                 (kdispatch/select-alternative
+                  scheduled [:x :out {:type :long :value %}]))]
+    (is (= :reference (select 127)))
+    (is (= :subgroup-score-reuse (select 128)))
+    (is (= :subgroup-score-reuse (select 255)))
+    (is (= :reference (select 256)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"non-empty conditions"
+         (kdispatch/with-selector
+           dispatch
+           {:kind :runtime-predicate-cases
+            :cases [{:conditions [] :strategy :reference}]
+            :default :subgroup-score-reuse})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"outside its scalar ABI"
+         (kdispatch/with-selector
+           dispatch
+           {:kind :runtime-predicate-cases
+            :cases [{:conditions [{:expression 'not-in-the-abi :op := :value 0}]
+                     :strategy :reference}]
             :default :subgroup-score-reuse})))))
 
 (deftest dispatch-preserves-one-interface-across-single-and-multi-kernel-schedules
