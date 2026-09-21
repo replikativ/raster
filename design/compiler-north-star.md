@@ -552,9 +552,11 @@ accepted by nvcc (sm_80 PTX) and hipcc (gfx1100 code object) without hardware. A
 transfer-free host-synchronous Gemma-shape comparison (`B=1`, `in=1024`, `out=640`) measured a noisy
 444 microsecond generated median versus 3.48 milliseconds for the legacy one-thread-per-output
 kernel (about 7.8x, with a 101--115 microsecond generated steady floor). This is directional
-evidence, not the durable Q4_K device-event/roofline gate; system noise was high. The generated path
-now enters the public `Compiled`/`LinkPlan` artifact and aggregate device-event measurement route,
-so the next comparison can measure both candidates under one resident clock without transfers.
+evidence, not the durable Q4_K device-event/roofline gate; system noise was high. Both the generated
+and serial schedules now enter an opt-in public `Compiled` comparison that interleaves aggregate
+device-event spans, keeps operands resident, poisons outputs outside the timed interval and requires
+bit-identical ggml results on every replay. A stable-machine Gemma-shape run and reviewed baseline
+are still required before this becomes deletion or regression-gate evidence.
 
 The same public equation-first route now closes the generic reassociated segmented fold-map used by
 RMSNorm. One cooperative KernelBody, rather than one serial work item, owns each row; the compiler
