@@ -563,11 +563,15 @@ are still required before this becomes deletion or regression-gate evidence.
 
 The row-major Q8_K/Q4_K decoder ABI now also has an equation-first product-scheduled entry with the
 same ordered arguments as the compatibility projection. Its semantic axes remain
-`[batch, output, super-block, sub-block, half]`; only the exact wrapping Int32 product is exposed to
-cooperative scheduling, while the eight-lane floating scale/min consumer retains source order. The
-subgroup product-consumer schedule removes both compiler-owned partial tensors before ABI emission,
-so weights and quantization metadata stay shared while activation state remains row-local. The old
-entry remains a compatibility leaf until pretrained-rstr's logits and token-trajectory anchors have
+`[batch, output, super-block, sub-block, half]`; exact wrapping Int32 dot, scale and block-sum
+components are exposed to cooperative scheduling, while the established left-associated floating
+scale/min consumer retains source order. Explicitly typed constant identities canonicalize to the
+same scalar Fold as symbolic identities, and the product-consumer lowering handles scalar and
+tuple-valued ordered Folds uniformly. The subgroup schedule removes all four compiler-owned partial
+tensors before ABI emission, so weights and quantization metadata stay shared while activation
+state remains row-local. At two super-blocks its host result is raw-Float-bit identical to the
+compatibility projection, and the fused artifact executes as one kernel on Intel Arc. The old entry
+remains a compatibility leaf until pretrained-rstr's logits and token-trajectory anchors have
 migrated; it is not a second compiler abstraction.
 
 The same public equation-first route now closes the generic reassociated segmented fold-map used by
