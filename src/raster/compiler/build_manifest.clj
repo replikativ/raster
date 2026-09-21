@@ -10,7 +10,7 @@
             [clojure.string :as str]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]))
 
-(def schema-version 1)
+(def schema-version 2)
 (def resource-name "raster/compiler-build.edn")
 
 (defn- fail! [message reason data]
@@ -49,6 +49,13 @@
                  (non-blank-string? (get-in manifest [:runtime :clojure-version])))
     (fail! "compiler build manifest requires explicit Java and Clojure versions"
            :compiler-build-manifest-runtime {:runtime (:runtime manifest)}))
+  (when-not (and (vector? (:source-namespaces manifest))
+                 (= (:source-namespaces manifest)
+                    (vec (sort-by str (distinct (:source-namespaces manifest)))))
+                 (every? symbol? (:source-namespaces manifest)))
+    (fail! "compiler build manifest requires unique ordered packaged source namespaces"
+           :compiler-build-manifest-source-namespaces
+           {:source-namespaces (:source-namespaces manifest)}))
   (when-not (and (map? (:dependencies manifest))
                  (every? symbol? (keys (:dependencies manifest)))
                  (every? dependency-coordinate? (vals (:dependencies manifest))))

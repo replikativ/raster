@@ -4,11 +4,12 @@
             [raster.compiler.build-manifest :as manifest]))
 
 (defn- valid-manifest []
-  {:schema-version 1
+  {:schema-version 2
    :library 'org.replikativ/raster
    :version "0.2.685"
    :revision "0123456789abcdef"
    :runtime {:java-version "25.0.1" :clojure-version "1.12.0"}
+   :source-namespaces '[raster.compiler.pipeline raster.core]
    :dependencies {'org.clojure/clojure {:mvn/version "1.12.0"}
                   'org.replikativ/pattern {:git/sha "abcdef"}}})
 
@@ -39,7 +40,7 @@
 (deftest malformed-manifests-fail-loud
   (is (= :compiler-build-manifest-schema
          (reason-of #(manifest/manifest-identity
-                      (assoc (valid-manifest) :schema-version 2)))))
+                      (assoc (valid-manifest) :schema-version 3)))))
   (is (= :compiler-build-manifest-dependencies
          (reason-of #(manifest/manifest-identity
                       (assoc-in (valid-manifest) [:dependencies 'bad/library] {}))))))

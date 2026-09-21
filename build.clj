@@ -29,13 +29,29 @@
      (:git/sha coordinate) {:git/sha (:git/sha coordinate)}
      :else {:unversioned true})])
 
+(defn- source-namespace [file]
+  (with-open [reader (java.io.PushbackReader. (io/reader file))]
+    (binding [*read-eval* false]
+      (let [form (read {:eof nil :read-cond :allow :features #{:clj}} reader)]
+        (when (and (seq? form) (= 'ns (first form)) (symbol? (second form)))
+          (second form))))))
+
+(defn- packaged-source-namespaces []
+  (->> (file-seq (io/file "src"))
+       (filter #(and (.isFile %) (re-find #"\.clj[cs]?$" (.getName %))))
+       (keep source-namespace)
+       distinct
+       (sort-by str)
+       vec))
+
 (defn- compiler-build-manifest []
-  {:schema-version 1
+  {:schema-version 2
    :library lib
    :version version
    :revision current-commit
    :runtime {:java-version (System/getProperty "java.version")
              :clojure-version (clojure-version)}
+   :source-namespaces (packaged-source-namespaces)
    :dependencies (into (sorted-map) (map dependency-coordinate) (:libs basis))})
 
 (defn- write-compiler-build-manifest! []
