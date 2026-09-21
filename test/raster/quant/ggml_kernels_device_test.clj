@@ -8,6 +8,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.descriptor-fixture :as fixture]
@@ -60,10 +61,24 @@
 
 (deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
   (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-product-rows!
-                                                 :ze:0 :dtype :float)]
-    (is (= [{:sym 'partials :dtype :int}]
-           (mapv #(select-keys % [:sym :dtype]) (:allocs descriptor))))
-    (is (= [:executable :map-void] (mapv :convention (:steps descriptor))))
+                                                 :ze:0 :dtype :float)
+        executable (get-in descriptor [:steps 0 :artifact])
+        lowering (resident-plan/lower
+                  {:id ::q6-resident-product
+                   :target :ze:0
+                   :descriptor descriptor
+                   :arguments [(int-array 64) (float-array 1)
+                               (int-array 64) (float-array 1) (int-array 16)
+                               (float-array 1) 256 1 1]
+                   :outputs ['y]})]
+    (is (empty? (:allocs descriptor))
+        "the certified graph refinement substitutes the semantic temporary")
+    (is (= [:executable] (mapv :convention (:steps descriptor))))
+    (is (contains? #{:product-tree-ordered-consumer
+                     :subgroup-product-ordered-consumer}
+                   (get-in executable [:attributes :strategy])))
+    (is (resident-plan/certified-plan? lowering)
+        "self extent contracts resolve from resident views without hidden ABI scalars")
     (is (= '[xq xd wq wd wsc y in out nrows] (:all-params descriptor)))))
 
 (deftest q6-k-product-semantics-remain-bit-identical

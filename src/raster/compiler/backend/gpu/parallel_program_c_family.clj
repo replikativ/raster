@@ -138,7 +138,7 @@
              "scheduled equation has no supported retained algorithm"
              {:equation (:id equation) :algorithm algorithm}))))
 
-(defn- product-consumer-plans
+(defn product-consumer-plans
   "Admit non-overlapping consecutive numerical pairs through the generic region proof.
 
    Declines are ordinary: their equations continue through independent emission. Any unexpected
@@ -146,22 +146,22 @@
   [parallel-program]
   (let [numerical (filterv (comp seq :operations) (:equations parallel-program))]
     (mapv #(assoc %2 :region-ordinal %1)
-     (range)
-     (loop [remaining numerical plans []]
-      (if (< (count remaining) 2)
-        plans
-        (let [pair (subvec remaining 0 2)
-              result (if (every? (comp soac/program-form? :algorithm) pair)
-                       (try
-                         {:plan (product-consumer-region/analyze parallel-program pair)}
-                         (catch clojure.lang.ExceptionInfo exception
-                           (if (product-consumer-region/declined? exception)
-                             {:declined true}
-                             (throw exception))))
-                       {:declined true})]
-          (if-let [plan (:plan result)]
-            (recur (subvec remaining 2) (conj plans plan))
-            (recur (subvec remaining 1) plans))))))))
+          (range)
+          (loop [remaining numerical plans []]
+            (if (< (count remaining) 2)
+              plans
+              (let [pair (subvec remaining 0 2)
+                    result (if (every? (comp soac/program-form? :algorithm) pair)
+                             (try
+                               {:plan (product-consumer-region/analyze parallel-program pair)}
+                               (catch clojure.lang.ExceptionInfo exception
+                                 (if (product-consumer-region/declined? exception)
+                                   {:declined true}
+                                   (throw exception))))
+                             {:declined true})]
+                (if-let [plan (:plan result)]
+                  (recur (subvec remaining 2) (conj plans plan))
+                  (recur (subvec remaining 1) plans))))))))
 
 (defn- emit-product-consumer
   [plan opts]
