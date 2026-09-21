@@ -61,10 +61,26 @@
   (applyTo [this argseq] (apply invoke-compiled this argseq)))
 
 (defrecord Prepared
-           [lowering in-tree out-tree donated schedule target descriptor args preparation-report])
+           [lowering in-tree out-tree donated schedule target descriptor args preparation-report
+            provenance-seal])
 
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
+
+(defn- seal-prepared
+  "Bind in-process provenance to one exact immutable Prepared object. A copied or associated
+   record may retain the closure but cannot satisfy its identity check. This is an optimization
+   witness, never a replacement for the public, re-derivable lowering certificate."
+  [prepared]
+  (let [owner (volatile! nil)
+        sealed (assoc prepared :provenance-seal
+                      (fn [candidate] (identical? candidate @owner)))]
+    (vreset! owner sealed)
+    sealed))
+
+(defn- sealed-prepared? [prepared]
+  (let [seal (:provenance-seal prepared)]
+    (and (fn? seal) (true? (seal prepared)))))
 
 ;; Compilation templates are immutable and argument-independent.  LinkPlan lowering below still
 ;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
@@ -353,7 +369,8 @@
                 :link-plan-lowering-ns lowering-ns
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
-    (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args report)))
+    (seal-prepared
+     (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args report nil))))
 
 (defn- equation-first-value
   [plan node role]
@@ -495,7 +512,8 @@
                 :link-plan-lowering-ns lowering-ns
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
-    (->Prepared lowering in-tree out-tree donated schedule target descriptor args report)))
+    (seal-prepared
+     (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil))))
 
 (defn lower
   "Lower a deftm Var into an allocation-free `Prepared` artifact.
@@ -617,8 +635,11 @@
             (throw (ex-info "composite output keys must be unique and ordered"
                             {:reason :compiled-composition-output-keys
                              :keys (mapv :key output-specs)})))
+        prevalidated? (every? (comp sealed-prepared? :program) components)
         low-level
-        (link-composition/compose
+        ((if prevalidated?
+           link-composition/compose-prevalidated
+           link-composition/compose)
          {:id id
           :components (mapv (fn [{:keys [id program]}]
                               {:id id :lowering (:lowering program)})
@@ -672,8 +693,9 @@
                                   components)
                 :nodes (count (get-in low-level [:plan :nodes]))
                 :instances (count (get-in low-level [:plan :instances]))}]
-    (->Prepared low-level in-tree out-tree {} schedules (:target (:plan low-level))
-                descriptor [] report)))
+    (seal-prepared
+     (->Prepared low-level in-tree out-tree {} schedules (:target (:plan low-level))
+                 descriptor [] report nil))))
 
 (defn compile
   "Lower and instantiate a deftm as one callable Compiled artifact. Use `lower`, `compose`, then
