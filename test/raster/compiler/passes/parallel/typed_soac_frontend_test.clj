@@ -40,6 +40,20 @@
     (is (= source (frontend/normalize-source source {:dtype :float}))
         "an untyped/object clone does not acquire a guessed device representation")))
 
+(deftest direct-allocation-lengths-are-partially-evaluated-before-shape-analysis
+  (let [source '(let* [buffer (clojure.core/float-array
+                               (clojure.core/alength (raster.arrays/zeros-like input n)))
+                       effect (raster.par/map! buffer i n float
+                                               (clojure.core/aget input i))]
+                      effect)
+        normalized (frontend/normalize-source
+                    source {:dtype :float :array-types {'input :float}
+                            :scalar-types {'n :long}})]
+    (is (some #{'(clojure.core/float-array n)}
+              (tree-seq coll? seq normalized)))
+    (is (not-any? #(and (seq? %) (= 'clojure.core/alength (first %)))
+                  (tree-seq coll? seq normalized)))))
+
 (deftest map-let-spines-become-typed-locals
   (let [body '(let* [^float p1 (* (aget x i) (aget x i))
                     ^float p2 (* p1 p1)

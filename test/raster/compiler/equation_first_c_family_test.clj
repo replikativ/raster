@@ -358,6 +358,18 @@
       (is (= 1 (count (:outputs linked))))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
+(deftest allocating-dense-weight-gradient-elides-its-dead-zero-fill
+  (doseq [target [cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'nn/dense-backward-dW {:target target :dtype :float})
+          linked (equation-first/lower
+                  compilation [(float-array [1.0 2.0]) (float-array [3.0 4.0 5.0])])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= 1 (count (:outputs linked))))
+      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

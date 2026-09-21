@@ -2603,6 +2603,23 @@
 
         :else nil))))
 
+(defn- resolve-direct-allocation-alengths
+  "Partially evaluate `alength` whose operand is itself a recognized allocation expression.
+
+   This is the expression-local counterpart of the forward allocation-symbol table below. It is
+   needed after buffer fusion constructs `array(alength(zeros-like(ref,n)))`: the allocator
+   contract already proves `n`, so no executable host expression belongs in a typed extent."
+  [expression]
+  (cond
+    (and (seq? expression) (= 'quote (first expression))) expression
+    (seq? expression)
+    (let [rewritten (util/remake-from
+                     expression (map resolve-direct-allocation-alengths expression))
+          array (alength-array rewritten)]
+      (or (when (seq? array) (allocation-length array)) rewritten))
+    (vector? expression) (mapv resolve-direct-allocation-alengths expression)
+    :else expression))
+
 (defn- normalize-fixed-scalar-inputs
   "Expose source-signature conversions as ordinary host scalar equations, in evaluation order.
    In particular, a captured `(int seed)` must not be erased merely because the primitive then
@@ -2916,7 +2933,8 @@
                          local-scalar-types buffer-aliases]
                    :as state}
                   [ordinal [symbol expression]]]
-               (let [expression (util/subst-syms buffer-aliases expression)
+               (let [expression (-> (util/subst-syms buffer-aliases expression)
+                                    resolve-direct-allocation-alengths)
                      return-index (:return-alias-arg (form/form-info expression))
                      returned (if (symbol? expression) expression
                                   (when (some? return-index)
@@ -3023,14 +3041,24 @@
                                         (with-meta (apply list (concat (butlast expression) [extent]))
                                           (meta expression))))
                      ;; `(alength y)` over a local allocation is the allocation's declared
-                     ;; length; follow renamed allocations to their length as well.
+                     ;; length; follow renamed allocations to their length as well. Buffer fusion
+                     ;; may leave the allocation directly under alength (`alength(zeros-like
+                     ;; ref,n)`); the same allocator contract proves that nested shape without
+                     ;; requiring a temporary symbol.
                      resolve-length (fn resolve-length [extent seen]
-                                      (let [array (alength-array extent)]
-                                        (if (and array (contains? allocation-lengths array)
-                                                 (not (contains? seen array)))
+                                      (let [array (alength-array extent)
+                                            direct-allocation-length
+                                            (when (seq? array) (allocation-length array))]
+                                        (cond
+                                          direct-allocation-length
+                                          (resolve-length direct-allocation-length seen)
+
+                                          (and array (contains? allocation-lengths array)
+                                               (not (contains? seen array)))
                                           (resolve-length (get allocation-lengths array)
                                                           (conj seen array))
-                                          extent)))
+
+                                          :else extent)))
                      canonical-extent (some-> extent
                                               (resolve-length #{})
                                               (->> (util/subst-syms scalar-aliases))
