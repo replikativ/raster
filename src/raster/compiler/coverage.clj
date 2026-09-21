@@ -24,6 +24,7 @@
     raster.ode.pde])
 
 (def default-baseline-path "test/resources/coverage/gpu-corpus.edn")
+(def default-current-report-path "test-results/coverage/gpu-corpus-current.edn")
 
 (defn corpus-vars
   "Source `deftm` vars (generic functions, not their generated specializations) in `namespaces`."
@@ -157,15 +158,25 @@
       (dissoc :emission-summary)
       (update :vars #(mapv (fn [row] (dissoc row :emission :emission-declines)) %))))
 
-(defn write-baseline!
-  "Write `report` as the committed baseline. Emission facts are excluded: they depend on the
-   device's tuned leaves, while route and error facts are device-independent."
+(defn write-report!
+  "Write the complete EDN `report` to `path`, creating its parent directories."
   [path report]
   (io/make-parents path)
   (with-open [writer (io/writer path)]
     (binding [*print-length* nil *print-level* nil]
-      (pp/pprint (baseline-facts report) writer)))
+      (pp/pprint report writer)))
   path)
+
+(defn residual-rows
+  "Rows that still fail or use a compatibility route, in stable corpus order."
+  [report]
+  (filterv #(#{:compatibility :error} (:route %)) (:vars report)))
+
+(defn write-baseline!
+  "Write `report` as the committed baseline. Emission facts are excluded: they depend on the
+  device's tuned leaves, while route and error facts are device-independent."
+  [path report]
+  (write-report! path (baseline-facts report)))
 
 (defn -main
   "`update` rewrites the baseline for the OpenCL device the runtime selects; otherwise prints the

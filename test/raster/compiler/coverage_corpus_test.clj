@@ -16,9 +16,14 @@
     (device-probe/opencl-skip! "typed-route coverage corpus")
     (let [baseline (coverage/read-baseline coverage/default-baseline-path)
           report (coverage/corpus-report {:target-device :ocl:0 :dtype :float})
-          violations (coverage/ratchet-violations baseline report)]
+          violations (coverage/ratchet-violations baseline report)
+          report-path (coverage/write-report! coverage/default-current-report-path report)]
       (println "  [coverage] summary:" (pr-str (:summary report)))
       (println "  [coverage] emitted artifacts:" (pr-str (:emission-summary report)))
+      (println "  [coverage] full report:" report-path)
+      (doseq [row (coverage/residual-rows report)]
+        (println "  [coverage] residual:"
+                 (pr-str (select-keys row [:var :route :error :declines]))))
       (testing "every var that took the typed route still does, and no var started failing"
         (is (empty? violations)
             (with-out-str
@@ -85,3 +90,11 @@
         (is (not (contains? baseline :emission-summary)))
         (is (every? #(not-any? (set (keys %)) [:emission :emission-declines]) (:vars baseline)))
         (is (empty? (coverage/ratchet-violations baseline report)))))))
+
+(deftest residual-rows-name-only-compatibility-and-errors
+  (let [rows [{:var 'typed :route :typed-soac}
+              {:var 'compatible :route :compatibility :declines [{:reason :legacy}]}
+              {:var 'scalar :route :scalar}
+              {:var 'broken :route :error :error :unsupported}]]
+    (is (= ['compatible 'broken]
+           (mapv :var (coverage/residual-rows {:vars rows}))))))
