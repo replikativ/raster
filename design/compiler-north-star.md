@@ -483,8 +483,13 @@ printing and runtime identity. Hot-reload guards such as Var-root identity and t
 revision remain separate and process-local. A request fingerprint is not yet permission to persist an
 artifact. Packaged Raster builds now carry a validated build manifest covering the exact Git
 revision, dependency coordinates, Java version and Clojure version; source checkouts and builds with
-unversioned dependencies fail closed. The transitive resolved-source dependency graph must still be
-certified before persistence, and unsupported runtime values also make persistence fail closed. The remaining
+unversioned dependencies fail closed. The manifest also names the exact namespaces packaged in the
+artifact: prefix spelling is not ownership evidence. Template identity recursively fingerprints
+application-owned retained `deftm` callees, while calls into those exact Raster namespaces, Clojure
+or JVM interop are covered by the build identity. Opaque application Vars, unresolved calls and
+dynamic local calls remain explicit persistence blockers. This establishes eligibility for a later
+artifact store; it does not serialize closure-bearing descriptors. Unsupported runtime values also
+make persistence fail closed. The remaining
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 

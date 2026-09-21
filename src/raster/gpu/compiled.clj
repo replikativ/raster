@@ -31,6 +31,7 @@
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.pipeline :as pl]
+            [raster.compiler.source-dependencies :as source-dependencies]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
@@ -157,19 +158,28 @@
                      fn-var)
         metadata (meta resolved)
         source-body (:raster.core/deftm-source-body metadata)
+        build (build-manifest/current-identity)
+        dependency-evidence
+        (when (and source-body (:complete? build))
+          (source-dependencies/manifest
+           resolved dtype
+           {:build-owned-namespaces (get-in build [:manifest :source-namespaces])}))
         stable {:requested (qualified-var-symbol fn-var)
                 :resolved (qualified-var-symbol resolved)
                 :tags (:raster.core/deftm-tags metadata)
                 :source-body-fingerprint
-                (when source-body (semantic-fingerprint/fingerprint source-body))}]
+                (when source-body (semantic-fingerprint/fingerprint source-body))
+                :source-dependency-fingerprint (:fingerprint dependency-evidence)}
+        persistence-blockers
+        (cond-> #{}
+          (nil? source-body) (conj :retained-deftm-source)
+          (nil? dependency-evidence) (conj :resolved-source-dependencies)
+          (and dependency-evidence (not (:complete? dependency-evidence)))
+          (conj :resolved-source-dependencies))]
     {:semantic stable
-     ;; Direct source identity is useful for explanations, but persistence additionally requires
-     ;; the transitive resolved Var dependency graph. Until that graph is certified, every entry
-     ;; remains explicitly process-local; the packaged build identity is added separately below.
-     :persistent-cache-eligible? false
-     :persistence-blockers
-     (cond-> #{:transitive-source-dependencies}
-       (nil? source-body) (conj :retained-deftm-source))
+     :persistent-cache-eligible? (empty? persistence-blockers)
+     :persistence-blockers persistence-blockers
+     :source-dependency-blockers (:blockers dependency-evidence)
      ;; Redefinition with textually equal source must not retain compiler state tied to an old Var
      ;; root (for example a changed closed-over helper or dispatch table).
      :root-identity (System/identityHashCode @resolved)}))
@@ -228,6 +238,7 @@
           (:persistent-cache-eligible? source)
           (:persistent-cache-eligible? target))
      :persistence-blockers persistence-blockers
+     :source-dependency-blockers (:source-dependency-blockers source)
      :guards {:compiler-revision revision
               :source-root-identity (:root-identity source)
               :pipeline-identity pipeline-identity}}))
@@ -278,6 +289,7 @@
             :semantic-fingerprint (:semantic-fingerprint key)
             :persistent-cache-eligible? (:persistent-cache-eligible? key)
             :persistence-blockers (:persistence-blockers key)
+            :source-dependency-blockers (:source-dependency-blockers key)
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         value)
       (catch Throwable error
@@ -288,6 +300,7 @@
             :semantic-fingerprint (:semantic-fingerprint key)
             :persistent-cache-eligible? (:persistent-cache-eligible? key)
             :persistence-blockers (:persistence-blockers key)
+            :source-dependency-blockers (:source-dependency-blockers key)
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         ;; A failed compilation is not a durable negative result: a hot reload or newly registered
         ;; specialization may make the same request valid on its next attempt.
