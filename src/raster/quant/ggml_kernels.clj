@@ -20,58 +20,6 @@
             [raster.numeric :as rn]
             [raster.par :as par]))
 
-;; The K-quant kernels spell out ggml's eight lanes inline: a helper deftm taking
-;; arrays leaves the typed route, whose emitter writes one operation per
-;; statement and so leaves no expression for the OpenCL compiler to contract.
-;; `lane-form` generates each lane's loop with plain, lane-unique locals, and
-;; `k-quant-dot` splices them into a quoted kernel template.
-
-(defn- lane-form
-  "Form for ggml's int32 lane `l` of one K-quant super-block.
-
-  The layout is lane-major (`ggml/code-position`), so the four elements this
-  lane takes from a 32-element chunk are one word and one dp4a. `scales-per-chunk`
-  is 1 for q4_K, whose 6-bit scale spans the whole chunk, and 2 for q6_K, whose
-  int8 scales split it: there the word's halves are masked apart and scaled
-  separately, which costs a second dp4a but keeps the packing shared. The sum is
-  the same integer either way, so the float lanes above are untouched. Reads the
-  template's `wq`, `xq`, `wsc`, `ww`, `xw` and `scb`."
-  [l scales-per-chunk]
-  (let [n #(symbol (str % "-l" l))
-        c (n "c") acc (n "acc") w (n "w") wv (n "wv") xv (n "xv")
-        lo (n "lo") hi (n "hi")]
-    (list 'loop [c 0 acc 0]
-          (list 'if (list '< c 8)
-                (list 'let
-                      (into [w (list '+ (list '* c 8) l)]
-                            (if (= 1 scales-per-chunk)
-                              [wv (list 'ra/aget 'wq (list '+ 'ww w))
-                               xv (list 'ra/aget 'xq (list '+ 'xw w))]
-                              [wv (list 'ra/aget 'wq (list '+ 'ww w))
-                               xv (list 'ra/aget 'xq (list '+ 'xw w))
-                               lo (list 'rn/bit-and wv (int 0xFFFF))
-                               hi (list 'rn/bit-and wv (int -65536))]))
-                      (list 'recur (list 'inc c)
-                            (if (= 1 scales-per-chunk)
-                              (list '+ acc (list '* (list 'ra/aget 'wsc (list '+ 'scb c))
-                                                 (list 'par/dp4a wv xv 0)))
-                              (list '+ acc
-                                    (list '+ (list '* (list 'ra/aget 'wsc (list '+ 'scb (list '* c 2)))
-                                                   (list 'par/dp4a lo xv 0))
-                                          (list '* (list 'ra/aget 'wsc (list '+ 'scb (list '+ (list '* c 2) 1)))
-                                                (list 'par/dp4a hi xv 0)))))))
-                acc))))
-
-(defn- k-quant-dot
-  "Splice lanes into `template`, replacing each `(lane l)` placeholder."
-  [template scales-per-chunk]
-  (clojure.walk/postwalk
-   (fn [form]
-     (if (and (seq? form) (= 'lane (first form)))
-       (lane-form (second form) scales-per-chunk)
-       form))
-   template))
-
 (deftm qdot-q8-0-rows!
   "q8_0 weights times q8_0 activations: ggml_vec_dot_q8_0_q8_0_generic,
   `sumf += sumi*(dw*dx)` per 32-element block."
@@ -120,58 +68,7 @@
                                sumf))]
                    (ra/aset y ro acc))))
 
-(defmacro ^:private def-q4-K-dot []
-  (k-quant-dot
-   '(deftm qdot-q4-K-rows!
-      "q4_K weights times q8_K activations: ggml_vec_dot_q4_K_q8_K_generic without
-      contraction. Per super-block: eight exact int lanes, `sums[l] += (dw*dx)*lane[l]`,
-      then `sumf -= (dmin*dx)*sumi` over the bsums and mins; finally the lanes are
-      added to sumf in order."
-      [xq :- (Array int), xd :- (Array float), xbs :- (Array int),
-       wq :- (Array int), wd :- (Array float), wdmin :- (Array float),
-       wsc :- (Array int), wm :- (Array int),
-       y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
-      (par/map-void! ro (* nrows out)
-                     (let [row (quot ro out)
-                           o (rem ro out)
-                           nb (quot in 256)
-                           acc
-                           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
-                                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)
-                                  sumf (float 0.0)]
-                             (if (< b nb)
-                               (let [wb (+ (* o nb) b)
-                                     xb (+ (* row nb) b)
-                                     xw (* xb 64)
-                                     ww (* wb 64)
-                                     scb (* wb 8)
-                                     d (* (ra/aget wd wb) (ra/aget xd xb))
-                                     dmin (* (ra/aget wdmin wb) (ra/aget xd xb))
-                                     sumi (loop [j 0 s 0]
-                                            (if (< j 16)
-                                              (recur (inc j) (+ s (* (ra/aget xbs (+ (* xb 16) j))
-                                                                     (ra/aget wm (+ scb (quot j 2))))))
-                                              s))
-                                     l0 (lane 0) l1 (lane 1) l2 (lane 2) l3 (lane 3)
-                                     l4 (lane 4) l5 (lane 5) l6 (lane 6) l7 (lane 7)
-                                     ;; each product is its own statement, so no
-                                     ;; expression is left to contract into an FMA
-                                     p0 (* d (float l0)) p1 (* d (float l1))
-                                     p2 (* d (float l2)) p3 (* d (float l3))
-                                     p4 (* d (float l4)) p5 (* d (float l5))
-                                     p6 (* d (float l6)) p7 (* d (float l7))
-                                     pm (* dmin (float sumi))]
-                                 (recur (inc b)
-                                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
-                                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)
-                                        (- sumf pm)))
-                               (+ (+ (+ (+ (+ (+ (+ (+ sumf s0) s1) s2) s3) s4) s5) s6) s7)))]
-                       (ra/aset y ro acc))))
-   1))
-
-(def-q4-K-dot)
-
-(deftm qdot-q4-K-product-rows!
+(deftm qdot-q4-K-rows!
   "q4_K × q8_K as a typed product reduction followed by ggml's ordered float fold.
 
   The local `lane` axis retains ggml's eight exact integer dot lanes; `pair` exposes the two
@@ -241,7 +138,7 @@
                (+ (+ (+ (+ (+ (+ (+ (+ sumf s0) s1) s2) s3) s4) s5) s6) s7)))]
        (ra/aset y ro acc)))))
 
-(deftm qdot-q6-K-product-rows!
+(deftm qdot-q6-K-rows!
   "q6_K weights times q8_K activations through Raster's typed product reduction.
 
   Each `(row,output,super-block,lane,half)` product is an exact wrapping int32 reduction over
@@ -301,43 +198,6 @@
                         (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
                (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
        (ra/aset y ro acc)))))
-
-(defmacro ^:private def-q6-K-dot []
-  (k-quant-dot
-   '(deftm qdot-q6-K-rows!
-      "Current single-stage Q6_K schedule. The typed product form is retained separately until
-      product/epilogue fusion removes its measured intermediate-workgroup regression."
-      [xq :- (Array int), xd :- (Array float),
-       wq :- (Array int), wd :- (Array float), wsc :- (Array int),
-       y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
-      (par/map-void! ro (* nrows out)
-                     (let [row (quot ro out)
-                           o (rem ro out)
-                           nb (quot in 256)
-                           acc
-                           (loop [b 0 s0 (float 0.0) s1 (float 0.0) s2 (float 0.0) s3 (float 0.0)
-                                  s4 (float 0.0) s5 (float 0.0) s6 (float 0.0) s7 (float 0.0)]
-                             (if (< b nb)
-                               (let [wb (+ (* o nb) b)
-                                     xb (+ (* row nb) b)
-                                     xw (* xb 64)
-                                     ww (* wb 64)
-                                     scb (* wb 16)
-                                     d (* (ra/aget wd wb) (ra/aget xd xb))
-                                     l0 (lane 0) l1 (lane 1) l2 (lane 2) l3 (lane 3)
-                                     l4 (lane 4) l5 (lane 5) l6 (lane 6) l7 (lane 7)
-                                     p0 (* d (float l0)) p1 (* d (float l1))
-                                     p2 (* d (float l2)) p3 (* d (float l3))
-                                     p4 (* d (float l4)) p5 (* d (float l5))
-                                     p6 (* d (float l6)) p7 (* d (float l7))]
-                                 (recur (inc b)
-                                        (+ s0 p0) (+ s1 p1) (+ s2 p2) (+ s3 p3)
-                                        (+ s4 p4) (+ s5 p5) (+ s6 p6) (+ s7 p7)))
-                               (+ (+ (+ (+ (+ (+ (+ (+ (float 0.0) s0) s1) s2) s3) s4) s5) s6) s7)))]
-                       (ra/aset y ro acc))))
-   2))
-
-(def-q6-K-dot)
 
 ;; ---------------------------------------------------------------------------
 ;; Activation quantizers: ggml's quantize_row_q8_0_ref and quantize_row_q8_K_ref
