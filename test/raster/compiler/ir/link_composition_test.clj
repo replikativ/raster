@@ -154,6 +154,9 @@
     (is (= first-y second-x) "the intermediate is one node, not two buffers plus a copy")
     (is (= first-w second-w) "shared constants retain one allocation identity")
     (is (= :internal (get-in plan [:nodes first-y :role])))
+    (is (link/effect-evidence? (:effect-evidence certificate)))
+    (is (= (link/initialization-contract plan)
+           (get-in certificate [:effect-evidence :initialization])))
     (is (= first-y-value (get-in plan [:instances 1 :bindings 'x])))
     (is (= first-w-value (get-in plan [:instances 1 :bindings 'w])))
     (is (= [(get (:node-mapping certificate) [:second [:second 'y]])]
@@ -253,6 +256,10 @@
                    :outputs [[:third third-output]]})]
     (is (= 3 (count (get-in lowering [:plan :instances]))))
     (is (= 1 (count (link/output-value-ids (:plan lowering)))))
+    (is (= 3 (count (get-in lowering [:certificate :effect-evidence :step-facts])))
+        "nested compositions retain one remapped effect step per leaf instance")
+    (is (= (link/initialization-contract (:plan lowering))
+           (get-in lowering [:certificate :effect-evidence :initialization])))
     (is (identical? lowering (composition/verify! lowering)))))
 
 (deftest composition-is-fail-loud-at-semantic-boundaries

@@ -14,7 +14,7 @@
 (defrecord ResidentPlanCertificate
            [source-dialect target-dialect plan-id target instance-id parameter-order
             array-parameters scalar-parameters bindings scalars roles schedule values outputs
-            aliases])
+            aliases effect-evidence])
 (defrecord CertifiedResidentPlan [plan certificate])
 
 (defn certificate? [x]
@@ -185,7 +185,7 @@
            ;; Preserve the original certificate query surface for one-leaf descriptors.
            (dissoc flat :name))))
 
-(defn- derive-certificate [plan]
+(defn- derive-certificate [plan effect-evidence]
   (let [instance (first (:instances plan))
         descriptor (:descriptor instance)
         alloc-symbols (set (map :sym (:allocs descriptor)))
@@ -202,7 +202,7 @@
      :resident-program :link-plan (:id plan) (:target plan) (:id instance)
      (:all-params descriptor) (:array-params descriptor) (:scalar-params descriptor)
      (:bindings instance) (:scalars instance) (link-plan/instance-roles plan instance)
-     (:schedule instance) values (:outputs plan) (:aliases plan))))
+     (:schedule instance) values (:outputs plan) (:aliases plan) effect-evidence)))
 
 (defn verify!
   "Verify and return a CertifiedResidentPlan.
@@ -214,9 +214,10 @@
   (when-not (certified-plan? lowering)
     (throw (ex-info "expected a CertifiedResidentPlan"
                     {:reason :resident-plan-lowering-type :actual (type lowering)})))
-  (let [plan (link-plan/validate! (:plan lowering))
+  (let [{:keys [plan effect-evidence]}
+        (link-plan/validate-with-effect-evidence! (:plan lowering))
         certificate (:certificate lowering)
-        expected (derive-certificate plan)]
+        expected (derive-certificate plan effect-evidence)]
     (when-not (certificate? certificate)
       (throw (ex-info "resident-plan lowering requires a ResidentPlanCertificate"
                       {:reason :resident-plan-certificate-type :actual (type certificate)})))
@@ -421,12 +422,13 @@
                   {:id (or instance-id [id :instance]) :descriptor descriptor
                    :bindings bindings :scalars scalar-values :schedule (:schedule descriptor)
                    :roles roles :arguments (vec arguments)})
-        plan (link-plan/make
-              {:id id :target target :nodes nodes :values logical-values :instances [instance]
-               :outputs (vec (mapcat #(map :node-id (:leaves (get value-by-symbol %))) outputs))
-               :aliases aliases
-               :attributes (assoc attributes :lowered-from :resident-program)})
-        lowering (->CertifiedResidentPlan plan (derive-certificate plan))]
+        {:keys [plan effect-evidence]}
+        (link-plan/make-with-effect-evidence
+         {:id id :target target :nodes nodes :values logical-values :instances [instance]
+          :outputs (vec (mapcat #(map :node-id (:leaves (get value-by-symbol %))) outputs))
+          :aliases aliases
+          :attributes (assoc attributes :lowered-from :resident-program)})
+        lowering (->CertifiedResidentPlan plan (derive-certificate plan effect-evidence))]
     ;; `plan` and its certificate are constructed together from the same validated inputs. The
     ;; public `verify!` boundary independently re-derives this witness when it later crosses into
     ;; composition, a cache, or the runtime; immediately doing the same work here is redundant.

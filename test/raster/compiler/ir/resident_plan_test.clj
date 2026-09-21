@@ -66,6 +66,9 @@
     (is (= {'x :x 'w :weight 'y :result} (:bindings certificate)))
     (is (= {'n 32} (:scalars certificate)))
     (is (= {'x :input 'w :constant 'y :output} (:roles certificate)))
+    (is (link/effect-evidence? (:effect-evidence certificate)))
+    (is (= (link/initialization-contract plan)
+           (get-in certificate [:effect-evidence :initialization])))
     (is (= [:result] (:outputs plan)))
     (is (= [4 8] (get-in plan [:nodes :x :view :shape])))
     (is (identical? x (get-in plan [:nodes :x :source])))
@@ -76,9 +79,9 @@
         derive @derive-var
         calls (atom 0)]
     (with-redefs-fn
-      {derive-var (fn [plan]
+      {derive-var (fn [plan effect-evidence]
                     (swap! calls inc)
-                    (derive plan))}
+                    (derive plan effect-evidence))}
       (fn []
         (let [x (float-array 8)
               lowering (resident/lower

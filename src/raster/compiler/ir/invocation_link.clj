@@ -22,7 +22,7 @@
 (defrecord InvocationLinkCertificate
            [source-dialect target-dialect plan-id target instance-ids public-buffer-bindings
             public-buffer-roles compiler-buffer-bindings semantic-outputs outputs aliases
-            driver-allocations])
+            driver-allocations effect-evidence])
 (defrecord CertifiedInvocationLink [plan certificate])
 
 (defn certificate? [value]
@@ -463,9 +463,8 @@
                    :driver-allocations 0}})))
 
 (defn- derive-certificate
-  [plan]
-  (let [plan (link/validate! plan)
-        attributes (:attributes plan)]
+  [plan effect-evidence]
+  (let [attributes (:attributes plan)]
     (when-not (= :typed-invocation (:source attributes))
       (fail! :invocation-link-certificate-source
              "an invocation certificate requires a typed-invocation LinkPlan"
@@ -482,7 +481,7 @@
      (:compiler-buffer-bindings attributes)
      (:semantic-outputs attributes)
      (:outputs plan) (:aliases plan)
-     (:driver-allocations attributes))))
+     (:driver-allocations attributes) effect-evidence)))
 
 (defn verify!
   "Revalidate a typed invocation LinkPlan and independently rederive its composition witness."
@@ -491,8 +490,9 @@
     (fail! :invocation-link-certificate-type
            "expected a CertifiedInvocationLink"
            {:actual (type lowering)}))
-  (let [plan (link/validate! (:plan lowering))
-        expected (derive-certificate plan)]
+  (let [{:keys [plan effect-evidence]}
+        (link/validate-with-effect-evidence! (:plan lowering))
+        expected (derive-certificate plan effect-evidence)]
     (when-not (certificate? (:certificate lowering))
       (fail! :invocation-link-certificate-type
              "typed invocation lowering requires an InvocationLinkCertificate"
@@ -506,8 +506,8 @@
 (defn certify
   "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness."
   [plan]
-  (let [plan (link/validate! plan)]
+  (let [{:keys [plan effect-evidence]} (link/validate-with-effect-evidence! plan)]
     ;; Construction and certificate derivation share the same validated immutable plan. External
     ;; boundaries retain `verify!` for independent re-derivation; repeating it here proves no new
     ;; fact and made every equation-first preparation pay for the certificate twice.
-    (->CertifiedInvocationLink plan (derive-certificate plan))))
+    (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence))))

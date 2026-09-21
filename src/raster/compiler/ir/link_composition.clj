@@ -17,7 +17,7 @@
 (defrecord LinkCompositionCertificate
            [source-dialect target-dialect plan-id target component-plan-ids
             connections shares value-mapping node-mapping allocation-mapping instance-mapping
-            outputs])
+            outputs effect-evidence])
 (defrecord CertifiedLinkComposition [plan certificate components specification])
 
 (defn certificate? [x]
@@ -247,6 +247,55 @@
        (apply mapv (fn [& leaves] (mapv :node leaves)) leaf-vectors)))
    value-groups))
 
+(defn- remap-effect-step
+  [component-id node-mapping instance-mapping step]
+  (let [map-node (fn [node-id]
+                   (or (get node-mapping [component-id node-id])
+                       (throw (ex-info "component effect evidence names an absent node"
+                                       {:reason :link-composition-effect-node
+                                        :component component-id :node node-id}))))
+        instance-id
+        (or (get instance-mapping [component-id (:instance step)])
+            (throw (ex-info "component effect evidence names an absent instance"
+                            {:reason :link-composition-effect-instance
+                             :component component-id :instance (:instance step)})))]
+    (cond-> (assoc step
+                   :instance instance-id
+                   :facts (mapv #(update % :node map-node) (:facts step)))
+      (contains? step :produced-views)
+      (update :produced-views #(into #{} (map map-node) %))
+
+      (contains? step :partial-writes)
+      (update :partial-writes #(into #{} (map map-node) %))
+
+      (contains? step :complete-writes)
+      (update :complete-writes #(into #{} (map map-node) %)))))
+
+(defn- composed-effect-facts
+  "Remap certified component effect facts into the composite identity space. Missing evidence
+   declines this optimization; malformed or stale evidence fails rather than silently falling back."
+  [components node-mapping instance-mapping]
+  (let [entries
+        (mapv (fn [{component-id :id lowering :lowering}]
+                (let [plan (:plan lowering)
+                      evidence (get-in lowering [:certificate :effect-evidence])]
+                  (when evidence
+                    (when-not (and (link-plan/effect-evidence? evidence)
+                                   (= (:id plan) (:plan-id evidence))
+                                   (= (:target plan) (:target evidence)))
+                      (throw (ex-info "component effect evidence differs from its certified plan"
+                                      {:reason :link-composition-effect-evidence
+                                       :component component-id :plan-id (:id plan)
+                                       :evidence-plan-id (:plan-id evidence)}))))
+                  [component-id evidence]))
+              components)]
+    (when (every? (comp some? second) entries)
+      (vec
+       (mapcat (fn [[component-id evidence]]
+                 (map #(remap-effect-step component-id node-mapping instance-mapping %)
+                      (:step-facts evidence)))
+               entries)))))
+
 (def ^:dynamic ^:private *verify-components?* true)
 
 (defn- derive-composition
@@ -402,6 +451,7 @@
                             (namespace-id id component-id :instance index)])
                          (get-in lowering [:plan :instances])))
                       components))
+        effect-facts (composed-effect-facts components node-mapping instance-mapping)
         instances
         (vec
          (mapcat (fn [{component-id :id lowering :lowering}]
@@ -417,20 +467,24 @@
                        (map (fn [[id node]] [id (:view node)]) nodes)))
         output-value-ids (mapv value-mapping outputs)
         output-ids (vec (mapcat #(map :node (get-in values [% :leaves])) output-value-ids))
-        plan (link-plan/make
-              {:id id :target target :nodes nodes :values values
-               :instances instances :outputs output-ids
-               :aliases aliases
-               :attributes (merge attributes
-                                  {:lowered-from :certified-link-composition
-                                   :component-plan-ids
-                                   (mapv (comp :id :plan :lowering) components)})})
+        plan-request
+        {:id id :target target :nodes nodes :values values
+         :instances instances :outputs output-ids
+         :aliases aliases
+         :attributes (merge attributes
+                            {:lowered-from :certified-link-composition
+                             :component-plan-ids
+                             (mapv (comp :id :plan :lowering) components)})}
+        {:keys [plan effect-evidence]}
+        (if (some? effect-facts)
+          (link-plan/make-with-certified-effect-facts plan-request effect-facts)
+          (link-plan/make-with-effect-evidence plan-request))
         certificate
         (->LinkCompositionCertificate
          :certified-link-plans :link-plan id target
          (mapv (comp :id :plan :lowering) components)
          connections shares value-mapping node-mapping allocation-mapping instance-mapping
-         output-ids)]
+         output-ids effect-evidence)]
     {:plan plan :certificate certificate :components components
      :specification (assoc specification :connections connections :shares shares
                            :outputs outputs :attributes attributes)}))
