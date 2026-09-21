@@ -5,7 +5,8 @@
    scalar kernel or a graph containing conversion, layout conversion, matrix contraction, and
    split-K combination. All mixed-precision scratch and derived scheduling scalars are private to
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
@@ -324,6 +325,14 @@
       :parameter-names {in "input" out "output"
                         :layout-rows "rows" :layout-cols "cols"}})))
 
+(defn- matrix-dimension-parameters
+  [m n k reserved]
+  (if (and (every? #(or (symbol? %) (keyword? %)) [m n k])
+           (= 3 (count (set [m n k])))
+           (empty? (set/intersection (set [m n k]) (set reserved))))
+    [m n k]
+    (contraction-schedule/allocate-dimension-parameters reserved)))
+
 (defn- scheduled-matrix-body
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
   [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
@@ -332,10 +341,12 @@
     :or {result-dtype :float provenance {}}}]
   (let [dimension-parameters
         (or dimension-parameters
-            (if (and (every? #(or (symbol? %) (keyword? %)) [m n k])
-                     (= 3 (count (set [m n k]))))
-              [m n k]
-              ['M 'N 'K]))]
+            (matrix-dimension-parameters
+             m n k
+             (concat [a b c]
+                     (map :id additional-parameters)
+                     (map :sym (:operands epilogue))
+                     (map :sym (:scalars epilogue)))))]
     (contraction-schedule/matrix-body
      {:id (or id [:gemm kernel-name])
       :row a :col b :out c
@@ -391,24 +402,30 @@
 
 (defn- split-k-matrix-spec
   [{:keys [kernel-name id a b c m n k kc splits axis-symbols tile provenance input-value-regions]}]
-  (let [z 'k-slice
+  (let [[M N K :as dimension-parameters]
+        (matrix-dimension-parameters m n k [a b c kc splits])
+        body-M (if (number? m) m M)
+        body-N (if (number? n) n N)
+        body-K (if (number? k) k K)
+        z 'k-slice
         c-view 'split-result-view
         k-lower (kbody/expression :mul z kc)
-        k-upper (kbody/expression :min (kbody/expression :add k-lower kc) k)]
+        k-upper (kbody/expression :min (kbody/expression :add k-lower kc) body-K)]
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+     :dimension-parameters dimension-parameters
      :axis-symbols axis-symbols
      :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
      :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
                              (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
-     :buffer-shapes {c [splits m n]}
+     :buffer-shapes {c [splits body-M body-N]}
      :buffer-views [{:id c-view :buffer c
-                     :element-offset (kbody/leading-slice-offset z [m n])
-                     :shape [m n]}]
+                     :element-offset (kbody/leading-slice-offset z [body-M body-N])
+                     :shape [body-M body-N]}]
      :operation-buffers {c c-view}
      :k-range [k-lower k-upper]
-     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
-                          (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+     :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value body-N) (:block-n tile))
+                          (klaunch/ceil-div (klaunch/runtime-value body-M) (:block-m tile))
                           (klaunch/runtime-value splits)]
      :attributes {:grid-z {:index z :extent splits :purpose :reduction-partition}}
      :parameter-names {kc "KC" splits "splits"}}))
@@ -426,7 +443,8 @@
         ;; distinct even when two runtime dimensions are the same compiler value (square
         ;; attention scores are the common case); graph binding maps these identities back to
         ;; m/n/k.  Buffer views must reference this body-local scope, not the outer aliases.
-        [M N K :as dimension-parameters] ['M 'N 'K]
+        [M N K :as dimension-parameters]
+        (contraction-schedule/allocate-dimension-parameters [a b c batch z])
         a-view 'batch-lhs-view
         b-view 'batch-rhs-view
         c-view 'batch-result-view

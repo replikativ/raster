@@ -449,6 +449,27 @@
                 (:views body))
         "views refer only to the body-local M/N/K parameters when semantic dimensions alias")))
 
+(deftest split-matrix-dimensions-do-not-alias-a-tensor-named-k
+  ;; Attention conventionally names its key tensor K.  The schedule's reduction dimension is a
+  ;; different lexical value even when the source program also calls that dimension `K`.
+  (let [emitted (gemm/emit-scheduled-split-k-kernel
+                 {:id :attention-qk
+                  :kernel-name "attention_qk"
+                  :a 'Q :b 'K :c 'scores
+                  :m 'seq-len :n 'seq-len :k 'dk
+                  :kc :k-chunk :splits :splits
+                  :tile (hardware/derive-gemm-tile {})})
+        kernel (:kernel-body emitted)
+        dimension-ids (mapv #(get-in kernel [:attributes :dimension-parameters %])
+                            [:m :n :k])
+        parameter-ids (mapv :id (:parameters kernel))]
+    (is (= (count parameter-ids) (count (set parameter-ids))))
+    (is (not-any? #{'Q 'K 'scores :k-chunk :splits} dimension-ids))
+    (is (= (set dimension-ids)
+           (set (mapcat #(filter (set dimension-ids) (tree-seq coll? seq %))
+                        (map :shape (:parameters kernel)))))
+        "symbolic parameter shapes use body-local dimensions, not caller aliases")))
+
 (deftest every-layout-schedule-realizes-to-kernel-calls
   (let [runtime-arguments (arguments 13 640 262144)]
     (doseq [variant [:nn :nt :tn :tt]

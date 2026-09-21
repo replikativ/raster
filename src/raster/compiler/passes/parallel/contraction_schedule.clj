@@ -5,7 +5,8 @@
   instruction, named operand/accumulator layouts, hardware indices, masks, K loop and stores are
   all inspectable compiler values.  A backend may decline an instruction family it cannot lower,
   but it must consume this body rather than reconstructing the schedule from the source form."
-  (:require [raster.compiler.core.dtype :as dtype]
+  (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
@@ -25,6 +26,30 @@
 
 (defn- compiler-id? [value]
   (or (symbol? value) (keyword? value)))
+
+(defn allocate-dimension-parameters
+  "Choose body-local M/N/K identities that cannot alias a public kernel parameter.
+
+  Tensor programs are allowed to call a value `M`, `N`, or `K` (attention commonly calls its
+  key tensor `K`).  Those are semantic program identities; the matrix dimensions below are
+  schedule temporaries.  Reusing the conventional spelling in that case would make one
+  KernelBody parameter mean both a buffer and a scalar."
+  [reserved]
+  (loop [remaining ['M 'N 'K]
+         used (set reserved)
+         result []]
+    (if-let [candidate (first remaining)]
+      (let [fresh (if-not (contains? used candidate)
+                    candidate
+                    (loop [ordinal 0]
+                      (let [candidate (symbol (str "rstr-dim-"
+                                                   (str/lower-case (name candidate))
+                                                   (when (pos? ordinal) (str "-" ordinal))))]
+                        (if (contains? used candidate)
+                          (recur (inc ordinal))
+                          candidate))))]
+        (recur (next remaining) (conj used fresh) (conj result fresh)))
+      result)))
 
 (defn- lowered-dpas-instruction?
   [{:keys [family m n k subgroup]}]
@@ -50,11 +75,14 @@
         base-parameters
         (vec
          (concat
-          [(body/->KernelParameter row :input (:dtype row-layout) (get buffer-shapes row [M K])
+          [(body/->KernelParameter row :input (:dtype row-layout)
+                                   (get buffer-shapes row [M K])
                                    :global row-layout :lhs)
-           (body/->KernelParameter col :input (:dtype col-layout) (get buffer-shapes col [K N])
+           (body/->KernelParameter col :input (:dtype col-layout)
+                                   (get buffer-shapes col [K N])
                                    :global col-layout :rhs)
-           (body/->KernelParameter out :output result-dtype (get buffer-shapes out [M N])
+           (body/->KernelParameter out :output result-dtype
+                                   (get buffer-shapes out [M N])
                                    :global out-layout :result)
            (body/->KernelParameter m-parameter :scalar :int [] nil nil :dimension)
            (body/->KernelParameter n-parameter :scalar :int [] nil nil :dimension)
@@ -90,8 +118,7 @@
            result-dtype provenance additional-parameters additional-indices buffer-shapes
            buffer-views operation-buffers k-range launch-group-count attributes input-value-regions
            input-layouts]
-    :or {dimension-parameters ['M 'N 'K]
-         axis-symbols ['i 'j 'k]
+    :or {axis-symbols ['i 'j 'k]
          result-dtype :half
          provenance {}
          additional-parameters []
@@ -111,6 +138,13 @@
         row-dtype (if row-region (:accumulator-dtype row-region) :half)
         col-dtype (if col-region (:accumulator-dtype col-region) :half)
         tile (assoc tile :num-stages (or (:num-stages tile) 3))
+        dimension-parameters
+        (or dimension-parameters
+            (allocate-dimension-parameters
+             (concat [row col out]
+                     (map :id additional-parameters)
+                     (map :sym (:operands epilogue))
+                     (map :sym (:scalars epilogue)))))
         _ (when-not (and (= 3 (count dimension-parameters))
                          (every? compiler-id? dimension-parameters)
                          (= 3 (count (set dimension-parameters))))
@@ -119,6 +153,12 @@
                              :dimension-parameters dimension-parameters})))
         [M N K] dimensions
         [m-parameter n-parameter k-parameter] dimension-parameters
+        ;; Preserve literal shape facts, but keep symbolic caller names outside the body-local
+        ;; scope.  For example square attention has M=N=`seq-len`, while its schedule requires
+        ;; two distinct scalar identities.
+        shape-M (if (number? M) M m-parameter)
+        shape-N (if (number? N) N n-parameter)
+        shape-K (if (number? K) K k-parameter)
         [k-lower k-upper] (or k-range [0 k-parameter])
         row-buffer (get operation-buffers row row)
         col-buffer (get operation-buffers col col)
@@ -133,15 +173,15 @@
         k-width (max 1 (quot 32 (layout/dtype-bits :half)))
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
-        row-storage-shape (get buffer-shapes row [M K])
-        col-storage-shape (get buffer-shapes col [K N])
+        row-storage-shape (get buffer-shapes row [shape-M shape-K])
+        col-storage-shape (get buffer-shapes col [shape-K shape-N])
         row-storage-layout (or (some-> (get input-layouts row)
                                        (assoc :shape row-storage-shape))
                                (layout/row-major row-storage-shape row-dtype))
         col-storage-layout (or (some-> (get input-layouts col)
                                        (assoc :shape col-storage-shape))
                                (layout/row-major col-storage-shape col-dtype))
-        out-layout (layout/row-major (get buffer-shapes out [M N]) result-dtype)
+        out-layout (layout/row-major (get buffer-shapes out [shape-M shape-N]) result-dtype)
         buffer-layouts {row row-storage-layout col col-storage-layout out out-layout}
         buffer-views (mapv (fn [view]
                              (if (instance? raster.compiler.ir.kernel_body.BufferView view)
@@ -252,7 +292,7 @@
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
-        parameters (matrix-parameters row col out M N K dimension-parameters
+        parameters (matrix-parameters row col out shape-M shape-N shape-K dimension-parameters
                                       row-storage-layout col-storage-layout out-layout
                                       result-dtype epilogue
                                       buffer-shapes additional-parameters)

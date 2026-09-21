@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.par]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.index-algebra :as index-algebra]
             [raster.compiler.ir.par :as ir-par]
             [raster.compiler.ir.soac :as legacy-soac]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -259,7 +260,7 @@
                   '(.invk raster.numeric/_star__m_long_long-impl kh kw)
                   {:raster.op/original 'raster.numeric/* :raster.type/tag 'long})]
     (is (= '(int (clojure.core/* kh kw))
-           (#'frontend/canonical-index-arithmetic (list 'int product))))))
+           (index-algebra/canonical-arithmetic (list 'int product))))))
 
 (deftest checked-counts-and-prefix-scalars-retain-one-ordered-evaluation
   (let [options {:dtype :double :array-types {'out :double}

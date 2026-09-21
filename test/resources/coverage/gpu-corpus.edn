@@ -283,11 +283,10 @@
    :declines
    [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
   {:var raster.dl.attention/causal-scaled-dot-product-attn,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :sequential-effect-continuation,
-     :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 2}}
   {:var raster.dl.attention/causal-scaled-dot-product-attn-dk,
    :route :typed-soac,
    :typed-validated true,
@@ -304,17 +303,15 @@
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.attention/causal-scaled-dot-product-attn-jvp,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :sequential-effect-continuation,
-     :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 3}}
   {:var raster.dl.attention/causal-single-head-attention,
-   :route :compatibility,
-   :typed-validated false,
-   :declines
-   [{:reason :sequential-effect-continuation,
-     :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 2}}
   {:var raster.dl.attention/fast-exp,
    :route :scalar,
    :typed-validated false,

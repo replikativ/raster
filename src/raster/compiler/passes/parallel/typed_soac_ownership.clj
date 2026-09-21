@@ -159,7 +159,11 @@
 (defn- ownership-signature
   [{:keys [index locals loops]} outer-index outer-extent forbidden-index-symbols
    capture-substitutions]
-  (let [local-initializers (into {} (map (juxt :id :init)) locals)
+  (let [index (index-algebra/canonical-arithmetic index)
+        locals (mapv #(update % :init index-algebra/canonical-arithmetic) locals)
+        loops (mapv #(update % :extent index-algebra/canonical-arithmetic) loops)
+        outer-extent (index-algebra/canonical-arithmetic outer-extent)
+        local-initializers (into {} (map (juxt :id :init)) locals)
         address-dependencies
         (loop [symbols (util/free-syms index)]
           (let [expanded (into symbols

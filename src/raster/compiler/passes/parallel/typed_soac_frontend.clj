@@ -1280,36 +1280,6 @@
                  (swap! atoms assoc key atom-symbol)
                  atom-symbol))))))))
 
-(defn- canonical-index-arithmetic
-  "Project walked numeric dispatch back to the small index algebra vocabulary.
-
-   The walker deliberately retains `.invk` for executable scalar dispatch. Ownership proof is not
-   execution and must compare the semantic arithmetic operation instead. This projection handles
-   only the exact integer ring operations the index algebra already understands; everything else
-   remains opaque and therefore declines conservatively."
-  [expression]
-  (if (seq? expression)
-    (let [operation (descriptor/semantic-op expression)
-          arguments (mapv canonical-index-arithmetic (descriptor/call-args expression))
-          canonical (cond
-                      (descriptor/addition-op? operation) 'clojure.core/+
-                      (descriptor/subtraction-op? operation) 'clojure.core/-
-                      (descriptor/multiplication-op? operation) 'clojure.core/*
-                      :else nil)
-          algebra-wrapper? (or (descriptor/cast-op? operation)
-                               (contains? '#{quot clojure.core/quot rem clojure.core/rem
-                                             mod clojure.core/mod}
-                                          operation))]
-      (cond
-        canonical (with-meta (list* canonical arguments) (meta expression))
-        ;; A cast or quotient/remainder is itself part of the index vocabulary. Preserve that
-        ;; exact operation while canonicalizing arithmetic nested inside it; leaving an `.invk`
-        ;; product opaque merely because it occurs under `(int ...)` made equivalent 2-D and 1-D
-        ;; row-major formulas take different ownership routes.
-        algebra-wrapper? (with-meta (list* (first expression) arguments) (meta expression))
-        :else expression))
-    expression))
-
 (defn- store-index-form
   "The mixed-radix index form of a store's destination index over the map index (extent
    `extent`), the region locals and, for a loop store, its loop's locals and index. Host
@@ -1336,13 +1306,13 @@
     ;; in the transitive index slice must not accidentally prove unique cross-item addressing.
     (when (empty? (set/intersection carry-bindings (util/free-syms index-expanded)))
       (index-algebra/index-form
-       (canonical-index-arithmetic (expand-index (:index store)))
+       (index-algebra/canonical-arithmetic (expand-index (:index store)))
        index (expand-extent extent)
        ;; Region locals are part of the same proof expression as the final store address. Expose
        ;; their address/product spines and canonicalize retained numeric dispatch too; leaving a
        ;; walked `.invk` inside a row/column local would make an otherwise affine permutation
        ;; opaque to the algebra.
-       (mapv #(update % :init (comp canonical-index-arithmetic expand-index))
+       (mapv #(update % :init (comp index-algebra/canonical-arithmetic expand-index))
              (concat locals (:locals loop)))
        (if loop {(:index loop) (expand-extent (:extent loop))} {})))))
 
@@ -2714,7 +2684,8 @@
       (when (and (par/par-map-form? inner)
                  (immutable-counted-bound? rows))
         (let [{:keys [out idx bound offset cast body]} (par/extract-par-map-info inner)
-              offset-product (some-> offset canonical-index-arithmetic index-algebra/monomial)
+              offset-product (some-> offset index-algebra/canonical-arithmetic
+                                     index-algebra/monomial)
               expected-product (index-algebra/monomial
                                 (list 'clojure.core/* row bound))]
           (when (and offset
@@ -3199,7 +3170,7 @@
                            (= operand source) (= zero 0)
                            (some? (index-algebra/monomial expanded)))
                   source)))
-            proof-scalar-expression (canonical-index-arithmetic expression)
+            proof-scalar-expression (index-algebra/canonical-arithmetic expression)
             scalar-definition
             (when (and (= :scalar (:kind description)) (symbol? symbol)
                        (seq? expression)
