@@ -193,8 +193,14 @@
 
    Emitters own the path because only they know which schedule axis produced their compatible
    alternatives. This function is generic: it validates the selector against the dispatch and
-   writes no operation-specific key itself."
-  [dispatch dispatch-tuning descriptor numerical-mode layout]
+   writes no operation-specific key itself.
+
+   `:pin-fixed? true` is an explicit promise that a fixed measured winner should be the only
+   emitted alternative after recompilation. It adds `:fallback :none`, which lets the compiler
+   prune every losing alternative and makes a later admission failure loud. Runtime-dependent
+   selectors cannot be pinned because they describe more than one specialization region."
+  [dispatch dispatch-tuning descriptor numerical-mode layout & {:keys [pin-fixed?]
+                                                                  :or {pin-fixed? false}}]
   (let [dispatch (kdispatch/validate! dispatch)
         _ (when-not (tuning/dispatch-tuning? dispatch-tuning)
             (throw (ex-info "schedule override requires a DispatchTuning"
@@ -202,7 +208,10 @@
         path (get-in dispatch [:attributes :tuning :schedule-path])
         schedule-key (get-in dispatch [:attributes :tuning :schedule-key])
         target-path (cond-> path (some? schedule-key) (conj schedule-key))
-        selector (:selector dispatch-tuning)]
+        measured-selector (:selector dispatch-tuning)]
+    (when-not (or (nil? pin-fixed?) (instance? Boolean pin-fixed?))
+      (throw (ex-info "schedule override :pin-fixed? must be boolean"
+                      {:reason :invalid-pinned-tuning-option :pin-fixed? pin-fixed?})))
     (when-not (and (vector? path) (seq path) (every? keyword? path))
       (throw (ex-info "emitted dispatch does not declare a tuning schedule path"
                       {:dispatch-id (:id dispatch) :schedule-path path})))
@@ -214,7 +223,15 @@
     ;; Recheck the full device/artifact/ABI/numerical/layout identity before admitting cached or
     ;; transported tuning data into recompilation.
     (tuning/apply-tuning dispatch dispatch-tuning descriptor numerical-mode layout)
-    (assoc-in {} target-path selector)))
+    (let [selector
+          (if (true? pin-fixed?)
+            (let [pinned (assoc measured-selector :fallback :none)]
+              ;; This validates both that the evidence names one fixed strategy and that the
+              ;; strategy exists. Do not silently reinterpret a piecewise selector as a pin.
+              (kdispatch/specialize-fixed dispatch pinned)
+              pinned)
+            measured-selector)]
+      (assoc-in {} target-path selector))))
 
 (defn- linked-case-fn
   [executable instance-selector step-selector case-fn]
@@ -247,9 +264,11 @@
    Numerical mode and layout default to emitter-owned tuning metadata but may be supplied
    explicitly. Returns the DispatchTuning together with a schedule override ready to pass as
    `:schedule` to compile-gpu-program. Compilation remains pure; this function is explicitly an
-   offline action."
+   offline action. `:pin-fixed? true` is accepted only for a fixed measured selector and requests
+   fallback-free recompilation with every losing alternative pruned."
   [executable descriptor runtime-values case-fn
-   & {:keys [instance step numerical-mode layout improvement-threshold force? measurement]
+   & {:keys [instance step numerical-mode layout improvement-threshold force? measurement
+             pin-fixed?]
       :or {improvement-threshold 0.001 force? false}}]
   (let [{:keys [dispatch step-index instance-id] compiled-step :step}
         (link/linked-dispatch executable instance step)
@@ -267,7 +286,8 @@
     {:tuning result
      :selector (:selector result)
      :schedule-override (tuning-schedule-override dispatch result descriptor
-                                                  numerical-mode layout)
+                                                  numerical-mode layout
+                                                  :pin-fixed? pin-fixed?)
      :instance-id instance-id
      :step-index step-index
      :phase (:phase compiled-step)}))
@@ -279,9 +299,11 @@
    value, and returns the compiled benchmark case accepted by tune-linked-dispatch!. Equivalent
    sites are measured once through their first descriptor step. `:max-measurements` is an optional
    fail-before-execution upper bound on alternatives × distinct runtime samples across selected
-   groups; cached results may perform fewer physical measurements."
+   groups; cached results may perform fewer physical measurements. `:pin-fixed? true` applies the
+   same explicit fallback-free promise to every selected group and therefore requires every result
+   to be a fixed selector."
   [executable descriptor plan runtime-values-fn case-fn
-   & {:keys [instance max-measurements improvement-threshold force? measurement]
+   & {:keys [instance max-measurements improvement-threshold force? measurement pin-fixed?]
       :or {improvement-threshold 0.001 force? false}}]
   (let [plan (program-tuning/validate-plan! plan)]
     (when-not (ifn? runtime-values-fn)
@@ -344,7 +366,8 @@
                  :step (:representative-step-index group)
                  :improvement-threshold improvement-threshold
                  :force? force?
-                 :measurement measurement)
+                 :measurement measurement
+                 :pin-fixed? pin-fixed?)
                 :group-id (:id group)
                 :site-count (:site-count group)
                 :planned-measurements planned-measurements))
