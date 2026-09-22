@@ -2395,10 +2395,10 @@
    `(dgemm! A B C m k n alpha beta)` is `C[m,n] = alpha·A·B + beta·C` over row-major operands;
    the `-tn!`/`-nt!` variants store `A` as `[k,m]` / `B` as `[n,k]`. With `beta = 0` the call
    is the pure contraction `(raster.par/contract C [[i m] [j n]] [[l k]] (* A[i,l] B[l,j]))`
-   scaled by `alpha`, and the typed route can schedule it like any contraction instead of
-   leaving the whole block on the host because one binding is an opaque BLAS effect. A non-zero
-   `beta` (a literal or a scalar value) is the same contraction with a result transform that
-   reads the destination element it overwrites: `C[i,j] := acc + beta·C[i,j]`. The destination
+   with `alpha` in its typed result transform, so a body-replacing schedule proves it accounts for
+   the complete summand before applying the scale. A non-zero `beta` (a literal or a scalar value)
+   extends that transform to read the destination element it overwrites:
+   `C[i,j] := alpha·acc + beta·C[i,j]`. The destination
    is then read-write storage of one kernel, which the KernelBody builders express as a single
    `:inout` parameter. A `beta` that is neither a literal nor a scalar value id, or a call whose
    element type is unknown, stays a host call.  A batched call adds one free logical axis; it
@@ -2477,28 +2477,40 @@
                     (if scalar-tag
                       (with-meta form {:raster.type/tag scalar-tag :tag scalar-tag})
                       form))
-            product (typed (list 'clojure.core/*
-                                 (typed (list 'clojure.core/aget A a-index))
-                                 (typed (list 'clojure.core/aget B b-index))))
             alpha-value (scalar-value alpha alpha-literal)
-            body (if (= 1.0 alpha-literal)
-                   product
-                   (typed (list 'clojure.core/* alpha-value product)))
-            ;; `beta·C[i,j]` is read at the store coordinates of the element being produced;
-            ;; the operand map declares that coordinate, the index inside the read is its
-            ;; row-major spelling for the host expansion.
+            scale-acc? (not= 1.0 alpha-literal)
+            body (typed (list 'clojure.core/*
+                              (typed (list 'clojure.core/aget A a-index))
+                              (typed (list 'clojure.core/aget B b-index))))
+            ;; Alpha and beta are result transforms of the same pure product reduction. Keeping
+            ;; alpha out of the summand lets every dense schedule prove that it replaces the
+            ;; complete body; the typed epilogue then owns scaling for scalar, tiled and batched
+            ;; leaves alike. `beta·C[i,j]` additionally reads the destination at the store
+            ;; coordinates, recorded by its verified operand map.
             epilogue
-            (when accumulate?
+            (when (or scale-acc? accumulate?)
               (let [acc (clojure.core/symbol (str "rstr_gemm_acc_" ordinal))
+                    scaled-acc (if scale-acc?
+                                 (typed (list 'clojure.core/* alpha-value acc))
+                                 acc)
                     destination (typed (list 'clojure.core/aget C
                                              (list 'clojure.core/+ (list 'clojure.core/* i n) j)))
                     scaled (if (= 1.0 beta-literal)
                              destination
                              (typed (list 'clojure.core/* beta-value destination)))]
                 {:acc acc
-                 :expr (typed (list 'clojure.core/+ acc scaled))
-                 :operands [{:sym C :map (axis-map/of-axes [[i m] [j n]]) :dtype elem-type}]
-                 :scalars (if (symbol? beta-value) [{:sym beta-value :dtype elem-type}] [])
+                 :expr (if accumulate?
+                         (typed (list 'clojure.core/+ scaled-acc scaled))
+                         scaled-acc)
+                 :operands (if accumulate?
+                             [{:sym C :map (axis-map/of-axes [[i m] [j n]])
+                               :dtype elem-type}]
+                             [])
+                 :scalars (->> [(when (and scale-acc? (symbol? alpha-value))
+                                  {:sym alpha-value :dtype elem-type})
+                                (when (and accumulate? (symbol? beta-value))
+                                  {:sym beta-value :dtype elem-type})]
+                               (remove nil?) distinct vec)
                  :dtype elem-type}))]
         (with-meta (cond-> (list 'raster.par/contract C
                                 (cond-> [] batched? (conj [batch-axis batch])

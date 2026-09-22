@@ -116,6 +116,20 @@
           (is (= [:map-void] (mapv :convention (:steps descriptor))))
           (is (< (rel-err out cpu) tol) (str "sum-kv relerr " (rel-err out cpu))))))))
 
+(deftest gpu-bidirectional-sdpa-uses-the-general-batched-contraction-vertical
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gpu-bidirectional-sdpa")
+    (let [rows 32 heads 2 hd 16 n (* rows heads hd)
+          q (rnd n 901) k (rnd n 902) v (rnd n 903)
+          scale (/ 1.0 (Math/sqrt (double hd)))
+          cpu (attn/bidirectional-sdpa q k v rows heads hd scale)
+          {:keys [descriptor out]}
+          (run-resident #'attn/bidirectional-sdpa [q k v rows heads hd scale])]
+      (is (= [:map-void :executable :executable :executable :map]
+             (mapv :convention (:steps descriptor))))
+      (is (< (rel-err out cpu) 5.0e-3)
+          (str "bidirectional SDPA relerr " (rel-err out cpu))))))
+
 ;; ── Fused causal SDPA forward (dense-attention-on-GPU Phase 2+3) ─────────────────
 ;; batched-causal-sdpa's FORWARD is THREE resident par/map-void! kernels — scores
 ;; (one work item per (b,i,j)), the per-row softmax sweep, and the W·V accumulation
@@ -190,25 +204,23 @@
           (str "typed noncausal SDPA relerr " (rel-err out cpu))))))
 
 (deftest fused-causal-sdpa-resident
-  ;; batched-causal-sdpa forward lowers to resident :map-void kernels ONLY (scores /
-  ;; row-softmax / W·V accumulation — no GEMM, no host scalar-let) and matches CPU.
+  ;; batched-causal-sdpa forward lowers to resident score/output maps around the first-class
+  ;; segmented fold-map softmax executable, with no host scalar-let, and matches CPU.
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "fused-causal-sdpa-resident")
     (let [batch 4 seq-len 6 hd 8 n (* batch seq-len hd)
           Q (rnd n 71) K (rnd n 72) V (rnd n 73)
           cpu (attn/batched-causal-sdpa Q K V batch seq-len hd)
           {:keys [descriptor out]} (run-resident #'attn/batched-causal-sdpa [Q K V batch seq-len hd])]
-      ;; three resident kernels, no GEMM and no host scalar-let; a dense single-result copy is a
-      ;; value-producing :map on the typed route
       (is (= 3 (count (:steps descriptor))))
-      (is (every? #(contains? #{:map :map-void} %) (mapv :convention (:steps descriptor)))
-          "causal SDPA lowers to three resident kernels (no GEMM, no host scalar-let)")
+      (is (= [:map :executable :map-void] (mapv :convention (:steps descriptor)))
+          "causal SDPA keeps the segmented softmax visible as a scheduled executable")
       (is (< (rel-err out cpu) 1e-5) (str "fused-sdpa GPU relerr " (rel-err out cpu))))))
 
 (deftest gqa-causal-mha-forward-fully-resident
   ;; THE Phase-2+3 milestone: the flat gqa-causal-mha forward (pack-heads →
   ;; broadcast-kv-heads → fused batched-causal-sdpa → unpack-heads) compiles to a
-  ;; FULLY resident program — every step a :map-void kernel, no non-resident binding —
+  ;; FULLY resident program — layout maps plus the scheduled segmented softmax, no host binding —
   ;; and matches the CPU forward on the Arc.
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gqa-causal-mha-fully-resident")
@@ -218,8 +230,9 @@
           p (pl/compile-gpu-program #'attn/gqa-causal-mha :ze:0 :dtype :float :on-non-resident :nil)]
       (is (some? p) "gqa-causal-mha forward compiles to a resident descriptor (no non-resident binding)")
       (when p
-        (is (every? #(contains? #{:map :map-void} %) (mapv :convention (:steps p)))
-            "every gqa-causal-mha forward step is a resident map kernel")
+        (is (= [:map :map-void :map-void :map :executable :map-void :map]
+               (mapv :convention (:steps p)))
+            "GQA remains resident while retaining softmax as an explicit scheduled operation")
         (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V 1 seq-len nq nkv hd])]
           (is (< (rel-err out cpu) 1e-5) (str "gqa-causal-mha GPU relerr " (rel-err out cpu))))))))
 

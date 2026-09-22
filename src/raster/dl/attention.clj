@@ -2109,11 +2109,11 @@
           [probabilities] [[row rows]] j nrows
           [[mx -1.0e30 :element nrows
             (n/max mx (aget sc (clojure.core/+ (clojure.core/* row nrows) j)))]
-           [denominator 0.0 :element nrows
-            (+ denominator
+           [sum-exp 0.0 :element nrows
+            (+ sum-exp
                (m/exp (- (aget sc (clojure.core/+ (clojure.core/* row nrows) j)) mx)))]]
           [(/ (m/exp (- (aget sc (clojure.core/+ (clojure.core/* row nrows) j)) mx))
-              denominator)])
+              sum-exp)])
          probabilities)))
 
 (deftm attn-prefill-out-strided!
@@ -2174,6 +2174,34 @@
                                                                                             (aget k (clojure.core/+ kb d)))))
                                                                            acc))]
                                                                (aset sc idx (* dot scale))))))
+
+(deftm bidirectional-sdpa
+  "Forward bidirectional scaled dot-product attention over token-major preprojected Q/K/V.
+
+  Q, K and V have logical shape [nrows,n-heads,head-dim].  The implementation is deliberately a
+  composition of general layout and contraction combinators: pack head slabs, compute batched
+  QK^T, apply the functional row softmax, compute batched probabilities@V, and unpack.  GPU
+  scheduling may therefore select ordinary matrix leaves without an attention-specific compiler
+  pass.  Training rules for the batched BLAS surface remain a separate contract; this entry is the
+  forward/inference path."
+  (All [T]
+       [q :- (Array T) k :- (Array T) v :- (Array T)
+        nrows :- Long n-heads :- Long head-dim :- Long scale :- Double]
+       :- (Array T)
+       (let [qh (ops/pack-heads q nrows n-heads head-dim)
+             kh (ops/pack-heads k nrows n-heads head-dim)
+             vh (ops/pack-heads v nrows n-heads head-dim)
+             scores (alloc-like q (clojure.core/* n-heads
+                                                   (clojure.core/* nrows nrows)))
+             qk-written (blas/batched-gemm-nt! qh kh scores n-heads nrows head-dim nrows
+                                               (n/oftype q scale))
+             probabilities (attn-prefill-softmax scores nrows n-heads)
+             context-heads (alloc-like q (clojure.core/* n-heads
+                                                          (clojure.core/* nrows head-dim)))
+             context-written (blas/batched-gemm-nn! probabilities vh context-heads
+                                                    n-heads nrows nrows head-dim
+                                                    (n/oftype q 1.0))]
+         (ops/unpack-heads context-heads nrows n-heads head-dim))))
 
 ;; Sliding-window scores (moonshine-style 'ergodic' encoder): query i attends j
 ;; iff 0 <= i-j <= left-1 (past incl. self) or 0 < j-i <= right-1 (future).

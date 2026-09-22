@@ -428,6 +428,26 @@
         (is (= (:effects certificate) (:effects artifact)))
         (is (= (scheduled-body/realized-launch certificate) (:launch artifact)))))))
 
+(deftest batched-nt-is-a-transposed-rhs-slice-not-a-materialized-transpose
+  (let [{graph :graph}
+        (gemm/emit-batched-matrix-alternative
+         {:id :batched-nt-layout
+          :a 'a :b 'b :c 'c :batch 'batch :m 'm :n 'n :k 'k
+          :variant :nt :tile (hardware/derive-gemm-tile {})
+          :batching {:row true :col true}})
+        artifact (get-in graph [:nodes 0 :operation])
+        stage (get-in artifact [:attributes :scheduled-kernel-body :source])
+        body (get-in artifact [:attributes :scheduled-kernel-body :body])
+        rhs-view (some #(when (= 'batch-rhs-view (:id %)) %) (:views body))]
+    (is (= [:contract] (mapv (comp last :id) (:nodes graph))))
+    (is (empty? (:temporaries graph))
+        "tile-local conversion plus a strided view needs no full-size cast or transpose")
+    (is (= :nt (get-in graph [:attributes :variant])))
+    (is (= [1 0] (get-in stage [:input-layouts 'b :perm])))
+    (is (= [1 0] (get-in rhs-view [:layout :perm])))
+    (is (= '[batch N K] (get-in body [:parameters 1 :shape]))
+        "the parent buffer states its physical [batch,N,K] storage")))
+
 (deftest square-batched-matrix-views-use-distinct-body-dimension-identities
   (let [emitted
         (gemm/emit-scheduled-batched-matrix-kernel

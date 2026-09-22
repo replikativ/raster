@@ -1261,10 +1261,6 @@
       {:alternatives []
        :decline {:reason :mixed-dpas-inout-result-transform-not-lowered}}
 
-      (and (:batched? matrix-view) (seq (:epilogue matrix-view)))
-      {:alternatives []
-       :decline {:reason :batched-matrix-result-transform-not-lowered}}
-
       (nil? target-schedule)
       {:alternatives []
        :decline {:reason :mixed-dpas-target-capability

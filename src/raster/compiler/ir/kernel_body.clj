@@ -2307,6 +2307,9 @@
                                   :view view})))
                (let [parent-shape (:shape parent)
                      view-shape (:shape view)
+                     view-permutation (or (get-in view [:layout :perm])
+                                          (vec (range (count view-shape))))
+                     physical-view-shape (mapv view-shape view-permutation)
                      prefix-rank (- (count parent-shape) (count view-shape))
                      offset (:element-offset view)
                      offset-arguments (when (and (record-kind?
@@ -2326,17 +2329,17 @@
                      slice-index (first offset-arguments)
                      group-axis (get group-axes slice-index)]
                  (when-not (and (= 1 prefix-rank)
-                                (= view-shape (subvec (vec parent-shape) 1))
+                                (= physical-view-shape (subvec (vec parent-shape) 1))
                                 (= (vec offset-arguments) (into [slice-index] view-shape))
                                 (integer? group-axis)
                                 (< group-axis (count (:group-count launch)))
                                 (= (first parent-shape)
                                    (launch-bound-value
                                     (nth (:group-count launch) group-axis))))
-                   (throw (ex-info
+                    (throw (ex-info
                            "kernel buffer view is not a launch-bounded contiguous leading slice"
                            {:view view :parent parent :launch launch
-                            :required {:parent-shape '[extent & view-shape]
+                            :required {:parent-shape '[extent & physical-view-shape]
                                        :element-offset '[group-index & view-shape]
                                        :group-count 'extent}}))))
                (assoc resolved (:id view)

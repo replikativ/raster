@@ -390,15 +390,21 @@
   "Canonical dense batch×matrix storage layouts.
 
    The leading free axis selects an independent slab; the other two free axes and the contracted
-   axis retain the ordinary M/N/K meaning.  This first schedule row is deliberately NN-only.
-   Transposed batched operands require a compiler-owned batched layout transform before they can
-   enter the same matrix body; they must not be accepted by assuming a stride convention."
-  {:both       {:row [:free0 :free1 :contract0]
-                :col [:free0 :contract0 :free2]}
-   :shared-col {:row [:free0 :free1 :contract0]
-                :col [:contract0 :free2]}
-   :shared-row {:row [:free1 :contract0]
-                :col [:free0 :contract0 :free2]}})
+   axis retain the ordinary M/N/K meaning. NN and NT are separate verified data rows: the latter
+   proves physical [batch,N,K] (or shared [N,K]) storage and therefore permits a schedule to carry
+   an explicit transposed RHS layout without assuming strides."
+  {:both-nn       {:variant :nn :row [:free0 :free1 :contract0]
+                   :col [:free0 :contract0 :free2]}
+   :shared-col-nn {:variant :nn :row [:free0 :free1 :contract0]
+                   :col [:contract0 :free2]}
+   :shared-row-nn {:variant :nn :row [:free1 :contract0]
+                   :col [:free0 :contract0 :free2]}
+   :both-nt       {:variant :nt :row [:free0 :free1 :contract0]
+                   :col [:free0 :free2 :contract0]}
+   :shared-col-nt {:variant :nt :row [:free0 :free1 :contract0]
+                   :col [:free2 :contract0]}
+   :shared-row-nt {:variant :nt :row [:free1 :contract0]
+                   :col [:free0 :free2 :contract0]}})
 
 (defn- role-map
   "The axis-map a role-spec denotes, e.g. [:free0 :contract0] → of-axes [[i M] [l L]] (index i·L+l)."
@@ -451,7 +457,10 @@
         {:keys [combine neutral element]} (scalar-reduction-view facts)
         batched? (= 3 (count free-axes))
         layouts (if batched? dense-batched-matrix-layouts dense-matrix-layouts)
-        layout-order (if batched? [:both :shared-col :shared-row] [:nn :nt :tn :tt])]
+        layout-order (if batched?
+                       [:both-nn :shared-col-nn :shared-row-nn
+                        :both-nt :shared-col-nt :shared-row-nt]
+                       [:nn :nt :tn :tt])]
     (cond
       (not (and (contains? #{2 3} (count free-axes))
                 (= 1 (count contract-axes))))
@@ -469,12 +478,13 @@
       :else
       (if-let [[layout-kind verdict]
                (some (fn [layout-kind]
-                       (let [verdict (check-layout facts (get layouts layout-kind))]
+                       (let [verdict (check-layout facts
+                                                   (dissoc (get layouts layout-kind) :variant))]
                          (when (:ok verdict) [layout-kind verdict])))
                      layout-order)]
         (cond->
          {:ok true
-          :variant (if batched? :nn layout-kind)
+          :variant (if batched? (get-in layouts [layout-kind :variant]) layout-kind)
           :batched? batched?
           :epilogue epilogue
           :bindings (:bindings verdict)
@@ -486,8 +496,12 @@
                          (second (second free-axes))
                          (second (first contract-axes))])}
           batched? (assoc :batch (second (first free-axes))
-                          :batching {:row (contains? #{:both :shared-col} layout-kind)
-                                     :col (contains? #{:both :shared-row} layout-kind)}))
+                          :batching {:row (contains? #{:both-nn :shared-col-nn
+                                                      :both-nt :shared-col-nt}
+                                                    layout-kind)
+                                     :col (contains? #{:both-nn :shared-row-nn
+                                                      :both-nt :shared-row-nt}
+                                                    layout-kind)}))
         {:ok false :reason :non-dense-matrix-layout
          :actual (mapv (juxt :sym :idx) operands)}))))
 

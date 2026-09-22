@@ -34,6 +34,21 @@
           (aset grad i (/ (- f+ f0) eps)))))
     grad))
 
+(deftest bidirectional-sdpa-composes-layouts-contractions-and-softmax
+  (let [rows 4 heads 2 head-dim 3 width (* heads head-dim)
+        q (double-array (map #(/ (- (mod % 17) 8) 9.0) (range (* rows width))))
+        k (double-array (map #(/ (- (mod % 13) 6) 8.0) (range (* rows width))))
+        v (double-array (map #(/ (- (mod % 11) 5) 7.0) (range (* rows width))))
+        scale (/ 1.0 (Math/sqrt (double head-dim)))
+        scores (double-array (* rows heads rows))
+        expected (double-array (* rows width))]
+    (attn/attn-prefill-scores-bidir! q k scores rows heads 1 heads head-dim scale)
+    (attn/attn-prefill-softmax! scores rows heads)
+    (attn/attn-prefill-out! scores v expected rows heads 1 heads head-dim)
+    (let [actual ^doubles (attn/bidirectional-sdpa q k v rows heads head-dim scale)]
+      (is (arr-approx= expected actual 1.0e-12)
+          "head-major batched contractions preserve the token-major staged API semantics"))))
+
 (deftest packed-prefill-views-match-materialized-inputs
   (let [rows 3
         heads 2

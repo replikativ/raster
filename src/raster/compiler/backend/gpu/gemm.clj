@@ -13,6 +13,7 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -108,15 +109,17 @@
      :arguments (mapv second interface)}))
 
 (defn- batched-outer-interface
-  [{:keys [a b c batch m n k]}]
-  {:abi [(kabi/slot a :input :float :c-name "A" :role :lhs)
-         (kabi/slot b :input :float :c-name "B" :role :rhs)
-         (kabi/slot c :output :float :c-name "C" :role :result)
-         (kabi/slot batch :scalar :int :c-name "batch" :role :extent)
-         (kabi/slot m :scalar :int :c-name "M" :role :extent)
-         (kabi/slot n :scalar :int :c-name "N" :role :extent)
-         (kabi/slot k :scalar :int :c-name "K" :role :extent)]
-   :arguments [a b c batch m n k]})
+  [{:keys [a b c batch m n k epilogue]}]
+  (let [base [[(kabi/slot a :input :float :c-name "A" :role :lhs) a]
+              [(kabi/slot b :input :float :c-name "B" :role :rhs) b]
+              [(kabi/slot c :output :float :c-name "C" :role :result) c]
+              [(kabi/slot batch :scalar :int :c-name "batch" :role :extent) batch]
+              [(kabi/slot m :scalar :int :c-name "M" :role :extent) m]
+              [(kabi/slot n :scalar :int :c-name "N" :role :extent) n]
+              [(kabi/slot k :scalar :int :c-name "K" :role :extent) k]]
+        interface (into base (epilogue-interface epilogue))]
+    {:abi (mapv first interface)
+     :arguments (mapv second interface)}))
 
 (defn- public-outer-interface
   [spec]
@@ -436,7 +439,8 @@
   (emit-scheduled-matrix-kernel (split-k-matrix-spec spec)))
 
 (defn- batched-matrix-spec
-  [{:keys [kernel-name id a b c m n k batch axis-symbols tile provenance batching input-value-regions]
+  [{:keys [kernel-name id a b c m n k batch axis-symbols tile provenance batching epilogue
+           input-value-regions input-layouts]
     :or {batching {:row true :col true}}}]
   (let [z 'slab
         ;; MatrixBody parameters are SSA identities, not semantic expressions.  Keep M/N/K
@@ -450,17 +454,24 @@
         c-view 'batch-result-view
         row-batched? (get batching :row true)
         col-batched? (get batching :col true)
+        row-slice-layout (get input-layouts a)
+        col-slice-layout (get input-layouts b)
+        col-transposed? (= [1 0] (:perm col-slice-layout))
         a-shape (if row-batched? [batch M K] [M K])
-        b-shape (if col-batched? [batch K N] [K N])
+        b-shape (if col-batched?
+                  (if col-transposed? [batch N K] [batch K N])
+                  (if col-transposed? [N K] [K N]))
         buffer-views
         (cond-> [{:id c-view :buffer c
                   :element-offset (kbody/leading-slice-offset z [M N]) :shape [M N]}]
           row-batched?
           (conj {:id a-view :buffer a
-                 :element-offset (kbody/leading-slice-offset z [M K]) :shape [M K]})
+                 :element-offset (kbody/leading-slice-offset z [M K]) :shape [M K]
+                 :layout (some-> row-slice-layout (assoc :shape [M K]))})
           col-batched?
           (conj {:id b-view :buffer b
-                 :element-offset (kbody/leading-slice-offset z [K N]) :shape [K N]}))
+                 :element-offset (kbody/leading-slice-offset z [K N]) :shape [K N]
+                 :layout (some-> col-slice-layout (assoc :shape [K N]))}))
         operation-buffers
         (cond-> {c c-view}
           row-batched? (assoc a a-view)
@@ -468,7 +479,13 @@
     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
      :dimension-parameters dimension-parameters
      :axis-symbols axis-symbols
-     :tile tile :result-dtype :float :provenance provenance :input-value-regions input-value-regions
+     :tile tile :result-dtype :float :provenance provenance
+     :epilogue epilogue :input-value-regions input-value-regions
+     ;; A batched operand's rank-2 permutation belongs to its selected slice. Shared operands
+     ;; remain rank 2 and keep the layout on the parent parameter.
+     :input-layouts (cond-> input-layouts
+                      row-batched? (dissoc a)
+                      col-batched? (dissoc b))
      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
      :additional-indices [(kbody/->IndexBinding z :group 2)]
      :buffer-shapes {a a-shape b b-shape c [batch M N]}
@@ -958,19 +975,21 @@
                       {:reason :matrix-input-fusion-ineligible :id (:id spec)}))))
 
 (defn emit-batched-matrix-alternative
-  "Emit one compiler-owned matrix schedule for a leading batch of dense NN contractions.
+  "Emit one compiler-owned matrix schedule for a leading batch of dense NN or NT contractions.
 
    The input and result tensors remain ordinary contiguous f32 values. The matrix KernelBody
    converts each selected tile to its f16 instruction representation at the load boundary, then
-   interprets the storage as [batch,M,K], [batch,K,N], and [batch,M,N] views. The return value is not a
-   standalone dispatch: the originating typed contraction supplies its general fallback and this
-   schedule contributes the alignment selector that chooses between them."
-  [{:keys [id a b c batch m n k variant tile vector-width batching
+   interprets the storage as [batch,M,K], either [batch,K,N] or [batch,N,K], and [batch,M,N]
+   views.  NT is a physical RHS layout carried by MatrixStage, not an attention special case or a
+   materialized transpose. The return value is not a standalone dispatch: the originating typed
+   contraction supplies its general fallback and this schedule contributes the alignment selector
+   that chooses between them."
+  [{:keys [id a b c batch m n k variant tile vector-width batching epilogue
            source-operation source-graph external-interface]
     :or {vector-width 4 batching {:row true :col true}}
     :as spec}]
-  (when-not (= :nn variant)
-    (throw (ex-info "batched matrix schedule currently requires canonical NN storage"
+  (when-not (contains? #{:nn :nt} variant)
+    (throw (ex-info "batched matrix schedule requires NN or NT storage"
                     {:reason :batched-matrix-layout-not-lowered
                      :id id :variant variant})))
   (doseq [[field value] [[:id id] [:a a] [:b b] [:c c] [:batch batch]
@@ -988,6 +1007,7 @@
                      (klaunch/product batch k n)
                      (klaunch/product k n))
         c-elements (klaunch/product batch m n)
+        epilogue-buffers (epilogue-buffer-specs epilogue)
         prefix (identifier (str id "_xmx_batched"))
         a16 [:gemm id :xmx-batched :a16]
         b16 [:gemm id :xmx-batched :b16]
@@ -1005,12 +1025,20 @@
                               :rhs (get batching :col true)}
                    :reduction {:kind :full :range [0 k]}
                    :result-shape [batch m n]
-                   :schedule {:kind :matrix-instruction-tiling :tile tile}})
+                   :epilogue epilogue
+                   :schedule {:kind :matrix-instruction-tiling :tile tile}
+                   :input-layouts
+                   (cond-> {}
+                     (= :nt variant)
+                     (assoc b16 (layout/transpose-layout
+                                 (layout/row-major [k n] :half))))})
         stage-graph
         (kgraph/make
          {:inputs (ordered-public-buffers
-                   [(graph-buffer a :float a-elements :input)
-                    (graph-buffer b :float b-elements :input)]
+                   (into [(graph-buffer a :float a-elements :input)
+                          (graph-buffer b :float b-elements :input)]
+                         (map #(graph-buffer (:id %) (:dtype %) (:elements %) :input))
+                         epilogue-buffers)
                    arguments)
           :outputs [(graph-buffer c :float c-elements :output)]
           :temporaries [(graph-buffer a16 :half a-elements :temporary)
@@ -1023,19 +1051,22 @@
                               [(value-use b :read) (value-use b16 :write)]
                               [b-elements] [])
                   (stage-node contract-id contract
-                              [(value-use a16 :read) (value-use b16 :read)
-                               (value-use c :write)]
-                              [batch m n k]
+                              (into [(value-use a16 :read) (value-use b16 :read)
+                                     (value-use c :write)]
+                                    (map #(value-use (:id %) :read)) epilogue-buffers)
+                              (vec (concat [batch m n k]
+                                           (map :sym (:scalars epilogue))))
                               [convert-a-id convert-b-id])]
           :abi abi :arguments arguments
           :effects effects
           :provenance {:semantic-op :contraction
-                       :variant :nn
+                       :variant variant
                        :lowering :batched-xmx-gemm}
           :attributes {:strategy :xmx-batched
-                       :variant :nn
+                       :variant variant
                        :batched? true
                        :batching batching
+                       :result-transform? (boolean (seq epilogue))
                        :precision :mixed-f16-f32
                        :vector-width vector-width
                        :tile tile}})
