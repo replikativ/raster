@@ -91,6 +91,17 @@
                             (:steps descriptor))))
         "the dense attention output discharges its initializer; paired RoPE stores retain theirs until even-width is proved")))
 
+(deftest functional-prefill-softmax-is-one-initializer-free-executable
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'attention/attn-prefill-softmax :ze:0 :dtype :float
+                    :on-non-resident :throw)
+        step (first (:steps descriptor))]
+    (is (= [:executable] (mapv :convention (:steps descriptor))))
+    (is (= 1 (count (:allocs descriptor))))
+    (is (= :segfoldmap (get-in step [:artifact :provenance :source-dialect])))
+    (is (not (-> step :artifact :provenance :segop-id str
+                 (.startsWith "rstr_initialization_equation_"))))))
+
 (deftest resident-typed-scan-is-one-graph-backed-executable-step
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-scan
                                                  :ze:0 :dtype :float)
