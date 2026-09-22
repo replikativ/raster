@@ -63,9 +63,10 @@
    rows :- Long model-width :- Long heads :- Long head-dim :- Long theta :- Double]
   :- (Array float)
   (let [packed (nn/linear-nb x qkv-weight rows model-width (* 3 model-width))
-        q (float-array (* rows model-width))
-        k (float-array (* rows model-width))
-        context (float-array (* rows model-width))
+        head-width (* heads head-dim)
+        q (float-array (* rows head-width))
+        k (float-array (* rows head-width))
+        context (float-array (* rows head-width))
         q-effect (attention/rope-prefill-strided!
                   packed q rows heads head-dim theta (* 3 model-width) 0)
         k-effect (attention/rope-prefill-strided!
@@ -75,16 +76,20 @@
                         (* 3 model-width) (* 2 model-width))]
     ;; Keep all three view consumers observable in this compiler regression.  A real attention
     ;; graph consumes Q/K through scores; this test uses a cheap continuation instead.
-    (raster.par/map! context i (* rows model-width) float
+    (raster.par/map! context i (* rows head-width) float
                      (+ (ra/aget context i) (ra/aget q i) (ra/aget k i)))))
 
 (deftest packed-qkv-views-compose-directly-with-the-projection
   (let [descriptor (pipeline/compile-gpu-program
                     #'packed-qkv-consumers :ze:0 :dtype :float :on-non-resident :throw)]
-    (is (= [:executable :map-void :map-void :map-void :map-void :map-void :map-void :map]
+    (is (= [:executable :map-void :map-void :map-void :map-void :map-void :map]
            (mapv :convention (:steps descriptor))))
     (is (= 4 (count (:allocs descriptor)))
-        "the packed projection, rotated Q/K and context are the only resident values")))
+        "the packed projection, rotated Q/K and context are the only resident values")
+    (is (= 2 (count (filter #(-> % :artifact :provenance :segop-id str
+                                 (.startsWith "rstr_initialization_equation_"))
+                            (:steps descriptor))))
+        "the dense attention output discharges its initializer; paired RoPE stores retain theirs until even-width is proved")))
 
 (deftest resident-typed-scan-is-one-graph-backed-executable-step
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-scan
