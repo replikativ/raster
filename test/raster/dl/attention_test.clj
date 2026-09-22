@@ -65,6 +65,21 @@
     (is (arr-approx= q-reference q-strided 1.0e-12))
     (is (arr-approx= out-reference out-strided 1.0e-12))))
 
+(deftest functional-prefill-softmax-matches-in-place-reference
+  (doseq [[rows heads] [[1 1] [3 2] [7 3]]]
+    (let [source (float-array
+                  (map #(float (/ (- (mod (* 17 %) 29) 14) 3.0))
+                       (range (* rows heads rows))))
+          reference (aclone source)
+          actual (attn/attn-prefill-softmax source rows heads)]
+      (attn/attn-prefill-softmax! reference rows heads)
+      (is (= (alength reference) (alength actual)))
+      (is (every? (fn [i]
+                    (< (Math/abs (- (double (aget reference i))
+                                    (double (aget actual i))))
+                       1.0e-6))
+                  (range (alength reference)))))))
+
 ;; ================================================================
 ;; Scaled dot-product attention
 ;; ================================================================

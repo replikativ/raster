@@ -486,6 +486,8 @@
       (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-out-strided! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-attention/attn-prefill-softmax {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-decode-attention-buf!

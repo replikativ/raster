@@ -2098,28 +2098,23 @@
                                                                   (recur (inc j)))
                                                               nil))))))
 
-;; Value-returning prefill softmax for resident graphs. A generic ordered
-;; segmented fold-map keeps the immutable scores disjoint from the probability
-;; output while representing max, denominator, and dense normalization as one
-;; algebraic operation.
-(deftm attn-prefill-softmax (All [T] [sc :- (Array T)
-                                      nrows :- Long n-q :- Long] :- (Array T)
-                                 (let [rows (clojure.core/* nrows n-q)
-                                       probs-buffer (alloc-like sc (clojure.core/* rows nrows))]
-                                   (raster.par/segmented-fold-map!
-                                    [probs-buffer] [[row rows]] j nrows
-                                    [[mx -1.0e30 :element nrows
-                                      (n/max mx (aget sc (clojure.core/+
-                                                          (clojure.core/* row nrows) j)))]
-                                     [sum 0.0 :element nrows
-                                      (+ sum (m/exp (- (aget sc (clojure.core/+
-                                                                 (clojure.core/* row nrows) j))
-                                                       mx)))]]
-                                   [(/ (m/exp (- (aget sc (clojure.core/+
-                                                            (clojure.core/* row nrows) j))
-                                                  mx))
-                                        sum)])
-                                   probs-buffer)))
+;; Functional spelling of the same ordered row softmax. Immutable scores and probabilities are
+;; distinct values, so the generic segmented fold-map retains both dependent folds and the dense
+;; normalization map as one operation without weakening KernelBody stable-read aliasing.
+(deftm attn-prefill-softmax
+  (All [T] [sc :- (Array T) nrows :- Long n-q :- Long] :- (Array T)
+       (let [rows (clojure.core/* nrows n-q)
+             probabilities (alloc-like sc (clojure.core/* rows nrows))]
+         (raster.par/segmented-fold-map!
+          [probabilities] [[row rows]] j nrows
+          [[mx -1.0e30 :element nrows
+            (n/max mx (aget sc (clojure.core/+ (clojure.core/* row nrows) j)))]
+           [denominator 0.0 :element nrows
+            (+ denominator
+               (m/exp (- (aget sc (clojure.core/+ (clojure.core/* row nrows) j)) mx)))]]
+          [(/ (m/exp (- (aget sc (clojure.core/+ (clojure.core/* row nrows) j)) mx))
+              denominator)])
+         probabilities)))
 
 (deftm attn-prefill-out-strided!
   "Apply prefill probabilities to a V field embedded in a row-strided source.  The result remains
@@ -2137,8 +2132,7 @@
               row (clojure.core/+ (clojure.core/* i n-q) hq)
               scb (clojure.core/* row nrows)
               hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
-          (aset out (clojure.core/+ (clojure.core/* i per-i)
-                                    (clojure.core/+ (clojure.core/* hq head-dim) d))
+          (aset out idx
                 (loop [j 0 a 0.0]
                   (if (< j nrows)
                     (recur (inc j)
