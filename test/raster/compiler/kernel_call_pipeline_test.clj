@@ -6,7 +6,9 @@
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.pipeline :as pipeline]
-            [raster.core :refer [deftm]]))
+            [raster.core :refer [deftm]]
+            [raster.dl.attention :as attention]
+            [raster.dl.nn :as nn]))
 
 (deftm resident-kernel-call-map
   [x :- (Array float) out :- (Array float) scale :- Float n :- Long] :- (Array float)
@@ -35,6 +37,59 @@
 (deftm resident-kernel-call-exclusive-scan
   [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
   (raster.par/scan-exclusive out acc 0.0 i n float (+ acc (ra/aget x i))))
+
+(deftm packed-gelu-between-contractions
+  [x :- (Array float) up-weight :- (Array float) down-weight :- (Array float)
+   rows :- Long input-width :- Long hidden-width :- Long output-width :- Long] :- (Array float)
+  (let [packed (nn/linear-nb x up-weight rows input-width (* 2 hidden-width))
+        hidden (float-array (* rows hidden-width))
+        effect (nn/gelu-erf-mul-strided! packed hidden rows (* 2 hidden-width)
+                                          0 hidden-width hidden-width)]
+    (nn/linear-nb hidden down-weight rows hidden-width output-width)))
+
+(deftest a-packed-multistage-consumer-does-not-erase-either-contraction
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'packed-gelu-between-contractions :ze:0 :dtype :float
+                    :on-non-resident :throw)
+        steps (:steps descriptor)]
+    (is (= 3 (count steps)))
+    (is (= [:executable :map-void :executable] (mapv :convention steps)))
+    (is (every? some? (map :artifact steps)))
+    (is (= 3 (count (:allocs descriptor)))
+        "only the packed projection, fused hidden value and final output are materialized")))
+
+(deftm packed-qkv-consumers
+  [x :- (Array float) qkv-weight :- (Array float) scores :- (Array float)
+   rows :- Long model-width :- Long heads :- Long head-dim :- Long theta :- Double]
+  :- (Array float)
+  (let [packed (nn/linear-nb x qkv-weight rows model-width (* 3 model-width))
+        head-width (* heads head-dim)
+        q (float-array (* rows head-width))
+        k (float-array (* rows head-width))
+        context (float-array (* rows head-width))
+        q-effect (attention/rope-prefill-strided!
+                  packed q rows heads head-dim theta (* 3 model-width) 0)
+        k-effect (attention/rope-prefill-strided!
+                  packed k rows heads head-dim theta (* 3 model-width) model-width)
+        context-effect (attention/attn-prefill-out-strided!
+                        scores packed context rows heads 1 heads head-dim
+                        (* 3 model-width) (* 2 model-width))]
+    ;; Keep all three view consumers observable in this compiler regression.  A real attention
+    ;; graph consumes Q/K through scores; this test uses a cheap continuation instead.
+    (raster.par/map! context i (* rows head-width) float
+                     (+ (ra/aget context i) (ra/aget q i) (ra/aget k i)))))
+
+(deftest packed-qkv-views-compose-directly-with-the-projection
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'packed-qkv-consumers :ze:0 :dtype :float :on-non-resident :throw)]
+    (is (= [:executable :map-void :map-void :map-void :map-void :map-void :map]
+           (mapv :convention (:steps descriptor))))
+    (is (= 4 (count (:allocs descriptor)))
+        "the packed projection, rotated Q/K and context are the only resident values")
+    (is (= 2 (count (filter #(-> % :artifact :provenance :segop-id str
+                                 (.startsWith "rstr_initialization_equation_"))
+                            (:steps descriptor))))
+        "the dense attention output discharges its initializer; paired RoPE stores retain theirs until even-width is proved")))
 
 (deftest resident-typed-scan-is-one-graph-backed-executable-step
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-scan

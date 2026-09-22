@@ -531,6 +531,41 @@
                                                   erf (if (< z 0.0) (- e) e)]
                                               (aset out i (* 0.5 v (+ 1.0 erf)))))))
 
+(deftm gelu-erf-mul-strided!
+  "Apply exact GELU to one row-strided field, multiply it by a second field, and write a
+  packed result.  This is the ordinary strided-view form of a gated MLP epilogue:
+  out[r,c] = gelu(src[r,left-offset+c]) * src[r,right-offset+c].  Keeping the address
+  transformation in the typed map lets a packed projection feed the consumer without two slice
+  allocations or an in-place activation stage; the compiler does not recognize a model or GELU."
+  (All [T] [src :- (Array T) out :- (Array T)
+            rows :- Long row-stride :- Long left-offset :- Long right-offset :- Long
+            width :- Long] :- Void
+       (raster.par/map-void!
+        i (clojure.core/* rows width)
+        (let [row (quot i width)
+              column (rem i width)
+              row-base (clojure.core/* row row-stride)
+              v (aget src (clojure.core/+ row-base
+                                          (clojure.core/+ left-offset column)))
+              gate (aget src (clojure.core/+ row-base
+                                             (clojure.core/+ right-offset column)))
+              z (* v 0.7071067811865476)
+              az (n/abs z)
+              tt (/ 1.0 (+ 1.0 (* 0.3275911 az)))
+              e (- 1.0 (* tt
+                          (+ 0.254829592
+                             (* tt (+ -0.284496736
+                                      (* tt (+ 1.421413741
+                                               (* tt (+ -1.453152027
+                                                        (* tt 1.061405429))))))))
+                          (m/exp (- (* az az)))))
+              erf (if (< z 0.0) (- e) e)
+              ;; The materialized gelu-erf! producer stores through T before hadamard reads it.
+              ;; Preserve that observable rounding boundary even though this view consumer removes
+              ;; the intermediate array.
+              activated (n/oftype src (* 0.5 v (+ 1.0 erf)))]
+          (aset out i (* activated gate))))))
+
 ;; Broadcast row-bias add in place semantics via separate out (resident-graph
 ;; friendly): out[r,j] = x[r,j] + b[j]. Follows every biased linear in
 ;; encoder-family layers (AuT, BERT) — the quantized GEMM kernels are bias-free.
