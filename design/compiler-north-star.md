@@ -693,9 +693,10 @@ results and unconditional unique effect regions may discharge a zero initializer
 mixed-radix index algebra proves an exact, zero-based image and scalar SSA proves that image has
 the allocation's complete volume. Injectivity or an ABI write permission alone is insufficient:
 padded rows, guarded stores, translated subviews, aliases and unproved shape relations retain the
-initializer. Packed strided slicing is consequently expressed as a flat output-element map, making
-both its complete-write property and its parallel schedule structural rather than dependent on a
-host-language nested loop.
+initializer. Nested dynamically allocated slice calls retain their ordered compatibility source
+until nested parallel allocation is representable; turning that library body into a parallel map
+would make existing scalar fallbacks illegal. Performance consumers instead carry source stride
+and offset coordinates directly, where the ordinary index algebra can prove them.
 Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
 the certified compatibility front door, and may still use `SegContract`, until the typed equation
 has explicit facts for them; admitting them while dropping those contracts would be a miscompile,

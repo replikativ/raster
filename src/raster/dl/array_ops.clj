@@ -302,13 +302,12 @@
             rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
        :- (Array T)
        (let [out (alloc-like src (* rows n-cols))]
-         ;; The packed output index is the natural parallel domain.  Besides exposing every
-         ;; output element to scheduling and fusion, this makes the complete-write contract
-         ;; structural: there is no row-loop positivity assumption hidden behind allocation.
-         (par/map! out i (* rows n-cols) nil
-                   (let [r (quot i n-cols)
-                         c (rem i n-cols)]
-                     (aget src (+ (+ (* r row-stride) col-offset) c))))
+         (dotimes [r rows]
+           (let [src-off (+ (* r (int row-stride)) (int col-offset))
+                 dst-off (* r (int n-cols))]
+             (dotimes [c n-cols]
+               (aset out (+ dst-off c)
+                     (aget src (+ src-off c))))))
          out)))
 
 (deftm scatter-strided-2d
