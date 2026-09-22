@@ -181,6 +181,15 @@
                    fd
                    critical-opts))
 
+(defn- make-optional-handle
+  "Create a zero-copy downcall when the active BLAS exposes an optional extension.
+  nil keeps callers on their portable CBLAS fallback."
+  [^String symbol-name ^FunctionDescriptor fd]
+  (require-blas!)
+  (let [opt (.find ^SymbolLookup (first @blas-state) symbol-name)]
+    (when (.isPresent opt)
+      (.downcallHandle (Linker/nativeLinker) (.get opt) fd critical-opts))))
+
 ;; ================================================================
 ;; CBLAS constants
 ;; ================================================================
@@ -238,13 +247,13 @@
     (scale-output-double! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int k)
-                           (MemorySegment/ofArray B) (int n)
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int k)
+                             (MemorySegment/ofArray B) (int n)
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 (deftm ^:no-inline dgemm-tn!
@@ -255,13 +264,13 @@
     (scale-output-double! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int m)   ;; lda = m (A is [k,m])
-                           (MemorySegment/ofArray B) (int n)
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int m)   ;; lda = m (A is [k,m])
+                             (MemorySegment/ofArray B) (int n)
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 (deftm ^:no-inline dgemm-nt!
@@ -272,13 +281,13 @@
     (scale-output-double! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int k)
-                           (MemorySegment/ofArray B) (int k)   ;; ldb = k (B is [n,k])
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int k)
+                             (MemorySegment/ofArray B) (int k)   ;; ldb = k (B is [n,k])
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 ;; ================================================================
@@ -313,13 +322,13 @@
     (scale-output-float! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int k)
-                           (MemorySegment/ofArray B) (int n)
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int k)
+                             (MemorySegment/ofArray B) (int n)
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 (deftm ^:no-inline dgemm-tn!
@@ -330,13 +339,13 @@
     (scale-output-float! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int m)
-                           (MemorySegment/ofArray B) (int n)
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int m)
+                             (MemorySegment/ofArray B) (int n)
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 (deftm ^:no-inline dgemm-nt!
@@ -352,13 +361,13 @@
     (scale-output-float! C (* m n) beta)
     (when (and (pos? m) (pos? n) (pos? k))
       (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
-                           (int m) (int n) (int k)
-                           alpha
-                           (MemorySegment/ofArray A) (int k)
-                           (MemorySegment/ofArray B) (int k)
-                           beta
-                           (MemorySegment/ofArray C) (int n)])))
+                            [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                             (int m) (int n) (int k)
+                             alpha
+                             (MemorySegment/ofArray A) (int k)
+                             (MemorySegment/ofArray B) (int k)
+                             beta
+                             (MemorySegment/ofArray C) (int n)])))
   C)
 
 ;; ── which argument a GEMM WRITES (the compiler's effect model) ─────────────────
@@ -384,40 +393,86 @@
   (descriptor/register-buffer-write! op :accumulate 2))
 
 ;; ================================================================
-;; Batched GEMM — one contiguous [batch,·,·] buffer per operand, looped over
-;; head slabs via asSlice offsets (no per-head alloc). Used by batched multi-head
+;; Batched GEMM — one contiguous [batch,·,·] buffer per operand. Use a single
+;; strided-batch call when the BLAS exposes it (oneMKL), otherwise loop over head
+;; slabs via asSlice offsets without allocating. Used by batched multi-head
 ;; attention: QK^T (nt) and scores@V (nn). alpha folds the 1/sqrt(dk) scale.
 ;; float+double arms (dispatch), mirroring dgemm!. beta is 0 (overwrite C).
 ;; ================================================================
+
+(def ^:private sgemm-batch-strided-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout
+               [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_FLOAT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_FLOAT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT])))
+
+(def ^:private dgemm-batch-strided-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout
+               [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_DOUBLE
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_DOUBLE
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT])))
+
+(def ^:private sgemm-batch-strided-mh
+  (delay (make-optional-handle "cblas_sgemm_batch_strided" sgemm-batch-strided-fd)))
+(def ^:private dgemm-batch-strided-mh
+  (delay (make-optional-handle "cblas_dgemm_batch_strided" dgemm-batch-strided-fd)))
 
 (deftm ^:no-inline batched-gemm-nt!
   "C_h = alpha * A_h @ B_h^T for h in 0..batch. A:[batch,m,k] B:[batch,n,k]
   C:[batch,m,n], all row-major contiguous."
   [A :- (Array float) B :- (Array float) C :- (Array float)
    batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
-  (when (and (pos? m) (pos? n) (pos? k))
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
     (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
           as (* m k) bs (* n k) cs (* m n)]
-      (dotimes [h batch]
-        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
-                               (.asSlice sa (* (long h) as 4)) (int k)
-                               (.asSlice sb (* (long h) bs 4)) (int k)
-                               (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+      (if-let [mh ^java.lang.invoke.MethodHandle @sgemm-batch-strided-mh]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int k) (Math/toIntExact (long as))
+                               sb (int k) (Math/toIntExact (long bs))
+                               (float 0.0) sc (int n) (Math/toIntExact (long cs))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) as 4)) (int k)
+                                 (.asSlice sb (* (long h) bs 4)) (int k)
+                                 (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)])))))
   C)
 
 (deftm ^:no-inline batched-gemm-nt!
   [A :- (Array double) B :- (Array double) C :- (Array double)
    batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
-  (when (and (pos? m) (pos? n) (pos? k))
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
     (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
           as (* m k) bs (* n k) cs (* m n)]
-      (dotimes [h batch]
-        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
-                               (.asSlice sa (* (long h) as 8)) (int k)
-                               (.asSlice sb (* (long h) bs 8)) (int k)
-                               0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+      (if-let [mh ^java.lang.invoke.MethodHandle @dgemm-batch-strided-mh]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int k) (Math/toIntExact (long as))
+                               sb (int k) (Math/toIntExact (long bs))
+                               0.0 sc (int n) (Math/toIntExact (long cs))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) as 8)) (int k)
+                                 (.asSlice sb (* (long h) bs 8)) (int k)
+                                 0.0 (.asSlice sc (* (long h) cs 8)) (int n)])))))
   C)
 
 (deftm ^:no-inline batched-gemm-nn!
@@ -425,29 +480,45 @@
   C:[batch,m,n], all row-major contiguous."
   [A :- (Array float) B :- (Array float) C :- (Array float)
    batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
-  (when (and (pos? m) (pos? n) (pos? k))
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
     (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
           as (* m k) bs (* k n) cs (* m n)]
-      (dotimes [h batch]
-        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
-                               (.asSlice sa (* (long h) as 4)) (int k)
-                               (.asSlice sb (* (long h) bs 4)) (int n)
-                               (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+      (if-let [mh ^java.lang.invoke.MethodHandle @sgemm-batch-strided-mh]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int k) (Math/toIntExact (long as))
+                               sb (int n) (Math/toIntExact (long bs))
+                               (float 0.0) sc (int n) (Math/toIntExact (long cs))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) as 4)) (int k)
+                                 (.asSlice sb (* (long h) bs 4)) (int n)
+                                 (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)])))))
   C)
 
 (deftm ^:no-inline batched-gemm-nn!
   [A :- (Array double) B :- (Array double) C :- (Array double)
    batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
-  (when (and (pos? m) (pos? n) (pos? k))
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
     (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
           as (* m k) bs (* k n) cs (* m n)]
-      (dotimes [h batch]
-        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
-                               (.asSlice sa (* (long h) as 8)) (int k)
-                               (.asSlice sb (* (long h) bs 8)) (int n)
-                               0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+      (if-let [mh ^java.lang.invoke.MethodHandle @dgemm-batch-strided-mh]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int k) (Math/toIntExact (long as))
+                               sb (int n) (Math/toIntExact (long bs))
+                               0.0 sc (int n) (Math/toIntExact (long cs))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) as 8)) (int k)
+                                 (.asSlice sb (* (long h) bs 8)) (int n)
+                                 0.0 (.asSlice sc (* (long h) cs 8)) (int n)])))))
   C)
 
 ;; ================================================================
