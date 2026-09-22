@@ -2510,6 +2510,32 @@
             elem-type (assoc :raster.type/elem-type elem-type))))
       expression)))
 
+(defn canonicalize-independent-operations
+  "Canonicalize top-level operations whose rewrite is valid independently of program admission.
+
+   TypedSOAC admission is deliberately whole-program and may decline because a later parallel
+   binding is not represented yet.  That decline must not roll an already-recognized producer back
+   to an opaque host call: in particular, a BLAS GEMM is the same explicit contraction whether or
+   not its consumer can fuse.  Keep only local, semantics-preserving operation rewrites here; shape
+   SSA, aliasing, allocation and scalar normalization remain owned by `normalize-source` after the
+   complete source has been admitted.
+
+   The compatibility scheduler can therefore schedule the canonical producer separately while it
+   reports the unsupported consumer at its own source site."
+  [source]
+  (if (and (seq? source) (contains? #{'let 'let*} (first source)))
+    (let [[head bindings & body] source
+          pairs (partition 2 bindings)
+          canonical
+          (map-indexed
+           (fn [ordinal [symbol expression]]
+             [symbol (->> expression
+                          (canonicalize-strided-indexed-operation ordinal)
+                          (canonicalize-blas-gemm ordinal))])
+           pairs)]
+      (with-meta (list* head (vec (mapcat identity canonical)) body) (meta source)))
+    source))
+
 (defn- source-shadowing-locals
   "The symbols that are locals of the analyzed source even when they collide with a
    `clojure.core` name: the let's own binders and the declared parameters. `util/free-syms`

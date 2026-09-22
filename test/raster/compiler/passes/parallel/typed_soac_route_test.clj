@@ -642,6 +642,48 @@
            (get-in result [:declined :bindings]))
         "a typed prefix must not hide nested parallel work behind a compatibility host barrier")))
 
+(deftest an-unsupported-consumer-cannot-erase-an-independent-gemm-producer
+  (let [gemm-call
+        (with-meta
+          (list '.invk
+                'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                'A 'B 'C 'm 'k 'n '(float 1.0) '(float 0.0))
+          {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+           :raster.type/tag 'floats :tag 'floats})
+        unsupported-consumer
+        '(let* [total (raster.par/reduce
+                        acc 0.0 index n
+                        (+ acc (clojure.core/aget C index)))]
+               (/ total (double n)))
+        source (list 'let* ['gemm gemm-call 'mean unsupported-consumer] 'mean)
+        options {:dtype :float :target-device :ze:0
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'k :long 'n :long}}
+        route-result (route/attempt source :float (:array-types options) options)
+        compatibility
+        (pipeline/run-passes source [:soac-fuse] options :write-read-fused)
+        scheduled
+        (pipeline/run-passes source [:soac-fuse :materialize :compound-detect :segop-lower]
+                             options :write-read-fused)
+        [_ bindings] compatibility
+        [[_ producer] [_ consumer]] (partition 2 bindings)]
+    (is (= :typed-soac-source-coverage (get-in route-result [:declined :reason])))
+    (is (= 'raster.par/contract (first producer))
+        "a later coverage decline retains the producer's semantic contraction")
+    (is (= unsupported-consumer consumer)
+        "the unsupported consumer remains byte-for-byte available to compatibility lowering")
+    (is (= 'C (second producer)))
+    (is (= 'raster.linalg.blas/dgemm-nt!
+           (:raster.op/original (meta producer)))
+        "the canonical producer retains diagnostic source provenance")
+    (is (= :segop (:dialect scheduled)))
+    (is (= 1 (count (:equations scheduled))))
+    (is (segop/seg-contract? (-> scheduled :equations first :operations first))
+        "compatibility scheduling consumes the retained semantic contraction")
+    (is (= unsupported-consumer
+           (-> scheduled :source second (nth 3)))
+        "the actual declining stage stays visible at its original binding")))
+
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
                        y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))

@@ -44,6 +44,7 @@
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.passes.parallel.resident-program-projection :as resident-projection]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-soac-frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
@@ -874,7 +875,11 @@
           semantic (semantic-program-attempt form opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
-        (unfused-compatibility form semantic)))
+        ;; Whole-program admission may decline because of one later consumer.  Producer-local
+        ;; canonicalization is nevertheless authoritative: do not turn an already-recognized BLAS
+        ;; contraction back into an opaque `.invk` merely because its consumer stays unfused.
+        (unfused-compatibility
+         (typed-soac-frontend/canonicalize-independent-operations form) semantic)))
     ;; A bare top-level parallel expression has no binding site for the direct SSA front end.
     ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
     ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
@@ -883,7 +888,8 @@
           semantic (semantic-program-attempt source opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
-        (unfused-compatibility form semantic)))))
+        (unfused-compatibility
+         (typed-soac-frontend/canonicalize-independent-operations form) semantic)))))
 
 (defn- register-gpu-kernels!
   "Register generated GPU kernels eagerly so they're available at eval time.
