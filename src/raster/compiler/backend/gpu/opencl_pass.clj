@@ -878,7 +878,9 @@
                         [:dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
                          :precision (:precision schedule)
                          :matrix-tiles
-                         (get-in schedule [:typed-contraction :matrix-tiles] :default)]
+                         (get-in schedule [:typed-contraction :matrix-tiles] :default)
+                         :split-factors
+                         (get-in schedule [:typed-contraction :split-factors] [])]
                         ;; A partial/internal schedule must retain the matrix route's defaults;
                         ;; only resolved public controls override them.
                         (mapcat identity

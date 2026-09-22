@@ -1702,7 +1702,8 @@
            form :device-id :ze:0 :dtype :float :min-elements 0
            :schedule {:precision :mixed-f16-f32
                       :tile (hardware/derive-gemm-tile descriptor)
-                      :typed-contraction {:matrix-tiles :default :measured-selectors {}}
+                      :typed-contraction {:matrix-tiles :default :split-factors [2 4 8]
+                                          :measured-selectors {}}
                       :gemm-dispatch {:target-fill-multiple 4
                                       :min-split-chunk 256
                                       :max-splits 64}}))]
@@ -1722,7 +1723,9 @@
     (is (= :xmx-split-k
            (executable/strategy
             (kdispatch/select-alternative (first (:dispatches emitted)) arguments)))
-        "the canonical GPU pass must propagate the resolved public schedule policy")))
+        "the canonical GPU pass must propagate the resolved public schedule policy")
+    (is (some? (kdispatch/alternative (first (:dispatches emitted)) :xmx-split-k-4))
+        "finite split candidates reach the generic measured-selector dispatch")))
 
 (deftest batched-f32-contraction-derives-one-grid-z-matrix-schedule
   (let [source
