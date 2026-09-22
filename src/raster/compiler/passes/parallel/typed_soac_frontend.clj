@@ -100,6 +100,34 @@
        (descriptor/atomic-add-op? (descriptor/semantic-op expression))
        (= 3 (count (descriptor/call-args expression)))))
 
+(defn- atomic-result-call
+  "Return the atomic call owned by a result binding, looking through its typed scalar cast.
+
+   `collect!` deliberately casts the old value to the counter's public int ticket type. The cast
+   is part of the result type contract, not a pure expression that may be separated from the
+   effect."
+  [expression]
+  (let [candidate (if (and (seq? expression)
+                           (contains? #{'int 'long 'float 'double
+                                        'clojure.core/int 'clojure.core/long
+                                        'clojure.core/float 'clojure.core/double}
+                                      (first expression))
+                           (= 2 (count expression)))
+                    (second expression)
+                    expression)]
+    (when (atomic-add-call? candidate) candidate)))
+
+(defn- unit-fetch-add-ticket?
+  "True when an expression obtains distinct ascending tickets from atomic fetch-add.
+
+   The uniqueness proof is intentionally narrow: only a literal unit increment is admitted.
+   `collect!` documents the remaining no-overflow/capacity precondition."
+  [expression]
+  (when-let [call (atomic-result-call expression)]
+    (let [contribution (nth (descriptor/call-args call) 2)
+          contribution (strip-index-cast contribution)]
+      (= 1 contribution))))
+
 (defn- same-symbol?
   [left right]
   (if (and (symbol? left) (symbol? right))
@@ -785,9 +813,9 @@
   (let [[head bindings & tail] body]
     (when (and (form/let-head? head) (vector? bindings) (= 2 (count bindings)))
       (let [[result initializer] bindings]
-        (when (and (symbol? result) (atomic-add-call? initializer))
+        (when-let [atomic-call (and (symbol? result) (atomic-result-call initializer))]
           (let [[destination destination-index contribution]
-                (descriptor/call-args initializer)
+                (descriptor/call-args atomic-call)
                 result-dtype (some-> (retained-local-dtype result initializer) dtype/canon)]
             (when (and result-dtype
                        (contains? #{:int :long :float :double} result-dtype))
@@ -990,6 +1018,12 @@
          (or (form/loop-head? (first body))
              (contains? '#{dotimes clojure.core/dotimes} (first body))))
     (counted-store-loop body index)
+
+    ;; `collect!` is a source-level ownership primitive nested inside map-void!, not a separate
+    ;; parallel equation. Expand it here so its atomic ticket and certified SoA scatters enter the
+    ;; same ordered effect region.
+    (par/par-collect-form? body)
+    (store-region (par/expand-par-collect! body) index result-expression)
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
@@ -1500,6 +1534,12 @@
                       (fn [store]
                         (and (not (:nested-loop? store))
                              (contains? proven (.indexOf ^java.util.List indices store)))))
+            atomic-ticket-results
+            (set (keep (fn [{:keys [result reduction-op value]}]
+                         (when (and result (= '+ reduction-op)
+                                    (= 1 (strip-index-cast value)))
+                           result))
+                       candidate-stores))
             ;; A marker is honoured only for an index outside the algebra's reach: the index
             ;; expression or a local it depends on (transitively) reads an array. Unrelated
             ;; locals may not authorize a claim, so only the index's dependency slice counts.
@@ -1521,7 +1561,15 @@
                                                                               found)))
                                                          (set/union seen next)
                                                          (into expressions found))))))]
-                                (seq (par/collect-aget-arrays (list* 'do slice)))))
+                                (or (seq (par/collect-aget-arrays (list* 'do slice)))
+                                    ;; An atomic unit fetch-add is a dynamic ownership source just
+                                    ;; like an indirect index array: its old values are distinct
+                                    ;; under collect!'s explicit no-overflow contract.
+                                    (some unit-fetch-add-ticket? slice)
+                                    (seq (set/intersection
+                                          atomic-ticket-results
+                                          (set (filter symbol?
+                                                       (mapcat #(tree-seq coll? seq %) slice))))))))
             all-stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
                                (let [destination-type (some-> (destination-dtype array-types out)
                                                              dtype/canon)

@@ -34,3 +34,20 @@
       (is (every? kernel-artifact/kernel-artifact? artifacts))
       (is (= 1 (count atomics)))
       (is (= :int (get-in (first atomics) [:result :type]))))))
+
+(deftest collect-preserves-its-fetch-add-ticket-as-a-resident-unique-scatter
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'phases/count-startups-par! :ze:debug
+                    :dtype :float :on-non-resident :nil)
+        artifact (get-in descriptor [:steps 0 :artifact])
+        operations (body-operations artifact)
+        atomics (filter #(= "AtomicRMW" (some-> % class .getSimpleName)) operations)
+        conditionals (filter #(= "IfRegion" (some-> % class .getSimpleName)) operations)]
+    (is (some? descriptor))
+    (is (= 1 (count (:steps descriptor))))
+    (is (kernel-artifact/kernel-artifact? artifact))
+    (is (= 1 (count atomics)))
+    (is (= :int (get-in (first atomics) [:result :type])))
+    (is (some #(= :int (get-in % [:results 0 :type])) conditionals)
+        "the guarded atomic exports its old value through typed SSA control")
+    (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))))
