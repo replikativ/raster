@@ -8,7 +8,8 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.extent-proof :as extent-proof]
-            [raster.compiler.ir.soac-dialect :as dialect]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.write-coverage :as write-coverage]))
 
 (defn- fail! [message data]
   (throw (ex-info message (assoc data :reason :typed-soac-initialization-contract))))
@@ -23,7 +24,7 @@
         id))))
 
 (defn- physical-inputs [facts equation]
-  (set (map #(physical-id facts %) (dialect/operation-inputs equation))))
+  (set (map #(physical-id facts %) (write-coverage/operation-read-values equation))))
 
 (defn- touches? [facts destination equation]
   (or (contains? (physical-inputs facts equation) destination)
@@ -36,15 +37,14 @@
        (nil? (:logical-layout value))))
 
 (defn- full-overwrite? [facts extent-environment {:keys [destination extent]} equation]
-  ;; These functional operations produce their entire validated logical result shape.
-  ;; Indexed/guarded effect maps and scatter do not have that guarantee.
   (and (not (contains? (physical-inputs facts equation) destination))
        (some (fn [[result storage]]
                (and (= destination (physical-id facts (:destination storage)))
-                    (= :write (:access storage))
+                    (contains? #{:write :read-write} (:access storage))
                     (dense-initializable-storage? (get-in facts [:values destination]))
                     (extent-proof/same-volume? extent-environment extent
-                                              (dialect/dense-functional-result-shape facts equation result))))
+                                              (write-coverage/symbolic-complete-write-shape
+                                               facts equation result extent-environment))))
              (map vector (nth equation 2) (dialect/result-storage facts (second equation))))))
 
 (defn- fresh-symbol [used prefix]

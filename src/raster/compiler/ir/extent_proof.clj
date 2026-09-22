@@ -115,3 +115,11 @@
           (boolean (and allocation (every? some? dimensions)
                         (= allocation (apply algebra/product dimensions)))))
         (catch ArithmeticException _ false))))
+
+(defn product-monomial
+  "Return the proved product of an available integral scalar expression, or nil.
+
+   This is an equality witness for other algebraic proofs; it does not replace executable SSA
+   or its checked-overflow behavior."
+  [environment form]
+  (:product (expression environment form)))

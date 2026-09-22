@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.write-coverage
   "Destination coverage from retained semantics, never from ABI write permission."
   (:require [clojure.walk :as walk]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.index-algebra :as algebra]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -15,6 +16,128 @@
       (let [dimensions (mapv resolve-dimension shape)]
         (and (every? #(and (integer? %) (<= 0 %)) dimensions)
              (= capacity (reduce *' 1 dimensions)))))))
+
+(defn- substitute-captures
+  [equation expression]
+  (let [{:keys [captures]} (soac/operation-parts equation)
+        {:keys [capture-parameters]} (soac/parameter-layout equation)]
+    (walk/postwalk-replace (zipmap capture-parameters captures) expression)))
+
+(defn- monomial-expression
+  [{:keys [const factors]}]
+  (when const (apply list 'clojure.core/* const factors)))
+
+(defn- proof-extent
+  [extent-environment expression]
+  (or (some-> (and extent-environment
+                   (extent-proof/product-monomial extent-environment expression))
+              monomial-expression)
+      expression))
+
+(defn- dense-effect-shape
+  [equation result extent-environment]
+  (let [{:keys [kind attributes arrays captures destinations lambda]}
+        (soac/operation-parts equation)
+        {:keys [destination-parameters]} (soac/parameter-layout equation)
+        result-index (.indexOf ^java.util.List (nth equation 2) result)
+        target (nth destination-parameters result-index nil)
+        substitute #(substitute-captures equation %)
+        outer (:index attributes)
+        outer-extent (substitute (:extent attributes))
+        algebra-outer-extent (proof-extent extent-environment outer-extent)]
+    (when (and (= 'effect-map kind) (empty? arrays) target
+               (= (count destinations) (count (nth equation 2))))
+      (letfn [(visit [region dimensions inherited-locals]
+                (let [locals (into inherited-locals
+                                   (map #(update % :init substitute)) (:locals region))]
+                  (mapcat
+                   (fn [effect]
+                     (let [{:keys [region predicate loop index lower upper-bound extent lambda
+                                   carry destination conflict destination-index]}
+                           (soac/effect-parts effect)]
+                       (cond
+                         ;; Guarded stores are not a complete domain proof.
+                         (and region predicate) [nil]
+                         region (visit region dimensions locals)
+                         loop
+                         (if (and (nil? carry) (= 0 lower) (= :exclusive upper-bound)
+                                  (not-any? #{index} (map first dimensions)))
+                           (visit (soac/lambda-parts lambda)
+                                  (conj dimensions [index (substitute extent)]) locals)
+                           [nil])
+                         (and (= target destination) (= :unique conflict)
+                              (contains? #{true 1} predicate))
+                         [{:dimensions dimensions
+                           :form (algebra/index-form (substitute destination-index)
+                                                     outer algebra-outer-extent locals
+                                                     (into {} (rest dimensions)))}]
+                         :else [nil])))
+                   (:body-results region))))]
+        (let [stores (vec (visit (soac/lambda-parts lambda)
+                                 [[outer outer-extent]] []))]
+          (when (and (seq stores) (every? some? stores)
+                     (apply = (map :dimensions stores))
+                     (algebra/dense-translated-forms? (mapv :form stores)))
+            (cond-> (mapv second (:dimensions (first stores)))
+              (< 1 (count stores)) (conj (count stores)))))))))
+
+(defn- dense-scatter-shape
+  [equation result extent-environment]
+  (let [{:keys [kind attributes lambda]} (soac/operation-parts equation)
+        result-index (.indexOf ^java.util.List (nth equation 2) result)
+        {:keys [locals body-results]} (soac/lambda-parts lambda)
+        write (some-> (nth body-results result-index nil) soac/write-parts)
+        substitute #(substitute-captures equation %)
+        outer (:index attributes)
+        extent (substitute (:extent attributes))
+        algebra-extent (proof-extent extent-environment extent)
+        locals (mapv #(update % :init substitute) locals)
+        form (when write
+               (algebra/index-form (substitute (:destination-index write))
+                                   outer algebra-extent locals {}))]
+    (when (and (= 'scatter kind) (= :unique (:conflict attributes))
+               write (contains? #{true 1} (:predicate write))
+               (algebra/dense? form))
+      [extent])))
+
+(defn operation-read-values
+  "Ordered values whose contents an operation can observe.
+
+   Array operands are conservatively reads.  For effect/scatter captures, the typed lexical
+   parameter must actually occur in a local initializer or result expression; an unused caller-
+   owned destination passed by the source API is not a read merely because it remains in the
+   call boundary.  Other operation kinds retain the dialect's conservative input contract."
+  [equation]
+  (let [{:keys [kind arrays captures lambda]} (soac/operation-parts equation)]
+    (if (and (contains? #{'effect-map 'scatter} kind) lambda)
+      (let [{:keys [capture-parameters]} (soac/parameter-layout equation)
+            {:keys [locals body-results effect-result]} (soac/lambda-parts lambda)
+            body (concat (map :init locals) body-results (when effect-result [effect-result]))
+            symbols (set (filter symbol? (tree-seq coll? seq body)))]
+        (vec (concat arrays
+                     (keep (fn [[value parameter]]
+                             (when (contains? symbols parameter) value))
+                           (map vector captures capture-parameters)))))
+      (soac/operation-inputs equation))))
+
+(defn symbolic-complete-write-shape
+  "Return the exact logical write domain of one result, or nil when coverage is unproved.
+
+   Functional SOACs use their declared dense result.  Ordered effect maps are admitted only when
+   their unconditional unique stores form an exact mixed-radix image rooted at zero.  The result
+   is a shape, not a physical-capacity claim; allocation and linker consumers must separately
+   prove equal volume and non-aliasing."
+  ([algorithm-or-facts equation result]
+   (symbolic-complete-write-shape algorithm-or-facts equation result nil))
+  ([algorithm-or-facts equation result extent-environment]
+   (or (soac/dense-functional-result-shape algorithm-or-facts equation result)
+       (let [facts (if (soac/program-form? algorithm-or-facts)
+                     (soac/facts algorithm-or-facts) algorithm-or-facts)
+             value (get-in facts [:values result])]
+         (when (and (= {:kind :plain} (:representation value))
+                    (nil? (:logical-layout value)))
+           (or (dense-effect-shape equation result extent-environment)
+               (dense-scatter-shape equation result extent-environment)))))))
 
 (defn- expression-range [expression types intervals]
   (let [typed (index-expression/lower-typed

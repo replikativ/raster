@@ -688,6 +688,14 @@ become ABI captures, and the contraction store changes from read-write to write-
 the separate bias-fill launch from ordinary linear projections without introducing a linear, GEMM,
 or attention opcode; mismatched extents, unproved addresses, observable initialization results and
 fold reads of the old destination remain materialized.
+Fresh-allocation initialization uses the same rule at the program boundary. Dense functional
+results and unconditional unique effect regions may discharge a zero initializer only when the
+mixed-radix index algebra proves an exact, zero-based image and scalar SSA proves that image has
+the allocation's complete volume. Injectivity or an ABI write permission alone is insufficient:
+padded rows, guarded stores, translated subviews, aliases and unproved shape relations retain the
+initializer. Packed strided slicing is consequently expressed as a flat output-element map, making
+both its complete-write property and its parallel schedule structural rather than dependent on a
+host-language nested loop.
 Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
 the certified compatibility front door, and may still use `SegContract`, until the typed equation
 has explicit facts for them; admitting them while dropping those contracts would be a miscompile,
