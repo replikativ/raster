@@ -56,6 +56,7 @@
                        {:acc 'acc :init identity :lambda (list combine 'acc 'element)} :int)]
       (is (scan/associative-scan? certificate))
       (is (= combine (:combine certificate)))
+      (is (= :wrap (:overflow certificate)))
       (is (= identity (:identity certificate))))))
 
 (deftest integral-min-max-use-the-exact-bounded-domain-identities

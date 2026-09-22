@@ -56,8 +56,18 @@
 (defn- offset-mask [offset]
   (keyword (str "scan-offset-" offset)))
 
+(defn- combine-expression
+  [scan-algebra result-type arguments]
+  (let [operator (intrinsics/canonical (:combine scan-algebra))
+        options (cond-> {}
+                  (dtype/integral? result-type)
+                  (assoc :overflow (:overflow scan-algebra)))]
+    (if (seq options)
+      (body/scalar-expression operator result-type arguments options)
+      (body/scalar-expression operator result-type arguments))))
+
 (defn- scan-stages
-  [scratch result-type operator identity workgroup-size]
+  [scratch result-type scan-algebra identity workgroup-size]
   (mapcat
    (fn [offset]
      (let [self (symbol (str "scan-self-" offset))
@@ -72,7 +82,7 @@
         (barrier)
         (body/->ScalarCompute
          (body/value combined result-type)
-         (body/scalar-expression operator result-type [left self]))
+         (combine-expression scan-algebra result-type [left self]))
         (body/->ScalarStore scratch ['scan-lane] combined (offset-mask offset))
         (barrier)]))
    (take-while #(< % workgroup-size) (iterate #(* 2 %) 1))))
@@ -117,9 +127,11 @@
                                                    :parameter)
                           scalar-ids)
                      [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
-    ;; Scan's combine is semantic value arithmetic.  Its association certification does not prove
-    ;; a finite-width overflow algebra, so a schedule may not label it `:no-overflow`.
-    (when (dtype/integral? result-type)
+    ;; Reassociation of finite-width integer arithmetic is sound only for an algebra whose
+    ;; overflow policy is part of the certificate.  Checked arithmetic cannot be rescheduled:
+    ;; an overflow may move to a different intermediate expression.
+    (when (and (dtype/integral? result-type)
+               (not= :wrap (:overflow scan-algebra)))
       (decline! :integral-overflow-algebra
                 "portable integer scan requires an explicit combine overflow contract"
                 {:phase phase :mode scan-mode :algebra scan-algebra
@@ -219,7 +231,7 @@
                                        (body/expression :sub '_n_bound
                                                         'scan-block-base)))])))
         initial (element-operations operation context)
-        stages (scan-stages scratch result-type operator identity workgroup-size)
+        stages (scan-stages scratch result-type scan-algebra identity workgroup-size)
         tail (vec
               (concat
                [(body/->ScalarLoad (body/value 'scan-result result-type) scratch ['scan-lane]
@@ -293,15 +305,15 @@
                               :scan-loop-active identity :cached)
            (body/->ScalarStore scratch ['scan-lane] 'scan-chunk-value nil)
            (barrier)]
-          (scan-stages scratch result-type operator identity workgroup-size)
+          (scan-stages scratch result-type scan-algebra identity workgroup-size)
           [(body/->ScalarLoad (body/value 'scan-prefix result-type) carry [0]
                               nil nil :cached)
            (body/->ScalarLoad (body/value 'scan-chunk-prefix result-type) scratch
                               ['scan-lane] nil nil :cached)
            (body/->ScalarCompute
             (body/value 'scan-total-prefix result-type)
-            (body/scalar-expression operator result-type
-                                    ['scan-prefix 'scan-chunk-prefix]))
+            (combine-expression scan-algebra result-type
+                                ['scan-prefix 'scan-chunk-prefix]))
            (body/->ScalarStore totals [(body/expression :add 'scan-base 'scan-lane)]
                                 'scan-total-prefix :scan-loop-active)
            (barrier)
@@ -318,8 +330,8 @@
             :scan-lane-zero identity :cached)
            (body/->ScalarCompute
             (body/value 'scan-next-carry result-type)
-            (body/scalar-expression operator result-type
-                                    ['scan-prefix 'scan-chunk-last]))
+            (combine-expression scan-algebra result-type
+                                ['scan-prefix 'scan-chunk-last]))
            (body/->ScalarStore carry [0] 'scan-next-carry :scan-lane-zero)
            (barrier)
            (body/->Yield [])]))]
@@ -403,8 +415,8 @@
                     :scan-has-carry identity :cached)
                    (body/->ScalarCompute
                     (body/value 'scan-with-carry result-type)
-                    (body/scalar-expression operator result-type
-                                            ['scan-carry 'scan-current]))
+                    (combine-expression scan-algebra result-type
+                                        ['scan-carry 'scan-current]))
                    (body/->ScalarStore output [result-index]
                                         'scan-with-carry :scan-active)]
       :schedule {:strategy :one-work-item-per-element :association :independent

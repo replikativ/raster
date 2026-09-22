@@ -338,8 +338,9 @@
 (defn- emitted-scan-graph
   ([form] (emitted-scan-graph form {}))
   ([form opts]
-   (let [node (soac/par-form->soac 'scan-result form 71)
-         operations (lower/lower-scan node nil)
+   (let [result-type (or (:dtype opts) :double)
+         node (soac/par-form->soac 'scan-result form 71 :dtype result-type)
+         operations (lower/lower-scan node nil :dtype result-type)
          graph (lower/scan-kernel-graph node operations opts)]
      (sg/generate-scan-kernel-graph graph
                                     :scalar-types (:scalar-types opts)))))
@@ -459,6 +460,23 @@
                    (get-in operation [:expression :op]))]
     (is (= [:*] (vec combines))
         "carry propagation must use the certified monoid, not a hard-coded addition")))
+
+(deftest integral-segscan-carries-certified-wrapping-through-every-combine
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc (int 0) i n int
+                                   (unchecked-add-int acc (aget values i)))
+                 {:dtype :int
+                  :array-types {'values :int 'out :int}
+                  :scalar-types {'n :int}})
+        combines (for [node (:nodes emitted)
+                       operation (kernel-body-operations (:operation node))
+                       :when (and (= "ScalarCompute" (operation-kind operation))
+                                  (= :+ (get-in operation [:expression :op]))
+                                  (= :int (get-in operation [:expression :result-type])))]
+                   (:expression operation))]
+    (is (seq combines))
+    (is (every? #(= :wrap (get-in % [:options :overflow])) combines)
+        "every reassociated integer combine must retain the certified modulo-2^N policy")))
 
 (deftest segscan-carry-separates-its-launch-width-from-the-scanned-block-width
   (let [node (soac/par-form->soac
