@@ -81,6 +81,25 @@
     (is (not (ia/disjoint-offsets? row [0 2]))
         "two literal offsets inside a symbolic-width row overlap")))
 
+(deftest dense-forms-distinguish-complete-images-from-injective-padding
+  (let [dense (ia/index-form '(+ (* r 4) j) 'r 'rows [] '{j 4})
+        padded (ia/index-form '(+ (* r 5) j) 'r 'rows [] '{j 4})
+        translated (ia/index-form '(+ base (* r width) j) 'r 'rows [] '{j width})]
+    (is (ia/dense? dense))
+    (is (ia/injective? padded))
+    (is (not (ia/dense? padded)) "an unconstrained row stride may leave holes")
+    (is (ia/injective? translated))
+    (is (not (ia/dense? translated)) "a translated tile does not cover an allocation from zero")))
+
+(deftest consecutive-translated-slabs-form-one-dense-image
+  (let [low (ia/index-form '(+ (* row (* 2 half)) i) 'row 'rows [] '{i half})
+        high (ia/index-form '(+ (* row (* 2 half)) i half) 'row 'rows [] '{i half})
+        gap (ia/index-form '(+ (* row (* 3 half)) i (* 2 half)) 'row 'rows [] '{i half})]
+    (is (not (ia/dense? low)) "one half-row is injective but incomplete")
+    (is (ia/dense-translated-forms? [low high]))
+    (is (not (ia/dense-translated-forms? [low gap]))
+        "disjoint translated stores with a missing middle slab are not complete")))
+
 (deftest common-symbolic-translations-cancel-relationally
   (let [low (ia/index-form '(+ base i) 'i 'half [] {})
         high (ia/index-form '(+ base i half) 'i 'half [] {})

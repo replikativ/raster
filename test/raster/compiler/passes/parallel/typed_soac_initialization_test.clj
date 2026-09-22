@@ -57,6 +57,27 @@
       (is (= fills (:initialization-fills stats)))
       (is (= (- 1 fills) (:initialization-full-overwrites stats))))))
 
+(deftest exact-rectangular-effect-images-elide-initialization
+  (doseq [[allocation address fills]
+          [['(float-array (* rows width)) '(+ (* row width) column) 0]
+           ['(float-array (* rows (+ width 1)))
+            '(+ (* row (+ width 1)) column) 1]]]
+    (let [source (list 'let* ['out allocation
+                              'effect
+                              (list 'raster.par/map-void! 'row 'rows
+                                    (list 'dotimes ['column 'width]
+                                          (list 'aset 'out address
+                                                '(aget input (+ (* row width) column)))))]
+                       'out)
+          result (route/attempt source :float {'input :float 'out :float}
+                                {:scalar-types {'rows :long 'width :long}
+                                 :resident-initialization? true})
+          stats (:stats result)]
+      (is (= :typed-soac (:route stats)))
+      (is (= fills (:initialization-fills stats)))
+      (is (= (- 1 fills) (:initialization-full-overwrites stats))
+          "injective padded rows still contain unwritten holes"))))
+
 (deftest allocation-only-public-extent-is-available-before-the-fill
   (let [p (frontend/form->program (source '(float-array n) 4)
                                  {:dtype :float :array-types {'input :float 'output :float}
