@@ -153,6 +153,28 @@
                              :dimension-parameters dimension-parameters})))
         [M N K] dimensions
         [m-parameter n-parameter k-parameter] dimension-parameters
+        [i j k-sym] axis-symbols
+        ;; Result-transform operand maps retain semantic axis bounds. Once a
+        ;; matrix schedule has allocated its ABI dimension identities, rewrite
+        ;; those bounds by axis identity so flattened operand addresses use the
+        ;; existing M/N/K parameters instead of undeclared source scalars.
+        scheduled-axis-bounds {i m-parameter j n-parameter k-sym k-parameter}
+        scheduled-boundary-ids (into #{row col out} (map :id additional-parameters))
+        epilogue
+        (when epilogue
+          (update epilogue :operands
+                  (fn [operands]
+                    (mapv (fn [operand]
+                            (if (contains? scheduled-boundary-ids (:sym operand))
+                              operand
+                              (update-in operand [:map :groups]
+                                         (fn [groups]
+                                           (mapv (fn [group]
+                                                   (mapv (fn [[axis bound]]
+                                                           [axis (get scheduled-axis-bounds axis bound)])
+                                                         group))
+                                                 groups)))))
+                          operands))))
         ;; Preserve literal shape facts, but keep symbolic caller names outside the body-local
         ;; scope.  For example square attention has M=N=`seq-len`, while its schedule requires
         ;; two distinct scalar identities.
@@ -163,7 +185,6 @@
         row-buffer (get operation-buffers row row)
         col-buffer (get operation-buffers col col)
         out-buffer (get operation-buffers out out)
-        [i j k-sym] axis-symbols
         matrix (:matrix tile)
         desc {:matrix matrix :subgroup-size (:subgroup matrix)}
         acc-layout (layout/derive-layout :mma-acc :float desc)
