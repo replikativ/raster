@@ -170,6 +170,22 @@
     (is (= (graph/boundary-contract (first (:alternatives scheduled)))
            (graph/boundary-contract candidate)))))
 
+(deftest finite-direct-tile-retains-materialized-input-policy
+  (let [base-tile (get-in (stage-graph) [:nodes 1 :operation :schedule :tile])
+        tile (assoc base-tile :block-k 64 :num-stages 4)
+        strategy (gemm/direct-tile-strategy tile)
+        spec {:id :finite-direct-test :a 'A :b 'B :c 'C
+              :m 96 :n 3072 :k 1024 :variant :nt :fill-workgroups 16
+              :tile tile :strategy strategy}
+        candidate (gemm/emit-matrix-direct-alternative spec)]
+    (is (= strategy (executable/strategy candidate)))
+    (is (= [:convert-a :convert-b :transpose-b :contract]
+           (mapv (comp last :id) (:nodes candidate))))
+    (is (= 3 (count (:temporaries candidate))))
+    (is (= tile (get-in candidate [:attributes :tile])))
+    (is (empty? (get-in candidate [:nodes 3 :operation :attributes
+                                   :scheduled-kernel-body :source :input-value-regions])))))
+
 (deftest normal-enumeration-retains-checked-input-fusion-without-changing-selection
   (let [spec {:id :enumeration-test :a 'A :b 'B :c 'C :m 16 :n 32 :k 32
               :fill-workgroups 16

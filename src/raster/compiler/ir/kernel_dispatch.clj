@@ -45,7 +45,8 @@
 
 (defn- validate-selector!
   [dispatch strategies common]
-  (let [{:keys [kind argument expression threshold at-least otherwise ranges below strategy]}
+  (let [{:keys [kind argument expression threshold at-least otherwise ranges below strategy
+                fallback]}
         (:selector dispatch)
         common-arguments (:arguments common)
         scalar-arguments (->> (map vector (:abi common) common-arguments)
@@ -105,7 +106,11 @@
                                            {:id (:id dispatch) :argument argument :slot slot}))))))]
     (case kind
       :fixed-strategy
-      (validate-selector-strategy! dispatch strategies :fixed strategy)
+      (do
+        (when-not (contains? #{nil :none} fallback)
+          (throw (ex-info "kernel dispatch fixed selector has an unsupported fallback policy"
+                          {:id (:id dispatch) :fallback fallback :allowed #{nil :none}})))
+        (validate-selector-strategy! dispatch strategies :fixed strategy))
 
       :runtime-scalar-threshold
       (do
@@ -258,6 +263,27 @@
   [dispatch selector]
   (validate! (assoc (validate! dispatch) :selector selector)))
 
+(defn specialize-fixed
+  "Bake a fixed selector into `dispatch` and discard every unselected executable.
+
+   This is a compile-time specialization step for an already validated offline tuning result.
+   It deliberately requires a :fixed-strategy selector with `:fallback :none`: ordinary cached
+   fixed preferences retain their default alternative for binding-time admission. The pinned
+   strategy becomes both the sole alternative and the default, so downstream compilation and
+   resource binding cannot accidentally retain work for dead schedules."
+  [dispatch selector]
+  (when-not (and (= :fixed-strategy (:kind selector))
+                 (= :none (:fallback selector)))
+    (throw (ex-info "kernel dispatch specialization requires a pinned fixed strategy selector"
+                    {:reason :kernel-dispatch-specialization-selector
+                     :id (:id dispatch) :selector selector})))
+  (let [dispatch (with-selector dispatch selector)
+        strategy (:strategy selector)
+        selected (alternative dispatch strategy)]
+    (validate! (assoc dispatch
+                      :alternatives [selected]
+                      :default-strategy strategy))))
+
 (defn- runtime-number
   [value]
   (if (and (map? value) (contains? value :value)) (:value value) value))
@@ -357,6 +383,7 @@
                      {:reason :kernel-dispatch-admission-callback})))
    (let [preferred (select-alternative dispatch runtime-arguments override)
          explicit? (and override (not= :auto override))
+         no-fallback? (= :none (get-in dispatch [:selector :fallback]))
          check (fn [executable]
                  (let [result (violations executable)]
                    (when-not (and (vector? result)
@@ -377,7 +404,8 @@
                                    :attempts attempts})))]
      (if (empty? (:violations first-attempt))
        (accept preferred [first-attempt])
-       (if (or explicit? (= (:strategy first-attempt) (:default-strategy dispatch)))
+       (if (or explicit? no-fallback?
+               (= (:strategy first-attempt) (:default-strategy dispatch)))
          (reject [first-attempt])
          (let [fallback (default-alternative dispatch)
                fallback-attempt (check fallback)

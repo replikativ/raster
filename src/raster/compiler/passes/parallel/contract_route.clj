@@ -20,6 +20,7 @@
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.core.util :as util]
             [clojure.string :as str]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
@@ -1028,18 +1029,33 @@
                    :candidate-family family
                    :candidate-schedule candidate-schedule}})))
 
+(defn- stable-generated-symbol
+  "Remove only compiler freshness suffixes while preserving the semantic stem and namespace."
+  [value]
+  (let [stable-name (-> (name value)
+                        (str/replace #"_α_[0-9]+(?:_[0-9]+)*$" "")
+                        (str/replace #"__[0-9]+$" ""))]
+    (symbol (namespace value) stable-name)))
+
+(defn- stable-dispatch-data
+  [value]
+  (walk/postwalk #(if (symbol? %) (stable-generated-symbol %) %) value))
+
 (defn- candidate-dispatch-id
   [operation-id candidates schedule-identity]
   (let [identity
         [operation-id
-         schedule-identity
+         (stable-dispatch-data schedule-identity)
          (mapv (fn [{:keys [family strategy artifact]}]
-                 (let [kernel-name (:kernel-name artifact)]
-                   {:family family
-                    :strategy strategy
-                    :artifact (-> (select-keys artifact
-                                               [:target :source :abi :arguments :launch :preconditions :effects])
-                                  (update :source str/replace kernel-name "<entry-point>"))}))
+                 {:family family
+                  :strategy strategy
+                  ;; Dispatch lookup identity is semantic/schedule identity, not emitted-source
+                  ;; identity. The tuning cache independently fingerprints complete executable
+                  ;; sources and rejects stale compiler output.
+                  :target (:target artifact)
+                  :interface (mapv #(select-keys % [:kind :dtype :kernel-dtype :role
+                                                    :aliasing :alignment])
+                                   (:abi artifact))})
                candidates)]]
     (format "raster_typed_contraction_dispatch_%08x"
             (bit-and 0xffffffff (long (hash identity))))))
@@ -1332,7 +1348,9 @@
                      scheduled (assoc emit-spec
                                       :tile tile
                                       :fill-workgroups (:fill-workgroups schedule))]
-                 [(gpu-gemm/emit-matrix-dynamic-lhs-alternative
+                 [(gpu-gemm/emit-matrix-direct-alternative
+                   (assoc scheduled :strategy (gpu-gemm/direct-tile-strategy tile)))
+                  (gpu-gemm/emit-matrix-dynamic-lhs-alternative
                    (assoc scheduled :strategy (gpu-gemm/dynamic-lhs-strategy tile)))
                   (gpu-gemm/emit-matrix-input-fusion-alternative
                    (assoc scheduled :strategy (gpu-gemm/tile-input-strategy tile)))]))
@@ -1377,10 +1395,12 @@
                   :tile-schedules
                   (when (and (not (:batched? matrix-view))
                              (contains? #{:nn :nt} (:variant matrix-view)))
-                    (into {:xmx-direct-dynamic-lhs target-schedule
+                    (into {:xmx-direct target-schedule
+                           :xmx-direct-dynamic-lhs target-schedule
                            :xmx-direct-tile-inputs target-schedule}
                           (mapcat (fn [schedule]
-                                    [[(gpu-gemm/dynamic-lhs-strategy (:tile schedule)) schedule]
+                                    [[(gpu-gemm/direct-tile-strategy (:tile schedule)) schedule]
+                                     [(gpu-gemm/dynamic-lhs-strategy (:tile schedule)) schedule]
                                      [(gpu-gemm/tile-input-strategy (:tile schedule)) schedule]]))
                           additional-tile-schedules))))}))))
 
