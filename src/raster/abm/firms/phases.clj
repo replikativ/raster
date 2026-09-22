@@ -147,7 +147,7 @@
   [member-offsets :- (Array int), firm-size :- (Array int),
    max-firms :- Long] :- Void
   (par/scan-exclusive member-offsets acc (int 0) f max-firms int
-                      (+ acc (aget firm-size f))))
+                      (unchecked-add-int acc (aget firm-size f))))
 
 (deftm startup-scan-par!
   "Exclusive prefix sum of not-alive → free-offsets (max-firms+1 elements).
@@ -155,7 +155,7 @@
   [free-offsets :- (Array int), not-alive :- (Array int),
    max-firms :- Long] :- Void
   (par/scan-exclusive free-offsets acc (int 0) f max-firms int
-                      (+ acc (aget not-alive f))))
+                      (unchecked-add-int acc (aget not-alive f))))
 
 ;; ================================================================
 ;; Phase 3b.5: generate-active-ids-par! — GPU-side active agent selection

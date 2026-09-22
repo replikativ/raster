@@ -978,10 +978,12 @@
 ;; carry a separately proven no-overflow range contract).
 (doseq [op '[unchecked-add unchecked-add-int
              clojure.core/unchecked-add clojure.core/unchecked-add-int]]
-  (register-algebra! op {:associative? true :commutative? true :identity 0}))
+  (register-algebra! op {:associative? true :commutative? true :identity 0
+                         :overflow :wrap}))
 (doseq [op '[unchecked-multiply unchecked-multiply-int
              clojure.core/unchecked-multiply clojure.core/unchecked-multiply-int]]
-  (register-algebra! op {:associative? true :commutative? true :identity 1}))
+  (register-algebra! op {:associative? true :commutative? true :identity 1
+                         :overflow :wrap}))
 
 (defn typed-reduce-identity
   "The identity element for a reduction op, TYPED for the element dtype — the
