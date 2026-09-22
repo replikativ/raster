@@ -54,7 +54,7 @@
 
 (def calibration-version
   "Bump when the microbench methodology changes, invalidating on-disk calibrations."
-  1)
+  2)
 
 (defn device-signature
   "A stable identity string for a device: name + the caps that affect measured performance. Two
@@ -63,9 +63,11 @@
   [device-id]
   (let [d (device device-id)
         caps (:capabilities d)]
-    (pr-str [(:name d)
-             (select-keys caps [:cores :arch :simd-width :total-eus :threads-per-eu
-                                :sm-count :compute-capability :global-memory-bytes])
+    (pr-str [(:type d) (:name d) (:driver-version d)
+             (select-keys caps [:vendor :device-id-hex :driver-version
+                                :cores :arch :gfx-arch :simd-width :subgroup-sizes
+                                :total-eus :threads-per-eu :sm-count :compute-capability
+                                :global-memory-bytes :global-mem-bytes :matrix])
              calibration-version])))
 
 (defn- calibration-file ^File [device-id]

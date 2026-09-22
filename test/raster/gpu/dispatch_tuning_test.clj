@@ -58,7 +58,8 @@
     :selector {:kind :fixed-strategy :strategy :reference}}))
 
 (def ^:private descriptor
-  {:device-id :ze:0 :vendor "Intel" :arch "xe2" :subgroup-size 16
+  {:device-id :ze:0 :device-name "Intel Arc" :device-id-hex "0x64a0"
+   :vendor "Intel" :arch "xe2" :subgroup-size 16
    :machine-lanes 8192 :driver-version "test-driver"})
 
 (def ^:private numerical-mode
@@ -194,6 +195,13 @@
                                                    numerical-mode layout 0.01)]
           (is (not= (tuning/cache-key base) (tuning/cache-key other-shapes)))
           (is (not= (tuning/cache-key base) (tuning/cache-key other-policy)))
+          (is (= "0x64a0" (get-in base [:device :device-id-hex])))
+          (is (not= (tuning/cache-key base)
+                    (tuning/cache-key
+                     (tuning/tuning-identity dispatch
+                                             (assoc descriptor :device-id-hex "0x9999")
+                                             [128 256 768]
+                                             numerical-mode layout 0.001))))
           (is (nil? (tuning/cache-get dispatch other-shapes)))))
       (testing "layout/numerical/device identity is checked again when applying"
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"identity differs"

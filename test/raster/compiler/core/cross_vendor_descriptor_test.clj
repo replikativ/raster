@@ -53,6 +53,8 @@
                         (quot (:block-n tile) (:sg-n tile))
                         (:subgroup-size a100))]
     (testing "CUDA catalogue keys do not leak Level Zero defaults"
+      (is (= "NVIDIA A100" (:device-name a100)))
+      (is (= "Intel(R) Arc(TM) Graphics" (:device-name arc)))
       (is (= :cuda (:backend a100)))
       (is (= #{32} (get-in a100 [:execution :subgroup-sizes])))
       (is (= 32 (get-in a100 [:execution :preferred-subgroup-size])))
@@ -71,6 +73,27 @@
               :device-dependent? true}
              (hw/shared-memory-bank-model arc)))
       (is (= :subgroup (get-in arc [:execution :subgroup-kind]))))))
+
+(deftest observed-capability-aliases-override-catalogue-values-in-evidence
+  (rt/register-target-device!
+   :ocl:observed-memory
+   {:name "Intel(R) Arc(TM) Graphics"
+    :capabilities {:global-mem-bytes 30172102656
+                   :device-id-hex "0x64a0"
+                   :vendor "Intel(R) Corporation"
+                   :subgroup-sizes [16 32]
+                   :simd-width 16
+                   :max-work-group-size 1024}})
+  (let [descriptor (hw/descriptor-for :ocl:observed-memory)
+        evidence (hw/evidence-signature descriptor)]
+    (is (= 30172102656 (:global-memory-bytes descriptor))
+        "the user/observed backend alias wins over the catalogued spelling")
+    (is (= "Intel(R) Arc(TM) Graphics" (:device-name evidence)))
+    (is (= "0x64a0" (:device-id-hex evidence)))
+    (is (= rt/calibration-version (:calibration-version evidence)))
+    (is (= :user (get-in evidence [:capability-provenance :global-mem-bytes])))
+    (is (= :catalogued
+           (get-in evidence [:capability-provenance :global-memory-bytes])))))
 
 (deftest explicit-capabilities-override-catalogue-per-field
   (let [device (rt/register-target-device!

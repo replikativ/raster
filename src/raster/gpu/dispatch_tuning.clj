@@ -5,8 +5,9 @@
    ABI-compatible executable alternatives through a caller-supplied validated benchmark, converts
    winners at sampled runtime scalar values into a piecewise selector, and atomically caches it.
    Applying a result rechecks the full identity: device, emitted sources, ABI, numerical mode, and
-   layout. A stale or cross-device result therefore cannot silently select a kernel."
-  (:require [raster.compiler.ir.kernel-artifact :as kart]
+  layout. A stale or cross-device result therefore cannot silently select a kernel."
+  (:require [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.gpu.measurement :as measurement]
@@ -14,7 +15,7 @@
   (:import [java.nio.charset StandardCharsets]
            [java.security MessageDigest]))
 
-(def tuning-version 4)
+(def tuning-version 5)
 
 (defrecord DispatchTuning
            [key identity selector measurements])
@@ -76,13 +77,6 @@
      :arguments-hash (sha256 (pr-str (kexec/arguments executable)))
      :effects-hash (sha256 (pr-str (canonical-data (kexec/effects executable))))}))
 
-(defn- device-signature
-  [descriptor]
-  (select-keys descriptor
-               [:device-id :device-name :vendor :arch :driver-version
-                :machine-lanes :grf-bytes-per-lane :bandwidth-bytes-s :peak-flops
-                :subgroup-size :max-workgroup-size :matrix]))
-
 (defn tuning-identity
   "Build the complete identity that guards a dispatch tuning result.
 
@@ -101,7 +95,7 @@
      {:version tuning-version
       :dispatch-id (:id dispatch)
       :selector-argument (get-in dispatch [:selector :argument])
-      :device (device-signature descriptor)
+      :device (hardware/evidence-signature descriptor)
       :numerical-mode numerical-mode
       :layout layout
       :policy {:runtime-values (vec runtime-values)
