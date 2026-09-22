@@ -1289,7 +1289,8 @@
             {:keys [row col]} (:bindings matrix-view)
             source-graph (semantic-source-graph context matrix-view abi arguments)
             semantic-effects (:effects source-graph)
-            emit-spec {:id [:typed-contraction operation-id]
+            emit-spec (merge
+                       {:id [:typed-contraction operation-id]
                        :a row :b col :c (:out facts)
                        :m m :n n :k k
                        ;; Matrix scheduling drops an optional leading batch axis, but the
@@ -1308,6 +1309,11 @@
                        :external-interface {:abi abi :arguments arguments
                                             :effects semantic-effects}
                        :split-factors (or (:split-factors options) [])}
+                       ;; These are schedule policy, not GEMM semantics.  Keep them on the
+                       ;; compiler-owned requested-splits expression so a resolved public
+                       ;; schedule can change occupancy policy without teaching the binder or
+                       ;; target emitter about contractions.
+                       (select-keys options [:target-fill-multiple :min-split-chunk :max-splits]))
             emitted (if (:batched? matrix-view)
                       (gpu-gemm/emit-batched-matrix-alternative
                        (assoc emit-spec

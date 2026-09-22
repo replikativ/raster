@@ -76,6 +76,10 @@
                         ;; the descriptor-derived tile family as compatible dispatch alternatives
                         ;; for explicit measurement/autotuning.
                         :matrix-tiles :default
+                        ;; Explicit K-partition candidates are likewise opt-in.  They remain
+                        ;; ordinary ABI-compatible KernelGraph alternatives for the generic
+                        ;; measured-selector machinery; an empty vector adds no compile cost.
+                        :split-factors []
                         :measured-selectors {}}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
@@ -210,6 +214,8 @@
         (get-in schedule [:typed-contraction :strategy] :auto)
         matrix-tiles
         (get-in schedule [:typed-contraction :matrix-tiles] :default)
+        split-factors
+        (get-in schedule [:typed-contraction :split-factors] [])
         typed-contraction-selectors
         (get-in schedule [:typed-contraction :measured-selectors] {})
         {:keys [target-fill-multiple min-split-chunk max-splits]}
@@ -247,6 +253,14 @@
       (throw (ex-info "schedule: unknown typed contraction matrix tile space"
                       {:matrix-tiles matrix-tiles
                        :expected valid-matrix-tile-spaces})))
+    (when-not (and (vector? split-factors)
+                   (= (count split-factors) (count (set split-factors)))
+                   (every? #(and (integer? %) (> (long %) 1)
+                                 (<= (long %) (long max-splits)))
+                           split-factors))
+      (throw (ex-info
+              "typed contraction split factors must be unique integers in [2,max-splits]"
+              {:split-factors split-factors :max-splits max-splits})))
     (when-not (and (map? typed-contraction-selectors)
                    (every? #(and (string? %) (not-empty %))
                            (keys typed-contraction-selectors))

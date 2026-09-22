@@ -57,7 +57,8 @@
               :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
     (testing "static typed contractions keep finite tile search out of the hot compile path"
-      (is (= {:strategy :auto :matrix-tiles :default :measured-selectors {}}
+      (is (= {:strategy :auto :matrix-tiles :default :split-factors []
+              :measured-selectors {}}
              (:typed-contraction derived))))
     (testing "GEMM dispatch policy is explicit, serializable schedule data"
       (is (= {:target-fill-multiple 4 :min-split-chunk 1024 :max-splits 64}
@@ -175,7 +176,18 @@
                           (sched/feasible?
                            (sched/resolve (sched/derive-default nil arc-desc)
                                           {:typed-contraction {:matrix-tiles :unbounded}})
-                           arc-desc))))
+                           arc-desc)))
+    (is (true? (sched/feasible?
+                (sched/resolve (sched/derive-default nil arc-desc)
+                               {:typed-contraction {:split-factors [2 4 8]}})
+                arc-desc)))
+    (doseq [invalid [[1 2] [2 2] [2 65] '(2 4)]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"typed contraction split factors"
+           (sched/feasible?
+            (sched/resolve (sched/derive-default nil arc-desc)
+                           {:typed-contraction {:split-factors invalid}})
+            arc-desc)))))
   (testing "GEMM dispatch controls reject missing, zero, and non-integral policy data"
     (doseq [invalid [{:max-splits 0}
                      {:min-split-chunk 1.5}]]
