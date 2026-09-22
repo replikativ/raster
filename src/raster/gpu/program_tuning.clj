@@ -10,6 +10,7 @@
 
 (def manifest-version 1)
 (def plan-version 1)
+(def receipt-version 1)
 
 (defn- schedule-target
   [dispatch]
@@ -205,3 +206,152 @@
             (merge-value result override []))
           {}
           overrides))
+
+(defn- selector-fragment
+  [signature selector]
+  (let [{:keys [path key]} (:schedule-target signature)
+        target-path (cond-> path (some? key) (conj key))]
+    (assoc-in {} target-path selector)))
+
+(defn- receipt-selector
+  [group tuning schedule-override]
+  (let [measured (:selector tuning)
+        target (:schedule-target (:signature group))
+        path (cond-> (:path target) (some? (:key target)) (conj (:key target)))
+        supplied (get-in schedule-override path)
+        pinned (when (= :fixed-strategy (:kind measured))
+                 (assoc measured :fallback :none))]
+    (cond
+      (= supplied measured) {:selector measured :pinned? false}
+      (and pinned (= supplied pinned)) {:selector pinned :pinned? true}
+      :else
+      (throw (ex-info "program tuning receipt selector differs from its measured evidence"
+                      {:reason :program-tuning-receipt-selector
+                       :group-id (:id group) :path path
+                       :measured measured :supplied supplied})))))
+
+(defn make-receipt
+  "Seal program tuning results and their schedule override into a plain, versioned receipt.
+
+   A receipt may cover the bounded subset selected by `tuning-plan`. It retains each exact
+   dispatch signature and complete DispatchTuning evidence; the schedule fragment alone is never
+   accepted as proof. Pinned fixed selectors are recorded explicitly."
+  [plan results schedule-override]
+  (let [plan (validate-plan! plan)]
+    (when-not (vector? results)
+      (throw (ex-info "program tuning receipt requires an ordered result vector"
+                      {:reason :invalid-program-tuning-receipt-results :results results})))
+    (let [groups (:selected-groups plan)
+          expected-ids (mapv :id groups)
+          actual-ids (mapv :group-id results)]
+      (when-not (= expected-ids actual-ids)
+        (throw (ex-info "program tuning receipt results differ from the selected plan groups"
+                        {:reason :program-tuning-receipt-groups
+                         :expected expected-ids :actual actual-ids})))
+      (let [entries
+            (mapv
+             (fn [group result]
+               (let [evidence (:tuning result)]
+                 (when-not (tuning/dispatch-tuning? evidence)
+                   (throw (ex-info "program tuning receipt requires DispatchTuning evidence"
+                                   {:reason :invalid-program-tuning-receipt-evidence
+                                    :group-id (:id group) :evidence evidence})))
+                 (let [identity (:identity evidence)
+                       signature (:signature group)]
+                   (when-not (and (= (:id group) (:dispatch-id identity))
+                                  (= (:alternatives signature) (:alternatives identity))
+                                  (= (:selector-argument signature)
+                                     (:selector-argument identity))
+                                  (= (:numerical-mode signature) (:numerical-mode identity))
+                                  (= (:layout signature) (:layout identity)))
+                     (throw (ex-info "program tuning evidence differs from its manifest group"
+                                     {:reason :program-tuning-receipt-identity
+                                      :group-id (:id group)
+                                      :signature signature :identity identity})))
+                   (let [{:keys [selector pinned?]}
+                         (receipt-selector group evidence schedule-override)]
+                     {:group-id (:id group)
+                      :signature signature
+                      :selector selector
+                      :pinned? pinned?
+                      :tuning (tuning/tuning-data evidence)}))))
+             groups results)
+            reconstructed (merge-schedule-overrides
+                           (mapv #(selector-fragment (:signature %) (:selector %)) entries))]
+        (when-not (= reconstructed schedule-override)
+          (throw (ex-info "program tuning receipt contains schedule data without tuning evidence"
+                          {:reason :program-tuning-receipt-override
+                           :expected reconstructed :actual schedule-override})))
+        {:version receipt-version
+         :manifest-version manifest-version
+         :plan-version plan-version
+         :groups entries
+         :schedule-override schedule-override}))))
+
+(defn replay-receipt
+  "Validate a tuning receipt against a freshly compiled descriptor and hardware descriptor.
+
+   Returns restored DispatchTunings and the exact schedule override for immutable recompilation.
+   Any program, emitted source, ABI, numerical/layout contract, device, driver, capability or
+   calibration drift fails loudly; callers choose whether that deployment error triggers a new
+   explicit tuning action."
+  [descriptor hardware-descriptor receipt]
+  (when-not (and (map? receipt)
+                 (= receipt-version (:version receipt))
+                 (= manifest-version (:manifest-version receipt))
+                 (= plan-version (:plan-version receipt))
+                 (vector? (:groups receipt))
+                 (map? (:schedule-override receipt)))
+    (throw (ex-info "invalid program tuning receipt"
+                    {:reason :invalid-program-tuning-receipt :receipt receipt})))
+  (let [current (manifest descriptor)
+        by-id (into {} (map (juxt :id identity)) (:groups current))
+        receipt-group-ids (mapv :group-id (:groups receipt))
+        _ (when-not (= (count receipt-group-ids) (count (distinct receipt-group-ids)))
+            (throw (ex-info "program tuning receipt repeats a dispatch group"
+                            {:reason :program-tuning-receipt-duplicate-group
+                             :group-ids receipt-group-ids})))
+        restored
+        (mapv
+         (fn [{:keys [group-id signature selector pinned? tuning] :as entry}]
+           (let [group (get by-id group-id)]
+             (when-not group
+               (throw (ex-info "program tuning receipt names a missing dispatch group"
+                               {:reason :program-tuning-receipt-missing-group
+                                :group-id group-id :known (set (keys by-id))})))
+             (when-not (= signature (:signature group))
+               (throw (ex-info "program tuning receipt manifest signature changed"
+                               {:reason :program-tuning-receipt-signature
+                                :group-id group-id
+                                :expected (:signature group) :actual signature})))
+             (let [step (:representative-step-index group)
+                   dispatch (get-in descriptor [:steps step :dispatch])
+                   contract (get-in dispatch [:attributes :tuning])
+                   evidence (tuning/restore-tuning dispatch tuning hardware-descriptor
+                                                    (:numerical-mode contract)
+                                                    (:layout contract))]
+               (when-not (instance? Boolean pinned?)
+                 (throw (ex-info "program tuning receipt :pinned? must be boolean"
+                                 {:reason :invalid-program-tuning-receipt-pin
+                                  :group-id group-id :pinned? pinned?})))
+               (let [expected (if pinned?
+                                (assoc (:selector evidence) :fallback :none)
+                                (:selector evidence))]
+                 (when pinned?
+                   (kdispatch/specialize-fixed dispatch expected))
+                 (when-not (= expected selector)
+                   (throw (ex-info "program tuning receipt selector differs from restored evidence"
+                                   {:reason :program-tuning-receipt-restored-selector
+                                    :group-id group-id :expected expected :actual selector})))
+                 {:group-id group-id :tuning evidence :selector selector
+                  :schedule-override (selector-fragment signature selector)
+                  :receipt-entry entry}))))
+         (:groups receipt))
+        schedule-override (merge-schedule-overrides (mapv :schedule-override restored))]
+    (when-not (= schedule-override (:schedule-override receipt))
+      (throw (ex-info "program tuning receipt schedule override is not evidence-complete"
+                      {:reason :program-tuning-receipt-override
+                       :expected schedule-override :actual (:schedule-override receipt)})))
+    {:receipt receipt
+     :tunings restored
+     :schedule-override schedule-override}))

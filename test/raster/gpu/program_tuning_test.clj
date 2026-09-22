@@ -1,10 +1,12 @@
 (ns raster.gpu.program-tuning-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.dispatch-benchmark :as benchmark]
+            [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.link :as link]
             [raster.gpu.program-tuning :as program-tuning]))
 
@@ -53,6 +55,16 @@
            {:phase :only-b :dispatch dispatch-b}
            {:phase :second-a :dispatch dispatch-a}
            {:phase :ordinary-kernel}]})
+
+(defn- persisted-row
+  [runtime-value signature cost]
+  {:runtime-value runtime-value
+   :strategy (:strategy signature)
+   :measurement {:min-ns cost :median-ns cost :p75-ns cost :mean-ns cost :cv 0.0
+                 :stationary? true :n 3 :warmup-iterations 1 :budget-ms 1.0
+                 :cold-warm :warm :timing-source :device-event :compile-ms 0.0 :hashes {}}
+   :validation {:passed? true :oracle-hash "program-tuning-oracle"
+                :candidate-hash (:source-hash signature)}})
 
 (deftest manifest-groups-equivalent-sites-in-program-order
   (let [manifest (program-tuning/manifest descriptor)]
@@ -115,11 +127,26 @@
           (let [step (:step (apply hash-map options))
                 dispatch (get-in descriptor [:steps step :dispatch])
                 id (:id dispatch)
+                contract (get-in dispatch [:attributes :tuning])
                 selector {:kind :runtime-scalar-ranges
                           :argument 'width :below :reference
-                          :ranges [{:at-least 256 :strategy :subgroup}]}]
+                          :ranges [{:at-least 256 :strategy :subgroup}]}
+                identity (dispatch-tuning/tuning-identity
+                          dispatch {} runtime-values
+                          (:numerical-mode contract) (:layout contract) 0.001)
+                rows (mapv (fn [[runtime-value signature]]
+                             (persisted-row
+                              runtime-value signature
+                              (if (= (:strategy signature)
+                                     (if (< runtime-value 256) :reference :subgroup))
+                                10.0 20.0)))
+                           (for [runtime-value runtime-values
+                                 signature (:alternatives identity)]
+                             [runtime-value signature]))
+                evidence (dispatch-tuning/->DispatchTuning
+                          (dispatch-tuning/cache-key identity) identity selector rows)]
             (swap! calls conj [id runtime-values step])
-            {:tuning :fake
+            {:tuning evidence
              :selector selector
              :schedule-override
              {:generic-reduction {:measured-selectors {id selector}}}
@@ -146,4 +173,23 @@
         (is (= #{"dispatch-a" "dispatch-b"}
                (set (keys (get-in result
                                   [:schedule-override :generic-reduction
-                                   :measured-selectors])))))))))
+                                   :measured-selectors])))))
+        (let [receipt (:receipt result)]
+          (is (= receipt (edn/read-string (pr-str receipt)))
+              "the receipt is plain versioned data, not a classloader-bound record")
+          (is (= (:schedule-override result)
+                 (:schedule-override
+                  (program-tuning/replay-receipt descriptor {} receipt))))
+          (is (= :program-tuning-receipt-signature
+                 (try
+                   (program-tuning/replay-receipt
+                    descriptor {}
+                    (assoc-in receipt [:groups 0 :signature :layout :input] :different))
+                   (catch clojure.lang.ExceptionInfo exception
+                     (:reason (ex-data exception))))))
+          (is (= :program-tuning-receipt-duplicate-group
+                 (try
+                   (program-tuning/replay-receipt
+                    descriptor {} (update receipt :groups conj (first (:groups receipt))))
+                   (catch clojure.lang.ExceptionInfo exception
+                     (:reason (ex-data exception)))))))))))
