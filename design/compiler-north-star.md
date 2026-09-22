@@ -1365,6 +1365,13 @@ fragment alone is not tuning evidence. Storage policy remains outside this contr
 receipt can later use the authenticated artifact store, Boring/Konserve or another envelope without
 changing compiler identity semantics.
 
+The former Level-Zero-only workgroup tuner has been removed. It keyed evidence by mutable kernel
+names, timed host-synchronized loops, patched the live runtime registry and bypassed numerical and
+oracle checks. The firms ABM continues to execute unchanged, but is intentionally not advertised as
+autotunable until its phases use resident descriptors and ordinary `KernelDispatch` candidates;
+that migration must reuse the same measurement, identity and immutable-recompilation contracts as
+every other workload.
+
 Partial evaluation complements the SSA-based KernelBody; it does not replace it. The existing
 source fixpoint already combines call/AD expansion, type-aware rewalking, PE and CSE. The explicit
 PE API also accepts known parameters and dimensions. General runtime-driven respecialization is

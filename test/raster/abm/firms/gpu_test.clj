@@ -15,7 +15,6 @@
             [raster.abm.firms.membership :as mem]
             [raster.par :as par]
             [raster.gpu.ze-runtime :as ze]
-            [raster.compiler.support.autotuner :as at]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass])
   (:import [raster.abm.firms AgentSoA FirmSoA FirmsConfig]
@@ -425,91 +424,6 @@
                             (clojure.core/aget ref-offsets %))
                        (range (inc max-firms)))
                "GPU CSR offsets must match CPU exclusive prefix sum")))))))
-
-;; ================================================================
-;; Test: Autotuner (requires Level Zero)
-;; ================================================================
-
-(deftest test-autotuner
-  (when-ze "ABM workgroup autotuning"
-   (ze/init!)
-
-   (testing "autotune-wg-sweep! returns valid KernelTuning with finite ms"
-     (gpu/with-gpu-session [sess :ze:0]
-       (fgpu/compile-abm-kernels! sess)
-       (gpu/alloc! sess {:alive [:int 50000 (int-array 50000 (repeat 50000 1))]
-                         :output [:float 50000 nil]
-                         :param-a [:float 50000 nil]
-                         :param-b [:float 50000 nil]
-                         :param-beta [:float 50000 nil]
-                         :total-effort [:float 50000 nil]})
-       (let [n 50000
-             po-kname (:kernel-name (first (gpu/kernel sess :produce-output)))
-             bufs (:buffers @sess)
-             wg-sizes [64 128 256 512]
-             tuning (at/autotune-wg-sweep! po-kname
-                                           [(get bufs :alive) (get bufs :output) (get bufs :param-a)
-                                            (get bufs :param-b) (get bufs :param-beta) (get bufs :total-effort)]
-                                           [] n :ze:0
-                                           :wg-sizes wg-sizes :warmup 1 :timed 3)]
-         (is (instance? raster.compiler.support.autotuner.KernelTuning tuning))
-         (is (contains? (set wg-sizes) (:workgroup-size tuning))
-             "Best wg-size must be one of the candidates")
-         (is (< (:best-ms tuning) 1.0e100) "Best ms must be finite (not MAX_VALUE)")
-         (is (> (:best-ms tuning) 0.0) "Best ms must be positive")
-         (is (= (set wg-sizes) (set (keys (:wg-sizes (:all-results tuning)))))
-             "all-results should contain all tried wg-sizes")
-         (is (every? #(< % 1.0e100) (vals (:wg-sizes (:all-results tuning))))
-             "All timed results must be finite"))))
-
-   (testing "autotune-kernel! patches registry workgroup-size"
-     (gpu/with-gpu-session [sess :ze:0]
-       (fgpu/compile-abm-kernels! sess)
-       (gpu/alloc! sess {:alive [:int 50000 (int-array 50000 (repeat 50000 1))]
-                         :output [:float 50000 nil]
-                         :param-a [:float 50000 nil]
-                         :param-b [:float 50000 nil]
-                         :param-beta [:float 50000 nil]
-                         :total-effort [:float 50000 nil]})
-       (let [n 50000
-             po-kname (:kernel-name (first (gpu/kernel sess :produce-output)))
-             bufs (:buffers @sess)]
-         (at/autotune-kernel! po-kname
-                              [(get bufs :alive) (get bufs :output) (get bufs :param-a)
-                               (get bufs :param-b) (get bufs :param-beta) (get bufs :total-effort)]
-                              [] n :ze:0 :wg-sizes [64 256] :warmup 1 :timed 2)
-         (let [wg (get-in @ze/kernel-registry [po-kname :workgroup-size])]
-           (is (contains? #{64 256} wg) "Registry should be patched with best wg-size")
-           (is (some? (get-in @ze/kernel-registry [po-kname :tuning]))
-               "Registry should store :tuning entry")))))
-
-   (testing "Tuning cache: save and load roundtrip"
-     (let [dummy-tuning (raster.compiler.support.autotuner/->KernelTuning
-                         "test_kernel" 256 1.23 {:wg-sizes {64 2.0 128 1.5 256 1.23 512 1.4}})]
-       (at/save-tuning-cache! :ze:test {"test_kernel" dummy-tuning})
-       (let [loaded (at/load-tuning-cache :ze:test)]
-         (is (map? loaded) "Loaded cache should be a map")
-         (is (contains? loaded "test_kernel") "Should contain saved kernel")
-         (let [entry (get loaded "test_kernel")]
-           (is (== 256 (:workgroup-size entry)) "wg-size should survive roundtrip")
-           (is (< (Math/abs (- 1.23 (double (:best-ms entry)))) 0.001)
-               "best-ms should survive roundtrip")))))
-
-   (testing "apply-cached-tuning! patches registry on cache hit"
-     (gpu/with-gpu-session [sess :ze:0]
-       (fgpu/compile-abm-kernels! sess)
-       (let [po-kname (:kernel-name (first (gpu/kernel sess :produce-output)))]
-          ;; Save a fake tuning entry
-         (at/save-tuning-cache! :ze:0
-                                {po-kname {:workgroup-size 128 :best-ms 0.5 :all-results {}}})
-          ;; Apply it
-         (let [hit? (at/apply-cached-tuning! po-kname :ze:0)]
-           (is (true? hit?) "Should return true on cache hit")
-           (is (== 128 (get-in @ze/kernel-registry [po-kname :workgroup-size]))
-               "Registry wg-size should be patched from cache"))
-          ;; Non-existent kernel
-         (let [miss? (at/apply-cached-tuning! "nonexistent_kernel" :ze:0)]
-           (is (false? miss?) "Should return false on cache miss")))))))
 
 (deftest test-codegen-smoke
   (testing "OpenCL codegen produces valid kernel source for par phases"
