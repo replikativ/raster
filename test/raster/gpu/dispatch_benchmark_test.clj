@@ -347,3 +347,39 @@
          clojure.lang.ExceptionInfo #"does not declare a tuning schedule path"
          (benchmark/tuning-schedule-override dispatch fake-tuning descriptor
                                              {:input :f32} {:input :contiguous})))))
+
+(deftest fixed-tuning-is-pinned-only-by-explicit-request
+  (let [contract {:schedule-path [:typed-contraction :measured-selectors]
+                  :schedule-key "fixed-resident-benchmark"
+                  :numerical-mode {:input :f32 :accumulate :f32 :output :f32}
+                  :layout {:input :contiguous :output :contiguous}}
+        fixed-dispatch
+        (kdispatch/make
+         {:id "fixed-resident-benchmark"
+          :alternatives [reference subgroup]
+          :default-strategy :reference
+          :selector {:kind :fixed-strategy :strategy :reference}
+          :attributes {:tuning contract}})
+        identity (tuning/tuning-identity fixed-dispatch descriptor []
+                                         (:numerical-mode contract) (:layout contract) 0.001)
+        evidence (tuning/->DispatchTuning
+                  (tuning/cache-key identity) identity
+                  {:kind :fixed-strategy :strategy :subgroup} [])
+        override (fn [& options]
+                   (apply benchmark/tuning-schedule-override
+                          fixed-dispatch evidence descriptor
+                          (:numerical-mode contract) (:layout contract) options))]
+    (is (= {:kind :fixed-strategy :strategy :subgroup}
+           (get-in (override) [:typed-contraction :measured-selectors
+                               "fixed-resident-benchmark"])))
+    (is (= {:kind :fixed-strategy :strategy :subgroup :fallback :none}
+           (get-in (override :pin-fixed? true)
+                   [:typed-contraction :measured-selectors "fixed-resident-benchmark"])))
+    (let [piecewise (assoc evidence :selector
+                           {:kind :runtime-scalar-ranges :argument 'width
+                            :below :reference :ranges []})]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"requires a pinned fixed strategy selector"
+           (benchmark/tuning-schedule-override
+            fixed-dispatch piecewise descriptor
+            (:numerical-mode contract) (:layout contract) :pin-fixed? true))))))
