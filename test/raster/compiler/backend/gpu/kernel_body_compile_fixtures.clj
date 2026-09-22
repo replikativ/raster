@@ -478,6 +478,14 @@
                  #'ggml-kernels/qdot-q4-K-rows!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-nn/layer-norm-reassociated! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'dl-nn/gelu-erf-mul-strided! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'dl-attention/rope-prefill-strided! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'dl-attention/attn-prefill-out-strided! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-attention/attn-prefill-softmax! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-decode-attention-buf!
