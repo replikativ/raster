@@ -176,3 +176,35 @@
     (blas/dgemm-nt! (float-array 0) (float-array 0) cf 1 0 2 (float 1.0) (float 0.5))
     (is (= [0.0 0.0] (vec c)))
     (is (= [2.5 3.0] (mapv double cf)))))
+
+(deftest test-batched-gemm-strided
+  (testing "float NT and NN batched paths match two independent products"
+    (let [a (float-array [1 2 3 4, 2 0 0 2])
+          b (float-array [5 6 7 8, 1 3 2 4])
+          cnt (float-array 8)
+          cnn (float-array 8)]
+      (blas/batched-gemm-nt! a b cnt 2 2 2 2 (float 1.0))
+      (blas/batched-gemm-nn! a b cnn 2 2 2 2 (float 1.0))
+      (is (= [17.0 23.0 39.0 53.0, 2.0 4.0 6.0 8.0] (mapv float cnt)))
+      (is (= [19.0 22.0 43.0 50.0, 2.0 6.0 4.0 8.0] (mapv float cnn)))))
+  (testing "double NT and NN batched paths"
+    (let [a (double-array [1 2 3 4, 2 0 0 2])
+          b (double-array [5 6 7 8, 1 3 2 4])
+          cnt (double-array 8)
+          cnn (double-array 8)]
+      (blas/batched-gemm-nt! a b cnt 2 2 2 2 1.0)
+      (blas/batched-gemm-nn! a b cnn 2 2 2 2 1.0)
+      (is (= [17.0 23.0 39.0 53.0, 2.0 4.0 6.0 8.0] (vec cnt)))
+      (is (= [19.0 22.0 43.0 50.0, 2.0 6.0 4.0 8.0] (vec cnn)))))
+  (testing "portable per-matrix fallback preserves the same contract"
+    (let [a (float-array [1 2 3 4, 2 0 0 2])
+          b (float-array [5 6 7 8, 1 3 2 4])
+          cnt (float-array 8)
+          cnn (float-array 8)
+          no-strided {(ns-resolve 'raster.linalg.blas 'sgemm-batch-strided-mh)
+                      (delay nil)}]
+      (with-redefs-fn no-strided
+        #(do (blas/batched-gemm-nt! a b cnt 2 2 2 2 (float 1.0))
+             (blas/batched-gemm-nn! a b cnn 2 2 2 2 (float 1.0))))
+      (is (= [17.0 23.0 39.0 53.0, 2.0 4.0 6.0 8.0] (mapv float cnt)))
+      (is (= [19.0 22.0 43.0 50.0, 2.0 6.0 4.0 8.0] (mapv float cnn))))))
