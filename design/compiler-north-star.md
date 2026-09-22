@@ -614,6 +614,24 @@ noisy 9.895 microsecond device-event median, versus the earlier 321 microsecond 
 opt-in canary validates the result, records the exact emitted artifact, and applies a deliberately
 broad 30x launch-aware roofline cliff. Stable-machine baselines remain the regression authority;
 ordinary CI compiles and validates the route but makes no laptop timing claim.
+LayerNorm uses the same operation without a named compiler path.  Its ordered fold tuple first
+reduces the mean and then reduces centered squares using that completed mean; the final affine map
+shares the same workgroup and kernel.  Both floating folds explicitly authorize reassociation, while
+the original polymorphic entry retains declaration-order reference semantics.  This avoids the
+unstable `E[x²] - E[x]²` shortcut and the former five-kernel partial-moment experiment without
+adding normalization-specific IR or emission.  The allocating spelling is only allocation plus a
+call to that same operation; its exact dense result discharges the fresh zero initializer.
+Packed projection consumers likewise remain typed address algebra rather than contraction
+epilogues named after a model.  The gated exact-GELU library operation reads two row-strided fields
+and writes one packed field as an ordinary map.  A composition regression places it between two
+allocating contractions and requires both contractions plus the packed map to remain independently
+scheduled, so declining a future fusion opportunity cannot erase either producer schedule.
+RoPE and the attention value reduction expose the same strided-source contract: logical outputs are
+dense, while source row stride and column offset are scalar coordinates proved by the usual index
+and storage analyses.  Their original packed-input entries delegate to offset zero, so there is one
+semantic implementation.  Q/K/V fields may consequently be consumed directly from a combined
+projection without materialized slice kernels; no view, attention or projection case is added to
+the compiler.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows
@@ -688,6 +706,15 @@ become ABI captures, and the contraction store changes from read-write to write-
 the separate bias-fill launch from ordinary linear projections without introducing a linear, GEMM,
 or attention opcode; mismatched extents, unproved addresses, observable initialization results and
 fold reads of the old destination remain materialized.
+Fresh-allocation initialization uses the same rule at the program boundary. Dense functional
+results and unconditional unique effect regions may discharge a zero initializer only when the
+mixed-radix index algebra proves an exact, zero-based image and scalar SSA proves that image has
+the allocation's complete volume. Injectivity or an ABI write permission alone is insufficient:
+padded rows, guarded stores, translated subviews, aliases and unproved shape relations retain the
+initializer. Nested dynamically allocated slice calls retain their ordered compatibility source
+until nested parallel allocation is representable; turning that library body into a parallel map
+would make existing scalar fallbacks illegal. Performance consumers instead carry source stride
+and offset coordinates directly, where the ordinary index algebra can prove them.
 Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
 the certified compatibility front door, and may still use `SegContract`, until the typed equation
 has explicit facts for them; admitting them while dropping those contracts would be a miscompile,
@@ -913,9 +940,13 @@ SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logic
 whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
 consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
 resident rewrite and typed-route opt-out are deleted. The analyzed front end now constructs this
-TypedSOAC subset directly. Certified inclusive and exclusive scans also cross the same typed
-algorithm and scheduled-program boundary, retaining explicit destination, result-layout, and
-graph-owned temporary-storage contracts. Migration is complete when hardware-costed multi-consumer
+TypedSOAC subset directly. A whole-program coverage decline no longer erases independently valid
+producer semantics: local BLAS and indexed-operation canonicalization survives into compatibility
+scheduling, so an unsupported consumer remains materialized at its own source site while its GEMM
+producer still lowers as the same typed contraction. Certified inclusive and exclusive scans also
+cross the same typed algorithm and scheduled-program boundary, retaining explicit destination,
+result-layout, and graph-owned temporary-storage contracts. Migration is complete when
+hardware-costed multi-consumer
 fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted.
 Full contractions with one pointwise reduction axis and disjoint caller-owned output now use the
 same TypedSOAC segmented reduction with an empty segment space. They lower to the complete scalar

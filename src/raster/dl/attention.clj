@@ -2016,29 +2016,40 @@
 ;; cache, positions from the work-item index. Causal mask via -1e30 scores.
 ;; ---------------------------------------------------------------------------
 
+(deftm rope-prefill-strided!
+  "Apply prefill RoPE while reading a packed field from a row-strided source.  Output is dense
+  [nrows,heads,head-dim]; row-stride and column-offset describe only the source view."
+  (All [T] [x :- (Array T) out :- (Array T)
+            nrows :- Long heads :- Long head-dim :- Long theta :- Double
+            row-stride :- Long column-offset :- Long] :- Void
+       (raster.par/map-void!
+        idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+        (let [hdim2 (quot head-dim 2)
+              per-row (clojure.core/* heads hdim2)
+              t (quot idx per-row)
+              rest0 (rem idx per-row)
+              h (quot rest0 hdim2)
+              i (rem rest0 hdim2)
+              source-base (clojure.core/+ (clojure.core/* t row-stride)
+                                          (clojure.core/+ column-offset
+                                                          (clojure.core/* h head-dim)))
+              output-base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                                          (clojure.core/* h head-dim))
+              ln-theta (m/log theta)
+              freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+              ang (* (double t) freq)
+              c (m/cos ang) s (m/sin ang)
+              x0 (aget x (clojure.core/+ source-base i))
+              x1 (aget x (clojure.core/+ (clojure.core/+ source-base i) hdim2))]
+          (aset out (clojure.core/+ output-base i) (- (* x0 c) (* x1 s)))
+          (aset out (clojure.core/+ (clojure.core/+ output-base i) hdim2)
+                (+ (* x1 c) (* x0 s)))))))
+
 (deftm rope-prefill! (All [T] [x :- (Array T) out :- (Array T)
                                nrows :- Long heads :- Long head-dim :- Long
                                theta :- Double] :- Void
-                          (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads head-dim))
-                                                (let [hdim2 (quot head-dim 2)
-                                                      per-row (clojure.core/* heads head-dim)
-                                                      t (quot idx per-row)
-                                                      rest0 (rem idx per-row)
-                                                      h (quot rest0 head-dim)
-                                                      d (rem rest0 head-dim)
-                                                      i (rem d hdim2)
-                                                      base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
-                                                                           (clojure.core/* h head-dim))
-                                                      ln-theta (m/log theta)
-                                                      freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                                      ang (* (double t) freq)
-                                                      c (m/cos ang) s (m/sin ang)
-                                                      x0 (aget x (clojure.core/+ base i))
-                                                      x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                  (aset out idx
-                                                        (if (< d hdim2)
-                                                          (- (* x0 c) (* x1 s))
-                                                          (+ (* x1 c) (* x0 s))))))))
+                          (rope-prefill-strided! x out nrows heads head-dim theta
+                                                 (clojure.core/* heads head-dim) 0)))
 
 ;; Causal batched attention, 3 phases. q:[T,nq*hd] k,v:[T,nkv*hd] row-major;
 ;; sc:[T*nq, T] scores/probs scratch; out:[T, nq*hd].
@@ -2104,32 +2115,45 @@
                                       (+ sum (m/exp (- (aget sc (clojure.core/+
                                                                  (clojure.core/* row nrows) j))
                                                        mx)))]]
-                                    [(/ (m/exp (- (aget sc (clojure.core/+
+                                   [(/ (m/exp (- (aget sc (clojure.core/+
                                                             (clojure.core/* row nrows) j))
                                                   mx))
                                         sum)])
                                    probs-buffer)))
 
+(deftm attn-prefill-out-strided!
+  "Apply prefill probabilities to a V field embedded in a row-strided source.  The result remains
+  dense [nrows,n-q,head-dim]; source row stride/offset are ordinary view coordinates."
+  (All [T] [sc :- (Array T) v :- (Array T) out :- (Array T)
+            nrows :- Long n-q :- Long group :- Long n-kv :- Long head-dim :- Long
+            v-row-stride :- Long v-column-offset :- Long] :- Void
+       (raster.par/map-void!
+        idx (clojure.core/* nrows (clojure.core/* n-q head-dim))
+        (let [per-i (clojure.core/* n-q head-dim)
+              i (quot idx per-i)
+              rest0 (rem idx per-i)
+              hq (quot rest0 head-dim)
+              d (rem rest0 head-dim)
+              row (clojure.core/+ (clojure.core/* i n-q) hq)
+              scb (clojure.core/* row nrows)
+              hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
+          (aset out (clojure.core/+ (clojure.core/* i per-i)
+                                    (clojure.core/+ (clojure.core/* hq head-dim) d))
+                (loop [j 0 a 0.0]
+                  (if (< j nrows)
+                    (recur (inc j)
+                           (+ a (* (aget sc (clojure.core/+ scb j))
+                                   (aget v (clojure.core/+ (clojure.core/* j v-row-stride)
+                                                           (clojure.core/+ v-column-offset
+                                                                           hkvb))))))
+                    a)))))))
+
 (deftm attn-prefill-out! (All [T] [sc :- (Array T) v :- (Array T) out :- (Array T)
                                    nrows :- Long n-q :- Long group :- Long
                                    n-kv :- Long head-dim :- Long] :- Void
-                              (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q head-dim))
-                                                    (let [per-i (clojure.core/* n-q head-dim)
-                                                          i (quot idx per-i)
-                                                          rest0 (rem idx per-i)
-                                                          hq (quot rest0 head-dim)
-                                                          d (rem rest0 head-dim)
-                                                          row (clojure.core/+ (clojure.core/* i n-q) hq)
-                                                          scb (clojure.core/* row nrows)
-                                                          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)
-                                                          kvstride (clojure.core/* n-kv head-dim)]
-                                                      (aset out idx
-                                                            (loop [j 0 a 0.0]
-                                                              (if (< j nrows)
-                                                                (recur (inc j)
-                                                                       (+ a (* (aget sc (clojure.core/+ scb j))
-                                                                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
-                                                                a)))))))
+                              (attn-prefill-out-strided!
+                               sc v out nrows n-q group n-kv head-dim
+                               (clojure.core/* n-kv head-dim) 0)))
 
 ;; Bidirectional scores (EmbeddingGemma-style encoder): all-to-all, no causal mask.
 ;; (Symmetric sliding window |i-j| < w only matters for T > window — the binder

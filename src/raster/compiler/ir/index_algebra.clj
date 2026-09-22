@@ -552,6 +552,77 @@
                             (dominates? coefficient required quot-facts))))
                    (range (count ordered))))))))
 
+(defn dense?
+  "Sufficient condition that an index form enumerates exactly `[0, product(radices))`.
+
+   This is deliberately stronger than injectivity.  Starting at coefficient one, every next
+   digit must have exactly the carry stride produced by all lower digits; domination is not
+   enough because padding would leave holes.  A non-zero invariant translation is likewise not
+   dense in the allocation rooted at zero.  Degenerate equal-stride digits conservatively
+   decline rather than choosing an arbitrary order."
+  [{:keys [terms offset-terms] :as form}]
+  (boolean
+   (and form (complete? form) (empty? offset-terms)
+        (loop [remaining (vec (vals terms))
+               expected {:const 1 :factors []}]
+          (if (empty? remaining)
+            true
+            (let [matches (keep-indexed
+                           (fn [position {:keys [coefficient]}]
+                             (when (= expected coefficient) position))
+                           remaining)]
+              (when (= 1 (count matches))
+                (let [position (first matches)
+                      {:keys [radix]} (nth remaining position)]
+                  (recur (vec (concat (subvec remaining 0 position)
+                                      (subvec remaining (inc position))))
+                         (product expected radix))))))))))
+
+(declare offset-multiple)
+
+(defn dense-translated-forms?
+  "Whether identical affine domains, translated by consecutive inner slabs, tile from zero.
+
+   This is the complete-write counterpart of `disjoint-translated-forms?`: offsets must be
+   exactly `0, stride, ..., (n-1)·stride`, and treating the store ordinal as one more digit must
+   produce a dense mixed-radix form.  Common non-zero base translations and gapped slabs are not
+   complete allocation coverage."
+  [forms]
+  (let [forms (vec forms)]
+    (boolean
+     (if (= 1 (count forms))
+       (dense? (first forms))
+       (when (seq forms)
+         (let [base (first forms)
+               same-domain? #(= (select-keys base [:terms :leaves :parents :quot-facts
+                                                    :fixed-leaves])
+                                (select-keys % [:terms :leaves :parents :quot-facts
+                                                 :fixed-leaves]))
+               offsets (mapv (fn [{:keys [offset-terms]}]
+                               (cond
+                                 (empty? offset-terms) {:const 0 :factors []}
+                                 (= 1 (count offset-terms)) (first offset-terms)
+                                 :else nil))
+                             forms)
+               zero {:const 0 :factors []}
+               nonzero (remove #(= zero %) offsets)]
+           (and (every? same-domain? forms)
+                (every? some? offsets)
+                (some #(= zero %) offsets)
+                (seq nonzero)
+                (let [stride (reduce (fn [a b]
+                                       (if (dominates? a b (:quot-facts base)) b a))
+                                     nonzero)
+                      multiples (mapv #(if (= zero %) 0 (offset-multiple % stride)) offsets)
+                      count* (count forms)]
+                  (and (= (set (range count*)) (set multiples))
+                       (dense? (-> base
+                                   (assoc :offset zero :offset-terms [])
+                                   (assoc-in [:terms 'rstr_store_ordinal]
+                                             {:coefficient stride
+                                              :radix {:const count* :factors []}})
+                                   (update :leaves conj 'rstr_store_ordinal))))))))))))
+
 (defn- offset-multiple
   "The integer `q` with `offset = q·stride` for monomials, or nil."
   [offset stride]

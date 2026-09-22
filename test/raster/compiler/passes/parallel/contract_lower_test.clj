@@ -78,4 +78,13 @@
       (is (= 3 (count (segop/seg-space-segment-dims (:space sr)))))
       (is (= {:name 'l :bound 'k} (segop/seg-space-reduced-dim (:space sr))))
       (is (= '(* (* btch m) n) (segop/seg-space-num-segments-expr (:space sr))))
-      (is (= '#{btch m n k} (:scalars sr))))))
+      (is (= '#{btch m n k x y} (:scalars sr))
+          "free body coordinates are semantic scalar operands, not implicit globals"))))
+
+(deftest contraction-body-uniform-scalars-survive-schedule-projection
+  (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
+                                   (* (double scale)
+                                      (* (aget A (+ (* i k) l))
+                                         (aget B (+ (* l n) j)))))
+        operation (cl/contract-form->segred form :dtype :float)]
+    (is (= '#{m n k scale} (:scalars operation)))))

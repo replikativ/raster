@@ -349,15 +349,6 @@
       (let [mean (/ (+ (aget y 0) (aget y 1) (aget y 2)) 3.0)]
         (is (approx= 0.0 mean 1e-4)))))
 
-  (testing "chunked layer-norm matches the row-serial primitive"
-    (let [x (double-array [0.2 -0.7 1.4 2.0 -1.1 0.3 0.8
-                           3.1 0.4 -2.2 0.1 1.7 -0.5 0.9])
-          gamma (double-array [0.5 1.1 -0.2 0.7 1.3 -0.8 0.4])
-          beta (double-array [0.1 -0.3 0.2 0.0 0.4 0.6 -0.1])
-          expected (nn/layer-norm x gamma beta 2 7 1e-5)
-          actual (nn/layer-norm-chunked x gamma beta 2 7 4 1e-5)]
-      (is (arr-approx= expected actual 1e-12))))
-
   (testing "layer-norm gradient"
     (let [x (double-array [0.1 0.2 0.3 0.4 0.5 0.6])
           gamma (double-array [1.0 1.0 1.0])
@@ -372,6 +363,64 @@
                      (+ (aget y 0) (aget y 4)))
                   x 1e-5)]
       (is (arr-approx= dx num-dx 1e-3)))))
+
+(deftest reassociated-layer-norm-test
+  (testing "ordered cooperative folds retain centered-variance LayerNorm semantics"
+    (doseq [[rows features] [[1 1] [1 17] [3 5]]]
+      (let [x (float-array (map #(float (+ 1000.0 (/ (- (mod % 11) 5) 7.0)))
+                                (range (* rows features))))
+            gamma (float-array (map #(float (/ (inc (mod % 5)) 4.0)) (range features)))
+            beta (float-array (map #(float (/ (- (mod % 3) 1) 5.0)) (range features)))
+            expected (float-array (* rows features))
+            actual (float-array (* rows features))]
+        (nn/layer-norm! x gamma beta expected rows features 1.0e-5)
+        (nn/layer-norm-reassociated! x gamma beta actual rows features 1.0e-5)
+        (is (every? #(< (Math/abs (double %)) 2.0e-3)
+                    (map - (vec expected) (vec actual))))
+        (is (every? #(< (Math/abs (double %)) 2.0e-3)
+                    (map - (vec expected)
+                         (vec (nn/layer-norm-reassociated
+                               x gamma beta rows features 1.0e-5)))))))))
+
+(deftest exact-gelu-mul-consumes-strided-fields-without-slices
+  (let [rows 3
+        width 5
+        stride 13
+        left-offset 1
+        right-offset 7
+        src (double-array (map #(/ (- (mod % 17) 8) 5.0) (range (* rows stride))))
+        activated (double-array (* rows width))
+        gate (double-array (* rows width))
+        expected (double-array (* rows width))
+        actual (double-array (* rows width))]
+    (dotimes [i (* rows width)]
+      (let [row (quot i width)
+            column (rem i width)]
+        (aset activated i (aget src (+ (* row stride) left-offset column)))
+        (aset gate i (aget src (+ (* row stride) right-offset column)))))
+    (nn/gelu-erf! activated expected (* rows width))
+    (dotimes [i (* rows width)]
+      (aset expected i (* (aget expected i) (aget gate i))))
+    (nn/gelu-erf-mul-strided! src actual rows stride left-offset right-offset width)
+    (is (arr-approx= expected actual 1.0e-12)))
+  (testing "fused float execution retains the removed activation store's rounding"
+    (let [src (float-array [99.0 -1.75 7.0 0.625 -0.03125 11.0
+                            99.0 1.125 7.0 -2.25 0.375 11.0])
+          activated (float-array 4)
+          gate (float-array 4)
+          expected (float-array 4)
+          actual (float-array 4)]
+      (dotimes [i 4]
+        (let [row (quot i 2)
+              column (rem i 2)]
+          (aset activated i (aget src (+ (* row 6) 1 column)))
+          (aset gate i (aget src (+ (* row 6) 3 column)))))
+      (nn/gelu-erf! activated expected 4)
+      (dotimes [i 4]
+        (aset expected i (* (aget expected i) (aget gate i))))
+      (nn/gelu-erf-mul-strided! src actual 2 6 1 3 2)
+      (is (= (mapv #(Float/floatToRawIntBits %) expected)
+             (mapv #(Float/floatToRawIntBits %) actual))))))
 
 ;; ================================================================
 ;; Group Norm tests

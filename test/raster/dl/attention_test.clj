@@ -34,6 +34,37 @@
           (aset grad i (/ (- f+ f0) eps)))))
     grad))
 
+(deftest packed-prefill-views-match-materialized-inputs
+  (let [rows 3
+        heads 2
+        head-dim 4
+        width (* heads head-dim)
+        stride (+ (* 3 width) 2)
+        q-offset 1
+        v-offset (+ 1 (* 2 width))
+        packed (double-array (map #(/ (- (mod % 19) 9) 7.0) (range (* rows stride))))
+        q (double-array (* rows width))
+        v (double-array (* rows width))
+        q-reference (double-array (* rows width))
+        q-strided (double-array (* rows width))
+        scores (double-array (map #(/ (inc (mod % 5)) 15.0)
+                                  (range (* rows heads rows))))
+        out-reference (double-array (* rows width))
+        out-strided (double-array (* rows width))]
+    (dotimes [i (* rows width)]
+      (let [row (quot i width)
+            column (rem i width)]
+        (aset q i (aget packed (+ (* row stride) q-offset column)))
+        (aset v i (aget packed (+ (* row stride) v-offset column)))))
+    (attn/rope-prefill! q q-reference rows heads head-dim 10000.0)
+    (attn/rope-prefill-strided! packed q-strided rows heads head-dim 10000.0
+                                stride q-offset)
+    (attn/attn-prefill-out! scores v out-reference rows heads 1 heads head-dim)
+    (attn/attn-prefill-out-strided! scores packed out-strided
+                                    rows heads 1 heads head-dim stride v-offset)
+    (is (arr-approx= q-reference q-strided 1.0e-12))
+    (is (arr-approx= out-reference out-strided 1.0e-12))))
+
 ;; ================================================================
 ;; Scaled dot-product attention
 ;; ================================================================
