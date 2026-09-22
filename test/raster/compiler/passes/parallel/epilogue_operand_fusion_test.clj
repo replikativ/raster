@@ -65,7 +65,8 @@
     (let [f (fuse (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't)))
           {:keys [source epi-ops]} (emitted-epilogue f)]
       (is (= (am/of-axes [['i M] ['j N]]) (:map (first (:operands (:epilogue f))))))
-      (is (re-find (re-pattern (str "R\\[[^]]*row[^]]*" N "[^]]*col")) source))
+      (is (re-find #"R\[[^]]*row[^]]*N[^]]*col" source)
+          "scheduled epilogue addressing must reuse the matrix N ABI parameter")
       (is (= '[R] epi-ops))))
   (testing "per-row scale: operand map is [i], emitted index is rs[row]"
     (let [f (fuse (list 'raster.numeric/* (list 'aget 'C 't) (list 'aget 'rs (list 'quot 't N))))
