@@ -621,6 +621,17 @@ the original polymorphic entry retains declaration-order reference semantics.  T
 unstable `E[x²] - E[x]²` shortcut and the former five-kernel partial-moment experiment without
 adding normalization-specific IR or emission.  The allocating spelling is only allocation plus a
 call to that same operation; its exact dense result discharges the fresh zero initializer.
+Packed projection consumers likewise remain typed address algebra rather than contraction
+epilogues named after a model.  The gated exact-GELU library operation reads two row-strided fields
+and writes one packed field as an ordinary map.  A composition regression places it between two
+allocating contractions and requires both contractions plus the packed map to remain independently
+scheduled, so declining a future fusion opportunity cannot erase either producer schedule.
+RoPE and the attention value reduction expose the same strided-source contract: logical outputs are
+dense, while source row stride and column offset are scalar coordinates proved by the usual index
+and storage analyses.  Their original packed-input entries delegate to offset zero, so there is one
+semantic implementation.  Q/K/V fields may consequently be consumed directly from a combined
+projection without materialized slice kernels; no view, attention or projection case is added to
+the compiler.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows

@@ -382,6 +382,46 @@
                          (vec (nn/layer-norm-reassociated
                                x gamma beta rows features 1.0e-5)))))))))
 
+(deftest exact-gelu-mul-consumes-strided-fields-without-slices
+  (let [rows 3
+        width 5
+        stride 13
+        left-offset 1
+        right-offset 7
+        src (double-array (map #(/ (- (mod % 17) 8) 5.0) (range (* rows stride))))
+        activated (double-array (* rows width))
+        gate (double-array (* rows width))
+        expected (double-array (* rows width))
+        actual (double-array (* rows width))]
+    (dotimes [i (* rows width)]
+      (let [row (quot i width)
+            column (rem i width)]
+        (aset activated i (aget src (+ (* row stride) left-offset column)))
+        (aset gate i (aget src (+ (* row stride) right-offset column)))))
+    (nn/gelu-erf! activated expected (* rows width))
+    (dotimes [i (* rows width)]
+      (aset expected i (* (aget expected i) (aget gate i))))
+    (nn/gelu-erf-mul-strided! src actual rows stride left-offset right-offset width)
+    (is (arr-approx= expected actual 1.0e-12)))
+  (testing "fused float execution retains the removed activation store's rounding"
+    (let [src (float-array [99.0 -1.75 7.0 0.625 -0.03125 11.0
+                            99.0 1.125 7.0 -2.25 0.375 11.0])
+          activated (float-array 4)
+          gate (float-array 4)
+          expected (float-array 4)
+          actual (float-array 4)]
+      (dotimes [i 4]
+        (let [row (quot i 2)
+              column (rem i 2)]
+          (aset activated i (aget src (+ (* row 6) 1 column)))
+          (aset gate i (aget src (+ (* row 6) 3 column)))))
+      (nn/gelu-erf! activated expected 4)
+      (dotimes [i 4]
+        (aset expected i (* (aget expected i) (aget gate i))))
+      (nn/gelu-erf-mul-strided! src actual 2 6 1 3 2)
+      (is (= (mapv #(Float/floatToRawIntBits %) expected)
+             (mapv #(Float/floatToRawIntBits %) actual))))))
+
 ;; ================================================================
 ;; Group Norm tests
 ;; ================================================================
