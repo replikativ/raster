@@ -489,7 +489,15 @@ application-owned retained `deftm` callees, while calls into those exact Raster 
 or JVM interop are covered by the build identity. Opaque application Vars, unresolved calls and
 dynamic local calls remain explicit persistence blockers. This establishes eligibility for a later
 artifact store; it does not serialize closure-bearing descriptors. Unsupported runtime values also
-make persistence fail closed. The remaining
+make persistence fail closed. Eligible equation-first compilations now have a versioned lowerable
+artifact envelope. The outer envelope authenticates the semantic request, compiler build, resolved
+source closure and target descriptor before its typed payload is reconstructed. Boring archival
+CBOR is only the transport; canonical semantic fingerprints remain the identity authority. Raster
+explicitly preserves the Clojure sequence and narrow-integer distinctions that CBOR arrays and
+integers do not carry, then revalidates the invocation plan, emitted program and every kernel
+artifact after decoding. Runtime handles and closures never enter the payload. The remaining store
+policy must add atomic publication, bounded retention and miss/corruption reporting without
+weakening these checks. The remaining
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 
