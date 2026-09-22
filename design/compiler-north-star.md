@@ -496,8 +496,12 @@ CBOR is only the transport; canonical semantic fingerprints remain the identity 
 explicitly preserves the Clojure sequence and narrow-integer distinctions that CBOR arrays and
 integers do not carry, then revalidates the invocation plan, emitted program and every kernel
 artifact after decoding. Runtime handles and closures never enter the payload. The remaining store
-policy must add atomic publication, bounded retention and miss/corruption reporting without
-weakening these checks. The remaining
+is content-addressed by the semantic request under a configurable non-temporary cache root. It
+publishes through an atomic rename, bounds entry count and total bytes, treats corruption and I/O
+failure as observable misses, and is consulted only for persistence-eligible equation-first
+templates. Process-local templates remain the first level. The remaining operational work is
+cross-process locking/duplicate-work suppression and measured retention policy; neither may weaken
+the artifact checks. The remaining
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 

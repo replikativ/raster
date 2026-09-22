@@ -1,9 +1,13 @@
 (ns raster.compiler.equation-artifact-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.compiler.equation-artifact :as artifact]
+            [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
             [raster.core :refer [deftm]]
-            [raster.runtime.hardware :as hardware]))
+            [raster.gpu.compiled :as compiled]
+            [raster.runtime.hardware :as hardware])
+  (:import [java.nio.file Files Path]
+           [java.util Comparator]))
 
 (def ^:private target :cuda:equation-artifact-test)
 
@@ -42,6 +46,16 @@
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(defn- with-temporary-directory [f]
+  (let [directory (Files/createTempDirectory "raster-equation-artifacts-"
+                                             (make-array java.nio.file.attribute.FileAttribute 0))]
+    (try
+      (f directory)
+      (finally
+        (with-open [paths (Files/walk directory (make-array java.nio.file.FileVisitOption 0))]
+          (doseq [^Path path (iterator-seq (.iterator (.sorted paths (Comparator/reverseOrder))))]
+            (Files/deleteIfExists path)))))))
+
 (deftest equation-compilation-round-trips-and-remains-lowerable
   (let [original @compilation
         envelope (artifact/seal identity original)
@@ -75,3 +89,52 @@
   (is (= :semantic-fingerprint-unsupported
          (reason-of #(artifact/seal identity
                                     (assoc @compilation :options {:callback (fn [] nil)}))))))
+
+(deftest atomic-store-round-trips-bounds-and-reports-corruption
+  (with-temporary-directory
+    (fn [directory]
+      (let [cache (store/make-store {:root (.toFile directory) :max-entries 1
+                                     :max-bytes (* 1024 1024)})
+            first-id identity
+            second-id (assoc identity :semantic-request-fingerprint "second-request")]
+        (is (= :stored (:status (store/store-artifact!
+                                 cache "semantic-request" first-id @compilation))))
+        (is (= @compilation
+               (:value (store/load-artifact cache "semantic-request" first-id))))
+        (store/store-artifact! cache "second-request" second-id @compilation)
+        (is (= 1 (count (filter #(.endsWith (.getName ^java.io.File %) ".cbor")
+                                (.listFiles (.toFile directory))))))
+        (let [entry (store/entry-file cache "second-request")]
+          (Files/write (.toPath entry) (byte-array [0 1 2])
+                       (make-array java.nio.file.OpenOption 0))
+          (is (= {:status :miss :reason :invalid-entry}
+                 (select-keys (store/load-artifact cache "second-request" second-id)
+                              [:status :reason]))))))))
+
+(deftest equation-template-cache-reuses-a-persistent-artifact-after-process-clear
+  (with-temporary-directory
+    (fn [directory]
+      (let [cache (store/make-store {:root (.toFile directory) :max-entries 4
+                                     :max-bytes (* 4 1024 1024)})
+            key {:kind ::persistent-fixture
+                 :semantic-fingerprint "semantic-request"
+                 :persistent-cache-eligible? true
+                 :persistence-blockers #{}
+                 :semantic-request
+                 {:compiler-build-fingerprint "compiler-build"
+                  :source {:source-dependency-fingerprint "source-dependencies"}
+                  :target {:descriptor-fingerprint "target-descriptor"}}}
+            compiles (atom 0)
+            report (atom nil)]
+        (compiled/clear-compilation-cache!)
+        (binding [compiled/*equation-artifact-store* cache]
+          (#'compiled/cached-compilation-template
+           key :equation-first #(do (swap! compiles inc) @compilation)))
+        (compiled/clear-compilation-cache!)
+        (binding [compiled/*equation-artifact-store* cache
+                  compiled/*compilation-template-observer* #(reset! report %)]
+          (is (= @compilation
+                 (#'compiled/cached-compilation-template
+                  key :equation-first #(throw (ex-info "must not compile" {}))))))
+        (is (= 1 @compiles))
+        (is (= :hit (get-in @report [:persistent-artifact :status])))))))
