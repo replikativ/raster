@@ -871,11 +871,21 @@
                     (try
                       ;; The scheduled SegRed carries its equation's dtype; a double contraction
                       ;; inside a float program routes at its own precision, not the program's.
-                      (croute/route-typed-contraction-dispatch
+                      (apply
+                       croute/route-typed-contraction-dispatch
                        typed-algorithm bound-sr
-                       :dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
-                       :precision (:precision schedule)
-                       :matrix-tiles (get-in schedule [:typed-contraction :matrix-tiles] :default))
+                       (concat
+                        [:dtype (:dtype bound-sr) :tile (:tile schedule) :desc target-desc
+                         :precision (:precision schedule)
+                         :matrix-tiles
+                         (get-in schedule [:typed-contraction :matrix-tiles] :default)]
+                        ;; A partial/internal schedule must retain the matrix route's defaults;
+                        ;; only resolved public controls override them.
+                        (mapcat identity
+                                (select-keys (:gemm-dispatch schedule)
+                                             [:target-fill-multiple
+                                              :min-split-chunk
+                                              :max-splits]))))
                       (catch clojure.lang.ExceptionInfo exception
                         (let [reason (:reason (ex-data exception))]
                           (if (contains? #{:typed-contraction-dispatch-invoke-protocol}

@@ -1670,6 +1670,60 @@
                (kdispatch/with-selector dispatch {:kind :fixed-strategy :strategy strategy})
                [:a :b :c 256 256 512])))))))
 
+(deftest typed-matrix-dispatch-consumes-resolved-split-occupancy-policy
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                                          (* (clojure.core/aget A (+ (* i k) l))
+                                             (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ze:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :int 'n :int 'k :int}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192
+                    :shared-local-memory 131072}
+        route (fn [min-split-chunk]
+                (contract-route/route-typed-contraction-dispatch
+                 algorithm operation :dtype :float :desc descriptor
+                 :precision :mixed-f16-f32
+                 :target-fill-multiple 4 :min-split-chunk min-split-chunk
+                 :max-splits 64))
+        arguments [:a :b :c 96 1024 1024]
+        emitted
+        (with-redefs [hardware/descriptor-for (constantly descriptor)]
+          (opencl-pass/opencl-pass
+           form :device-id :ze:0 :dtype :float :min-elements 0
+           :schedule {:precision :mixed-f16-f32
+                      :tile (hardware/derive-gemm-tile descriptor)
+                      :typed-contraction {:matrix-tiles :default :measured-selectors {}}
+                      :gemm-dispatch {:target-fill-multiple 4
+                                      :min-split-chunk 256
+                                      :max-splits 64}}))]
+    (is (= :xmx-direct
+           (executable/strategy
+            (kdispatch/select-alternative (route 1024) arguments)))
+        "one 1024-element chunk cannot increase occupancy")
+    (is (= :xmx-split-k
+           (executable/strategy
+            (kdispatch/select-alternative (route 256) arguments)))
+        "the resolved policy permits four K partitions for the same typed equation")
+    (is (= 4
+           (kernel-launch/resolve-expression
+            {'m 96 'n 1024 'k 1024}
+            (get-in (kdispatch/alternative (route 256) :xmx-split-k)
+                    [:attributes :requested-splits]))))
+    (is (= :xmx-split-k
+           (executable/strategy
+            (kdispatch/select-alternative (first (:dispatches emitted)) arguments)))
+        "the canonical GPU pass must propagate the resolved public schedule policy")))
+
 (deftest batched-f32-contraction-derives-one-grid-z-matrix-schedule
   (let [source
         '(let* [step (raster.par/contract
