@@ -206,7 +206,11 @@
         batched-col
         '(clojure.core/+ (clojure.core/*
                           (clojure.core/+ (clojure.core/* b 8) l) 6) j)
-        shared-col '(clojure.core/+ (clojure.core/* l 6) j)]
+        shared-col '(clojure.core/+ (clojure.core/* l 6) j)
+        batched-col-nt
+        '(clojure.core/+ (clojure.core/*
+                          (clojure.core/+ (clojure.core/* b 6) j) 8) l)
+        shared-col-nt '(clojure.core/+ (clojure.core/* j 8) l)]
     (testing "both operands may carry the leading batch axis"
       (let [view (cf/dense-matrix-view
                   (cf/contraction-facts (form batched-col) :dtype :float))]
@@ -215,13 +219,25 @@
         (is (= 3 (:batch view)))
         (is (= [4 6 8] (:dimensions view)))
         (is (= {:row true :col true} (:batching view)))
+        (is (= :nn (:variant view)))
         (is (= '{:row A :col B} (:bindings view)))))
     (testing "a batch-local activation may contract with stable shared weights"
       (let [view (cf/dense-matrix-view
                   (cf/contraction-facts (form shared-col) :dtype :float))]
         (is (:ok view))
         (is (= {:row true :col false} (:batching view)))
-        (is (= '{:row A :col B} (:bindings view)))))))
+        (is (= :nn (:variant view)))
+        (is (= '{:row A :col B} (:bindings view)))))
+    (doseq [[label col-index batching]
+            [["batch-local NT storage" batched-col-nt {:row true :col true}]
+             ["shared NT storage" shared-col-nt {:row true :col false}]]]
+      (testing label
+        (let [view (cf/dense-matrix-view
+                    (cf/contraction-facts (form col-index) :dtype :float))]
+          (is (:ok view))
+          (is (= :nt (:variant view)))
+          (is (= batching (:batching view)))
+          (is (= '{:row A :col B} (:bindings view))))))))
 
 (deftest orientation-is-a-data-row
   (let [nn (cf/contraction-facts (mm-form nn-idx))

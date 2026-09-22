@@ -3,6 +3,7 @@
             [raster.arrays :as ra]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.pipeline :as pipeline]
@@ -57,6 +58,25 @@
     (is (every? some? (map :artifact steps)))
     (is (= 3 (count (:allocs descriptor)))
         "only the packed projection, fused hidden value and final output are materialized")))
+
+(deftest bidirectional-sdpa-is-layout-two-contractions-and-softmax
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'attention/bidirectional-sdpa :ze:0 :dtype :float
+                    :on-non-resident :throw)
+        steps (:steps descriptor)
+        strategies (fn [step]
+                     (some->> step :dispatch :alternatives
+                              (mapv executable/strategy)))]
+    (is (= [:map-void :executable :executable :executable :map]
+           (mapv :convention steps)))
+    (is (= [:portable-segred :xmx-batched] (strategies (nth steps 1)))
+        "scaled batched QKᵀ is the generic NT matrix schedule")
+    (is (= [:grid-stride-one-work-item-per-segment] (strategies (nth steps 2)))
+        "softmax remains a first-class segmented fold-map")
+    (is (= [:portable-segred :xmx-batched] (strategies (nth steps 3)))
+        "probabilities×V is the generic NN matrix schedule")
+    (is (= 7 (count (:allocs descriptor)))
+        "all intermediates are compiler-owned resident scratch")))
 
 (deftm packed-qkv-consumers
   [x :- (Array float) qkv-weight :- (Array float) scores :- (Array float)

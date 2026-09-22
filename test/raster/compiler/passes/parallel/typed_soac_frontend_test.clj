@@ -1763,6 +1763,7 @@
           program (frontend/form->program (frontend/normalize-source source options) options)
           equation (first (dialect/equations program))
           {:keys [attributes lambda]} (dialect/operation-parts equation)
+          transform (:result-transform attributes)
           body (first (:body-results (dialect/lambda-parts lambda)))
           b-index (some (fn [expression]
                           (when (and (seq? expression)
@@ -1777,6 +1778,12 @@
              (:segment-axes attributes)))
       (is (= 'k (:extent attributes)))
       (is (some #{'scale} (dialect/operation-inputs equation)))
+      (is (= [] (:operands transform)))
+      (is (= [{:value 'scale :parameter '%result-scalar0 :dtype :float}]
+             (:scalars transform))
+          "BLAS alpha is a typed result transform, not an opaque extra reduction factor")
+      (is (not-any? #{'scale} (flatten body))
+          "the schedule-replaceable reduction body remains exactly A·B")
       (is (every? (set (flatten b-index))
                   '[rstr_gemm_batch_0 rstr_gemm_j_0 rstr_gemm_l_0])
           "B's ordinary row-major index retains the batch, column, and reduction axes")
