@@ -1640,15 +1640,17 @@
                   algorithm operation :dtype :float :desc descriptor
                   :precision :mixed-f16-f32 :matrix-tiles :finite)
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
+        direct-strategies (into #{:xmx-direct}
+                                (map gpu-gemm/direct-tile-strategy (rest tiles)))
         dynamic-strategies (into #{:xmx-direct-dynamic-lhs}
                                  (map gpu-gemm/dynamic-lhs-strategy (rest tiles)))
         fused-strategies (into #{:xmx-direct-tile-inputs}
                                (map gpu-gemm/tile-input-strategy (rest tiles)))
-        tile-strategies (into dynamic-strategies fused-strategies)]
+        tile-strategies (into direct-strategies (into dynamic-strategies fused-strategies))]
     (is (> (count tiles) 1))
     (is (= (count strategies) (count (set strategies))))
-    (is (= (+ 3 (* 2 (count tiles))) (count strategies))
-        "portable/materialized direct/split plus dynamic-LHS and fully fused alternatives per tile")
+    (is (= (+ 2 (* 3 (count tiles))) (count strategies))
+        "portable/split plus materialized, dynamic-LHS and fully fused alternatives per tile")
     (is (= tile-strategies (set (filter tile-strategies strategies))))
     (doseq [strategy dynamic-strategies]
       (is (= {:lhs :tile-local :rhs :materialized}
@@ -1726,6 +1728,18 @@
         "the canonical GPU pass must propagate the resolved public schedule policy")
     (is (some? (kdispatch/alternative (first (:dispatches emitted)) :xmx-split-k-4))
         "finite split candidates reach the generic measured-selector dispatch")))
+
+(deftest typed-contraction-dispatch-id-ignores-only-generated-symbol-freshness
+  (let [dispatch-id @#'contract-route/candidate-dispatch-id
+        candidates [{:family :matrix :strategy :xmx-direct
+                     :artifact {:target :opencl-intel
+                                :abi [{:kind :input :dtype :float :role :operand}]}}]
+        id #(dispatch-id :operation candidates %)]
+    (is (= (id {:lhs 'activation_α_12001_12002 :rhs 'weight__12003})
+           (id {:lhs 'activation_α_45001_45002 :rhs 'weight__45003})))
+    (is (not= (id {:lhs 'semantic4096})
+              (id {:lhs 'semantic8192}))
+        "numeric suffixes in user-facing semantic names remain significant")))
 
 (deftest batched-f32-contraction-derives-one-grid-z-matrix-schedule
   (let [source
@@ -1893,7 +1907,7 @@
                     (opencl-pass/opencl-pass form :device-id :ocl:0
                                              :dtype :half :min-elements 0)))
         emitted-dispatch (first (:dispatches emitted))
-        measured-selector {:kind :fixed-strategy :strategy :portable-segred}
+        measured-selector {:kind :fixed-strategy :strategy :portable-segred :fallback :none}
         measured-emitted
         (without-surface
          #(with-redefs [hardware/descriptor-for (constantly descriptor)]
@@ -1948,9 +1962,16 @@
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (= 1 (get-in emitted [:stats :kernel-graphs])))
     (is (= (:id emitted-dispatch) (:id measured-dispatch)))
-    (is (= (mapv dispatch-tuning/executable-signature (:alternatives emitted-dispatch))
-           (mapv dispatch-tuning/executable-signature (:alternatives measured-dispatch)))
+    (is (= [:portable-segred]
+           (mapv #(get-in % [:attributes :strategy])
+                 (:alternatives measured-dispatch)))
+        "a fixed measured result is specialized before dead alternatives are compiled")
+    (is (= (dispatch-tuning/executable-signature
+            (kdispatch/alternative emitted-dispatch :portable-segred))
+           (dispatch-tuning/executable-signature
+            (first (:alternatives measured-dispatch))))
         "counter-based emitter names must not invalidate the tuning cache on recompilation")
+    (is (= 1 (count (:kernels measured-emitted))))
     (is (= measured-selector (:selector measured-dispatch)))
     (is (= :measured-fixed (get-in measured-dispatch [:attributes :selection])))
     (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]

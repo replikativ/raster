@@ -938,6 +938,15 @@
    (format "xmx-direct-dynamic-lhs-bm%d-bn%d-sm%d-sn%d-bk%d-s%d"
            block-m block-n sg-m sg-n block-k (or num-stages 3))))
 
+(defn direct-tile-strategy
+  "Stable strategy identity for a finite-search materialized-input matrix schedule. The analytic
+   tile retains the concise `:xmx-direct` identity; finite alternatives use this identity so the
+   measured selector can choose tile geometry independently of input-fusion policy."
+  [{:keys [block-m block-n block-k sg-m sg-n num-stages]}]
+  (keyword
+   (format "xmx-direct-bm%d-bn%d-sm%d-sn%d-bk%d-s%d"
+           block-m block-n sg-m sg-n block-k (or num-stages 3))))
+
 (defn- matrix-input-fusion-alternative [spec]
   (when (matrix-input-fusion-target? spec)
     (xmx-graph (assoc spec :split-k? false :fuse-tile-inputs? true
@@ -960,6 +969,21 @@
   (or (matrix-dynamic-lhs-alternative spec)
       (throw (ex-info "dynamic-LHS matrix fusion obligations are not satisfied"
                       {:reason :matrix-dynamic-lhs-ineligible :id (:id spec)}))))
+
+(defn emit-matrix-direct-alternative
+  "Emit one explicit materialized-input Intel direct-matrix candidate for finite tile search.
+   This is the same representation policy as `:xmx-direct`; only checked tile geometry differs."
+  [{:keys [variant target-dialect] :as spec}]
+  (when-not (matrix-input-fusion-target? spec)
+    (throw (ex-info "finite direct-matrix search requires Intel NN/NT storage"
+                    {:reason :matrix-direct-tile-target :variant variant
+                     :target target-dialect})))
+  (or (xmx-graph (assoc spec :split-k? false
+                         :vector-width (get spec :vector-width 4)
+                         :strategy (or (:strategy spec)
+                                       (direct-tile-strategy (:tile spec)))))
+      (throw (ex-info "finite direct-matrix schedule obligations are not satisfied"
+                      {:reason :matrix-direct-tile-ineligible :id (:id spec)}))))
 
 (defn emit-matrix-input-fusion-alternative
   "Emit an explicit Intel direct-matrix candidate with tile-local FP32→FP16 inputs.

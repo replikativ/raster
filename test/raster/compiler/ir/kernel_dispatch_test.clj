@@ -72,6 +72,22 @@
                :at-least :subgroup-score-reuse
                :otherwise :reference}}))
 
+(deftest fixed-specialization-retains-only-the-selected-executable
+  (let [specialized (kdispatch/specialize-fixed
+                     dispatch
+                     {:kind :fixed-strategy :strategy :subgroup-score-reuse :fallback :none})]
+    (is (= [:subgroup-score-reuse]
+           (mapv kdispatch/alternative-strategy (:alternatives specialized))))
+    (is (= :subgroup-score-reuse (:default-strategy specialized)))
+    (is (= {:kind :fixed-strategy :strategy :subgroup-score-reuse :fallback :none}
+           (:selector specialized)))
+    (is (= subgroup
+           (kdispatch/select-alternative specialized [:x :out 1])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"requires a pinned fixed strategy selector"
+         (kdispatch/specialize-fixed
+          dispatch {:kind :fixed-strategy :strategy :subgroup-score-reuse})))))
+
 (deftest binding-admission-separates-preference-from-applicability
   (let [arguments [:x :out 512]
         hazard [{:reason :kernel-graph-writable-alias :left 'x :right 'out}]
@@ -91,6 +107,14 @@
                            (kdispatch/with-selector dispatch
                              {:kind :fixed-strategy :strategy :subgroup-score-reuse})
                            arguments :auto preflight)))))
+    (testing "an explicitly pinned fixed strategy cannot silently fall back"
+      (is (= :kernel-dispatch-inapplicable
+             (try
+               (kdispatch/admit-alternative
+                (kdispatch/with-selector dispatch
+                  {:kind :fixed-strategy :strategy :subgroup-score-reuse :fallback :none})
+                arguments :auto preflight)
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (testing "disjoint inputs retain the preferred executable"
       (is (= subgroup (:executable (kdispatch/admit-alternative
                                    dispatch arguments (constantly []))))))

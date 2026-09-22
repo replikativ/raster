@@ -903,7 +903,10 @@
                                         (:id typed-dispatch)])
                       typed-dispatch
                       (if measured-selector
-                        (-> (kdispatch/with-selector typed-dispatch measured-selector)
+                        (-> (if (and (= :fixed-strategy (:kind measured-selector))
+                                     (= :none (:fallback measured-selector)))
+                              (kdispatch/specialize-fixed typed-dispatch measured-selector)
+                              (kdispatch/with-selector typed-dispatch measured-selector))
                             (assoc-in [:attributes :selection] :measured-fixed))
                         typed-dispatch)
                       dispatch
