@@ -127,14 +127,17 @@
             compiles (atom 0)
             report (atom nil)]
         (compiled/clear-compilation-cache!)
-        (binding [compiled/*equation-artifact-store* cache]
-          (#'compiled/cached-compilation-template
-           key :equation-first #(do (swap! compiles inc) @compilation)))
-        (compiled/clear-compilation-cache!)
-        (binding [compiled/*equation-artifact-store* cache
-                  compiled/*compilation-template-observer* #(reset! report %)]
-          (is (= @compilation
-                 (#'compiled/cached-compilation-template
-                  key :equation-first #(throw (ex-info "must not compile" {}))))))
-        (is (= 1 @compiles))
-        (is (= :hit (get-in @report [:persistent-artifact :status])))))))
+        (try
+          (binding [compiled/*equation-artifact-store* cache]
+            (#'compiled/cached-compilation-template
+             key :equation-first #(do (swap! compiles inc) @compilation)))
+          (compiled/clear-compilation-cache!)
+          (binding [compiled/*equation-artifact-store* cache
+                    compiled/*compilation-template-observer* #(reset! report %)]
+            (is (= @compilation
+                   (#'compiled/cached-compilation-template
+                    key :equation-first #(throw (ex-info "must not compile" {}))))))
+          (is (= 1 @compiles))
+          (is (= :hit (get-in @report [:persistent-artifact :status])))
+          (finally
+            (compiled/clear-compilation-cache!)))))))
