@@ -54,17 +54,22 @@
         ;; Flattening two or more reduction axes makes k-bound a typed arithmetic expression.
         ;; Preserve every dimension scalar it references; collecting only direct symbol bounds
         ;; silently omitted l1/l2 from the ABI of an otherwise valid portable contraction.
-        ;; Body-level extra scalars (e.g. a scale) are a later refinement.
         bound-syms (reduce set/union #{}
                            (map util/free-syms
-                                (conj (mapv second free-axes) k-bound)))]
+                                (conj (mapv second free-axes) k-bound)))
+        axis-indices (set (map first (concat free-axes contract-axes)))
+        ;; A scale or another uniform scalar in the element expression is as much a semantic
+        ;; operand as an axis bound. Dropping it here left KernelBody with a free symbol after an
+        ;; otherwise valid producer-local GEMM canonicalization.
+        scalars (set/difference (set/union bound-syms (util/free-syms body))
+                                arrays axis-indices #{out})]
     (segop/->SegRed id space
                     (segop/->SegLevel :thread :virtual)
                     reduction
                     nil                 ; map-lambda: nil (product is in the combine)
                     inputs
                     #{out}
-                    (set/difference bound-syms arrays #{out})
+                    scalars
                     grid
                     :segmented
                     nil
