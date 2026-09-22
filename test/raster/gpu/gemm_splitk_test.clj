@@ -43,7 +43,7 @@
     (let [cases [[13 640 8192 8]      ;; the LM-head dx shape (small k, same geometry)
                  [13 640 8192 26]     ;; k/splits is not integral; last chunk is clipped
                  [7 640 4096 4]       ;; m below one 8-row DPAS tile
-                 [33 200 1000 3]      ;; ragged m, n and k
+                 [33 200 1008 3]      ;; ragged m, n and k within the DPAS K-multiple contract
                  [128 256 4096 8]]
           factors (vec (distinct (map #(nth % 3) cases)))
           scheduled (support/dense-dispatch :ze:0 :split-factors factors)
@@ -134,8 +134,10 @@
     (testing "the tied-embedding backward (5 workgroups, k=262144) is split"
       (is (> (decide 13 640 262144) 1)))
     (testing "a GEMM that already fills the machine is NOT split"
-      (is (< (decide 13 262144 640) 2))   ;; the head's forward logits: 2048 workgroups
-      (is (< (decide 640 2048 64) 2)))    ;; a :tn weight-gradient: 80 workgroups
+      (is (= 1 (decide 13 262144 640)))   ;; the head's forward logits: 2048 workgroups
+      (is (= 1 (decide 640 2048 64)))     ;; a :tn weight-gradient: 80 workgroups
+      (is (= 1 (decide 96 5248 1024))
+          "a wide Laya projection remains a bindable one-way split schedule"))
     (testing "a low-occupancy GEMM with a SHORT k is not split (chunks would be tiny)"
       (is (< (decide 64 640 512) 2)))
     (testing "split count stays within the cap"

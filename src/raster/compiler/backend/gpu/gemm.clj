@@ -1131,15 +1131,21 @@
                                            (klaunch/ceil-div n block-n))
         target-workgroups (* target-fill-multiple fill-workgroups)
         ;; Exactly zero once the unsplit output grid fills the machine, one otherwise. This keeps
-        ;; the historic "never split a filling GEMM" legality/policy gate inside the same checked
-        ;; arithmetic IR without introducing an opaque conditional callback.
+        ;; the historic "never split a filling GEMM" policy gate inside the same checked arithmetic
+        ;; IR without introducing an opaque conditional callback.  Clamp the final request to one:
+        ;; every emitted alternative must remain concretely bindable for offline autotuning, and a
+        ;; split graph cannot use zero as the divisor of its private K chunk.  One is the canonical
+        ;; executable representation of "do not split"; the selector still chooses split-K only
+        ;; when this expression is at least two.
         starved (klaunch/minimum 1 (klaunch/floor-div (dec fill-workgroups)
                                                       output-workgroups))]
-    (klaunch/product
-     starved
-     (klaunch/minimum (klaunch/ceil-div target-workgroups output-workgroups)
-                      (klaunch/floor-div k min-split-chunk)
-                      max-splits))))
+    (klaunch/maximum
+     1
+     (klaunch/product
+      starved
+      (klaunch/minimum (klaunch/ceil-div target-workgroups output-workgroups)
+                       (klaunch/floor-div k min-split-chunk)
+                       max-splits)))))
 
 (defn mixed-dpas-schedule
   "Return the target-derived schedule facts for the current mixed f16×f16→f32 DPAS graph.

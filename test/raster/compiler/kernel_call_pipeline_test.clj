@@ -1,6 +1,7 @@
 (ns raster.compiler.kernel-call-pipeline-test
   (:require [clojure.test :refer [deftest is]]
             [raster.arrays :as ra]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -60,9 +61,18 @@
         "only the packed projection, fused hidden value and final output are materialized")))
 
 (deftest bidirectional-sdpa-is-layout-two-contractions-and-softmax
-  (let [descriptor (pipeline/compile-gpu-program
-                    #'attention/bidirectional-sdpa :ze:0 :dtype :float
-                    :on-non-resident :throw)
+  (let [arc-descriptor
+        {:backend :ze :device-type :gpu
+         :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+         :execution {:subgroup-sizes #{16 32} :preferred-subgroup-size 16
+                     :max-workgroup-size 1024 :scratchpad-bytes 131072}
+         :subgroup-sizes #{16 32} :subgroup-size 16 :max-workgroup-size 1024
+         :grf-bytes-per-lane 256 :machine-lanes 8192
+         :cache {:slm 131072}}
+        descriptor (with-redefs [hardware/descriptor-for (constantly arc-descriptor)]
+                     (pipeline/compile-gpu-program
+                      #'attention/bidirectional-sdpa :ze:0 :dtype :float
+                      :on-non-resident :throw))
         steps (:steps descriptor)
         strategies (fn [step]
                      (some->> step :dispatch :alternatives
