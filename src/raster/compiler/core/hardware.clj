@@ -376,6 +376,7 @@
   [device-id]
   (let [device (rt/device device-id)
         raw-caps (:capabilities device)
+        source (:source device)
         target-type (or (:type device) (rt/device-type device-id))
         gpu?   (not= target-type :cpu)
         matrix (when gpu? (matrix-capability raw-caps))
@@ -392,7 +393,8 @@
         ;; ABSENT here and the analytic fns fall back to :balance; the :measured layer (Phase 1)
         ;; fills them from a microbenchmark and OVERWRITES the analytic guess.
         bw-gb  (:memory-bandwidth-gb-s caps)
-        global-memory-bytes (or (:global-memory-bytes caps) (:global-mem-bytes caps))
+        [_global-memory-key global-memory-bytes]
+        (best-capability caps source [:global-memory-bytes :global-mem-bytes])
         compute-units (or (:compute-units caps) (:max-compute-units caps))
         peak-flops (into {} (remove (comp nil? val))
                          {:f32 (:peak-flops-sp caps) :float (:peak-flops-sp caps)
@@ -415,6 +417,7 @@
     (cond-> {:device-type (if gpu? :gpu :cpu)
              :device-id   device-id
              :backend     target-type
+             :calibration-version rt/calibration-version
              :has-native-dot-reduce
              (if gpu? true
                  ;; x86 has a widening int-dot-reduce ONLY with AVX-VNNI (vpdpbusd). Prefer the
@@ -430,9 +433,15 @@
                               (when gpu? global-memory-bytes)
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
+      (:name device) (assoc :device-name (:name device))
+      (:device-id-hex caps) (assoc :device-id-hex (:device-id-hex caps))
+      (or (:driver-version device) (:driver-version caps))
+      (assoc :driver-version (or (:driver-version device) (:driver-version caps)))
       vbits (assoc :vector-bits vbits)
-      (:vendor caps)  (assoc :vendor (:vendor caps))
-      (:arch caps)    (assoc :arch (:arch caps))
+      (or (:vendor device) (:vendor caps))
+      (assoc :vendor (or (:vendor device) (:vendor caps)))
+      (or (:arch device) (:arch caps) (:gfx-arch caps))
+      (assoc :arch (or (:arch device) (:arch caps) (:gfx-arch caps)))
       bw-gb           (assoc :bandwidth-bytes-s (* (double bw-gb) 1e9))
       (seq peak-flops) (assoc :peak-flops peak-flops)
       (seq cache)     (assoc :cache cache)
@@ -475,6 +484,27 @@
       (assoc :machine-lanes (* (long (:total-eus caps))
                                (long (:threads-per-eu caps))
                                (long gpu-width))))))
+
+(def ^:private evidence-fields
+  "Descriptor facts that guard measured schedule evidence. This intentionally includes identity,
+   execution limits, performance calibration and provenance, but excludes unrelated compiler or
+   runtime state. Missing facts stay missing rather than acquiring guessed sentinel values."
+  [:device-id :device-name :device-id-hex :vendor :arch :driver-version
+   :device-type :backend :integrated?
+   :vector-bits :num-vector-registers :machine-lanes :grf-bytes-per-lane
+   :subgroup-size :subgroup-sizes :max-workgroup-size :execution :matrix
+   :cache :llc-bytes :global-memory-bytes
+   :bandwidth-bytes-s :peak-flops :launch-overhead-ns
+   :capability-provenance :provenance :calibration-version])
+
+(defn evidence-signature
+  "Project a HardwareDescriptor to the auditable facts that guard calibration/autotuning data.
+
+   This is deliberately richer than the target-neutral abstract machine used by SOAC fusion:
+   evidence must not cross a different device, driver, execution hierarchy, capability source or
+   measured calibration merely because both devices happen to occupy the same local `:ze:0` slot."
+  [descriptor]
+  (select-keys descriptor evidence-fields))
 
 (defn descriptor-for
   "The HardwareDescriptor for `device-id`: the probed/analytic model (build-descriptor) with the
