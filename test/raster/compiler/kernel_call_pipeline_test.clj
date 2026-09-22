@@ -1,6 +1,7 @@
 (ns raster.compiler.kernel-call-pipeline-test
   (:require [clojure.test :refer [deftest is]]
             [raster.arrays :as ra]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -45,7 +46,7 @@
   (let [packed (nn/linear-nb x up-weight rows input-width (* 2 hidden-width))
         hidden (float-array (* rows hidden-width))
         effect (nn/gelu-erf-mul-strided! packed hidden rows (* 2 hidden-width)
-                                          0 hidden-width hidden-width)]
+                                         0 hidden-width hidden-width)]
     (nn/linear-nb hidden down-weight rows hidden-width output-width)))
 
 (deftest a-packed-multistage-consumer-does-not-erase-either-contraction
@@ -60,9 +61,18 @@
         "only the packed projection, fused hidden value and final output are materialized")))
 
 (deftest bidirectional-sdpa-is-layout-two-contractions-and-softmax
-  (let [descriptor (pipeline/compile-gpu-program
-                    #'attention/bidirectional-sdpa :ze:0 :dtype :float
-                    :on-non-resident :throw)
+  (let [target-descriptor {:backend :ze :device-type :gpu
+                           :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                           :execution {:subgroup-sizes #{16 32}
+                                       :max-workgroup-size 1024}
+                           :subgroup-size 16 :max-workgroup-size 1024
+                           :grf-bytes-per-lane 256 :machine-lanes 8192
+                           :shared-local-memory 131072}
+        descriptor (with-redefs [hardware/descriptor-for
+                                 (constantly target-descriptor)]
+                     (pipeline/compile-gpu-program
+                      #'attention/bidirectional-sdpa :ze:0 :dtype :float
+                      :on-non-resident :throw))
         steps (:steps descriptor)
         strategies (fn [step]
                      (some->> step :dispatch :alternatives
