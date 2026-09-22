@@ -20,6 +20,57 @@
                                    :kernel-body :schedule :strategy])))
         (is (empty? (:allocs descriptor)) "the completed fold stays inside one kernel")))))
 
+(deftest public-layernorm-is-one-generic-cooperative-executable
+  (doseq [target [:ocl:0 :ze:0]]
+    (let [descriptor (pipeline/compile-gpu-program
+                      #'nn/layer-norm-reassociated! target :dtype :float)
+          body (get-in descriptor [:steps 0 :artifact :attributes :kernel-body])]
+      (is (= [:executable] (mapv :convention (:steps descriptor))))
+      (is (= :one-workgroup-per-segment (get-in body [:schedule :strategy])))
+      (is (= [:+ :+] (get-in body [:schedule :reduction-operators])))
+      (is (= 2 (get-in body [:schedule :fold-count])))
+      (is (empty? (:allocs descriptor)) "both moments and the affine map stay in one kernel"))
+    (let [descriptor (pipeline/compile-gpu-program
+                      #'nn/layer-norm-reassociated target :dtype :float)
+          body (get-in descriptor [:steps 0 :artifact :attributes :kernel-body])]
+      (is (= [:executable] (mapv :convention (:steps descriptor))))
+      (is (= :one-workgroup-per-segment (get-in body [:schedule :strategy])))
+      (is (= 1 (count (:allocs descriptor)))
+          "only the returned dense output is allocated; no zero-fill executable remains"))))
+
+(defn- run-layernorm! [target]
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'nn/layer-norm-reassociated! target :dtype :float)]
+    (gpu/with-gpu-session [session target]
+      (doseq [[rows width] [[1 1] [1 17] [1 513] [3 17]]]
+        (let [x (float-array (map #(float (+ 1000.0 (/ (- (mod % 11) 5) 7.0)))
+                                  (range (* rows width))))
+              gamma (float-array (map #(float (/ (inc (mod % 7)) 9.0)) (range width)))
+              beta (float-array (map #(float (/ (- (mod % 5) 2) 8.0)) (range width)))
+              expected (float-array (* rows width))
+              output (float-array (* rows width))
+              arguments [x gamma beta output (long rows) (long width) 0.0001]
+              _ (nn/layer-norm-reassociated! x gamma beta expected rows width 0.0001)
+              program (fixture/instantiate!
+                       session descriptor arguments
+                       {'x :input 'gamma :input 'beta :input 'out :output})]
+          (try
+            (let [actual (get (fixture/run! program arguments) 'out)]
+              (is (= (* rows width) (count actual)))
+              (is (every? #(< (Math/abs (double %)) 0.002)
+                          (map - (vec expected) actual))))
+            (finally (fixture/close! program))))))))
+
+(deftest opencl-resident-layernorm-matches-reference
+  (if @opencl-probe/opencl-available?
+    (run-layernorm! :ocl:0)
+    (opencl-probe/opencl-skip! "resident LayerNorm ordered folds")))
+
+(deftest level-zero-resident-layernorm-matches-reference
+  (if @gpu-probe/gpu-available?
+    (run-layernorm! :ze:0)
+    (gpu-probe/gpu-skip! "resident LayerNorm ordered folds")))
+
 (deftest public-softmax-backward-composes-resident-reduction-and-map
   (if @opencl-probe/opencl-available?
     (let [compilation (equation-first/compile
