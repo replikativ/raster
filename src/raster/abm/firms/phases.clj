@@ -105,9 +105,13 @@
   ;; Fill members with atomic position allocation
   (par/map-void! i n
                  (when (>= (aget current-firm i) 0)
-                   (let [f (aget current-firm i)
+                     (let [f (aget current-firm i)
                          p (par/atomic-add! pos f (int 1))]
-                     (aset members (+ (aget member-offsets f) p) (int i))))))
+                     ;; The atomic ticket is unique within firm f; validated CSR offsets own
+                     ;; disjoint firm segments. State that external ownership fact explicitly.
+                     (aset members
+                           (par/unique-index (+ (aget member-offsets f) p))
+                           (int i))))))
 
 (deftm rebuild-csr-par!
   "Rebuild CSR membership using par primitives.

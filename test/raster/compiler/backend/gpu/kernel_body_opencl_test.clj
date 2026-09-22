@@ -150,18 +150,27 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
-(defn- atomic-add-kernel-body []
-  (body/make
-   {:id :atomic-add-test
-    :parameters [(body/->KernelParameter
-                  'out :inout :float [16] :global
-                  (layout/row-major [16] :float) :result)
-                 (body/->KernelParameter 'contribution :scalar :float [] nil nil :value)]
-    :indices [(body/->IndexBinding 'lane :local 0)]
-    :operations [(body/->AtomicRMW 'out ['lane] 'contribution :+ nil)]
-    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
-    :provenance {:dialect :test}
-    :attributes {:kind :scalar}}))
+(defn- atomic-add-kernel-body
+  ([] (atomic-add-kernel-body false))
+  ([old-value?]
+   (body/make
+    {:id :atomic-add-test
+     :parameters (cond-> [(body/->KernelParameter
+                           'out :inout :float [16] :global
+                           (layout/row-major [16] :float) :result)
+                          (body/->KernelParameter 'contribution :scalar :float [] nil nil :value)]
+                   old-value? (conj (body/->KernelParameter
+                                     'observed :output :float [16] :global
+                                     (layout/row-major [16] :float) :result)))
+     :indices [(body/->IndexBinding 'lane :local 0)]
+     :operations (let [atomic (cond-> (body/->AtomicRMW
+                                       'out ['lane] 'contribution :+ nil)
+                                old-value? (assoc :result (body/value 'old :float)))]
+                   (cond-> [atomic]
+                     old-value? (conj (body/->ScalarStore 'observed ['lane] 'old nil))))
+     :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+     :provenance {:dialect :test}
+     :attributes {:kind :scalar}})))
 
 (defn- integer-arithmetic-kernel-body
   ([overflow]
@@ -467,6 +476,15 @@
             {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
+
+(deftest value-returning-atomic-emits-one-typed-ssa-definition
+  (doseq [target [:opencl-portable :cuda :hip]]
+    (let [source (opencl/emit-scalar-kernel
+                  "atomic_old_value" (atomic-add-kernel-body true)
+                  {:target-dialect target})]
+      (is (re-find #"float rstr_old[^=]*= atomic(?:_add_float|Add)\(" source)
+          (name target))
+      (is (str/includes? source "observed[") (name target)))))
 
 (deftest inclusive-loop-bound-does-not-require-an-overflowing-successor
   (let [sources (mapv (fn [target]

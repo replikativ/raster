@@ -475,7 +475,7 @@
        (od/void-op? (first expr))))
 
 (defn effectful?
-  "Does `expr` contain a side-effecting (void) operation anywhere?
+  "Does `expr` contain a side-effecting operation anywhere?
 
    The layer-neutral purity predicate for beta-reduction decisions. Recognizes both the surface
    spelling (`void-form?`) and the DEVIRTUALIZED array write — an intermediate's `aset`
@@ -488,6 +488,8 @@
    (and (seq? expr)
         (not= 'quote (first expr))
         (or (void-form? expr)
+            ;; atomic-add! returns a value, but that does not make its read-modify-write pure.
+            (od/atomic-add-op? (od/semantic-op expr))
             (and (= '.invk (first expr))
                  (od/aset-op? (:raster.op/original (meta expr))))
             (some effectful? (rest expr))))))

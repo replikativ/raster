@@ -308,7 +308,8 @@
                       effect [:destination :destination-index :predicate :value]))))
         lower-effect
         (fn lower-effect
-          [environment {:keys [destination conflict destination-index predicate value] :as effect}]
+          [environment {:keys [destination conflict destination-index predicate value
+                               result result-dtype] :as effect}]
           (if-let [{:keys [predicate locals effects]} (:region effect)]
             (let [lowered-predicate (when predicate
                                       ((:lower lowerer) predicate :predicate environment))
@@ -393,9 +394,16 @@
                     (decline! :effect-reduction-operator
                               "ordered reduction effect has no canonical scalar operator"
                               {:operation (:id segmap) :effect effect}))
+                _ (when (and result
+                             (or (not= :reduce (:kind conflict))
+                                 (not (contains? #{true 1} predicate))))
+                    (decline! :effect-atomic-result
+                              "a value-returning atomic effect requires an unconditional reduction"
+                              {:operation (:id segmap) :effect effect}))
                 store (if (= :reduce (:kind conflict))
-                        (body/->AtomicRMW destination [coordinate-expression]
-                                          (:result lowered-value) operator :map-active)
+                        (cond-> (body/->AtomicRMW destination [coordinate-expression]
+                                                  (:result lowered-value) operator :map-active)
+                          result (assoc :result (body/value result result-dtype)))
                         (body/->ScalarStore destination [coordinate-expression]
                                             (:result lowered-value) :map-active))
                 effect-operations (vec (concat (:operations coordinate-value)
@@ -407,7 +415,8 @@
                              [(body/->IfRegion (:result lowered-predicate)
                                                (conj effect-operations (body/->Yield []))
                                                [(body/->Yield [])] [])]))))))]
-            {:operations operations :environment environment}))))
+            {:operations operations
+             :environment (cond-> environment result (assoc result result-dtype))}))))
         effect-operations
         (:operations
          (reduce (fn [{:keys [environment operations]} effect]

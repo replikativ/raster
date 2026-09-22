@@ -32,6 +32,10 @@
   (testing "a known void descriptor is authoritative over incidental contextual result metadata"
     (is (util/effectful? (with-meta (list 'raster.arrays/aset 'O 0 1.0)
                            {:raster.type/tag 'Double}))))
+  (testing "a value-returning atomic remains an effect"
+    (is (util/effectful? '(raster.par/atomic-add! counts i 1)))
+    (is (util/effectful? (with-meta (list '.invk 'impl 'counts 'i 1)
+                           {:raster.op/original 'raster.par/atomic-add!}))))
   (testing "pure arithmetic and reads"
     (is (not (util/effectful? '(clojure.core/* (raster.arrays/aget A i) 2)))))
   (testing "quoted data is data, not code to scan"

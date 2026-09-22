@@ -595,7 +595,13 @@
     (testing "the contribution must agree with the resident element dtype"
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"contribution type"
-           (inout-body (assoc atomic :value (body/literal 1 :int))))))))
+           (inout-body (assoc atomic :value (body/literal 1 :int))))))
+    (testing "the atomic old value is an optional typed SSA result"
+      (is (body/kernel-body?
+           (inout-body (assoc atomic :result (body/value 'old :float)))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"atomic result type"
+           (inout-body (assoc atomic :result (body/value 'old :int))))))))
 
 (deftest structured-regions-prove-yields-and-collective-convergence
   (testing "both if branches terminate with typed yields"
