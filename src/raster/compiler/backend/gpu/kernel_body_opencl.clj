@@ -452,6 +452,9 @@
                   (some-> operation class .getSimpleName))
        [(:id (:result operation))]
 
+       (and (record-kind? "AtomicRMW" operation) (:result operation))
+       [(:id (:result operation))]
+
        (record-kind? "IfRegion" operation)
        (concat (map :id (:results operation))
                (scalar-defined-ids (:then-operations operation))
@@ -1042,19 +1045,28 @@
        context])
 
     (record-kind? "AtomicRMW" operation)
-    (let [storage (get-in context [:storage (:buffer operation)])
+    (let [result (:result operation)
+          next-context (if result (add-value context result) context)
+          storage (get-in context [:storage (:buffer operation)])
           base-name (get-in context [:names (or (some-> storage :view :buffer)
                                                 (:id storage))])
           index (emit-storage-index storage (:coordinates operation) (:names context))
           atomic-name (c-dialect/atomic-add-name *scalar-dialect* (:dtype storage))
-          statement (str atomic-name "(" base-name " + " index ", "
-                         (emit-scalar-value (:value operation) context) ");")]
-      [(if-let [predicate (emit-mask (:predicate operation) context)]
+          call (str atomic-name "(" base-name " + " index ", "
+                    (emit-scalar-value (:value operation) context) ")")
+          predicate (emit-mask (:predicate operation) context)
+          statement
+          (if result
+            (str (target-type (get-in next-context [:types (:id result)])) " "
+                 (get-in next-context [:names (:id result)]) " = "
+                 (if predicate (str "(" predicate " ? " call " : 0)") call) ";")
+            (str call ";"))]
+      [(if (and predicate (nil? result))
          (str (indent-lines depth (str "if (" predicate ") {"))
               (indent-lines (inc depth) statement)
               (indent-lines depth "}"))
          (indent-lines depth statement))
-       context])
+       next-context])
 
     (record-kind? "Guard" operation)
     (let [predicate (emit-mask (:mask operation) context)

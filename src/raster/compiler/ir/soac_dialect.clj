@@ -221,6 +221,14 @@
                      (= % (dtype/canon %)))
                (:dtypes value))))
 
+(defn effect-value-result?
+  "Canonical typed SSA result exported by one value-returning ordered effect."
+  [value]
+  (and (map? value)
+       (= #{:result :dtype} (set (keys value)))
+       (symbol? (:result value))
+       (contains? #{:int :long :float :double} (:dtype value))))
+
 (defn stencil-attributes?
   "Attributes for a boundary-aware neighborhood map.
 
@@ -534,6 +542,7 @@
              [xa scatter-attributes?]
              [ema effect-map-attributes?]
              [ec effect-conflict?]
+             [evr effect-value-result?]
              [ela effect-loop-attributes?]
              [sta stencil-attributes?]
              [ra reduce-attributes?]
@@ -566,6 +575,8 @@
           (effect-when ?s:predicate [(?:* d)] [(?:+ e)])
           (effect ?sym:destination ?ec:conflict
                   ?s:destination-index ?s:predicate ?s:value)
+          (effect ?sym:destination ?ec:conflict
+                  ?s:destination-index ?s:predicate ?s:value ?evr)
           (effect-loop ?ela ?s:extent ?el)
           (effect-loop ?ela ?s:extent ?s:init ?rel))
 
@@ -714,7 +725,7 @@
   "Whether a typed ordered-effect item has canonical syntax: a store, counted loop, lexical
    region, or guarded lexical region."
   [value]
-  (or (and (seq? value) (= 'effect (first value)) (= 6 (count value)))
+  (or (and (seq? value) (= 'effect (first value)) (contains? #{6 7} (count value)))
       (effect-loop-form? value)
       (and (seq? value) (= 'effect-region (first value)) (= 3 (count value))
            (vector? (second value)) (vector? (nth value 2)))
@@ -752,9 +763,10 @@
                              :update (:effect-result (lambda-parts lambda))))))
 
     (effect-form? value)
-    (let [[_ destination conflict destination-index predicate written-value] value]
-      {:destination destination :conflict conflict
-       :destination-index destination-index :predicate predicate :value written-value})))
+    (let [[_ destination conflict destination-index predicate written-value result] value]
+      (cond-> {:destination destination :conflict conflict
+               :destination-index destination-index :predicate predicate :value written-value}
+        result (assoc :result (:result result) :result-dtype (:dtype result))))))
 
 (defn effect-part-leaves
   "The store effects of projected effect parts, descending into store loops."
@@ -803,7 +815,8 @@
   [effects]
   (boolean
    (some (fn [effect]
-           (or (:region effect)
+           (or (:result effect)
+               (:region effect)
                (when-let [loop (:loop effect)]
                  (or (:carry loop)
                      (some #(or (:loop %) (:region %)) (:effects loop))
@@ -871,9 +884,17 @@
                      (closed! extent bound :extent)
                      (walk effects (locals! locals (conj bound index)))
                      bound))
-                 (do (doseq [field [:destination-index :predicate :value]]
-                       (closed! (get effect field) bound field))
-                     bound))))
+                 (do
+                   (doseq [field [:destination-index :predicate :value]]
+                     (closed! (get effect field) bound field))
+                   (if-let [result (:result effect)]
+                     (let [result-dtype (:result-dtype effect)]
+                       (when-not (and (symbol? result) (not (contains? bound result))
+                                      (contains? #{:int :long :float :double} result-dtype))
+                         (fail "atomic effect result requires a fresh typed scalar binder"
+                               {:result result :dtype result-dtype}))
+                       (conj bound result))
+                     bound)))))
              bound effects))]
     (walk effects (set scope))
     effects))
@@ -1484,7 +1505,16 @@
                         {:equation equation-id :loop (:index part) :parameters loop-parameters}))
                (validate-parts inner (into scope ids))
                (cond-> scope carry (conj (:result carry))))
-             :else scope))
+             :else
+             (if-let [result (:result part)]
+               (let [result-dtype (:result-dtype part)]
+                 (when-not (and (symbol? result) (not (contains? scope result))
+                                (contains? #{:int :long :float :double} result-dtype))
+                   (fail! :typed-soac-effect-result
+                          "atomic effect result requires a fresh typed scalar binder"
+                          {:equation equation-id :result result :dtype result-dtype}))
+                 (conj scope result))
+               scope)))
          scope parts))]
           (validate-parts effects region-bound))
         (try
@@ -1514,7 +1544,8 @@
                   :used (vec (keys by-destination))}))
         (doseq [[ordinal destination-parameter dtype]
                 (map vector (range) destination-parameters (:dtypes attributes))
-                :let [contracts (set (map :conflict (get by-destination destination-parameter)))] ]
+                :let [destination-effects (get by-destination destination-parameter)
+                      contracts (set (map :conflict destination-effects))]]
           (when-not (= 1 (count contracts))
             (fail! :typed-soac-effect-conflict
                    "one effect destination requires one uniform cross-work-item conflict contract"
@@ -1526,7 +1557,15 @@
               (fail! :typed-soac-effect-conflict-dtype
                      "a reduction effect contract must match its destination dtype"
                      {:equation equation-id :destination destination-parameter
-                      :ordinal ordinal :dtype dtype :contract contract})))))
+                      :ordinal ordinal :dtype dtype :contract contract}))
+            (doseq [{:keys [result result-dtype]} destination-effects :when result]
+              (when-not (and (reducing-scatter-conflict? contract)
+                             (= dtype result-dtype))
+                (fail! :typed-soac-effect-result-contract
+                       "a value-returning effect must be a typed atomic reduction"
+                       {:equation equation-id :destination destination-parameter
+                        :result result :result-dtype result-dtype
+                        :destination-dtype dtype :contract contract}))))))
 
       stencil
       (do

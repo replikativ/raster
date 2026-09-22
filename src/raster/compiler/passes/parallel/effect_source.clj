@@ -138,7 +138,7 @@
                  loop (emit-loop loop (ordered-effects (:effects loop) emitters))
                  :else (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]
-      (if-let [result (get-in loop [:carry :result])]
+      (if-let [result (or (get-in loop [:carry :result]) (:result effect))]
         (list 'let* [(vary-meta result dissoc :tag) form] continuation)
         (list 'do form continuation)))
     nil))

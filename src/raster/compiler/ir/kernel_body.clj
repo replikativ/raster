@@ -760,6 +760,12 @@
           (throw (ex-info "atomic coordinates must match the buffer rank"
                           {:buffer (:buffer operation) :shape (:shape p)
                            :coordinates (:coordinates operation)})))
+        (when-let [result (:result operation)]
+          (value-spec! "value-returning atomic update" result)
+          (when-not (= (canonical-type (:type result)) (canonical-type (:dtype p)))
+            (throw (ex-info "atomic result type must equal the buffer element type"
+                            {:reason :kernel-body-atomic-result-dtype
+                             :result result :buffer p}))))
         (mask (:predicate operation)))
 
       (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
@@ -1580,7 +1586,9 @@
       values)
 
     (record-kind? "raster.compiler.ir.kernel_body.AtomicRMW" operation)
-    (let [buffer (get storage (:buffer operation))
+    (let [result (when-let [result (:result operation)]
+                   (claim-value! claimed reserved values result "atomic old value"))
+          buffer (get storage (:buffer operation))
           contribution (scalar-value-info! (:value operation) values)
           buffer-type (canonical-type (:dtype buffer))]
       (doseq [coordinate (:coordinates operation)]
@@ -1590,7 +1598,11 @@
         (throw (ex-info "atomic contribution type must equal the buffer element type"
                         {:reason :kernel-body-atomic-dtype
                          :buffer buffer :value-type (:type contribution)})))
-      values)
+      (if result
+        (assoc values (:id result)
+               {:type buffer-type :range (scalar-range/for-dtype buffer-type)
+                :uniformity lane-varying})
+        values))
 
     (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
     (let [condition (typed-info! values (:condition operation) "kernel if condition")]

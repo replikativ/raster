@@ -84,9 +84,6 @@
 (def ^:private unique-index-ops
   '#{raster.par/unique-index unique-index})
 
-(def ^:private atomic-add-ops
-  '#{raster.par/atomic-add! atomic-add!})
-
 (defn- unique-index-expression
   "Return the inner destination expression when `expression` carries Raster's explicit
    uniqueness contract. The marker may be a direct source call or a walker-devirtualized call;
@@ -100,7 +97,7 @@
 (defn- atomic-add-call?
   [expression]
   (and (seq? expression)
-       (contains? atomic-add-ops (descriptor/semantic-op expression))
+       (descriptor/atomic-add-op? (descriptor/semantic-op expression))
        (= 3 (count (descriptor/call-args expression)))))
 
 (defn- same-symbol?
@@ -779,6 +776,36 @@
                                        :order continuation-order}]]
                             continuation-order))}))))))
 
+(defn- atomic-result-binding
+  "Expose a value-returning atomic let binding as the first item of an ordered effect spine.
+
+  The binder denotes the old destination value. It is neither a pure scalar local nor a second
+  load: the atomic operation itself owns the SSA result consumed by the continuation."
+  [body index]
+  (let [[head bindings & tail] body]
+    (when (and (form/let-head? head) (vector? bindings) (= 2 (count bindings)))
+      (let [[result initializer] bindings]
+        (when (and (symbol? result) (atomic-add-call? initializer))
+          (let [[destination destination-index contribution]
+                (descriptor/call-args initializer)
+                result-dtype (some-> (retained-local-dtype result initializer) dtype/canon)]
+            (when (and result-dtype
+                       (contains? #{:int :long :float :double} result-dtype))
+              (when-let [continuation (store-region (list* 'do tail) index)]
+                (let [continuation-order
+                      (map-region-order (region-order continuation) identity 1 0)
+                      atomic-store {:out destination :index (strip-index-cast destination-index)
+                                    :reduction-op '+ :predicate 1 :value contribution
+                                    :result result :result-dtype result-dtype}]
+                  {:locals []
+                   :stores (into [atomic-store] (:stores continuation))
+                   :loops (:loops continuation)
+                   :order (into [[:store 0]]
+                                (if (seq (:locals continuation))
+                                  [[:region {:locals (:locals continuation)
+                                             :order continuation-order}]]
+                                  continuation-order))})))))))))
+
 (defn- store-region
   "Recognize an ordered, pure local-SSA spine ending exclusively in certified effects.
 
@@ -807,7 +834,8 @@
                      (list* 'do tail) (reverse (partition 2 bindings)))
              index result-expression)))
         (when-not (some? result-expression)
-          (or (effect-store-binding body index)
+          (or (atomic-result-binding body index)
+              (effect-store-binding body index)
               (carried-store-binding body index)))
     (let [[_ bindings & nested-body] body]
       (when (and (even? (count bindings))
@@ -1416,8 +1444,10 @@
         loops (vec (map-indexed (fn [ordinal loop]
                                   (rename-loop-tree loop [ordinal]))
                                 (or loops [])))
-        local-types (into (into (assoc scalar-types index :long)
-                                (map (juxt :id :dtype)) analysis-locals)
+        local-types (into (into (into (assoc scalar-types index :long)
+                                     (map (juxt :id :dtype)) analysis-locals)
+                                (keep (fn [{:keys [result result-dtype]}]
+                                        (when result [result result-dtype]))) stores)
                           (map (fn [loop] [(:index loop) :long]) (loop-tree loops)))]
     (when (and (or (seq stores) (seq loops))
                (every? (fn [{:keys [lower extent carry]}]
@@ -1558,6 +1588,7 @@
             carry-bindings (set (mapcat #(when-let [carry (:carry %)]
                                           [(:parameter carry) (:result carry)])
                                         all-effect-loops))
+            effect-result-bindings (set (keep :result all-stores))
             iteration-order (when ordered?
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
@@ -1576,7 +1607,8 @@
                                     write-indices predicates values)
             io (update (extract-io (list* 'do analysis-values) index destinations)
                        :scalars set/difference (set (map :id all-locals))
-                       (set (map :index all-effect-loops)) carry-bindings)
+                       (set (map :index all-effect-loops)) carry-bindings
+                       effect-result-bindings)
             results (if (= :buffer host-return)
                       [symbol]
                       (mapv #(effect-result-id id %) (range (count destinations))))
@@ -1584,7 +1616,7 @@
                                 destinations)
             store-effect (fn [store]
                            (select-keys store [:out :index :predicate :value :cast
-                                               :effect-conflict]))
+                                               :effect-conflict :result :result-dtype]))
             stores-by-path (into {} (keep (fn [store]
                                             (when-let [path (:effect-path store)]
                                               [path store]))) all-stores)
@@ -3835,7 +3867,8 @@
                                             (transform init) dtype)))
         local-forms (mapv typed-local locals)
         effect-form
-        (fn effect-form [{:keys [out index predicate value cast effect-conflict] :as effect}]
+        (fn effect-form [{:keys [out index predicate value cast effect-conflict
+                                 result result-dtype] :as effect}]
           (if-let [region (:region effect)]
             (let [locals (mapv (fn [{:keys [id dtype init]}]
                                  (dialect/local-value id dtype
@@ -3863,14 +3896,14 @@
               (if carry
                 (list 'effect-loop attributes (transform extent) (transform (:init carry)) lambda)
                 (list 'effect-loop attributes (transform extent) lambda)))
-            (list 'effect (get destination-substitutions out)
-                  effect-conflict (transform index) (transform predicate)
-                  ;; The destination dtype is already carried by the effect-map result/storage
-                  ;; contract. Preserve a cast explicitly present in the source store, without
-                  ;; adding a second synthetic cast around the complete value expression.
-                  (canonicalize-scalar-folds
-                   (transform (if cast (list cast value) value))
-                   (get destination-dtypes out))))))
+            (cond-> (list 'effect (get destination-substitutions out)
+                          effect-conflict (transform index) (transform predicate)
+                          ;; The destination dtype is already carried by the effect-map
+                          ;; result/storage contract. Preserve only a source-written cast.
+                          (canonicalize-scalar-folds
+                           (transform (if cast (list cast value) value))
+                           (get destination-dtypes out)))
+              result (concat [{:result result :dtype result-dtype}])))))
         effect-forms (mapv effect-form effects)]
     (list '= id results
           (list 'effect-map

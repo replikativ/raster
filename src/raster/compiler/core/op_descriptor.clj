@@ -536,6 +536,10 @@
   "Array write operations."
   #{'aset 'clojure.core/aset 'raster.arrays/aset})
 
+(def atomic-add-ops
+  "Atomic read-modify-write operations whose result is the destination's old element value."
+  #{'raster.par/atomic-add! 'par/atomic-add! 'atomic-add!})
+
 (def alength-ops
   "Array length operations."
   #{'alength 'clojure.core/alength 'raster.arrays/alength})
@@ -567,6 +571,11 @@
   "True if sym is an array read operation."
   [sym]
   (contains? aget-ops sym))
+
+(defn atomic-add-op?
+  "True when `sym` denotes Raster's value-returning atomic addition primitive."
+  [sym]
+  (contains? atomic-add-ops sym))
 
 (defn aset-op?
   "True if sym is an array write operation."

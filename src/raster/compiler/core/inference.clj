@@ -926,6 +926,18 @@
       (when (symbol? arr-sym)
         (type-env-element type-env arr-sym)))))
 
+(defn- infer-array-element-type
+  [array type-env]
+  (when (symbol? array)
+    (let [env-tag (type-env-tag type-env array)]
+      (or (type-env-element type-env array)
+          ;; Element dispatch tag carried on the symbol survives a re-walk whose environment
+          ;; does not reach a captured array.
+          (:raster.type/element (meta array))
+          (get types/primitive-array-element-types env-tag)
+          (get types/primitive-array-element-types (:tag (meta array)))
+          (get @types/soa-reverse-registry env-tag)))))
+
 (defn infer-aget-type
   "Infer the result type of an aget expression.
   type-env: {sym → {:tag, :fn-info, :element}}"
@@ -934,15 +946,19 @@
              (descriptor/aget-op? (first form))
              (>= (count form) 3))
     (let [arr-sym (second form)]
-      (when (symbol? arr-sym)
-        (let [env-tag (type-env-tag type-env arr-sym)]
-          (or (type-env-element type-env arr-sym)
-              ;; Element dispatch tag carried on the symbol (stamped at the binding
-              ;; site) — survives a re-walk whose env doesn't reach a captured var.
-              (:raster.type/element (meta arr-sym))
-              (get types/primitive-array-element-types env-tag)
-              (get types/primitive-array-element-types (:tag (meta arr-sym)))
-              (get @types/soa-reverse-registry env-tag)))))))
+      (infer-array-element-type arr-sym type-env))))
+
+(defn infer-atomic-add-type
+  "Infer the old-value result of atomic-add! from its destination array element type.
+
+  This is a dependent primitive contract, not arithmetic promotion: the atomic storage type
+  fixes both the accepted update and the returned value."
+  [form type-env]
+  (when (and (seq? form)
+             (descriptor/atomic-add-op? (descriptor/semantic-op form))
+             (= 3 (count (descriptor/call-args form))))
+    (let [destination (first (descriptor/call-args form))]
+      (infer-array-element-type destination type-env))))
 
 (def long-returning-core-ops
   "clojure.core ops whose result is a primitive long — integer index/counter
@@ -990,6 +1006,9 @@
         ;; aget on typed array
         (descriptor/aget-op? head)
         (infer-aget-type expr type-env)
+        ;; Value-returning atomic RMW: its old value has the destination element type.
+        (descriptor/atomic-add-op? (descriptor/semantic-op expr))
+        (infer-atomic-add-type expr type-env)
         ;; Clojure core fns with known long return type
         (contains? long-returning-core-ops head)
         'long
@@ -1541,6 +1560,11 @@
    ;; Typed array aget — TC covers, but needed for parametric fns
    (when-let [t (infer-aget-type init type-env)]
      (trace-inferred sym t :aget))
+   ;; An atomic RMW returns the destination's old element value. Derive it from the same
+   ;; authoritative array fact as aget; do not guess from the update operand or consumer.
+   (when-let [t (or (infer-atomic-add-type init type-env)
+                    (infer-atomic-add-type rewritten-init type-env))]
+     (trace-inferred sym t :atomic-old-value))
    ;; Record field type — TC doesn't know field-type-registry
    (when-let [t (infer-field-type init type-env)]
      (trace-inferred sym t :field))

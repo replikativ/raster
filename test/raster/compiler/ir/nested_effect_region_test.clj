@@ -97,6 +97,17 @@
                  (dialect/validate-scheduled-effect-carries!
                   [{:region {:locals locals :effects []}}] '#{sum out i})))))
 
+(deftest value-returning-effects-bind-only-their-ordered-continuation
+  (let [atomic {:destination 'counts :destination-index 'i :predicate 1 :value 1
+                :result 'ticket :result-dtype :int}
+        store {:destination 'out :destination-index 'ticket :predicate 1 :value 'i}]
+    (is (= [atomic store]
+           (dialect/validate-scheduled-effect-carries!
+            [atomic store] '#{counts out i})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (dialect/validate-scheduled-effect-carries!
+                  [store atomic] '#{counts out i})))))
+
 (deftest regions-cannot-hide-loops-inside-carried-bodies
   (let [inner {:loop {:index 'j :lower 0 :extent 2 :locals []
                       :effects [{:destination 'out :destination-index 'j

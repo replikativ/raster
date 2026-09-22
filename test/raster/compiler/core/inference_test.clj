@@ -74,6 +74,14 @@
     (is (= 'double (inf/infer-binding-tag 'x '(double y) nil (type-env) (opts))))
     (is (= 'long (inf/infer-binding-tag 'x '(long y) nil (type-env) (opts))))))
 
+(deftest atomic-add-result-inherits-the-destination-element-type
+  (doseq [[array-tag expected] [['ints 'int] ['floats 'float]]]
+    (let [environment (type-env {'values array-tag})
+          expression '(raster.par/atomic-add! values i delta)]
+      (is (= expected (inf/infer-expr-tag expression environment *ns*)))
+      (is (= expected
+             (inf/infer-binding-tag 'old expression expression environment (opts)))))))
+
 ;; ================================================================
 ;; infer-rewritten-tag
 ;; ================================================================
