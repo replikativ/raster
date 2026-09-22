@@ -21,6 +21,7 @@
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.equation-artifact-store :as equation-artifact-store]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.build-manifest :as build-manifest]
             [raster.compiler.core.hardware :as hardware]
@@ -99,6 +100,10 @@
 (def ^:dynamic *compilation-template-observer*
   "Internal per-request observer. It receives only cache/timing facts, never source or artifacts."
   nil)
+
+(def ^:dynamic *equation-artifact-store*
+  "Persistent equation-first store. Bind to a bounded temporary store in tests."
+  (equation-artifact-store/make-store))
 
 (defn clear-compilation-cache!
   "Clear reusable compiler templates and their counters. Runtime modules, buffers, and tuning
@@ -254,22 +259,60 @@
            (some #(= family-id (:family-fingerprint %)) keys)) :specialization
       :else :compulsory)))
 
+(defn- persistent-artifact-identity [key]
+  {:semantic-request-fingerprint (:semantic-fingerprint key)
+   :compiler-build-fingerprint
+   (get-in key [:semantic-request :compiler-build-fingerprint])
+   :source-dependency-fingerprint
+   (get-in key [:semantic-request :source :source-dependency-fingerprint])
+   :target-descriptor-fingerprint
+   (get-in key [:semantic-request :target :descriptor-fingerprint])})
+
+(defn- resolve-compilation-template
+  [key compiler thunk persistent-report]
+  (let [persistent? (and (= :equation-first compiler)
+                         (:persistent-cache-eligible? key))
+        identity (when persistent? (persistent-artifact-identity key))
+        loaded (when persistent?
+                 (equation-artifact-store/load-artifact
+                  *equation-artifact-store* (:semantic-fingerprint key) identity))]
+    (if (= :hit (:status loaded))
+      (do (reset! persistent-report (dissoc loaded :value))
+          (:value loaded))
+      (let [started (System/nanoTime)
+            value (try
+                    (let [value (thunk)]
+                      (swap! compilation-template-stats update :compilations inc)
+                      value)
+                    (catch Throwable error
+                      (swap! compilation-template-stats update :failures inc)
+                      (throw error))
+                    (finally
+                      (swap! compilation-template-stats update :compile-nanos +
+                             (- (System/nanoTime) started))))
+            stored
+            (when persistent?
+              (try
+                (equation-artifact-store/store-artifact!
+                 *equation-artifact-store* (:semantic-fingerprint key) identity value)
+                (catch Exception error
+                  {:status :write-failed :error-class (.getName (class error))})))]
+        (reset! persistent-report
+                (cond
+                  (not persistent?) {:status :ineligible}
+                  stored (assoc stored :load-miss-reason (:reason loaded)
+                                :load-artifact-reason (:artifact-reason loaded))
+                  :else {:status :not-stored}))
+        value))))
+
 (defn- cached-compilation-template
   [key compiler thunk]
-  (let [candidate
+  (let [persistent-report (atom nil)
+        candidate
         {:compiler compiler
          :value (delay
-                  (let [started (System/nanoTime)]
-                    (try
-                      (let [value (thunk)]
-                        (swap! compilation-template-stats update :compilations inc)
-                        value)
-                      (catch Throwable error
-                        (swap! compilation-template-stats update :failures inc)
-                        (throw error))
-                      (finally
-                        (swap! compilation-template-stats update :compile-nanos +
-                               (- (System/nanoTime) started))))))}
+                  (resolve-compilation-template key compiler thunk persistent-report))
+         :persistent-report persistent-report}
         [before after]
         (swap-vals! compilation-template-cache
                     #(if (contains? % key) % (assoc % key candidate)))
@@ -290,6 +333,10 @@
             :persistent-cache-eligible? (:persistent-cache-eligible? key)
             :persistence-blockers (:persistence-blockers key)
             :source-dependency-blockers (:source-dependency-blockers key)
+            :persistent-artifact
+            (if hit?
+              {:status :not-consulted :reason :process-cache-hit}
+              @(:persistent-report entry))
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         value)
       (catch Throwable error
@@ -301,6 +348,10 @@
             :persistent-cache-eligible? (:persistent-cache-eligible? key)
             :persistence-blockers (:persistence-blockers key)
             :source-dependency-blockers (:source-dependency-blockers key)
+            :persistent-artifact
+            (if hit?
+              {:status :not-consulted :reason :process-cache-hit}
+              @(:persistent-report entry))
             :resolution-ns (- (System/nanoTime) resolution-started)}))
         ;; A failed compilation is not a durable negative result: a hot reload or newly registered
         ;; specialization may make the same request valid on its next attempt.

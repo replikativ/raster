@@ -211,7 +211,7 @@
           (try
             (restore-sequences
              (boring/decode (:payload envelope) compiler-cbor-options))
-            (catch Throwable error
+            (catch Exception error
               (throw (ex-info "equation artifact payload is not valid compiler CBOR"
                               {:reason :equation-artifact-payload-decode
                                :artifact :equation-first}
@@ -235,7 +235,7 @@
   (try
     (validate-envelope! (boring/decode bytes {:profile :archival}))
     (catch clojure.lang.ExceptionInfo error (throw error))
-    (catch Throwable error
+    (catch Exception error
       (throw (ex-info "equation artifact transport is not valid CBOR"
                       {:reason :equation-artifact-transport :artifact :equation-first}
                       error)))))
