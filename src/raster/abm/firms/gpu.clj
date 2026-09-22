@@ -158,58 +158,6 @@
         (gpu/invoke! sess :distribute-income {} [] max-firms)
         cnt))))
 
-(defn autotune-abm-kernels!
-  "Tune the core firms ABM kernels using the session's actual layout and buffer set."
-  [sess & {:keys [warmup timed wg-sizes load-cache?]
-           :or {warmup 3 timed 5 wg-sizes [64 128 256 512] load-cache? true}}]
-  (let [autotune! (requiring-resolve 'raster.compiler.support.autotuner/autotune-kernel!)
-        save-cache! (requiring-resolve 'raster.compiler.support.autotuner/save-tuning-cache!)
-        load-cache-fn (requiring-resolve 'raster.compiler.support.autotuner/load-tuning-cache)
-        apply-cached! (requiring-resolve 'raster.compiler.support.autotuner/apply-cached-tuning!)
-        {:keys [kernels buffers device-id]} @sess
-        {:keys [n-agents n-friends max-firms n-active-capacity]} (require-layout sess)
-        specs [{:kname (:kernel-name (first (:agent-decide kernels)))
-                :arrays (mapv #(get buffers %) [:active-ids :agent-ids :alive :current-firm
-                                                :decision-types :effort :endowment :firm-size
-                                                :friends :new-efforts :output :param-a :param-b
-                                                :param-beta :q-count :s-cache :target-firms
-                                                :theta :total-effort])
-                :scalars [{:type :int :value (int n-friends)}]
-                :n n-active-capacity}
-               {:kname (:kernel-name (first (:produce-output kernels)))
-                :arrays (mapv #(get buffers %) [:param-a :param-b :param-beta :total-effort :output :alive])
-                :scalars []
-                :n max-firms}
-               {:kname (:kernel-name (first (:distribute-income kernels)))
-                :arrays (mapv #(get buffers %) [:income :output :firm-size :alive :members :member-offsets])
-                :scalars []
-                :n max-firms}
-               {:kname (:kernel-name (first (:zero-firm-sizes kernels)))
-                :arrays [(:firm-size buffers)]
-                :scalars []
-                :n max-firms}
-               {:kname (:kernel-name (first (:histogram-firms kernels)))
-                :arrays [(:firm-size buffers) (:current-firm buffers)]
-                :scalars []
-                :n n-agents}
-               {:kname (:kernel-name (first (:update-alive kernels)))
-                :arrays [(:alive buffers) (:firm-size buffers)]
-                :scalars []
-                :n max-firms}]
-        cache (when load-cache? (load-cache-fn device-id))
-        tuning-results (atom {})]
-    (doseq [{:keys [kname arrays scalars n]} specs]
-      (if (and load-cache? (get cache kname))
-        (do
-          (apply-cached! kname device-id)
-          (println (str "[autotune] " kname " loaded from cache")))
-        (swap! tuning-results assoc kname
-               (autotune! kname arrays scalars n device-id
-                          :wg-sizes wg-sizes :warmup warmup :timed timed))))
-    (when (seq @tuning-results)
-      (save-cache! device-id @tuning-results))
-    @tuning-results))
-
 (defn- sync-bufs-to-soa!
   [sess ^AgentSoA agents ^FirmSoA firms]
   (gpu/sync-to-arrays! sess
