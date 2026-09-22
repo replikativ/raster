@@ -27,6 +27,33 @@
                      (list 'clojure.core/+ (list 'clojure.core/* 'l n) 'j))))
    (when (some? init) [:init init])))
 
+(deftest symbolic-epilogue-maps-use-scheduled-dimension-identities
+  (let [kernel
+        (schedule/matrix-body
+         {:id :symbolic-epilogue-dimensions
+          :row 'a :col 'b :out 'c
+          :dimensions ['semantic-m 'semantic-n 'semantic-k]
+          :dimension-parameters ['M 'N 'K]
+          :axis-symbols ['i 'j 'l]
+          :tile (hardware/derive-gemm-tile {})
+          :result-dtype :float
+          :epilogue
+          {:acc 'acc
+           :expr '(raster.numeric/+ acc
+                                    (clojure.core/aget residual
+                                                       (clojure.core/+ (clojure.core/* i semantic-n)
+                                                                       j)))
+           :operands [{:sym 'residual :dtype :float
+                       :map (axis-map/of-axes [['i 'semantic-m] ['j 'semantic-n]])}]}})
+        residual (first (filter #(= 'residual (:id %)) (:parameters kernel)))
+        executable-sections [(:parameters kernel) (:views kernel) (:indices kernel)
+                             (:operations kernel) (:launch kernel)]]
+    (is (= ['M 'N] (:shape residual)))
+    (is (= ['M 'N] (get-in residual [:layout :shape])))
+    (is (not-any? #{'semantic-m 'semantic-n 'semantic-k}
+                  (tree-seq coll? seq executable-sections))
+        "semantic source bounds must not escape into the scheduled KernelBody scope")))
+
 (deftest applying-a-matrix-schedule-produces-a-target-neutral-kernel-body
   (let [contract-facts (facts/contraction-facts (matrix-form 128 128 128) :dtype :half)
         planned (schedule/plan-matrix-body contract-facts nil nil {:operation-id 41})
