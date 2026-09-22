@@ -520,6 +520,7 @@
             carry (assoc (:parameter carry) parameter))]
       (cond-> (assoc loop
                      :index next-index
+                     :lower (util/subst-syms substitutions (:lower loop))
                      :extent (util/subst-syms substitutions (:extent loop))
                      :locals (mapv (fn [local [id init]] (assoc local :id id :init init))
                                    locals local-pairs)
@@ -626,13 +627,16 @@
                                      util/*shadowing-locals*))
                             (patterns/ordered-unit-step? (second x) index))
                        (let [update (strip-index-cast (second x))]
-                       (or (and (seq? update) (= 2 (count update))
-                                (contains? '#{inc clojure.core/inc} (first update))
-                                (= index (strip-index-cast (second update))))
-                           (and (seq? update) (= 3 (count update))
-                                (contains? '#{+ clojure.core/+} (first update))
-                                (= index (strip-index-cast (second update)))
-                                (= 1 (strip-index-cast (nth update 2)))))))))]
+                         (or (patterns/ordered-unit-step? update index)
+                             ;; Preserve the historical narrow syntax while all callers migrate
+                             ;; to the shared affine matcher above.
+                             (and (seq? update) (= 2 (count update))
+                                  (contains? '#{inc clojure.core/inc} (first update))
+                                  (= index (strip-index-cast (second update))))
+                             (and (seq? update) (= 3 (count update))
+                                  (contains? '#{+ clojure.core/+} (first update))
+                                  (= index (strip-index-cast (second update)))
+                                  (= 1 (strip-index-cast (nth update 2)))))))))]
     (cond
       (step? form) {:body '(do) :update (when carried? (nth form 2))}
       (and (seq? form) (= 'do (first form)) (step? (last form)))

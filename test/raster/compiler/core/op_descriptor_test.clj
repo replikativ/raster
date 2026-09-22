@@ -44,3 +44,13 @@
       (is (= kind (descriptor/comparison-kind op)) (str op " comparison kind"))
       (is (= 'boolean (descriptor/result-tag op ['long 'long]))
           (str op " result tag")))))
+
+(deftest affine-steps-share-the-typed-wrapping-operator-registry
+  (doseq [op '[unchecked-add unchecked-add-int
+               clojure.core/unchecked-add clojure.core/unchecked-add-int]]
+    (is (descriptor/wrapping-addition-op? op))
+    (is (= 1 (descriptor/affine-step (list op '(clojure.core/long i)
+                                               '(clojure.core/long 1))
+                                     'i))))
+  (is (not (descriptor/wrapping-addition-op? 'clojure.core/+)))
+  (is (= 1 (descriptor/affine-step '(clojure.core/+ i 1) 'i))))

@@ -66,7 +66,10 @@
                          end   (aget member-offsets (inc fi))]
                      (loop [j start]
                        (when (< j end)
-                         (aset income (aget members j) wage)
+                         ;; A validated CSR membership contains every agent in exactly one
+                         ;; disjoint firm segment, so this indirect destination is unique across
+                         ;; both the inner segment and the enclosing firm map.
+                         (aset income (par/unique-index (aget members j)) wage)
                          (recur (unchecked-add-int j 1))))))))
 
 ;; ================================================================

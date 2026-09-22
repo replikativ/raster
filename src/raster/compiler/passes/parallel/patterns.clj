@@ -107,23 +107,15 @@
 
         :else nil))))
 
-(def ^:private unchecked-add-ops
-  "Unchecked add variants for index arithmetic."
-  #{'unchecked-add 'clojure.core/unchecked-add})
-
-(def ^:private unchecked-multiply-ops
-  "Unchecked multiply variants for index arithmetic."
-  #{'unchecked-multiply 'clojure.core/unchecked-multiply})
-
 (defn- index-add-op?
   "True if sym is an addition op including unchecked variants (for index arithmetic)."
   [sym]
-  (or (descriptor/addition-op? sym) (contains? unchecked-add-ops sym)))
+  (or (descriptor/addition-op? sym) (descriptor/wrapping-addition-op? sym)))
 
 (defn- index-multiply-op?
   "True if sym is a multiplication op including unchecked variants (for index arithmetic)."
   [sym]
-  (or (descriptor/multiplication-op? sym) (contains? unchecked-multiply-ops sym)))
+  (or (descriptor/multiplication-op? sym) (descriptor/wrapping-multiplication-op? sym)))
 
 (defn- linear-index-parts
   "`[outer-sym extent inner-sym]` of an index spelled `(+ (* outer extent) inner)`, in the

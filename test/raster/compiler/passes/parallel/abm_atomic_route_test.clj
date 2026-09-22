@@ -51,3 +51,15 @@
     (is (some #(= :int (get-in % [:results 0 :type])) conditionals)
         "the guarded atomic exports its old value through typed SSA control")
     (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))))
+
+(deftest csr-income-distribution-is-one-resident-nested-effect-map
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'phases/distribute-income-par! :ze:debug
+                    :dtype :float :on-non-resident :nil)
+        artifact (get-in descriptor [:steps 0 :artifact])
+        operations (body-operations artifact)]
+    (is (some? descriptor))
+    (is (= 1 (count (:steps descriptor))))
+    (is (kernel-artifact/kernel-artifact? artifact))
+    (is (some #(= "ForLoop" (some-> % class .getSimpleName)) operations))
+    (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))))
