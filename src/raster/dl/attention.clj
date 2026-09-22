@@ -2019,13 +2019,14 @@
 (deftm rope-prefill! (All [T] [x :- (Array T) out :- (Array T)
                                nrows :- Long heads :- Long head-dim :- Long
                                theta :- Double] :- Void
-                          (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+                          (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads head-dim))
                                                 (let [hdim2 (quot head-dim 2)
-                                                      per-row (clojure.core/* heads hdim2)
+                                                      per-row (clojure.core/* heads head-dim)
                                                       t (quot idx per-row)
                                                       rest0 (rem idx per-row)
-                                                      h (quot rest0 hdim2)
-                                                      i (rem rest0 hdim2)
+                                                      h (quot rest0 head-dim)
+                                                      d (rem rest0 head-dim)
+                                                      i (rem d hdim2)
                                                       base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
                                                                            (clojure.core/* h head-dim))
                                                       ln-theta (m/log theta)
@@ -2034,8 +2035,10 @@
                                                       c (m/cos ang) s (m/sin ang)
                                                       x0 (aget x (clojure.core/+ base i))
                                                       x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                  (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                                                  (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+                                                  (aset out idx
+                                                        (if (< d hdim2)
+                                                          (- (* x0 c) (* x1 s))
+                                                          (+ (* x1 c) (* x0 s))))))))
 
 ;; Causal batched attention, 3 phases. q:[T,nq*hd] k,v:[T,nkv*hd] row-major;
 ;; sc:[T*nq, T] scores/probs scratch; out:[T, nq*hd].
@@ -2048,10 +2051,9 @@
                                                              i (quot idx per-i)
                                                              rest0 (rem idx per-i)
                                                              hq (quot rest0 nrows)
-                                                             j (rem rest0 nrows)
-                                                             row (clojure.core/+ (clojure.core/* i n-q) hq)]
+                                                             j (rem rest0 nrows)]
                                                          (if (< i j)
-                                                           (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
+                                                           (aset sc idx -1.0e30)
                                                            (let [hkv (quot hq group)
                                                                  qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
                                                                                     (clojure.core/* hq head-dim))
@@ -2063,7 +2065,7 @@
                                                                                 (+ acc (* (aget q (clojure.core/+ qb d))
                                                                                           (aget k (clojure.core/+ kb d)))))
                                                                          acc))]
-                                                             (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
+                                                             (aset sc idx (* dot scale))))))))
 
 (deftm attn-prefill-softmax! (All [T] [sc :- (Array T)
                                        nrows :- Long n-q :- Long] :- Void
@@ -2085,6 +2087,29 @@
                                                                   (recur (inc j)))
                                                               nil))))))
 
+;; Value-returning prefill softmax for resident graphs. A generic ordered
+;; segmented fold-map keeps the immutable scores disjoint from the probability
+;; output while representing max, denominator, and dense normalization as one
+;; algebraic operation.
+(deftm attn-prefill-softmax (All [T] [sc :- (Array T)
+                                      nrows :- Long n-q :- Long] :- (Array T)
+                                 (let [rows (clojure.core/* nrows n-q)
+                                       probs-buffer (alloc-like sc (clojure.core/* rows nrows))]
+                                   (raster.par/segmented-fold-map!
+                                    [probs-buffer] [[row rows]] j nrows
+                                    [[mx -1.0e30 :element nrows
+                                      (n/max mx (aget sc (clojure.core/+
+                                                          (clojure.core/* row nrows) j)))]
+                                     [sum 0.0 :element nrows
+                                      (+ sum (m/exp (- (aget sc (clojure.core/+
+                                                                 (clojure.core/* row nrows) j))
+                                                       mx)))]]
+                                    [(/ (m/exp (- (aget sc (clojure.core/+
+                                                            (clojure.core/* row nrows) j))
+                                                  mx))
+                                        sum)])
+                                   probs-buffer)))
+
 (deftm attn-prefill-out! (All [T] [sc :- (Array T) v :- (Array T) out :- (Array T)
                                    nrows :- Long n-q :- Long group :- Long
                                    n-kv :- Long head-dim :- Long] :- Void
@@ -2098,7 +2123,7 @@
                                                           scb (clojure.core/* row nrows)
                                                           hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)
                                                           kvstride (clojure.core/* n-kv head-dim)]
-                                                      (aset out (clojure.core/+ (clojure.core/* i per-i) (clojure.core/+ (clojure.core/* hq head-dim) d))
+                                                      (aset out idx
                                                             (loop [j 0 a 0.0]
                                                               (if (< j nrows)
                                                                 (recur (inc j)
@@ -2119,7 +2144,6 @@
                                                                    rest0 (rem idx per-i)
                                                                    hq (quot rest0 nrows)
                                                                    j (rem rest0 nrows)
-                                                                   row (clojure.core/+ (clojure.core/* i n-q) hq)
                                                                    hkv (quot hq group)
                                                                    qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
                                                                                       (clojure.core/* hq head-dim))
@@ -2131,7 +2155,7 @@
                                                                                   (+ acc (* (aget q (clojure.core/+ qb d))
                                                                                             (aget k (clojure.core/+ kb d)))))
                                                                            acc))]
-                                                               (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))
+                                                               (aset sc idx (* dot scale))))))
 
 ;; Sliding-window scores (moonshine-style 'ergodic' encoder): query i attends j
 ;; iff 0 <= i-j <= left-1 (past incl. self) or 0 < j-i <= right-1 (future).
@@ -2140,9 +2164,9 @@
 ;; Degenerate windows recover the siblings exactly: [nrows, 1] == the causal
 ;; kernel, [nrows, nrows] == the bidir kernel; per-block calls with
 ;; left = right = block-size give block-diagonal attention. Out-of-window
-;; scores get the same -1.0e30 sentinel as the causal kernel, so
-;; attn-prefill-softmax!/attn-prefill-out! compose unchanged: exp(-1e30 - mx)
-;; underflows to exactly 0.0 and masked lanes contribute exact zeros.
+;; scores get the same -1.0e30 sentinel as the causal kernel, so either
+;; prefill softmax variant and attn-prefill-out! compose unchanged:
+;; exp(-1e30 - mx) underflows to exactly 0.0 and masked lanes contribute exact zeros.
 (deftm attn-prefill-scores-windowed! (All [T] [q :- (Array T) k :- (Array T) sc :- (Array T)
                                                nrows :- Long n-q :- Long group :- Long
                                                n-kv :- Long head-dim :- Long
@@ -2153,7 +2177,6 @@
                                                                       rest0 (rem idx per-i)
                                                                       hq (quot rest0 nrows)
                                                                       j (rem rest0 nrows)
-                                                                      row (clojure.core/+ (clojure.core/* i n-q) hq)
                                                                       ;; Keep masking as one typed comparison: `or`/`and` macro
                                                                       ;; temporaries can lose their Boolean tag at GPU fixpoints.
                                                                       distance (if (< i j)
@@ -2161,7 +2184,7 @@
                                                                                  (clojure.core/- i j))
                                                                       limit (if (< i j) (dec right) (dec left))]
                                                                   (if (> distance limit)
-                                                                    (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
+                                                                    (aset sc idx -1.0e30)
                                                                     (let [hkv (quot hq group)
                                                                           qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
                                                                                              (clojure.core/* hq head-dim))
@@ -2173,4 +2196,4 @@
                                                                                          (+ acc (* (aget q (clojure.core/+ qb d))
                                                                                                    (aget k (clojure.core/+ kb d)))))
                                                                                   acc))]
-                                                                      (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
+                                                                      (aset sc idx (* dot scale))))))))

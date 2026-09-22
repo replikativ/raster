@@ -349,6 +349,15 @@
       (let [mean (/ (+ (aget y 0) (aget y 1) (aget y 2)) 3.0)]
         (is (approx= 0.0 mean 1e-4)))))
 
+  (testing "chunked layer-norm matches the row-serial primitive"
+    (let [x (double-array [0.2 -0.7 1.4 2.0 -1.1 0.3 0.8
+                           3.1 0.4 -2.2 0.1 1.7 -0.5 0.9])
+          gamma (double-array [0.5 1.1 -0.2 0.7 1.3 -0.8 0.4])
+          beta (double-array [0.1 -0.3 0.2 0.0 0.4 0.6 -0.1])
+          expected (nn/layer-norm x gamma beta 2 7 1e-5)
+          actual (nn/layer-norm-chunked x gamma beta 2 7 4 1e-5)]
+      (is (arr-approx= expected actual 1e-12))))
+
   (testing "layer-norm gradient"
     (let [x (double-array [0.1 0.2 0.3 0.4 0.5 0.6])
           gamma (double-array [1.0 1.0 1.0])

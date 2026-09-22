@@ -449,6 +449,61 @@
                                                         (recur (inc i)))
                                                     nil))))))
 
+;; GPU schedule: expose feature reduction across row×chunk work-items, then
+;; apply normalization across every element. Each phase has one destination,
+;; matching the explicit SegMap store contract.
+(deftm layer-norm-chunked! (All [T]
+                                [x :- (Array T) gamma :- (Array T) beta :- (Array T) out :- (Array T)
+                                 rows :- Long features :- Long chunks :- Long eps :- Double] :- Void
+                                (let [sums (alloc-like x (clojure.core/* rows chunks))
+                                      sumsqs (alloc-like x (clojure.core/* rows chunks))
+                                      means (alloc-like x rows)
+                                      invs (alloc-like x rows)]
+                                  (raster.par/map-void! t (clojure.core/* rows chunks)
+                                                        (let [r (quot t chunks) c (rem t chunks) base (clojure.core/* r features)
+                                                              sum (loop [i c s 0.0]
+                                                                    (if (< i features)
+                                                                      (recur (clojure.core/+ i chunks)
+                                                                             (+ s (aget x (clojure.core/+ base i))))
+                                                                      s))]
+                                                          (aset sums t sum)))
+                                  (raster.par/map-void! t (clojure.core/* rows chunks)
+                                                        (let [r (quot t chunks) c (rem t chunks) base (clojure.core/* r features)
+                                                              sumsq (loop [i c s 0.0]
+                                                                      (if (< i features)
+                                                                        (let [v (aget x (clojure.core/+ base i))]
+                                                                          (recur (clojure.core/+ i chunks) (+ s (* v v))))
+                                                                        s))]
+                                                          (aset sumsqs t sumsq)))
+                                  (raster.par/map-void! r rows
+                                                        (let [base (clojure.core/* r chunks)
+                                                              sum (loop [c 0 s 0.0]
+                                                                    (if (< c chunks)
+                                                                      (recur (inc c) (+ s (aget sums (clojure.core/+ base c))))
+                                                                      s))]
+                                                          (aset means r (/ sum (double features)))))
+                                  (raster.par/map-void! r rows
+                                                        (let [base (clojure.core/* r chunks)
+                                                              sumsq (loop [c 0 s 0.0]
+                                                                      (if (< c chunks)
+                                                                        (recur (inc c) (+ s (aget sumsqs (clojure.core/+ base c))))
+                                                                        s))
+                                                              mean (aget means r)
+                                                              variance (n/max 0.0 (- (/ sumsq (double features)) (* mean mean)))]
+                                                          (aset invs r (/ 1.0 (n/sqrt (+ variance eps))))))
+                                  (raster.par/map-void! t (clojure.core/* rows features)
+                                                        (let [r (quot t features) i (rem t features)
+                                                              mean (aget means r) inv (aget invs r)]
+                                                          (aset out t (+ (* (aget gamma i) (* (- (aget x t) mean) inv))
+                                                                         (aget beta i))))))))
+
+(deftm layer-norm-chunked (All [T]
+                               [x :- (Array T) gamma :- (Array T) beta :- (Array T)
+                                rows :- Long features :- Long chunks :- Long eps :- Double] :- (Array T)
+                               (let [out (alloc-like x (clojure.core/* rows features))]
+                                 (layer-norm-chunked! x gamma beta out rows features chunks eps)
+                                 out)))
+
 ;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
 (deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
                   (raster.par/map-void! i n

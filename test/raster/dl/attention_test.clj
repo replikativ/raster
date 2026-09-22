@@ -209,6 +209,26 @@
 ;; Windowed prefill scores (moonshine-style sliding-window encoder)
 ;; ================================================================
 
+(deftest rope-prefill-source-shaped-test
+  (let [rows 3 heads 2 head-dim 6 half (quot head-dim 2)
+        x (float-array (map #(float (/ (- % 13) 9.0))
+                            (range (* rows heads head-dim))))
+        actual (float-array (alength x))
+        expected (float-array (alength x))
+        theta 10000.0]
+    (attn/rope-prefill! x actual rows heads head-dim theta)
+    (dotimes [row rows]
+      (dotimes [head heads]
+        (let [base (+ (* row heads head-dim) (* head head-dim))]
+          (dotimes [i half]
+            (let [angle (* row (Math/pow theta (/ (* -2.0 i) head-dim)))
+                  c (Math/cos angle) s (Math/sin angle)
+                  x0 (aget x (+ base i)) x1 (aget x (+ base i half))]
+              (aset expected (+ base i) (float (- (* x0 c) (* x1 s))))
+              (aset expected (+ base i half) (float (+ (* x1 c) (* x0 s)))))))))
+    (dotimes [i (alength x)]
+      (is (< (Math/abs (- (double (aget expected i)) (double (aget actual i)))) 1e-6)))))
+
 (deftest attn-prefill-scores-windowed-test
   (let [T 7 heads 2 hd 4
         dim (* heads hd)
@@ -260,6 +280,13 @@
     (testing "left=T right=T degenerates BIT-IDENTICALLY to the bidir kernel"
       (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores-bidir!)
                                    ^floats (scores attn/attn-prefill-scores-windowed! T T))))
+    (testing "value-returning softmax matches the in-place compatibility primitive"
+      (let [source (scores attn/attn-prefill-scores-bidir!)
+            expected (aclone source)
+            actual (attn/attn-prefill-softmax source T heads)]
+        (attn/attn-prefill-softmax! expected T heads)
+        (dotimes [i (alength expected)]
+          (is (< (Math/abs (- (double (aget expected i)) (double (aget actual i)))) 1e-6)))))
     (testing "small [left right] windows match a naive double reference through softmax+out"
       (doseq [[l r] [[3 2] [16 4] [2 1] [1 1] [4 3]]]
         (let [got (composed l r)
