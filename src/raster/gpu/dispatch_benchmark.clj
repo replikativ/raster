@@ -371,9 +371,11 @@
                 :group-id (:id group)
                 :site-count (:site-count group)
                 :planned-measurements planned-measurements))
-             jobs)]
+             jobs)
+            schedule-override
+            (program-tuning/merge-schedule-overrides (mapv :schedule-override results))]
         {:plan plan
          :planned-measurements planned-measurements
          :results results
-         :schedule-override
-         (program-tuning/merge-schedule-overrides (mapv :schedule-override results))}))))
+         :schedule-override schedule-override
+         :receipt (program-tuning/make-receipt plan results schedule-override)}))))

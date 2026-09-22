@@ -155,6 +155,56 @@
       (is (= [] (get-in result [:identity :policy :runtime-values]))
           "static tuning adds no synthetic value to the executable ABI"))))
 
+(deftest transported-tuning-rederives-complete-identity
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [result (tuning/tune-fixed!
+                  fixed-dispatch descriptor
+                  #(validated-result % (if (= % subgroup) 4.0 10.0))
+                  :numerical-mode numerical-mode :layout layout)
+          data (tuning/tuning-data result)
+          restored (tuning/restore-tuning fixed-dispatch data descriptor numerical-mode layout)]
+      (is (= result restored))
+      (is (map? data))
+      (is (not (record? data)))
+      (testing "a selector without its evidence envelope is not restorable"
+        (is (= :invalid-transported-dispatch-tuning-policy
+               (try
+                 (tuning/restore-tuning fixed-dispatch (:selector data) descriptor
+                                        numerical-mode layout)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception)))))))
+      (testing "a valid identity cannot carry a forged selector or missing measurements"
+        (is (= :dispatch-tuning-evidence-selector
+               (try
+                 (tuning/restore-tuning
+                  fixed-dispatch
+                  (assoc data :selector {:kind :fixed-strategy :strategy :reference})
+                  descriptor numerical-mode layout)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception))))))
+        (is (= :dispatch-tuning-evidence-coverage
+               (try
+                 (tuning/restore-tuning fixed-dispatch (assoc data :measurements []) descriptor
+                                        numerical-mode layout)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception)))))))
+      (testing "device and emitted-program drift fail loudly"
+        (is (= :transported-dispatch-tuning-identity
+               (try
+                 (tuning/restore-tuning fixed-dispatch data
+                                        (assoc descriptor :driver-version "different")
+                                        numerical-mode layout)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception))))))
+        (is (= :transported-dispatch-tuning-identity
+               (try
+                 (tuning/restore-tuning
+                  (assoc fixed-dispatch :alternatives
+                         [(update reference :source str "\n") subgroup])
+                  data descriptor numerical-mode layout)
+                 (catch clojure.lang.ExceptionInfo exception
+                   (:reason (ex-data exception))))))))))
+
 (deftest validated-device-measurements-produce-and-cache-piecewise-selection
   (binding [cache/*cache-root* (temporary-cache-root)]
     (let [calls (atom 0)

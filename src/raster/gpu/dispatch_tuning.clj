@@ -106,7 +106,9 @@
   [identity]
   (sha256 (pr-str (canonical-data identity))))
 
-(defn- tuning-from-data
+(declare validate-tuning-evidence!)
+
+(defn- validated-tuning-from-data
   [dispatch identity key data]
   (when (and (= tuning-version (:version data))
              (= key (:key data))
@@ -114,14 +116,55 @@
              (map? (:selector data))
              (vector? (:measurements data)))
     (kdispatch/with-selector dispatch (:selector data))
-    (->DispatchTuning key identity (:selector data) (:measurements data))))
+    (validate-tuning-evidence!
+     dispatch (->DispatchTuning key identity (:selector data) (:measurements data)))))
+
+(defn tuning-data
+  "Project a DispatchTuning to plain, versioned EDN data suitable for an artifact or wire envelope.
+
+   The result deliberately retains the unhashed complete identity as well as its key. A consumer
+   must call `restore-tuning`; a selector by itself is not portable tuning evidence."
+  [tuning]
+  (when-not (dispatch-tuning? tuning)
+    (throw (ex-info "tuning-data requires a DispatchTuning" {:tuning tuning})))
+  {:version tuning-version
+   :key (:key tuning)
+   :identity (:identity tuning)
+   :selector (:selector tuning)
+   :measurements (:measurements tuning)})
+
+(defn restore-tuning
+  "Restore transported plain tuning data after rederiving its complete current identity.
+
+   Unlike a cache lookup, malformed, stale, cross-build or cross-device evidence fails loudly.
+   This boundary is intended for program receipts and externally stored artifacts where silently
+   treating invalid supplied evidence as a cache miss would hide a deployment error."
+  [dispatch data descriptor numerical-mode layout]
+  (when-not (map? data)
+    (throw (ex-info "transported dispatch tuning must be a map"
+                    {:reason :invalid-transported-dispatch-tuning :data data})))
+  (let [{:keys [runtime-values improvement-threshold]} (get-in data [:identity :policy])]
+    (when-not (and (vector? runtime-values) (number? improvement-threshold))
+      (throw (ex-info "transported dispatch tuning has an invalid policy identity"
+                      {:reason :invalid-transported-dispatch-tuning-policy
+                       :policy (get-in data [:identity :policy])})))
+    (let [identity (tuning-identity dispatch descriptor runtime-values numerical-mode layout
+                                    improvement-threshold)
+          key (cache-key identity)]
+      (or (validated-tuning-from-data dispatch identity key data)
+          (throw (ex-info "transported dispatch tuning differs from the target dispatch"
+                          {:reason :transported-dispatch-tuning-identity
+                           :expected-key key
+                           :actual-key (:key data)
+                           :expected identity
+                           :actual (:identity data)}))))))
 
 (defn cache-get
   "Read and validate a cached result for the exact dispatch identity. Corrupt/stale entries miss."
   [dispatch identity]
   (let [key (cache-key identity)]
     (try
-      (tuning-from-data dispatch identity key (cache/read-entry key))
+      (validated-tuning-from-data dispatch identity key (cache/read-entry key))
       (catch Exception _ nil))))
 
 (defn cache-put!
@@ -129,11 +172,7 @@
   [tuning]
   (when-not (dispatch-tuning? tuning)
     (throw (ex-info "dispatch tuning cache requires a DispatchTuning" {:value tuning})))
-  (let [data {:version tuning-version
-              :key (:key tuning)
-              :identity (:identity tuning)
-              :selector (:selector tuning)
-              :measurements (:measurements tuning)}]
+  (let [data (tuning-data tuning)]
     (cache/write-entry! (:key tuning) data)
     tuning))
 
@@ -238,6 +277,103 @@
      :argument (get-in dispatch [:selector :argument])
      :below default-strategy
      :ranges ranges}))
+
+(defn- finite-nonnegative?
+  [value]
+  (and (number? value)
+       (Double/isFinite (double value))
+       (not (neg? (double value)))))
+
+(defn- validate-persisted-row!
+  [signatures expected-runtime-values row]
+  (let [strategy (:strategy row)
+        signature (get signatures strategy)
+        candidate-hash (:source-hash signature)]
+    (when-not signature
+      (throw (ex-info "persisted tuning row names an absent strategy"
+                      {:reason :dispatch-tuning-evidence-strategy :row row
+                       :strategies (set (keys signatures))})))
+    (when-not (contains? expected-runtime-values (:runtime-value row))
+      (throw (ex-info "persisted tuning row names an unsampled runtime value"
+                      {:reason :dispatch-tuning-evidence-runtime-value :row row
+                       :runtime-values expected-runtime-values})))
+    (if (= :inapplicable (:status row))
+      (when-not (and (= candidate-hash (:candidate-hash row))
+                     (vector? (:violations row)) (seq (:violations row))
+                     (every? #(and (map? %) (keyword? (:reason %))) (:violations row))
+                     (not (contains? row :measurement))
+                     (not (contains? row :validation)))
+        (throw (ex-info "persisted inapplicable tuning row is invalid"
+                        {:reason :dispatch-tuning-evidence-inapplicable :row row})))
+      (let [measured (:measurement row)
+            validation (:validation row)]
+        (when-not (and (not (contains? row :status))
+                       (map? measured)
+                       (every? finite-nonnegative?
+                               (map measured [:min-ns :median-ns :p75-ns :mean-ns :cv
+                                              :budget-ms :compile-ms]))
+                       (true? (:stationary? measured))
+                       (integer? (:n measured)) (pos? (long (:n measured)))
+                       (integer? (:warmup-iterations measured))
+                       (not (neg? (long (:warmup-iterations measured))))
+                       (contains? #{:warm :cold} (:cold-warm measured))
+                       (= :device-event (:timing-source measured))
+                       (map? (:hashes measured)))
+          (throw (ex-info "persisted tuning row has invalid measurement evidence"
+                          {:reason :dispatch-tuning-evidence-measurement :row row})))
+        (when-not (and (map? validation)
+                       (true? (:passed? validation))
+                       (string? (:oracle-hash validation))
+                       (not-empty (:oracle-hash validation))
+                       (= candidate-hash (:candidate-hash validation)))
+          (throw (ex-info "persisted tuning row has invalid oracle evidence"
+                          {:reason :dispatch-tuning-evidence-oracle :row row})))))))
+
+(defn- validate-tuning-evidence!
+  [dispatch tuning]
+  (let [dispatch (kdispatch/validate! dispatch)
+        identity (:identity tuning)
+        runtime-values (get-in identity [:policy :runtime-values])
+        improvement-threshold (get-in identity [:policy :improvement-threshold])
+        fixed? (= :fixed-strategy (get-in dispatch [:selector :kind]))
+        expected-runtime-values (if fixed? #{:fixed} (set runtime-values))
+        signatures (into {} (map (juxt :strategy clojure.core/identity))
+                         (:alternatives identity))
+        rows (:measurements tuning)
+        expected-pairs (set (for [runtime-value expected-runtime-values
+                                  strategy (keys signatures)]
+                              [runtime-value strategy]))
+        actual-pairs (mapv (juxt :runtime-value :strategy) rows)]
+    (when-not (and (vector? runtime-values)
+                   (if fixed?
+                     (empty? runtime-values)
+                     (and (seq runtime-values)
+                          (= runtime-values (vec (sort (distinct runtime-values))))
+                          (every? #(and (number? %) (Double/isFinite (double %)))
+                                  runtime-values)))
+                   (number? improvement-threshold)
+                   (<= 0.0 (double improvement-threshold))
+                   (< (double improvement-threshold) 1.0))
+      (throw (ex-info "persisted tuning policy is invalid"
+                      {:reason :dispatch-tuning-evidence-policy
+                       :policy (:policy identity) :fixed? fixed?})))
+    (doseq [row rows]
+      (validate-persisted-row! signatures expected-runtime-values row))
+    (when-not (and (= expected-pairs (set actual-pairs))
+                   (= (count expected-pairs) (count actual-pairs)))
+      (throw (ex-info "persisted tuning evidence does not cover every candidate and sample once"
+                      {:reason :dispatch-tuning-evidence-coverage
+                       :expected expected-pairs :actual actual-pairs})))
+    (let [selector (if fixed?
+                     {:kind :fixed-strategy
+                      :strategy (winner-at rows (:default-strategy dispatch)
+                                           improvement-threshold)}
+                     (measured-selector dispatch runtime-values rows improvement-threshold))]
+      (when-not (= selector (:selector tuning))
+        (throw (ex-info "persisted tuning selector does not follow from its measurements"
+                        {:reason :dispatch-tuning-evidence-selector
+                         :expected selector :actual (:selector tuning)})))
+      tuning)))
 
 (defn tune!
   "Measure, validate, and cache a generic KernelDispatch selector OFFLINE.

@@ -1355,6 +1355,16 @@ numerical or resource checks. Logical events, measurements, hardware descriptors
 `LinkPlan` and `ExecutionPlan` are the compiler/runtime seam to OpenCL, Level Zero, CUDA/HIP and
 future collective or cluster runtimes.
 
+Explicit program tuning now returns a versioned plain-data receipt in addition to its schedule
+override. The receipt retains each selected manifest signature and the complete per-dispatch
+evidence envelope (emitted alternatives, numerical/layout policy, samples, stationary
+measurements, hardware/calibration identity and cache key). Replaying it against a fresh generic
+compile rederives every identity before yielding the exact override for immutable recompilation;
+program, ABI, device, driver, capability or calibration drift fails loudly. A selector or schedule
+fragment alone is not tuning evidence. Storage policy remains outside this contract, so the same
+receipt can later use the authenticated artifact store, Boring/Konserve or another envelope without
+changing compiler identity semantics.
+
 Partial evaluation complements the SSA-based KernelBody; it does not replace it. The existing
 source fixpoint already combines call/AD expansion, type-aware rewalking, PE and CSE. The explicit
 PE API also accepts known parameters and dimensions. General runtime-driven respecialization is
