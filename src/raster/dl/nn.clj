@@ -494,6 +494,13 @@
          inverse-standard-deviation))
        (raster.arrays/aget beta i)))]))
 
+(deftm layer-norm-reassociated
+  [x :- (Array float) gamma :- (Array float) beta :- (Array float)
+   rows :- Long features :- Long eps :- Double] :- (Array float)
+  (let [out (float-array (clojure.core/* rows features))]
+    (layer-norm-reassociated! x gamma beta out rows features eps)
+    out))
+
 ;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
 (deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
                   (raster.par/map-void! i n

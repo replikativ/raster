@@ -29,7 +29,14 @@
       (is (= :one-workgroup-per-segment (get-in body [:schedule :strategy])))
       (is (= [:+ :+] (get-in body [:schedule :reduction-operators])))
       (is (= 2 (get-in body [:schedule :fold-count])))
-      (is (empty? (:allocs descriptor)) "both moments and the affine map stay in one kernel"))))
+      (is (empty? (:allocs descriptor)) "both moments and the affine map stay in one kernel"))
+    (let [descriptor (pipeline/compile-gpu-program
+                      #'nn/layer-norm-reassociated target :dtype :float)
+          body (get-in descriptor [:steps 0 :artifact :attributes :kernel-body])]
+      (is (= [:executable] (mapv :convention (:steps descriptor))))
+      (is (= :one-workgroup-per-segment (get-in body [:schedule :strategy])))
+      (is (= 1 (count (:allocs descriptor)))
+          "only the returned dense output is allocated; no zero-fill executable remains"))))
 
 (defn- run-layernorm! [target]
   (let [descriptor (pipeline/compile-gpu-program

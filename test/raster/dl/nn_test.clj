@@ -376,7 +376,11 @@
         (nn/layer-norm! x gamma beta expected rows features 1.0e-5)
         (nn/layer-norm-reassociated! x gamma beta actual rows features 1.0e-5)
         (is (every? #(< (Math/abs (double %)) 2.0e-3)
-                    (map - (vec expected) (vec actual))))))))
+                    (map - (vec expected) (vec actual))))
+        (is (every? #(< (Math/abs (double %)) 2.0e-3)
+                    (map - (vec expected)
+                         (vec (nn/layer-norm-reassociated
+                               x gamma beta rows features 1.0e-5)))))))))
 
 ;; ================================================================
 ;; Group Norm tests

@@ -619,7 +619,8 @@ reduces the mean and then reduces centered squares using that completed mean; th
 shares the same workgroup and kernel.  Both floating folds explicitly authorize reassociation, while
 the original polymorphic entry retains declaration-order reference semantics.  This avoids the
 unstable `E[x²] - E[x]²` shortcut and the former five-kernel partial-moment experiment without
-adding normalization-specific IR or emission.
+adding normalization-specific IR or emission.  The allocating spelling is only allocation plus a
+call to that same operation; its exact dense result discharges the fresh zero initializer.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows
