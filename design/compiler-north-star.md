@@ -913,9 +913,13 @@ SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logic
 whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
 consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
 resident rewrite and typed-route opt-out are deleted. The analyzed front end now constructs this
-TypedSOAC subset directly. Certified inclusive and exclusive scans also cross the same typed
-algorithm and scheduled-program boundary, retaining explicit destination, result-layout, and
-graph-owned temporary-storage contracts. Migration is complete when hardware-costed multi-consumer
+TypedSOAC subset directly. A whole-program coverage decline no longer erases independently valid
+producer semantics: local BLAS and indexed-operation canonicalization survives into compatibility
+scheduling, so an unsupported consumer remains materialized at its own source site while its GEMM
+producer still lowers as the same typed contraction. Certified inclusive and exclusive scans also
+cross the same typed algorithm and scheduled-program boundary, retaining explicit destination,
+result-layout, and graph-owned temporary-storage contracts. Migration is complete when
+hardware-costed multi-consumer
 fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted.
 Full contractions with one pointwise reduction axis and disjoint caller-owned output now use the
 same TypedSOAC segmented reduction with an empty segment space. They lower to the complete scalar

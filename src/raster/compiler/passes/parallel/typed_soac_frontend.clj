@@ -2510,6 +2510,64 @@
             elem-type (assoc :raster.type/elem-type elem-type))))
       expression)))
 
+(defn canonicalize-independent-operations
+  "Canonicalize top-level operations whose rewrite is valid independently of program admission.
+
+   TypedSOAC admission is deliberately whole-program and may decline because a later parallel
+   binding is not represented yet.  That decline must not roll an already-recognized producer back
+   to an opaque host call: in particular, a BLAS GEMM is the same explicit contraction whether or
+   not its consumer can fuse.  Keep only local, semantics-preserving operation rewrites here; shape
+   SSA, aliasing, allocation and scalar normalization remain owned by `normalize-source` after the
+   complete source has been admitted.
+
+   The compatibility scheduler can therefore schedule the canonical producer separately while it
+   reports the unsupported consumer at its own source site."
+  [source]
+  (if (and (seq? source) (contains? #{'let 'let*} (first source)))
+    (let [[head bindings & body] source
+          pairs (partition 2 bindings)
+          {:keys [canonical]}
+          (reduce
+           (fn [{:keys [canonical retained-types]} [ordinal [symbol expression]]]
+             (let [original expression
+                   retained (select-keys (meta symbol)
+                                         [:raster.type/tag :raster.type/elem-type :tag])
+                   retained-types (cond-> retained-types (seq retained)
+                                    (assoc symbol retained))
+                   expression (->> expression
+                                   (canonicalize-strided-indexed-operation ordinal)
+                                   (canonicalize-blas-gemm ordinal))
+                   ;; An accumulating GEMM has a result-transform operand. The whole TypedSOAC
+                   ;; route represents that boundary, but compatibility scheduling cannot yet do
+                   ;; so for every dynamic/mixed-dtype leaf. It is therefore not independently
+                   ;; schedulable and remains at its original call when whole-program admission
+                   ;; declines.
+                   expression (if (and (seq? expression)
+                                       (= 'raster.par/contract (first expression))
+                                       (some #{:epilogue} (take-nth 2 (drop 5 expression))))
+                                original expression)
+                   ;; Producer-local canonicalization must carry the walker's authoritative SSA
+                   ;; binder dtype to its uses. Compatibility scheduling otherwise sees an
+                   ;; untyped symbol at an explicit cast boundary and would have to guess. Restrict
+                   ;; this projection to explicit contractions; other operations retain their
+                   ;; original analyzed source unchanged.
+                   expression
+                   (if (and (seq? expression)
+                            (= 'raster.par/contract (first expression)))
+                     (walk/postwalk
+                      (fn [value]
+                        (if-let [type-meta (and (symbol? value) (get retained-types value))]
+                          (with-meta value (merge (meta value) type-meta))
+                          value))
+                      expression)
+                     expression)]
+               {:canonical (conj canonical [symbol expression])
+                :retained-types retained-types}))
+           {:canonical [] :retained-types {}}
+           (map-indexed vector pairs))]
+      (with-meta (list* head (vec (mapcat identity canonical)) body) (meta source)))
+    source))
+
 (defn- source-shadowing-locals
   "The symbols that are locals of the analyzed source even when they collide with a
    `clojure.core` name: the let's own binders and the declared parameters. `util/free-syms`
