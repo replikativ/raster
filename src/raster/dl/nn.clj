@@ -449,6 +449,51 @@
                                                         (recur (inc i)))
                                                     nil))))))
 
+;; Reassociated float LayerNorm.  The two statistical passes remain ordered: the variance fold
+;; consumes the completed mean fold, so this retains the numerically preferable centered second
+;; moment instead of replacing it with E[x²] - E[x]².  Each fold explicitly permits a target
+;; reduction tree.  The generic segmented-fold-map scheduler consequently assigns one workgroup to
+;; each row and performs the affine map in the same kernel; no LayerNorm name reaches the backend.
+;;
+;; As with rms-norm-reassociated!, this entry is concrete-float on purpose.  It is the accelerator
+;; numerical policy, while layer-norm! retains the declaration-order polymorphic host/reference
+;; policy.  Interpreted execution still evaluates both folds from left to right.
+(deftm layer-norm-reassociated!
+  [x :- (Array float) gamma :- (Array float) beta :- (Array float)
+   out :- (Array float) rows :- Long features :- Long eps :- Double] :- Void
+  (raster.par/segmented-fold-map!
+   [out] [[row rows]] i features
+   [[sum 0.0 :float features
+     (raster.numeric/+ sum
+                       (raster.arrays/aget
+                        x (clojure.core/+ (clojure.core/* row features) i)))
+     {:association :implementation-defined}]
+    [centered-squares 0.0 :float features
+     (let [mean (raster.numeric// sum (float features))
+           centered (raster.numeric/-
+                     (raster.arrays/aget
+                      x (clojure.core/+ (clojure.core/* row features) i))
+                     mean)]
+       (raster.numeric/+ centered-squares
+                         (raster.numeric/* centered centered)))
+     {:association :implementation-defined}]]
+   [(let [mean (raster.numeric// sum (float features))
+          inverse-standard-deviation
+          (raster.numeric//
+           (float 1.0)
+           (raster.numeric/sqrt
+            (raster.numeric/+
+             (raster.numeric// centered-squares (float features))
+             (float eps))))
+          coordinate (clojure.core/+ (clojure.core/* row features) i)]
+      (raster.numeric/+
+       (raster.numeric/*
+        (raster.arrays/aget gamma i)
+        (raster.numeric/*
+         (raster.numeric/- (raster.arrays/aget x coordinate) mean)
+         inverse-standard-deviation))
+       (raster.arrays/aget beta i)))]))
+
 ;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
 (deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
                   (raster.par/map-void! i n

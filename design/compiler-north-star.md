@@ -614,6 +614,12 @@ noisy 9.895 microsecond device-event median, versus the earlier 321 microsecond 
 opt-in canary validates the result, records the exact emitted artifact, and applies a deliberately
 broad 30x launch-aware roofline cliff. Stable-machine baselines remain the regression authority;
 ordinary CI compiles and validates the route but makes no laptop timing claim.
+LayerNorm uses the same operation without a named compiler path.  Its ordered fold tuple first
+reduces the mean and then reduces centered squares using that completed mean; the final affine map
+shares the same workgroup and kernel.  Both floating folds explicitly authorize reassociation, while
+the original polymorphic entry retains declaration-order reference semantics.  This avoids the
+unstable `E[x²] - E[x]²` shortcut and the former five-kernel partial-moment experiment without
+adding normalization-specific IR or emission.
 Product operands need not all traverse that complete axis tuple: the storage proof searches a
 bounded set of AxisMap permutations and subsets, then verifies the actual typed load coordinate
 against the selected map. Transposed/reordered packed inputs and weights broadcast over batch rows

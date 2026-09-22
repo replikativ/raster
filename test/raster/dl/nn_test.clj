@@ -364,6 +364,20 @@
                   x 1e-5)]
       (is (arr-approx= dx num-dx 1e-3)))))
 
+(deftest reassociated-layer-norm-test
+  (testing "ordered cooperative folds retain centered-variance LayerNorm semantics"
+    (doseq [[rows features] [[1 1] [1 17] [3 5]]]
+      (let [x (float-array (map #(float (+ 1000.0 (/ (- (mod % 11) 5) 7.0)))
+                                (range (* rows features))))
+            gamma (float-array (map #(float (/ (inc (mod % 5)) 4.0)) (range features)))
+            beta (float-array (map #(float (/ (- (mod % 3) 1) 5.0)) (range features)))
+            expected (float-array (* rows features))
+            actual (float-array (* rows features))]
+        (nn/layer-norm! x gamma beta expected rows features 1.0e-5)
+        (nn/layer-norm-reassociated! x gamma beta actual rows features 1.0e-5)
+        (is (every? #(< (Math/abs (double %)) 2.0e-3)
+                    (map - (vec expected) (vec actual))))))))
+
 ;; ================================================================
 ;; Group Norm tests
 ;; ================================================================
