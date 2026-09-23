@@ -456,6 +456,26 @@
                   (if (< i 6) (recur (inc i) (+ s (aget y i))) s))]
         (is (approx= 0.0 sum 1e-3))))))
 
+(deftest group-norm-product-derivatives-match-finite-differences
+  (let [x (double-array [0.2 -0.4 0.7 1.1 -0.3 0.5 0.9 -0.8])
+        gamma (double-array [1.2 0.7])
+        beta (double-array [0.1 -0.2])
+        dy (double-array [0.3 -0.2 0.1 0.4 -0.5 0.2 0.6 -0.1])
+        tangent (double-array [0.2 0.1 -0.3 0.5 0.4 -0.2 0.1 -0.4])
+        epsilon 1.0e-6
+        objective (fn []
+                    (let [y (nn/group-norm x gamma beta 1 2 4 1 1.0e-5)]
+                      (reduce + (map * y dy))))
+        expected-backward (numerical-grad-array objective x epsilon)
+        actual-backward (nn/group-norm-backward-dx dy x gamma 1 2 4 1 1.0e-5)
+        y0 (nn/group-norm x gamma beta 1 2 4 1 1.0e-5)
+        x-plus (double-array (map #(+ %1 (* epsilon %2)) x tangent))
+        y-plus (nn/group-norm x-plus gamma beta 1 2 4 1 1.0e-5)
+        expected-jvp (double-array (map #(/ (- %1 %2) epsilon) y-plus y0))
+        actual-jvp (nn/group-norm-jvp-dx tangent x gamma 1 2 4 1 1.0e-5)]
+    (is (arr-approx= expected-backward actual-backward 1.0e-5))
+    (is (arr-approx= expected-jvp actual-jvp 1.0e-5))))
+
 ;; ================================================================
 ;; Batch Norm tests
 ;; ================================================================

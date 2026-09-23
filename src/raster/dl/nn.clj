@@ -1969,59 +1969,62 @@
                                    :- (Array T)
                                    (let [cpg (quot channels groups)
                                          group-size (* cpg spatial)
+                                         means (double-array (* batch groups))
+                                         variances (double-array (* batch groups))
+                                         s1s (double-array (* batch groups))
+                                         s2s (double-array (* batch groups))
+                                         dg-values (alloc-like dy (* batch channels spatial))
                                          dx (alloc-like dy (* batch channels spatial))]
-                                     (dotimes [b batch]
-                                       (dotimes [g groups]
-                                         (let [mean (loop [c 0 acc 0.0]
-                                                      (if (< c cpg)
-                                                        (let [ch (+ (* g (int cpg)) c)
-                                                              acc (loop [sp 0 inner-acc acc]
-                                                                    (if (< sp spatial)
-                                                                      (recur (inc sp) (+ inner-acc
-                                                                                         (aget x (+ (* b (int (* channels spatial)))
-                                                                                                    (* ch (int spatial)) sp))))
-                                                                      inner-acc))]
-                                                          (recur (inc c) acc))
-                                                        (/ acc group-size)))
-                                               var (loop [c 0 acc 0.0]
-                                                     (if (< c cpg)
-                                                       (let [ch (+ (* g (int cpg)) c)
-                                                             acc (loop [sp 0 inner-acc acc]
-                                                                   (if (< sp spatial)
-                                                                     (let [idx (+ (* b (int (* channels spatial)))
-                                                                                  (* ch (int spatial)) sp)
-                                                                           d (- (aget x idx) mean)]
-                                                                       (recur (inc sp) (+ inner-acc (* d d))))
-                                                                     inner-acc))]
-                                                         (recur (inc c) acc))
-                                                       (/ acc group-size)))
-                                               inv-std (/ 1.0 (n/sqrt (+ var eps)))
-                                               ;; Accumulate into double-array to avoid vector return
-                                               ;; (nth on vector loses type tags after inlining)
-                                               sums-buf (double-array 2)
-                                               _ (dotimes [c cpg]
-                                                   (let [ch (+ (* g (int cpg)) c)]
-                                                     (dotimes [sp spatial]
-                                                       (let [idx (+ (* b (int (* channels spatial)))
-                                                                    (* ch (int spatial)) sp)
-                                                             x-hat (* (- (aget x idx) mean) inv-std)
-                                                             dg (* (aget dy idx) (aget gamma ch))]
-                                                         (aset sums-buf 0 (+ (aget sums-buf 0) (* dg x-hat)))
-                                                         (aset sums-buf 1 (+ (aget sums-buf 1) dg))))))
-                                               s1 (aget sums-buf 0)
-                                               s2 (aget sums-buf 1)
-                                               n-inv (/ 1.0 group-size)]
-                                           (dotimes [c cpg]
-                                             (let [ch (+ (* g (int cpg)) c)]
-                                               (dotimes [sp spatial]
-                                                 (let [idx (+ (* b (int (* channels spatial)))
-                                                              (* ch (int spatial)) sp)
-                                                       x-hat (* (- (aget x idx) mean) inv-std)
-                                                       dyi (aget dy idx)
-                                                       gi (aget gamma ch)]
-                                                   (aset dx idx
-                                                         (* inv-std (- (* dyi gi)
-                                                                       (* n-inv (+ s2 (* s1 x-hat)))))))))))))
+                                     (raster.par/map!
+                                      dg-values idx (* batch channels spatial) nil
+                                      (let [within-batch (rem idx (* channels spatial))
+                                            ch (quot within-batch spatial)]
+                                        (* (aget dy idx) (aget gamma ch))))
+                                     (raster.par/product-reduce!
+                                      [means] [[sum 0.0 :double]] [[b batch] [g groups]]
+                                      i group-size
+                                      []
+                                      [(/ (double (aget x (+ (* (+ (* b groups) g) group-size) i)))
+                                          (double group-size))]
+                                      [[left right]] [] [(+ left right)]
+                                      {:associative? true :commutative? true
+                                       :order :implementation-defined})
+                                     (raster.par/product-reduce!
+                                      [variances] [[sum 0.0 :double]] [[b batch] [g groups]]
+                                      i group-size
+                                      [d (- (aget x (+ (* (+ (* b groups) g) group-size) i))
+                                            (aget means (+ (* b groups) g)))]
+                                      [(/ (* (double d) (double d)) (double group-size))]
+                                      [[left right]] [] [(+ left right)]
+                                      {:associative? true :commutative? true
+                                       :order :implementation-defined})
+                                     (raster.par/product-reduce!
+                                      [s1s s2s]
+                                      [[s1 0.0 :double] [s2 0.0 :double]]
+                                      [[b batch] [g groups]] i group-size
+                                      [inv-std (/ 1.0 (n/sqrt (+ (aget variances (+ (* b groups) g)) eps)))
+                                       x-hat (* (- (aget x (+ (* (+ (* b groups) g) group-size) i))
+                                                   (aget means (+ (* b groups) g))) inv-std)
+                                       dg (aget dg-values (+ (* (+ (* b groups) g) group-size) i))]
+                                      [(* (double dg) (double x-hat)) (double dg)]
+                                      [[left1 right1] [left2 right2]] []
+                                      [(+ left1 right1) (+ left2 right2)]
+                                      {:associative? true :commutative? true
+                                       :order :implementation-defined})
+                                     (raster.par/map!
+                                      dx idx (* batch channels spatial) nil
+                                      (let [b (quot idx (* channels spatial))
+                                            within-batch (rem idx (* channels spatial))
+                                            ch (quot within-batch spatial)
+                                            g (quot ch cpg)
+                                            stats-idx (+ (* b groups) g)
+                                            inv-std (/ 1.0 (n/sqrt (+ (aget variances stats-idx) eps)))
+                                            x-hat (* (- (aget x idx) (aget means stats-idx)) inv-std)
+                                            n-inv (/ 1.0 (double group-size))]
+                                        (* inv-std
+                                           (- (* (aget dy idx) (aget gamma ch))
+                                              (* n-inv (+ (aget s2s stats-idx)
+                                                          (* (aget s1s stats-idx) x-hat)))))))
                                      dx)))
 
 (deftm group-norm-backward-dgamma (All [T] [dy :- (Array T) x :- (Array T)
@@ -2096,58 +2099,56 @@
                               :- (Array T)
                               (let [cpg (quot channels groups)
                                     group-size (* cpg spatial)
+                                    means (double-array (* batch groups))
+                                    variances (double-array (* batch groups))
+                                    dx-sums (double-array (* batch groups))
+                                    xhat-dx-sums (double-array (* batch groups))
                                     out (alloc-like dx (* batch channels spatial))]
-                                (dotimes [b batch]
-                                  (dotimes [g groups]
-                                    (let [mean (loop [c 0 acc 0.0]
-                                                 (if (< c cpg)
-                                                   (let [ch (+ (* g (int cpg)) c)
-                                                         acc (loop [sp 0 inner-acc acc]
-                                                               (if (< sp spatial)
-                                                                 (recur (inc sp)
-                                                                        (+ inner-acc
-                                                                           (aget x (+ (* b (int (* channels spatial)))
-                                                                                      (* ch (int spatial)) sp))))
-                                                                 inner-acc))]
-                                                     (recur (inc c) acc))
-                                                   (/ acc group-size)))
-                                          var (loop [c 0 acc 0.0]
-                                                (if (< c cpg)
-                                                  (let [ch (+ (* g (int cpg)) c)
-                                                        acc (loop [sp 0 inner-acc acc]
-                                                              (if (< sp spatial)
-                                                                (let [idx (+ (* b (int (* channels spatial)))
-                                                                             (* ch (int spatial)) sp)
-                                                                      d (- (aget x idx) mean)]
-                                                                  (recur (inc sp) (+ inner-acc (* d d))))
-                                                                inner-acc))]
-                                                    (recur (inc c) acc))
-                                                  (/ acc group-size)))
-                                          inv-std (/ 1.0 (n/sqrt (+ var eps)))
-              ;; group means of dx and x̂⊙dx (double-array accumulator — same
-              ;; vector-return workaround as group-norm-backward-dx)
-                                          sums-buf (double-array 2)
-                                          _ (dotimes [c cpg]
-                                              (let [ch (+ (* g (int cpg)) c)]
-                                                (dotimes [sp spatial]
-                                                  (let [idx (+ (* b (int (* channels spatial)))
-                                                               (* ch (int spatial)) sp)
-                                                        x-hat (* (- (aget x idx) mean) inv-std)]
-                                                    (aset sums-buf 0 (+ (aget sums-buf 0) (aget dx idx)))
-                                                    (aset sums-buf 1 (+ (aget sums-buf 1)
-                                                                        (* x-hat (aget dx idx))))))))
-                                          dmean (/ (aget sums-buf 0) group-size)
-                                          m2 (/ (aget sums-buf 1) group-size)]
-                                      (dotimes [c cpg]
-                                        (let [ch (+ (* g (int cpg)) c)]
-                                          (dotimes [sp spatial]
-                                            (let [idx (+ (* b (int (* channels spatial)))
-                                                         (* ch (int spatial)) sp)
-                                                  x-hat (* (- (aget x idx) mean) inv-std)]
-                                              (aset out idx
-                                                    (* (aget gamma ch)
-                                                       (* inv-std
-                                                          (- (aget dx idx) (+ dmean (* x-hat m2)))))))))))))
+                                (raster.par/product-reduce!
+                                 [means] [[sum 0.0 :double]] [[b batch] [g groups]]
+                                 i group-size
+                                 []
+                                 [(/ (double (aget x (+ (* (+ (* b groups) g) group-size) i)))
+                                     (double group-size))]
+                                 [[left right]] [] [(+ left right)]
+                                 {:associative? true :commutative? true
+                                  :order :implementation-defined})
+                                (raster.par/product-reduce!
+                                 [variances] [[sum 0.0 :double]] [[b batch] [g groups]]
+                                 i group-size
+                                 [d (- (aget x (+ (* (+ (* b groups) g) group-size) i))
+                                       (aget means (+ (* b groups) g)))]
+                                 [(/ (* (double d) (double d)) (double group-size))]
+                                 [[left right]] [] [(+ left right)]
+                                 {:associative? true :commutative? true
+                                  :order :implementation-defined})
+                                (raster.par/product-reduce!
+                                 [dx-sums xhat-dx-sums]
+                                 [[dx-sum 0.0 :double] [xhat-dx-sum 0.0 :double]]
+                                 [[b batch] [g groups]] i group-size
+                                 [inv-std (/ 1.0 (n/sqrt (+ (aget variances (+ (* b groups) g)) eps)))
+                                  x-hat (* (- (aget x (+ (* (+ (* b groups) g) group-size) i))
+                                              (aget means (+ (* b groups) g))) inv-std)]
+                                 [(double (aget dx (+ (* (+ (* b groups) g) group-size) i)))
+                                  (* (double x-hat)
+                                     (double (aget dx (+ (* (+ (* b groups) g) group-size) i))))]
+                                 [[left1 right1] [left2 right2]] []
+                                 [(+ left1 right1) (+ left2 right2)]
+                                 {:associative? true :commutative? true
+                                  :order :implementation-defined})
+                                (raster.par/map!
+                                 out idx (* batch channels spatial) nil
+                                 (let [b (quot idx (* channels spatial))
+                                       within-batch (rem idx (* channels spatial))
+                                       ch (quot within-batch spatial)
+                                       g (quot ch cpg)
+                                       stats-idx (+ (* b groups) g)
+                                       inv-std (/ 1.0 (n/sqrt (+ (aget variances stats-idx) eps)))
+                                       x-hat (* (- (aget x idx) (aget means stats-idx)) inv-std)
+                                       dmean (/ (aget dx-sums stats-idx) (double group-size))
+                                       m2 (/ (aget xhat-dx-sums stats-idx) (double group-size))]
+                                   (* (aget gamma ch) inv-std
+                                      (- (aget dx idx) (+ dmean (* x-hat m2))))))
                                 out)))
 
 ;; ----------------------------------------------------------------
