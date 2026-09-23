@@ -46,6 +46,7 @@
                    'raster.dl.nn/maxpool2d! 2
                    'raster.dl.nn/group-norm-backward-dx 5
                    'raster.dl.nn/group-norm-jvp-dx 4
+                   'raster.dl.nn/batch-norm 4
                    'raster.dl.attention/graph-attention 5
                    'raster.dl.nn/rms-norm-chunked 3
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3
