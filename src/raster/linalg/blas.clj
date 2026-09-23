@@ -538,6 +538,79 @@
 (def ^:private dgemm-batch-strided-mh
   (delay (make-optional-handle "cblas_dgemm_batch_strided" dgemm-batch-strided-fd)))
 
+(deftm ^:no-inline batched-gemm-nt-layout!
+  "C_h = alpha*A_h@B_h^T for equally strided row-major matrix views.
+
+  Offsets, leading dimensions, and batch strides are in elements. Unlike
+  `batched-gemm-nt!`, matrices need not occupy contiguous slabs; this admits
+  head views embedded in `[row,head,dim]` tensors without packing."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float
+   a-offset :- Long lda :- Long stride-a :- Long
+   b-offset :- Long ldb :- Long stride-b :- Long
+   c-offset :- Long ldc :- Long stride-c :- Long] :- (Array float)
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
+    (let [^MemorySegment sa (.asSlice (MemorySegment/ofArray A) (* (long a-offset) 4))
+          ^MemorySegment sb (.asSlice (MemorySegment/ofArray B) (* (long b-offset) 4))
+          ^MemorySegment sc (.asSlice (MemorySegment/ofArray C) (* (long c-offset) 4))]
+      (if-let [mh ^java.lang.invoke.MethodHandle
+               ;; oneMKL rejects an output batch stride smaller than the
+               ;; padded matrix span, even when the logical elements of
+               ;; interleaved matrix views are disjoint.  Independent GEMMs
+               ;; preserve that useful layout without a pack/unpack pass.
+               (when (or (== batch 1) (>= stride-c (* m ldc)))
+                 @sgemm-batch-strided-mh)]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int lda) (Math/toIntExact (long stride-a))
+                               sb (int ldb) (Math/toIntExact (long stride-b))
+                               (float 0.0) sc (int ldc) (Math/toIntExact (long stride-c))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                                 (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) stride-a 4)) (int lda)
+                                 (.asSlice sb (* (long h) stride-b 4)) (int ldb)
+                                 (float 0.0)
+                                 (.asSlice sc (* (long h) stride-c 4)) (int ldc)])))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nn-layout!
+  "C_h = alpha*A_h@B_h for equally strided row-major matrix views.
+
+  Offsets, leading dimensions, and batch strides are in elements. Input and
+  output heads may be interleaved in a wider row layout."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float
+   a-offset :- Long lda :- Long stride-a :- Long
+   b-offset :- Long ldb :- Long stride-b :- Long
+   c-offset :- Long ldc :- Long stride-c :- Long] :- (Array float)
+  (when (and (pos? batch) (pos? m) (pos? n) (pos? k))
+    (let [^MemorySegment sa (.asSlice (MemorySegment/ofArray A) (* (long a-offset) 4))
+          ^MemorySegment sb (.asSlice (MemorySegment/ofArray B) (* (long b-offset) 4))
+          ^MemorySegment sc (.asSlice (MemorySegment/ofArray C) (* (long c-offset) 4))]
+      (if-let [mh ^java.lang.invoke.MethodHandle
+               (when (or (== batch 1) (>= stride-c (* m ldc)))
+                 @sgemm-batch-strided-mh)]
+        (.invokeWithArguments mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                               (int m) (int n) (int k) alpha
+                               sa (int lda) (Math/toIntExact (long stride-a))
+                               sb (int ldb) (Math/toIntExact (long stride-b))
+                               (float 0.0) sc (int ldc) (Math/toIntExact (long stride-c))
+                               (Math/toIntExact (long batch))])
+        (dotimes [h batch]
+          (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                                [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                                 (int m) (int n) (int k) alpha
+                                 (.asSlice sa (* (long h) stride-a 4)) (int lda)
+                                 (.asSlice sb (* (long h) stride-b 4)) (int ldb)
+                                 (float 0.0)
+                                 (.asSlice sc (* (long h) stride-c 4)) (int ldc)])))))
+  C)
+
 (deftm ^:no-inline batched-gemm-nt!
   "C_h = alpha * A_h @ B_h^T for h in 0..batch. A:[batch,m,k] B:[batch,n,k]
   C:[batch,m,n], all row-major contiguous."
@@ -629,6 +702,17 @@
                                  (.asSlice sb (* (long h) bs 8)) (int n)
                                  0.0 (.asSlice sc (* (long h) cs 8)) (int n)])))))
   C)
+
+;; Every batched contraction overwrites only C (argument 2).  Make that
+;; explicit so calls embedded in a larger compiled graph participate in DCE
+;; and buffer planning just like the scalar GEMM wrappers above.
+(doseq [op '[raster.linalg.blas/batched-gemm-nt-layout!
+             raster.linalg.blas/batched-gemm-nn-layout!
+             raster.linalg.blas/batched-gemm-nt!
+             raster.linalg.blas/batched-gemm-nn!]]
+  (descriptor/register-buffer-semantics! op {:allocates? false :in-place-arg 2
+                                             :mutating? true})
+  (descriptor/register-buffer-write! op :overwrite 2))
 
 ;; ================================================================
 ;; cblas_dgemv — matrix-vector multiply

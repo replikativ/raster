@@ -246,3 +246,38 @@
              (blas/batched-gemm-nn! a b cnn 2 2 2 2 (float 1.0))))
       (is (= [17.0 23.0 39.0 53.0, 2.0 4.0 6.0 8.0] (mapv float cnt)))
       (is (= [19.0 22.0 43.0 50.0, 2.0 6.0 4.0 8.0] (mapv float cnn))))))
+
+(deftest test-batched-gemm-strided-layouts
+  (letfn [(check-layouts []
+            ;; A and B are [row,head,dim].  Each head is contiguous within a
+            ;; row, but consecutive rows of one head have a wider leading
+            ;; dimension.  C is head-major here, as attention scores are.
+            (let [a (float-array [99, 1 2, 5 6, 3 4, 7 8])
+                  b (float-array [99, 1 0, 2 0, 0 1, 0 2, 1 1, 1 2])
+                  c (float-array 14)]
+              (java.util.Arrays/fill c (float -1))
+              (blas/batched-gemm-nt-layout!
+               a b c 2 2 2 3 (float 1)
+               1 4 2, 1 4 2, 1 3 6)
+              (is (= [-1.0, 1.0 2.0 3.0, 3.0 4.0 7.0,
+                      10.0 12.0 17.0, 14.0 16.0 23.0, -1.0]
+                     (mapv float c))))
+            ;; Scores are head-major, while values and the destination are
+            ;; [row,head,dim].  This is the layout needed to write attention
+            ;; context directly, without an unpack pass.
+            (let [a (float-array [99, 1 2 3, 4 5 6, 2 0 1, 1 3 2])
+                  b (float-array [99, 1 0, 2 1, 0 1, 1 0, 1 1, 0 2])
+                  c (float-array 10)]
+              (java.util.Arrays/fill c (float -1))
+              (blas/batched-gemm-nn-layout!
+               a b c 2 2 3 2 (float 1)
+               1 3 6, 1 4 2, 1 4 2)
+              (is (= [-1.0, 4.0 5.0, 4.0 4.0,
+                      10.0 11.0, 5.0 5.0, -1.0]
+                     (mapv float c)))))]
+    (testing "configured BLAS path supports logically disjoint matrix views"
+      (check-layouts))
+    (testing "portable per-matrix fallback supports the same layouts"
+      (with-redefs-fn
+        {(ns-resolve 'raster.linalg.blas 'sgemm-batch-strided-mh) (delay nil)}
+        check-layouts))))
