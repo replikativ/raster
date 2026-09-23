@@ -16,12 +16,51 @@
     {sym → {:tag dispatch-tag, :fn-info map?, :element dispatch-tag?}}
   This is the walker's canonical type representation."
   (:require [clojure.string :as str]
-            [clojure.core.typed :as t]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
-            [raster.compiler.ir.form :as form]
-            [raster.compiler.core.tc-extensions]))
+            [raster.compiler.ir.form :as form]))
+
+(def ^:private tc-check-form-info-fn
+  "Load Typed Clojure and Raster's checker extensions only when a caller asks
+   for checker-backed inference. Ordinary deftm definition and structural
+   walking deliberately do not pay this startup cost."
+  (delay
+    (require 'raster.compiler.core.tc-extensions)
+    (let [check-form-info (requiring-resolve 'clojure.core.typed/check-form-info)]
+      ;; The checker initializes configured var-type providers on its first
+      ;; check and may replace annotation environments while doing so. Complete
+      ;; that initialization before queued Raster annotations are published.
+      (check-form-info 1 {:check-config {:check-form-eval :never}})
+      ((requiring-resolve
+        'raster.compiler.core.dispatch/invalidate-tc-annotation-flush!))
+      check-form-info)))
+
+(defonce ^:private initialized-tc-source-namespaces (atom #{}))
+
+(defn- tc-check-form-info
+  [source-ns]
+  (let [check-form-info @tc-check-form-info-fn
+        source-ns (cond
+                    (instance? clojure.lang.Namespace source-ns) source-ns
+                    (symbol? source-ns) (the-ns source-ns)
+                    :else *ns*)]
+    ;; TC initializes namespace-local environments lazily as well. Ensure the
+    ;; source namespace exists in those environments before its queued Vars are
+    ;; annotated, otherwise the first real check can replace the annotation.
+    (let [source-name (ns-name source-ns)]
+      (when-not (contains? @initialized-tc-source-namespaces source-name)
+        (locking initialized-tc-source-namespaces
+          (when-not (contains? @initialized-tc-source-namespaces source-name)
+            (binding [*ns* source-ns]
+              (check-form-info '(clojure.core.typed/fn [x :- Long] x)
+                               {:checked-ast true
+                                :check-config {:check-form-eval :never}}))
+            (swap! initialized-tc-source-namespaces conj source-name)))))
+    ;; Typed Clojure finishes initializing/resetting its environments while the
+    ;; extension namespace loads. Publish queued annotations only afterwards.
+    ((requiring-resolve 'raster.compiler.core.dispatch/flush-tc-annotations!))
+    check-form-info))
 
 ;; Signature-derived result typing lives in dispatch (with the parametric
 ;; registry). dispatch → specialize → inference, so we resolve it lazily
@@ -293,7 +332,7 @@
     ;; These are polymorphic fallbacks where TC can't add value — every operation
     ;; on Any will fail type checking, producing noise.
     (when (some some? annotations)
-      (let [check-fn t/check-form-info
+      (let [check-fn (tc-check-form-info source-ns)
             fn-params (vec (mapcat (fn [p ann]
                                      (let [tc-type (if ann
                                                      (raster-ann->tc-type ann)
@@ -403,7 +442,7 @@
   Used by the pipeline rewalk pass to type-check post-AD code."
   [param-env form]
   (try
-    (let [check-fn t/check-form-info
+    (let [check-fn (tc-check-form-info *ns*)
           ;; Desugar .invk → plain calls so TC can analyze them
           tc-form (desugar-invk-for-tc form)
           ;; Build TC fn params from param-env

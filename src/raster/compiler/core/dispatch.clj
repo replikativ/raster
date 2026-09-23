@@ -12,7 +12,6 @@
   compatibility with bytecode.clj and tooling/inspect.clj."
   (:require [clojure.string :as str]
             [clojure.walk]
-            [clojure.core.typed :as t]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry]
             [raster.compiler.core.specialize :as specialize]))
@@ -712,9 +711,31 @@
     (when (seq all)
       (list* 'typed.clojure/IFn all))))
 
+(defonce ^:private pending-tc-annotations (atom {}))
+(defonce ^:private pending-direct-tc-annotations (atom {}))
+(defonce ^:private pending-tc-annotation-version (atom 0))
+(defonce ^:private flushed-tc-annotation-version (atom -1))
+(defonce ^:private tc-annotations-ready? (atom false))
+
+(defn register-tc-ann!
+  "Register a direct Typed Clojure annotation now, or retain it until the
+   checker is first initialized."
+  [ns-sym qualified-symbol type-form]
+  (let [annotation [ns-sym qualified-symbol type-form {} nil nil]]
+    (if @tc-annotations-ready?
+      ((requiring-resolve 'clojure.core.typed/-ann) annotation)
+      (do (swap! pending-direct-tc-annotations assoc qualified-symbol annotation)
+          (swap! pending-tc-annotation-version inc)
+          ;; If a user loaded TC directly, make the annotation available now;
+          ;; retaining it in the queue still lets Raster republish after the
+          ;; checker's lazy environment initialization.
+          (when (find-ns 'clojure.core.typed)
+            (try ((requiring-resolve 'clojure.core.typed/-ann) annotation)
+                 (catch Throwable _ nil)))))))
+
 (defn- emit-tc-ann! [target-ns-obj simple-name table-atom]
   (try
-    (let [ann-fn t/-ann]
+    (let [ann-fn (requiring-resolve 'clojure.core.typed/-ann)]
       (let [ns-sym (ns-name target-ns-obj)
             qsym (symbol (str ns-sym) (str simple-name))
             ret-tags (reduce
@@ -737,6 +758,32 @@
     (catch Exception e
       (binding [*out* *err*]
         (println (str "WARNING: TC annotation failed for " simple-name ": " (.getMessage e)))))))
+
+(defn invalidate-tc-annotation-flush!
+  "Force the next flush to republish annotations after checker initialization."
+  []
+  (reset! tc-annotations-ready? false)
+  (reset! flushed-tc-annotation-version -1))
+
+(defn flush-tc-annotations!
+  "Publish annotations accumulated while Typed Clojure was not loaded.
+
+   Checker-backed inference calls this after Raster's TC extensions initialize.
+   Every dispatch annotation is retained without making ordinary namespace
+   loading initialize the checker."
+  []
+  (let [version @pending-tc-annotation-version]
+    (if (= version @flushed-tc-annotation-version)
+      0
+      (let [direct (vals @pending-direct-tc-annotations)
+            ann-fn (requiring-resolve 'clojure.core.typed/-ann)
+            _ (doseq [annotation direct] (ann-fn annotation))
+            pending (vals @pending-tc-annotations)]
+        (doseq [[target-ns-obj simple-name table-atom] pending]
+          (emit-tc-ann! target-ns-obj simple-name table-atom))
+        (reset! flushed-tc-annotation-version version)
+        (reset! tc-annotations-ready? true)
+        (+ (count direct) (count pending))))))
 
 ;; ================================================================
 ;; Compiler-facing deftm metadata — one source of truth across generic and mangled vars
@@ -843,7 +890,13 @@
                     :raster.compiler/host-only all-host-only?
                     :arglists (seq arglists))
        (clear-specialization-cache! k)
-       (emit-tc-ann! target-ns-obj simple-name table-atom)
+       (if @tc-annotations-ready?
+         (emit-tc-ann! target-ns-obj simple-name table-atom)
+         (do (swap! pending-tc-annotations assoc k
+                    [target-ns-obj simple-name table-atom])
+             (swap! pending-tc-annotation-version inc)
+             (when (find-ns 'clojure.core.typed)
+               (emit-tc-ann! target-ns-obj simple-name table-atom))))
        v))))
 
 (defn set-reducible!

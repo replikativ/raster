@@ -45,7 +45,6 @@
   argument types, using instanceof checks at runtime."
   (:refer-clojure :exclude [defn])
   (:require [clojure.string :as str]
-            [raster.compiler.passes.scalar.simplify :as simplify]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
@@ -54,10 +53,22 @@
             [raster.compiler.core.specialize :as specialize]
             [raster.compiler.backend.jvm.valhalla :as valhalla]
             [raster.compiler.core.method-entry :as me]
-            [raster.compiler.backend.jvm.bytecode :as bytecode]
-            [raster.compiler.backend.jvm.par-simd :as par-simd]
-            [raster.compiler.core.typed-dispatch :as typed-dispatch]
-            [raster.runtime.callsites :as callsites]))
+            [raster.compiler.core.typed-dispatch :as typed-dispatch]))
+
+(def ^:private simplify-fn
+  (delay (requiring-resolve 'raster.compiler.passes.scalar.simplify/simplify)))
+
+(def ^:private simd-pass-fn
+  (delay (requiring-resolve 'raster.compiler.backend.jvm.par-simd/simd-pass)))
+
+(def ^:private compile-typed-impl-fn
+  (delay (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)))
+
+(def ^:private invalidate-callsites-fn
+  (delay (requiring-resolve 'raster.runtime.callsites/invalidate!)))
+
+(clojure.core/defn- simplify-form [form]
+  (@simplify-fn form))
 
 (def ^:dynamic ^:no-doc *simplify?*
   "When true, algebraic simplification is applied to walked deftm bodies.
@@ -258,13 +269,13 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
         walked-body (when-not skip-walk?
                       (let [wb (map #(walker/walk-body % walk-opts) body)]
-                        (if simplify? (map simplify/simplify wb) wb)))
+                        (if simplify? (map simplify-form wb) wb)))
         ;; Conditional second walk with fn-info (typed .invk path)
         has-fn-params? (some :fn-info (vals full-type-env))
         walked-body-typed (when (and (not skip-walk?) has-fn-params?)
                             (let [full-walk-opts (assoc walk-opts :type-env full-type-env)
                                   wb (map #(walker/walk-body % full-walk-opts) body)]
-                              (if simplify? (map simplify/simplify wb) wb)))
+                              (if simplify? (map simplify-form wb) wb)))
         ;; Typed interface info
         typed-iface-info (when generate-typed?
                            (let [prim-tags (mapv #(types/annotation->tag %1 %2) annotations params)]
@@ -349,7 +360,7 @@
     walked-body
     (binding [*ns* (or source-ns *ns*)]
       (mapv (fn [form]
-              (try (:form (par-simd/simd-pass form))
+              (try (:form (@simd-pass-fn form))
                    (catch Throwable _ form)))
             walked-body))))
 
@@ -380,9 +391,9 @@
                               (.replace (str mangled-sym) "." "_")
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
                               "_" (mod (System/nanoTime) 1000000))
-              impl (bytecode/compile-typed-impl! class-name params tags return-tag
-                                                 effective-body source-ns typed-iface-name
-                                                 (str (ns-name source-ns)) (str mangled-sym))]
+              impl (@compile-typed-impl-fn class-name params tags return-tag
+                                           effective-body source-ns typed-iface-name
+                                           (str (ns-name source-ns)) (str mangled-sym))]
           (when impl
             (let [old-impl (.getRawRoot ^clojure.lang.Var impl-var)]
               (alter-var-root impl-var (constantly impl))
@@ -413,7 +424,7 @@
                       (let [dispatch-obj (.getRawRoot ^clojure.lang.Var v)]
                         (typed-dispatch/update-dispatch-impl! dispatch-obj old-impl impl)))))
             ;; Invalidate MutableCallSites so C2 re-inlines with new impl
-                (callsites/invalidate! impl-var impl)
+                (@invalidate-callsites-fn impl-var impl)
                 impl
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure
@@ -1234,9 +1245,10 @@
                        (let [~@(mapcat (fn [p i] [p (list 'nth args-sym i)])
                                        factory-params (range))]
                          (new ~name ~@factory-params)))))
-               (try (clojure.core.typed/-ann
-                     ['~(ns-name *ns*) '~(symbol (str (ns-name *ns*)) (str factory-sym))
-                      '~tc-ann-form {} nil nil])
+               (try (dispatch/register-tc-ann!
+                     '~(ns-name *ns*)
+                     '~(symbol (str (ns-name *ns*)) (str factory-sym))
+                     '~tc-ann-form)
                     (catch Exception _#))
                ~(when (seq field-types)
                   `(inf/register-field-types! '~name '~field-types
@@ -1285,9 +1297,10 @@
                        (str "#" '~name
                             (array-map ~@(mapcat (fn [p] [(keyword (clojure.core/name p))
                                                           `(. ~'v ~(symbol (str "-" (clojure.core/name p))))]) params)))))
-             (try (clojure.core.typed/-ann
-                   ['~(ns-name *ns*) '~(symbol (str (ns-name *ns*)) (str factory-sym))
-                    '~tc-ann-form {} nil nil])
+             (try (dispatch/register-tc-ann!
+                   '~(ns-name *ns*)
+                   '~(symbol (str (ns-name *ns*)) (str factory-sym))
+                   '~tc-ann-form)
                   (catch Exception _#))
              ~(when (seq field-types)
                 `(inf/register-field-types! '~name '~field-types
