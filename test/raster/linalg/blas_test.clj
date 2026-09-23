@@ -77,6 +77,44 @@
       (is (== 139.0 (aget C 2)))
       (is (== 154.0 (aget C 3))))))
 
+(deftest test-sgemm-nt-prepacked
+  (testing "fixed-shape packed B matches ordinary float NT GEMM"
+    (let [m 3 k 4 n 5
+          A (float-array (map #(/ (float %) 7.0) (range 1 (inc (* m k)))))
+          B (float-array (map #(/ (float %) 11.0) (range 1 (inc (* n k)))))
+          expected (float-array (* m n))
+          actual (float-array (* m n))
+          prepared (blas/pack-sgemm-nt-b B m k n (float 0.75))]
+      (blas/dgemm-nt! A B expected m k n (float 0.75) (float 0.0))
+      (with-open [packed prepared]
+        (is (identical? actual
+                        (blas/sgemm-nt-prepacked!
+                         A packed actual m k n (float 0.0))))
+        (is (every? #(< (Math/abs (double (- (aget expected %) (aget actual %))))
+                        1.0e-5)
+                    (range (* m n))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"shape mismatch"
+                              (blas/sgemm-nt-prepacked!
+                               A packed actual (inc m) k n (float 0.0)))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage is closed"
+                            (blas/sgemm-nt-prepacked!
+                             A prepared actual m k n (float 0.0))))))
+  (testing "backends without packed-GEMM extensions retain the same contract"
+    (let [m 2 k 3 n 2
+          A (float-array [1 2 3, 4 5 6])
+          B (float-array [7 9 11, 8 10 12])
+          actual (float-array (* m n))
+          no-pack (into {}
+                        (map (fn [name]
+                               [(ns-resolve 'raster.linalg.blas name) (delay nil)]))
+                        '[sgemm-pack-get-size-mh sgemm-pack-mh sgemm-compute-mh])]
+      (with-redefs-fn
+        no-pack
+        #(with-open [packed (blas/pack-sgemm-nt-b B m k n (float 1.0))]
+           (is (= :portable (:backend packed)))
+           (blas/sgemm-nt-prepacked! A packed actual m k n (float 0.0))))
+      (is (= [58.0 64.0 139.0 154.0] (mapv float actual))))))
+
 (deftest test-dgemv-basic
   (testing "y = A @ x, 2x3 @ 3 -> 2"
     (let [A (double-array [1 2 3 4 5 6])       ;; [2,3]
