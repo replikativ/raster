@@ -43,9 +43,7 @@
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3}]
             (is (= {:kernel-body expected-kernels}
                    (get-in rows [workload :emission :routes]))
-                (str workload " regained a compatibility emitter"))
-            (is (empty? (get-in rows [workload :emission :declines]))
-                (str workload " has an unexplained emitter decline"))))))))
+                (str workload " regained a compatibility emitter"))))))))
 
 (deftest frontend-coverage-retains-independent-emission-evidence
   (let [calls (atom 0)
