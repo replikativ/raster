@@ -71,7 +71,7 @@
         {:keys [graph]} (equation-graph/make-for-equation
                          scheduled (first (:equations scheduled)))
         input (first (filter #(= 'x (:id %)) (:inputs graph)))
-        certificate (get-in graph [:nodes 0 :operation :read-capacity-certificate])]
+        certificate (get-in graph [:nodes 0 :read-capacity-certificate])]
     (is (= 'n (:elements input))
         "the active map domain proves x[0..n), and graph binding enforces that capacity")
     (is (= :zero-based-dense-read-spans (:kind certificate)))
