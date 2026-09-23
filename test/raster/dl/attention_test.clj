@@ -1,6 +1,7 @@
 (ns raster.dl.attention-test
   (:require [clojure.test :refer [deftest testing is use-fixtures]]
             [raster.dl.attention :as attn]
+            [raster.dl.attention-reference :as attention-reference]
             [raster.dl.array-ops :as ops]
             [raster.dl.nn :as nn]
             [raster.ad.templates :as tmpl]
@@ -503,9 +504,9 @@
             kc (frand (* n n-kv hd))
             vc (frand (* n n-kv hd))
             wsink (float-array n)
-            base ^floats (attn/gqa-decode-attention q kc vc n n-q n-kv hd scale)
+            base ^floats (attention-reference/gqa-decode q kc vc n n-q n-kv hd scale)
             got ^floats (attn/gqa-decode-attention-weights! q kc vc n n-q n-kv hd scale wsink)]
-        (testing (str "output bit-identical to gqa-decode-attention (n-q " n-q " n-kv " n-kv ")")
+        (testing (str "output bit-identical to the sequential oracle (n-q " n-q " n-kv " n-kv ")")
           (is (java.util.Arrays/equals base got)))
         (testing "head-averaged weights sum to ~1 for the query"
           (let [s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (aget wsink j))) s))]
