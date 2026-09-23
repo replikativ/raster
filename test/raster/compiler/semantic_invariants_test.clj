@@ -56,6 +56,19 @@
           (is (< (Math/abs (- (aget ^floats y 0) (/ 3.0 (Math/sqrt 12.5)))) 1.0e-5)))))
     (testing "gelu"
       (is (fn? (pl/compile-aot #'nn/gelu :dtype :float))))
+    (testing "late scalar expansion preserves the closed-core invariant"
+      (let [f (pl/compile-aot #'nn/layer-norm-reassociated!
+                              :dtype :float :target :c :simd? false)
+            x (float-array [1.0 2.0 4.0 -1.0 0.5 3.0])
+            gamma (float-array [0.5 1.0 2.0])
+            beta (float-array [0.25 -0.5 1.0])
+            expected (float-array 6)
+            actual (float-array 6)]
+        (nn/layer-norm-reassociated! x gamma beta expected 2 3 1.0e-5)
+        (f x gamma beta actual 2 3 1.0e-5)
+        (is (every? #(< (Math/abs (double (- (aget expected %) (aget actual %))))
+                        1.0e-6)
+                    (range 6)))))
     (testing "batched causal SDPA (fused attention kernel)"
       (is (fn? (pl/compile-aot #'attn/batched-causal-sdpa :dtype :float))))
     (testing "gqa-causal-mha (the GPU-lowerable gqa path)"
