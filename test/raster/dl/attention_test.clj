@@ -250,6 +250,58 @@
                                       src-edges dst-edges n-nodes n-edges d-model)]
         (is (= (* n-nodes d-model) (alength out)))))))
 
+(deftest graph-attention-generic-scatter-algebra-matches-sequential-oracle
+  (let [n-nodes 3
+        n-edges 4
+        d-model 2
+        h (double-array [0.2 -0.3, 0.5 0.7, -0.4 0.9])
+        Wq (double-array [0.8 -0.1, 0.3 0.6])
+        Wk (double-array [0.4 0.2, -0.5 0.9])
+        Wv (double-array [0.7 -0.2, 0.1 0.5])
+        Wo (double-array [0.6 0.4, -0.3 0.8])
+        src (long-array [0 1 2 0])
+        dst (long-array [2 2 0 1])
+        mm (fn [^doubles a ^doubles b]
+             (let [out (double-array (* n-nodes d-model))]
+               (dotimes [i n-nodes]
+                 (dotimes [j d-model]
+                   (aset out (+ (* i d-model) j)
+                         (reduce +
+                                 (for [k (range d-model)]
+                                   (* (aget a (+ (* i d-model) k))
+                                      (aget b (+ (* k d-model) j))))))))
+               out))
+        q (mm h Wq)
+        k (mm h Wk)
+        v (mm h Wv)
+        scores (double-array n-edges)
+        denominator (double-array n-nodes)
+        weighted (double-array (* n-nodes d-model))
+        scale (/ 1.0 (Math/sqrt (double d-model)))]
+    (dotimes [edge n-edges]
+      (let [source (aget src edge)
+            destination (aget dst edge)
+            dot (reduce +
+                        (for [component (range d-model)]
+                          (* (aget q (+ (* destination d-model) component))
+                             (aget k (+ (* source d-model) component)))))
+            score (Math/exp (min 5.0 (max -5.0 (* dot scale))))]
+        (aset scores edge score)
+        (aset denominator destination (+ (aget denominator destination) score))
+        (dotimes [component d-model]
+          (let [to (+ (* destination d-model) component)
+                from (+ (* source d-model) component)]
+            (aset weighted to (+ (aget weighted to) (* score (aget v from))))))))
+    (dotimes [node n-nodes]
+      (dotimes [component d-model]
+        (let [index (+ (* node d-model) component)]
+          (aset weighted index
+                (/ (aget weighted index) (+ (aget denominator node) 1e-6))))))
+    (let [expected (mm weighted Wo)
+          actual (attn/graph-attention h Wq Wk Wv Wo src dst
+                                       n-nodes n-edges d-model)]
+      (is (arr-approx= expected actual 1e-12)))))
+
 ;; ================================================================
 ;; Sinusoidal embedding
 ;; ================================================================

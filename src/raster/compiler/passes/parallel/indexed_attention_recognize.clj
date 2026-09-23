@@ -223,7 +223,13 @@
                     :operands operands
                     :output (buffer output dtype value-shape)
                     :accumulator-dtype accumulator-dtype
-                    :runtime-parameters [n-nodes n-edges total-dim n-heads slice-dim]
+                    ;; A specialization may identify dimensions (single-head attention has
+                    ;; total-dim = slice-dim) or make one of them static.  Marker rebinding is a
+                    ;; substitution by semantic value, so duplicate entries would be ambiguous
+                    ;; even though the plan itself is valid.  Transport each distinct value once;
+                    ;; every occurrence in the plan is then rewritten by the same substitution.
+                    :runtime-parameters (vec (distinct [n-nodes n-edges total-dim
+                                                        n-heads slice-dim]))
                     :source-operation {:form form :output output
                                        :intermediates internal}
                     :provenance {:semantic-op :indexed-graph-attention

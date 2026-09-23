@@ -1598,48 +1598,24 @@
    src-edges :- (Array long) dst-edges :- (Array long)
    n-nodes :- Long n-edges :- Long d-model :- Long]
   :- (Array double)
-  (let [;; Project Q, K, V from node features
+  (let [;; Project Q, K, V from node features.
         Q (nn/matmul h Wq n-nodes d-model d-model)
         K (nn/matmul h Wk n-nodes d-model d-model)
         V (nn/matmul h Wv n-nodes d-model d-model)
-        ;; Compute attention scores at edges
-        ;; score[e] = exp(sum_d Q[dst[e],d] * K[src[e],d] / sqrt(dk))
-        scale (/ 1.0 (n/sqrt (double d-model)))
-        scores (double-array n-edges)
-        _ (dotimes [e n-edges]
-            (let [src (aget src-edges e)
-                  dst (aget dst-edges e)
-                  dot (loop [d 0 acc 0.0]
-                        (if (< d d-model)
-                          (recur (inc d)
-                                 (+ acc (* (aget Q (+ (* dst (int d-model)) d))
-                                           (aget K (+ (* src (int d-model)) d)))))
-                          acc))]
-              (aset scores e (m/exp (n/min 5.0 (n/max -5.0 (* dot scale)))))))
-        ;; Scatter scores to get normalization Z per node
-        Z (double-array n-nodes)
-        _ (dotimes [e n-edges]
-            (let [dst (aget dst-edges e)]
-              (aset Z dst
-                    (+ (aget Z dst) (aget scores e)))))
-        ;; Compute weighted messages and scatter to nodes
-        out (double-array (* n-nodes d-model))
-        _ (dotimes [e n-edges]
-            (let [src (aget src-edges e)
-                  dst (aget dst-edges e)
-                  w (aget scores e)]
-              (dotimes [d d-model]
-                (let [dst-idx (+ (* dst (int d-model)) d)
-                      src-idx (+ (* src (int d-model)) d)]
-                  (aset out dst-idx
-                        (+ (aget out dst-idx)
-                           (* w (aget V src-idx))))))))
-        ;; Normalize: out[node] /= Z[node]
-        _ (dotimes [node n-nodes]
-            (let [z (+ (aget Z node) 1e-6)]
-              (dotimes [d d-model]
-                (let [idx (+ (* node (int d-model)) d)]
-                  (aset out idx (/ (aget out idx) z))))))]
+        ;; Keep graph routing in the generic indexed/scatter algebra.  In particular, concurrent
+        ;; edges may share a destination: spelling their updates as ordinary `aset` read/modify/
+        ;; writes would be sequential source semantics and an invalid parallelization premise.
+        ;; The scatter operations retain their collision contracts, allowing either an atomic
+        ;; scatter schedule or fusion into an ownership-safe segmented reduction.
+        raw-scores (ops/indexed-dot Q K dst-edges src-edges
+                                    n-nodes n-nodes n-edges d-model d-model 1)
+        scores (ops/scale-clamp-exp raw-scores
+                                    (/ 1.0 (n/sqrt (double d-model)))
+                                    5.0 (* n-edges 1))
+        Z (ops/scatter-add scores dst-edges n-nodes n-edges 1)
+        weighted (ops/scatter-mul-add scores V dst-edges src-edges
+                                      n-nodes n-nodes n-edges d-model d-model 1)
+        out (ops/segment-div weighted Z n-nodes d-model 1 1e-6)]
     ;; Output projection
     (nn/matmul out Wo n-nodes d-model d-model)))
 
