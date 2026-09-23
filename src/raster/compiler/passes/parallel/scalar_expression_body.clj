@@ -586,16 +586,35 @@
                        (= 2 (count expression)))
                   (let [target (dtype/dtype-for-scalar-tag
                                 (descriptor/cast-result-tag (first expression)))
-                        source-expected (dtype/canon
-                                         (or (authoritative-source-type (second expression) env)
-                                             (decline! :scalar-source-type
-                                                       "explicit scalar cast requires the retained operand dtype"
-                                                       {:expression expression
-                                                        :operand (second expression)
-                                                        :target target})))
-                        lowered (lower (second expression) source-expected env)]
-                    (cast-lowered lowered target expression
-                                  (descriptor/cast-integral-narrowing (first expression))))
+                        operand (second expression)
+                        ;; A conditional with independently typed branches need not have one
+                        ;; source dtype. Cast only the selected branch, as the source cast does;
+                        ;; this preserves rounding and exceptional behavior without guessing a
+                        ;; union's type from the destination. The ordinary `if` lowering still
+                        ;; evaluates its condition exactly once.
+                        conditional? (and (seq? operand) (= 'if (first operand))
+                                          (= 4 (count operand)))
+                        then-type (when conditional?
+                                    (authoritative-source-type (nth operand 2) env))
+                        else-type (when conditional?
+                                    (authoritative-source-type (nth operand 3) env))]
+                    (if (and then-type else-type
+                             (dtype/known? then-type) (dtype/known? else-type)
+                             (not= (canon-type then-type) (canon-type else-type)))
+                      (lower (list 'if (second operand)
+                                   (list (first expression) (nth operand 2))
+                                   (list (first expression) (nth operand 3)))
+                             target env)
+                      (let [source-expected
+                            (dtype/canon
+                             (or (authoritative-source-type operand env)
+                                 (decline! :scalar-source-type
+                                           "explicit scalar cast requires the retained operand dtype"
+                                           {:expression expression :operand operand
+                                            :target target})))
+                            lowered (lower operand source-expected env)]
+                        (cast-lowered lowered target expression
+                                      (descriptor/cast-integral-narrowing (first expression))))))
 
                   (dialect/scalar-convert-form? expression)
                   (let [{:keys [attributes operand]} (dialect/scalar-convert-parts expression)

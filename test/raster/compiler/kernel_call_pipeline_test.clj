@@ -32,6 +32,31 @@
   (raster.par/map-void! i n
                         (ra/aset out i (* scale (ra/aget x i)))))
 
+(deftm segmented-mask-effect!
+  [scores :- (Array float) segments :- (Array float) out :- (Array float)
+   nrows :- Long nheads :- Long] :- Void
+  (raster.par/map-void! idx (* nrows (* nheads nrows))
+                        (let [q (quot idx (* nheads nrows))
+                              k (rem idx nrows)]
+                          (ra/aset out idx
+                                   (if (= (ra/aget segments q) (ra/aget segments k))
+                                     (ra/aget scores idx)
+                                     -1.0e30)))))
+
+(deftm segmented-mask-value-from-effect
+  [scores :- (Array float) segments :- (Array float)
+   nrows :- Long nheads :- Long] :- (Array float)
+  (let [out (ra/alloc-like scores (* nrows (* nheads nrows)))
+        _ (segmented-mask-effect! scores segments out nrows nheads)]
+    out))
+
+(deftest allocating-segment-mask-retains-its-effect-produced-value
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'segmented-mask-value-from-effect :ze:0 :dtype :float
+                    :on-non-resident :throw)]
+    (is (= [:map-void] (mapv :convention (:steps descriptor))))
+    (is (= 1 (count (:allocs descriptor))))))
+
 (deftm resident-kernel-call-scan
   [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
   (raster.par/scan out acc 0.0 i n float (+ acc (ra/aget x i))))
