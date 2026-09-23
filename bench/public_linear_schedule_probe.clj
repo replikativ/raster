@@ -21,7 +21,7 @@
 
 (defn- comparison-strategies
   [choice matrix-tiles]
-  (if (= :finite matrix-tiles)
+  (if (not= :default matrix-tiles)
     (filterv (fn [candidate]
                (let [strategy (executable/strategy candidate)]
                  (or (contains? #{:portable-segred :xmx-direct} strategy)
@@ -38,7 +38,8 @@
                  (string? environment) (seq environment)
                  (= :ocl:0 target)
                  (contains? #{:all-stages :constant-weights} residency)
-                 (contains? #{:default :finite} matrix-tiles)
+                 (or (contains? #{:default :finite} matrix-tiles)
+                     (and (vector? matrix-tiles) (seq matrix-tiles)))
                  (integer? rounds) (<= 2 rounds 120) (even? rounds)
                  (integer? warmup-rounds) (<= 0 warmup-rounds 30))
     (throw (ex-info "linear probe requires Arc OpenCL, positive [rows,in,out], identities and bounded rounds"
@@ -124,7 +125,8 @@
    transforms on every replay; `:constant-weights` uses the ordinary LinkPlan role contract to
    hoist weight-only transforms into an untimed one-time prologue. `:matrix-tiles :finite`
    compares both compiler-emitted tile-local families; the default keeps the four main
-   schedules for a cheaper diagnostic."
+   schedules for a cheaper diagnostic. A non-empty vector of descriptor-derived tile maps compiles
+   exactly that bounded subset together with the analytic seed, allowing low-memory tuning batches."
   [{:keys [shape revision environment rounds warmup-rounds target residency matrix-tiles]
     :or {shape [32 256 256] rounds 12 warmup-rounds 4 target :ocl:0
          residency :all-stages matrix-tiles :default}

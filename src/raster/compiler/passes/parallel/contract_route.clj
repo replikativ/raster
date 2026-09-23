@@ -1251,14 +1251,17 @@
                                      (:batched? matrix-view) (conj (:batch matrix-view)))))
         target-schedule (when (and (= :mixed-f16-f32 precision) (:ok matrix-view))
                           (gpu-gemm/mixed-dpas-schedule (:desc options) (:tile options)))
-        finite-matrix-tiles?
-        (= :finite (get options :matrix-tiles :default))
+        matrix-tiles (get options :matrix-tiles :default)
+        expanded-matrix-tiles? (or (= :finite matrix-tiles) (vector? matrix-tiles))
         tile-schedules
         (when target-schedule
-          (let [tiles (if finite-matrix-tiles?
-                        (distinct (cons (:tile target-schedule)
-                                        (hardware/gemm-tile-candidates (:desc options))))
-                        [(:tile target-schedule)])]
+          (let [requested (cond
+                            (= :finite matrix-tiles)
+                            (hardware/gemm-tile-candidates (:desc options))
+
+                            (vector? matrix-tiles) matrix-tiles
+                            :else [])
+                tiles (distinct (cons (:tile target-schedule) requested))]
             (mapv #(gpu-gemm/mixed-dpas-schedule (:desc options) %) tiles)))]
     (cond
       (not matrix-enabled?)
@@ -1336,7 +1339,7 @@
                                [(:graph emitted)]
                                (:alternatives emitted))
             additional-tile-schedules
-            (if (and finite-matrix-tiles?
+            (if (and expanded-matrix-tiles?
                      (not (:batched? matrix-view))
                      (contains? #{:nn :nt} (:variant matrix-view)))
               (rest tile-schedules)
@@ -1390,8 +1393,8 @@
                   :dimensions (:dimensions matrix-view)
                   :tile (:tile target-schedule)
                   :matrix (:matrix target-schedule)}
-           finite-matrix-tiles?
-           (assoc :matrix-tiles :finite
+           expanded-matrix-tiles?
+           (assoc :matrix-tiles matrix-tiles
                   :tile-schedules
                   (when (and (not (:batched? matrix-view))
                              (contains? #{:nn :nt} (:variant matrix-view)))

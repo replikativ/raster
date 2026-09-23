@@ -73,8 +73,8 @@
     ;; tuning writes the validated selector here; recompilation consumes it without benchmarking.
     :typed-contraction {:strategy :auto
                         ;; Compile only the analytic tile in the hot path. `:finite` materializes
-                        ;; the descriptor-derived tile family as compatible dispatch alternatives
-                        ;; for explicit measurement/autotuning.
+                        ;; the descriptor-derived family; a non-empty vector selects an exact
+                        ;; validated subset so an offline tuner can compile/measure bounded batches.
                         :matrix-tiles :default
                         ;; Explicit K-partition candidates are likewise opt-in.  They remain
                         ;; ordinary ABI-compatible KernelGraph alternatives for the generic
@@ -105,6 +105,14 @@
   #{:auto :reference :subgroup-score-reuse})
 (def ^:private valid-typed-contraction-strategies #{:auto})
 (def ^:private valid-matrix-tile-spaces #{:default :finite})
+
+(defn- valid-matrix-tile-space?
+  [matrix-tiles desc]
+  (or (contains? valid-matrix-tile-spaces matrix-tiles)
+      (and (vector? matrix-tiles)
+           (seq matrix-tiles)
+           (= (count matrix-tiles) (count (distinct matrix-tiles)))
+           (every? (set (hw/gemm-tile-candidates desc)) matrix-tiles))))
 
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
@@ -249,10 +257,11 @@
       (throw (ex-info "schedule: unknown typed contraction strategy"
                       {:strategy typed-contraction-strategy
                        :expected valid-typed-contraction-strategies})))
-    (when-not (valid-matrix-tile-spaces matrix-tiles)
-      (throw (ex-info "schedule: unknown typed contraction matrix tile space"
+    (when-not (valid-matrix-tile-space? matrix-tiles desc)
+      (throw (ex-info "schedule: unknown typed contraction matrix tile space; expected :default, :finite, or a non-empty unique subset of the descriptor-derived family"
                       {:matrix-tiles matrix-tiles
-                       :expected valid-matrix-tile-spaces})))
+                       :expected valid-matrix-tile-spaces
+                       :candidates (hw/gemm-tile-candidates desc)})))
     (when-not (and (vector? split-factors)
                    (= (count split-factors) (count (set split-factors)))
                    (every? #(and (integer? %) (> (long %) 1)
