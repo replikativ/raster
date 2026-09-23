@@ -518,7 +518,10 @@
                  #'dl-attention/gqa-decode-attention-buf!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
-                 #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))))))
+                 #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'dl-attention/gqa-causal-mha-jvp
+                 {:target device-id :dtype :float}))))))
 
 (defn- write-artifact!
   [directory suffix label artifact]

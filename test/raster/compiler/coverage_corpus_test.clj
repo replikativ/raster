@@ -48,6 +48,7 @@
                    'raster.dl.nn/group-norm-jvp-dx 4
                    'raster.dl.nn/batch-norm 4
                    'raster.dl.attention/graph-attention 5
+                   'raster.dl.attention/gqa-causal-mha-jvp 11
                    'raster.dl.nn/rms-norm-chunked 3
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3
                    'raster.dl.nn/generate-dropout-mask-seeded 1}]

@@ -1194,6 +1194,83 @@
                                  (aset D bi acc)))
          D)))
 
+(deftm batched-causal-attn-score-jvp
+  "Directional derivative of the scaled causal score matrix.
+
+  DZ[b,i,j] = (dQ[b,i]·K[b,j] + Q[b,i]·dK[b,j]) / sqrt(head-dim) for j<=i,
+  and zero above the causal diagonal.  One work item owns each score, so the head-dimension
+  fold remains explicit and schedulable instead of hiding behind a per-head host loop."
+  (All [T]
+       [dQ :- (Array T) dK :- (Array T) Q :- (Array T) K :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array T)
+       (let [slab (* seq-len head-dim)
+             ss (* seq-len seq-len)
+             DZ (alloc-like Q (* batch ss))]
+         (raster.par/map-void! t (clojure.core/* batch ss)
+                               (let [b (quot t ss)
+                                     r (rem t ss)
+                                     i (quot r seq-len)
+                                     j (rem r seq-len)
+                                     boff (clojure.core/* b slab)]
+                                 (if (<= j i)
+                                   (let [qrow (clojure.core/+ boff (clojure.core/* i head-dim))
+                                         krow (clojure.core/+ boff (clojure.core/* j head-dim))
+                                         dz (loop [d 0 acc 0.0]
+                                              (if (< d head-dim)
+                                                (recur (inc d)
+                                                       (+ acc
+                                                          (* (aget dQ (clojure.core/+ qrow d))
+                                                             (aget K (clojure.core/+ krow d)))
+                                                          (* (aget Q (clojure.core/+ qrow d))
+                                                             (aget dK (clojure.core/+ krow d)))))
+                                                acc))]
+                                     (aset DZ t (/ dz (n/oftype dz (n/sqrt (double head-dim))))))
+                                   (aset DZ t 0.0))))
+         DZ)))
+
+(deftm batched-causal-sdpa-jvp
+  "Forward tangent of batched-causal-sdpa as a flat resident composition.
+
+  W is the primal causal softmax, DZ is the score tangent, and
+  R[b,i]=sum_j W[b,i,j]*DZ[b,i,j].  The final map applies the softmax JVP and value
+  tangent without materializing dW:
+
+    dO[b,i,d] = sum_j W_ij*(DZ_ij-R_i)*V[b,j,d] + W_ij*dV[b,j,d]."
+  (All [T]
+       [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
+        Q :- (Array T) K :- (Array T) V :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array T)
+       (let [slab (* seq-len head-dim)
+             ss (* seq-len seq-len)
+             W (batched-causal-attn-weights Q K batch seq-len head-dim)
+             DZ (batched-causal-attn-score-jvp dQ dK Q K batch seq-len head-dim)
+             R (batched-causal-attn-dsum W DZ batch seq-len)
+             dO (alloc-like Q (* batch slab))]
+         (raster.par/map-void! t (clojure.core/* batch slab)
+                               (let [b (quot t slab)
+                                     r (rem t slab)
+                                     i (quot r head-dim)
+                                     d (rem r head-dim)
+                                     boff (clojure.core/* b slab)
+                                     woff (clojure.core/+ (clojure.core/* b ss)
+                                                          (clojure.core/* i seq-len))
+                                     ri (aget R (clojure.core/+ (clojure.core/* b seq-len) i))
+                                     acc (loop [j 0 acc 0.0]
+                                           (if (<= j i)
+                                             (let [wij (aget W (clojure.core/+ woff j))
+                                                   dzij (aget DZ (clojure.core/+ woff j))
+                                                   v-index (clojure.core/+ boff
+                                                                 (clojure.core/+ (clojure.core/* j head-dim) d))]
+                                               (recur (inc j)
+                                                      (+ acc
+                                                         (* (* wij (- dzij ri)) (aget V v-index))
+                                                         (* wij (aget dV v-index)))))
+                                             acc))]
+                                 (aset dO t acc)))
+         dO)))
+
 (deftm batched-causal-sdpa
   "Causal SDPA over `batch` contiguous [seq,hd] head slabs: out = softmax_causal(Q·Kᵀ/√hd)·V.
   Materializes the weight matrix W (batched-causal-attn-weights — ONE QKᵀ dot per score,
@@ -1427,12 +1504,9 @@
 ;; GPU-lowerable IR with no closures-as-tape. The :jvp-fn (forward mode) is KEPT
 ;; below — its removability is a separate forward-mode audit.
 
-;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention — mirrors
-;; gqa-causal-mha-backward's head iteration: per query head hq, slice the
-;; (Q,K,V) and (dQ,dK,dV) head slabs, run the single-head causal-SDPA JVP,
-;; and WRITE the head tangent into hq's output slab (each hq owns its slab —
-;; no accumulation on the output side; the kv-head fan-IN that forces dK/dV
-;; accumulation in the backward has no forward counterpart).
+;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention.  It is the same flat
+;; relayout/broadcast/SDPA/unpack algebra as the primal, applied jointly to primal and tangent
+;; arrays.  There is no per-head carry loop and therefore no separate scheduling exception.
 (deftm gqa-causal-mha-jvp
   (All [T]
        [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
@@ -1440,33 +1514,21 @@
         batch :- Long seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
        :- (Array T)
        (let [group (quot n-q n-kv)
-             qstride (* n-q head-dim)
-             kvstride (* n-kv head-dim)
-             dOut (alloc-like Q (* batch (* seq-len qstride)))]
-         ;; per (example, query head): each example's `seq` rows are an independent
-         ;; causal sequence. slice-strided-2d's col-offset is a FLAT additive offset,
-         ;; so the example base (b·seq·stride) folds into it with rows := seq-len.
-         (dotimes [b batch]
-           (let [qbase (* b (int (* seq-len qstride)))
-                 kvbase (* b (int (* seq-len kvstride)))]
-             (dotimes [hq n-q]
-               (let [hkv (quot hq (int group))
-                     qoff0 (+ qbase (* hq (int head-dim)))
-                     kvoff0 (+ kvbase (* hkv (int head-dim)))
-                     Qh (ops/slice-strided-2d Q seq-len qstride qoff0 head-dim)
-                     Kh (ops/slice-strided-2d K seq-len kvstride kvoff0 head-dim)
-                     Vh (ops/slice-strided-2d V seq-len kvstride kvoff0 head-dim)
-                     dQh (ops/slice-strided-2d dQ seq-len qstride qoff0 head-dim)
-                     dKh (ops/slice-strided-2d dK seq-len kvstride kvoff0 head-dim)
-                     dVh (ops/slice-strided-2d dV seq-len kvstride kvoff0 head-dim)
-                     dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
-                                                             seq-len head-dim head-dim)]
-                 (dotimes [r seq-len]
-                   (let [qoff (+ qoff0 (* r (int qstride)))
-                         hoff (* r (int head-dim))]
-                     (dotimes [c head-dim]
-                       (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))))
-         dOut)))
+             rows (* batch seq-len)
+             bslab (* batch (* seq-len head-dim))
+             dQp (ops/pack-heads dQ rows n-q head-dim)
+             dKp (ops/pack-heads dK rows n-kv head-dim)
+             dVp (ops/pack-heads dV rows n-kv head-dim)
+             Qp (ops/pack-heads Q rows n-q head-dim)
+             Kp (ops/pack-heads K rows n-kv head-dim)
+             Vp (ops/pack-heads V rows n-kv head-dim)
+             dKe (ops/broadcast-kv-heads dKp n-kv group bslab)
+             dVe (ops/broadcast-kv-heads dVp n-kv group bslab)
+             Ke (ops/broadcast-kv-heads Kp n-kv group bslab)
+             Ve (ops/broadcast-kv-heads Vp n-kv group bslab)
+             dOp (batched-causal-sdpa-jvp dQp dKe dVe Qp Ke Ve
+                                           (* n-q batch) seq-len head-dim)]
+         (ops/unpack-heads dOp rows n-q head-dim))))
 
 ;; gqa-causal-mha :jvp-fn — one kernel call; absent tangents get typed zeros
 ;; (jointly linear pushforward in (dQ,dK,dV)).

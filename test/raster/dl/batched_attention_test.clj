@@ -108,6 +108,23 @@
         (is (pos? (max-abs-diff (slice-rows base 1 S qc) (slice-rows pert 1 S qc)))
             "example 1 itself must have changed (the perturbation is real)")))))
 
+(deftest gqa-causal-mha-jvp-is-the-joint-qkv-directional-derivative
+  (testing "the flat batched JVP matches a centered finite difference for simultaneous Q/K/V tangents"
+    (let [qc (* NQ HD) kc (* NKV HD)
+          Q (rnd (* B S qc) 31) K (rnd (* B S kc) 32) V (rnd (* B S kc) 33)
+          dQ (rnd (* B S qc) 34) dK (rnd (* B S kc) 35) dV (rnd (* B S kc) 36)
+          eps 1.0e-6
+          bump (fn [^doubles primal ^doubles tangent sign]
+                 (double-array (map #(+ (double %1) (* sign eps (double %2)))
+                                    primal tangent)))
+          plus (attn/gqa-causal-mha (bump Q dQ 1.0) (bump K dK 1.0) (bump V dV 1.0)
+                                     B S NQ NKV HD)
+          minus (attn/gqa-causal-mha (bump Q dQ -1.0) (bump K dK -1.0) (bump V dV -1.0)
+                                      B S NQ NKV HD)
+          want (double-array (map #(/ (- (double %1) (double %2)) (* 2.0 eps)) plus minus))
+          got (attn/gqa-causal-mha-jvp dQ dK dV Q K V B S NQ NKV HD)]
+      (is (< (max-abs-diff got want) 1.0e-8)))))
+
 ;; ---------------------------------------------------------------------------
 ;; The gradient gate: a batch loss is a SUM over examples, so d/dQ of the batch is
 ;; the per-example gradients laid out example-major, and any SHARED-parameter grad
