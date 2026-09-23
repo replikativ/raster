@@ -2098,6 +2098,49 @@
               (aset sc idx -1.0e30)
               nil))))))
 
+(deftm attn-prefill-softmax-windowed-head-major!
+  "Apply a symmetric window and normalize scores in place. Scores use
+  `[head,nrows,nrows]` layout. Combining the mask with the ordered softmax
+  removes one complete score traversal; zero left/right extents leave that
+  side unbounded."
+  (All [T] [sc :- (Array T) nrows :- Long n-heads :- Long
+            left :- Long right :- Long] :- Void
+       (raster.par/map-void!
+        row (clojure.core/* nrows n-heads)
+        (let [scb (clojure.core/* row nrows)
+              i (rem row nrows)
+              left-limit (if (> left 0) (dec left) nrows)
+              right-limit (if (> right 0) (dec right) nrows)
+              mx (loop [j 0 mm -1.0e30]
+                   (if (< j nrows)
+                     (let [distance (clojure.core/- i j)
+                           score (if (> distance left-limit)
+                                   -1.0e30
+                                   (if (> (clojure.core/- 0 distance) right-limit)
+                                     -1.0e30
+                                     (aget sc (clojure.core/+ scb j))))]
+                       (recur (inc j) (n/max mm score)))
+                     mm))
+              sum (loop [j 0 s 0.0]
+                    (if (< j nrows)
+                      (let [distance (clojure.core/- i j)
+                            score (if (> distance left-limit)
+                                    -1.0e30
+                                    (if (> (clojure.core/- 0 distance) right-limit)
+                                      -1.0e30
+                                      (aget sc (clojure.core/+ scb j))))
+                            e (m/exp (- score mx))]
+                        (aset sc (clojure.core/+ scb j) e)
+                        (recur (inc j) (+ s e)))
+                      s))
+              inv (/ 1.0 sum)]
+          (loop [j 0]
+            (if (< j nrows)
+              (do (aset sc (clojure.core/+ scb j)
+                        (* (aget sc (clojure.core/+ scb j)) inv))
+                  (recur (inc j)))
+              nil))))))
+
 (deftm attn-prefill-mask-segmented-head-major!
   "Mask padding and an optional symmetric window in a uniform batched-attention
   score slab. Scores are `[head,batch,nrows,nrows]` (head-major because

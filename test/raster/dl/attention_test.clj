@@ -120,6 +120,27 @@
                 (is (= (float (if keep? 1.0 -1.0e30))
                        (aget scores idx)))))))))))
 
+(deftest fused-windowed-prefill-softmax-matches-staged-operations
+  (doseq [[nrows heads left right]
+          [[1 1 0 0] [4 2 2 2] [5 3 0 3] [5 2 4 0]]]
+    (let [source (float-array
+                  (map #(float (/ (- (mod (* 17 %) 29) 14) 3.0))
+                       (range (* heads nrows nrows))))
+          expected (aclone source)
+          actual (aclone source)]
+      (attn/attn-prefill-mask-windowed-head-major!
+       expected nrows heads left right)
+      (attn/attn-prefill-softmax! expected nrows heads)
+      (attn/attn-prefill-softmax-windowed-head-major!
+       actual nrows heads left right)
+      (is (every? (fn [i]
+                    (< (Math/abs (- (double (aget expected i))
+                                    (double (aget actual i))))
+                       1.0e-7))
+                  (range (alength expected)))
+          (str "windowed softmax mismatch for "
+               [nrows heads left right])))))
+
 (deftest functional-prefill-softmax-matches-in-place-reference
   (doseq [[rows heads] [[1 1] [3 2] [7 3]]]
     (let [source (float-array
