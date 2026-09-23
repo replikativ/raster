@@ -40,6 +40,8 @@
           (doseq [[workload expected-kernels]
                   {'raster.dl.array-ops/masked-mse-loss-into! 2
                    'raster.dl.array-ops/masked-mse-loss-backward 2
+                   'raster.dl.loss/cross-entropy-loss-into! 4
+                   'raster.dl.loss/cross-entropy-loss-backward 3
                    'raster.dl.attention/graph-attention 5
                    'raster.dl.nn/rms-norm-chunked 3
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3
@@ -123,7 +125,7 @@
                                {:vars [typed-row]} {:vars [host-row]})))))))
 
 (deftest emitted-artifact-summary-does-not-change-the-portable-ratchet
-  (let [rows [{:var 'a :route :typed-soac :typed-validated true :declines []
+  (let [rows [{:var 'a :dtype :float :route :typed-soac :typed-validated true :declines []
                :emission-declines 0 :emission {:routes {:kernel-body 2} :declines []}}
               {:var 'b :route :typed-soac :typed-validated true :declines []
                :emission-declines 1 :emission {:routes {:verified-segmap-opencl 1}
@@ -137,7 +139,8 @@
                 :programs-with-declines 1} (:emission-summary report)))
         (is (= {:total 3 :typed-soac 2 :error 1} (:summary report)))
         (is (not (contains? baseline :emission-summary)))
-        (is (every? #(not-any? (set (keys %)) [:emission :emission-declines]) (:vars baseline)))
+        (is (every? #(not-any? (set (keys %)) [:dtype :emission :emission-declines])
+                    (:vars baseline)))
         (is (empty? (coverage/ratchet-violations baseline report)))))))
 
 (deftest residual-rows-name-only-compatibility-and-errors

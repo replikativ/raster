@@ -62,10 +62,13 @@
 (deftest cross-entropy-loss-test
   (testing "cross-entropy-loss with clear prediction"
     (let [logits (double-array [10 0 0  0 10 0])  ;; [2, 3]
-          target (long-array [0 1])]
+          target (long-array [0 1])
+          resident (double-array 1)]
+      (loss/cross-entropy-loss-into! logits target resident 2 3)
       (let [l (loss/cross-entropy-loss logits target 2 3)]
         ;; Very confident predictions → near 0 loss
-        (is (< l 0.001)))))
+        (is (< l 0.001))
+        (is (approx= l (aget resident 0))))))
 
   (testing "cross-entropy-loss gradient"
     (let [logits (double-array [1.0 2.0 3.0])  ;; [1, 3]
