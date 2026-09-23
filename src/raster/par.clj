@@ -566,12 +566,21 @@
     slot = atomic_add(count-arr, 0, 1)
     arr1[slot] = val1
     arr2[slot] = val2
-    ..."
+    ...
+
+  Contract: count-arr[0] plus the number of successful claims must fit in int and every
+  destination array must have capacity for the claimed slots. Under that contract the old values
+  returned by the atomic fetch-add are distinct, so the expansion carries an explicit unique-index
+  certificate for the scatter writes."
   [count-arr & pairs]
   (assert (even? (count pairs)) "par/collect! requires even number of array/value pairs")
-  (let [slot-sym (gensym "slot__")]
+  (let [slot-sym (with-meta (gensym "slot__")
+                   {:tag 'int :raster.type/tag 'int})]
     `(let [~slot-sym (int (atomic-add! ~count-arr 0 (int 1)))]
-       ~@(clojure.core/map (fn [[arr val]] `(clojure.core/aset ~arr ~slot-sym ~val))
+       ~@(clojure.core/map (fn [[arr val]]
+                            `(clojure.core/aset ~arr
+                                                (unique-index (long ~slot-sym))
+                                                ~val))
                            (partition 2 pairs)))))
 
 (defmacro atomic-add!

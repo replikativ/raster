@@ -100,6 +100,34 @@
        (descriptor/atomic-add-op? (descriptor/semantic-op expression))
        (= 3 (count (descriptor/call-args expression)))))
 
+(defn- atomic-result-call
+  "Return the atomic call owned by a result binding, looking through its typed scalar cast.
+
+   `collect!` deliberately casts the old value to the counter's public int ticket type. The cast
+   is part of the result type contract, not a pure expression that may be separated from the
+   effect."
+  [expression]
+  (let [candidate (if (and (seq? expression)
+                           (contains? #{'int 'long 'float 'double
+                                        'clojure.core/int 'clojure.core/long
+                                        'clojure.core/float 'clojure.core/double}
+                                      (first expression))
+                           (= 2 (count expression)))
+                    (second expression)
+                    expression)]
+    (when (atomic-add-call? candidate) candidate)))
+
+(defn- unit-fetch-add-ticket?
+  "True when an expression obtains distinct ascending tickets from atomic fetch-add.
+
+   The uniqueness proof is intentionally narrow: only a literal unit increment is admitted.
+   `collect!` documents the remaining no-overflow/capacity precondition."
+  [expression]
+  (when-let [call (atomic-result-call expression)]
+    (let [contribution (nth (descriptor/call-args call) 2)
+          contribution (strip-index-cast contribution)]
+      (= 1 contribution))))
+
 (defn- same-symbol?
   [left right]
   (if (and (symbol? left) (symbol? right))
@@ -312,9 +340,20 @@
           [_ local-bindings] (when (and (seq? then-branch)
                                         (form/let-head? (first then-branch)))
                                then-branch)
-          locals (if local-bindings (typed-region-locals local-bindings) [])]
+          locals (if local-bindings (typed-region-locals local-bindings) [])
+          ;; projected-recur-argument retains the lexical wrapper independently for every carry.
+          ;; The product lambda owns that common prefix once; leave only each projected body here.
+          update-exprs
+          (if local-bindings
+            (mapv (fn [update]
+                    (if (and (seq? update) (form/let-head? (first update))
+                             (= local-bindings (second update)) (= 3 (count update)))
+                      (nth update 2)
+                      update))
+                  update-exprs)
+            update-exprs)]
       (when (and (every? some? dtypes) (some? locals)
-                 (every? dialect/scalar-literal? identities)
+                 (every? some? identities)
                  (not-any? util/effectful?
                            (concat carry-inits [index-init bound-expr] update-exprs
                                    (map :init locals) [exit-expr])))
@@ -367,6 +406,32 @@
                 component-ids (range) dtypes)
           exit (util/subst-syms (zipmap carry-syms component-ids) exit-expr)]
       (conj components [aggregate exit]))))
+
+(defn- canonicalize-nested-product-loops
+  "Replace pure ordered multi-carry loops nested in scalar control with product Fold terms.
+
+   A nested loop cannot be floated to surrounding locals without changing conditional evaluation.
+   Instead its exit expression selects typed components of one structurally shared Fold. The
+   KernelBody scalar lowerer memoizes equal product terms inside that lexical region, so several
+   component uses still emit exactly one loop."
+  [expression]
+  (walk/postwalk
+   (fn [form]
+     (if-let [{:keys [product matched dtypes]}
+              (when (and (seq? form) (contains? #{'loop 'loop*} (first form)))
+                (source-product-fold-info form))]
+       (let [components
+             (mapv (fn [ordinal component-dtype]
+                     (with-meta (list 'product-component product ordinal)
+                       {:tag (dtype/scalar-tag-for-dtype component-dtype)
+                        :raster.type/tag (dtype/scalar-tag-for-dtype component-dtype)}))
+                   (range) dtypes)]
+         (with-meta
+           (util/subst-syms (zipmap (:carry-syms matched) components)
+                            (:exit-expr matched))
+           (meta form)))
+       form))
+   expression))
 
 (defn- product-component-alias
   [aggregate expression component-count]
@@ -492,6 +557,7 @@
             carry (assoc (:parameter carry) parameter))]
       (cond-> (assoc loop
                      :index next-index
+                     :lower (util/subst-syms substitutions (:lower loop))
                      :extent (util/subst-syms substitutions (:extent loop))
                      :locals (mapv (fn [local [id init]] (assoc local :id id :init init))
                                    locals local-pairs)
@@ -598,13 +664,16 @@
                                      util/*shadowing-locals*))
                             (patterns/ordered-unit-step? (second x) index))
                        (let [update (strip-index-cast (second x))]
-                       (or (and (seq? update) (= 2 (count update))
-                                (contains? '#{inc clojure.core/inc} (first update))
-                                (= index (strip-index-cast (second update))))
-                           (and (seq? update) (= 3 (count update))
-                                (contains? '#{+ clojure.core/+} (first update))
-                                (= index (strip-index-cast (second update)))
-                                (= 1 (strip-index-cast (nth update 2)))))))))]
+                         (or (patterns/ordered-unit-step? update index)
+                             ;; Preserve the historical narrow syntax while all callers migrate
+                             ;; to the shared affine matcher above.
+                             (and (seq? update) (= 2 (count update))
+                                  (contains? '#{inc clojure.core/inc} (first update))
+                                  (= index (strip-index-cast (second update))))
+                             (and (seq? update) (= 3 (count update))
+                                  (contains? '#{+ clojure.core/+} (first update))
+                                  (= index (strip-index-cast (second update)))
+                                  (= 1 (strip-index-cast (nth update 2)))))))))]
     (cond
       (step? form) {:body '(do) :update (when carried? (nth form 2))}
       (and (seq? form) (= 'do (first form)) (step? (last form)))
@@ -785,9 +854,9 @@
   (let [[head bindings & tail] body]
     (when (and (form/let-head? head) (vector? bindings) (= 2 (count bindings)))
       (let [[result initializer] bindings]
-        (when (and (symbol? result) (atomic-add-call? initializer))
+        (when-let [atomic-call (and (symbol? result) (atomic-result-call initializer))]
           (let [[destination destination-index contribution]
-                (descriptor/call-args initializer)
+                (descriptor/call-args atomic-call)
                 result-dtype (some-> (retained-local-dtype result initializer) dtype/canon)]
             (when (and result-dtype
                        (contains? #{:int :long :float :double} result-dtype))
@@ -821,6 +890,9 @@
     (let [[head source-bindings & tail] body
           bindings (or (expand-product-loop-locals source-bindings tail)
                        source-bindings)
+          bindings (vec (mapcat (fn [[binding initializer]]
+                                  [binding (canonicalize-nested-product-loops initializer)])
+                                (partition 2 bindings)))
           body (if (= bindings source-bindings)
                  body
                  (with-meta (list* head bindings tail) (meta body)))]
@@ -990,6 +1062,12 @@
          (or (form/loop-head? (first body))
              (contains? '#{dotimes clojure.core/dotimes} (first body))))
     (counted-store-loop body index)
+
+    ;; `collect!` is a source-level ownership primitive nested inside map-void!, not a separate
+    ;; parallel equation. Expand it here so its atomic ticket and certified SoA scatters enter the
+    ;; same ordered effect region.
+    (par/par-collect-form? body)
+    (store-region (par/expand-par-collect! body) index result-expression)
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
@@ -1500,6 +1578,12 @@
                       (fn [store]
                         (and (not (:nested-loop? store))
                              (contains? proven (.indexOf ^java.util.List indices store)))))
+            atomic-ticket-results
+            (set (keep (fn [{:keys [result reduction-op value]}]
+                         (when (and result (= '+ reduction-op)
+                                    (= 1 (strip-index-cast value)))
+                           result))
+                       candidate-stores))
             ;; A marker is honoured only for an index outside the algebra's reach: the index
             ;; expression or a local it depends on (transitively) reads an array. Unrelated
             ;; locals may not authorize a claim, so only the index's dependency slice counts.
@@ -1521,7 +1605,15 @@
                                                                               found)))
                                                          (set/union seen next)
                                                          (into expressions found))))))]
-                                (seq (par/collect-aget-arrays (list* 'do slice)))))
+                                (or (seq (par/collect-aget-arrays (list* 'do slice)))
+                                    ;; An atomic unit fetch-add is a dynamic ownership source just
+                                    ;; like an indirect index array: its old values are distinct
+                                    ;; under collect!'s explicit no-overflow contract.
+                                    (some unit-fetch-add-ticket? slice)
+                                    (seq (set/intersection
+                                          atomic-ticket-results
+                                          (set (filter symbol?
+                                                       (mapcat #(tree-seq coll? seq %) slice))))))))
             all-stores (mapv (fn [{:keys [out reduction-op conflict] :as store}]
                                (let [destination-type (some-> (destination-dtype array-types out)
                                                              dtype/canon)

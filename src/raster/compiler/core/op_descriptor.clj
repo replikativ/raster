@@ -607,6 +607,12 @@
   "All symbol variants recognized as addition."
   #{'+ 'clojure.core/+ 'raster.numeric/+})
 
+(def wrapping-addition-ops
+  "Finite-width unchecked additions. Kept distinct from checked `addition-ops` so callers cannot
+   erase overflow semantics while still sharing one spelling registry."
+  #{'unchecked-add 'unchecked-add-int
+    'clojure.core/unchecked-add 'clojure.core/unchecked-add-int})
+
 (def subtraction-ops
   "All symbol variants recognized as subtraction/negation."
   #{'- 'clojure.core/- 'raster.numeric/-})
@@ -614,6 +620,11 @@
 (def multiplication-ops
   "All symbol variants recognized as multiplication."
   #{'* 'clojure.core/* 'raster.numeric/*})
+
+(def wrapping-multiplication-ops
+  "Finite-width unchecked multiplications, distinct from checked multiplication."
+  #{'unchecked-multiply 'unchecked-multiply-int
+    'clojure.core/unchecked-multiply 'clojure.core/unchecked-multiply-int})
 
 (def division-ops
   "All symbol variants recognized as division."
@@ -624,8 +635,10 @@
   #{'Math/pow 'raster.numeric/pow})
 
 (defn addition-op? [sym] (contains? addition-ops sym))
+(defn wrapping-addition-op? [sym] (contains? wrapping-addition-ops sym))
 (defn subtraction-op? [sym] (contains? subtraction-ops sym))
 (defn multiplication-op? [sym] (contains? multiplication-ops sym))
+(defn wrapping-multiplication-op? [sym] (contains? wrapping-multiplication-ops sym))
 (defn division-op? [sym] (contains? division-ops sym))
 (defn power-op? [sym] (contains? power-ops sym))
 
@@ -878,7 +891,7 @@
              (= idx-sym (first args)))
         1
 
-        (and (addition-op? op)
+        (and (or (addition-op? op) (wrapping-addition-op? op))
              (= 2 (count args)))
         (let [[a b] args]
           (cond

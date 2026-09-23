@@ -41,12 +41,20 @@
           ids-arr)))
 
 (defn expand-par-collect!
-  "Expand a (raster.par/collect! count-arr arr1 val1 ...) form to sequential S-expr."
+  "Expand a (raster.par/collect! count-arr arr1 val1 ...) form to sequential S-expr.
+
+   The atomic fetch-add ticket is unique while the public collect! capacity/overflow contract
+   holds. Preserve that ownership fact explicitly instead of making later scheduling recover it
+   from incidental syntax."
   [form]
   (let [[_ count-arr & pairs] form
-        slot-sym (gensym "slot__")]
+        slot-sym (with-meta (gensym "slot__")
+                   {:tag 'int :raster.type/tag 'int})]
     (list 'let* [slot-sym (list 'int (list 'raster.par/atomic-add! count-arr 0 (list 'int 1)))]
-          (cons 'do (map (fn [[arr val]] (list 'clojure.core/aset arr slot-sym val))
+          (cons 'do (map (fn [[arr val]]
+                           (list 'clojure.core/aset arr
+                                 (list 'raster.par/unique-index (list 'long slot-sym))
+                                 val))
                          (partition 2 pairs))))))
 
 (defn expand-par-rng-fill

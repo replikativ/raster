@@ -1239,7 +1239,8 @@
                       '~tc-ann-form {} nil nil])
                     (catch Exception _#))
                ~(when (seq field-types)
-                  `(inf/register-field-types! '~name '~field-types))
+                  `(inf/register-field-types! '~name '~field-types
+                                              '~(mapv first orig-field-pairs)))
                ~@(when soa-eligible
                    [`(defvalue ~soa-name ~soa-fields)
                     `(inf/register-soa! '~name '~soa-name '~(mapv #(dissoc % :get-path) flat-field-info))
@@ -1289,7 +1290,8 @@
                     '~tc-ann-form {} nil nil])
                   (catch Exception _#))
              ~(when (seq field-types)
-                `(inf/register-field-types! '~name '~field-types))
+                `(inf/register-field-types! '~name '~field-types
+                                            '~(mapv first orig-field-pairs)))
              ~@(when soa-eligible
                  [`(defvalue ~soa-name ~soa-fields)
                   `(inf/register-soa! '~name '~soa-name '~(mapv #(dissoc % :get-path) flat-field-info))

@@ -46,6 +46,43 @@
     (is (= 2 (count (:results loop))))
     (is (= 2 (count (:values (peek (:operations loop))))))))
 
+(deftest branchy-product-updates-share-loads-and-multi-result-control
+  (let [shared-let '[^{:raster.type/tag float} value (clojure.core/aget x i)]
+        product
+        (list 'product-fold
+              {:accumulators '[sum count] :identities [0.0 0]
+               :dtypes [:float :int] :index 'i :lower 0 :extent 'width
+               :association :ordered}
+              (list 'lambda '[sum count i]
+                    (list 'region []
+                          [(list 'let* shared-let
+                                 '(if (clojure.core/> value threshold)
+                                    (clojure.core/+ sum value) sum))
+                           (list 'let* shared-let
+                                 '(if (clojure.core/> value threshold)
+                                    (clojure.core/inc count) count))])))
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{'x} :array-types {'x :float}
+                  :scalar-types {'width :long 'threshold :float} :index-scope #{}
+                  :lower-index (fn [expression _] expression)
+                  :decline! (fn [rule message data]
+                              (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:lower-region lowerer)
+                 {:bindings []
+                  :results [(list 'product-component product 0)
+                            (list 'product-component product 1)]}
+                 [:float :int] {} {'width :long 'threshold :float})
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                            (:operations lowered)))
+        loads (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                      (:operations loop))
+        branches (filter #(instance? raster.compiler.ir.kernel_body.IfRegion %)
+                         (:operations loop))]
+    (is (= 1 (count loads)) "the shared lexical prefix is emitted once")
+    (is (= 1 (count branches)) "the shared branch tree is emitted once")
+    (is (= 2 (count (:results (first branches))))
+        "one SSA branch exports every updated carry")))
+
 (def ^:private product-fold-map
   '(let* [y
           (raster.par/pmap

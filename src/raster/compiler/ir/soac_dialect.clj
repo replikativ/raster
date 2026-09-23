@@ -87,6 +87,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-closure :as contraction]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
@@ -462,7 +463,10 @@
          (every? symbol? accumulators)
          (or (nil? (:index value)) (symbol? (:index value)))
          (vector? identities) (= (count accumulators) (count identities))
-         (every? scalar-literal? identities)
+         ;; An ordered multi-carry loop has scalar initializers, not necessarily monoid
+         ;; identities. Their purity, typeability, and lexical closure are checked with the
+         ;; enclosing region below; reassociating schedules still demand literal algebra evidence.
+         (every? #(or (scalar-literal? %) (symbol? %) (seq? %)) identities)
          (vector? dtypes) (= (count accumulators) (count dtypes))
          (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %))) dtypes)
          (or (extent? (:extent value)) (seq? (:extent value)))
@@ -1047,8 +1051,11 @@
                     accumulators (:accumulators attributes)
                     expected (conj accumulators (:index attributes))
                     lower-bound (:lower attributes 0)
-                    outer-unbound (set/union (util/free-syms lower-bound bound)
-                                             (util/free-syms (:extent attributes) bound))]
+                    initializers (:identities attributes)
+                    outer-unbound (reduce set/union
+                                          (set/union (util/free-syms lower-bound bound)
+                                                     (util/free-syms (:extent attributes) bound))
+                                          (map #(util/free-syms % bound) initializers))]
                 (when-not (and (product-fold-attributes? attributes)
                                (< -1 ordinal (count accumulators))
                                (= expected parameters)
@@ -1057,12 +1064,15 @@
                                (empty? (set/intersection bound (set parameters)))
                                (empty? outer-unbound)
                                (not (util/effectful? lower-bound))
-                               (not (util/effectful? (:extent attributes))))
+                               (not (util/effectful? (:extent attributes)))
+                               (not-any? util/effectful? initializers))
                   (fail! :typed-soac-product-fold
                          "product fold requires a closed ordered multi-carry region"
                          {:equation equation-id :fold product :parameters parameters
                           :expected expected :results results :ordinal ordinal
                           :outer-unbound outer-unbound}))
+                (doseq [initializer initializers]
+                  (walk-expression! initializer bound))
                 (let [final-bound
                       (reduce
                        (fn [local-bound {:keys [id dtype init] :as local}]
@@ -1149,6 +1159,26 @@
                             :result-unbound result-unbound}))))
 
               (and (seq? expression) (= 'quote (first expression))) nil
+              (and (seq? expression) (form/scope-info expression))
+              (let [{:keys [scopes outer sequential? rec?]} (form/scope-info expression)]
+                (doseq [outside outer]
+                  (walk-expression! outside bound))
+                (doseq [{:keys [binders inits body]} scopes]
+                  (let [binder-set (set (filter symbol? binders))]
+                    (if sequential?
+                      (let [final-bound
+                            (reduce (fn [local-bound [binder initializer]]
+                                      (walk-expression! initializer local-bound)
+                                      (conj local-bound binder))
+                                    bound (map vector binders inits))]
+                        (doseq [nested body]
+                          (walk-expression! nested final-bound)))
+                      (let [initializer-bound (if rec? (into bound binder-set) bound)
+                            body-bound (into bound binder-set)]
+                        (doseq [initializer inits]
+                          (walk-expression! initializer initializer-bound))
+                        (doseq [nested body]
+                          (walk-expression! nested body-bound)))))))
               (map? expression)
               (doseq [[key value] expression]
                 (walk-expression! key bound)

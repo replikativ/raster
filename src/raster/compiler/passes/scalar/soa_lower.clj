@@ -19,6 +19,7 @@
    NOT inlined by the current inliner, so such calls don't explode yet — that's a
    separable follow-on (extend inlinable-body? / inline value-type deftms)."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.core.types :as types]
             [clojure.walk :as walk]))
 
@@ -31,17 +32,39 @@
   [field-name]
   (if (keyword? field-name) field-name (keyword (name field-name))))
 
+(def ^:private array-tag->element-tag
+  (into {} (map (fn [[element array]] [array element])) types/primitive->array-tag))
+
+(defn- array-bundle-info
+  "Describe a defvalue whose fields are already primitive arrays as physical product leaves.
+
+   This is the container dual of a generated SoA companion: no element-wise transpose is needed,
+   but the logical record parameter must still disappear before functional IR construction."
+  [tag]
+  (let [field-types (get @inference/field-type-registry tag)
+        order (or (get @inference/field-order-registry tag) (vec (keys field-types)))
+        fields (mapv (fn [field]
+                       (let [array-tag (get field-types field)]
+                         {:name field
+                          :element-tag (get array-tag->element-tag array-tag)
+                          :array-tag array-tag}))
+                     order)]
+    (when (and (seq fields) (every? :element-tag fields))
+      {:scalar-tag tag :soa-tag tag :fields fields :representation :array-bundle})))
+
 (defn soa-param-env
-  "From ordered param-specs [{:sym :tag}], find SoA-typed params and build
-   {param-sym → {:scalar-tag :fields [{:name :element-tag :array-tag}]}}."
+  "From ordered param-specs [{:sym :tag}], find SoA or array-bundle params and build
+  {param-sym → {:scalar-tag :fields [{:name :element-tag :array-tag}]}}."
   [param-specs]
   (let [rev @types/soa-reverse-registry
         reg @types/soa-registry]
     (into {}
           (keep (fn [{:keys [sym tag]}]
-                  (when-let [scalar-tag (get rev tag)]
+                  (if-let [scalar-tag (get rev tag)]
                     (when-let [info (get reg scalar-tag)]
-                      [sym {:scalar-tag scalar-tag :soa-tag tag :fields (:fields info)}])))
+                      [sym {:scalar-tag scalar-tag :soa-tag tag :fields (:fields info)}])
+                    (when-let [info (array-bundle-info tag)]
+                      [sym info])))
                 param-specs))))
 
 (defn collect-soa-env
@@ -235,9 +258,9 @@
     (lower {:soa soa-env :exploded exploded} body)))
 
 (defn soa-lower
-  "Top-level (wasm): expand SoA params + scalar-replace value-type access.
+  "Expand SoA/array-bundle params and scalar-replace value-type access.
    Returns {:body body' :params param-specs' :soa-expansion {soa-sym → info}}.
-   No-op when no SoA params."
+   No-op when no physical-product params are present."
   [body param-specs]
   (let [soa-env (soa-param-env param-specs)]
     (if (empty? soa-env)

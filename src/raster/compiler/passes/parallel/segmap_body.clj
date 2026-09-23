@@ -314,12 +314,15 @@
             (let [lowered-predicate (when predicate
                                       ((:lower lowerer) predicate :predicate environment))
                   state (lower-locals locals environment)
-                  inner (reduce (fn [{:keys [environment operations]} effect]
+                  inner (reduce (fn [{:keys [environment operations masks]} effect]
                                   (let [next (lower-effect
                                               environment
                                               (substitute-effect (:substitutions state) effect))]
-                                    (update next :operations #(into operations %))))
-                                {:environment (:environment state) :operations (:operations state)}
+                                    (-> next
+                                        (update :operations #(into operations %))
+                                        (update :masks #(into masks %)))))
+                                {:environment (:environment state)
+                                 :operations (:operations state) :masks []}
                                 effects)]
               ;; Nested locals/results remain lexical. A guard dominates their evaluation, so a
               ;; checked conversion in the region is never speculated into an inactive lane.
@@ -330,7 +333,8 @@
                               [(body/->IfRegion (:result lowered-predicate)
                                                 (conj (vec (:operations inner)) (body/->Yield []))
                                                 [(body/->Yield [])] [])]))
-                 (:operations inner))})
+                 (:operations inner))
+               :masks (:masks inner)})
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower upper-bound extent carry]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
@@ -350,11 +354,14 @@
                   loop-environment (cond-> (assoc environment loop-index :long)
                                      carry (assoc parameter (:dtype carry)))
                   loop-state (lower-locals loop-locals loop-environment)
-                  inner (reduce (fn [{:keys [environment operations]} effect]
+                  inner (reduce (fn [{:keys [environment operations masks]} effect]
                                   (let [next (lower-effect environment
                                                            (substitute-effect (:substitutions loop-state) effect))]
-                                    (update next :operations #(into operations %))))
-                                {:environment (:environment loop-state) :operations []} loop-effects)
+                                    (-> next
+                                        (update :operations #(into operations %))
+                                        (update :masks #(into masks %)))))
+                                {:environment (:environment loop-state)
+                                 :operations [] :masks []} loop-effects)
                   update-value (when carry
                                  (cast-carry
                                   (util/subst-syms (:substitutions loop-state)
@@ -375,8 +382,9 @@
                                     (= :inclusive upper-bound)
                                     (assoc :upper-bound :inclusive)))]
               {:operations (conj (vec (:operations initial)) loop-operation)
+               :masks (:masks inner)
                :environment (cond-> environment carry (assoc (:result carry) (:dtype carry)))})
-          (let [operations (do
+          (do
           (when-not (contains? output-set destination)
             (decline! :effect-destination
                       "ordered effect targets an undeclared result"
@@ -394,36 +402,57 @@
                     (decline! :effect-reduction-operator
                               "ordered reduction effect has no canonical scalar operator"
                               {:operation (:id segmap) :effect effect}))
-                _ (when (and result
-                             (or (not= :reduce (:kind conflict))
-                                 (not (contains? #{true 1} predicate))))
+                _ (when (and result (not= :reduce (:kind conflict)))
                     (decline! :effect-atomic-result
-                              "a value-returning atomic effect requires an unconditional reduction"
+                              "a value-returning atomic effect requires a reduction"
                               {:operation (:id segmap) :effect effect}))
+                lowered-predicate (when (and result
+                                             (not (contains? #{true 1} predicate)))
+                                    ((:lower lowerer) predicate :predicate environment))
+                guarded-atomic-result (when lowered-predicate
+                                        ((:fresh-binding lowerer) "atomic-old"))
                 store (if (= :reduce (:kind conflict))
                         (cond-> (body/->AtomicRMW destination [coordinate-expression]
-                                                  (:result lowered-value) operator :map-active)
-                          result (assoc :result (body/value result result-dtype)))
+                                                  (:result lowered-value) operator
+                                                  (when-not lowered-predicate :map-active))
+                          result (assoc :result
+                                        (body/value (or guarded-atomic-result result)
+                                                    result-dtype)))
                         (body/->ScalarStore destination [coordinate-expression]
                                             (:result lowered-value) :map-active))
-                effect-operations (vec (concat (:operations coordinate-value)
-                                               (:operations lowered-value) [store]))]
-            (if (contains? #{true 1} predicate)
-              effect-operations
-              (let [lowered-predicate ((:lower lowerer) predicate :predicate environment)]
-                (vec (concat (:operations lowered-predicate)
-                             [(body/->IfRegion (:result lowered-predicate)
-                                               (conj effect-operations (body/->Yield []))
-                                               [(body/->Yield [])] [])]))))))]
+                atomic-operations (vec (concat (:operations coordinate-value)
+                                               (:operations lowered-value) [store]))
+                effect-operations
+                (if lowered-predicate
+                  (vec (concat
+                        (:operations lowered-predicate)
+                        [(body/->IfRegion
+                          (:result lowered-predicate)
+                          (conj atomic-operations
+                                (body/->Yield [guarded-atomic-result]))
+                          [(body/->Yield [(body/literal 0 result-dtype)])]
+                          [(body/value result result-dtype)])]))
+                  atomic-operations)
+                operations
+                (if (or result (contains? #{true 1} predicate))
+                  effect-operations
+                  (let [lowered-predicate ((:lower lowerer) predicate :predicate environment)]
+                    (vec (concat (:operations lowered-predicate)
+                                 [(body/->IfRegion (:result lowered-predicate)
+                                                   (conj effect-operations (body/->Yield []))
+                                                   [(body/->Yield [])] [])]))))]
             {:operations operations
-             :environment (cond-> environment result (assoc result result-dtype))}))))
-        effect-operations
-        (:operations
-         (reduce (fn [{:keys [environment operations]} effect]
+             :masks []
+             :environment (cond-> environment result (assoc result result-dtype))})))))
+        effect-state
+        (reduce (fn [{:keys [environment operations masks]} effect]
                    (let [next (lower-effect environment
                                             (substitute-effect (:substitutions local-state) effect))]
-                     (update next :operations #(into operations %))))
-                 {:environment environment :operations []} effects))
+                     (-> next
+                         (update :operations #(into operations %))
+                         (update :masks #(into masks %)))))
+                 {:environment environment :operations [] :masks []} effects)
+        effect-operations (:operations effect-state)
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
                                             (get array-types primary-output) environment))
@@ -483,11 +512,13 @@
                                     (body/expression :mul group-index workgroup-size)
                                     local-index)
                    :long :exact))]
-       :masks [(body/->Mask
-                :map-active
-                [(if sequential-effects?
-                   (body/predicate :eq launch-index 0)
-                   (body/predicate :lt index (body/index-cast '_n_bound :long :exact)))])]
+       :masks (into [(body/->Mask
+                      :map-active
+                      [(if sequential-effects?
+                         (body/predicate :eq launch-index 0)
+                         (body/predicate :lt index
+                                         (body/index-cast '_n_bound :long :exact)))])]
+                    (:masks effect-state))
        :operations scheduled-operations
        :schedule {:strategy (if sequential-effects?
                               :one-work-item-ordered-loop
