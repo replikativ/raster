@@ -490,7 +490,19 @@
           y (nn/batch-norm x gamma beta rm rv 2 2 1e-5 0.1 1)]
       ;; After normalization, each feature should have ~zero mean
       (is (approx= 0.0 (+ (aget y 0) (aget y 2)) 1e-4))
-      (is (approx= 0.0 (+ (aget y 1) (aget y 3)) 1e-4)))))
+      (is (approx= 0.0 (+ (aget y 1) (aget y 3)) 1e-4))))
+  (testing "batch-norm eval uses but does not mutate running statistics"
+    (let [x (double-array [1 2 3 4])
+          gamma (double-array [1 1])
+          beta (double-array [0 0])
+          rm (double-array [0.2 0.3])
+          rv (double-array [0.8 0.9])
+          before-rm (vec rm)
+          before-rv (vec rv)
+          y (nn/batch-norm x gamma beta rm rv 2 2 1e-5 0.1 0)]
+      (is (every? #(Double/isFinite %) y))
+      (is (= before-rm (vec rm)))
+      (is (= before-rv (vec rv))))))
 
 ;; ================================================================
 ;; Conv1d tests

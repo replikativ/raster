@@ -446,6 +446,8 @@
       (:kernels (equation-first/compile
                  #'dl-nn/group-norm-jvp-dx {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-nn/batch-norm {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-nn/rms-norm-reassociated! {:target device-id :dtype :float}))

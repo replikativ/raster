@@ -893,47 +893,46 @@
                             running-var :- (Array T) batch :- Long
                             features :- Long eps :- Double momentum :- Double
                             training :- Long] :- (Array T)
-                       (let [out (alloc-like x (* batch features))]
-                         (if (== training 1)
-      ;; Training: use batch statistics
-                           (dotimes [j features]
-                             (let [;; batch mean
-                                   mean (loop [i 0 s 0.0]
-                                          (if (< i batch)
-                                            (recur (inc i) (+ s (aget x (+ (* i (int features)) j))))
-                                            (/ s batch)))
-              ;; batch variance
-                                   var (loop [i 0 s 0.0]
-                                         (if (< i batch)
-                                           (let [d (- (aget x (+ (* i (int features)) j)) mean)]
-                                             (recur (inc i) (+ s (* d d))))
-                                           (/ s batch)))
-                                   inv-std (/ 1.0 (n/sqrt (+ var eps)))]
-          ;; update running stats
-                               (aset running-mean j
-                                     (+ (* (- 1.0 momentum) (aget running-mean j))
-                                        (* momentum mean)))
-                               (aset running-var j
-                                     (+ (* (- 1.0 momentum) (aget running-var j))
-                                        (* momentum var)))
-          ;; normalize
-                               (dotimes [i batch]
-                                 (let [idx (+ (* i (int features)) j)
-                                       x-hat (* (- (aget x idx) mean) inv-std)]
-                                   (aset out idx
-                                         (+ (* (aget gamma j) x-hat)
-                                            (aget beta j)))))))
-      ;; Eval: use running statistics
-                           (dotimes [j features]
-                             (let [inv-std (/ 1.0 (n/sqrt (+ (aget running-var j) eps)))]
-                               (dotimes [i batch]
-                                 (let [idx (+ (* i (int features)) j)
-                                       x-hat (* (- (aget x idx)
-                                                   (aget running-mean j))
-                                                inv-std)]
-                                   (aset out idx
-                                         (+ (* (aget gamma j) x-hat)
-                                            (aget beta j))))))))
+                       (let [means (double-array features)
+                             variances (double-array features)
+                             out (alloc-like x (* batch features))]
+                         (raster.par/product-reduce!
+                          [means] [[sum 0.0 :double]] [[j features]] i batch
+                          []
+                          [(/ (double (aget x (+ (* i features) j))) (double batch))]
+                          [[left right]] [] [(+ left right)]
+                          {:associative? true :commutative? true
+                           :order :implementation-defined})
+                         (raster.par/product-reduce!
+                          [variances] [[sum 0.0 :double]] [[j features]] i batch
+                          [d (- (aget x (+ (* i features) j)) (aget means j))]
+                          [(/ (* (double d) (double d)) (double batch))]
+                          [[left right]] [] [(+ left right)]
+                          {:associative? true :commutative? true
+                           :order :implementation-defined})
+                         (raster.par/map-void!
+                          j features
+                          (if (== training 1)
+                            (do
+                              (aset running-mean j
+                                    (+ (* (- 1.0 momentum) (aget running-mean j))
+                                       (* momentum (aget means j))))
+                              (aset running-var j
+                                    (+ (* (- 1.0 momentum) (aget running-var j))
+                                       (* momentum (aget variances j)))))
+                            nil))
+                         (raster.par/map!
+                          out idx (* batch features) nil
+                          (let [j (rem idx features)
+                                mean (if (== training 1)
+                                       (aget means j)
+                                       (double (aget running-mean j)))
+                                variance (if (== training 1)
+                                           (aget variances j)
+                                           (double (aget running-var j)))
+                                inv-std (/ 1.0 (n/sqrt (+ variance eps)))
+                                x-hat (* (- (aget x idx) mean) inv-std)]
+                            (+ (* (aget gamma j) x-hat) (aget beta j))))
                          out)))
 
 ;; batch-norm rrule — pullback registered after backward deftm (below)
