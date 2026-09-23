@@ -75,6 +75,17 @@
     (attn/rope-prefill! q q-reference rows heads head-dim 10000.0)
     (attn/rope-prefill-strided! packed q-strided rows heads head-dim 10000.0
                                 stride q-offset)
+    (let [half (quot head-dim 2)
+          cosines (double-array
+                   (for [row (range rows) i (range half)]
+                     (Math/cos (* row (Math/pow 10000.0 (/ (* -2.0 i) head-dim))))))
+          sines (double-array
+                 (for [row (range rows) i (range half)]
+                   (Math/sin (* row (Math/pow 10000.0 (/ (* -2.0 i) head-dim))))))
+          table-out (double-array (* rows width))]
+      (attn/rope-prefill-strided-table! packed cosines sines table-out
+                                        rows heads head-dim stride q-offset)
+      (is (arr-approx= q-reference table-out 1.0e-12)))
     (attn/attn-prefill-out! scores v out-reference rows heads 1 heads head-dim)
     (attn/attn-prefill-out-strided! scores packed out-strided
                                     rows heads 1 heads head-dim stride v-offset)

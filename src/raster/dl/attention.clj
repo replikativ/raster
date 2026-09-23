@@ -1945,6 +1945,36 @@
           (aset out (clojure.core/+ (clojure.core/+ output-base i) hdim2)
                 (+ (* x1 c) (* x0 s)))))))
 
+(deftm rope-prefill-strided-table!
+  "Apply prefill RoPE from dense cosine/sine tables while reading a packed
+  field from a row-strided source. `cosines` and `sines` are
+  `[nrows,head-dim/2]`; output is dense `[nrows,heads,head-dim]`. This separates
+  reusable position/frequency evaluation from the projection-dependent rotate."
+  (All [T] [x :- (Array T) cosines :- (Array T) sines :- (Array T)
+            out :- (Array T) nrows :- Long heads :- Long head-dim :- Long
+            row-stride :- Long column-offset :- Long] :- Void
+       (raster.par/map-void!
+        idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+        (let [hdim2 (quot head-dim 2)
+              per-row (clojure.core/* heads hdim2)
+              t (quot idx per-row)
+              rest0 (rem idx per-row)
+              h (quot rest0 hdim2)
+              i (rem rest0 hdim2)
+              table-index (clojure.core/+ (clojure.core/* t hdim2) i)
+              source-base (clojure.core/+ (clojure.core/* t row-stride)
+                                          (clojure.core/+ column-offset
+                                                          (clojure.core/* h head-dim)))
+              output-base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                                          (clojure.core/* h head-dim))
+              c (aget cosines table-index)
+              s (aget sines table-index)
+              x0 (aget x (clojure.core/+ source-base i))
+              x1 (aget x (clojure.core/+ (clojure.core/+ source-base i) hdim2))]
+          (aset out (clojure.core/+ output-base i) (- (* x0 c) (* x1 s)))
+          (aset out (clojure.core/+ (clojure.core/+ output-base i) hdim2)
+                (+ (* x1 c) (* x0 s)))))))
+
 (deftm rope-prefill! (All [T] [x :- (Array T) out :- (Array T)
                                nrows :- Long heads :- Long head-dim :- Long
                                theta :- Double] :- Void
