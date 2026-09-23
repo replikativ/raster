@@ -429,6 +429,10 @@
       (:kernels (equation-first/compile
                  #'dl-arrays/dot-rows-dbias {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
+                 #'dl-arrays/masked-mse-loss-into! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'dl-arrays/masked-mse-loss-backward {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-nn/rms-norm-reassociated! {:target device-id :dtype :float}))

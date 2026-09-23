@@ -38,7 +38,9 @@
       (testing "migrated graph and strided-norm workloads remain entirely KernelBody-emitted"
         (let [rows (into {} (map (juxt :var identity)) (:vars report))]
           (doseq [[workload expected-kernels]
-                  {'raster.dl.attention/graph-attention 5
+                  {'raster.dl.array-ops/masked-mse-loss-into! 2
+                   'raster.dl.array-ops/masked-mse-loss-backward 2
+                   'raster.dl.attention/graph-attention 5
                    'raster.dl.nn/rms-norm-chunked 3
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3
                    'raster.dl.nn/generate-dropout-mask-seeded 1}]

@@ -265,11 +265,23 @@
     (let [pred (double-array [1.0 2.0 3.0 4.0])
           target (double-array [1.5 2.0 2.5 3.5])
           states (long-array [0 1 0 0])  ;; index 1 is observed
+          resident (double-array 1)
+          _ (ops/masked-mse-loss-into! pred target states resident 4)
           loss (ops/masked-mse-loss pred target states 4)]
       (is (Double/isFinite loss))
       ;; non-observed: indices 0,2,3
       ;; diffs: -0.5, 0.5, 0.5 → squares: 0.25, 0.25, 0.25 → mean = 0.25
-      (is (approx= 0.25 loss)))))
+      (is (approx= 0.25 loss))
+      (is (approx= loss (aget resident 0)))))
+  (testing "an entirely masked loss has a defined zero value and gradient"
+    (let [pred (double-array [1.0 2.0])
+          target (double-array [3.0 4.0])
+          states (long-array [1 1])
+          resident (double-array 1)]
+      (ops/masked-mse-loss-into! pred target states resident 2)
+      (is (zero? (aget resident 0)))
+      (is (= [0.0 0.0]
+             (vec (ops/masked-mse-loss-backward 1.0 pred target states 2)))))))
 
 (deftest sinusoidal-embed-backward-test
   (testing "sinusoidal backward produces finite result"
