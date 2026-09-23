@@ -1089,8 +1089,9 @@
                                                             (aget x x-idx)))))))))))
                                     cols)))
 
-;; In-place im2col-2d: writes into pre-allocated cols buffer
-;; Fast path: stride=1, pad=0 uses acopy! for contiguous rows
+;; In-place im2col-2d: every flattened column cell has one owner.  Keeping the layout transform
+;; as one total map lets scheduling choose vector width/coalescing without a host-side fast-path
+;; branch, and makes padding deterministic even when `cols` is a reused resident buffer.
 (deftm ^:no-inline im2col-2d! (All [T] [x :- (Array T) cols :- (Array T)
                                         batch :- Long c-in :- Long
                                         h :- Long w :- Long kh :- Long kw :- Long
@@ -1098,43 +1099,29 @@
                                         pad-h :- Long pad-w :- Long] :- (Array T)
                                    (let [h-out (+ 1 (quot (+ h (* 2 pad-h) (- kh)) stride-h))
                                          w-out (+ 1 (quot (+ w (* 2 pad-w) (- kw)) stride-w))
-                                         col-cols (* batch h-out w-out)]
-                                     (if (and (== stride-h 1) (== stride-w 1) (== pad-h 0) (== pad-w 0))
-      ;; FAST PATH: contiguous copy with acopy!
-                                       (let [hw (* h w)
-                                             chw (* c-in hw)
-                                             hw-out (* h-out w-out)]
-                                         (dotimes [c c-in]
-                                           (dotimes [khi kh]
-                                             (dotimes [kwi kw]
-                                               (let [row (+ (* c (int (* kh kw))) (* khi (int kw)) kwi)]
-                                                 (dotimes [bi batch]
-                                                   (dotimes [oh h-out]
-                    ;; Copy w-out contiguous elements from x to cols
-                                                     (let [x-start (+ (* bi (int chw)) (* c (int hw))
-                                                                      (* (+ khi oh) (int w)) kwi)
-                                                           col-start (+ (* row (int col-cols))
-                                                                        (* bi (int hw-out))
-                                                                        (* oh (int w-out)))]
-                                                       (acopy! x x-start cols col-start w-out)))))))))
-      ;; GENERIC PATH: element-by-element with bounds checking
-                                       (dotimes [bi batch]
-                                         (dotimes [c c-in]
-                                           (dotimes [khi kh]
-                                             (dotimes [kwi kw]
-                                               (dotimes [oh h-out]
-                                                 (dotimes [ow w-out]
-                                                   (let [ih (+ (- (* oh (int stride-h)) pad-h) khi)
-                                                         iw (+ (- (* ow (int stride-w)) pad-w) kwi)]
-                                                     (when (and (>= ih 0) (< ih h) (>= iw 0) (< iw w))
-                                                       (let [row (+ (* c (int (* kh kw))) (* khi (int kw)) kwi)
-                                                             col (+ (* bi (int (* h-out w-out)))
-                                                                    (* oh (int w-out)) ow)
-                                                             x-idx (+ (* bi (int (* c-in h w)))
-                                                                      (* c (int (* h w)))
-                                                                      (* ih (int w)) iw)]
-                                                         (aset cols (+ (* row col-cols) col)
-                                                               (aget x x-idx))))))))))))
+                                         spatial-out (* h-out w-out)
+                                         col-cols (* batch spatial-out)
+                                         kernel-elements (* kh kw)
+                                         n-cols (* (* c-in kernel-elements) col-cols)]
+                                     (raster.par/map!
+                                      cols idx n-cols nil
+                                      (let [row (quot idx col-cols)
+                                            col (rem idx col-cols)
+                                            c (quot row kernel-elements)
+                                            kernel-offset (rem row kernel-elements)
+                                            khi (quot kernel-offset kw)
+                                            kwi (rem kernel-offset kw)
+                                            bi (quot col spatial-out)
+                                            output-offset (rem col spatial-out)
+                                            oh (quot output-offset w-out)
+                                            ow (rem output-offset w-out)
+                                            ih (+ (- (* oh stride-h) pad-h) khi)
+                                            iw (+ (- (* ow stride-w) pad-w) kwi)]
+                                        (if (and (>= ih 0) (< ih h) (>= iw 0) (< iw w))
+                                          (aget x (+ (* bi (* c-in h w))
+                                                     (* c (* h w))
+                                                     (* ih w) iw))
+                                          (n/oftype x 0.0))))
                                      cols)))
 
 ;; col2im-2d: reverse of im2col-2d
