@@ -150,6 +150,35 @@
         (is (= (seq rq) (seq cq))
             "no off-by-one from round-half-away-from-zero on negatives")))))
 
+;; A flat logical [rows,width] traversal is convenient and is the right GPU
+;; schedule, but integer quotient/remainder in its hot loop blocks LLVM's CPU
+;; vectorizer. CPU AOT recovers the rectangular loop without changing source.
+(deftm rectangular-strided-map
+  [src :- (Array float) rows :- Long stride :- Long width :- Long]
+  :- (Array float)
+  (let [out (float-array (* rows width))]
+    (raster.par/map-void!
+     i (* rows width)
+     (let [row (quot i width)
+           column (rem i width)
+           base (* row stride)]
+       (aset out i (+ (aget src (+ base column))
+                      (aget src (+ base width column))))))
+    out))
+
+(deftest cpu-c-recovers-rectangular-strided-map
+  (when (clang-available?)
+    (let [rows 3 stride 11 width 4
+          src (float-array (map float (range (* rows stride))))
+          expected (rectangular-strided-map src rows stride width)
+          compiled (aot/compile-aot-c #'rectangular-strided-map :float)
+          source (:c-source (meta compiled))]
+      (is (re-find #"long row =" source)
+          "the recovered outer coordinate is a loop induction variable")
+      (is (re-find #"long column =" source)
+          "the recovered contiguous coordinate is the inner loop")
+      (is (= (vec expected) (vec (compiled src rows stride width)))))))
+
 ;; ---- #27: explicit C-SIMD reduction (compile-aot-c :simd? true) ----
 
 ;; rms-norm with the variance reduction expressed as a reduce! SOAC (par/reduce),
