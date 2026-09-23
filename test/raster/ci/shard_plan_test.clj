@@ -38,6 +38,17 @@
     (is (every? #(pos? (Long/parseLong (second %))) measured-rows))
     (is (not (zero? (:exit (run "/not-a-ci-timing-file")))))))
 
+(deftest bounded-ci-subshards-preserve-the-complete-plan
+  (let [result (shell/sh "bash" "scripts/ci-test-shard.sh" "--plan"
+                         :env (assoc (into {} (System/getenv))
+                                     "RASTER_TEST_SHARDS" "8"
+                                     "RASTER_TEST_SHARD" "0"))
+        rows (mapv #(str/split % #"\t") (str/split-lines (:out result)))]
+    (is (zero? (:exit result)) (:err result))
+    (is (= (set (vals (weights/test-paths))) (set (map last rows))))
+    (is (= (count rows) (count (set (map #(nth % 2) rows)))))
+    (is (= (set (map str (range 8))) (set (map first rows))))))
+
 (deftest malformed-timing-data-fails-before-test-selection
   (let [file (java.io.File/createTempFile "raster-invalid-weights-" ".tsv")]
     (try
