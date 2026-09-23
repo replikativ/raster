@@ -886,23 +886,24 @@
     (is (re-find #"int offset" (:source k)))
     (is (= '[a out offset n] (:arguments k)))))
 
-(deftest scheduled-segmap-uses-one-observable-compatibility-boundary
+(deftest scheduled-segmap-fails-closed-at-the-kernel-body-boundary
   (let [form '(raster.par/map! out i n float
                                (clojure.core/aget a i))
         operation (-> (soac/par-form->soac 'out form 2)
                       (lower/lower-map nil :dtype :float)
                       first)
-        artifact
+        failure
         (with-redefs [segmap-body/lower
                       (fn [& _]
                         (throw (ex-info "simulated portable coverage gap"
                                         {:reason :segmap-kernel-body-declined
                                          :missing-rule :simulated
                                          :fallback :none})))]
-          (sg/generate-scheduled-segmap-kernel operation :dtype :float))]
-    (is (= :verified-segmap-opencl
-           (get-in artifact [:attributes :emission-route])))
-    (is (= :simulated
-           (get-in artifact [:attributes :kernel-body-decline :missing-rule])))
-    (is (= :verified-segmap-opencl
-           (get-in artifact [:attributes :kernel-body-decline :fallback])))))
+          (try
+            (sg/generate-scheduled-segmap-kernel operation :dtype :float)
+            nil
+            (catch clojure.lang.ExceptionInfo exception
+              (ex-data exception))))]
+    (is (= :segmap-kernel-body-declined (:reason failure)))
+    (is (= :simulated (:missing-rule failure)))
+    (is (= :none (:fallback failure)))))
