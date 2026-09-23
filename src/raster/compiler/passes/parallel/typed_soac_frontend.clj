@@ -2190,7 +2190,10 @@
                    :dtype (fold-dtype declared-dtype) :extent extent :step step
                    :association (or (:association schedule-request) :ordered)})
                 folds)
-          all-expressions (vec (concat (map :step normalized-folds) map-results))
+          ;; A ragged fold bound may read a stable lengths/offsets tensor. Its read is part
+          ;; of the operation dependency and alias contract, not a scalar ABI parameter.
+          all-expressions (vec (concat (map :extent normalized-folds)
+                                       (map :step normalized-folds) map-results))
           inputs (reduce set/union #{} (map par/collect-aget-arrays all-expressions))
           binders (set (concat (map first segment-axes) [idx]
                                (map :accumulator normalized-folds)))
@@ -4147,7 +4150,8 @@
                 (let [step (util/subst-syms substitutions step)
                       attributes
                       (cond-> {:accumulator accumulator :identity identity :dtype dtype
-                               :extent extent :association association}
+                               :extent extent
+                               :association association}
                         (= :implementation-defined association)
                         (assoc :algebra
                                (try

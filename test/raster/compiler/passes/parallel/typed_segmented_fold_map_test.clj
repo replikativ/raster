@@ -855,6 +855,46 @@
     (is (= :float (:dtype scale-parameter)))
     (is (str/includes? (:source kernel) "float scale"))))
 
+(deftest runtime-segment-lengths-admit-a-ragged-fold-domain
+  (let [ragged-source
+        '(let* [effect
+                (raster.par/segmented-fold-map!
+                 [out] [[row rows]] index 1
+                 [[sum 0.0 :float (clojure.core/aget lengths row)
+                   (clojure.core/+ sum
+                                   (clojure.core/aget values
+                                      (clojure.core/unchecked-add
+                                       (clojure.core/aget offsets row) index)))]]
+                 [(clojure.core/float sum)])]
+               effect)
+        attempted (route/attempt ragged-source :float
+                                 {'values :float 'offsets :long 'lengths :long 'out :float}
+                                 {:scalar-types {'rows :long}})
+        program (:program attempted)]
+    (is program (pr-str (dissoc attempted :program)))
+    (when program
+      (is (set/subset? #{'values 'offsets 'lengths}
+                       (set (:inputs program)))
+          "a bound read is a real stable tensor dependency, not a scalar")
+      (let [operation (-> (segop-lower/segop-lower-pass
+                           program {:dtype :float :target-device :ocl:0
+                                    :array-types {'values :float 'offsets :long
+                                                  'lengths :long 'out :float}
+                                    :scalar-types {'rows :long}})
+                          :form :equations first :operations first)
+            decline (try
+                      (segop-opencl/generate-segfoldmap-kernel
+                       operation :target-dialect :opencl-portable
+                       :array-types {'values :float 'offsets :long
+                                     'lengths :long 'out :float}
+                       :scalar-types {'rows :long})
+                      nil
+                      (catch clojure.lang.ExceptionInfo exception
+                        (ex-data exception)))]
+        (is (= :segfoldmap-kernel-body-declined (:reason decline)))
+        (is (= :index-expression (:missing-rule decline))
+            "runtime fold bounds remain fail-closed until their range/capacity is certified")))))
+
 (deftest a-fold-cannot-reference-a-future-accumulator
   (let [bad
         '(let* [effect
