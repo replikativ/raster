@@ -599,6 +599,7 @@
                         else-type (when conditional?
                                     (authoritative-source-type (nth operand 3) env))]
                     (if (and then-type else-type
+                             (dtype/known? then-type) (dtype/known? else-type)
                              (not= (canon-type then-type) (canon-type else-type)))
                       (lower (list 'if (second operand)
                                    (list (first expression) (nth operand 2))
