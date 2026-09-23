@@ -1278,7 +1278,9 @@
                                                       (aget holder 0))))))))
                                     out)))
 
-;; In-place maxpool2d: writes into pre-allocated out, also fills argmax for backward
+;; In-place maxpool2d: one ordered window fold per output, followed by a value gather.  Window
+;; folds are intentionally kept ordered for deterministic first-index ties and NaN propagation;
+;; pooling windows are small, while outputs remain fully parallel and caller-owned.
 (deftm ^:no-inline maxpool2d! (All [T] [x :- (Array T) out :- (Array T) argmax :- (Array long)
                                         batch :- Long channels :- Long
                                         h :- Long w :- Long kh :- Long kw :- Long]
@@ -1289,34 +1291,40 @@
                                          hw (* h w)
                                          chw-out (* channels h-out w-out)
                                          hw-out (* h-out w-out)
-                                         w-int (int w)
-                                         kh-int (int kh)
-                                         kw-int (int kw)
-                                         w-out-int (int w-out)
-        ;; Single holder pair reused across all output positions (same type as x)
-                                         holder (alloc-like x 1)
-                                         iholder (long-array 1)]
-                                     (dotimes [bi batch]
-                                       (dotimes [ci channels]
-                                         (let [base-in (+ (* bi (int chw)) (* ci (int hw)))
-                                               base-out (+ (* bi (int chw-out)) (* ci (int hw-out)))]
-                                           (dotimes [oh h-out]
-                                             (dotimes [ow w-out]
-                                               (let [ih0 (* oh kh-int)
-                                                     iw0 (* ow kw-int)]
-                ;; Reset holders
-                                                 (aset holder 0 Double/NEGATIVE_INFINITY)
-                                                 (aset iholder 0 0)
-                                                 (dotimes [khi kh]
-                                                   (dotimes [kwi kw]
-                                                     (let [x-idx (+ base-in (* (+ ih0 khi) w-int) (+ iw0 kwi))
-                                                           v (aget x x-idx)]
-                                                       (when (> v (aget holder 0))
-                                                         (aset holder 0 v)
-                                                         (aset iholder 0 (long x-idx))))))
-                                                 (let [oi (+ base-out (* oh w-out-int) ow)]
-                                                   (aset out oi (aget holder 0))
-                                                   (aset argmax oi (aget iholder 0)))))))))
+                                         kernel-elements (* kh kw)
+                                         n-out (* batch chw-out)]
+                                     (raster.par/map!
+                                      argmax oi n-out long
+                                      (let [bi (quot oi chw-out)
+                                            within-batch (rem oi chw-out)
+                                            ci (quot within-batch hw-out)
+                                            output-offset (rem within-batch hw-out)
+                                            oh (quot output-offset w-out)
+                                            ow (rem output-offset w-out)
+                                            base-in (+ (* bi chw) (* ci hw))
+                                            first-index (+ base-in (* (* oh kh) w) (* ow kw))]
+                                        (loop [k 0 best-index first-index]
+                                          (if (< k kernel-elements)
+                                            (let [khi (quot k kw)
+                                                  kwi (rem k kw)
+                                                  candidate-index (+ first-index (* khi w) kwi)
+                                                  best-value (aget x best-index)
+                                                  candidate-value (aget x candidate-index)
+                                                  best-nan (if (== best-value best-value) 0 1)
+                                                  candidate-nan (if (== candidate-value candidate-value) 0 1)]
+                                              (recur
+                                               (inc k)
+                                               (if (== candidate-nan 1)
+                                                 (if (== best-nan 1) best-index candidate-index)
+                                                 (if (== best-nan 1)
+                                                   best-index
+                                                   (if (> candidate-value best-value)
+                                                     candidate-index
+                                                     best-index)))))
+                                            best-index))))
+                                     (raster.par/map!
+                                      out oi n-out nil
+                                      (aget x (aget argmax oi)))
                                      out)))
 
 ;; In-place maxpool2d backward: uses pre-computed argmax, writes into pre-allocated dx
