@@ -69,50 +69,111 @@
 ;; Returns: -mean(log_softmax[target_class])
 ;; ================================================================
 
+(deftm cross-entropy-loss-into!
+  "Reduce stable cross-entropy into caller-owned `out[0]`.
+
+  Maxima and exponential sums are segmented over classes, exposing the cooperative reduction axis
+  to the scheduler. The final batch mean is a separate product reduction because its algebra is
+  independent of the per-row log-sum-exp. Floating sums explicitly permit a target reduction tree;
+  the maximum has deterministic NaN and tie ordering."
+  [logits :- (Array double) target :- (Array long) out :- (Array double)
+   batch :- Long classes :- Long] :- Void
+  (let [maxima (double-array batch)
+        sums (double-array batch)
+        losses (double-array batch)]
+    (raster.par/product-reduce!
+     [maxima nil]
+     [[best Double/NEGATIVE_INFINITY :double]
+      [best-index (long Long/MAX_VALUE) :long]]
+     [[b batch]] c classes
+     [candidate (aget logits (+ (* b classes) c))]
+     [candidate c]
+     [[left right] [left-index right-index]]
+     [left-nan (long (if (== left left) 0 1))
+      right-nan (long (if (== right right) 0 1))
+      better (long (if (== right-nan 1)
+                     (if (== left-nan 1) (if (< right-index left-index) 1 0) 1)
+                     (if (== left-nan 1)
+                       0
+                       (if (> right left) 1
+                         (if (== right left) (if (< right-index left-index) 1 0) 0)))))]
+     [(if (== better 1) right left)
+      (if (== better 1) right-index left-index)]
+     {:associative? true :commutative? true
+      :order {:nan :highest :tie :lowest-index}})
+    (raster.par/product-reduce!
+     [sums]
+     [[sum 0.0 :double]]
+     [[b batch]] c classes
+     [term (Math/exp (- (aget logits (+ (* b classes) c)) (aget maxima b)))]
+     [term]
+     [[left right]] []
+     [(+ left right)]
+     {:associative? true :commutative? true :order :implementation-defined})
+    (raster.par/map!
+     losses b batch double
+     (let [target-class (aget target b)]
+       (- (+ (aget maxima b) (Math/log (aget sums b)))
+          (aget logits (+ (* b classes) target-class)))))
+    (raster.par/product-reduce!
+     [out]
+     [[total 0.0 :double]]
+     [[segment 1]] b batch
+     [row-loss (/ (aget losses b) (double batch))]
+     [row-loss]
+     [[left right]] []
+     [(+ left right)]
+     {:associative? true :commutative? true :order :implementation-defined})))
+
 (deftm cross-entropy-loss [logits :- (Array double) target :- (Array long)
                            batch :- Long classes :- Long] :- Double
-  (loop [b 0 total-loss 0.0]
-    (if (< b batch)
-      (let [offset (* b (int classes))
-            ;; log-sum-exp for numerical stability
-            max-logit (loop [c 0 m Double/NEGATIVE_INFINITY]
-                        (if (< c classes)
-                          (recur (inc c) (Math/max m (clojure.core/aget logits (+ offset c))))
-                          m))
-            lse (loop [c 0 s 0.0]
-                  (if (< c classes)
-                    (recur (inc c) (+ s (Math/exp (- (clojure.core/aget logits (+ offset c))
-                                                     max-logit))))
-                    (+ max-logit (Math/log s))))
-            target-class (clojure.core/aget target b)
-            log-prob (- (clojure.core/aget logits (+ offset target-class)) lse)]
-        (recur (inc b) (- total-loss log-prob)))
-      (/ total-loss (double batch)))))
+  (let [out (double-array 1)
+        _ (cross-entropy-loss-into! logits target out batch classes)]
+    (aget out 0)))
 
 ;; d_logits = (softmax(logits) - one_hot(target)) / batch
 (deftm cross-entropy-loss-backward [dy :- Double logits :- (Array double)
                                     target :- (Array long) batch :- Long classes :- Long]
   :- (Array double)
-  (let [d-logits (double-array (* batch classes))]
-    (dotimes [b batch]
-      (let [offset (* b (int classes))
-            max-logit (loop [c 0 m Double/NEGATIVE_INFINITY]
-                        (if (< c classes)
-                          (recur (inc c) (Math/max m (clojure.core/aget logits (+ offset c))))
-                          m))
-            sum-exp (loop [c 0 s 0.0]
-                      (if (< c classes)
-                        (let [e (Math/exp (- (clojure.core/aget logits (+ offset c)) max-logit))]
-                          (clojure.core/aset d-logits (+ offset c) e)
-                          (recur (inc c) (+ s e)))
-                        s))
-            inv-sum (/ 1.0 sum-exp)
-            target-c (clojure.core/aget target b)]
-        (dotimes [c classes]
-          (let [idx (+ offset c)
-                si (* (clojure.core/aget d-logits idx) inv-sum)
-                grad (if (== c target-c) (- si 1.0) si)]
-            (clojure.core/aset d-logits idx (* dy (/ grad (double batch))))))))
+  (let [maxima (double-array batch)
+        sums (double-array batch)
+        d-logits (double-array (* batch classes))]
+    (raster.par/product-reduce!
+     [maxima nil]
+     [[best Double/NEGATIVE_INFINITY :double]
+      [best-index (long Long/MAX_VALUE) :long]]
+     [[b batch]] c classes
+     [candidate (aget logits (+ (* b classes) c))]
+     [candidate c]
+     [[left right] [left-index right-index]]
+     [left-nan (long (if (== left left) 0 1))
+      right-nan (long (if (== right right) 0 1))
+      better (long (if (== right-nan 1)
+                     (if (== left-nan 1) (if (< right-index left-index) 1 0) 1)
+                     (if (== left-nan 1)
+                       0
+                       (if (> right left) 1
+                         (if (== right left) (if (< right-index left-index) 1 0) 0)))))]
+     [(if (== better 1) right left)
+      (if (== better 1) right-index left-index)]
+     {:associative? true :commutative? true
+      :order {:nan :highest :tie :lowest-index}})
+    (raster.par/product-reduce!
+     [sums]
+     [[sum 0.0 :double]]
+     [[b batch]] c classes
+     [term (Math/exp (- (aget logits (+ (* b classes) c)) (aget maxima b)))]
+     [term]
+     [[left right]] []
+     [(+ left right)]
+     {:associative? true :commutative? true :order :implementation-defined})
+    (raster.par/map!
+     d-logits i (* batch classes) double
+     (let [b (quot i classes)
+           c (rem i classes)
+           softmax (/ (Math/exp (- (aget logits i) (aget maxima b))) (aget sums b))
+           grad (if (== c (aget target b)) (- softmax 1.0) softmax)]
+       (* dy (/ grad (double batch)))))
     d-logits))
 
 
@@ -195,4 +256,3 @@
 ;; mse-loss: returns scalar, does not allocate a buffer
 (descriptor/register-buffer-semantics! 'raster.dl.loss/mse-loss
                                        {:allocates? false})
-

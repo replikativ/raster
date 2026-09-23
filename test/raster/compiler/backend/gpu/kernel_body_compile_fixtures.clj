@@ -43,6 +43,7 @@
             [raster.ode.multilevel :as multilevel]
             [raster.dl.attention :as dl-attention]
             [raster.dl.array-ops :as dl-arrays]
+            [raster.dl.loss :as dl-loss]
             [raster.dl.nn :as dl-nn]
             [raster.linalg.contract :as contract]
             [raster.numeric]
@@ -432,6 +433,10 @@
                  #'dl-arrays/masked-mse-loss-into! {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
                  #'dl-arrays/masked-mse-loss-backward {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'dl-loss/cross-entropy-loss-into! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'dl-loss/cross-entropy-loss-backward {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

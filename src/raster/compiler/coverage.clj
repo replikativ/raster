@@ -178,11 +178,14 @@
     (edn/read reader)))
 
 (defn baseline-facts
-  "The existing device-independent ratchet excludes target-specific emission diagnostics."
+  "The device-independent route ratchet excludes target-specific emission diagnostics and the
+  diagnostic effective dtype. The latter is recomputed from retained tags on every run and is not
+  currently compared by `ratchet-violations`; retaining it only creates whole-corpus baseline
+  churn when reporting changes."
   [report]
   (-> report
       (dissoc :emission-summary)
-      (update :vars #(mapv (fn [row] (dissoc row :emission :emission-declines)) %))))
+      (update :vars #(mapv (fn [row] (dissoc row :dtype :emission :emission-declines)) %))))
 
 (defn write-report!
   "Write the complete EDN `report` to `path`, creating its parent directories."
