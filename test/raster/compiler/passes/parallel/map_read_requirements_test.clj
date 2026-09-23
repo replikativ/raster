@@ -22,11 +22,17 @@
 
 (deftest symbolic-packing-read-retains-its-exact-runtime-capacity
   (let [coordinate '(+ (* row (* heads width)) (+ (* head width) column))
-        result (requirements/symbolic-read-requirements
-                (packed-head-map coordinate)
-                {:scalar-definitions {'total (launch/product 'rows 'heads 'width)}})]
+        certificate (requirements/symbolic-read-certificate
+                     (packed-head-map coordinate)
+                     {:scalar-definitions {'total (launch/product 'rows 'heads 'width)}})
+        result (:requirements certificate)]
     (is (= {:const 1 :factors '[heads rows width]}
-           (algebra/monomial (get result 'input))))))
+           (algebra/monomial (get result 'input))))
+    (is (= coordinate (get-in certificate [:reads 0 :source-coordinate])))
+    (is (= {'total (launch/product 'rows 'heads 'width)}
+           (:scalar-definitions certificate)))
+    (is (= (get-in (packed-head-map coordinate) [:scalar-region :locals])
+           (:source-locals certificate)))))
 
 (deftest symbolic-read-proof-declines-padding-translation-and-indirection
   (doseq [coordinate ['(+ base (* row (* heads width)) (+ (* head width) column))
