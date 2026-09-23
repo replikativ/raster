@@ -81,6 +81,34 @@
     (is (arr-approx= q-reference q-strided 1.0e-12))
     (is (arr-approx= out-reference out-strided 1.0e-12))))
 
+(deftest head-major-prefill-masks
+  (testing "the uniform mask follows strided-batch BLAS head-major layout"
+    (let [nrows 4 heads 2
+          scores (float-array (map float (range (* heads nrows nrows))))]
+      (attn/attn-prefill-mask-windowed-head-major! scores nrows heads 2 2)
+      (dotimes [h heads]
+        (dotimes [i nrows]
+          (dotimes [j nrows]
+            (let [actual (aget scores (+ (* h nrows nrows) (* i nrows) j))]
+              (if (< (Math/abs (long (- i j))) 2)
+                (is (= (float (+ (* h nrows nrows) (* i nrows) j)) actual))
+                (is (= (float -1.0e30) actual)))))))))
+  (testing "segmented masking combines padding and a local window"
+    (let [batch 2 nrows 4 heads 2 lengths (long-array [2 4])
+          scores (float-array (repeat (* heads batch nrows nrows) 1.0))]
+      (attn/attn-prefill-mask-segmented-head-major!
+       scores lengths batch nrows heads 2 2)
+      (dotimes [h heads]
+        (dotimes [b batch]
+          (dotimes [i nrows]
+            (dotimes [j nrows]
+              (let [idx (+ (* (+ (* h batch) b) nrows nrows) (* i nrows) j)
+                    active (aget lengths b)
+                    keep? (and (< i active) (< j active)
+                               (< (Math/abs (long (- i j))) 2))]
+                (is (= (float (if keep? 1.0 -1.0e30))
+                       (aget scores idx)))))))))))
+
 (deftest functional-prefill-softmax-matches-in-place-reference
   (doseq [[rows heads] [[1 1] [3 2] [7 3]]]
     (let [source (float-array

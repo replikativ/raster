@@ -226,6 +226,14 @@
    :route :typed-soac,
    :typed-validated true,
    :declines []}
+  {:var raster.dl.attention/attn-prefill-mask-segmented-head-major!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/attn-prefill-mask-windowed-head-major!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.attention/attn-prefill-scores!,
    :route :typed-soac,
    :typed-validated true,

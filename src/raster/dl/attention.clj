@@ -2049,6 +2049,56 @@
                                sc v out nrows n-q group n-kv head-dim
                                (clojure.core/* n-kv head-dim) 0)))
 
+(deftm attn-prefill-mask-windowed-head-major!
+  "Apply a symmetric window to scores stored as `[head,nrows,nrows]`, the
+  layout produced by strided-batch QKᵀ. A zero left or right extent leaves that
+  side unbounded."
+  (All [T] [sc :- (Array T) nrows :- Long n-heads :- Long
+            left :- Long right :- Long] :- Void
+       (raster.par/map-void!
+        idx (clojure.core/* n-heads (clojure.core/* nrows nrows))
+        (let [row (quot idx nrows)
+              i (rem row nrows)
+              j (rem idx nrows)
+              left-limit (if (> left 0) (dec left) nrows)
+              right-limit (if (> right 0) (dec right) nrows)]
+          (if (> (clojure.core/- i j) left-limit)
+            (aset sc idx -1.0e30)
+            (if (> (clojure.core/- j i) right-limit)
+              (aset sc idx -1.0e30)
+              nil))))))
+
+(deftm attn-prefill-mask-segmented-head-major!
+  "Mask padding and an optional symmetric window in a uniform batched-attention
+  score slab. Scores are `[head,batch,nrows,nrows]` (head-major because
+  `pack-heads` treats `batch*nrows` as its row domain); `lengths[b]` is the
+  active prefix. Zero left/right extents are unbounded. Padded query rows are
+  masked too, although consumers may simply discard their outputs."
+  (All [T] [sc :- (Array T) lengths :- (Array long)
+            batch :- Long nrows :- Long n-heads :- Long
+            left :- Long right :- Long] :- Void
+       (raster.par/map-void!
+        idx (clojure.core/* n-heads
+                            (clojure.core/* batch (clojure.core/* nrows nrows)))
+        (let [matrix-size (clojure.core/* nrows nrows)
+              matrix (quot idx matrix-size)
+              b (rem matrix batch)
+              within (rem idx matrix-size)
+              i (quot within nrows)
+              j (rem within nrows)
+              active (aget lengths b)
+              left-limit (if (> left 0) (dec left) nrows)
+              right-limit (if (> right 0) (dec right) nrows)]
+          (if (>= i active)
+            (aset sc idx -1.0e30)
+            (if (>= j active)
+              (aset sc idx -1.0e30)
+              (if (> (clojure.core/- i j) left-limit)
+                (aset sc idx -1.0e30)
+                (if (> (clojure.core/- j i) right-limit)
+                  (aset sc idx -1.0e30)
+                  nil))))))))
+
 ;; Bidirectional scores (EmbeddingGemma-style encoder): all-to-all, no causal mask.
 ;; (Symmetric sliding window |i-j| < w only matters for T > window — the binder
 ;; asserts T <= window, so full attention here is exact.)
