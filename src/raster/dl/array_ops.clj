@@ -355,6 +355,51 @@
 ;; reference each other by name, so the resident rewrite leaves them untouched).
 ;; ================================================================
 
+(deftm pack-heads-strided
+  "Pack a `[seq-len,n-heads*head-dim]` field embedded in a wider row-major
+  source into contiguous `[n-heads,seq-len,head-dim]` slabs. `row-stride` and
+  `column-offset` describe the source view, so projection fields can feed BLAS
+  without first materializing a dense slice."
+  (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long
+            row-stride :- Long column-offset :- Long] :- (Array T)
+       (let [out (alloc-like x (* seq-len n-heads head-dim))]
+         (par/map! out idx
+                   (clojure.core/* (clojure.core/* n-heads seq-len) head-dim)
+                   nil
+                   (let [^long d (rem idx head-dim)
+                         ^long e (quot idx head-dim)
+                         ^long h (quot e seq-len)
+                         ^long s (rem e seq-len)
+                         ^long src (clojure.core/+ (clojure.core/* s row-stride)
+                                                   (clojure.core/+ column-offset
+                                                                   (clojure.core/* h head-dim)
+                                                                   d))]
+                     (aget x src))))))
+
+(deftm unpack-heads-strided
+  "Unpack contiguous `[n-heads,seq-len,head-dim]` slabs into a field of a
+  zero-filled `[seq-len,row-stride]` result. This is the exact linear dual of
+  `pack-heads-strided`."
+  (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long
+            row-stride :- Long column-offset :- Long] :- (Array T)
+       (let [out (alloc-like x (* seq-len row-stride))
+             field-width (clojure.core/* n-heads head-dim)]
+         (par/map! out idx (clojure.core/* seq-len row-stride) nil
+                   (let [^long s (quot idx row-stride)
+                         ^long c (rem idx row-stride)]
+                     (if (< c column-offset)
+                       (n/oftype x 0)
+                       (if (< c (clojure.core/+ column-offset field-width))
+                         (let [^long field-column (clojure.core/- c column-offset)
+                               ^long h (quot field-column head-dim)
+                               ^long d (rem field-column head-dim)
+                               ^long src (clojure.core/+ (clojure.core/* h
+                                                                         (clojure.core/* seq-len head-dim))
+                                                         (clojure.core/* s head-dim)
+                                                         d)]
+                           (aget x src))
+                         (n/oftype x 0))))))))
+
 (deftm pack-heads
   "Reshape [seq-len, n-heads*head-dim] (row-major) → [n-heads, seq-len, head-dim]
   so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d].
@@ -391,6 +436,44 @@
                                                               d)]
                                 (aget x src)))]
          result)))
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/pack-heads-strided
+                           {:pullback-factory
+                            (fn [_result _x seq-len n-heads head-dim row-stride column-offset]
+                              (fn [d-out]
+                                [(unpack-heads-strided d-out seq-len n-heads head-dim
+                                                       row-stride column-offset)
+                                 nil nil nil nil nil]))
+                            :params '[x seq-len n-heads head-dim row-stride column-offset]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [x seq-len n-heads head-dim row-stride column-offset]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [dx (gensym-fn "d_x" (tmpl/grad-tag x))]
+                                [(update ctx :bindings into
+                                         [dx (list 'raster.dl.array-ops/unpack-heads-strided
+                                                   adjoint-sym seq-len n-heads head-dim
+                                                   row-stride column-offset)])
+                                 [dx nil nil nil nil nil]]))})
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/unpack-heads-strided
+                           {:pullback-factory
+                            (fn [_result _x seq-len n-heads head-dim _row-stride _column-offset]
+                              (fn [d-out]
+                                [(pack-heads-strided d-out seq-len n-heads head-dim
+                                                     _row-stride _column-offset)
+                                 nil nil nil nil nil]))
+                            :params '[x seq-len n-heads head-dim row-stride column-offset]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [x seq-len n-heads head-dim row-stride column-offset]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [dx (gensym-fn "d_x" (tmpl/grad-tag x))]
+                                [(update ctx :bindings into
+                                         [dx (list 'raster.dl.array-ops/pack-heads-strided
+                                                   adjoint-sym seq-len n-heads head-dim
+                                                   row-stride column-offset)])
+                                 [dx nil nil nil nil nil]]))})
 
 (deftm blit-slab!
   "Copy `len` contiguous elements from `src[0..len)` into `dst[dst-off .. dst-off+len)`.

@@ -129,6 +129,10 @@
    :route :typed-soac,
    :typed-validated true,
    :declines []}
+  {:var raster.dl.array-ops/pack-heads-strided,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.array-ops/pad-strided-2d,
    :route :typed-soac,
    :typed-validated true,
@@ -207,6 +211,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.array-ops/unpack-heads,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.array-ops/unpack-heads-strided,
    :route :typed-soac,
    :typed-validated true,
    :declines []}

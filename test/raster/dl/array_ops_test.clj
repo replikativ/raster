@@ -143,6 +143,32 @@
       ;; round-trip identity
       (is (arr-approx= (ops/unpack-heads p sl nh hd) x))
       (is (arr-approx= (ops/pack-heads (ops/unpack-heads x sl nh hd) sl nh hd) x))))
+  (testing "strided head packing reads a projection field without a dense slice"
+    (let [sl 3 nh 2 hd 2 stride 11 offset 3
+          wide (double-array (map double (range (* sl stride))))
+          dense (ops/slice-strided-2d wide sl stride offset (* nh hd))
+          expected (ops/pack-heads dense sl nh hd)
+          packed (ops/pack-heads-strided wide sl nh hd stride offset)
+          restored (ops/unpack-heads-strided packed sl nh hd stride offset)]
+      (is (arr-approx= expected packed))
+      (dotimes [s sl]
+        (dotimes [c stride]
+          (is (approx= (aget restored (+ (* s stride) c))
+                       (if (and (<= offset c) (< c (+ offset (* nh hd))))
+                         (aget wide (+ (* s stride) c))
+                         0.0)))))))
+  (testing "strided head pack and unpack satisfy the inner-product duality"
+    (let [sl 2 nh 2 hd 3 stride 10 offset 2
+          wide (double-array (map #(- (double %) 4.0) (range (* sl stride))))
+          packed-cotangent (double-array
+                            (map #(* 0.25 (inc (double %)))
+                                 (range (* sl nh hd))))
+          packed (ops/pack-heads-strided wide sl nh hd stride offset)
+          wide-cotangent (ops/unpack-heads-strided packed-cotangent sl nh hd
+                                                   stride offset)
+          lhs (reduce + (map * packed packed-cotangent))
+          rhs (reduce + (map * wide wide-cotangent))]
+      (is (approx= lhs rhs 1.0e-10))))
   (testing "broadcast-kv-heads / sum-kv-heads are duals (fan-out ↔ fan-in)"
     ;; gemma-style MQA: n-kv=1 group=4, plus a general 2:group case
     (doseq [[nkv grp slab] [[1 4 5] [2 4 3]]]
