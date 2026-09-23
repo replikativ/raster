@@ -1,7 +1,8 @@
 (ns raster.compiler.passes.parallel.gqa-decode-route-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.coverage :as coverage]
-            [raster.dl.attention :as attention]))
+            [raster.dl.attention :as attention]
+            [raster.dl.attention-reference :as attention-reference]))
 
 (def ^:private compiled-route
   (delay (coverage/report-var #'attention/gqa-decode-attention-buf!
@@ -26,7 +27,7 @@
     (doseq [cache-length [0 1 3 5 7]]
       (testing (str "cache length " cache-length)
         (let [effective (min cache-length maxpos)
-              expected (attention/gqa-decode-attention
+              expected (attention-reference/gqa-decode
                         q k v effective n-q n-kv head-dim scale)
               out (double-array (* n-q head-dim))
               scratch (double-array (repeat (* n-q maxpos) -77.0))]

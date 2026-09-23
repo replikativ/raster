@@ -149,52 +149,6 @@
                                                              adjoint-sym batch seq-len heads head-dim theta)])
                                            [dx nil nil nil nil nil]]))})
 
-;; --- Grouped / multi-query causal attention ---
-;; q:[seq,n_q,hd]  k,v:[seq,n_kv,hd]  (n_kv divides n_q; n_kv<n_q = GQA, n_kv=1 = MQA).
-;; Causal softmax with an EXPLICIT scale (Gemma: query_pre_attn_scalar^-0.5, which
-;; need not equal 1/sqrt(head_dim)). Returns [seq, n_q*hd]. Each query head hq reads
-;; kv head (hq / (n_q/n_kv)). Generic across Llama/Qwen/Gemma attention.
-(deftm gqa-causal-attention (All [T]
-                                 [q :- (Array T) k :- (Array T) v :- (Array T)
-                                  seq-len :- Long n-q :- Long n-kv :- Long
-                                  head-dim :- Long scale :- Double] :- (Array T)
-                                 (let [out (alloc-like q (* seq-len (* n-q head-dim)))
-                                       group (quot n-q n-kv)
-                                       neg-inf (n/neg-inf-val (aget q 0))]
-                                   (dotimes [hq n-q]
-                                     (let [hkv (quot hq group)]
-                                       (dotimes [i seq-len]
-                                         (let [qb (+ (* i (* n-q head-dim)) (* hq (int head-dim)))
-                                               sc (alloc-like q (inc i))
-                                               _ (dotimes [j (inc i)]
-                                                   (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
-                                                         dot (loop [d 0 acc 0.0]
-                                                               (if (< d head-dim)
-                                                                 (recur (inc d)
-                                                                        (+ acc (* (aget q (+ qb d))
-                                                                                  (aget k (+ kb d)))))
-                                                                 acc))]
-                                                     (aset sc j (* dot scale))))
-                                               mx (loop [j 0 mm neg-inf]
-                                                    (if (<= j i) (recur (inc j) (n/max mm (aget sc j))) mm))
-                                               sum (loop [j 0 s 0.0]
-                                                     (if (<= j i)
-                                                       (let [e (m/exp (- (aget sc j) mx))]
-                                                         (aset sc j e) (recur (inc j) (+ s e)))
-                                                       s))
-                                               inv (/ 1.0 sum)
-                                               ob (+ (* i (* n-q head-dim)) (* hq (int head-dim)))]
-                                           (dotimes [d head-dim]
-                                             (aset out (+ ob d)
-                                                   (loop [j 0 a 0.0]
-                                                     (if (<= j i)
-                                                       (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
-                                                         (recur (inc j)
-                                                                (+ a (* (* (aget sc j) inv)
-                                                                        (aget v (+ kvb d))))))
-                                                       a))))))))
-                                   out)))
-
 ;; --- RoPE at an absolute position offset (KV-cache decode) ---
 ;; Like rope, but positions run pos-offset .. pos-offset+seq-1. Decode passes
 ;; seq-len 1 and pos-offset = the new token's absolute position.
@@ -245,54 +199,9 @@
                                         (aset x i1 (+ (* x1 c) (* x0 s)))))))
                                 x)))
 
-;; --- Single-query attention over a KV cache (decode step) ---
-;; q:[1, n_q, hd], k/v:[>=cache_len, n_kv, hd] (the cache; only first cache_len
-;; positions are read). The single query attends ALL cache_len keys (all causal).
-;; Returns [n_q*hd]. MQA/GQA via n_kv<n_q.
-(deftm gqa-decode-attention (All [T]
-                                 [q :- (Array T) k :- (Array T) v :- (Array T)
-                                  cache-len :- Long n-q :- Long n-kv :- Long
-                                  head-dim :- Long scale :- Double] :- (Array T)
-                                 (let [out (alloc-like q (* n-q head-dim))
-                                       group (quot n-q n-kv)
-                                       neg-inf (n/neg-inf-val (aget q 0))]
-                                   (dotimes [hq n-q]
-                                     (let [hkv (quot hq group)
-                                           qb (* hq (int head-dim))
-                                           sc (alloc-like q cache-len)
-                                           _ (dotimes [j cache-len]
-                                               (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
-                                                     dot (loop [d 0 acc 0.0]
-                                                           (if (< d head-dim)
-                                                             (recur (inc d)
-                                                                    (+ acc (* (aget q (+ qb d))
-                                                                              (aget k (+ kb d)))))
-                                                             acc))]
-                                                 (aset sc j (* dot scale))))
-                                           mx (loop [j 0 mm neg-inf]
-                                                (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
-                                           sum (loop [j 0 s 0.0]
-                                                 (if (< j cache-len)
-                                                   (let [e (m/exp (- (aget sc j) mx))]
-                                                     (aset sc j e) (recur (inc j) (+ s e)))
-                                                   s))
-                                           inv (/ 1.0 sum)
-                                           ob (* hq (int head-dim))]
-                                       (dotimes [d head-dim]
-                                         (aset out (+ ob d)
-                                               (loop [j 0 a 0.0]
-                                                 (if (< j cache-len)
-                                                   (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
-                                                     (recur (inc j)
-                                                            (+ a (* (* (aget sc j) inv)
-                                                                    (aget v (+ kvb d))))))
-                                                   a))))))
-                                   out)))
-
 ;; --- Decode attention that also captures the attention-weight distribution ---
-;; Identical layout/scale semantics (and bit-identical output) to
-;; gqa-decode-attention above, plus ACCUMULATES the head-averaged softmax
-;; weights into wsink (length >= cache-len): wsink[j] += (1/n_q) * weight[hq,j].
+;; Returns single-query GQA/MQA output and ACCUMULATES the head-averaged softmax weights into
+;; wsink (length >= cache-len): wsink[j] += (1/n_q) * weight[hq,j].
 ;; This is the cross-attention alignment signal for DTW word timestamps
 ;; (whisper/moonshine style) — call with a zeroed wsink per decode step, or let
 ;; it accumulate across layers for a layer+head average.
@@ -341,52 +250,6 @@
                                                             a))))))
                                             out)))
 
-(deftm gqa-decode-attention-heads! (All [T]
-                                        [q :- (Array T) k :- (Array T) v :- (Array T) out :- (Array T)
-                                         cache-len :- Long kv-start :- Long h0 :- Long h-cnt :- Long
-                                         group :- Long n-kv :- Long head-dim :- Long scale :- Double] :- Long
-                                        ;; Like gqa-decode-attention but computes only heads [h0, h0+h-cnt)
-                                        ;; into a CALLER-provided `out` (so the decode loop can split heads
-                                        ;; across the pool), and attends only KV positions [kv-start, cache-len)
-                                        ;; — kv-start>0 implements sliding-window attention. Returns 0.
-                                        (let [neg-inf (n/neg-inf-val (aget q 0))
-                                              j0 (long kv-start)]
-                                          (dotimes [hi h-cnt]
-                                            (let [hq (clojure.core/+ (long h0) hi)
-                                                  hkv (quot hq group)
-                                                  qb (* hq (int head-dim))
-                                                  sc (alloc-like q cache-len)
-                                                  _ (loop [j j0]
-                                                      (when (< j cache-len)
-                                                        (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
-                                                              dot (loop [d 0 acc 0.0]
-                                                                    (if (< d head-dim)
-                                                                      (recur (inc d)
-                                                                             (+ acc (* (aget q (+ qb d))
-                                                                                       (aget k (+ kb d)))))
-                                                                      acc))]
-                                                          (aset sc j (* dot scale)))
-                                                        (recur (inc j))))
-                                                  mx (loop [j j0 mm neg-inf]
-                                                       (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
-                                                  sum (loop [j j0 s 0.0]
-                                                        (if (< j cache-len)
-                                                          (let [e (m/exp (- (aget sc j) mx))]
-                                                            (aset sc j e) (recur (inc j) (+ s e)))
-                                                          s))
-                                                  inv (/ 1.0 sum)
-                                                  ob (* hq (int head-dim))]
-                                              (dotimes [d head-dim]
-                                                (aset out (+ ob d)
-                                                      (loop [j j0 a 0.0]
-                                                        (if (< j cache-len)
-                                                          (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
-                                                            (recur (inc j)
-                                                                   (+ a (* (* (aget sc j) inv)
-                                                                           (aget v (+ kvb d))))))
-                                                          a))))))
-                                          0)))
-
 ;; KV-cache append (decode): write the current token's K (or V) slab of length kvrow = n_kv*head_dim
 ;; into the cache at absolute position `pos` (offset pos*kvrow). par/map-void! over kvrow — the
 ;; on-device equivalent of the CPU System/arraycopy append. Index math clojure.core (integer).
@@ -395,9 +258,8 @@
                                              (aset cache (clojure.core/+ (clojure.core/* pos kvrow) i)
                                                    (aget src i)))))
 
-;; GPU/vectorizable decode attention: the SAME per-head computation as
-;; gqa-decode-attention-heads!, but the head loop is a par/map-void! (one work-item per query
-;; head) so it lowers to OpenCL and SIMD-vectorizes on CPU. Per-head scratch is caller-provided
+;; GPU/vectorizable decode attention: one work-item per query head, so it lowers to OpenCL and
+;; SIMD-vectorizes on CPU. Per-head scratch is caller-provided
 ;; (sc, size n-q*cache-len — GPU work-items can't allocate); index math is clojure.core
 ;; (integer subscripts), float compute is raster.numeric/raster.math. Attends all cache positions.
 (deftm gqa-decode-attention-gpu! (All [T]

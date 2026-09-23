@@ -8,6 +8,7 @@
             [raster.quant.kernels-k :as qk]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
+            [raster.dl.attention-reference :as attention-reference]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
@@ -155,12 +156,10 @@
 (deftest gqa-decode-attention-gpu-lowers
   (when (gpu-available?)
     (testing "GQA decode attention (QK^T+softmax+weighted-V, parallel over heads) lowers to OpenCL"
-      ;; Reuses the per-head computation of gqa-decode-attention-heads! verbatim, as a
-      ;; par/map-void! over query heads with caller-provided per-head scratch — matches the CPU
-      ;; gqa-decode-attention reference. GQA via n-kv < n-q.
+      ;; GQA via n-kv < n-q, checked against an independent sequential host oracle.
       (let [nq 8 nkv 2 hd 64 cl 16 group (quot nq nkv) scale (/ 1.0 (Math/sqrt hd))
             q (gen (* nq hd) 1) k (gen (* cl nkv hd) 2) v (gen (* cl nkv hd) 3)
-            ycpu (attn/gqa-decode-attention q k v cl nq nkv hd scale)
+            ycpu (attention-reference/gqa-decode q k v cl nq nkv hd scale)
             sess (gpu/make-session :ze:0)]
         (try
           (gpu/compile! sess :at #'attn/gqa-decode-attention-gpu!)
