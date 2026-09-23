@@ -23,6 +23,7 @@
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
@@ -109,6 +110,111 @@
       {:form (if program (:source program) lowered)
        :parallel-program program
        :params active :param-env penv})))
+
+(defn- strip-index-casts [x]
+  (loop [x x]
+    (if (and (seq? x)
+             (= 2 (count x))
+             (contains? #{'int 'long 'clojure.core/int 'clojure.core/long}
+                        (first x)))
+      (recur (second x))
+      x)))
+
+(defn- source-op? [form op-name]
+  (and (seq? form)
+       (symbol? (first form))
+       (= op-name (name (first form)))))
+
+(defn- product-other-factor [product factor]
+  (let [product (strip-index-casts product)]
+    (when (and (source-op? product "*") (= 3 (count product)))
+      (let [[a b] (map strip-index-casts (rest product))
+            factor (strip-index-casts factor)]
+        (cond (= a factor) b
+              (= b factor) a)))))
+
+(defn- divmod-binding?
+  [init op-name index divisor]
+  (let [init (strip-index-casts init)]
+    (and (source-op? init op-name)
+         (= 3 (count init))
+         (= (strip-index-casts (second init)) index)
+         (= (strip-index-casts (nth init 2)) (strip-index-casts divisor)))))
+
+(defn- without-binding-pairs [bindings removed]
+  (vec (mapcat identity
+               (remove (fn [[sym _]] (contains? removed sym))
+                       (partition 2 bindings)))))
+
+(defn- rectangular-map
+  "Recover a rectangular iteration space from the canonical flattening
+
+      i < rows*width; row = i/width; column = i%width
+
+  before C emission.  Keeping `row` and `column` as actual loop induction
+  variables removes runtime integer div/rem from the innermost body and gives
+  LLVM an affine contiguous loop it can vectorize.  This is a CPU schedule of
+  the same source map; GPU lowering continues to see the original flat SegMap."
+  [form]
+  (when (and (seq? form)
+             (contains? #{'let 'let*} (first form)))
+    (let [[let-op bindings & body] form
+          pairs (partition 2 bindings)]
+      (when (and (= 1 (count pairs))
+                 (= 2 (count body))
+                 (nil? (second body)))
+        (let [[[extent-sym extent-init]] pairs
+              loop-form (first body)]
+          (when (and (seq? loop-form)
+                     (= 'dotimes (first loop-form))
+                     (= 3 (count loop-form)))
+            (let [[_ [index bound] loop-body] loop-form]
+              (when (and (= bound extent-sym)
+                         (seq? loop-body)
+                         (contains? #{'let 'let*} (first loop-body)))
+                (let [[body-let body-bindings & body-tail] loop-body
+                      body-pairs (partition 2 body-bindings)]
+                  (some
+                   (fn [[row-sym row-init]]
+                     (some
+                      (fn [[column-sym column-init]]
+                        (when (and (divmod-binding? row-init "quot" index
+                                                            (nth (strip-index-casts column-init) 2 nil))
+                                   (divmod-binding? column-init "rem" index
+                                                            (nth (strip-index-casts row-init) 2 nil)))
+                          (let [divisor (nth (strip-index-casts row-init) 2)
+                                outer (product-other-factor extent-init divisor)]
+                            (when outer
+                              (let [remaining (without-binding-pairs
+                                               body-bindings #{row-sym column-sym})
+                                    inner-body (if (seq remaining)
+                                                 (list* body-let remaining body-tail)
+                                                 (if (= 1 (count body-tail))
+                                                   (first body-tail)
+                                                   (list* 'do body-tail)))
+                                    dense-index (list 'clojure.core/+
+                                                      (list 'clojure.core/* row-sym divisor)
+                                                      column-sym)
+                                    inner-body (util/subst-syms {index dense-index} inner-body)
+                                    nested (list 'dotimes [row-sym outer]
+                                                 (list 'dotimes [column-sym divisor]
+                                                       inner-body))]
+                                ;; Source dotimes treats non-positive extents as empty.  Preserve
+                                ;; the original flattened behavior outside the tensor-shape domain.
+                                (list let-op bindings
+                                      (list 'if
+                                            (list 'and (list 'clojure.core/< 0 outer)
+                                                  (list 'clojure.core/< 0 divisor))
+                                            nested loop-form)
+                                      nil))))))
+                      body-pairs))
+                   body-pairs))))))))))
+
+(defn recover-rectangular-maps
+  "Apply CPU-only rectangular map scheduling bottom-up. Public for focused
+  compiler tests; it is a semantic source-to-source scheduling pass."
+  [form]
+  (walk/postwalk (fn [x] (or (rectangular-map x) x)) form))
 
 ;; ---------------------------------------------------------------------------
 ;; Form normalization for C emission.
@@ -581,6 +687,7 @@
   [f-var dtype & {:keys [simd?] :or {simd? false}}]
   (let [{:keys [form parallel-program params param-env]}
         (fused-scalar-form f-var dtype :simd? simd?)
+        form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
