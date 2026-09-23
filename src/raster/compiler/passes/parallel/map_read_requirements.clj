@@ -32,12 +32,12 @@
              (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))
              (not (seq (get-in operation [:scalar-region :effects]))))
     (let [{index :name bound :bound} (first (get-in operation [:space :dims]))
-          {:keys [locals result]} (:scalar-region operation)
+          {source-locals :locals result :result} (:scalar-region operation)
           monomial-definitions (into {} (filter (comp algebra/monomial val)) scalar-definitions)
           expand #(walk/postwalk-replace monomial-definitions %)
           bound (expand bound)
-          locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) locals)
-          reads (->> (concat (map :init locals) [result])
+          locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) source-locals)
+          reads (->> (concat (map :init source-locals) [result])
                      (mapcat descriptor/aget-reads)
                      (filter #(contains? (:inputs operation) (:sym %)))
                      vec)
@@ -48,12 +48,20 @@
                               coordinate
                               index bound locals {})]
                     (when-let [span (algebra/zero-based-dense-span form)]
-                      {:buffer sym :coordinate coordinate :form form
+                      {:buffer sym :source-coordinate idx
+                       :coordinate coordinate :form form
                        :span (span-expression span)})))
                 reads)]
       (when (and (seq reads) (every? some? read-facts))
         {:kind :zero-based-dense-read-spans
-         :index index :extent bound :locals locals :reads read-facts
+         :index index :extent bound
+         ;; Retain both sides of the proof. `:source-locals` and
+         ;; `:scalar-definitions` let a later graph-bound target projection recompute this
+         ;; certificate from the exact SegMap instead of trusting attached metadata. `:locals`
+         ;; is the canonical expanded region used by the mixed-radix proof.
+         :source-locals source-locals
+         :scalar-definitions monomial-definitions
+         :locals locals :reads read-facts
          :requirements
          (reduce (fn [result {:keys [buffer span]}]
                   (update result buffer
