@@ -440,6 +440,8 @@
       (:kernels (equation-first/compile
                  #'dl-nn/im2col-2d! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-nn/maxpool2d! {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
                  #'dl-arrays/sum-kv-heads {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-nn/rms-norm-reassociated! {:target device-id :dtype :float}))

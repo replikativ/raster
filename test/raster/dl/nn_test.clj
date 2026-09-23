@@ -44,6 +44,15 @@
     (is (identical? actual (nn/im2col-2d! input actual 1 1 3 3 2 2 1 1 1 1)))
     (is (= (vec expected) (vec actual)))))
 
+(deftest maxpool2d-into-retains-values-and-global-argmax
+  (let [input (double-array (map double (range 1 17)))
+        expected (nn/maxpool2d input 1 1 4 4 2 2)
+        actual (double-array 4)
+        argmax (long-array 4)]
+    (is (identical? actual (nn/maxpool2d! input actual argmax 1 1 4 4 2 2)))
+    (is (= (vec expected) (vec actual)))
+    (is (= [5 7 13 15] (vec argmax)))))
+
 (deftest col2im-2d-into-gathers-every-overlapping-column
   (doseq [[batch channels height width kernel-height kernel-width
             stride-height stride-width pad-height pad-width]

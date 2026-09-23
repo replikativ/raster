@@ -43,6 +43,7 @@
                    'raster.dl.loss/cross-entropy-loss-into! 4
                    'raster.dl.loss/cross-entropy-loss-backward 3
                    'raster.dl.nn/im2col-2d! 1
+                   'raster.dl.nn/maxpool2d! 2
                    'raster.dl.attention/graph-attention 5
                    'raster.dl.nn/rms-norm-chunked 3
                    'raster.dl.nn/rms-norm-chunked-backward-dx 3
