@@ -26,6 +26,20 @@
 (def SM-MIX1  ir.par/SM-MIX1)
 (def SM-MIX2  ir.par/SM-MIX2)
 
+(deftm splitmix64
+  "Return the counter-based SplitMix64 value for `(base-seed,counter)`.
+
+  This is ordinary typed scalar algebra rather than a kernel primitive. Pointwise random maps
+  may call it directly, allowing the normal TypedSOAC map/fusion path to retain the projection
+  that consumes the random bits without materializing an intermediate seed array."
+  [base-seed :- Long counter :- Long] :- Long
+  (let [state (unchecked-add base-seed (unchecked-multiply counter SM-GAMMA))
+        s1 (bit-xor state (unsigned-bit-shift-right state 30))
+        s2 (unchecked-multiply s1 SM-MIX1)
+        s3 (bit-xor s2 (unsigned-bit-shift-right s2 27))
+        s4 (unchecked-multiply s3 SM-MIX2)]
+    (bit-xor s4 (unsigned-bit-shift-right s4 31))))
+
 ;; ================================================================
 ;; Runtime macros (fallback expansion when eval'd)
 ;; ================================================================

@@ -1474,14 +1474,30 @@
                                                    [dx (list 'raster.dl.nn/dropout-backward adjoint mask n)])
                                            [dx nil nil]]))})
 
-(deftm generate-dropout-mask [n :- Long p :- Double] :- (Array double)
+(deftm generate-dropout-mask-seeded
+  "Generate an inverted-dropout mask from an explicit counter-based seed.
+
+   Randomness is pointwise SplitMix64 algebra: element i depends only on `(seed,i)`, so CPU, GPU,
+   CUDA and HIP schedules may change execution order without changing the mask. The upper 53 bits
+   map exactly to the representable double grid in [0,1)."
+  [n :- Long p :- Double base-seed :- Long] :- (Array double)
   (let [mask (double-array n)
         scale (/ 1.0 (- 1.0 p))
-        rng (java.util.Random.)]
-    (dotimes [i n]
-      (aset mask i
-            (if (>= (.nextDouble rng) p) scale 0.0)))
+        _ (raster.par/map! mask i n double
+                           (let [bits (raster.par/splitmix64 base-seed (long i))
+                                 mantissa (unsigned-bit-shift-right bits 11)
+                                 uniform (* (double mantissa) 1.1102230246251565e-16)]
+                             (if (>= uniform p) scale 0.0)))]
     mask))
+
+(deftm ^{:raster.compiler/host-only true} generate-dropout-mask
+  "Convenience API that chooses a nondeterministic host seed.
+
+   Device/JIT workflows should call `generate-dropout-mask-seeded` and make seed/counter ownership
+   explicit. A fresh `java.util.Random` object is host orchestration, not portable kernel algebra."
+  [n :- Long p :- Double] :- (Array double)
+  (let [rng (java.util.Random.)]
+    (generate-dropout-mask-seeded n p (.nextLong rng))))
 
 ;; ================================================================
 ;; Softmax (batched, over last dim)

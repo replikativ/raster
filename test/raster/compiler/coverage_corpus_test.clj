@@ -40,7 +40,8 @@
           (doseq [[workload expected-kernels]
                   {'raster.dl.attention/graph-attention 5
                    'raster.dl.nn/rms-norm-chunked 3
-                   'raster.dl.nn/rms-norm-chunked-backward-dx 3}]
+                   'raster.dl.nn/rms-norm-chunked-backward-dx 3
+                   'raster.dl.nn/generate-dropout-mask-seeded 1}]
             (is (= {:kernel-body expected-kernels}
                    (get-in rows [workload :emission :routes]))
                 (str workload " regained a compatibility emitter"))))))))
