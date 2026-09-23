@@ -675,6 +675,18 @@
       (is (= 1 (count (:outputs linked))))
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
+(deftest public-gqa-jvp-is-the-same-generated-c-family-composition
+  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
+    (let [compilation (equation-first/compile
+                       #'attention/gqa-causal-mha-jvp {:target target :dtype :float})
+          kernels (:kernels compilation)]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 11 (count kernels)))
+      (is (every? #(= module-target (:target %)) kernels))
+      (is (every? #(get-in % [:attributes :kernel-body]) kernels))
+      (is (= {:kernel-body 11}
+             (get-in compilation [:stats :emission :emission-routes]))))))
+
 (deftest public-stencil-uses-portable-kernel-body
   (doseq [[target module-target]
           [[cuda-target :cuda-c]
