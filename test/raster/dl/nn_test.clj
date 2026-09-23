@@ -35,6 +35,15 @@
           (aset grad i (/ (- f+ f0) eps)))))
     grad))
 
+(deftest im2col-2d-into-is-a-total-layout-map
+  (let [input (double-array (map double (range 1 10)))
+        expected (nn/im2col-2d input 1 1 3 3 2 2 1 1 1 1)
+        actual (double-array (alength expected))]
+    ;; A resident destination may contain old data. Padding must be written, not assumed zero.
+    (java.util.Arrays/fill actual 99.0)
+    (is (identical? actual (nn/im2col-2d! input actual 1 1 3 3 2 2 1 1 1 1)))
+    (is (= (vec expected) (vec actual)))))
+
 (deftest col2im-2d-into-gathers-every-overlapping-column
   (doseq [[batch channels height width kernel-height kernel-width
             stride-height stride-width pad-height pad-width]
