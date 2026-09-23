@@ -236,54 +236,26 @@
       (is (nil? (kart/attribute kernel :soa-expansions))))))
 
 ;; ================================================================
-;; Phase 3: deftm inlining in OpenCL kernels
+;; Phase 3: canonical frontend/backend boundary
 ;; ================================================================
 
 (deftm test-scale [^double x ^double factor] :- Double
   (* x factor))
 
-(deftm test-add3 [^double a ^double b ^double c] :- Double
-  (+ a (+ b c)))
-
-(deftest deftm-inline-basic-test
-  (testing "deftm call gets inlined into OpenCL kernel"
+(deftest scheduled-backend-does-not-inline-deftm-calls-test
+  (testing "raw deftm calls must be normalized by the shared frontend before scheduling"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       (list 'aset 'out 'i
                             (list 'raster.gpu.soa-test/test-scale '(aget arr i) 2.5)))
                 {'out 'doubles 'arr 'doubles})
-          result (opencl-pass/opencl-pass body :dtype :double)
-          source (:source (first (:kernels result)))]
-      ;; Should inline the body, not emit a function call
-      (is (not (str/includes? source "test_scale(")))
-      ;; Should have the multiplication
-      (is (str/includes? source "*")))))
-
-(deftest deftm-inline-3arg-test
-  (testing "3-arg deftm inlining"
-    (let [body (tag-body
-                (list 'raster.par/map-void! 'i 'n
-                      (list 'aset 'out 'i
-                            (list 'raster.gpu.soa-test/test-add3
-                                  '(aget a i) '(aget b i) '(aget c i))))
-                {'out 'doubles 'a 'doubles 'b 'doubles 'c 'doubles})
-          result (opencl-pass/opencl-pass body :dtype :double)
-          source (:source (first (:kernels result)))]
-      ;; Should inline as addition, not function call
-      (is (not (str/includes? source "test_add3(")))
-      (is (str/includes? source "+")))))
-
-(deftest deftm-inline-no-spurious-scalars-test
-  (testing "Inlined deftm doesn't leave function name as scalar param"
-    (let [body (tag-body
-                (list 'raster.par/map-void! 'i 'n
-                      (list 'aset 'out 'i
-                            (list 'raster.gpu.soa-test/test-scale '(aget arr i) 2.5)))
-                {'out 'doubles 'arr 'doubles})
-          result (opencl-pass/opencl-pass body :dtype :double)
-          source (:source (first (:kernels result)))]
-      ;; Should NOT have test_scale as a kernel parameter
-      (is (not (str/includes? source "double test_scale"))))))
+          error (try
+                  (opencl-pass/opencl-pass body :dtype :double)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :scalar-expression (:missing-rule (ex-data error))))
+      (is (= 'raster.gpu.soa-test/test-scale
+             (first (:expression (ex-data error))))))))
 
 ;; ================================================================
 ;; Phase 4: Display module

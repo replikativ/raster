@@ -232,18 +232,18 @@
 
 ;; ---- 1.9 opencl-pass integration ----
 
-(deftest codegen-opencl-pass-test
-  (testing "opencl-pass replaces par form with kernel invocation"
+(deftest codegen-opencl-pass-requires-canonical-casts-test
+  (testing "the scheduled backend does not invent a float-to-int conversion policy"
     (let [form '(raster.par/map-void! i n
                                       (if (clojure.core/== 1 (aget alive i))
                                         (clojure.core/aset output i (float 1.0))
                                         (clojure.core/aset output i (float 0.0))))
-          result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)]
-      (is (seq (:kernels result)) "Should generate at least one kernel")
-      (when (seq (:kernels result))
-        (let [k (first (:kernels result))]
-          (is (string? (:source k)))
-          (is (str/includes? (:source k) "__kernel")))))))
+          error (try
+                  (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :cast-policy (:missing-rule (ex-data error))))
+      (is (= '(clojure.core/aget alive i) (:expression (ex-data error)))))))
 
 ;; ================================================================
 ;; Tier 2: Numerical Correctness (GPU-gated)

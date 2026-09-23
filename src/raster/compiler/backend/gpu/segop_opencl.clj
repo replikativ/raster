@@ -30,7 +30,6 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
-            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
@@ -442,53 +441,21 @@
      kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn generate-scheduled-segmap-kernel
-  "Emit one scheduled SegMap through the single KernelBody-first C-family boundary.
+  "Emit one scheduled SegMap through the single target-neutral KernelBody boundary.
 
-   Portable targets never consume source-shaped OpenCL fallback code. OpenCL retains the verified
-   compatibility emitter for scalar regions and memory effects that KernelBody cannot represent
-   yet, with the structured decline attached to the artifact so the remaining debt is observable."
+   A scheduled operation is already past semantic analysis, so every target consumes the same
+   certified body. Missing KernelBody coverage fails with its structured decline; OpenCL may not
+   silently recover by reparsing the source-shaped lambda through its historical emitter."
   [operation & {:keys [dtype kernel-name-prefix scalar-types array-types array-shapes target-dialect
                       graph-node kernel-graph]
                 :or {kernel-name-prefix "segmap" scalar-types {} array-types {}
                      target-dialect :opencl-intel}}]
-  (let [dtype (or (:dtype operation) dtype :double)
-        target (kernel-body-c-dialect/resolve! target-dialect)]
-    (try
-       (generate-segmap-kernel-body
-        operation :dtype dtype :scalar-types scalar-types :array-types array-types
-        :array-shapes array-shapes
-        :graph-node graph-node :kernel-graph kernel-graph
-        :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)
-       (catch clojure.lang.ExceptionInfo exception
-         (if (and (kernel-body-c-dialect/opencl? target)
-                  ;; A source-shaped fallback cannot preserve the new carried-effect contract.
-                  (not (soac-dialect/scheduled-effect-carries?
-                        (get-in operation [:scalar-region :effects])))
-                  (segmap-body/declined? exception))
-           (try
-             (kart/certify-scheduled-operation
-              (-> (if (:out-sym operation)
-                    (generate-segmap-kernel
-                     operation (:out-sym operation)
-                     :dtype dtype :scalar-types scalar-types :array-types array-types
-                     :kernel-name-prefix kernel-name-prefix)
-                    (generate-explicit-segmap-kernel
-                     operation :dtype dtype :scalar-types scalar-types :array-types array-types
-                     :kernel-name-prefix (str kernel-name-prefix "_effect")))
-                  (assoc-in [:attributes :emission-route] :verified-segmap-opencl)
-                  (assoc-in [:attributes :kernel-body-decline]
-                            (assoc (ex-data exception) :fallback :verified-segmap-opencl)))
-              operation)
-             (catch clojure.lang.ExceptionInfo retry
-               ;; The verified OpenCL generator refused as well: report both refusals as one
-               ;; structured error instead of letting the second one hide the first.
-               (throw (ex-info "scheduled map has no OpenCL emission: KernelBody declined and the verified generator refused"
-                               {:reason :segmap-emission-refused
-                                :operation (:id operation)
-                                :kernel-body-decline (ex-data exception)
-                                :generator-refusal (ex-data retry)}
-                               retry))))
-           (throw exception))))))
+  (let [dtype (or (:dtype operation) dtype :double)]
+    (generate-segmap-kernel-body
+     operation :dtype dtype :scalar-types scalar-types :array-types array-types
+     :array-shapes array-shapes
+     :graph-node graph-node :kernel-graph kernel-graph
+     :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
