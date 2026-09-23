@@ -85,6 +85,18 @@
     (is (= (mapv :id numerical) (mapv :id (subvec (:equations body) 1))))
     (is (= 2 (count (:nodes graph))))))
 
+(deftest later-global-extent-becomes-a-bindable-buffer-capacity
+  (let [scheduled (scheduled-three-maps)
+        scheduled (-> scheduled
+                      (assoc-in [:values 'later-extent] (get-in scheduled [:values 'n]))
+                      (assoc-in [:values 'x :shape] ['later-extent]))
+        {:keys [body graph]} (equation-graph/make-for-equation
+                              scheduled (first (:equations scheduled)))
+        graph-input (first (filter #(= 'x (:id %)) (:inputs graph)))]
+    (is (= '[(extent x)] (get-in body [:values 'x :shape])))
+    (is (= '(extent x) (:elements graph-input))
+        "a caller-owned allocation remains resolvable; it never becomes unknown-dimension")))
+
 (deftest earlier-equation-does-not-capture-a-later-global-buffer-extent
   ;; group-norm's final dense map normalizes `batch*channel-span` after three product equations.
   ;; The program-wide value table once leaked that later extent into every earlier graph ABI,

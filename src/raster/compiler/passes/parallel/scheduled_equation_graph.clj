@@ -209,13 +209,14 @@
           (mapcat :results equations))))
 
 (defn- slice-value-contracts
-  "Remove program-global tensor capacities that depend on scalars unavailable to this slice.
+  "Remove a later scalar from a slice-local tensor capacity.
 
   ParallelProgram keeps one value table for the whole program.  A later map can refine a shared
-  input/output buffer to its own normalized extent, but an earlier scheduled equation must not
-  acquire that later scalar as an ABI argument merely because it sees the global table.  Mark the
-  capacity unresolved here; `make` reconstructs the earlier equation's required read/write extent
-  from its retained operations.  Scalar contracts and shapes closed over the slice are unchanged."
+  input/output buffer to its normalized extent, but an earlier scheduled equation must not acquire
+  that later scalar as an ABI argument.  Restore the ordinary runtime allocation-capacity marker:
+  graph construction replaces it with any independently proved read/write extent, while a public
+  input resolves it from the bound buffer.  Unlike `unknown-dimension`, `(extent id)` therefore
+  remains bindable when an operation deliberately consumes the caller's complete allocation."
   [values equations]
   (let [inputs (set (program/infer-inputs equations))
         results (set (mapcat :results equations))
@@ -224,17 +225,18 @@
                      (and (contains? values id)
                           (empty? (:shape (get values id)))
                           (contains? #{:int :long}
-                                     (some-> (get-in values [id :dtype]) dtype/canon))))]
+                                     (some-> (get-in values [id :dtype]) dtype/canon))))
+        closed? (fn [value]
+                  (let [shape-scalars (into #{}
+                                            (filter scalar-id?)
+                                            (mapcat util/free-syms (:shape value)))]
+                    (set/subset? shape-scalars available)))]
     (reduce-kv
      (fn [sliced id value]
-       (let [shape-scalars (into #{}
-                                 (filter scalar-id?)
-                                 (mapcat util/free-syms (:shape value)))]
-         (assoc sliced id
-                (if (and (= :tensor (:kind value))
-                         (not (set/subset? shape-scalars available)))
-                  (assoc value :shape [(list 'unknown-dimension id)])
-                  value))))
+       (assoc sliced id (if (and (= :tensor (:kind value))
+                                 (not (closed? value)))
+                          (assoc value :shape [(list 'extent id)])
+                          value)))
      {} values)))
 
 (defn body-for-equations
