@@ -17,11 +17,14 @@
 
 (defn- make-case
   [route-kind visibility-kind & [options]]
-  (let [{:keys [value-head-dim query-offset-values query-position-values window-left]
+  (let [{:keys [value-head-dim query-offset-values query-position-values
+                causal? window-left window-right]
          :or {value-head-dim 6
               query-offset-values [0 2 3 4]
               query-position-values [3 4 10 12]
-              window-left 2}} (or options {})
+              causal? true
+              window-left 2
+              window-right 0}} (or options {})
         dims {:batch-size 3 :q-heads 4 :kv-heads 2 :qk-head-dim 8
               :value-head-dim value-head-dim :page-size 2 :physical-pages 7}
         {:keys [q-heads kv-heads qk-head-dim value-head-dim page-size physical-pages]} dims
@@ -75,7 +78,8 @@
         attention-visibility
         (case visibility-kind
           :interval
-          (attention/visibility {:causal? true :window-left window-left :window-right 0})
+          (attention/visibility {:causal? causal?
+                                 :window-left window-left :window-right window-right})
 
           :csr
           (attention/csr-visibility
@@ -342,6 +346,19 @@
     (gp/gpu-skip! "FP32-I/O packed attention over FP16 KV on Level Zero")
     (run-mixed-io-case :ze:0 :subgroup-score-reuse
                        :routed-paged-subgroup-online-score-reuse)))
+
+(deftest level-zero-packed-bidirectional-segments-match-reference
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "packed bidirectional segment-isolated attention on Level Zero")
+    (do
+      ;; Each packed query row sees its own routed K/V sequence. The middle row has a query
+      ;; but no keys; its output must remain the zero empty-segment value. The other rows
+      ;; exercise full bidirectional visibility without admitting keys from their neighbors.
+      (run-case :ze:0 :dense-paged :interval :reference :fp16-reference
+                {:causal? false :window-left nil :window-right nil})
+      (run-case :ze:0 :dense-paged :interval :subgroup-score-reuse
+                :routed-paged-subgroup-online-score-reuse
+                {:causal? false :window-left nil :window-right nil}))))
 
 (deftest opencl-packed-csr-attention-matches-reference
   (if-not @device-probe/opencl-fp16-available?
