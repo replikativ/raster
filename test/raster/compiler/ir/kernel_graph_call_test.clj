@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
@@ -39,6 +40,17 @@
                   (fn [& _] (throw (ex-info "temporary sizing happened first" {})))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
                             (graph-call/temporary-specs graph {'n {:type :int :value 32}}))))))
+
+(deftest graph-preconditions-compare-symbolic-capacities-before-temporary-sizing
+  (let [required 'n
+        capacity (launch/product 4 (launch/floor-div 'n 4))
+        graph (assoc (emitted-graph) :preconditions
+                     [{:expression capacity :op :>= :value required}])
+        valid {'n {:type :int :value 12}}
+        invalid {'n {:type :int :value 13}}]
+    (is (= graph (graph-call/preflight! graph valid)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
+                          (graph-call/temporary-specs graph invalid)))))
 
 (deftest later-node-preconditions-resolve-derived-physical-scalars
   (let [graph (emitted-graph)
