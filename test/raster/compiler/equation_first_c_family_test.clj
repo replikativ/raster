@@ -676,7 +676,9 @@
       (is (= :none (get-in compilation [:stats :fallback]))))))
 
 (deftest public-gqa-jvp-is-the-same-generated-c-family-composition
-  (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
+  (doseq [[target module-target] [[cuda-target :cuda-c]
+                                  [hip-target :hip-cpp]
+                                  [ocl-target :opencl-c]]]
     (let [compilation (equation-first/compile
                        #'attention/gqa-causal-mha-jvp {:target target :dtype :float})
           kernels (:kernels compilation)

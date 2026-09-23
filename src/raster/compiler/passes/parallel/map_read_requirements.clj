@@ -189,12 +189,21 @@
   [operation options]
   (:requirements (symbolic-read-certificate operation options)))
 
-(defn- capacity-covers?
+(defn capacity-covers?
+  "Whether a symbolic graph capacity structurally proves one certified minimum."
   [capacity required]
   (or (extent/equivalent? capacity required)
       (and (integer? capacity) (integer? required) (<= required capacity))
       (and (= "raster.compiler.ir.kernel_launch.Maximum" (some-> capacity class .getName))
            (some #(capacity-covers? % required) (:values capacity)))))
+
+(defn- precondition-covers?
+  [conditions capacity required]
+  (some (fn [{:keys [expression op value]}]
+          (and (= :>= op)
+               (extent/equivalent? expression capacity)
+               (extent/equivalent? value required)))
+        conditions))
 
 (defn- address-substitutions
   [locals expression]
@@ -299,7 +308,9 @@
                               (:temporaries kernel-graph)))
         _ (doseq [[id required] (:requirements attached)]
             (let [capacity (:elements (get buffers id))]
-              (when-not (capacity-covers? capacity required)
+              (when-not (or (capacity-covers? capacity required)
+                            (precondition-covers? (:preconditions kernel-graph)
+                                                 capacity required))
                 (throw (ex-info "graph buffer does not enforce the certified map read span"
                                 {:reason :map-address-certificate-capacity
                                  :buffer id :required required :capacity capacity})))))

@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.scalar-range :as scalar-range]))
 
 (defrecord ScheduledKernelCall [id call dependencies])
@@ -237,6 +238,8 @@
   (let [graph (executable/validate! graph)
         public-values (select-keys scalar-values (map second (scalar-interface graph)))
         _ (validate-scalar-values! graph public-values)]
+    (precondition/check! (:preconditions graph)
+                         #(resolve-integer scalar-values %))
     (doseq [{:keys [operation]} (:nodes graph)]
       (let [artifact (kart/validate! operation)
             arguments (mapv (fn [slot compiler-value]

@@ -24,10 +24,12 @@
   (doseq [{:keys [expression op value] :as condition} conditions]
     (when-not (and (map? condition) (= #{:expression :op :value} (set (keys condition)))
                    (launch/expression? expression) (contains? comparison-ops op)
-                   (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+                   (launch/expression? value))
       (throw (ex-info "kernel precondition requires a checked integer comparison"
                       {:reason :kernel-precondition-invalid :condition condition})))
-    (when-not (every? scalar-identities (launch/expression-references expression))
+    (when-not (every? scalar-identities
+                      (into (launch/expression-references expression)
+                            (launch/expression-references value)))
       (throw (ex-info "kernel precondition references values outside the integral scalar ABI"
                       {:reason :kernel-precondition-scope :condition condition
                        :scalar-identities scalar-identities}))))
@@ -37,9 +39,10 @@
   "Check in order, before allocation or launch. Arithmetic retains checked overflow semantics."
   [conditions resolve-value]
   (doseq [{:keys [expression op value] :as condition} conditions]
-    (let [actual (launch/resolve-expression resolve-value expression)]
-      (when-not (compare-value? op actual value)
+    (let [actual (launch/resolve-expression resolve-value expression)
+          expected (launch/resolve-expression resolve-value value)]
+      (when-not (compare-value? op actual expected)
         (throw (ex-info "kernel scalar precondition failed"
                         {:reason :kernel-precondition-failed
-                         :condition condition :actual actual})))))
+                         :condition condition :actual actual :expected expected})))))
   true)

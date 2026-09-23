@@ -540,6 +540,15 @@
                                        extent))
                            specs))
                        buffer-specs result-storage-values)
+         capacity-preconditions
+         (->> read-capacity-certificates
+              (mapcat (comp seq :requirements))
+              (keep (fn [[id required]]
+                      (let [capacity (get-in buffer-specs [id :elements])]
+                        (when-not (map-reads/capacity-covers? capacity required)
+                          {:expression capacity :op :>= :value required}))))
+              distinct
+              vec)
          scalars (public-scalars scheduled operations buffer-specs)]
      (let [kernel-graph
            (graph/from-segops
@@ -548,6 +557,7 @@
              :outputs outputs
              :temporaries (select-keys buffer-specs temporary-ids)
              :scalars scalars
+             :preconditions capacity-preconditions
              :buffer-specs buffer-specs
              :dtype (:dtype (first (vals buffer-specs)))
              :effects (or effects {:semantic (:effects (soac/facts algorithm))})

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
@@ -129,6 +130,29 @@
                (:reason (ex-data exception))))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbol or keyword"
                           (graph/scalar 42 :int)))))
+
+(deftest graph-preconditions-are-a-checked-public-scalar-contract
+  (let [operation (segop/->SegMap
+                   10 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(aget values i) nil #{'values} #{'out} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'out nil)
+        condition {:expression (launch/product 'groups (launch/floor-div 'n 'groups))
+                   :op :>=
+                   :value 'n}
+        scheduled (graph/from-segops
+                   [operation]
+                   {:inputs #{'values} :outputs #{'out} :dtype :float
+                    :scalars [(graph/scalar 'n :long) (graph/scalar 'groups :long)]
+                    :preconditions [condition]})]
+    (is (= [condition] (:preconditions scheduled)))
+    (is (= [condition] (:preconditions (graph/boundary-contract scheduled))))
+    (is (= :kernel-precondition-scope
+           (try
+             (graph/validate!
+              (assoc scheduled :preconditions [{:expression 'missing :op :>= :value 'n}]))
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
 
 (deftest public-graph-interface-deduplicates-logical-scalars-across-physical-roles
   (let [abi [(kabi/slot 'values :input :float)

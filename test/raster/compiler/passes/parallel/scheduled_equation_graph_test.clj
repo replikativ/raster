@@ -88,14 +88,21 @@
         projected (map-reads/validate-and-project-addresses operation node graph)
         forged-node (assoc-in node [:read-capacity-certificate :requirements 'x] 1)
         forged-graph (assoc graph :nodes [forged-node])
-        undersized (assoc-in graph [:inputs 0 :elements] 1)]
+        undersized (assoc-in graph [:inputs 0 :elements] 1)
+        runtime-guarded (assoc undersized :preconditions
+                               [{:expression 1 :op :>= :value 'n}])]
     (is (= :certified-index-expression (get-in projected [:address-projection :kind])))
     (is (= :map-address-certificate-mismatch
            (reason-of #(map-reads/validate-and-project-addresses
                         operation forged-node forged-graph))))
     (is (= :map-address-certificate-capacity
            (reason-of #(map-reads/validate-and-project-addresses
-                        operation node undersized))))))
+                        operation node undersized))))
+    (is (= :certified-index-expression
+           (get-in (map-reads/validate-and-project-addresses
+                    operation node runtime-guarded)
+                   [:address-projection :kind]))
+        "a checked graph-boundary capacity contract can discharge a dynamic read proof")))
 
 (deftest equation-region-must-be-an-exact-contiguous-slice
   (let [scheduled (scheduled-three-maps)

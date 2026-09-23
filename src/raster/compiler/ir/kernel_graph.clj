@@ -9,6 +9,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.segop :as segop]))
 
 (defrecord GraphBuffer [id dtype elements memory-space role])
@@ -16,7 +17,7 @@
 (defrecord ValueUse [buffer access])
 (defrecord ScheduledKernel [id operation uses scalar-uses dependencies])
 (defrecord KernelGraph
-           [inputs outputs temporaries scalars nodes abi arguments effects provenance attributes])
+           [inputs outputs temporaries scalars preconditions nodes abi arguments effects provenance attributes])
 
 (def ^:private buffer-roles #{:input :output :inout :temporary})
 (def ^:private access-modes #{:read :write :read-write})
@@ -224,7 +225,7 @@
   (when-not (kernel-graph? graph)
     (throw (ex-info "kernel graph must be a KernelGraph value"
                     {:graph graph :actual (type graph)})))
-  (let [{:keys [inputs outputs temporaries scalars nodes effects provenance attributes]} graph
+  (let [{:keys [inputs outputs temporaries scalars preconditions nodes effects provenance attributes]} graph
         sections [inputs outputs temporaries]
         buffers (vec (mapcat identity sections))
         buffer-ids (mapv :id buffers)]
@@ -256,6 +257,7 @@
           (throw (ex-info "kernel graph buffer and scalar identities must be disjoint"
                           {:reason :kernel-graph-value-identity
                            :collisions collisions})))))
+    (precondition/validate! preconditions (set (map :id scalars)))
     (doseq [b buffers]
       (when-not (graph-buffer? b)
         (throw (ex-info "kernel graph contains a non-buffer value" {:buffer b})))
@@ -383,9 +385,9 @@
 
 (defn make
   "Construct and verify a scheduled KernelGraph from explicit compiler values."
-  [{:keys [inputs outputs temporaries scalars nodes abi arguments effects provenance attributes]
-    :or {inputs [] outputs [] temporaries [] nodes [] effects {} provenance {} attributes {}}}]
-  (validate! (->KernelGraph inputs outputs temporaries scalars nodes abi arguments
+  [{:keys [inputs outputs temporaries scalars preconditions nodes abi arguments effects provenance attributes]
+    :or {inputs [] outputs [] temporaries [] preconditions [] nodes [] effects {} provenance {} attributes {}}}]
+  (validate! (->KernelGraph inputs outputs temporaries scalars (vec preconditions) nodes abi arguments
                             effects provenance attributes)))
 
 (defn map-operations
@@ -408,6 +410,7 @@
      :outputs (:outputs graph)
      :temporaries (:temporaries graph)
      :scalars (:scalars graph)
+     :preconditions (:preconditions graph)
      :nodes (mapv #(select-keys % [:id :uses :scalar-uses :dependencies]) (:nodes graph))
      :effects (:effects graph)}))
 
@@ -423,6 +426,7 @@
     {:inputs (:inputs graph)
      :outputs (:outputs graph)
      :scalars (:scalars graph)
+     :preconditions (:preconditions graph)
      :abi (:abi graph)
      :arguments (:arguments graph)
      :effects (:effects graph)}))
@@ -459,10 +463,10 @@
    `temporaries` is a map from stable buffer identity to at least `{:elements expr}`. External
    inputs/outputs are explicit; therefore a newly introduced intermediate can never hide as an
    undeclared symbol in a later kernel."
-  [segops {:keys [inputs outputs temporaries scalars buffer-specs dtype memory-space effects provenance
+  [segops {:keys [inputs outputs temporaries scalars preconditions buffer-specs dtype memory-space effects provenance
                   attributes]
            :or {temporaries {} buffer-specs {} memory-space :device effects {} provenance {}
-                attributes {}}}]
+                preconditions [] attributes {}}}]
   (when-not (vector? segops)
     (throw (ex-info "scheduled SegOps must be an ordered vector" {:segops segops})))
   (doseq [operation segops]
@@ -534,6 +538,7 @@
              :outputs outputs*
              :temporaries temporaries*
              :scalars scalars
+             :preconditions preconditions
              :nodes nodes
              :effects effects
              :provenance provenance
