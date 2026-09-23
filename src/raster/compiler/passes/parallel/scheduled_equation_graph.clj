@@ -461,6 +461,22 @@
              (fail! :scheduled-equation-empty
                     "a KernelGraph requires at least one scheduled operation" {}))
          derived-scalars (derived-scalar-expressions (:values scheduled) host-prefix)
+         values (:values scheduled)
+         map-read-options
+         {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
+          :scalar-types (into {} (keep (fn [[id v]]
+                                        (when (empty? (:shape v)) [id (:dtype v)]))) values)
+          :scalar-definitions derived-scalars}
+         ;; Retain the structural address proof on the exact scheduled operation. A target can
+         ;; project checked source arithmetic only after the enclosing graph has revalidated the
+         ;; corresponding capacity; no emitter has to rediscover this from source spelling.
+         operations
+         (mapv (fn [operation]
+                 (if-let [certificate
+                          (map-reads/symbolic-read-certificate operation map-read-options)]
+                   (assoc operation :read-capacity-certificate certificate)
+                   operation))
+               operations)
          inputs (external-inputs operations)
          outputs (set (physical-outputs algorithm))
          operation-values (reduce set/union #{}
@@ -468,7 +484,6 @@
                                                    (segop/operation-outputs %))
                                        operations))
          temporary-ids (set/difference operation-values inputs outputs)
-         values (:values scheduled)
          result-storage-values
          (reduce
           (fn [by-storage equation]
@@ -493,14 +508,9 @@
                             (and (= {:kind :plain} (:representation value))
                                  (nil? (:logical-layout value)))))
                         (:inputs operation)))
-              (let [options
-                    {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
-                     :scalar-types (into {} (keep (fn [[id v]]
-                                                   (when (empty? (:shape v))
-                                                     [id (:dtype v)]))) values)
-                     :scalar-definitions derived-scalars}
-                    derived (or (map-reads/symbolic-read-requirements operation options)
-                                (map-reads/static-read-requirements operation options))]
+              (let [derived (or (get-in operation [:read-capacity-certificate :requirements])
+                                (map-reads/static-read-requirements
+                                 operation map-read-options))]
                 (merge-with into requirements
                             (into {} (map (fn [[id extent]] [id [extent]])) derived)))
               requirements))

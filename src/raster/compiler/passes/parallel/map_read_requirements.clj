@@ -17,8 +17,8 @@
       1 (first operands)
       (apply launch/product operands))))
 
-(defn symbolic-read-requirements
-  "Derive exact symbolic minimum capacities for the flat reads of a typed one-dimensional map.
+(defn symbolic-read-certificate
+  "Certify exact symbolic spans for the flat reads of a typed one-dimensional map.
 
    The proof is structural: the map index is decomposed into mixed-radix digits and each address
    must enumerate a zero-based dense interval over the digits it represents. Omitted digits are
@@ -41,23 +41,33 @@
                      (mapcat descriptor/aget-reads)
                      (filter #(contains? (:inputs operation) (:sym %)))
                      vec)
-          requirements
+          read-facts
           (mapv (fn [{:keys [sym idx]}]
-                  (let [form (algebra/index-form
-                              (algebra/canonical-arithmetic (expand idx))
+                  (let [coordinate (algebra/canonical-arithmetic (expand idx))
+                        form (algebra/index-form
+                              coordinate
                               index bound locals {})]
                     (when-let [span (algebra/zero-based-dense-span form)]
-                      [sym (span-expression span)])))
+                      {:buffer sym :coordinate coordinate :form form
+                       :span (span-expression span)})))
                 reads)]
-      (when (and (seq reads) (every? some? requirements))
-        (reduce (fn [result [id extent]]
-                  (update result id
+      (when (and (seq reads) (every? some? read-facts))
+        {:kind :zero-based-dense-read-spans
+         :index index :extent bound :locals locals :reads read-facts
+         :requirements
+         (reduce (fn [result {:keys [buffer span]}]
+                  (update result buffer
                           (fn [prior]
                             (cond
-                              (nil? prior) extent
-                              (= prior extent) prior
-                              :else (launch/maximum prior extent)))))
-                {} requirements)))))
+                              (nil? prior) span
+                              (= prior span) prior
+                              :else (launch/maximum prior span)))))
+                 {} read-facts)}))))
+
+(defn symbolic-read-requirements
+  "Return only the buffer-capacity projection of `symbolic-read-certificate`."
+  [operation options]
+  (:requirements (symbolic-read-certificate operation options)))
 
 (defn static-read-requirements
   "Optional all-load proof for a plain, positive static, one-dimensional result map.
