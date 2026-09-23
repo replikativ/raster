@@ -208,6 +208,35 @@
           (filter #(or (contains? escaping %) (contains? terminal-results %)))
           (mapcat :results equations))))
 
+(defn- slice-value-contracts
+  "Remove program-global tensor capacities that depend on scalars unavailable to this slice.
+
+  ParallelProgram keeps one value table for the whole program.  A later map can refine a shared
+  input/output buffer to its own normalized extent, but an earlier scheduled equation must not
+  acquire that later scalar as an ABI argument merely because it sees the global table.  Mark the
+  capacity unresolved here; `make` reconstructs the earlier equation's required read/write extent
+  from its retained operations.  Scalar contracts and shapes closed over the slice are unchanged."
+  [values equations]
+  (let [inputs (set (program/infer-inputs equations))
+        results (set (mapcat :results equations))
+        available (set/union inputs results)
+        scalar-id? (fn [id]
+                     (and (contains? values id)
+                          (empty? (:shape (get values id)))
+                          (contains? #{:int :long}
+                                     (some-> (get-in values [id :dtype]) dtype/canon))))]
+    (reduce-kv
+     (fn [sliced id value]
+       (let [shape-scalars (into #{}
+                                 (filter scalar-id?)
+                                 (mapcat util/free-syms (:shape value)))]
+         (assoc sliced id
+                (if (and (= :tensor (:kind value))
+                         (not (set/subset? shape-scalars available)))
+                  (assoc value :shape [(list 'unknown-dimension id)])
+                  value))))
+     {} values)))
+
 (defn body-for-equations
   "Return the dependency-closed scheduled program slice for a numerical equation region.
 
@@ -223,11 +252,12 @@
         preceding (subvec (:equations parallel-program) 0 first-index)
         scalar-prefix (vec (filter #(true? (get-in % [:attributes :host-only])) preceding))
         outputs (region-outputs parallel-program equations indices)
-        body-equations (vec (concat scalar-prefix host-gap equations))]
+        body-equations (vec (concat scalar-prefix host-gap equations))
+        values (slice-value-contracts (:values parallel-program) body-equations)]
     (program/make
      {:dialect :segop
       :source nil
-      :values (:values parallel-program)
+      :values values
       :inputs (program/infer-inputs body-equations)
       :equations body-equations
       :outputs outputs

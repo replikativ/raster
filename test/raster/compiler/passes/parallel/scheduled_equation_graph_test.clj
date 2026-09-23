@@ -1,10 +1,12 @@
 (ns raster.compiler.passes.parallel.scheduled-equation-graph-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
-            [raster.compiler.passes.parallel.typed-soac-route :as route]))
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.dl.nn :as nn]))
 
 (def ^:private three-map-source
   '(let* [first-effect
@@ -82,3 +84,13 @@
     (is (true? (get-in body [:equations 0 :attributes :host-only])))
     (is (= (mapv :id numerical) (mapv :id (subvec (:equations body) 1))))
     (is (= 2 (count (:nodes graph))))))
+
+(deftest earlier-equation-does-not-capture-a-later-global-buffer-extent
+  ;; group-norm's final dense map normalizes `batch*channel-span` after three product equations.
+  ;; The program-wide value table once leaked that later extent into every earlier graph ABI,
+  ;; producing a forward reference at backend reconstruction time.
+  (let [report (pipeline/compile-report #'nn/group-norm-jvp-dx
+                                        :target-device :ocl:0 :dtype :float)]
+    (is (= :typed-soac (get-in report [:route :source-dialect])))
+    (is (= {:kernel-body 4} (get-in report [:emission :routes])))
+    (is (empty? (get-in report [:route :declines])))))
