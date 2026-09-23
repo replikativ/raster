@@ -128,3 +128,25 @@
            (:requirements certificate)))
     (is (= {:const 1 :factors '[rows]}
            (get-in certificate [:reads 0 :loop-indices 'j])))))
+
+(deftest address-projection-expands-only-coordinate-dependencies
+  (let [noise-locals
+        (mapv (fn [index]
+                {:id (symbol (str "noise" index))
+                 :dtype :long
+                 :init (if (zero? index)
+                         1
+                         (let [prior (symbol (str "noise" (dec index)))]
+                           (list '+ prior prior)))})
+              (range 20))
+        operation
+        (segop/map->SegMap
+         {:id :irrelevant-large-scalar-region
+          :space (segop/make-seg-space 'row 'rows)
+          :inputs #{'input} :outputs #{'output} :scalars '#{rows}
+          :dtype :float :out-sym 'output
+          :scalar-region {:locals noise-locals :result '(aget input row)}})
+        certificate (requirements/symbolic-read-certificate operation {})]
+    (is (= {'input 'rows} (:requirements certificate)))
+    (is (= 'row (get-in certificate [:reads 0 :projected-coordinate])))
+    (is (empty? (get-in certificate [:reads 0 :address-locals])))))

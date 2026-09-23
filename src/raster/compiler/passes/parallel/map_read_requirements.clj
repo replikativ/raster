@@ -147,7 +147,7 @@
                   (let [coordinate (algebra/canonical-arithmetic (expand idx))
                         projected-coordinate
                         (algebra/canonical-arithmetic
-                         (util/subst-syms (address-substitutions site-locals) idx))
+                         (util/subst-syms (address-substitutions site-locals idx) idx))
                         form (algebra/index-form
                               coordinate
                               index bound
@@ -197,10 +197,17 @@
            (some #(capacity-covers? % required) (:values capacity)))))
 
 (defn- address-substitutions
-  [locals]
-  (reduce (fn [substitutions {:keys [id init]}]
-            (assoc substitutions id (util/subst-syms substitutions init)))
-          {} locals))
+  [locals expression]
+  ;; A scalar region may contain large decoded/quantized values that have no bearing on this
+  ;; address. Eagerly expanding every preceding local makes repeated values duplicate
+  ;; exponentially even though the mixed-radix proof only needs the coordinate's transitive
+  ;; dependencies. Restrict substitution to that already-computed lexical slice.
+  (let [needed (local-dependencies locals expression)]
+    (reduce (fn [substitutions {:keys [id init]}]
+              (if (contains? needed id)
+                (assoc substitutions id (util/subst-syms substitutions init))
+                substitutions))
+            {} locals)))
 
 (defn- retain-live-locals
   [locals result removable]
