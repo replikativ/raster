@@ -74,7 +74,7 @@ jobs:
 
   test:
     executor: clojure-java24
-    parallelism: 4
+    parallelism: 8
     steps:
       - attach_workspace:
           at: ~/
@@ -88,17 +88,9 @@ jobs:
           command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev clang
       - run:
           name: Run deterministic test subshards
-          command: |
-            raster_first_subshard=$((CIRCLE_NODE_INDEX * 2))
-            raster_second_subshard=$((raster_first_subshard + 1))
-            RASTER_TEST_SHARDS=8 \
-              RASTER_TEST_SHARD="${raster_first_subshard}" \
-              RASTER_TEST_TIMING_REPORT="test-results/timings-${raster_first_subshard}.edn" \
-              scripts/ci-test-shard.sh
-            RASTER_TEST_SHARDS=8 \
-              RASTER_TEST_SHARD="${raster_second_subshard}" \
-              RASTER_TEST_TIMING_REPORT="test-results/timings-${raster_second_subshard}.edn" \
-              scripts/ci-test-shard.sh
+          command: >-
+            RASTER_TEST_TIMING_REPORT="test-results/timings-${CIRCLE_NODE_INDEX}.edn"
+            scripts/ci-test-shard.sh
       - store_artifacts:
           path: test-results
           destination: test-timings
