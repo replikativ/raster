@@ -406,6 +406,19 @@
       (is (= 1 (count (:outputs linked))))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
+(deftest in-place-convolution-gradients-project-blas-effects-to-contractions
+  ;; These helpers return their caller-owned destination.  The BLAS call must remain an explicit
+  ;; effect in the block so the common frontend can project NT/TN layouts to typed contractions;
+  ;; returning the call directly used to leave both public deftms on the scalar route.
+  (doseq [target [cuda-target hip-target ocl-target]
+          operation [#'dl-nn/conv2d-backward-dW-into!
+                     #'dl-nn/conv2d-backward-dcols-into!]]
+    (let [compilation (equation-first/compile operation {:target target :dtype :float})]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (get-in compilation [:kernels 0 :attributes :kernel-body]))
+      (is (= 1 (get-in compilation [:stats :emission :typed-equations-emitted]))))))
+
 (deftest public-huber-loss-shares-typed-conditional-reduction-lowering
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile

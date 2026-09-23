@@ -1372,13 +1372,19 @@
 (deftm ^:no-inline conv2d-backward-dW-into! (All [T]
                                                  [dy-cols :- (Array T) cols :- (Array T) dW :- (Array T)
                                                   c-out :- Long bhw :- Long ckk :- Long] :- (Array T)
-                                                 (blas/dgemm-nt! dy-cols cols dW c-out bhw ckk (n/oftype dy-cols 1.0) (n/oftype dy-cols 0.0))))
+                                                 (let [_ (blas/dgemm-nt! dy-cols cols dW c-out bhw ckk
+                                                                        (n/oftype dy-cols 1.0)
+                                                                        (n/oftype dy-cols 0.0))]
+                                                   dW)))
 
 ;; d_cols = W^T @ dy_cols via BLAS TN
 (deftm ^:no-inline conv2d-backward-dcols-into! (All [T]
                                                     [W :- (Array T) dy-cols :- (Array T) d-cols :- (Array T)
                                                      ckk :- Long c-out :- Long bhw :- Long] :- (Array T)
-                                                    (blas/dgemm-tn! W dy-cols d-cols ckk c-out bhw (n/oftype W 1.0) (n/oftype W 0.0))))
+                                                    (let [_ (blas/dgemm-tn! W dy-cols d-cols ckk c-out bhw
+                                                                           (n/oftype W 1.0)
+                                                                           (n/oftype W 0.0))]
+                                                      d-cols)))
 
 ;; db = sum dy over batch and spatial dimensions.  The output-channel map is independent; each
 ;; lane owns one ordered reduction.  Keeping that algebra explicit lets the common TypedSOAC
