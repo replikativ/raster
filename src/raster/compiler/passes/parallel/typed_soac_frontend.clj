@@ -340,7 +340,18 @@
           [_ local-bindings] (when (and (seq? then-branch)
                                         (form/let-head? (first then-branch)))
                                then-branch)
-          locals (if local-bindings (typed-region-locals local-bindings) [])]
+          locals (if local-bindings (typed-region-locals local-bindings) [])
+          ;; projected-recur-argument retains the lexical wrapper independently for every carry.
+          ;; The product lambda owns that common prefix once; leave only each projected body here.
+          update-exprs
+          (if local-bindings
+            (mapv (fn [update]
+                    (if (and (seq? update) (form/let-head? (first update))
+                             (= local-bindings (second update)) (= 3 (count update)))
+                      (nth update 2)
+                      update))
+                  update-exprs)
+            update-exprs)]
       (when (and (every? some? dtypes) (some? locals)
                  (every? some? identities)
                  (not-any? util/effectful?

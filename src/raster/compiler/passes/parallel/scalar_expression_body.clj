@@ -391,6 +391,86 @@
                {:operations [] :substitutions {} :environment env}
                (partition 2 bindings)))
 
+            (lower-product-results [expressions result-types env]
+              (let [expressions (vec expressions)
+                    result-types (mapv canon-type result-types)
+                    common-let?
+                    (and (seq expressions)
+                         (every? #(and (seq? %)
+                                       (contains? #{'let 'let* 'clojure.core/let} (first %))
+                                       (= 3 (count %)))
+                                 expressions)
+                         (apply = (map second expressions)))
+                    common-if?
+                    (and (seq expressions)
+                         (every? #(and (seq? %) (= 'if (first %)) (= 4 (count %)))
+                                 expressions)
+                         (apply = (map second expressions)))]
+                (cond
+                  common-let?
+                  (let [bindings (second (first expressions))
+                        {:keys [operations substitutions environment]}
+                        (lower-ordered-bindings
+                         bindings env
+                         (fn [id init environment]
+                           (or (retained-type id)
+                               (authoritative-source-type init environment)
+                               (decline! :typed-product-fold-local-dtype
+                                         "shared product Fold binding lacks a retained dtype"
+                                         {:binding id :initializer init})))
+                         :typed-product-fold-local-dtype
+                         "shared product Fold binding must preserve its retained dtype")
+                        tails (mapv #(util/subst-syms substitutions (nth % 2)) expressions)
+                        lowered (lower-product-results tails result-types environment)]
+                    (update lowered :operations #(into operations %)))
+
+                  common-if?
+                  (let [condition-expression (second (first expressions))
+                        constant? (or (nil? condition-expression) (boolean? condition-expression)
+                                      (keyword? condition-expression) (number? condition-expression)
+                                      (string? condition-expression) (char? condition-expression))]
+                    (if constant?
+                      (lower-product-results
+                       (mapv #(nth % (if (or (nil? condition-expression)
+                                             (false? condition-expression)) 3 2))
+                             expressions)
+                       result-types env)
+                      (let [condition (lower condition-expression :predicate env)
+                            then-region (lower-product-results (mapv #(nth % 2) expressions)
+                                                               result-types env)
+                            else-region (lower-product-results (mapv #(nth % 3) expressions)
+                                                               result-types env)
+                            results (mapv (fn [_] (fresh "product-fold-if")) result-types)
+                            ranges (mapv scalar-range/hull
+                                         (map vector (:ranges then-region) (:ranges else-region)))]
+                        (doseq [[result range] (map vector results ranges)]
+                          (remember-range! result range))
+                        {:operations
+                         (conj (vec (:operations condition))
+                               (body/->IfRegion
+                                (:result condition)
+                                (conj (vec (:operations then-region))
+                                      (body/->Yield (:results then-region)))
+                                (conj (vec (:operations else-region))
+                                      (body/->Yield (:results else-region)))
+                                (mapv (fn [result type] (body/value result type))
+                                      results result-types)))
+                         :results results :types result-types :ranges ranges})))
+
+                  :else
+                  (let [lowered (mapv (fn [expression type] (lower expression type env))
+                                      expressions result-types)]
+                    (doseq [[value type expression]
+                            (map vector lowered result-types expressions)]
+                      (when-not (= type (:type value))
+                        (decline! :typed-product-fold-dtype
+                                  "product Fold carry dtype must remain invariant"
+                                  {:expression expression :expected type :actual (:type value)})))
+                    {:operations (vec (mapcat :operations lowered))
+                     :results (mapv :result lowered)
+                     :types (mapv :type lowered)
+                     :ranges (mapv :range lowered)}))))
+
             (lower-let [expression expected env]
               (let [[_ bindings & body-expressions] expression
                     ids (when (vector? bindings) (take-nth 2 bindings))]
@@ -737,17 +817,11 @@
                                    {:operations [] :substitutions substitutions
                                     :environment initial-env}
                                    fold-locals)
-                                  updates (mapv (fn [update type]
-                                                  (lower (util/subst-syms (:substitutions local-state)
-                                                                         update)
-                                                         type (:environment local-state)))
-                                                body-results dtypes)
-                                  _ (doseq [[update type] (map vector updates dtypes)]
-                                      (when-not (= type (:type update))
-                                        (decline! :typed-product-fold-dtype
-                                                  "product Fold carry dtype must remain invariant"
-                                                  {:expression expression :expected type
-                                                   :actual (:type update)})))
+                                  updates
+                                  (lower-product-results
+                                   (mapv #(util/subst-syms (:substitutions local-state) %)
+                                         body-results)
+                                   dtypes (:environment local-state))
                                   loop-operation
                                   (body/->ForLoop
                                    (body/value loop-index :long)
@@ -758,9 +832,9 @@
                                            (body/->LoopArg (body/value carry (:type initial))
                                                            (:result initial)))
                                          carries initials)
-                                   (conj (vec (concat (:operations local-state)
-                                                     (mapcat :operations updates)))
-                                         (body/->Yield (mapv :result updates)))
+                                   (conj (into (vec (:operations local-state))
+                                               (:operations updates))
+                                         (body/->Yield (:results updates)))
                                    (mapv (fn [result type] (body/value result type)) results dtypes)
                                    (cond-> {:association :ordered :source-order true}
                                      (= :inclusive (:upper-bound attributes))

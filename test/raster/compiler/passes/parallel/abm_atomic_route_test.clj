@@ -88,6 +88,10 @@
     (is (kernel-artifact/kernel-artifact? artifact))
     (is (<= 2 (count (filter #(= "ForLoop" (some-> % class .getSimpleName)) operations)))
         "the bounded Newton solve and friend selection remain typed ordered loops")
+    (is (some #(and (= "IfRegion" (some-> % class .getSimpleName))
+                    (< 1 (count (:results %))))
+              operations)
+        "branchy carry updates share one multi-result SSA control region")
     (is (= ["effort" "income" "theta" "endowment" "firm" "friends" "cache"]
            (get-in descriptor [:value-specs 'agents :physical-layout :field-order])))
     (is (= ["a" "b" "beta" "te" "output" "n-workers" "alive" "members" "offsets"]
