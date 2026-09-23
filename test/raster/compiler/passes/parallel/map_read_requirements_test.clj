@@ -1,9 +1,18 @@
 (ns raster.compiler.passes.parallel.map-read-requirements-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.index-algebra :as algebra]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.map-read-requirements :as requirements]))
+
+(deftest source-read-rewriting-keeps-embedded-compiler-records-opaque
+  (let [certificate (scan/->AssociativeScan 'acc 0.0 '+ '(aget input i) 0.0 :float)
+        expression (list 'pair certificate '(aget input i))
+        rewritten (descriptor/rewrite-aget-indices expression {'input 'projected})]
+    (is (identical? certificate (second rewritten)))
+    (is (= '(aget input projected) (nth rewritten 2)))))
 
 (defn- packed-head-map
   [coordinate]

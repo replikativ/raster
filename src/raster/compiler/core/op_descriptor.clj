@@ -801,6 +801,10 @@
                 (seq? f) (or (when (aget-call? f) (replace-fn f))
                              (with-meta (apply list (map go f)) (meta f)))
                 (vector? f) (with-meta (mapv go f) (meta f))
+                ;; IR records are deliberately opaque semantic values. They satisfy `map?`, but
+                ;; many correctly reject `empty`; rebuilding one as a source map would also erase
+                ;; its type and invariants.
+                (record? f) f
                 (map? f) (with-meta (into (empty f) (map (fn [[k v]] [(go k) (go v)])) f) (meta f))
                 (set? f) (with-meta (into (empty f) (map go) f) (meta f))
                 :else f))]

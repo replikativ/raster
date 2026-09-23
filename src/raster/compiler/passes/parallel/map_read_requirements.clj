@@ -230,9 +230,12 @@
 
               (seq? form) (with-meta (apply list (map prune form)) (meta form))
               (vector? form) (with-meta (mapv prune form) (meta form))
-              (map? form) (with-meta (into (empty form)
-                                           (map (fn [[k v]] [(prune k) (prune v)])) form)
-                                      (meta form))
+              ;; Compiler IR records are map-like, but rebuilding them through `empty` is neither
+              ;; supported nor desirable: address-let pruning only owns source collection forms.
+              (and (map? form) (not (record? form)))
+              (with-meta (into (empty form)
+                               (map (fn [[k v]] [(prune k) (prune v)])) form)
+                         (meta form))
               :else form))]
     (prune expression)))
 
