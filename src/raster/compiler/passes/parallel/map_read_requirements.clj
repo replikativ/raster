@@ -49,8 +49,12 @@
 
 (defn- lexical-read-sites
   "Collect array reads with the exact lexical locals and counted-loop domains at each site."
-  [expression index extent initial-locals]
-  (letfn [(collect-sequential [bindings body locals loops]
+  [expression index extent initial-locals expand]
+  (letfn [(proof-locals [locals]
+            ;; Host scalar definitions prove range relationships, but must never replace the
+            ;; source locals retained for address projection into the emitted kernel.
+            (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) locals))
+          (collect-sequential [bindings body locals loops]
             (loop [pairs (seq (partition 2 bindings)) locals locals result []]
               (if-let [[id init] (first pairs)]
                 (recur (next pairs) (conj locals {:id id :init init})
@@ -65,7 +69,8 @@
                   inclusive? (= :inclusive (:upper-bound attributes))
                   loop-extent (when (= 0 lower)
                                 (conservative-loop-extent
-                                 index extent locals (:extent attributes) inclusive?))
+                                 index extent (proof-locals locals)
+                                 (:extent attributes) inclusive?))
                   loops (cond-> loops loop-extent (assoc loop-index loop-extent))]
               (into (collect (:identity attributes) locals loops)
                     (loop [remaining fold-locals locals locals result []]
@@ -94,7 +99,8 @@
                        (patterns/match-ordered-reduce-loop form)]
                 (let [loop-extent (when (= 0 index-init)
                                     (conservative-loop-extent
-                                     index extent locals bound-expr (= :inclusive bound-mode)))
+                                     index extent (proof-locals locals)
+                                     bound-expr (= :inclusive bound-mode)))
                       loops (cond-> loops loop-extent (assoc index-sym loop-extent))]
                   (into (collect acc-init locals loops)
                         (concat (collect scoped-update-expr locals loops)
@@ -132,7 +138,7 @@
                             (filter #(contains? (:inputs operation) (:sym %)))
                             vec)
           read-sites (->> expressions
-                          (mapcat #(lexical-read-sites % index bound source-locals))
+                          (mapcat #(lexical-read-sites % index bound source-locals expand))
                           (filter #(contains? (:inputs operation) (get-in % [:read :sym])))
                           vec)
           read-facts
@@ -212,6 +218,23 @@
   [expression removable]
   (letfn [(prune [form]
             (cond
+              (dialect/scalar-fold-form? form)
+              (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
+                    {parameters :parameters locals :locals body :body-results}
+                    (dialect/lambda-parts lambda)
+                    locals (mapv #(update % :init prune) locals)
+                    body (mapv prune body)
+                    locals (retain-live-locals locals body removable)]
+                (with-meta
+                  (list 'fold attributes
+                        (dialect/lambda-form
+                         parameters
+                         (mapv (fn [{:keys [id dtype init]}]
+                                 (dialect/local-value id dtype init))
+                               locals)
+                         body))
+                  (meta form)))
+
               (and (seq? form) (contains? #{'let 'let* 'clojure.core/let} (first form))
                    (vector? (second form)) (even? (count (second form))))
               (let [head (first form)

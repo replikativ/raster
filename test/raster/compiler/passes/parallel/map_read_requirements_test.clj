@@ -95,3 +95,36 @@
            (:requirements certificate)))
     (is (= {:const 1 :factors '[seq-len]}
            (get-in certificate [:reads 0 :loop-indices 'j])))))
+
+(deftest triangular-fold-range-uses-retained-host-scalar-definitions
+  (let [operation
+        (segop/map->SegMap
+         {:id :batched-head-triangle :space (segop/make-seg-space 't 'total)
+          :inputs #{'weights} :outputs #{'output}
+          :scalars '#{batch heads rows width slab square total}
+          :dtype :float :out-sym 'output
+          :scalar-region
+          {:locals
+           '[{:id bq :dtype :long :init (quot t slab)}
+             {:id within :dtype :long :init (rem t slab)}
+             {:id row :dtype :long :init (quot within width)}
+             {:id column :dtype :long :init (rem within width)}
+             {:id base :dtype :long :init (+ (* bq square) (* row rows))}
+             {:id sum :dtype :float
+              :init (fold {:accumulator acc, :index j, :identity 0.0, :lower 0,
+                           :dtype :float, :extent row, :association :ordered,
+                           :upper-bound :inclusive}
+                          (lambda [acc j]
+                            (region [] [(+ acc (aget weights (+ base j)))])))}]
+           :result 'sum}})
+        certificate
+        (requirements/symbolic-read-certificate
+         operation
+         {:scalar-definitions
+          {'slab (launch/product 'rows 'width)
+           'square (launch/product 'rows 'rows)
+           'total (launch/product 'batch 'heads 'rows 'width)}})]
+    (is (= {'weights (launch/product 'batch 'heads 'rows 'rows)}
+           (:requirements certificate)))
+    (is (= {:const 1 :factors '[rows]}
+           (get-in certificate [:reads 0 :loop-indices 'j])))))
