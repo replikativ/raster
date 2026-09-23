@@ -711,6 +711,19 @@
           y (nn/dropout x mask 5)]
       (is (every? zero? (seq y))))))
 
+(deftest seeded-dropout-mask-is-counter-deterministic
+  (let [n 257
+        p 0.25
+        scale (/ 1.0 (- 1.0 p))
+        first-mask (nn/generate-dropout-mask-seeded n p 42)
+        replay (nn/generate-dropout-mask-seeded n p 42)
+        other-seed (nn/generate-dropout-mask-seeded n p 43)]
+    (is (= (vec first-mask) (vec replay)))
+    (is (not= (vec first-mask) (vec other-seed)))
+    (is (every? #(or (zero? %) (= scale %)) first-mask))
+    (is (= (vec (repeat n 1.0))
+           (vec (nn/generate-dropout-mask-seeded n 0.0 42))))))
+
 ;; ================================================================
 ;; Softmax-1d tests
 ;; ================================================================

@@ -437,6 +437,8 @@
       (:kernels (equation-first/compile
                  #'dl-nn/rms-norm-chunked-backward-dx {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
+                 #'dl-nn/generate-dropout-mask-seeded {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
                  #'public-c-family-cooperative-mixed-folds!
                  {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
