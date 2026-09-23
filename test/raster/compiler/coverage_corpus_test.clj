@@ -34,7 +34,18 @@
               (doseq [v violations]
                 (println "  coverage regression:" (pr-str v))))))
       (testing "the corpus compiled for a real device"
-        (is (pos? (:total (:summary report))))))))
+        (is (pos? (:total (:summary report)))))
+      (testing "migrated graph and strided-norm workloads remain entirely KernelBody-emitted"
+        (let [rows (into {} (map (juxt :var identity)) (:vars report))]
+          (doseq [[workload expected-kernels]
+                  {'raster.dl.attention/graph-attention 5
+                   'raster.dl.nn/rms-norm-chunked 3
+                   'raster.dl.nn/rms-norm-chunked-backward-dx 3}]
+            (is (= {:kernel-body expected-kernels}
+                   (get-in rows [workload :emission :routes]))
+                (str workload " regained a compatibility emitter"))
+            (is (empty? (get-in rows [workload :emission :declines]))
+                (str workload " has an unexplained emitter decline"))))))))
 
 (deftest frontend-coverage-retains-independent-emission-evidence
   (let [calls (atom 0)
