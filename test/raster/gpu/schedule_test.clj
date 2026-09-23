@@ -4,6 +4,7 @@
    T1–T3 are device-free (the schedule is pure data+fns). T4 checks the schedule threads
    through compile-gpu-program and the gate fires on the real Arc."
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.compiler.core.hardware :as hardware]
             [raster.gpu.schedule :as sched]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.compiler.pipeline :as pl]))
@@ -172,6 +173,19 @@
                 (sched/resolve (sched/derive-default nil arc-desc)
                                {:typed-contraction {:matrix-tiles :finite}})
                 arc-desc)))
+    (let [candidate (second (hardware/gemm-tile-candidates arc-desc))]
+      (is (true? (sched/feasible?
+                  (sched/resolve (sched/derive-default nil arc-desc)
+                                 {:typed-contraction {:matrix-tiles [candidate]}})
+                  arc-desc)))
+      (doseq [invalid [[] [candidate candidate]
+                       [(assoc candidate :block-k 3)]]]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"unknown typed contraction matrix tile space"
+             (sched/feasible?
+              (sched/resolve (sched/derive-default nil arc-desc)
+                             {:typed-contraction {:matrix-tiles invalid}})
+              arc-desc)))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown typed contraction matrix tile space"
                           (sched/feasible?
                            (sched/resolve (sched/derive-default nil arc-desc)

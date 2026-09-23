@@ -1747,8 +1747,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    public ABI remain unchanged. The portable candidate remains its independent correctness oracle.
    This is not yet evidence of competitive throughput. The ordinary compile path retains one
    analytic tile; an explicit `:typed-contraction {:matrix-tiles :finite}` schedule materializes
-   the descriptor-derived finite tile family as ABI-compatible, refinement-checked alternatives
-   with stable identities for the existing measured-selector machinery. Thus selective tuning
+   the descriptor-derived finite tile family as ABI-compatible, refinement-checked alternatives.
+   A non-empty vector may select an exact validated subset of that same family for bounded-memory
+   tuning batches; it introduces neither a second tile registry nor weaker candidate identities.
+   Every alternative remains compatible with the existing measured-selector machinery. Thus selective tuning
    does not multiply normal compilation cost or create a GEMM-specific runtime registry. Matched
    performance against vendor BLAS/Triton and fusion of surrounding projection/softmax
    stages remain explicit measurement and scheduling gates.

@@ -106,6 +106,10 @@ Set `:matrix-tiles :finite` to compile and compare the descriptor-derived physic
 hybrid and fully tile-local input placement. Candidate identities come from the emitted dispatch
 and cover block-M/N/K, subgroup-M/N and pipeline depth; the probe does not maintain a parallel
 tile registry. Finite search can be combined with either residency regime.
+On memory-constrained hosts, pass a non-empty vector selected from
+`raster.compiler.core.hardware/gemm-tile-candidates` instead. Raster validates that every tile is
+an exact member of the target descriptor's family and compiles only that bounded batch plus the
+analytic seed; candidate identities and legality remain compiler-derived.
 The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
 stationarity diagnostics, and never updates the tuning cache.
 

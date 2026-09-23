@@ -1635,10 +1635,14 @@
                     :subgroup-size 16 :max-workgroup-size 1024
                     :grf-bytes-per-lane 256 :machine-lanes 8192
                     :shared-local-memory 131072}
-        tiles (hardware/gemm-tile-candidates descriptor)
-        dispatch (contract-route/route-typed-contraction-dispatch
-                  algorithm operation :dtype :float :desc descriptor
-                  :precision :mixed-f16-f32 :matrix-tiles :finite)
+        ;; The full descriptor family is covered by the pure hardware tests. Keep this expensive
+        ;; emission test to two representative members; explicit benchmark batches exercise the
+        ;; remaining members without multiplying the unit-test compile footprint.
+        tiles (vec (take 2 (hardware/gemm-tile-candidates descriptor)))
+        dispatch (with-redefs [hardware/gemm-tile-candidates (constantly tiles)]
+                   (contract-route/route-typed-contraction-dispatch
+                    algorithm operation :dtype :float :desc descriptor
+                    :precision :mixed-f16-f32 :matrix-tiles :finite))
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
         direct-strategies (into #{:xmx-direct}
                                 (map gpu-gemm/direct-tile-strategy (rest tiles)))
@@ -1661,6 +1665,18 @@
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
     (is (apply = (map :effects (:alternatives dispatch))))
+    (let [requested [(second tiles)]
+          bounded (contract-route/route-typed-contraction-dispatch
+                   algorithm operation :dtype :float :desc descriptor
+                   :precision :mixed-f16-f32 :matrix-tiles requested)
+          bounded-strategies (set (map kdispatch/alternative-strategy
+                                       (:alternatives bounded)))]
+      (is (= 8 (count bounded-strategies))
+          "portable/split plus three policies for the analytic and one requested tile")
+      (is (= requested (get-in bounded [:attributes :candidate-schedules
+                                        :xmx-direct :matrix-tiles])))
+      (is (contains? bounded-strategies
+                     (gpu-gemm/dynamic-lhs-strategy (second tiles)))))
     (is (= :xmx-direct
            (kdispatch/alternative-strategy
             (kdispatch/select-alternative dispatch [:a :b :c 256 256 512])))
