@@ -490,6 +490,28 @@
                (:rule (ex-data exception)))))
         "an outer cast target may not context-type an unknown compound operand")))
 
+(deftest cast-of-mixed-typed-conditional-converts-only-selected-branch
+  (let [lower (:lower (lowerer))
+        lowered (lower '(float (if selected (aget x i) -1.0e30))
+                       :float {'i :int 'selected :predicate})
+        branch (last (:operations lowered))]
+    (is (= :float (:type lowered)))
+    (is (instance? raster.compiler.ir.kernel_body.IfRegion branch))
+    (is (= :float (get-in branch [:results 0 :type])))
+    (is (= :float (get-in branch [:then-operations 0 :result :type]))
+        "the Float load retains its source width")
+    (is (some #(= :double (get-in % [:expression :arguments 0 :type]))
+              (:else-operations branch))
+        "the Double sentinel is narrowed inside its own branch")
+    (is (= :scalar-source-type
+           (try
+             (lower '(float (if selected (aget x i) unknown))
+                    :float {'i :int 'selected :predicate})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:rule (ex-data exception)))))
+        "an unknown alternative is never typed from the outer cast")))
+
 (deftest strict-effect-expressions-derive-lexical-and-arithmetic-source-types
   (let [decline! (fn [rule message data]
                    (throw (ex-info message (assoc data :rule rule))))
