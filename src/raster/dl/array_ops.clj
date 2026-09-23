@@ -1046,19 +1046,45 @@
 ;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]!=1)
 ;; ================================================================
 
+(deftm masked-mse-loss-into!
+  "Reduce masked squared error into caller-owned `out[0]`.
+
+  The sum and active-element count form one typed product reduction. Floating addition permits an
+  implementation-defined parallel tree (the same numerical contract used by accelerator loss
+  reductions generally); the count remains exact. The singleton partials are compiler-owned
+  scratch, while the public result remains the caller's stable resident buffer."
+  [pred :- (Array double) target :- (Array double)
+   states :- (Array long) out :- (Array double) n :- Long]
+  :- Void
+  (let [sums (double-array 1)
+        counts (long-array 1)]
+    (par/product-reduce!
+     [sums counts]
+     [[sum 0.0 :double] [count (long 0) :long]]
+     [[segment 1]]
+     i n
+     [active (long (if (not= (aget states i) 1) 1 0))
+      diff (- (aget pred i) (aget target i))]
+     [(if (== active 1) (* diff diff) 0.0) active]
+     [[left-sum right-sum] [left-count right-count]]
+     []
+     [(+ left-sum right-sum) (unchecked-add left-count right-count)]
+     {:associative? true :commutative? true :order :implementation-defined})
+    (par/map-void!
+     output 1
+     (let [count (aget counts 0)]
+       (aset out output
+             (if (> count 0)
+               (/ (aget sums 0) (double count))
+               0.0))))))
+
 (deftm masked-mse-loss
   [pred :- (Array double) target :- (Array double)
    states :- (Array long) n :- Long]
   :- Double
-  (loop [i 0 acc 0.0 cnt 0]
-    (if (< i n)
-      (if (not= (aget states i) 1)
-        (let [diff (- (aget pred i) (aget target i))]
-          (recur (inc i) (+ acc (* diff diff)) (inc cnt)))
-        (recur (inc i) acc cnt))
-      (if (pos? cnt)
-        (/ acc (double cnt))
-        0.0))))
+  (let [out (double-array 1)
+        _ (masked-mse-loss-into! pred target states out n)]
+    (aget out 0)))
 
 (deftm masked-mse-loss-backward
   "Backward for pred in masked-mse-loss.
@@ -1066,21 +1092,29 @@
   [dy :- Double pred :- (Array double) target :- (Array double)
    states :- (Array long) n :- Long]
   :- (Array double)
-  (let [;; First count non-observed
-        cnt (loop [i 0 c 0]
-              (if (< i n)
-                (if (not= (aget states i) 1)
-                  (recur (inc i) (inc c))
-                  (recur (inc i) c))
-                c))
+  (let [counts (long-array 1)
         out (double-array n)]
-    (when (pos? cnt)
-      (let [scale (/ (* 2.0 dy) (double cnt))]
-        (dotimes [i n]
-          (when (not= (aget states i) 1)
-            (aset out i
-                  (* scale (- (aget pred i)
-                              (aget target i))))))))
+    (par/product-reduce!
+     [counts]
+     [[count (long 0) :long]]
+     [[segment 1]]
+     i n
+     [active (long (if (not= (aget states i) 1) 1 0))]
+     [active]
+     [[left-count right-count]]
+     []
+     [(unchecked-add left-count right-count)]
+     {:associative? true :commutative? true
+      :overflow :wrap :order :implementation-defined})
+    (par/map!
+     out i n double
+     (let [count (aget counts 0)]
+       (if (> count 0)
+         (if (not= (aget states i) 1)
+           (* (/ (* 2.0 dy) (double count))
+              (- (aget pred i) (aget target i)))
+           0.0)
+         0.0)))
     out))
 
 ;; ================================================================
