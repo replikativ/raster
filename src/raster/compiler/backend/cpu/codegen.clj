@@ -15,6 +15,9 @@
             [raster.compiler.backend.gpu.c-emit :as ce])
   (:import [java.lang.foreign Arena Linker Linker$Option FunctionDescriptor
             SymbolLookup ValueLayout MemoryLayout MemorySegment]
+           [java.nio.channels FileChannel]
+           [java.nio.charset StandardCharsets]
+           [java.nio.file Files OpenOption StandardCopyOption StandardOpenOption]
            [java.security MessageDigest]))
 
 ;; ---- backend config: native C (float uses fabsf/fmaxf, statement-exprs ok) ----
@@ -57,9 +60,10 @@
          "  }\n}\n")))
 
 ;; ---- compile + load (clang -O3 -march=native -> .so -> Panama) ----
-(defn- sha [^String s]
-  (let [d (.digest (MessageDigest/getInstance "SHA-1") (.getBytes s))]
-    (apply str (map #(format "%02x" %) (take 8 d)))))
+(defn- sha256 [^String s]
+  (let [d (.digest (MessageDigest/getInstance "SHA-256")
+                   (.getBytes s StandardCharsets/UTF_8))]
+    (apply str (map #(format "%02x" (bit-and 0xff %)) d))))
 
 (def ^:private cc (or (System/getenv "RASTER_CC") "clang"))
 (def ^:private cache-dir (let [d (io/file (System/getProperty "java.io.tmpdir") "raster-cpu-kernels")]
@@ -75,20 +79,79 @@
 
 (def ^:private link-libs ["-lmvec" "-lm"])
 
+(def ^:private cache-schema :raster.cpu-native-cache/v2)
+
+(defn- command-output
+  [arguments]
+  (try
+    (let [process-builder (doto (ProcessBuilder. ^java.util.List (into [cc] arguments))
+                            (.redirectErrorStream true)
+                            (.directory (io/file cache-dir)))
+          process (.start process-builder)]
+      ;; Target probing uses stdin as its translation unit.
+      (.close (.getOutputStream process))
+      (let [output (slurp (.getInputStream process))]
+        (.waitFor process)
+        output))
+    (catch Throwable error
+      (str "unavailable:" (.getName (class error))))))
+
+(def ^:private compiler-identity
+  (delay
+    {:schema cache-schema
+     :compiler cc
+     :compiler-version (command-output ["--version"])
+     ;; -march=native output is CPU-specific. Probe the compiler's resolved
+     ;; target so a shared temp directory cannot reuse a binary for a different
+     ;; microarchitecture with the same generic os.arch value.
+     :native-target (command-output ["-###" "-march=native" "-x" "c"
+                                     "-c" "-" "-o" "/dev/null"])
+     :flags cflags
+     :link-libs link-libs
+     :os (System/getProperty "os.name")
+     :architecture (System/getProperty "os.arch")}))
+
+(defn- source-cache-key
+  [^String source]
+  (sha256 (pr-str [@compiler-identity source])))
+
 (defn compile-source!
-  "Compile C source to a cached .so. Returns path."
+  "Compile C source to a cached .so. Returns path.
+
+   Compilation is serialized per artifact across JVMs and published by atomic
+   move, so concurrent cold starts cannot observe a partial shared object."
   [^String src]
-  (let [base (str cache-dir "/k_" (sha src))
-        so (str base ".so")]
-    (when-not (.exists (io/file so))
-      (let [c (str base ".c")]
-        (spit c src)
-        (let [r (-> (ProcessBuilder. ^java.util.List
-                     (concat [cc] cflags [c "-o" so] link-libs))
-                    (.redirectErrorStream true) (.start))
-              out (slurp (.getInputStream r))]
-          (when-not (zero? (.waitFor r))
-            (throw (ex-info (str "C compile failed: " out) {:src src}))))))
+  (let [base (str cache-dir "/k_" (source-cache-key src))
+        so (str base ".so")
+        so-file (io/file so)]
+    (when-not (.exists so-file)
+      (let [lock-path (.toPath (io/file (str base ".lock")))
+            options (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE])]
+        (with-open [channel (FileChannel/open lock-path options)
+                    lock (.lock channel)]
+          ;; Another JVM may have published the artifact while this JVM waited.
+          (when-not (.exists so-file)
+            (let [directory (io/file cache-dir)
+                  c-file (java.io.File/createTempFile "raster-kernel-" ".c" directory)
+                  tmp-so (java.io.File/createTempFile "raster-kernel-" ".so" directory)]
+              (try
+                (spit c-file src)
+                (let [r (-> (ProcessBuilder. ^java.util.List
+                                             (concat [cc] cflags
+                                                     [(.getAbsolutePath c-file) "-o"
+                                                      (.getAbsolutePath tmp-so)]
+                                                     link-libs))
+                            (.redirectErrorStream true) (.start))
+                      out (slurp (.getInputStream r))]
+                  (when-not (zero? (.waitFor r))
+                    (throw (ex-info (str "C compile failed: " out) {:src src})))
+                  (Files/move (.toPath tmp-so) (.toPath so-file)
+                              (into-array StandardCopyOption
+                                          [StandardCopyOption/ATOMIC_MOVE
+                                           StandardCopyOption/REPLACE_EXISTING])))
+                (finally
+                  (Files/deleteIfExists (.toPath c-file))
+                  (Files/deleteIfExists (.toPath tmp-so)))))))))
     so))
 
 (def ^:private linker (Linker/nativeLinker))

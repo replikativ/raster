@@ -689,6 +689,11 @@
         (fused-scalar-form f-var dtype :simd? simd?)
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
+        ;; The lowering pipeline uses hygienic gensyms. Canonicalize the final
+        ;; closed-core program before deriving its ABI and C source so equivalent
+        ;; compilations receive byte-identical source and can share native cache
+        ;; artifacts across calls and JVM processes.
+        nform (util/alpha-normalize nform)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
         ;; r = (let* [..writes buf..] buf) from inlining residual-add, where r feeds a
