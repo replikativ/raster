@@ -10,6 +10,8 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segmap-body :as map-body]))
 
 (defn- span-expression
@@ -20,6 +22,7 @@
       1 (first operands)
       (apply launch/product operands))))
 
+(declare address-substitutions)
 (defn- local-dependencies
   [locals expression]
   (:dependencies
@@ -31,6 +34,84 @@
            {:live (util/free-syms expression) :dependencies #{}}
            (reverse locals))))
 
+(defn- strip-index-cast
+  [expression]
+  (if (and (seq? expression) (= 2 (count expression))
+           (contains? '#{long int clojure.core/long clojure.core/int} (first expression)))
+    (recur (second expression))
+    expression))
+
+(defn- conservative-loop-extent
+  [index extent locals bound inclusive?]
+  (let [bound (strip-index-cast bound)]
+    (or (when (symbol? bound) (algebra/digit-radix index extent locals bound))
+        (if inclusive? (list 'clojure.core/+ bound 1) bound))))
+
+(defn- lexical-read-sites
+  "Collect array reads with the exact lexical locals and counted-loop domains at each site."
+  [expression index extent initial-locals expand]
+  (letfn [(proof-locals [locals]
+            ;; Host scalar definitions prove range relationships, but must never replace the
+            ;; source locals retained for address projection into the emitted kernel.
+            (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) locals))
+          (collect-sequential [bindings body locals loops]
+            (loop [pairs (seq (partition 2 bindings)) locals locals result []]
+              (if-let [[id init] (first pairs)]
+                (recur (next pairs) (conj locals {:id id :init init})
+                       (into result (collect init locals loops)))
+                (into result (mapcat #(collect % locals loops) body)))))
+          (collect-fold [expression locals loops]
+            (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts expression)
+                  {parameters :parameters fold-locals :locals body :body-results}
+                  (dialect/lambda-parts lambda)
+                  [_acc loop-index] parameters
+                  lower (:lower attributes 0)
+                  inclusive? (= :inclusive (:upper-bound attributes))
+                  loop-extent (when (= 0 lower)
+                                (conservative-loop-extent
+                                 index extent (proof-locals locals)
+                                 (:extent attributes) inclusive?))
+                  loops (cond-> loops loop-extent (assoc loop-index loop-extent))]
+              (into (collect (:identity attributes) locals loops)
+                    (loop [remaining fold-locals locals locals result []]
+                      (if-let [local (first remaining)]
+                        (recur (next remaining) (conj locals local)
+                               (into result (collect (:init local) locals loops)))
+                        (into result (mapcat #(collect % locals loops) body)))))))
+          (collect [form locals loops]
+            (cond
+              (descriptor/aget-call? form)
+              (into [{:read {:sym (descriptor/aget-array-sym form)
+                             :idx (descriptor/aget-index form) :form form}
+                      :locals locals :loop-indices loops}]
+                    (collect (descriptor/aget-index form) locals loops))
+
+              (and (seq? form) (contains? #{'let 'let* 'clojure.core/let} (first form))
+                   (vector? (second form)) (even? (count (second form))))
+              (collect-sequential (second form) (drop 2 form) locals loops)
+
+              (dialect/scalar-fold-form? form)
+              (collect-fold form locals loops)
+
+              (and (seq? form) (contains? #{'loop 'loop*} (first form)))
+              (if-let [{:keys [index-sym index-init bound-expr bound-mode acc-init
+                               scoped-update-expr else-expr]}
+                       (patterns/match-ordered-reduce-loop form)]
+                (let [loop-extent (when (= 0 index-init)
+                                    (conservative-loop-extent
+                                     index extent (proof-locals locals)
+                                     bound-expr (= :inclusive bound-mode)))
+                      loops (cond-> loops loop-extent (assoc index-sym loop-extent))]
+                  (into (collect acc-init locals loops)
+                        (concat (collect scoped-update-expr locals loops)
+                                (collect else-expr locals loops))))
+                [])
+
+              (seq? form) (mapcat #(collect % locals loops) (rest form))
+              (vector? form) (mapcat #(collect % locals loops) form)
+              (map? form) (mapcat #(collect % locals loops) (apply concat form))
+              :else []))]
+    (vec (collect expression initial-locals {}))))
 (defn symbolic-read-certificate
   "Certify exact symbolic spans for the flat reads of a typed one-dimensional map.
 
@@ -51,24 +132,39 @@
           expand #(walk/postwalk-replace monomial-definitions %)
           bound (expand bound)
           locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) source-locals)
-          reads (->> (concat (map :init source-locals) [result])
-                     (mapcat descriptor/aget-reads)
-                     (filter #(contains? (:inputs operation) (:sym %)))
-                     vec)
+          expressions (concat (map :init source-locals) [result])
+          source-reads (->> expressions
+                            (mapcat descriptor/aget-reads)
+                            (filter #(contains? (:inputs operation) (:sym %)))
+                            vec)
+          read-sites (->> expressions
+                          (mapcat #(lexical-read-sites % index bound source-locals expand))
+                          (filter #(contains? (:inputs operation) (get-in % [:read :sym])))
+                          vec)
           read-facts
-          (mapv (fn [{:keys [sym idx]}]
+          (mapv (fn [{{:keys [sym idx]} :read site-locals :locals
+                      loop-indices :loop-indices}]
                   (let [coordinate (algebra/canonical-arithmetic (expand idx))
+                        projected-coordinate
+                        (algebra/canonical-arithmetic
+                         (util/subst-syms (address-substitutions site-locals idx) idx))
                         form (algebra/index-form
                               coordinate
-                              index bound locals {})]
+                              index bound
+                              (mapv #(update % :init (comp algebra/canonical-arithmetic expand))
+                                    site-locals)
+                              loop-indices)]
                     (when-let [span (algebra/zero-based-dense-span form)]
-                      {:buffer sym :source-coordinate idx
+                       {:buffer sym :source-coordinate idx
                        :coordinate coordinate
-                       :address-locals (local-dependencies source-locals idx)
-                       :form form
+                       :projected-coordinate projected-coordinate
+                       :address-locals (local-dependencies site-locals idx)
+                       :loop-indices loop-indices :form form
                        :span (span-expression span)})))
-                reads)]
-      (when (and (seq reads) (every? some? read-facts))
+                read-sites)]
+      (when (and (seq source-reads)
+                 (= (count source-reads) (count read-sites))
+                 (every? some? read-facts))
         {:kind :zero-based-dense-read-spans
          :index index :extent bound
          ;; Retain both sides of the proof. `:source-locals` and
@@ -101,10 +197,17 @@
            (some #(capacity-covers? % required) (:values capacity)))))
 
 (defn- address-substitutions
-  [locals]
-  (reduce (fn [substitutions {:keys [id init]}]
-            (assoc substitutions id (util/subst-syms substitutions init)))
-          {} locals))
+  [locals expression]
+  ;; A scalar region may contain large decoded/quantized values that have no bearing on this
+  ;; address. Eagerly expanding every preceding local makes repeated values duplicate
+  ;; exponentially even though the mixed-radix proof only needs the coordinate's transitive
+  ;; dependencies. Restrict substitution to that already-computed lexical slice.
+  (let [needed (local-dependencies locals expression)]
+    (reduce (fn [substitutions {:keys [id init]}]
+              (if (contains? needed id)
+                (assoc substitutions id (util/subst-syms substitutions init))
+                substitutions))
+            {} locals)))
 
 (defn- retain-live-locals
   [locals result removable]
@@ -117,6 +220,54 @@
         {:live live :locals locals}))
     {:live (util/free-syms result) :locals []}
     (reverse locals))))
+
+(defn- prune-certified-address-lets
+  [expression removable]
+  (letfn [(prune [form]
+            (cond
+              (dialect/scalar-fold-form? form)
+              (let [{:keys [attributes lambda]} (dialect/scalar-fold-parts form)
+                    {parameters :parameters locals :locals body :body-results}
+                    (dialect/lambda-parts lambda)
+                    locals (mapv #(update % :init prune) locals)
+                    body (mapv prune body)
+                    locals (retain-live-locals locals body removable)]
+                (with-meta
+                  (list 'fold attributes
+                        (dialect/lambda-form
+                         parameters
+                         (mapv (fn [{:keys [id dtype init]}]
+                                 (dialect/local-value id dtype init))
+                               locals)
+                         body))
+                  (meta form)))
+
+              (and (seq? form) (contains? #{'let 'let* 'clojure.core/let} (first form))
+                   (vector? (second form)) (even? (count (second form))))
+              (let [head (first form)
+                    pairs (mapv (fn [[id init]] [id (prune init)])
+                                (partition 2 (second form)))
+                    body (mapv prune (drop 2 form))
+                    state
+                    (reduce (fn [{:keys [live pairs]} [id init :as pair]]
+                              (if (or (contains? live id) (not (contains? removable id)))
+                                {:live (into (disj live id) (util/free-syms init))
+                                 :pairs (into [pair] pairs)}
+                                {:live live :pairs pairs}))
+                            {:live (apply set/union #{} (map util/free-syms body)) :pairs []}
+                            (reverse pairs))]
+                (with-meta (list* head (vec (mapcat identity (:pairs state))) body) (meta form)))
+
+              (seq? form) (with-meta (apply list (map prune form)) (meta form))
+              (vector? form) (with-meta (mapv prune form) (meta form))
+              ;; Compiler IR records are map-like, but rebuilding them through `empty` is neither
+              ;; supported nor desirable: address-let pruning only owns source collection forms.
+              (and (map? form) (not (record? form)))
+              (with-meta (into (empty form)
+                               (map (fn [[k v]] [(prune k) (prune v)])) form)
+                         (meta form))
+              :else form))]
+    (prune expression)))
 
 (defn validate-and-project-addresses
   "Project certified map load coordinates out of scalar SSA and into the index dialect.
@@ -152,25 +303,34 @@
                 (throw (ex-info "graph buffer does not enforce the certified map read span"
                                 {:reason :map-address-certificate-capacity
                                  :buffer id :required required :capacity capacity})))))
-        substitutions (address-substitutions (:source-locals attached))
+        remaining (atom (:reads attached))
         rewrite
         (fn [expression]
           (descriptor/rewrite-aget-reads
            expression
            (fn [read]
              (when (contains? (:inputs operation) (descriptor/aget-array-sym read))
-               (descriptor/rewrite-aget-index
-                read
-                (algebra/canonical-arithmetic
-                 ;; Host definitions justify the span but are not kernel captures. Preserve the
-                 ;; source operation's derived scalar here; replacing it with its host expression
-                 ;; would inject uncaptured public symbols into this node.
-                 (util/subst-syms substitutions (descriptor/aget-index read))))))))
+               (let [fact (first @remaining)]
+                 (when-not (and fact
+                                (= (descriptor/aget-array-sym read) (:buffer fact))
+                                (= (descriptor/aget-index read) (:source-coordinate fact)))
+                   (throw (ex-info "map read order differs from its recomputed certificate"
+                                   {:reason :map-address-certificate-read
+                                    :read read :fact fact})))
+                 (swap! remaining subvec 1)
+                 (descriptor/rewrite-aget-index read (:projected-coordinate fact)))))))
         removable (apply set/union #{} (map :address-locals (:reads attached)))
         region (:scalar-region operation)
-        locals (mapv #(update % :init rewrite) (:locals region))
-        result (rewrite (:result region))
-        locals (retain-live-locals locals result removable)]
+        locals (mapv #(update % :init
+                              (fn [init]
+                                (prune-certified-address-lets (rewrite init) removable)))
+                     (:locals region))
+        result (prune-certified-address-lets (rewrite (:result region)) removable)
+        locals (retain-live-locals locals result removable)
+        _ (when (seq @remaining)
+            (throw (ex-info "map address certificate contains unprojected reads"
+                            {:reason :map-address-certificate-read
+                             :remaining @remaining})))]
     (-> operation
         (assoc :scalar-region (assoc region :locals locals :result result))
         (assoc :address-projection
