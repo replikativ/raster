@@ -1078,7 +1078,12 @@
       ;; :scalar
         (let [clean (strip-compound-markers form)
               source (if (parallel-program/parallel-program? clean) (:source clean) clean)]
-          {:form (par/expand-par-forms source) :stats nil :backend :scalar})))))
+          ;; Parallel fallbacks are expanded after the walked source was already
+          ;; closed. Macros such as segmented-fold-map! introduce fresh
+          ;; let/loop/dotimes forms here, so close that generated code before the
+          ;; backend invariant and C emitter see it.
+          {:form (mex/macroexpand-core (par/expand-par-forms source))
+           :stats nil :backend :scalar})))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.
