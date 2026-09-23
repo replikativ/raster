@@ -493,14 +493,16 @@
                             (and (= {:kind :plain} (:representation value))
                                  (nil? (:logical-layout value)))))
                         (:inputs operation)))
-              (merge-with into requirements
-                          (into {} (map (fn [[id extent]] [id [extent]]))
-                                (map-reads/static-read-requirements
-                                 operation
-                                 {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
-                                  :scalar-types (into {} (keep (fn [[id v]]
-                                                                (when (empty? (:shape v))
-                                                                  [id (:dtype v)]))) values)})))
+              (let [options
+                    {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
+                     :scalar-types (into {} (keep (fn [[id v]]
+                                                   (when (empty? (:shape v))
+                                                     [id (:dtype v)]))) values)
+                     :scalar-definitions derived-scalars}
+                    derived (or (map-reads/symbolic-read-requirements operation options)
+                                (map-reads/static-read-requirements operation options))]
+                (merge-with into requirements
+                            (into {} (map (fn [[id extent]] [id [extent]])) derived)))
               requirements))
           (product-read-requirements values operations derived-scalars) operations)
          buffer-specs (reduce-kv

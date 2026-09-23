@@ -66,6 +66,14 @@
     (is (= #{'middle} (set (map :id (:outputs graph)))))
     (is (= #{'tmp} (set (map :id (:temporaries graph)))))))
 
+(deftest symbolic-map-read-refines-an-opaque-caller-buffer-capacity
+  (let [scheduled (scheduled-three-maps)
+        {:keys [graph]} (equation-graph/make-for-equation
+                         scheduled (first (:equations scheduled)))
+        input (first (filter #(= 'x (:id %)) (:inputs graph)))]
+    (is (= 'n (:elements input))
+        "the active map domain proves x[0..n), and graph binding enforces that capacity")))
+
 (deftest equation-region-must-be-an-exact-contiguous-slice
   (let [scheduled (scheduled-three-maps)
         equations (:equations scheduled)]
@@ -94,8 +102,8 @@
                               scheduled (first (:equations scheduled)))
         graph-input (first (filter #(= 'x (:id %)) (:inputs graph)))]
     (is (= '[(extent x)] (get-in body [:values 'x :shape])))
-    (is (= '(extent x) (:elements graph-input))
-        "a caller-owned allocation remains resolvable; it never becomes unknown-dimension")))
+    (is (= 'n (:elements graph-input))
+        "the local access proof replaces a later global shape with this graph's bindable minimum")))
 
 (deftest earlier-equation-does-not-capture-a-later-global-buffer-extent
   ;; group-norm's final dense map normalizes `batch*channel-span` after three product equations.

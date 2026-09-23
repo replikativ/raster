@@ -1,9 +1,63 @@
 (ns raster.compiler.passes.parallel.map-read-requirements
   "Minimum flat storage derived from actual typed map loads, not from output size."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.index-algebra :as algebra]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.segmap-body :as map-body]))
+
+(defn- span-expression
+  [{:keys [const factors]}]
+  (let [operands (cond-> (vec factors) (not= 1 const) (conj const))]
+    (case (count operands)
+      0 1
+      1 (first operands)
+      (apply launch/product operands))))
+
+(defn symbolic-read-requirements
+  "Derive exact symbolic minimum capacities for the flat reads of a typed one-dimensional map.
+
+   The proof is structural: the map index is decomposed into mixed-radix digits and each address
+   must enumerate a zero-based dense interval over the digits it represents. Omitted digits are
+   permitted because a broadcast may repeat an input interval; padding, translation, indirect
+   reads, and undecidable arithmetic decline. `scalar-definitions` contains already checked
+   KernelLaunch definitions from the host prefix. Only monomial definitions are substituted, so
+   quotient relations are never invented here."
+  [operation {:keys [scalar-definitions] :or {scalar-definitions {}}}]
+  (when (and (segop/seg-map? operation)
+             (= 1 (count (get-in operation [:space :dims])))
+             (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))
+             (not (seq (get-in operation [:scalar-region :effects]))))
+    (let [{index :name bound :bound} (first (get-in operation [:space :dims]))
+          {:keys [locals result]} (:scalar-region operation)
+          monomial-definitions (into {} (filter (comp algebra/monomial val)) scalar-definitions)
+          expand #(walk/postwalk-replace monomial-definitions %)
+          bound (expand bound)
+          locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) locals)
+          reads (->> (concat (map :init locals) [result])
+                     (mapcat descriptor/aget-reads)
+                     (filter #(contains? (:inputs operation) (:sym %)))
+                     vec)
+          requirements
+          (mapv (fn [{:keys [sym idx]}]
+                  (let [form (algebra/index-form
+                              (algebra/canonical-arithmetic (expand idx))
+                              index bound locals {})]
+                    (when-let [span (algebra/zero-based-dense-span form)]
+                      [sym (span-expression span)])))
+                reads)]
+      (when (and (seq reads) (every? some? requirements))
+        (reduce (fn [result [id extent]]
+                  (update result id
+                          (fn [prior]
+                            (cond
+                              (nil? prior) extent
+                              (= prior extent) prior
+                              :else (launch/maximum prior extent)))))
+                {} requirements)))))
 
 (defn static-read-requirements
   "Optional all-load proof for a plain, positive static, one-dimensional result map.
