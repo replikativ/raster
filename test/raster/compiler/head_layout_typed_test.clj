@@ -5,7 +5,11 @@
             [raster.dl.array-ops :as ops]))
 
 (deftest head-layout-permutations-use-the-direct-typed-route
-  (doseq [operation [#'ops/pack-heads #'ops/unpack-heads]]
+  (doseq [[operation scalar-equations]
+          [[#'ops/pack-heads 2]
+           [#'ops/unpack-heads 2]
+           [#'ops/pack-heads-strided 2]
+           [#'ops/unpack-heads-strided 3]]]
     (let [compiled (pipeline/show-pipeline operation :target-device :ze:0 :dtype :float)
           compiler-report (report/from-pipeline compiled)]
       (is (= {:backend :opencl :source-dialect :typed-soac
@@ -13,7 +17,7 @@
              (:route compiler-report))
           (str (:name (meta operation)) " route"))
       (is (= {:segops 1 :kernel-graphs 0 :structured-loops 0
-              :typed-reused 1 :typed-scalar-equations 2
+              :typed-reused 1 :typed-scalar-equations scalar-equations
               :backend-reused 1 :backend-relowered 0 :fallback 0}
              (:lowering compiler-report))
           (str (:name (meta operation)) " lowering"))
