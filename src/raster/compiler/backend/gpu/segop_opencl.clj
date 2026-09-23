@@ -376,7 +376,7 @@
     (throw (ex-info "map graph certification requires both node and graph"
                     {:reason :segmap-graph-context
                      :graph-node graph-node :kernel-graph kernel-graph})))
-  (let [projected (if (and graph-node (:read-capacity-certificate segmap))
+  (let [projected (if (and graph-node (:read-capacity-certificate graph-node))
                     (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
                     segmap)
         scheduled

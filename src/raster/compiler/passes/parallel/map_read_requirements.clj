@@ -119,12 +119,12 @@
                  (some #(= node %) (:nodes kernel-graph)))
     (throw (ex-info "map address projection requires its exact graph node"
                     {:reason :map-address-certificate-node})))
-  (let [attached (:read-capacity-certificate operation)
+  (let [attached (:read-capacity-certificate node)
         _ (when-not (= :zero-based-dense-read-spans (:kind attached))
             (throw (ex-info "map address projection requires a structural read certificate"
                             {:reason :map-address-certificate-missing})))
         recomputed (symbolic-read-certificate
-                    (dissoc operation :read-capacity-certificate)
+                    operation
                     {:scalar-definitions (:scalar-definitions attached)})
         _ (when-not (= attached recomputed)
             (throw (ex-info "map address certificate does not match its source operation"

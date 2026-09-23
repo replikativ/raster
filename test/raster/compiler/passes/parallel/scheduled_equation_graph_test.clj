@@ -86,14 +86,13 @@
         node (first (:nodes graph))
         operation (:operation node)
         projected (map-reads/validate-and-project-addresses operation node graph)
-        forged (assoc-in operation [:read-capacity-certificate :requirements 'x] 1)
-        forged-node (assoc node :operation forged)
+        forged-node (assoc-in node [:read-capacity-certificate :requirements 'x] 1)
         forged-graph (assoc graph :nodes [forged-node])
         undersized (assoc-in graph [:inputs 0 :elements] 1)]
     (is (= :certified-index-expression (get-in projected [:address-projection :kind])))
     (is (= :map-address-certificate-mismatch
            (reason-of #(map-reads/validate-and-project-addresses
-                        forged forged-node forged-graph))))
+                        operation forged-node forged-graph))))
     (is (= :map-address-certificate-capacity
            (reason-of #(map-reads/validate-and-project-addresses
                         operation node undersized))))))
