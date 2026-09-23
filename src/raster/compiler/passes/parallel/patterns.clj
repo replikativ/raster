@@ -705,6 +705,30 @@
 
     :else nil))
 
+(defn- projected-recur-argument
+  "Project one carry's next value through a pure branchy recurrence region.
+
+   This is the scalar SSA phi construction for source loops: every control-flow leaf must recur
+   with the same arity, while lexical lets and conditionals are retained around the selected
+   argument. Effects and arbitrary statement sequences deliberately remain outside this subset."
+  [form ordinal arity]
+  (cond
+    (and (seq? form) (= 'recur (first form)) (= arity (count (rest form))))
+    (nth (vec (rest form)) ordinal)
+
+    (and (form/binding-form? form) (= 1 (count (drop 2 form))))
+    (when-let [projected (projected-recur-argument (last form) ordinal arity)]
+      (with-meta (list (first form) (second form) projected) (meta form)))
+
+    (and (seq? form) (contains? '#{if clojure.core/if} (first form)) (= 4 (count form)))
+    (let [[head predicate then-expression else-expression] form
+          then-value (projected-recur-argument then-expression ordinal arity)
+          else-value (projected-recur-argument else-expression ordinal arity)]
+      (when (and then-value else-value)
+        (with-meta (list head predicate then-value else-value) (meta form))))
+
+    :else nil))
+
 (defn- match-reduce-loop*
   "Generic matcher for reduction loops.
 	Returns a structural descriptor of the loop/update shape or nil."
@@ -798,7 +822,9 @@
         (let [[_ test then-branch else-branch] body-form
               [index-sym bound-expr] (test-index+bound test)
               index-slot (.indexOf ids index-sym)
-              recur-form (find-recur-form then-branch)
+              all-recurs (vec (filter #(and (seq? %) (= 'recur (first %)))
+                                      (tree-seq coll? seq then-branch)))
+              recur-form (first all-recurs)
               recur-args (when recur-form (vec (rest recur-form)))
               index-init (when-not (neg? index-slot) (second (nth pairs index-slot)))
               lhs (first (descriptor/call-args test))
@@ -816,10 +842,17 @@
             (let [carry-slots (vec (remove #{index-slot} (range (count pairs))))
                   carry-syms (mapv #(first (nth pairs %)) carry-slots)
                   carry-inits (mapv #(second (nth pairs %)) carry-slots)
-                  update-exprs (mapv #(nth recur-args %) carry-slots)
-                  scoped (mapv #(scoped-recur-value then-branch %) update-exprs)]
+                  recurrence-edges-valid?
+                  (and (seq all-recurs)
+                       (every? #(and (= (count pairs) (count (rest %)))
+                                     (ordered-unit-step? (nth (vec (rest %)) index-slot)
+                                                         index-sym))
+                               all-recurs))
+                  update-exprs (mapv #(projected-recur-argument
+                                        then-branch % (count pairs)) carry-slots)]
               (when (and (not (contains-sym? else-branch index-sym))
-                         (every? some? scoped))
+                         recurrence-edges-valid?
+                         (every? some? update-exprs))
                 {:index-sym index-sym
                  :index-init index-init
                  :index-slot index-slot
@@ -833,7 +866,7 @@
                  :carry-inits carry-inits
                  :exit-expr else-branch
                  :update-exprs update-exprs
-                 :scoped-update-exprs scoped}))))))))
+                 :scoped-update-exprs update-exprs}))))))))
 
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.

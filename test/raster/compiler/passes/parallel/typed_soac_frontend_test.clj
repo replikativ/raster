@@ -2218,3 +2218,36 @@
                        :array-types {'initial :float 'scratch :float 'x :float}
                        :scalar-types {'heads :long 'n :long}}))
         "a validated TypedSOAC program must own every parallel leaf as an equation")))
+
+(deftest nested-branchy-multi-carry-loops-become-ordered-product-folds
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (let* [^double seed (double (clojure.core/aget input i))
+                        ^double solved
+                        (if use-seed
+                          seed
+                          (loop* [^long j (long 0)
+                                  ^double value seed
+                                  ^int done (int 0)]
+                            (if (clojure.core/< j limit)
+                              (if (clojure.core/== done (int 1))
+                                (recur (clojure.core/inc j) value done)
+                                (if (clojure.core/> value threshold)
+                                  (recur (clojure.core/inc j) value (int 1))
+                                  (recur (clojure.core/inc j)
+                                         (clojure.core/+ value step) (int 0))))
+                              (if (clojure.core/== done (int 1)) value threshold))))]
+                   (clojure.core/aset output (raster.par/unique-index i)
+                                      (float solved))))]
+           effect)
+        program (frontend/form->program
+                 source {:dtype :float :array-types {'input :float 'output :float}
+                         :scalar-types {'n :long 'limit :long 'use-seed :int
+                                        'threshold :double 'step :double}})
+        equation (first (dialect/equations program))
+        expressions (tree-seq coll? seq equation)]
+    (is (= program (dialect/validate! program)))
+    (is (some dialect/product-component-form? expressions))
+    (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %))) expressions))))

@@ -74,40 +74,50 @@
                      endowment :- Double] :- Double
   (let [e-min 0.001
         e-max (- endowment 0.001)]
-    (loop [guess (* theta endowment)  ;; initial guess: θ*ω
-           iter  (int 0)]
-      (if (>= iter 10)
+    ;; `done` makes the bounded Newton solve an explicit pure state machine. An early scalar
+    ;; return is represented by an inert carry for the remaining iterations, which has identical
+    ;; numerical semantics and lets TypedSOAC retain the whole loop as one ordered product Fold.
+    (loop [guess  (* theta endowment)  ;; initial guess: θ*ω
+           iter   (int 0)
+           done   (int 0)
+           result (* theta endowment)]
+      (if (< iter 10)
+        (if (== done 1)
+          (recur guess (unchecked-add-int iter 1) done result)
+          (let [e     (Math/max e-min (Math/min e-max guess))
+                E     (+ e others-effort)
+                ;; Single pow call: E^(β-2), derive E^(β-1) and E^β via multiply
+                Ebm2  (Math/pow E (- beta 2.0))
+                Ebm1  (* Ebm2 E)          ;; E^(β-1) = E^(β-2) * E
+                Eb    (* Ebm1 E)          ;; E^β     = E^(β-1) * E
+                Y     (+ (* a E) (* b Eb))
+                MP    (+ a (* b beta Ebm1))
+                dMP   (* b beta (- beta 1.0) Ebm2)
+                leis  (- endowment e)
+                ;; f(e) = θ*MP/Y - (1-θ)/leis
+                fe    (- (/ (* theta MP) Y)
+                         (/ (- 1.0 theta) leis))
+                ;; f'(e) = θ*(dMP*Y - MP²)/Y² - (1-θ)/leis²
+                fpe   (- (/ (* theta (- (* dMP Y) (* MP MP)))
+                            (* Y Y))
+                         (/ (- 1.0 theta)
+                            (* leis leis)))]
+            (if (or (< (Math/abs fe) 1e-6)
+                    (== fpe 0.0))
+              ;; converged or stuck
+              (recur guess (unchecked-add-int iter 1) (int 1) e)
+              (let [step     (/ fe fpe)
+                    ;; damped step to avoid overshooting
+                    step     (Math/max (- (/ e-max 2.0)) (Math/min (/ e-max 2.0) step))
+                    new-e    (- e step)]
+                (if (< (Math/abs step) 0.001)
+                  (recur guess (unchecked-add-int iter 1) (int 1)
+                         (Math/max e-min (Math/min e-max new-e)))
+                  (recur new-e (unchecked-add-int iter 1) (int 0) result))))))
         ;; max iters — clamp and return (C11 uses 10 iters, tol 0.001)
-        (Math/max e-min (Math/min e-max guess))
-        (let [e     (Math/max e-min (Math/min e-max guess))
-              E     (+ e others-effort)
-              ;; Single pow call: E^(β-2), derive E^(β-1) and E^β via multiply
-              Ebm2  (Math/pow E (- beta 2.0))
-              Ebm1  (* Ebm2 E)          ;; E^(β-1) = E^(β-2) * E
-              Eb    (* Ebm1 E)          ;; E^β     = E^(β-1) * E
-              Y     (+ (* a E) (* b Eb))
-              MP    (+ a (* b beta Ebm1))
-              dMP   (* b beta (- beta 1.0) Ebm2)
-              leis  (- endowment e)
-              ;; f(e) = θ*MP/Y - (1-θ)/leis
-              fe    (- (/ (* theta MP) Y)
-                       (/ (- 1.0 theta) leis))
-              ;; f'(e) = θ*(dMP*Y - MP²)/Y² - (1-θ)/leis²
-              fpe   (- (/ (* theta (- (* dMP Y) (* MP MP)))
-                          (* Y Y))
-                       (/ (- 1.0 theta)
-                          (* leis leis)))]
-          (if (or (< (Math/abs fe) 1e-6)
-                  (== fpe 0.0))
-            ;; converged or stuck
-            e
-            (let [step     (/ fe fpe)
-                  ;; damped step to avoid overshooting
-                  step     (Math/max (- (/ e-max 2.0)) (Math/min (/ e-max 2.0) step))
-                  new-e    (- e step)]
-              (if (< (Math/abs step) 0.001)
-                (Math/max e-min (Math/min e-max new-e))
-                (recur new-e (unchecked-add-int iter 1))))))))))
+        (if (== done 1)
+          result
+          (Math/max e-min (Math/min e-max guess)))))))
 
 ;; ================================================================
 ;; Convenience: singleton effort (others-effort = 0)

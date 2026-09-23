@@ -1901,12 +1901,10 @@
         param-specs (mapv (fn [p t] {:sym (if (symbol? p) (with-meta p nil) (symbol (name p)))
                                      :tag (when t (symbol t))})
                           d-params* d-tags*)
-        value-reg   @types/soa-registry
-        soa-reverse @types/soa-reverse-registry
-        value-fn?   (boolean
-                     (some #(or (contains? value-reg (:tag %))
-                                (contains? soa-reverse (:tag %)))
-                           param-specs))
+        ;; One representation pass owns both generated SoA companions and defvalues that already
+        ;; bundle primitive arrays. The latter are common model/simulation state boundaries; their
+        ;; record identity is a host ABI fact, never a scalar operation in TypedSOAC or KernelBody.
+        value-fn?   (boolean (seq (soa-lower/soa-param-env param-specs)))
         pre-gpu-param-types
         ;; Flat signatures already have their authoritative walker/deftm parameter tags. Give
         ;; TypedSOAC those facts before fusion instead of defaulting every resident array to the

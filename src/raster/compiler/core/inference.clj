@@ -489,11 +489,21 @@
 ;; ================================================================
 
 (defonce field-type-registry (atom {}))
+(defonce ^{:doc "Source declaration order for registered aggregate fields. A map is sufficient
+for field lookup but is not an ABI: wide persistent maps need not retain insertion order. Scalar
+replacement and resident value projection consume this vector so a logical aggregate has one
+stable physical-leaf order on every backend."}
+  field-order-registry
+  (atom {}))
 
 (defn register-field-types!
   "Register field types for a record/value type."
-  [type-tag fields]
-  (swap! field-type-registry assoc type-tag fields))
+  ([type-tag fields]
+   (register-field-types! type-tag fields (vec (keys fields))))
+  ([type-tag fields field-order]
+   (swap! field-type-registry assoc type-tag fields)
+   (swap! field-order-registry assoc type-tag (vec field-order))
+   fields))
 
 (defn register-record-fields!
   "Auto-register field types for a defrecord class via Java reflection.
@@ -501,27 +511,30 @@
   Call after defrecord to enable keyword→field devirtualization."
   [^Class record-class]
   (let [type-tag (symbol (.getSimpleName record-class))
-        fields (->> (.getDeclaredFields record-class)
-                    (remove #(java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Field %)))
-                    ;; Skip Clojure's internal defrecord fields
-                    (remove #(.startsWith (.getName ^java.lang.reflect.Field %) "__"))
-                    (reduce (fn [m ^java.lang.reflect.Field f]
-                              (let [fname (.getName f)
-                                    ftype (.getType f)
-                                    tag (cond
-                                          (= ftype Double/TYPE) 'double
-                                          (= ftype Long/TYPE) 'long
-                                          (= ftype Float/TYPE) 'float
-                                          (= ftype Integer/TYPE) 'int
-                                          (= ftype Boolean/TYPE) 'boolean
-                                          (= ftype Byte/TYPE) 'byte
-                                          (= ftype Short/TYPE) 'short
-                                          (= ftype Character/TYPE) 'char
-                                          (.isArray ftype) (symbol (.getSimpleName ftype))
-                                          :else (symbol (.getName ftype)))]
-                                (assoc m fname tag)))
-                            {}))]
-    (swap! field-type-registry assoc type-tag fields)
+        declared-fields (->> (.getDeclaredFields record-class)
+                             (remove #(java.lang.reflect.Modifier/isStatic
+                                       (.getModifiers ^java.lang.reflect.Field %)))
+                             ;; Skip Clojure's internal defrecord fields
+                             (remove #(.startsWith (.getName ^java.lang.reflect.Field %) "__"))
+                             vec)
+        fields (reduce (fn [m ^java.lang.reflect.Field f]
+                         (let [fname (.getName f)
+                               ftype (.getType f)
+                               tag (cond
+                                     (= ftype Double/TYPE) 'double
+                                     (= ftype Long/TYPE) 'long
+                                     (= ftype Float/TYPE) 'float
+                                     (= ftype Integer/TYPE) 'int
+                                     (= ftype Boolean/TYPE) 'boolean
+                                     (= ftype Byte/TYPE) 'byte
+                                     (= ftype Short/TYPE) 'short
+                                     (= ftype Character/TYPE) 'char
+                                     (.isArray ftype) (symbol (.getSimpleName ftype))
+                                     :else (symbol (.getName ftype)))]
+                           (assoc m fname tag)))
+                       {} declared-fields)]
+    (register-field-types! type-tag fields
+                           (mapv #(.getName ^java.lang.reflect.Field %) declared-fields))
     fields))
 
 ;; ================================================================

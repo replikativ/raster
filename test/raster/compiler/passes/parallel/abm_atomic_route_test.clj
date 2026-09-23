@@ -63,3 +63,32 @@
     (is (kernel-artifact/kernel-artifact? artifact))
     (is (some #(= "ForLoop" (some-> % class .getSimpleName)) operations))
     (is (some #(= "ScalarStore" (some-> % class .getSimpleName)) operations))))
+
+(deftest startup-execution-separates-unique-firm-inits-from-ordered-agent-updates
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'phases/execute-startups-par! :ze:debug
+                    :dtype :float :on-non-resident :nil)
+        artifacts (mapv :artifact (:steps descriptor))]
+    (is (some? descriptor))
+    (is (= 2 (count artifacts)))
+    (is (every? kernel-artifact/kernel-artifact? artifacts))
+    (is (= [:one-work-item-per-element :one-work-item-ordered-loop]
+           (mapv #(get-in % [:attributes :kernel-body :schedule :strategy]) artifacts)))
+    (is (some #(= "AtomicRMW" (some-> % class .getSimpleName))
+              (body-operations (second artifacts))))))
+
+(deftest agent-decisions-keep-bundle-projections-and-ordered-scalar-solvers-in-one-kernel
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'phases/agent-decide-par! :ze:debug
+                    :dtype :float :on-non-resident :nil)
+        artifact (get-in descriptor [:steps 0 :artifact])
+        operations (body-operations artifact)]
+    (is (some? descriptor))
+    (is (= 1 (count (:steps descriptor))))
+    (is (kernel-artifact/kernel-artifact? artifact))
+    (is (<= 2 (count (filter #(= "ForLoop" (some-> % class .getSimpleName)) operations)))
+        "the bounded Newton solve and friend selection remain typed ordered loops")
+    (is (= ["effort" "income" "theta" "endowment" "firm" "friends" "cache"]
+           (get-in descriptor [:value-specs 'agents :physical-layout :field-order])))
+    (is (= ["a" "b" "beta" "te" "output" "n-workers" "alive" "members" "offsets"]
+           (get-in descriptor [:value-specs 'firms :physical-layout :field-order])))))

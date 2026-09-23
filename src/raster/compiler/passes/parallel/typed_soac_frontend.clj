@@ -342,7 +342,7 @@
                                then-branch)
           locals (if local-bindings (typed-region-locals local-bindings) [])]
       (when (and (every? some? dtypes) (some? locals)
-                 (every? dialect/scalar-literal? identities)
+                 (every? some? identities)
                  (not-any? util/effectful?
                            (concat carry-inits [index-init bound-expr] update-exprs
                                    (map :init locals) [exit-expr])))
@@ -395,6 +395,32 @@
                 component-ids (range) dtypes)
           exit (util/subst-syms (zipmap carry-syms component-ids) exit-expr)]
       (conj components [aggregate exit]))))
+
+(defn- canonicalize-nested-product-loops
+  "Replace pure ordered multi-carry loops nested in scalar control with product Fold terms.
+
+   A nested loop cannot be floated to surrounding locals without changing conditional evaluation.
+   Instead its exit expression selects typed components of one structurally shared Fold. The
+   KernelBody scalar lowerer memoizes equal product terms inside that lexical region, so several
+   component uses still emit exactly one loop."
+  [expression]
+  (walk/postwalk
+   (fn [form]
+     (if-let [{:keys [product matched dtypes]}
+              (when (and (seq? form) (contains? #{'loop 'loop*} (first form)))
+                (source-product-fold-info form))]
+       (let [components
+             (mapv (fn [ordinal component-dtype]
+                     (with-meta (list 'product-component product ordinal)
+                       {:tag (dtype/scalar-tag-for-dtype component-dtype)
+                        :raster.type/tag (dtype/scalar-tag-for-dtype component-dtype)}))
+                   (range) dtypes)]
+         (with-meta
+           (util/subst-syms (zipmap (:carry-syms matched) components)
+                            (:exit-expr matched))
+           (meta form)))
+       form))
+   expression))
 
 (defn- product-component-alias
   [aggregate expression component-count]
@@ -853,6 +879,9 @@
     (let [[head source-bindings & tail] body
           bindings (or (expand-product-loop-locals source-bindings tail)
                        source-bindings)
+          bindings (vec (mapcat (fn [[binding initializer]]
+                                  [binding (canonicalize-nested-product-loops initializer)])
+                                (partition 2 bindings)))
           body (if (= bindings source-bindings)
                  body
                  (with-meta (list* head bindings tail) (meta body)))]

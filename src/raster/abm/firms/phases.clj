@@ -243,55 +243,62 @@
                                        Y    (+ (* a E) (* b (* (* Ebm2 E) E)))
                                        wage (/ Y (double fsize))]
                                    (econ/log-utility th wage end cur-e)))
-                         friend-base (* agent-id n-friends)]
-      ;; Loop over friends' firms, compare with startup, enqueue
-                     (loop [j (int 0)
-                            best-fi   (int fi)
-                            best-e    cur-e
-                            best-u    cur-u
-                            best-type (int 0)]
-                       (if (>= j n-friends)
-          ;; Done evaluating friends — compare with startup and enqueue
-                         (let [su-u (double (aget s-cache (inc sc-idx)))
-                               final-type (if (> su-u best-u) (int 2) best-type)
-                               final-fi   (if (> su-u best-u) (int -1) best-fi)
-                               final-e    (if (> su-u best-u) (aget s-cache sc-idx) (float best-e))]
-                           (par/collect! q-count
-                                         agent-ids (int agent-id)
-                                         decision-types final-type
-                                         target-firms final-fi
-                                         new-efforts final-e))
+                         friend-base (* agent-id n-friends)
+      ;; Keep numerical search pure. The compiler represents this as an ordered product Fold;
+      ;; queue publication remains a separate typed effect continuation.
+                         best (loop [j (int 0)
+                                     best-fi   (int fi)
+                                     best-e    cur-e
+                                     best-u    cur-u
+                                     best-type (int 0)]
+                                (if (< j n-friends)
           ;; Evaluate friend's firm
-                         (let [fid    (aget friends (+ friend-base j))
-                               alt-fi (aget current-firm fid)]
-                           (if (== alt-fi fi)
-                             (recur (unchecked-add-int j 1)
-                                    best-fi best-e best-u best-type)
-                             (if (== (aget alive alt-fi) 0)
-                               (recur (unchecked-add-int j 1)
-                                      best-fi best-e best-u best-type)
-                               (let [af-Y    (double (aget output alt-fi))
-                                     af-size (aget firm-size alt-fi)]
-                                 (if (<= af-Y 0.0)
-                                   (recur (unchecked-add-int j 1)
-                                          best-fi best-e best-u best-type)
-                                   (if (<= af-size 0)
-                                     (recur (unchecked-add-int j 1)
-                                            best-fi best-e best-u best-type)
-                                     (let [af-te   (double (aget total-effort alt-fi))
-                                           af-wage (/ af-Y (double (inc af-size)))
-                                           raw-af-e (/ af-te (double af-size))
-                                           af-e    (Math/max 0.001 (Math/min (- end 0.001) raw-af-e))
-                                           af-leis (- end af-e)
-                                           af-u    (if (> af-leis 1e-300)
-                                                     (+ (* th (Math/log (Math/max 1e-300 af-wage)))
-                                                        (* (- 1.0 th) (Math/log af-leis)))
-                                                     (* th (Math/log (Math/max 1e-300 af-wage))))]
-                                       (if (> af-u best-u)
-                                         (recur (unchecked-add-int j 1)
-                                                alt-fi af-e af-u (int 1))
-                                         (recur (unchecked-add-int j 1)
-                                                best-fi best-e best-u best-type)))))))))))))))
+                                  (let [fid    (aget friends (+ friend-base j))
+                                        alt-fi (aget current-firm fid)]
+                                    (if (== alt-fi fi)
+                                      (recur (unchecked-add-int j 1)
+                                             best-fi best-e best-u best-type)
+                                      (if (== (aget alive alt-fi) 0)
+                                        (recur (unchecked-add-int j 1)
+                                               best-fi best-e best-u best-type)
+                                        (let [af-Y    (double (aget output alt-fi))
+                                              af-size (aget firm-size alt-fi)]
+                                          (if (<= af-Y 0.0)
+                                            (recur (unchecked-add-int j 1)
+                                                   best-fi best-e best-u best-type)
+                                            (if (<= af-size 0)
+                                              (recur (unchecked-add-int j 1)
+                                                     best-fi best-e best-u best-type)
+                                              (let [af-te   (double (aget total-effort alt-fi))
+                                                    af-wage (/ af-Y (double (inc af-size)))
+                                                    raw-af-e (/ af-te (double af-size))
+                                                    af-e    (Math/max 0.001 (Math/min (- end 0.001) raw-af-e))
+                                                    af-leis (- end af-e)
+                                                    af-u    (if (> af-leis 1e-300)
+                                                              (+ (* th (Math/log (Math/max 1e-300 af-wage)))
+                                                                 (* (- 1.0 th) (Math/log af-leis)))
+                                                              (* th (Math/log (Math/max 1e-300 af-wage))))]
+                                                (if (> af-u best-u)
+                                                  (recur (unchecked-add-int j 1)
+                                                         alt-fi af-e af-u (int 1))
+                                                  (recur (unchecked-add-int j 1)
+                                                         best-fi best-e best-u best-type)))))))))
+                                  [best-fi best-e best-u best-type]))
+      ;; Compare the selected existing firm with startup, then publish one queue row. Keeping the
+      ;; projections in the same lexical spine lets TypedSOAC eliminate the aggregate tuple.
+                         ^int best-fi (nth best 0)
+                         ^double best-e (nth best 1)
+                         ^double best-u (nth best 2)
+                         ^int best-type (nth best 3)
+                         su-u (double (aget s-cache (inc sc-idx)))
+                         final-type (if (> su-u best-u) (int 2) best-type)
+                         final-fi   (if (> su-u best-u) (int -1) best-fi)
+                         final-e    (if (> su-u best-u) (aget s-cache sc-idx) (float best-e))]
+                     (par/collect! q-count
+                                   agent-ids (int agent-id)
+                                   decision-types final-type
+                                   target-firms final-fi
+                                   new-efforts final-e)))))
 
 ;; ================================================================
 ;; Phase 5: GPU execute-decisions — parallel phases
@@ -355,7 +362,11 @@
                    (aset free-slots (aget free-offsets f) (int f)))))
 
 (deftm execute-startups-par!
-  "Execute STARTUP decisions in parallel, using pre-computed free firm slots."
+  "Execute STARTUP decisions using pre-computed free firm slots.
+
+   Firm initialization and agent transitions are separate SOACs because they have different
+   ownership: free-slots is a unique compacted set, while an activation batch may contain the
+   same agent more than once and therefore requires source-ordered agent updates."
   [agent-ids :- (Array int), startup-indices :- (Array int),
    new-efforts :- (Array float),
    effort :- (Array float), current-firm :- (Array int),
@@ -364,30 +375,36 @@
    param-beta :- (Array float), output :- (Array float),
    free-slots :- (Array int), rng-seeds :- (Array long),
    n-startups :- Long] :- Void
+  ;; Each startup owns one slot from the validated compacted free-slot array.
+  (par/map-void! s n-startups
+                 (let [q (aget startup-indices s)
+                       ai (aget agent-ids q)
+                       new-e (aget new-efforts q)
+                       new-fi (aget free-slots s)
+                       seed (aget rng-seeds ai)
+                       a-new (float (+ 0.1 (* 1.4 (/ (float (int (bit-and seed (long 0xFFFF)))) 65536.0))))
+                       b-new (float (+ 0.1 (* 1.4 (/ (float (int (bit-and (unsigned-bit-shift-right seed 16) (long 0xFFFF)))) 65536.0))))
+                       beta-new (float (+ 1.0 (* 0.99 (/ (float (int (bit-and (unsigned-bit-shift-right seed 32) (long 0xFFFF)))) 65536.0))))]
+                   (aset alive (par/unique-index new-fi) (int 1))
+                   (aset param-a (par/unique-index new-fi) a-new)
+                   (aset param-b (par/unique-index new-fi) b-new)
+                   (aset param-beta (par/unique-index new-fi) beta-new)
+                   (aset total-effort (par/unique-index new-fi) new-e)
+                   (aset output (par/unique-index new-fi) (float 0.0))
+                   (aset firm-size (par/unique-index new-fi) (int 1))))
+  ;; Activated agents are sampled with replacement. Keep duplicate-agent updates in queue order;
+  ;; the compiler emits one ordered resident loop while old-firm changes remain explicit atomics.
   (par/map-void! s n-startups
                  (let [q (aget startup-indices s)
                        ai (aget agent-ids q)
                        new-e (aget new-efforts q)
                        old-fi (aget current-firm ai)
                        old-e (aget effort ai)
-                       new-fi (aget free-slots s)
-                       seed (aget rng-seeds ai)
-                       a-new (float (+ 0.1 (* 1.4 (/ (float (int (bit-and seed (long 0xFFFF)))) 65536.0))))
-                       b-new (float (+ 0.1 (* 1.4 (/ (float (int (bit-and (unsigned-bit-shift-right seed 16) (long 0xFFFF)))) 65536.0))))
-                       beta-new (float (+ 1.0 (* 0.99 (/ (float (int (bit-and (unsigned-bit-shift-right seed 32) (long 0xFFFF)))) 65536.0))))]
-      ;; Init new firm
-                   (aset alive new-fi (int 1))
-                   (aset param-a new-fi a-new)
-                   (aset param-b new-fi b-new)
-                   (aset param-beta new-fi beta-new)
-                   (aset total-effort new-fi new-e)
-                   (aset output new-fi (float 0.0))
-                   (aset firm-size new-fi (int 1))
-      ;; Leave old firm
+                       new-fi (aget free-slots s)]
                    (when (>= old-fi (int 0))
-                     (par/atomic-add! total-effort old-fi (float (- (float 0.0) (float old-e))))
+                     (par/atomic-add! total-effort old-fi
+                                      (float (- (float 0.0) (float old-e))))
                      (par/atomic-add! firm-size old-fi (int -1)))
-      ;; Join new
                    (aset current-firm ai (int new-fi))
                    (aset effort ai new-e))))
 

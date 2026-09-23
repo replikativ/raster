@@ -13,6 +13,8 @@
 
 (defvalue Cplx [re :- Double, im :- Double])
 
+(defvalue ArrayBundle [positions :- (Array float), labels :- (Array int)])
+
 (deftm cadd-soa! [as :- CplxSoA, bs :- CplxSoA, os :- CplxSoA, n :- Long] :- nil
   (dotimes [i n]
     (aset-cplx! os i (->Cplx (raster.numeric/+ (.re (aget-cplx as i)) (.re (aget-cplx bs i)))
@@ -28,6 +30,22 @@
       (is (= {'as_re {:binding 'as :field :re}
               'as_im {:binding 'as :field :im}}
              (sl/buffer-projections env))))))
+
+(deftest array-bundle-lowering-uses-the-same-physical-product-boundary
+  (let [specs [{:sym 'state :tag 'ArrayBundle} {:sym 'n :tag 'long}]
+        env (sl/soa-param-env specs)
+        lowered (sl/soa-lower
+                 '(let* [p (.positions state) l (.labels state)]
+                    (clojure.core/aset p 0 (float (clojure.core/aget l 0))))
+                 specs)]
+    (is (= '[state_positions state_labels n] (mapv :sym (:params lowered))))
+    (is (= '[floats ints long] (mapv :tag (:params lowered))))
+    (is (= {'state_positions {:binding 'state :field :positions}
+            'state_labels {:binding 'state :field :labels}}
+           (sl/buffer-projections env)))
+    (is (= '(let* [p state_positions l state_labels]
+              (clojure.core/aset p 0 (float (clojure.core/aget l 0))))
+           (:body lowered)))))
 
 (deftm get-re-soa! [ps :- CplxSoA, out :- (Array double), n :- Long] :- nil
   (dotimes [i n]
