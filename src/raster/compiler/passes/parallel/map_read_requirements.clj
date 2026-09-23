@@ -20,6 +20,17 @@
       1 (first operands)
       (apply launch/product operands))))
 
+(defn- local-dependencies
+  [locals expression]
+  (:dependencies
+   (reduce (fn [{:keys [live dependencies]} {:keys [id init]}]
+             (if (contains? live id)
+               {:live (into (disj live id) (util/free-syms init))
+                :dependencies (conj dependencies id)}
+               {:live live :dependencies dependencies}))
+           {:live (util/free-syms expression) :dependencies #{}}
+           (reverse locals))))
+
 (defn symbolic-read-certificate
   "Certify exact symbolic spans for the flat reads of a typed one-dimensional map.
 
@@ -52,7 +63,9 @@
                               index bound locals {})]
                     (when-let [span (algebra/zero-based-dense-span form)]
                       {:buffer sym :source-coordinate idx
-                       :coordinate coordinate :form form
+                       :coordinate coordinate
+                       :address-locals (local-dependencies source-locals idx)
+                       :form form
                        :span (span-expression span)})))
                 reads)]
       (when (and (seq reads) (every? some? read-facts))
@@ -94,11 +107,11 @@
           {} locals))
 
 (defn- retain-live-locals
-  [locals result]
+  [locals result removable]
   (:locals
    (reduce
     (fn [{:keys [live locals]} {:keys [id init] :as local}]
-      (if (contains? live id)
+      (if (or (contains? live id) (not (contains? removable id)))
         {:live (into (disj live id) (util/free-syms init))
          :locals (into [local] locals)}
         {:live live :locals locals}))
@@ -153,10 +166,11 @@
                  ;; source operation's derived scalar here; replacing it with its host expression
                  ;; would inject uncaptured public symbols into this node.
                  (util/subst-syms substitutions (descriptor/aget-index read))))))))
+        removable (apply set/union #{} (map :address-locals (:reads attached)))
         region (:scalar-region operation)
         locals (mapv #(update % :init rewrite) (:locals region))
         result (rewrite (:result region))
-        locals (retain-live-locals locals result)]
+        locals (retain-live-locals locals result removable)]
     (-> operation
         (assoc :scalar-region (assoc region :locals locals :result result))
         (assoc :address-projection

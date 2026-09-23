@@ -377,7 +377,16 @@
                     {:reason :segmap-graph-context
                      :graph-node graph-node :kernel-graph kernel-graph})))
   (let [projected (if (and graph-node (:read-capacity-certificate graph-node))
-                    (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
+                    (try
+                      (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
+                      (catch clojure.lang.ExceptionInfo exception
+                        ;; A structural span is still useful when a quotient-derived buffer
+                        ;; expression cannot prove the minimum without a retained relational
+                        ;; contract. Keep checked scalar address arithmetic in that case.
+                        (if (= :map-address-certificate-capacity
+                               (:reason (ex-data exception)))
+                          segmap
+                          (throw exception))))
                     segmap)
         scheduled
         (segmap-body/schedule projected
