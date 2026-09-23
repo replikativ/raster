@@ -17,8 +17,8 @@
       1 (first operands)
       (apply launch/product operands))))
 
-(defn symbolic-read-requirements
-  "Derive exact symbolic minimum capacities for the flat reads of a typed one-dimensional map.
+(defn symbolic-read-certificate
+  "Certify exact symbolic spans for the flat reads of a typed one-dimensional map.
 
    The proof is structural: the map index is decomposed into mixed-radix digits and each address
    must enumerate a zero-based dense interval over the digits it represents. Omitted digits are
@@ -32,32 +32,50 @@
              (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))
              (not (seq (get-in operation [:scalar-region :effects]))))
     (let [{index :name bound :bound} (first (get-in operation [:space :dims]))
-          {:keys [locals result]} (:scalar-region operation)
+          {source-locals :locals result :result} (:scalar-region operation)
           monomial-definitions (into {} (filter (comp algebra/monomial val)) scalar-definitions)
           expand #(walk/postwalk-replace monomial-definitions %)
           bound (expand bound)
-          locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) locals)
-          reads (->> (concat (map :init locals) [result])
+          locals (mapv #(update % :init (comp algebra/canonical-arithmetic expand)) source-locals)
+          reads (->> (concat (map :init source-locals) [result])
                      (mapcat descriptor/aget-reads)
                      (filter #(contains? (:inputs operation) (:sym %)))
                      vec)
-          requirements
+          read-facts
           (mapv (fn [{:keys [sym idx]}]
-                  (let [form (algebra/index-form
-                              (algebra/canonical-arithmetic (expand idx))
+                  (let [coordinate (algebra/canonical-arithmetic (expand idx))
+                        form (algebra/index-form
+                              coordinate
                               index bound locals {})]
                     (when-let [span (algebra/zero-based-dense-span form)]
-                      [sym (span-expression span)])))
+                      {:buffer sym :source-coordinate idx
+                       :coordinate coordinate :form form
+                       :span (span-expression span)})))
                 reads)]
-      (when (and (seq reads) (every? some? requirements))
-        (reduce (fn [result [id extent]]
-                  (update result id
+      (when (and (seq reads) (every? some? read-facts))
+        {:kind :zero-based-dense-read-spans
+         :index index :extent bound
+         ;; Retain both sides of the proof. `:source-locals` and
+         ;; `:scalar-definitions` let a later graph-bound target projection recompute this
+         ;; certificate from the exact SegMap instead of trusting attached metadata. `:locals`
+         ;; is the canonical expanded region used by the mixed-radix proof.
+         :source-locals source-locals
+         :scalar-definitions monomial-definitions
+         :locals locals :reads read-facts
+         :requirements
+         (reduce (fn [result {:keys [buffer span]}]
+                  (update result buffer
                           (fn [prior]
                             (cond
-                              (nil? prior) extent
-                              (= prior extent) prior
-                              :else (launch/maximum prior extent)))))
-                {} requirements)))))
+                              (nil? prior) span
+                              (= prior span) prior
+                              :else (launch/maximum prior span)))))
+                 {} read-facts)}))))
+
+(defn symbolic-read-requirements
+  "Return only the buffer-capacity projection of `symbolic-read-certificate`."
+  [operation options]
+  (:requirements (symbolic-read-certificate operation options)))
 
 (defn static-read-requirements
   "Optional all-load proof for a plain, positive static, one-dimensional result map.

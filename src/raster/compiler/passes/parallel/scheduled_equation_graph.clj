@@ -461,6 +461,17 @@
              (fail! :scheduled-equation-empty
                     "a KernelGraph requires at least one scheduled operation" {}))
          derived-scalars (derived-scalar-expressions (:values scheduled) host-prefix)
+         values (:values scheduled)
+         map-read-options
+         {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
+          :scalar-types (into {} (keep (fn [[id v]]
+                                        (when (empty? (:shape v)) [id (:dtype v)]))) values)
+          :scalar-definitions derived-scalars}
+         ;; Proof metadata belongs to the scheduled node, not the semantic SegOp. Mutating the
+         ;; operation would change structural identity inside enclosing structured-control IR.
+         ;; A target may consume this witness only after revalidating the exact node and graph.
+         read-capacity-certificates
+         (mapv #(map-reads/symbolic-read-certificate % map-read-options) operations)
          inputs (external-inputs operations)
          outputs (set (physical-outputs algorithm))
          operation-values (reduce set/union #{}
@@ -468,7 +479,6 @@
                                                    (segop/operation-outputs %))
                                        operations))
          temporary-ids (set/difference operation-values inputs outputs)
-         values (:values scheduled)
          result-storage-values
          (reduce
           (fn [by-storage equation]
@@ -483,7 +493,7 @@
                             (set/union inputs outputs temporary-ids))
          read-requirements
          (reduce
-          (fn [requirements operation]
+          (fn [requirements [operation certificate]]
             (if (and (some (fn [id]
                              (unresolved-capacity? id (get values id)
                                                    (get-in buffer-specs [id :elements])))
@@ -493,18 +503,14 @@
                             (and (= {:kind :plain} (:representation value))
                                  (nil? (:logical-layout value)))))
                         (:inputs operation)))
-              (let [options
-                    {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
-                     :scalar-types (into {} (keep (fn [[id v]]
-                                                   (when (empty? (:shape v))
-                                                     [id (:dtype v)]))) values)
-                     :scalar-definitions derived-scalars}
-                    derived (or (map-reads/symbolic-read-requirements operation options)
-                                (map-reads/static-read-requirements operation options))]
+              (let [derived (or (:requirements certificate)
+                                (map-reads/static-read-requirements
+                                 operation map-read-options))]
                 (merge-with into requirements
                             (into {} (map (fn [[id extent]] [id [extent]])) derived)))
               requirements))
-          (product-read-requirements values operations derived-scalars) operations)
+          (product-read-requirements values operations derived-scalars)
+          (map vector operations read-capacity-certificates))
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
                          (let [extents (vec (distinct
@@ -535,23 +541,28 @@
                            specs))
                        buffer-specs result-storage-values)
          scalars (public-scalars scheduled operations buffer-specs)]
-     (graph/from-segops
-      operations
-      {:inputs inputs
-       :outputs outputs
-       :temporaries (select-keys buffer-specs temporary-ids)
-       :scalars scalars
-       :buffer-specs buffer-specs
-       :dtype (:dtype (first (vals buffer-specs)))
-       :effects (or effects {:semantic (:effects (soac/facts algorithm))})
-       :provenance (merge {:source-dialect :typed-soac
-                           :algorithm-dialect :typed-soac
-                           :schedule-dialect :segop}
-                          provenance)
-       ;; Derived scalar definitions are deliberately absent here.  They are proof terms in the
-       ;; retained ParallelProgram prefix, not descriptive KernelGraph attributes.  A schedule
-       ;; validator that needs them must receive and revalidate that exact program slice.
-       :attributes attributes}))))
+     (let [kernel-graph
+           (graph/from-segops
+            operations
+            {:inputs inputs
+             :outputs outputs
+             :temporaries (select-keys buffer-specs temporary-ids)
+             :scalars scalars
+             :buffer-specs buffer-specs
+             :dtype (:dtype (first (vals buffer-specs)))
+             :effects (or effects {:semantic (:effects (soac/facts algorithm))})
+             :provenance (merge {:source-dialect :typed-soac
+                                 :algorithm-dialect :typed-soac
+                                 :schedule-dialect :segop}
+                                provenance)
+             ;; Derived scalar definitions are deliberately absent here.  They are proof terms
+             ;; in the retained ParallelProgram prefix, not descriptive graph attributes.
+             :attributes attributes})
+           nodes (mapv (fn [node certificate]
+                         (cond-> node certificate
+                           (assoc :read-capacity-certificate certificate)))
+                       (:nodes kernel-graph) read-capacity-certificates)]
+       (graph/validate! (assoc kernel-graph :nodes nodes))))))
 
 (defn validate-projection!
   "Require the exact graph projection of an independently retained algorithm and scheduled body.

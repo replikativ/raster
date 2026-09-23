@@ -70,9 +70,13 @@
   (let [scheduled (scheduled-three-maps)
         {:keys [graph]} (equation-graph/make-for-equation
                          scheduled (first (:equations scheduled)))
-        input (first (filter #(= 'x (:id %)) (:inputs graph)))]
+        input (first (filter #(= 'x (:id %)) (:inputs graph)))
+        certificate (get-in graph [:nodes 0 :read-capacity-certificate])]
     (is (= 'n (:elements input))
-        "the active map domain proves x[0..n), and graph binding enforces that capacity")))
+        "the active map domain proves x[0..n), and graph binding enforces that capacity")
+    (is (= :zero-based-dense-read-spans (:kind certificate)))
+    (is (= {'x 'n} (:requirements certificate))
+        "the checked graph retains the exact proof target for later address projection")))
 
 (deftest equation-region-must-be-an-exact-contiguous-slice
   (let [scheduled (scheduled-three-maps)
