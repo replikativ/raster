@@ -663,17 +663,22 @@
          ;; `chunks` makes lane c and lane c+1 read x[rbase+c] and x[rbase+c+1] at the
          ;; same step — contiguous across the subgroup ⇒ coalesced. Same Σx², merely
          ;; reassociated across chunks (already non-bit-identical to rms-norm; f32
-         ;; agrees to ~1e-6 relative). The strided loop also handles a non-divisible
-         ;; `features` with no start/end/len bookkeeping. Every C backend inherits
-         ;; this — it is the deftm's own schedule, lowered by the shared c_emit.
+         ;; agrees to ~1e-6 relative). A unit-step trip counter retains the exact
+         ;; c,c+chunks,… access order while keeping the ordered recurrence in the common
+         ;; KernelBody loop dialect. Every C backend inherits this surface schedule.
          (raster.par/map-void! t (clojure.core/* rows chunks)
                                (let [r (quot t chunks)
                                      c (rem t chunks)
                                      rbase (clojure.core/* r features)
-                                     s (loop [i c s 0.0]
-                                         (if (< i features)
-                                           (let [v (aget x (clojure.core/+ rbase i))]
-                                             (recur (clojure.core/+ i chunks) (+ s (* v v))))
+                                     steps (quot (clojure.core/+ (clojure.core/- features c)
+                                                                 (dec chunks))
+                                                 chunks)
+                                     s (loop [q 0 s 0.0]
+                                         (if (< q steps)
+                                           (let [i (clojure.core/+ c
+                                                                  (clojure.core/* q chunks))
+                                                 v (aget x (clojure.core/+ rbase i))]
+                                             (recur (inc q) (+ s (* v v))))
                                            s))]
                                  (aset ps t s)))
          ;; stage 2 — per-row combine (identical arithmetic to rms-norm!'s tail)
@@ -1825,16 +1830,24 @@
                                (let [r (quot t chunks)
                                      c (rem t chunks)
                                      rbase (clojure.core/* r features)
-                                     sq (loop [i c s 0.0]
-                                          (if (< i features)
-                                            (let [v (aget x (clojure.core/+ rbase i))]
-                                              (recur (clojure.core/+ i chunks) (+ s (* v v))))
+                                     steps (quot (clojure.core/+ (clojure.core/- features c)
+                                                                 (dec chunks))
+                                                 chunks)
+                                     sq (loop [q 0 s 0.0]
+                                          (if (< q steps)
+                                            (let [i (clojure.core/+ c
+                                                                   (clojure.core/* q chunks))
+                                                  v (aget x (clojure.core/+ rbase i))]
+                                              (recur (inc q) (+ s (* v v))))
                                             s))
-                                     sc (loop [i c s 0.0]
-                                          (if (< i features)
-                                            (let [j (clojure.core/+ rbase i)
+                                     sc (loop [q 0 s 0.0]
+                                          (if (< q steps)
+                                            (let [i (clojure.core/+ c
+                                                                   (clojure.core/* q chunks))
+                                                  j (clojure.core/+ rbase i)
                                                   gi (+ gain-offset (aget weight i))]
-                                              (recur (clojure.core/+ i chunks) (+ s (* gi (* (aget x j) (aget dy j))))))
+                                              (recur (inc q)
+                                                     (+ s (* gi (* (aget x j) (aget dy j))))))
                                             s))]
                                  (aset pss t sq)
                                  (aset pc t sc)))
