@@ -38,6 +38,7 @@
             [raster.compiler.passes.parallel.segfoldmap-body :as segfoldmap-body]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged-body]
             [raster.compiler.passes.parallel.product-reduction-body :as product-body]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
@@ -371,11 +372,30 @@
              :or {kernel-name-prefix "segmap"
                   target-dialect :opencl-intel workgroup-size 256
                   scalar-types {} array-types {}}}]
-  (let [scheduled
-        (segmap-body/schedule segmap
+  (when (not= (some? graph-node) (some? kernel-graph))
+    (throw (ex-info "map graph certification requires both node and graph"
+                    {:reason :segmap-graph-context
+                     :graph-node graph-node :kernel-graph kernel-graph})))
+  (let [projected (if (and graph-node (:read-capacity-certificate graph-node))
+                    (try
+                      (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
+                      (catch clojure.lang.ExceptionInfo exception
+                        ;; A structural span is still useful when a quotient-derived buffer
+                        ;; expression cannot prove the minimum without a retained relational
+                        ;; contract. Keep checked scalar address arithmetic in that case.
+                        (if (= :map-address-certificate-capacity
+                               (:reason (ex-data exception)))
+                          segmap
+                          (throw exception))))
+                    segmap)
+        scheduled
+        (segmap-body/schedule projected
                               {:workgroup-size workgroup-size
                                :scalar-types scalar-types :array-types array-types
                                :array-shapes array-shapes})
+        ;; The projected operation is private schedule input. ScheduledKernelBody remains a
+        ;; refinement of the exact semantic graph node, which is what later binding validates.
+        scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
         _ (when (or graph-node kernel-graph)
             (segmap-body/validate-static-graph-capacities! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))

@@ -27,6 +27,14 @@
     (is (= 1 (launch/resolve-expression {'rows 0} projected)))
     (is (= 7 (launch/resolve-expression {'rows 7} projected)))))
 
+(deftest checked-launch-algebra-projects-back-into-kernel-index-algebra
+  (let [source (launch/product (launch/runtime-value 'rows)
+                               (launch/maximum (launch/runtime-value 'heads) 1))
+        lowered (index-expression/lower source #{'rows 'heads} fail!)]
+    (is (= :mul (:op lowered)))
+    (is (= 'rows (first (:arguments lowered))))
+    (is (= :max (:op (second (:arguments lowered)))))))
+
 (deftest typed-launch-projection-declines-int-overflow-semantics
   (let [reason (try
                  (index-expression/lower-typed
