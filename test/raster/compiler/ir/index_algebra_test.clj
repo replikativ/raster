@@ -91,6 +91,25 @@
     (is (ia/injective? translated))
     (is (not (ia/dense? translated)) "a translated tile does not cover an allocation from zero")))
 
+(deftest represented-digits-have-an-exact-span-even-when-a-broadcast-digit-is-dropped
+  (let [locals '[{:id q :init (quot idx width)}
+                 {:id column :init (rem idx width)}
+                 {:id row :init (quot q heads)}
+                 {:id head :init (rem q heads)}]
+        broadcast (ia/index-form '(+ (* row width) column) 'idx '(* rows (* heads width))
+                                 locals {})
+        padded (ia/index-form '(+ (* row stride) column) 'idx '(* rows (* heads width))
+                              locals {})
+        translated (ia/index-form '(+ base (* row width) column) 'idx
+                                  '(* rows (* heads width)) locals {})]
+    (is (not (ia/dense? broadcast)) "different heads repeat the same input rows")
+    (is (= {:const 1 :factors '[rows width]}
+           (ia/zero-based-dense-span broadcast))
+        "the represented row/column digits still enumerate one exact input interval")
+    (is (nil? (ia/zero-based-dense-span padded)) "an unrelated stride may leave gaps")
+    (is (nil? (ia/zero-based-dense-span translated))
+        "an invariant translation needs an independent base/capacity proof")))
+
 (deftest consecutive-translated-slabs-form-one-dense-image
   (let [low (ia/index-form '(+ (* row (* 2 half)) i) 'row 'rows [] '{i half})
         high (ia/index-form '(+ (* row (* 2 half)) i half) 'row 'rows [] '{i half})

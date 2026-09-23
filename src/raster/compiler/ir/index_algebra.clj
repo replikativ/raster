@@ -552,31 +552,39 @@
                             (dominates? coefficient required quot-facts))))
                    (range (count ordered))))))))
 
+(defn zero-based-dense-span
+  "Return the exact monomial span of the digits represented by `form`, or nil.
+
+   Starting at coefficient one, every next digit must have exactly the carry stride produced by
+   all lower represented digits. Unlike `dense?`, this deliberately permits omitted source-domain
+   digits: a broadcast may repeat a dense input interval while still proving that every read lies
+   in `[0, span)`. A non-zero translation, padding, ambiguous equal stride, or non-row-major
+   coefficient declines. The result is proof data, not a storage allocation claim."
+  [{:keys [terms offset-terms] :as form}]
+  (when (and form (empty? offset-terms))
+    (loop [remaining (vec (vals terms))
+           expected {:const 1 :factors []}]
+      (if (empty? remaining)
+        expected
+        (let [matches (keep-indexed
+                       (fn [position {:keys [coefficient]}]
+                         (when (= expected coefficient) position))
+                       remaining)]
+          (when (= 1 (count matches))
+            (let [position (first matches)
+                  {:keys [radix]} (nth remaining position)]
+              (recur (vec (concat (subvec remaining 0 position)
+                                  (subvec remaining (inc position))))
+                     (product expected radix)))))))))
+
 (defn dense?
   "Sufficient condition that an index form enumerates exactly `[0, product(radices))`.
 
-   This is deliberately stronger than injectivity.  Starting at coefficient one, every next
-   digit must have exactly the carry stride produced by all lower digits; domination is not
-   enough because padding would leave holes.  A non-zero invariant translation is likewise not
-   dense in the allocation rooted at zero.  Degenerate equal-stride digits conservatively
-   decline rather than choosing an arbitrary order."
-  [{:keys [terms offset-terms] :as form}]
-  (boolean
-   (and form (complete? form) (empty? offset-terms)
-        (loop [remaining (vec (vals terms))
-               expected {:const 1 :factors []}]
-          (if (empty? remaining)
-            true
-            (let [matches (keep-indexed
-                           (fn [position {:keys [coefficient]}]
-                             (when (= expected coefficient) position))
-                           remaining)]
-              (when (= 1 (count matches))
-                (let [position (first matches)
-                      {:keys [radix]} (nth remaining position)]
-                  (recur (vec (concat (subvec remaining 0 position)
-                                      (subvec remaining (inc position))))
-                         (product expected radix))))))))))
+   This is deliberately stronger than injectivity. Every source-domain leaf must contribute, and
+   `zero-based-dense-span` must prove exact row-major carry. Padding and dropped digits therefore
+   remain incomplete even though the latter may still have a useful bounded read span."
+  [form]
+  (boolean (and form (complete? form) (zero-based-dense-span form))))
 
 (declare offset-multiple)
 
