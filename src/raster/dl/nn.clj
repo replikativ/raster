@@ -1968,16 +1968,17 @@
                                         spatial :- Long groups :- Long eps :- Double]
                                    :- (Array T)
                                    (let [cpg (quot channels groups)
+                                         channel-span (* channels spatial)
                                          group-size (* cpg spatial)
                                          means (double-array (* batch groups))
                                          variances (double-array (* batch groups))
                                          s1s (double-array (* batch groups))
                                          s2s (double-array (* batch groups))
-                                         dg-values (alloc-like dy (* batch channels spatial))
-                                         dx (alloc-like dy (* batch channels spatial))]
+                                         dg-values (alloc-like dy (* batch channel-span))
+                                         dx (alloc-like dy (* batch channel-span))]
                                      (raster.par/map!
-                                      dg-values idx (* batch channels spatial) nil
-                                      (let [within-batch (rem idx (* channels spatial))
+                                      dg-values idx (* batch channel-span) nil
+                                      (let [within-batch (rem idx channel-span)
                                             ch (quot within-batch spatial)]
                                         (* (aget dy idx) (aget gamma ch))))
                                      (raster.par/product-reduce!
@@ -2012,12 +2013,15 @@
                                       {:associative? true :commutative? true
                                        :order :implementation-defined})
                                      (raster.par/map!
-                                      dx idx (* batch channels spatial) nil
-                                      (let [b (quot idx (* channels spatial))
-                                            within-batch (rem idx (* channels spatial))
+                                      dx idx (* batch channel-span) nil
+                                      (let [b (quot idx channel-span)
+                                            within-batch (rem idx channel-span)
                                             ch (quot within-batch spatial)
                                             g (quot ch cpg)
-                                            stats-idx (+ (* b groups) g)
+                                            ;; `means`/`variances` allocation already checked batch*groups
+                                            ;; on the host. Under that precondition this row-major device
+                                            ;; index cannot overflow, so no unavailable OpenCL trap is needed.
+                                            stats-idx (unchecked-add (unchecked-multiply b groups) g)
                                             inv-std (/ 1.0 (n/sqrt (+ (aget variances stats-idx) eps)))
                                             x-hat (* (- (aget x idx) (aget means stats-idx)) inv-std)
                                             n-inv (/ 1.0 (double group-size))]
@@ -2098,12 +2102,13 @@
                                    spatial :- Long groups :- Long eps :- Double]
                               :- (Array T)
                               (let [cpg (quot channels groups)
+                                    channel-span (* channels spatial)
                                     group-size (* cpg spatial)
                                     means (double-array (* batch groups))
                                     variances (double-array (* batch groups))
                                     dx-sums (double-array (* batch groups))
                                     xhat-dx-sums (double-array (* batch groups))
-                                    out (alloc-like dx (* batch channels spatial))]
+                                    out (alloc-like dx (* batch channel-span))]
                                 (raster.par/product-reduce!
                                  [means] [[sum 0.0 :double]] [[b batch] [g groups]]
                                  i group-size
@@ -2137,12 +2142,13 @@
                                  {:associative? true :commutative? true
                                   :order :implementation-defined})
                                 (raster.par/map!
-                                 out idx (* batch channels spatial) nil
-                                 (let [b (quot idx (* channels spatial))
-                                       within-batch (rem idx (* channels spatial))
+                                 out idx (* batch channel-span) nil
+                                 (let [b (quot idx channel-span)
+                                       within-batch (rem idx channel-span)
                                        ch (quot within-batch spatial)
                                        g (quot ch cpg)
-                                       stats-idx (+ (* b groups) g)
+                                       ;; The checked batch*groups allocation is the overflow witness.
+                                       stats-idx (unchecked-add (unchecked-multiply b groups) g)
                                        inv-std (/ 1.0 (n/sqrt (+ (aget variances stats-idx) eps)))
                                        x-hat (* (- (aget x idx) (aget means stats-idx)) inv-std)
                                        dmean (/ (aget dx-sums stats-idx) (double group-size))
