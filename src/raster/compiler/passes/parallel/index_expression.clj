@@ -76,7 +76,8 @@
    `decline!` is called as `(decline! rule message data)`.  This is normalization of explicit
    index arithmetic only; it does not infer types, layouts, or affine facts."
   [expression scope decline!]
-  (let [expression (descriptor/unwrap-int-cast expression)]
+  (let [expression (descriptor/unwrap-int-cast expression)
+        launch-kind (some-> expression class .getSimpleName)]
     (cond
       (integer? expression) expression
 
@@ -98,6 +99,29 @@
       (instance? raster.compiler.ir.kernel_body.IndexCast expression)
       (body/index-cast (lower (:argument expression) scope decline!)
                        (:dtype expression) (:overflow expression))
+
+      (= "RuntimeValue" launch-kind)
+      (lower (:value expression) scope decline!)
+
+      (contains? #{"Product" "Sum" "Minimum" "Maximum"} launch-kind)
+      (let [[operator arguments]
+            (case launch-kind
+              "Product" [:mul (:factors expression)]
+              "Sum" [:add (:terms expression)]
+              "Minimum" [:min (:values expression)]
+              "Maximum" [:max (:values expression)])]
+        (apply body/expression operator
+               (map #(lower % scope decline!) arguments)))
+
+      (contains? #{"CeilDiv" "FloorDiv"} launch-kind)
+      (body/expression (if (= "CeilDiv" launch-kind) :ceil-div :floor-div)
+                       (lower (:value expression) scope decline!)
+                       (lower (:divisor expression) scope decline!))
+
+      (= "AlignUp" launch-kind)
+      (let [value (lower (:value expression) scope decline!)
+            alignment (lower (:alignment expression) scope decline!)]
+        (body/expression :mul (body/expression :ceil-div value alignment) alignment))
 
       (symbol? expression)
       (if (contains? scope expression)

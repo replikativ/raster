@@ -3,6 +3,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
@@ -77,6 +78,25 @@
     (is (= :zero-based-dense-read-spans (:kind certificate)))
     (is (= {'x 'n} (:requirements certificate))
         "the checked graph retains the exact proof target for later address projection")))
+
+(deftest address-projection-recomputes-the-proof-and-requires-graph-capacity
+  (let [scheduled (scheduled-three-maps)
+        {:keys [graph]} (equation-graph/make-for-equation
+                         scheduled (first (:equations scheduled)))
+        node (first (:nodes graph))
+        operation (:operation node)
+        projected (map-reads/validate-and-project-addresses operation node graph)
+        forged (assoc-in operation [:read-capacity-certificate :requirements 'x] 1)
+        forged-node (assoc node :operation forged)
+        forged-graph (assoc graph :nodes [forged-node])
+        undersized (assoc-in graph [:inputs 0 :elements] 1)]
+    (is (= :certified-index-expression (get-in projected [:address-projection :kind])))
+    (is (= :map-address-certificate-mismatch
+           (reason-of #(map-reads/validate-and-project-addresses
+                        forged forged-node forged-graph))))
+    (is (= :map-address-certificate-capacity
+           (reason-of #(map-reads/validate-and-project-addresses
+                        operation node undersized))))))
 
 (deftest equation-region-must-be-an-exact-contiguous-slice
   (let [scheduled (scheduled-three-maps)

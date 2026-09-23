@@ -679,11 +679,22 @@
   (doseq [[target module-target] [[cuda-target :cuda-c] [hip-target :hip-cpp]]]
     (let [compilation (equation-first/compile
                        #'attention/gqa-causal-mha-jvp {:target target :dtype :float})
-          kernels (:kernels compilation)]
+          kernels (:kernels compilation)
+          certified (filter #(get-in % [:attributes :kernel-body :attributes
+                                        :address-projection]) kernels)]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 11 (count kernels)))
       (is (every? #(= module-target (:target %)) kernels))
       (is (every? #(get-in % [:attributes :kernel-body]) kernels))
+      (is (seq certified))
+      (is (not-any?
+           (fn [kernel]
+             (some #(and (= "ScalarCompute" (some-> % class .getSimpleName))
+                         (= :trap (get-in % [:expression :options :overflow])))
+                   (nested-operations
+                    (get-in kernel [:attributes :kernel-body :operations]))))
+           certified)
+          "graph-certified addresses lower as IndexExpr, not trapping scalar arithmetic")
       (is (= {:kernel-body 11}
              (get-in compilation [:stats :emission :emission-routes]))))))
 

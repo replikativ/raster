@@ -3,7 +3,10 @@
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
+            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.index-algebra :as algebra]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.segop :as segop]
@@ -76,6 +79,90 @@
   "Return only the buffer-capacity projection of `symbolic-read-certificate`."
   [operation options]
   (:requirements (symbolic-read-certificate operation options)))
+
+(defn- capacity-covers?
+  [capacity required]
+  (or (extent/equivalent? capacity required)
+      (and (integer? capacity) (integer? required) (<= required capacity))
+      (and (= "raster.compiler.ir.kernel_launch.Maximum" (some-> capacity class .getName))
+           (some #(capacity-covers? % required) (:values capacity)))))
+
+(defn- address-substitutions
+  [locals]
+  (reduce (fn [substitutions {:keys [id init]}]
+            (assoc substitutions id (util/subst-syms substitutions init)))
+          {} locals))
+
+(defn- retain-live-locals
+  [locals result]
+  (:locals
+   (reduce
+    (fn [{:keys [live locals]} {:keys [id init] :as local}]
+      (if (contains? live id)
+        {:live (into (disj live id) (util/free-syms init))
+         :locals (into [local] locals)}
+        {:live live :locals locals}))
+    {:live (util/free-syms result) :locals []}
+    (reverse locals))))
+
+(defn validate-and-project-addresses
+  "Project certified map load coordinates out of scalar SSA and into the index dialect.
+
+   This transformation is deliberately graph-bound. It recomputes the attached structural
+   certificate from the exact SegMap, checks that the exact graph node is present, and verifies
+   that every certified minimum is enforced by the graph buffer. Only then are lexical address
+   locals substituted into load coordinates; locals still used numerically remain intact.
+   Direct schedule callers therefore retain checked scalar arithmetic and its traps."
+  [operation node kernel-graph]
+  (graph/validate! kernel-graph)
+  (when-not (and (= operation (:operation node))
+                 (some #(= node %) (:nodes kernel-graph)))
+    (throw (ex-info "map address projection requires its exact graph node"
+                    {:reason :map-address-certificate-node})))
+  (let [attached (:read-capacity-certificate operation)
+        _ (when-not (= :zero-based-dense-read-spans (:kind attached))
+            (throw (ex-info "map address projection requires a structural read certificate"
+                            {:reason :map-address-certificate-missing})))
+        recomputed (symbolic-read-certificate
+                    (dissoc operation :read-capacity-certificate)
+                    {:scalar-definitions (:scalar-definitions attached)})
+        _ (when-not (= attached recomputed)
+            (throw (ex-info "map address certificate does not match its source operation"
+                            {:reason :map-address-certificate-mismatch
+                             :attached attached :recomputed recomputed})))
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))
+        _ (doseq [[id required] (:requirements attached)]
+            (let [capacity (:elements (get buffers id))]
+              (when-not (capacity-covers? capacity required)
+                (throw (ex-info "graph buffer does not enforce the certified map read span"
+                                {:reason :map-address-certificate-capacity
+                                 :buffer id :required required :capacity capacity})))))
+        substitutions (address-substitutions (:source-locals attached))
+        rewrite
+        (fn [expression]
+          (descriptor/rewrite-aget-reads
+           expression
+           (fn [read]
+             (when (contains? (:inputs operation) (descriptor/aget-array-sym read))
+               (descriptor/rewrite-aget-index
+                read
+                (algebra/canonical-arithmetic
+                 ;; Host definitions justify the span but are not kernel captures. Preserve the
+                 ;; source operation's derived scalar here; replacing it with its host expression
+                 ;; would inject uncaptured public symbols into this node.
+                 (util/subst-syms substitutions (descriptor/aget-index read))))))))
+        region (:scalar-region operation)
+        locals (mapv #(update % :init rewrite) (:locals region))
+        result (rewrite (:result region))
+        locals (retain-live-locals locals result)]
+    (-> operation
+        (assoc :scalar-region (assoc region :locals locals :result result))
+        (assoc :address-projection
+               {:kind :certified-index-expression
+                :certificate-kind (:kind attached)
+                :requirements (:requirements attached)}))))
 
 (defn static-read-requirements
   "Optional all-load proof for a plain, positive static, one-dimensional result map.

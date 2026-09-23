@@ -531,8 +531,10 @@
                                :group-count [(launch/ceil-div '_n_bound workgroup-size)]}))
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
-       :attributes {:kind :portable-segmap :extent bound :no-write-alias true
-                    :effect-iteration-order iteration-order}})
+       :attributes (cond-> {:kind :portable-segmap :extent bound :no-write-alias true
+                            :effect-iteration-order iteration-order}
+                     (:address-projection segmap)
+                     (assoc :address-projection (:address-projection segmap)))})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))
 
 (defn validate-static-graph-capacities!
