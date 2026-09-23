@@ -1,6 +1,7 @@
 (ns raster.compiler.core.util
   "Shared utilities for the compiler pipeline."
   (:require [clojure.set :as set]
+            [clojure.string :as str]
             [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
@@ -115,10 +116,15 @@
   [smap]
   (apply set/union #{} (map free-syms (vals smap))))
 
+(def ^:dynamic *fresh-binder*
+  "Binder allocator used by alpha-convert.  Kept dynamic so the same scope-aware
+   traversal can also assign deterministic names for canonical compiler artifacts."
+  (fn [sym] (with-meta (gensym (str (name sym) "_α_")) (meta sym))))
+
 (defn- fresh-like
   "A fresh gensym carrying sym's metadata, suffixed _α_ for traceability."
   [sym]
-  (with-meta (gensym (str (name sym) "_α_")) (meta sym)))
+  (*fresh-binder* sym))
 
 (declare subst-syms remake-from)
 
@@ -259,6 +265,41 @@
      (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
      (set? form) (into (empty form) (map #(alpha-convert env %) form))
      :else form)))
+
+(defn alpha-normalize
+  "Canonicalize compiler freshness suffixes on lexical binders in a closed-core form.
+
+   Unlike `alpha-convert`, this is deterministic across invocations and JVMs.
+   It uses the same `form/scope-info` traversal, so shadowing, sequential and
+   recursive bindings, Fold locals, and ftm source bodies retain exactly the
+   hygiene semantics of alpha conversion. Readable semantic stems are retained;
+   duplicate stems are disambiguated by deterministic binding order. Free
+   symbols are unchanged and reserved when allocating binder names."
+  [form]
+  (let [free (free-syms form)
+        used (volatile! free)
+        ordinals (volatile! {})
+        stable-stem (fn [name]
+                      (-> name
+                          (str/replace #"_α_[0-9]+(?:_[0-9]+)*$" "")
+                          ;; Clojure gensym accepts both `prefix_` and `prefix__`
+                          ;; conventions; normalize their trailing counter.
+                          (str/replace #"__?[0-9]+$" "")))
+        allocate (fn [original]
+                   (let [stem (stable-stem (name original))
+                         ns-name (namespace original)]
+                     (loop [ordinal (get @ordinals [ns-name stem] 0)]
+                       (let [candidate-name (if (zero? ordinal)
+                                              stem
+                                              (str stem "_" ordinal))
+                             candidate (symbol ns-name candidate-name)]
+                         (if (contains? @used candidate)
+                           (recur (inc ordinal))
+                           (do (vswap! ordinals assoc [ns-name stem] (inc ordinal))
+                               (vswap! used conj candidate)
+                               (with-meta candidate (meta original))))))))]
+    (binding [*fresh-binder* allocate]
+      (alpha-convert form))))
 
 (declare uniquify*)
 

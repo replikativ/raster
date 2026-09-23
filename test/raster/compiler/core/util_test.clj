@@ -293,6 +293,31 @@
           a' (nth binds 0) b-init (nth binds 3)]
       (is (= a' b-init) "b's init references the renamed a, not a stale name"))))
 
+(deftest alpha-normalize-test
+  (testing "compiler-fresh alpha-equivalent programs receive the same canonical form"
+    (is (= (util/alpha-normalize
+            '(let* [body_result_123 1 fold_value__456 (+ body_result_123 2)]
+               (+ fold_value__456 free)))
+           (util/alpha-normalize
+            '(let* [body_result_987 1 fold_value__654 (+ body_result_987 2)]
+               (+ fold_value__654 free))))))
+  (testing "canonical names are stable, readable, and do not capture a free symbol"
+    (let [form '(let* [x x] (let* [x 2] (+ x x)))
+          first-pass (util/alpha-normalize form)
+          second-pass (util/alpha-normalize form)
+          [_ bindings nested] first-pass]
+      (is (= first-pass second-pass))
+      (is (= 'x_1 (first bindings)))
+      (is (= 'x_2 (first (second nested))))
+      (is (= #{'x} (util/free-syms first-pass)))))
+  (testing "metadata needed by lowering remains on canonical binders and references"
+    (let [binder (with-meta 'x {:raster.type/tag 'floats})
+          reference (with-meta 'x {:use :reference})
+          result (util/alpha-normalize (list 'let* [binder 1] reference))
+          canonical (first (second result))]
+      (is (= 'floats (:raster.type/tag (meta canonical))))
+      (is (= :reference (:use (meta (nth result 2))))))))
+
 
 ;; ── alpha-convert SEPARATES duplicate bound names; postwalk-replace COLLAPSES them ──
 (deftest alpha-convert-separates-duplicate-bound-names
