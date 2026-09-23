@@ -130,6 +130,28 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"symbol or keyword"
                           (graph/scalar 42 :int)))))
 
+(deftest public-graph-interface-deduplicates-logical-scalars-across-physical-roles
+  (let [abi [(kabi/slot 'values :input :float)
+             (kabi/slot 'row-width :scalar :long)
+             (kabi/slot 'component-width :scalar :long)
+             (kabi/slot 'scale :scalar :float)
+             (kabi/slot 'result :output :float)]
+        interface (graph/public-interface abi '[values width width alpha result])]
+    (is (= '[values row-width scale result] (mapv :name (:abi interface))))
+    (is (= '[values width alpha result] (:arguments interface)))
+    (is (= [(graph/scalar 'width :long) (graph/scalar 'alpha :float)]
+           (graph/interface-scalars (:abi interface) (:arguments interface))))
+    (is (= :kernel-graph-scalar-interface-dtype
+           (try
+             (graph/public-interface
+             [(kabi/slot 'long-width :scalar :long)
+               (kabi/slot 'int-width :scalar :int)
+               (kabi/slot 'result :output :float)]
+              '[width width result])
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
+
 (deftest ordered-output-vectors-retain-write-access
   (let [operation (segop/->SegFoldMap
                    10 (segop/make-seg-space 'segment 'nsegments)

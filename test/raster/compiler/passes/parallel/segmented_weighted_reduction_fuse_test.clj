@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-fuse-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.walk :as walk]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -96,6 +97,20 @@
            (:runtime-parameters plan)))
     (is (= 'entities2 (get-in plan [:segment-axes 0 :extent])))
     (is (= 'width2 (get-in plan [:storage :total-dim])))))
+
+(deftest marker-rebinding-deduplicates-identified-single-head-dimensions
+  (let [single-head (walk/postwalk-replace
+                     {'dk 'emb-dim 'n-heads 1}
+                     (chain))
+        {:keys [form stats]} (fuse/fuse single-head :float)
+        marker (second (last (mapv vec (partition 2 (second form)))))
+        plan (fuse/marker-plan marker :float)]
+    (is (= {:segmented-weighted-reductions-fused 1} stats))
+    (is (= '[n-nodes n-edges emb-dim 1]
+           (:runtime-parameters plan)))
+    (is (= 'emb-dim (get-in plan [:score :axis :extent])))
+    (is (= 'emb-dim (get-in plan [:storage :total-dim])))
+    (is (= 1 (get-in plan [:segment-axes 1 :extent])))))
 
 (deftest an-unproved-chain-remains-the-identical-fallback-form
   (let [original (chain)

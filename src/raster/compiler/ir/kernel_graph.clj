@@ -87,14 +87,36 @@
   "Remove target-private scalar literals and arithmetic from an artifact-style interface.
 
    Pointer arguments and stable symbolic scalar identities form the callable graph boundary.
-   Literal dimensions and derived integer expressions remain node-private specialization facts."
+   Literal dimensions and derived integer expressions remain node-private specialization facts.
+   A physical kernel may consume one logical scalar in several ABI roles (for example a single-
+   head reduction whose row width is also its component width); expose that logical value once
+   while the ScheduledKernel retains every physical slot."
   [abi arguments]
   (kabi/validate-arguments! abi arguments)
-  (let [pairs (filterv (fn [[slot argument]]
-                         (or (not= :scalar (:kind slot))
-                             (symbol? argument)
-                             (keyword? argument)))
-                       (mapv vector abi arguments))]
+  (let [[pairs _]
+        (reduce
+         (fn [[pairs scalar-dtypes] [slot argument :as pair]]
+           (cond
+             (not= :scalar (:kind slot))
+             [(conj pairs pair) scalar-dtypes]
+
+             (not (or (symbol? argument) (keyword? argument)))
+             [pairs scalar-dtypes]
+
+             (contains? scalar-dtypes argument)
+             (let [prior (get scalar-dtypes argument)
+                   current (dtype/canon (:dtype slot))]
+               (when-not (= prior current)
+                 (throw (ex-info "one public graph scalar has incompatible physical ABI dtypes"
+                                 {:reason :kernel-graph-scalar-interface-dtype
+                                  :argument argument :prior prior :current current})))
+               [pairs scalar-dtypes])
+
+             :else
+             [(conj pairs pair)
+              (assoc scalar-dtypes argument (dtype/canon (:dtype slot)))]))
+         [[] {}]
+         (map vector abi arguments))]
     {:abi (mapv first pairs)
      :arguments (mapv second pairs)}))
 

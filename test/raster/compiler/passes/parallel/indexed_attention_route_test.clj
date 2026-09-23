@@ -106,6 +106,7 @@
     (is (= '[Q K V dst src normalized
              n_entities n_edges total_dim n_heads n_components output_elements]
            (mapv :name (:abi artifact))))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
     (is (= '[Q K V dst src normalized n-nodes n-edges emb-dim n-heads dk]
            (vec (butlast (:arguments artifact))))
         "the final target-private extent has explicit arithmetic IR")

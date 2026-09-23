@@ -235,6 +235,7 @@
                    :algebra-plan-id (:id plan)
                    :lowering :direct-dynamic-reference}
       :attributes {:strategy :indexed-segmented-reduction-reference
+                   :emission-route :kernel-body
                    :optimization-tier :reference
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)
@@ -293,6 +294,7 @@
                    :algebra-plan-id (:id plan)
                    :lowering :destination-score-reuse}
       :attributes {:strategy :indexed-segmented-reduction-subgroup-score-reuse
+                   :emission-route :kernel-body
                    :optimization-tier :subgroup
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)
@@ -341,6 +343,7 @@
                    :algebra-plan-id (:id plan)
                    :lowering :direct-reference}
       :attributes {:strategy :indexed-segmented-reduction-reference
+                   :emission-route :kernel-body
                    :optimization-tier :reference
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)

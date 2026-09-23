@@ -1,9 +1,9 @@
 {:target-device :ocl:0,
  :dtype :float,
  :summary
- {:total 237,
-  :typed-soac 210,
-  :scalar 21,
+ {:total 243,
+  :typed-soac 217,
+  :scalar 20,
   :host-only 5,
   :typed-structured-control 1},
  :vars
@@ -210,6 +210,10 @@
    :route :typed-soac,
    :typed-validated true,
    :declines []}
+  {:var raster.dl.attention/attn-prefill-out-strided!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.attention/attn-prefill-scores!,
    :route :typed-soac,
    :typed-validated true,
@@ -256,6 +260,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/batched-causal-sdpa-dv,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/bidirectional-sdpa,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
@@ -333,10 +341,9 @@
    :typed-validated false,
    :declines []}
   {:var raster.dl.attention/graph-attention,
-   :route :scalar,
-   :typed-validated false,
-   :declines
-   [{:reason :typed-soac-source-coverage, :kind :typed-soac-declined}]}
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.attention/kv-append!,
    :route :typed-soac,
    :typed-validated true,
@@ -378,6 +385,11 @@
    :declines [],
    :effect-orders {:independent 1}}
   {:var raster.dl.attention/rope-prefill!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines [],
+   :effect-orders {:independent 1}}
+  {:var raster.dl.attention/rope-prefill-strided!,
    :route :typed-soac,
    :typed-validated true,
    :declines [],
@@ -563,7 +575,8 @@
   {:var raster.dl.nn/conv2d-rearrange-dy!,
    :route :typed-soac,
    :typed-validated true,
-   :declines []}
+   :declines [],
+   :effect-orders {:independent 1}}
   {:var raster.dl.nn/dropout,
    :route :typed-soac,
    :typed-validated true,
@@ -599,6 +612,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/gelu-erf!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.nn/gelu-erf-mul-strided!,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
@@ -646,6 +663,8 @@
    :declines []}
   {:var raster.dl.nn/he-init,
    :route :host-only,
+   :typed-validated false,
+   :declines [],
    :host-contract :explicit}
   {:var raster.dl.nn/im2col-1d,
    :route :typed-soac,
@@ -700,6 +719,14 @@
    :typed-validated true,
    :declines [],
    :effect-orders {:independent 1}}
+  {:var raster.dl.nn/layer-norm-reassociated,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.nn/layer-norm-reassociated!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
   {:var raster.dl.nn/leaky-relu,
    :route :typed-soac,
    :typed-validated true,
@@ -891,6 +918,8 @@
    :effect-orders {:independent 1}}
   {:var raster.dl.nn/xavier-init,
    :route :host-only,
+   :typed-validated false,
+   :declines [],
    :host-contract :explicit}
   {:var raster.dl.optim/adam-step!,
    :route :typed-soac,
