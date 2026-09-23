@@ -197,6 +197,8 @@
 (def ^:private ^:const CBLAS_ROW_MAJOR (int 101))
 (def ^:private ^:const CBLAS_NO_TRANS  (int 111))
 (def ^:private ^:const CBLAS_TRANS     (int 112))
+(def ^:private ^:const CBLAS_PACKED    (int 151))
+(def ^:private ^:const CBLAS_B_MATRIX  (int 162))
 
 ;; ================================================================
 ;; cblas_dgemm — general matrix multiply
@@ -313,6 +315,113 @@
                 ValueLayout/JAVA_INT])))  ;; ldc
 
 (def ^:private sgemm-mh (delay (make-handle "cblas_sgemm" sgemm-fd)))
+
+;; oneMKL's optional packed-GEMM extension. Packed storage is deliberately an
+;; opaque, closeable object: its format is backend-private, depends on M/N/K,
+;; and must remain at the address where MKL created its internal metadata.
+(def ^:private sgemm-pack-get-size-fd
+  (FunctionDescriptor/of
+   ValueLayout/JAVA_LONG
+   (into-array MemoryLayout
+               [ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT ValueLayout/JAVA_INT])))
+
+(def ^:private sgemm-pack-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout
+               [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_FLOAT ValueLayout/ADDRESS ValueLayout/JAVA_INT
+                ValueLayout/ADDRESS])))
+
+(def ^:private sgemm-compute-fd
+  (FunctionDescriptor/ofVoid
+   (into-array MemoryLayout
+               [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT
+                ValueLayout/ADDRESS ValueLayout/JAVA_INT
+                ValueLayout/JAVA_FLOAT ValueLayout/ADDRESS ValueLayout/JAVA_INT])))
+
+(def ^:private sgemm-pack-get-size-mh
+  (delay (make-optional-handle "cblas_sgemm_pack_get_size" sgemm-pack-get-size-fd)))
+(def ^:private sgemm-pack-mh
+  (delay (make-optional-handle "cblas_sgemm_pack" sgemm-pack-fd)))
+(def ^:private sgemm-compute-mh
+  (delay (make-optional-handle "cblas_sgemm_compute" sgemm-compute-fd)))
+
+(declare dgemm-nt!)
+
+(defrecord PackedSgemmNtB [raw packed arena m k n alpha bytes backend closed]
+  java.lang.AutoCloseable
+  (close [_]
+    (when (compare-and-set! closed false true)
+      (when (and arena (.isAlive (.scope ^Arena arena)))
+        (.close ^Arena arena)))))
+
+(defn pack-sgemm-nt-b
+  "Prepare a fixed-shape F32 B operand for repeated `A @ B^T` calls.
+
+  oneMKL receives aligned, address-stable native storage and bakes `alpha` plus
+  the exact M/N/K shape into its private format. Callers must close the returned
+  value (prefer `with-open`). Backends without the optional MKL extension return
+  the same closeable contract backed by the original array; compute then falls
+  back to ordinary CBLAS. Packed objects are not portable across shapes."
+  [^floats B m k n alpha]
+  (let [m (long m) k (long k) n (long n) alpha (float alpha)
+        get-size @sgemm-pack-get-size-mh
+        pack @sgemm-pack-mh
+        compute @sgemm-compute-mh]
+    (when-not (= (alength B) (* n k))
+      (throw (ex-info "SGEMM B size does not match n*k"
+                      {:length (alength B) :m m :k k :n n})))
+    (if (and get-size pack compute (pos? m) (pos? k) (pos? n))
+      (let [bytes (long (.invokeWithArguments ^java.lang.invoke.MethodHandle get-size
+                                              [CBLAS_B_MATRIX (int m) (int n) (int k)]))
+            arena (Arena/ofShared)]
+        (try
+          (let [storage (.allocate arena bytes 64)]
+            (.invokeWithArguments ^java.lang.invoke.MethodHandle pack
+                                  [CBLAS_ROW_MAJOR CBLAS_B_MATRIX CBLAS_TRANS
+                                   (int m) (int n) (int k) alpha
+                                   (MemorySegment/ofArray B) (int k) storage])
+            (->PackedSgemmNtB nil storage arena m k n alpha bytes :mkl-packed
+                              (atom false)))
+          (catch Throwable error
+            (.close arena)
+            (throw error))))
+      (->PackedSgemmNtB B nil nil m k n alpha (* 4 (alength B)) :portable
+                        (atom false)))))
+
+(defn sgemm-nt-prepacked!
+  "Compute `C := packed-alpha * A @ B^T + beta*C` with a value returned by
+  `pack-sgemm-nt-b`. Shape mismatches fail rather than silently repacking."
+  [^floats A ^PackedSgemmNtB prepared ^floats C m k n beta]
+  (let [m (long m) k (long k) n (long n) beta (float beta)]
+    (when @(:closed prepared)
+      (throw (ex-info "prepacked SGEMM storage is closed" {:shape [m k n]})))
+    (when-not (= [m k n] [(:m prepared) (:k prepared) (:n prepared)])
+      (throw (ex-info "prepacked SGEMM shape mismatch"
+                      {:requested [m k n]
+                       :prepared [(:m prepared) (:k prepared) (:n prepared)]})))
+    (when-not (= (alength A) (* m k))
+      (throw (ex-info "SGEMM A size does not match m*k"
+                      {:length (alength A) :m m :k k :n n})))
+    (when-not (= (alength C) (* m n))
+      (throw (ex-info "SGEMM C size does not match m*n"
+                      {:length (alength C) :m m :k k :n n})))
+    (if-let [^MemorySegment storage (:packed prepared)]
+      (do
+        (when-not (.isAlive (.scope storage))
+          (throw (ex-info "prepacked SGEMM storage is closed" {:shape [m k n]})))
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-compute-mh
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_PACKED
+                               (int m) (int n) (int k)
+                               (MemorySegment/ofArray A) (int k)
+                               storage (int 0) beta
+                               (MemorySegment/ofArray C) (int n)]))
+      (dgemm-nt! A (:raw prepared) C m k n (:alpha prepared) beta))
+    C))
 
 (deftm ^:no-inline dgemm!
   [A :- (Array float) B :- (Array float) C :- (Array float)
