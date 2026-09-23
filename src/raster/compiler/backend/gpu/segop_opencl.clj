@@ -380,9 +380,11 @@
                     (try
                       (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
                       (catch clojure.lang.ExceptionInfo exception
-                        ;; A structural span is still useful when a quotient-derived buffer
-                        ;; expression cannot prove the minimum without a retained relational
-                        ;; contract. Keep checked scalar address arithmetic in that case.
+                        ;; A structural read span is useful graph information even when the
+                        ;; current buffer expression does not prove that minimum (for example a
+                        ;; quotient-derived GQA extent without a retained divisibility contract).
+                        ;; Keep checked scalar address arithmetic in that case; malformed or stale
+                        ;; certificates remain hard compiler failures.
                         (if (= :map-address-certificate-capacity
                                (:reason (ex-data exception)))
                           segmap

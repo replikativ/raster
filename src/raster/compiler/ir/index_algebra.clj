@@ -67,6 +67,12 @@
   (let [expression (strip-cast expression)
         record (record-name expression)]
     (cond
+      (and (map? expression)
+           (= #{:const :factors} (set (keys expression)))
+           (integer? (:const expression)) (<= 0 (:const expression))
+           (vector? (:factors expression)) (every? symbol? (:factors expression)))
+      {:const (long (:const expression)) :factors (vec (sort (:factors expression)))}
+
       (= "RuntimeValue" record) (monomial (:value expression))
       (= "IndexCast" record) (monomial (:argument expression))
       (= "Product" record)
@@ -292,6 +298,17 @@
            :else state)))
      initial
      locals)))
+
+(declare complete-digits)
+
+(defn digit-radix
+  "Return the normalized radix of one recovered mixed-radix digit, or nil.
+
+   This is a range witness for nested counted loops: if a loop upper bound is a map digit, the
+   digit's radix is a conservative invariant loop extent even when the loop is triangular
+   (`0..digit`). The caller must still establish zero-based unit-step iteration."
+  [index extent locals digit]
+  (get-in (complete-digits (digits index extent locals) index) [:digits digit :radix]))
 
 (defn- complete-digits
   "Resolve the map index's own radix (its extent) once every scalar local is known, under the

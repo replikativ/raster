@@ -41,3 +41,48 @@
     (is (nil? (requirements/symbolic-read-requirements
                (packed-head-map coordinate)
                {:scalar-definitions {'total (launch/product 'rows 'heads 'width)}})))))
+
+(deftest ordered-loop-read-span-includes-the-counted-axis
+  (let [operation
+        (segop/map->SegMap
+         {:id :row-dot :space (segop/make-seg-space 'row 'rows)
+          :inputs #{'input} :outputs #{'output} :scalars '#{rows width}
+          :dtype :float :out-sym 'output
+          :scalar-region
+          {:locals []
+           :result
+           '(loop* [d 0 acc 0.0]
+              (if (< (long d) (long width))
+                (recur (inc (long d))
+                       (+ acc (aget input (+ (* row width) d))))
+                acc))}})
+        certificate (requirements/symbolic-read-certificate operation {})]
+    (is (= {'input (launch/product 'rows 'width)} (:requirements certificate)))
+    (is (= {'d 'width} (get-in certificate [:reads 0 :loop-indices])))
+    (is (= '(clojure.core/+ (clojure.core/* row width) d)
+           (get-in certificate [:reads 0 :projected-coordinate])))))
+
+(deftest triangular-fold-uses-the-enclosing-digit-radix-as-a-safe-loop-bound
+  (let [operation
+        (segop/map->SegMap
+         {:id :triangular-row :space (segop/make-seg-space 'bi '(clojure.core/* batch seq-len))
+          :inputs #{'input} :outputs #{'output} :scalars '#{batch seq-len}
+          :dtype :float :out-sym 'output
+          :scalar-region
+          {:locals
+           '[{:id b :dtype :long :init (quot bi seq-len)}
+             {:id i :dtype :long :init (rem bi seq-len)}
+             {:id base :dtype :long
+              :init (+ (* b (* seq-len seq-len)) (* i seq-len))}
+             {:id sum :dtype :float
+              :init (fold {:accumulator acc, :index j, :identity 0.0, :lower 0,
+                           :dtype :float, :extent i, :association :ordered,
+                           :upper-bound :inclusive}
+                          (lambda [acc j]
+                            (region [] [(+ acc (aget input (+ base j)))])))}]
+           :result 'sum}})
+        certificate (requirements/symbolic-read-certificate operation {})]
+    (is (= {'input (launch/product 'batch 'seq-len 'seq-len)}
+           (:requirements certificate)))
+    (is (= {:const 1 :factors '[seq-len]}
+           (get-in certificate [:reads 0 :loop-indices 'j])))))
