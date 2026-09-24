@@ -82,3 +82,6 @@ when the source step cannot be matched, or when the selected replay order overla
 per-replay ordering still leaves cross-replay full initialization, completion/escape, and physical
 alias realization open. In particular, a prologue-produced temporary read on each replay must
 not be recycled for a later temporary in the same replay: it would corrupt the next invocation.
+Only an ABI-certified complete first overwrite of both single-view allocations, in the witnessed
+per-replay order, discharges the cross-replay initialization obligation. A legacy descriptor's
+write permission alone never does. Completion/escape and physical alias realization remain open.

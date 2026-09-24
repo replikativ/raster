@@ -41,6 +41,8 @@
      :alignment (:alignment allocation)
      :dtype (when (= 1 (count node-facts)) (:dtype (first node-facts)))
      :first-order first-order :last-order last-order
+     :first-complete-write? (boolean (and (= :write (:access (first events)))
+                                          (:complete-write? (first events))))
      :reason reason}))
 
 (defn- compatible? [left right]
@@ -91,9 +93,10 @@
 (defn report
   "Find ordered, compatible local storage pairs without changing the LinkPlan.
 
-   A proposal is *not* a reuse proof: it omits runtime event completion, cross-plan escapes,
-   and the alias/rebinding validation needed before allocation. No aggregate byte saving is
-   claimed, since proposals can compete for the same allocation."
+   An optional linked execution-order witness can discharge selected-order and certified
+   cross-replay overwrite obligations. A proposal is *not* a reuse proof: it still omits runtime
+   event completion, cross-plan escapes, and alias/rebinding validation before allocation.
+   No aggregate byte saving is claimed, since proposals can compete for the same allocation."
   ([plan] (report plan nil))
   ([plan execution-order]
   (let [memory (link/memory-report plan)
@@ -131,6 +134,9 @@
                                         (runtime-order-assessment ordered-accesses
                                                                   left-id right-id
                                                                   execution-order))]
+                       (let [replay-initialized? (and (= :witnessed (:status assessment))
+                                                      (:first-complete-write? left)
+                                                      (:first-complete-write? right))]
                        (cond-> {:from left-id :to right-id
                                 :after-order (:last-order left)
                                 :before-order (:first-order right)
@@ -146,7 +152,12 @@
                                                    :completion-and-escape
                                                    :cross-replay-initialization}
                                            (= :witnessed (:status assessment))
-                                           (disj :runtime-order)))))))]
+                                           (disj :runtime-order)
+                                           replay-initialized?
+                                           (disj :cross-replay-initialization)))
+                         execution-order
+                         (assoc :cross-replay-initialization
+                                (if replay-initialized? :witnessed :unproven)))))))]
     {:plan (:plan memory)
      :slots slots
      :proposals proposals
