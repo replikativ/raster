@@ -31,10 +31,17 @@
 (defn- route-values
   [problem values]
   (let [route (:route problem)]
-    (if (attention/dense-paged-route? route)
+    (cond
+      (attention/dense-packed-route? route)
+      {:row-offsets (get values (:row-offsets route))
+       :start-positions (get values (:start-positions route))}
+
+      (attention/dense-paged-route? route)
       {:page-table (get values (:page-table route))
        :lengths (get values (:lengths route))
        :start-positions (get values (:start-positions route))}
+
+      :else
       {:page-offsets (get values (:page-offsets route))
        :page-indices (get values (:page-indices route))
        :last-page-lengths (get values (:last-page-lengths route))
@@ -72,30 +79,48 @@
 (defn- route-row
   [problem values batch]
   (let [{:keys [route page-size]} problem]
-    (if (attention/dense-paged-route? route)
+    (cond
+      (attention/dense-packed-route? route)
+      (let [offsets (get values (:row-offsets route))
+            begin (nth offsets batch)]
+        {:length (- (nth offsets (inc batch)) begin)
+         :start-position (nth (get values (:start-positions route)) batch)
+         ;; The internal :page field is a physical token ordinal for packed storage; the
+         ;; token-head-major address formula below interprets it without page arithmetic.
+         :physical-address (fn [token] {:page (+ begin token) :page-token 0})})
+
+      (attention/dense-paged-route? route)
       (let [lengths (get values (:lengths route))
             pages (get values (:page-table route))
             pages-per-sequence (:pages-per-sequence route)]
         {:length (nth lengths batch)
          :start-position (nth (get values (:start-positions route)) batch)
-         :physical-page
-         (fn [logical-page]
-           (nth pages (+ (* batch pages-per-sequence) logical-page)))})
+         :physical-address
+         (fn [token]
+           {:page (nth pages (+ (* batch pages-per-sequence) (quot token page-size)))
+            :page-token (rem token page-size)})})
+
+      :else
       (let [offsets (get values (:page-offsets route))
             indices (get values (:page-indices route))
             lasts (get values (:last-page-lengths route))
             page-begin (nth offsets batch)
-            page-end (nth offsets (inc batch))
-            page-count (- page-end page-begin)]
+            page-count (- (nth offsets (inc batch)) page-begin)]
         {:length (if (zero? page-count)
                    0
                    (+ (* (dec page-count) page-size) (nth lasts batch)))
          :start-position (nth (get values (:start-positions route)) batch)
-         :physical-page (fn [logical-page] (nth indices (+ page-begin logical-page)))}))))
+         :physical-address
+         (fn [token]
+           {:page (nth indices (+ page-begin (quot token page-size)))
+            :page-token (rem token page-size)})}))))
 
 (defn- cache-index
   [{:keys [physical-pages page-size kv-heads]} layout dim kv-head page token d]
   (case layout
+    :token-head-major
+    (+ (* (+ (* page kv-heads) kv-head) dim) d)
+
     :kv-head-major
     (+ (* (+ (* (+ (* kv-head physical-pages) page) page-size) token) dim) d)
 
@@ -110,14 +135,14 @@
 
 (defn- attention-row
   [problem values query-token query-head batch]
-  (let [{:keys [query k-pages q-heads kv-heads qk-head-dim page-size scale k-layout
+  (let [{:keys [query k-pages q-heads kv-heads qk-head-dim scale k-layout
                 visibility]} problem
         q (get values (:values query))
         k (get values k-pages)
         query-position (nth (get values (:positions query)) query-token)
         kv-head (quot query-head (quot q-heads kv-heads))
         q-base (* (+ (* query-token q-heads) query-head) qk-head-dim)
-        {:keys [length start-position physical-page]} (route-row problem values batch)
+        {:keys [length start-position physical-address]} (route-row problem values batch)
         logical-tokens
         (if (attention/csr-visibility? visibility)
           (let [row-offsets (get values (:row-offsets visibility))
@@ -131,8 +156,7 @@
               (keep (fn [token]
                       (let [kv-position (+ start-position token)]
                         (when (visible? position-filter query-position kv-position)
-                          (let [page (physical-page (quot token page-size))
-                                page-token (rem token page-size)
+                          (let [{:keys [page page-token]} (physical-address token)
                                 k-base (cache-index problem k-layout qk-head-dim
                                                     kv-head page page-token 0)
                                 logit
