@@ -314,6 +314,37 @@
                           (gpu/profile-recorded-graph!
                            (atom {:device-id :ze:0 :graphs {:plain graph}}) :plain)))))
 
+(deftest linked-profile-attributes-device-events-to-compiler-steps
+  (let [instance-id [:encoder :layer-0]
+        phase [::gpu-link/phase :execution instance-id 1]
+        measured {:profile [{:kernel-name "segmap_42" :phase phase :ms 2.0}
+                            {:kernel-name "prologue" :phase :unmapped :ms 0.5}]
+                  :kernel-total-ms 2.5 :device-wall-ms 2.5}
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:instances [{:id instance-id
+                                         :descriptor
+                                         {:steps [{:convention :map}
+                                                  {:convention :map
+                                                   :artifact
+                                                   {:provenance
+                                                    {:dialect :segmap
+                                                     :segop-id [:map :scores]
+                                                     :operation-id :scores
+                                                     :debug-only :excluded}}}]}}]}
+                     :session :session :graph-key :graph
+                     :pending-inputs (atom #{}) :closed? (atom false)})]
+    (with-redefs [gpu/profile-recorded-graph! (fn [session graph]
+                                                (is (= [:session :graph] [session graph]))
+                                                measured)]
+      (let [profile (gpu-link/profile! executable)]
+        (is (= 2.5 (:device-wall-ms profile)))
+        (is (= {:instance-id instance-id :step-index 1 :convention :map
+                :provenance {:dialect :segmap :segop-id [:map :scores]
+                             :operation-id :scores}}
+               (get-in profile [:profile 0 :compiler-step])))
+        (is (= (second (:profile measured)) (second (:profile profile)))
+            "unmapped phases remain intact instead of receiving guessed provenance")))))
+
 (deftest spike-two-instance-link
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "C.spike 2-instance link")
