@@ -57,7 +57,10 @@ latency against a frozen baseline. Merge green, reviewable slices rather than st
 refactors.
 
 After the observation and witness seams, alternate memory slices with the existing city typed
-effectful-loop/helper/constant work and Laya attention/quantized-kernel benchmarks. Those are
+effectful-loop/helper/constant work and Laya attention/quantized-kernel benchmarks. The immediate
+city gate is the day-kernel episode loop with a guarded inner search followed by an atomic effect;
+the nested two-exit spelling has an equivalent supported single-exit form and is a later language
+ergonomics task. Those are
 real workload oracles for the broader compiler agenda, not reasons to postpone memory planning
 until a cluster scheduler exists. Revisit external JAX/MLIR/Mojo and scientific/LLM baselines at
 measured milestones, not in every edit/test cycle.

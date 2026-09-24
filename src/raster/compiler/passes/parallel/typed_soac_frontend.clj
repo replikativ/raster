@@ -1565,8 +1565,12 @@
   [loops]
   (mapcat (fn [loop] (cons loop (loop-tree (:loops loop)))) loops))
 
-(defn- source-loop-expressions [{:keys [lower extent locals carry loops]}]
+(defn- source-loop-expressions [{:keys [lower extent locals order carry loops]}]
+  ;; Ordered regions inside an effect loop may guard a store or bind a scalar search result
+  ;; before that store. Both are reads of the enclosing equation even though neither is a
+  ;; loop bound or a store leaf. Omitting them loses array/scalar captures and the read effect.
   (concat [lower extent] (map :init locals)
+          (map :init (order-locals order)) (order-predicates order)
           (when carry [(:init carry) (:update carry)])
           (mapcat source-loop-expressions loops)))
 
@@ -1606,11 +1610,13 @@
         loops (vec (map-indexed (fn [ordinal loop]
                                   (rename-loop-tree loop [ordinal]))
                                 (or loops [])))
+        loop-region-locals (vec (mapcat #(order-locals (:order %)) (loop-tree loops)))
         local-types (into (into (into (assoc scalar-types index :long)
                                      (map (juxt :id :dtype)) analysis-locals)
                                 (keep (fn [{:keys [result result-dtype]}]
                                         (when result [result result-dtype]))) stores)
-                          (map (fn [loop] [(:index loop) :long]) (loop-tree loops)))]
+                          (concat (map (fn [loop] [(:index loop) :long]) (loop-tree loops))
+                                  (map (juxt :id :dtype) loop-region-locals)))]
     (when (and (or (seq stores) (seq loops))
                (every? (fn [{:keys [lower extent carry]}]
                          (or (nil? carry)
@@ -1757,7 +1763,8 @@
                                     (= 1 (count (set (map :effect-conflict grouped)))))
                                   (group-by :out all-stores)))
             all-locals (vec (concat analysis-locals
-                                    (mapcat :locals (loop-tree loops))))
+                                    (mapcat :locals (loop-tree loops))
+                                    loop-region-locals))
             loop-expressions (mapcat source-loop-expressions loops)
             scoped-predicates (order-predicates order)
             all-effect-loops (vec (loop-tree loops))
