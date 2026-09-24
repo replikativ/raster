@@ -799,19 +799,26 @@
                 (fn [events]
                   (mapv
                    (fn [{:keys [phase] :as event}]
-                     (let [[kind _ instance-id step-index] (when (vector? phase) phase)
+                     (let [nested? (and (vector? phase)
+                                        (= ::gpu/graph-node-phase (first phase)))
+                           parent-phase (if nested? (second phase) phase)
+                           node-id (when nested? (nth phase 2 nil))
+                           [kind _ instance-id step-index]
+                           (when (vector? parent-phase) parent-phase)
                            step (when (and (= ::phase kind) (integer? step-index)
                                            (not (neg? step-index)))
                                   (get-in instances [instance-id :descriptor :steps step-index]))]
                        (if step
                          (assoc event :compiler-step
-                                {:instance-id instance-id
-                                 :step-index step-index
-                                 :convention (:convention step)
-                                 :provenance (select-keys (get-in step [:artifact :provenance])
-                                                          [:semantic-op :dialect :source-dialect
-                                                           :segop-id :operation-id :strategy
-                                                           :variant])})
+                                (cond->
+                                 {:instance-id instance-id
+                                  :step-index step-index
+                                  :convention (:convention step)
+                                  :provenance (select-keys (get-in step [:artifact :provenance])
+                                                           [:semantic-op :dialect :source-dialect
+                                                            :segop-id :operation-id :strategy
+                                                            :variant])}
+                                  nested? (assoc :graph-node-id node-id)))
                          event)))
                    events)))))))
 

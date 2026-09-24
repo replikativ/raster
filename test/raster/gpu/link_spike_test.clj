@@ -318,12 +318,20 @@
   (let [instance-id [:encoder :layer-0]
         phase [::gpu-link/phase :execution instance-id 1]
         measured {:profile [{:kernel-name "segmap_42" :phase phase :ms 2.0}
+                            {:kernel-name "contract_tile"
+                             :phase [::gpu/graph-node-phase
+                                     [::gpu-link/phase :execution instance-id 0]
+                                     :tile]
+                             :ms 1.0}
                             {:kernel-name "prologue" :phase :unmapped :ms 0.5}]
-                  :kernel-total-ms 2.5 :device-wall-ms 2.5}
+                  :kernel-total-ms 3.5 :device-wall-ms 3.5}
         executable (gpu-link/map->LinkedExecutable
                     {:plan {:instances [{:id instance-id
                                          :descriptor
-                                         {:steps [{:convention :map}
+                                         {:steps [{:convention :contract
+                                                  :artifact {:provenance
+                                                             {:semantic-op :contraction
+                                                              :operation-id :projection}}}
                                                   {:convention :map
                                                    :artifact
                                                    {:provenance
@@ -337,12 +345,16 @@
                                                 (is (= [:session :graph] [session graph]))
                                                 measured)]
       (let [profile (gpu-link/profile! executable)]
-        (is (= 2.5 (:device-wall-ms profile)))
+        (is (= 3.5 (:device-wall-ms profile)))
         (is (= {:instance-id instance-id :step-index 1 :convention :map
                 :provenance {:dialect :segmap :segop-id [:map :scores]
                              :operation-id :scores}}
                (get-in profile [:profile 0 :compiler-step])))
-        (is (= (second (:profile measured)) (second (:profile profile)))
+        (is (= {:instance-id instance-id :step-index 0 :convention :contract
+                :provenance {:semantic-op :contraction :operation-id :projection}
+                :graph-node-id :tile}
+               (get-in profile [:profile 1 :compiler-step])))
+        (is (= (last (:profile measured)) (last (:profile profile)))
             "unmapped phases remain intact instead of receiving guessed provenance")))))
 
 (deftest spike-two-instance-link
@@ -441,7 +453,7 @@
                :bindings {'x :x1 'W :W1 result-sym :x2}})]
             :outputs [:x2]})
           session (gpu/make-session :ze:0)
-          executable (gpu-link/instantiate! plan {:session session})]
+          executable (gpu-link/instantiate! plan {:session session :profile? true})]
       (is (= [:executable] (mapv :convention (:steps prog)))
           "linear-nb's BLAS GEMM is a typed contraction step")
       (try
@@ -459,6 +471,14 @@
                                 (gpu-link/run! executable))
               "owned dynamic inputs must be uploaded before the first replay")
           (gpu-link/upload! executable :x0 x0)
+          (let [events (:profile (gpu-link/profile! executable))]
+            (is (seq events))
+            (is (= #{:linear-0 :linear-1}
+                   (set (map #(get-in % [:compiler-step :instance-id]) events))))
+            (is (every? #(and (= :executable (get-in % [:compiler-step :convention]))
+                              (contains? (:compiler-step %) :graph-node-id))
+                        events)
+                "nested graph kernels retain their selecting descriptor step"))
           (let [resident-outputs (gpu-link/run! executable)
                 actual (gpu-link/download executable :x2)
                 expected (cpu-linear (cpu-linear x0 W0 rows width) W1 rows width)]
