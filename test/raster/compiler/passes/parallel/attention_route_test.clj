@@ -91,6 +91,22 @@
     (is (str/includes? reference-source "k_values["))
     (is (str/includes? scheduled-source "sub_group_reduce_add"))))
 
+(deftest dense-packed-bidirectional-segments-and-local-windows-share-one-route
+  (doseq [visibility [(attention/visibility)
+                      (attention/visibility
+                       {:window-left 2 :window-right 2})]]
+    (let [packed (problem :route (packed-route)
+                          :page-size nil :physical-pages nil
+                          :k-layout :token-head-major :v-layout :token-head-major
+                          :q-dtype :float :k-dtype :float :v-dtype :float
+                          :output-dtype :float :visibility visibility)
+          routed (route/route! packed intel-desc)]
+      (is (= :dense-packed-subgroup-online-score-reuse (:strategy routed)))
+      (is (= :dense-packed-kv (get-in routed [:plan :storage :kind])))
+      (is (= :interval (get-in routed [:plan :membership :visibility-kind])))
+      (is (empty? (get-in routed [:graph :temporaries]))
+          "segment masking must not materialize a full score tensor"))))
+
 (deftest dense-packed-measured-dispatch-keeps-its-own-reference-strategy
   (let [packed (problem :route (packed-route)
                         :page-size nil :physical-pages nil
