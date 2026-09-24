@@ -2717,7 +2717,7 @@
   replay-graph! has completed (the synchronous queue guarantees all events are signaled).
   Resets the events afterwards so the graph can be replayed again.
 
-  Returns {:kernels [{:kernel-name str :phase kw|nil :ms double :context-ms double
+  Returns {:kernels [{:kernel-name str :phase value|nil :ms double :context-ms double
                       :start-ticks long :end-ticks long} …]   ;; execution order
            :wall-ms double|nil    ;; device span first-kernel-start → last-kernel-end
            :ns-per-tick double}

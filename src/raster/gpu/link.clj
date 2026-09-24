@@ -780,7 +780,11 @@
           (:phases executable))))
 
 (defn profile!
-  "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready."
+  "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.
+
+   Descriptor-backed events retain their stable LinkPlan instance and step identities plus the
+   compiler artifact's bounded provenance. Runtime phase keys still identify the exact replay,
+   but callers need not decode generated kernel names or execution UUIDs to attribute costs."
   [executable]
   (let [executable (ensure-live! executable :profile!)]
     (when (seq @(:pending-inputs executable))
@@ -789,7 +793,34 @@
     (if-let [prepared (:prepared-program executable)]
       (parallel-program/profile-prepared!
        prepared #(gpu/profile-bound-kernel-graph! (:session executable) %))
-      (gpu/profile-recorded-graph! (:session executable) (:graph-key executable)))))
+      (let [profile (gpu/profile-recorded-graph! (:session executable) (:graph-key executable))
+            instances (into {} (map (juxt :id identity)) (get-in executable [:plan :instances]))]
+        (update profile :profile
+                (fn [events]
+                  (mapv
+                   (fn [{:keys [phase] :as event}]
+                     (let [nested? (and (vector? phase)
+                                        (= ::gpu/graph-node-phase (first phase)))
+                           parent-phase (if nested? (second phase) phase)
+                           node-id (when nested? (nth phase 2 nil))
+                           [kind _ instance-id step-index]
+                           (when (vector? parent-phase) parent-phase)
+                           step (when (and (= ::phase kind) (integer? step-index)
+                                           (not (neg? step-index)))
+                                  (get-in instances [instance-id :descriptor :steps step-index]))]
+                       (if step
+                         (assoc event :compiler-step
+                                (cond->
+                                 {:instance-id instance-id
+                                  :step-index step-index
+                                  :convention (:convention step)
+                                  :provenance (select-keys (get-in step [:artifact :provenance])
+                                                           [:semantic-op :dialect :source-dialect
+                                                            :segop-id :operation-id :strategy
+                                                            :variant])}
+                                  nested? (assoc :graph-node-id node-id)))
+                         event)))
+                   events)))))))
 
 (defn measure!
   "Measure a profiled LinkedExecutable with device events. Stateful plans require the explicit

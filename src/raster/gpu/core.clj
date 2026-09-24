@@ -1915,7 +1915,13 @@
                   (register! (:kernel-name artifact) artifact)
                   (vswap! prepareds conj
                           (assoc (bind-call! (:call called-node))
-                                 :phase (or (:id scheduled-node) phase)
+                                 ;; Preserve the graph node's identity while retaining the
+                                 ;; descriptor step that selected this graph. Device profiles
+                                 ;; otherwise cannot attribute nested contraction kernels to
+                                 ;; their source LinkPlan instance.
+                                 :phase (if phase
+                                          [::graph-node-phase phase (:id scheduled-node)]
+                                          (:id scheduled-node))
                                  :const-prologue? constant?))
                   (recur (next scheduled-nodes) (next called-nodes)
                          (if constant? (into constants writes) constants)))))
