@@ -67,6 +67,7 @@
   (let [problem (attention/validate! problem)
         plan (lower/lower problem)
         reference (emit/kernel-graph plan (emit/emit-fp16-reference plan desc))
+        reference-strategy (get-in reference [:attributes :strategy])
         dispatch-id
         (fn [candidate-key]
           (format "raster_segmented_weighted_reduction_static_%08x"
@@ -75,8 +76,8 @@
       (kdispatch/make
        {:id (dispatch-id (swr/schedule-key plan))
         :alternatives [reference]
-        :default-strategy :fp16-reference
-        :selector {:kind :fixed-strategy :strategy :fp16-reference}
+        :default-strategy reference-strategy
+        :selector {:kind :fixed-strategy :strategy reference-strategy}
         :provenance {:algebra-plan-id (:id plan)}
         :attributes {:algebra :segmented-weighted-reduction
                      :selection :static-reference-only}})
@@ -96,8 +97,8 @@
         (kdispatch/make
          {:id id
           :alternatives alternatives
-          :default-strategy :fp16-reference
-          :selector {:kind :fixed-strategy :strategy :fp16-reference}
+          :default-strategy reference-strategy
+          :selector {:kind :fixed-strategy :strategy reference-strategy}
           :provenance {:operation-id (:id problem) :algebra-plan-id (:id plan)}
           :attributes
           {:algebra :segmented-weighted-reduction
@@ -105,7 +106,9 @@
            :tuning {:schedule-path [:segmented-weighted-reduction :measured-selectors]
                     :schedule-key id
                     :numerical-mode {:query (:q-dtype problem)
-                                     :storage :half
+                                     :storage (if (attention/dense-packed-route? (:route problem))
+                                                [(:k-dtype problem) (:v-dtype problem)]
+                                                :half)
                                      :accumulate (:accumulator-dtype problem)
                                      :output (:output-dtype problem)}
                     :layout {:key (:k-layout problem)
@@ -115,7 +118,7 @@
                                           (:visibility problem))}}}})))))
 
 (defn route
-  "Route packed/routed attention through a cooperative schedule or its semantic oracle.
+  "Route dense-packed or paged attention through a cooperative schedule or its semantic oracle.
 
    Quantized K/V formats stay semantic values but decline until their scale/group operands are
    explicit. Dense and CSR physical routing retain deliberately distinct ABIs while interval and
@@ -123,8 +126,10 @@
   ([problem] (route problem nil))
   ([problem desc]
    (let [{:keys [q-dtype k-dtype v-dtype output-dtype accumulator-dtype
-                 k-format v-format]
+                 k-format v-format route]
           :as problem} (attention/validate! problem)]
+     (let [packed? (attention/dense-packed-route? route)
+           storage-dtypes (if packed? #{:half :float} #{:half})]
      (cond
        (and desc (not= :gpu (:device-type desc)))
        (decline problem :attention-requires-gpu
@@ -136,13 +141,13 @@
                 {:k-format k-format :v-format v-format})
 
        (not (and (contains? #{:half :float} q-dtype)
-                 (= :half k-dtype)
-                 (= :half v-dtype)
+                 (contains? storage-dtypes k-dtype)
+                 (contains? storage-dtypes v-dtype)
                  (contains? #{:half :float} output-dtype)))
        (decline problem :attention-reference-storage-unsupported
                 {:required {:q-dtype #{:half :float}
-                            :k-dtype :half
-                            :v-dtype :half
+                            :k-dtype storage-dtypes
+                            :v-dtype storage-dtypes
                             :output-dtype #{:half :float}}
                  :actual [q-dtype k-dtype v-dtype output-dtype]})
 
@@ -214,7 +219,7 @@
             :declines [{:leaf :attention-schedule-policy
                         :reason :attention-schedule-policy-unsupported
                         :data {:requested policy
-                               :supported (into [:auto :reference] cooperative-policies)}}]}))))))
+                               :supported (into [:auto :reference] cooperative-policies)}}]})))))))
 
 (defn route!
   "Route attention or fail with the complete machine-readable decline trail."

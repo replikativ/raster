@@ -2,9 +2,9 @@
   "Backend-neutral semantic attention and routed KV storage contracts.
 
    Attention is expressed in logical token coordinates. Packed query rows, query positions and
-   visibility are independent of the physical KV route. Dense and CSR page routes therefore share
-   semantics without being forced through one native ABI. Cache allocation, relocation, sharing,
-   native handles and queue ownership remain outside this IR."
+   visibility are independent of the physical KV route. Dense-packed, dense-paged and CSR-paged
+   storage share semantics without being forced through one native ABI. Cache allocation,
+   relocation, sharing, native handles and queue ownership remain outside this IR."
   (:require [raster.compiler.core.dtype :as dtype]))
 
 (defrecord PackedQueryBatch [values row-offsets positions total-tokens])
@@ -14,6 +14,7 @@
 (defrecord DensePagedRoute [page-table lengths start-positions pages-per-sequence])
 (defrecord CSRPagedRoute
            [page-offsets page-indices last-page-lengths start-positions page-index-capacity])
+(defrecord DensePackedRoute [row-offsets start-positions total-tokens])
 (defrecord AttentionProblem
            [id query k-pages v-pages route output
             batch-size q-heads kv-heads qk-head-dim value-head-dim
@@ -22,6 +23,7 @@
             scale k-format v-format k-layout v-layout visibility])
 
 (def ^:private cache-layouts #{:kv-head-major :page-major})
+(def ^:private packed-layouts #{:token-head-major})
 
 (defn packed-query-batch?
   [x]
@@ -47,6 +49,10 @@
   [x]
   (instance? CSRPagedRoute x))
 
+(defn dense-packed-route?
+  [x]
+  (instance? DensePackedRoute x))
+
 (defn paged-route?
   [x]
   (or (dense-paged-route? x) (csr-paged-route? x)))
@@ -58,6 +64,7 @@
 (defn route-kind
   [route]
   (cond
+    (dense-packed-route? route) :dense-packed
     (dense-paged-route? route) :dense-paged
     (csr-paged-route? route) :csr-paged
     :else nil))
@@ -195,6 +202,17 @@
   (->CSRPagedRoute page-offsets page-indices last-page-lengths start-positions
                    page-index-capacity))
 
+(defn dense-packed-route
+  "Construct contiguous token-major K/V storage. `row-offsets [B+1]` partitions the physical
+   token axis; `start-positions[B]` gives the logical position of each row's first token. Query
+   and KV rows may differ, so cross-attention and empty rows use the same contract."
+  [{:keys [row-offsets start-positions total-tokens]}]
+  (when (some nil? [row-offsets start-positions])
+    (throw (ex-info "dense packed K/V requires row offsets and start positions"
+                    {:reason :attention-dense-packed-missing-buffer})))
+  (int32-offset-capacity! "dense packed K/V" :total-tokens total-tokens)
+  (->DensePackedRoute row-offsets start-positions total-tokens))
+
 (defn- validate-format!
   [field storage-dtype format]
   (when-not (map? format)
@@ -216,9 +234,12 @@
   format)
 
 (defn route-buffer-ids
-  "Return the physical metadata buffer identities for a checked paged-route variant."
+  "Return the physical metadata buffer identities for a checked storage route."
   [route]
   (cond
+    (dense-packed-route? route)
+    [(:row-offsets route) (:start-positions route)]
+
     (dense-paged-route? route)
     [(:page-table route) (:lengths route) (:start-positions route)]
 
@@ -270,8 +291,8 @@
     (when-not (visibility? visibility)
       (throw (ex-info "attention requires interval or CSR visibility"
                       {:reason :attention-invalid-visibility :visibility visibility})))
-    (when-not (paged-route? route)
-      (throw (ex-info "attention requires a dense or CSR paged route"
+    (when-not (or (paged-route? route) (dense-packed-route? route))
+      (throw (ex-info "attention requires a supported K/V storage route"
                       {:reason :attention-unsupported-route :route route})))
     ;; Check the descriptor-level int32 ABI before derived token-capacity arithmetic so callers
     ;; receive the representation error rather than an incidental later overflow diagnosis.
@@ -281,10 +302,11 @@
     (when (csr-visibility? visibility)
       (int32-offset-capacity! "CSR visibility" :key-index-capacity
                               (:key-index-capacity visibility)))
-    (doseq [[field value] [[:batch-size batch-size] [:q-heads q-heads]
-                           [:kv-heads kv-heads] [:qk-head-dim qk-head-dim]
-                           [:value-head-dim value-head-dim] [:page-size page-size]
-                           [:physical-pages physical-pages]]]
+    (doseq [[field value] (concat [[:batch-size batch-size] [:q-heads q-heads]
+                                  [:kv-heads kv-heads] [:qk-head-dim qk-head-dim]
+                                  [:value-head-dim value-head-dim]]
+                                 (when (paged-route? route)
+                                   [[:page-size page-size] [:physical-pages physical-pages]]))]
       (positive-integer! "attention" field value))
     (positive-integer! "packed query batch" :total-tokens (:total-tokens query))
     (when-not (zero? (mod q-heads kv-heads))
@@ -305,10 +327,13 @@
     (validate-format! :k k-dtype k-format)
     (validate-format! :v v-dtype v-format)
     (doseq [[field layout] [[:k-layout k-layout] [:v-layout v-layout]]]
-      (when-not (contains? cache-layouts layout)
-        (throw (ex-info "attention cache layout is unsupported"
+      (when-not (contains? (if (dense-packed-route? route)
+                             packed-layouts cache-layouts) layout)
+        (throw (ex-info "attention storage layout is unsupported"
                         {:reason :attention-unsupported-cache-layout
-                         :field field :layout layout :supported cache-layouts}))))
+                         :field field :layout layout
+                         :supported (if (dense-packed-route? route)
+                                      packed-layouts cache-layouts)}))))
     (let [buffers (vec (concat [(:values query) (:row-offsets query) (:positions query)
                                 k-pages v-pages]
                                (route-buffer-ids route)
@@ -321,21 +346,25 @@
         (throw (ex-info "attention logical buffer identities must be distinct"
                         {:reason :attention-duplicate-buffer-identity :buffers buffers}))))
     (checked-product :q [(:total-tokens query) q-heads qk-head-dim])
-    (checked-product :k-cache [kv-heads physical-pages page-size qk-head-dim])
-    (checked-product :v-cache [kv-heads physical-pages page-size value-head-dim])
+    (if (dense-packed-route? route)
+      (do (checked-product :k-packed [(:total-tokens route) kv-heads qk-head-dim])
+          (checked-product :v-packed [(:total-tokens route) kv-heads value-head-dim]))
+      (do (checked-product :k-cache [kv-heads physical-pages page-size qk-head-dim])
+          (checked-product :v-cache [kv-heads physical-pages page-size value-head-dim])))
     (checked-product :output [(:total-tokens query) q-heads value-head-dim])
     (when (> (:total-tokens query) Integer/MAX_VALUE)
       (throw (ex-info "packed query offsets use int32 and cannot address this many tokens"
                       {:reason :attention-query-token-capacity-overflow
                        :total-tokens (:total-tokens query)})))
-    (let [page-capacity (if (dense-paged-route? route)
-                          (:pages-per-sequence route)
-                          (:page-index-capacity route))
-          token-capacity (checked-product :logical-kv-capacity [page-capacity page-size])]
-      (when (> token-capacity Integer/MAX_VALUE)
-        (throw (ex-info "page route lengths use int32 and exceed their token capacity"
-                        {:reason :attention-route-token-capacity-overflow
-                         :page-capacity page-capacity :page-size page-size}))))
+    (when (paged-route? route)
+      (let [page-capacity (if (dense-paged-route? route)
+                            (:pages-per-sequence route)
+                            (:page-index-capacity route))
+            token-capacity (checked-product :logical-kv-capacity [page-capacity page-size])]
+        (when (> token-capacity Integer/MAX_VALUE)
+          (throw (ex-info "page route lengths use int32 and exceed their token capacity"
+                          {:reason :attention-route-token-capacity-overflow
+                           :page-capacity page-capacity :page-size page-size})))))
     (when (dense-paged-route? route)
       (checked-product :page-table [batch-size (:pages-per-sequence route)]))
     problem))
@@ -349,7 +378,7 @@
            k-format v-format k-layout v-layout visibility]
     :or {q-dtype :half k-dtype :half v-dtype :half output-dtype :half
          accumulator-dtype :float k-format nil v-format nil
-         k-layout :kv-head-major v-layout :kv-head-major visibility nil}}]
+         k-layout nil v-layout nil visibility nil}}]
   (let [q-dtype (dtype/canon q-dtype)
         k-dtype (dtype/canon k-dtype)
         v-dtype (dtype/canon v-dtype)
@@ -357,6 +386,10 @@
         accumulator-dtype (dtype/canon accumulator-dtype)
         k-format (or k-format {:dtype k-dtype :quantization :none})
         v-format (or v-format {:dtype v-dtype :quantization :none})
+        k-layout (or k-layout (if (dense-packed-route? route)
+                                :token-head-major :kv-head-major))
+        v-layout (or v-layout (if (dense-packed-route? route)
+                                :token-head-major :kv-head-major))
         visibility (or visibility (raster.compiler.ir.attention/visibility))
         problem (->AttentionProblem
                  id query k-pages v-pages route output batch-size q-heads kv-heads
@@ -372,6 +405,7 @@
                 page-size physical-pages k-layout v-layout visibility]} (validate! problem)
         cache-shape (fn [layout dim]
                       (case layout
+                        :token-head-major [(:total-tokens route) kv-heads dim]
                         :kv-head-major [kv-heads physical-pages page-size dim]
                         :page-major [physical-pages page-size kv-heads dim]))
         common {:q [(:total-tokens query) q-heads qk-head-dim]
@@ -382,9 +416,15 @@
                 :kv-start-positions [batch-size]
                 :output [(:total-tokens query) q-heads value-head-dim]}]
     (merge common
-           (if (dense-paged-route? route)
+           (cond
+             (dense-packed-route? route)
+             {:kv-row-offsets [(inc batch-size)]}
+
+             (dense-paged-route? route)
              {:page-table [batch-size (:pages-per-sequence route)]
               :kv-lengths [batch-size]}
+
+             :else
              {:page-offsets [(inc batch-size)]
               :page-indices [(:page-index-capacity route)]
               :last-page-lengths [batch-size]})
@@ -409,9 +449,15 @@
                 (:start-positions route) (spec :input :int :kv-start-positions)
                 output (spec :output output-dtype :output)}]
     (merge common
-           (if (dense-paged-route? route)
+           (cond
+             (dense-packed-route? route)
+             {(:row-offsets route) (spec :input :int :kv-row-offsets)}
+
+             (dense-paged-route? route)
              {(:page-table route) (spec :input :int :page-table)
               (:lengths route) (spec :input :int :kv-lengths)}
+
+             :else
              {(:page-offsets route) (spec :input :int :page-offsets)
               (:page-indices route) (spec :input :int :page-indices)
               (:last-page-lengths route) (spec :input :int :last-page-lengths)})
@@ -473,12 +519,31 @@
   starts)
 
 (defn validate-routing!
-  "Validate host-visible physical route metadata before upload. Dense padding entries are ignored;
-   only pages selected by each length must be valid. CSR offsets may use any prefix of their
-   resident page-index capacity."
+  "Validate host-visible physical route metadata before upload. Packed offsets partition the
+   token axis. Dense page padding entries are ignored; only selected pages must be valid. CSR
+   offsets may use any prefix of their resident page-index capacity."
   [problem values]
   (let [{:keys [route batch-size page-size physical-pages]} (validate! problem)]
-    (if (dense-paged-route? route)
+    (cond
+      (dense-packed-route? route)
+      (let [offsets (vec (:row-offsets values))
+            starts (vec (:start-positions values))
+            capacity (:total-tokens route)]
+        (when-not (= (inc batch-size) (count offsets))
+          (throw (ex-info "packed KV row offsets have the wrong element count"
+                          {:reason :attention-kv-offset-shape
+                           :expected (inc batch-size) :actual (count offsets)})))
+        (when-not (and (= 0 (first offsets)) (= capacity (peek offsets))
+                       (every? int32-nonnegative? offsets)
+                       (every? true? (map <= offsets (rest offsets))))
+          (throw (ex-info "packed KV row offsets must partition the storage extent"
+                          {:reason :attention-invalid-kv-offsets
+                           :offsets offsets :total-tokens capacity})))
+        (validate-start-positions! batch-size starts
+                                   (mapv - (rest offsets) offsets))
+        problem)
+
+      (dense-paged-route? route)
       (let [{:keys [page-table lengths start-positions]} values
             table (vec page-table)
             lengths (vec lengths)
@@ -510,6 +575,7 @@
                                  :physical-pages physical-pages}))))))
         (validate-start-positions! batch-size starts lengths)
         problem)
+      :else
       (let [{:keys [page-offsets page-indices last-page-lengths start-positions]} values
             offsets (vec page-offsets)
             indices (vec page-indices)
@@ -561,8 +627,15 @@
   [problem values]
   (let [{:keys [route batch-size page-size] :as problem} (validate! problem)]
     (validate-routing! problem values)
-    (if (dense-paged-route? route)
+    (cond
+      (dense-packed-route? route)
+      (let [offsets (vec (:row-offsets values))]
+        (mapv - (rest offsets) offsets))
+
+      (dense-paged-route? route)
       (vec (:lengths values))
+
+      :else
       (let [offsets (vec (:page-offsets values))
             lasts (vec (:last-page-lengths values))]
         (mapv (fn [batch]

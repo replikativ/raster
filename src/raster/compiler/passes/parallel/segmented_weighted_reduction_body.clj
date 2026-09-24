@@ -1,7 +1,7 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-body
   "Apply a verified cooperative schedule to a segmented weighted reduction.
 
-  The first production storage row is routed paged K/V with interval or CSR membership. The
+  Production storage rows include dense-packed and routed-paged K/V with interval or CSR membership. The
   resulting KernelBody contains all scalar/control, memory, loop-carried online state, and
   subgroup-reduction structure. It contains no OpenCL spelling and preserves the source plan's
   buffer identities so the ordered ABI can be projected independently."
@@ -81,9 +81,15 @@
           v-pages :value-cache
           (:start-positions route) :kv-start-positions
           output :result}
-         (if (attention/dense-paged-route? route)
+         (cond
+           (attention/dense-packed-route? route)
+           {(:row-offsets route) :kv-row-offsets}
+
+           (attention/dense-paged-route? route)
            {(:page-table route) :page-routing
             (:lengths route) :kv-lengths}
+
+           :else
            {(:page-offsets route) :page-row-offsets
             (:page-indices route) :page-routing
             (:last-page-lengths route) :last-page-lengths})
@@ -240,6 +246,49 @@
                     (expr :max :int 'kv-length (lit 0 :int))
                     (lit capacity :int)))]))
 
+(defn- dense-packed-route-operations
+  [{:keys [route batch-size]}]
+  (let [capacity (:total-tokens route)
+        offsets (:row-offsets route)]
+    [(load-value 'kv-offset-zero :int offsets [0])
+     (load-value 'kv-offset-final :int offsets [batch-size])
+     (load-value 'kv-begin :int offsets ['safe-query-batch])
+     (load-value 'kv-end :int offsets [(body/expression :add 'safe-query-batch 1)])
+     (load-value 'kv-start-position :int (:start-positions route) ['safe-query-batch])
+     (compute 'kv-offset-zero-valid :predicate
+              (expr :eq :predicate 'kv-offset-zero (lit 0 :int)))
+     (compute 'kv-offset-final-valid :predicate
+              (expr :eq :predicate 'kv-offset-final (lit capacity :int)))
+     (compute 'kv-begin-nonnegative :predicate
+              (expr :ge :predicate 'kv-begin (lit 0 :int)))
+     (compute 'kv-offset-order-valid :predicate
+              (expr :ge :predicate 'kv-end 'kv-begin))
+     (compute 'kv-end-bounded :predicate
+              (expr :le :predicate 'kv-end (lit capacity :int)))
+     (compute 'kv-start-nonnegative :predicate
+              (expr :ge :predicate 'kv-start-position (lit 0 :int)))
+     (compute 'safe-kv-begin :int
+              (expr :min :int (expr :max :int 'kv-begin (lit 0 :int))
+                    (lit capacity :int)))
+     (compute 'safe-kv-end :int
+              (expr :min :int (expr :max :int 'kv-end (lit 0 :int))
+                    (lit capacity :int)))
+     (compute 'safe-kv-length :int
+              (expr :max :int
+                    (bounded-expr :- :int 'safe-kv-end 'safe-kv-begin)
+                    (lit 0 :int)))
+     (compute 'safe-kv-begin-long :long (cast-expr 'safe-kv-begin :long))
+     (compute 'kv-start-long :long (cast-expr 'kv-start-position :long))
+     (compute 'kv-length-long :long (cast-expr 'safe-kv-length :long))
+     (compute 'kv-end-long :long (bounded-expr :+ :long 'kv-start-long 'kv-length-long))
+     (compute 'kv-position-end-bounded :predicate
+              (expr :le :predicate 'kv-end-long (lit 2147483648 :long)))
+     (compute 'route-valid :predicate
+              (all-expr ['kv-offset-zero-valid 'kv-offset-final-valid
+                         'kv-begin-nonnegative 'kv-offset-order-valid
+                         'kv-end-bounded 'kv-start-nonnegative
+                         'kv-position-end-bounded]))]))
+
 (defn- csr-route-operations
   [{:keys [route page-size]}]
   (let [capacity (:page-index-capacity route)
@@ -313,6 +362,14 @@
               (expr :min :int
                     (expr :max :int 'kv-length (lit 0 :int))
                     (lit token-capacity :int)))]))
+
+(defn- route-operations
+  [problem]
+  (let [route (:route problem)]
+    (cond
+      (attention/dense-packed-route? route) (dense-packed-route-operations problem)
+      (attention/dense-paged-route? route) (dense-route-operations problem)
+      :else (csr-route-operations problem))))
 
 (defn- interval-membership-operations
   [{:keys [visibility]}]
@@ -408,6 +465,7 @@
 (defn- cache-coordinates
   [layout kv-head physical-page page-token component]
   (case layout
+    :token-head-major [page-token kv-head component]
     :kv-head-major [kv-head physical-page page-token component]
     :page-major [physical-page page-token kv-head component]))
 
@@ -428,7 +486,22 @@
 
 (defn- physical-page-operations
   [{:keys [route page-size physical-pages]}]
-  (if (attention/dense-paged-route? route)
+  (cond
+    (attention/dense-packed-route? route)
+    (let [capacity (:total-tokens route)]
+      [(compute 'physical-page :int (bounded-expr :+ :int (lit 0 :int) (lit 0 :int)))
+       (compute 'raw-packed-token :long
+                (bounded-expr :+ :long 'safe-kv-begin-long 'logical-token-long))
+       (compute 'physical-page-nonnegative :predicate
+                (expr :ge :predicate 'raw-packed-token (lit 0 :long)))
+       (compute 'physical-page-bounded :predicate
+                (expr :lt :predicate 'raw-packed-token (lit capacity :long)))
+       (compute 'page-token :long
+                (expr :min :long
+                      (expr :max :long 'raw-packed-token (lit 0 :long))
+                      (lit (dec capacity) :long)))])
+
+    (attention/dense-paged-route? route)
     [(compute 'logical-page :long
               (expr :quot :long 'logical-token-long (lit page-size :long)))
      (compute 'safe-logical-page :long
@@ -444,6 +517,7 @@
               (expr :ge :predicate 'physical-page (lit 0 :int)))
      (compute 'physical-page-bounded :predicate
               (expr :lt :predicate 'physical-page (lit physical-pages :int)))]
+    :else
     (let [capacity (:page-index-capacity route)]
       [(compute 'logical-page :long
                 (expr :quot :long 'logical-token-long (lit page-size :long)))
@@ -619,7 +693,7 @@
            (compute 'safe-physical-page :int
                     (expr :min :int
                           (expr :max :int 'physical-page (lit 0 :int))
-                          (lit (dec (:physical-pages problem)) :int)))]
+                          (lit (dec (or (:physical-pages problem) 1)) :int)))]
           dot-ops value-ops
           [(body/->IfRegion
             'member-applies update-region
@@ -1107,7 +1181,9 @@
              (get-in scheduled [:numerical-mode :state-accumulate]))
           (= (:value-head-dim problem)
              (get-in scheduled [:value-mapping :components]))
-          (= :routed-paged-kv (get-in scheduled [:attributes :storage-kind]))
+          (= (if (attention/dense-packed-route? (:route problem))
+               :dense-packed-kv :routed-paged-kv)
+             (get-in scheduled [:attributes :storage-kind]))
           (= (attention/route-kind (:route problem))
              (get-in scheduled [:attributes :route-kind]))
           (= visibility-kind (get-in scheduled [:attributes :visibility-kind]))
@@ -1208,9 +1284,7 @@
               :result-id 'weighted-value-result}
         slots [slot]
         query-ops (query-metadata-operations problem)
-        route-ops (if (attention/dense-paged-route? (:route problem))
-                    (dense-route-operations problem)
-                    (csr-route-operations problem))
+        route-ops (route-operations problem)
         membership-ops (if (attention/interval-visibility? (:visibility problem))
                          (interval-membership-operations problem)
                          (csr-membership-operations problem))
@@ -1277,7 +1351,8 @@
                    :semantic-op :segmented-weighted-reduction
                    :algebra-plan-id (:id plan)
                    :lowering :reference-kernel-body}
-      :attributes {:storage-kind :routed-paged-kv
+      :attributes {:storage-kind (if (attention/dense-packed-route? (:route problem))
+                                   :dense-packed-kv :routed-paged-kv)
                    :route-kind (attention/route-kind (:route problem))
                    :visibility-kind (attention/visibility-kind (:visibility problem))}})))
 
@@ -1295,9 +1370,7 @@
         subgroup-size (:workgroup-size scheduled)
         slots (component-slots scheduled)
         query-ops (query-metadata-operations problem)
-        route-ops (if (attention/dense-paged-route? (:route problem))
-                    (dense-route-operations problem)
-                    (csr-route-operations problem))
+        route-ops (route-operations problem)
         membership-ops (if (attention/interval-visibility? (:visibility problem))
                          (interval-membership-operations problem)
                          (csr-membership-operations problem))
@@ -1346,7 +1419,8 @@
                    :semantic-op :segmented-weighted-reduction
                    :algebra-plan-id (:id plan)
                    :lowering :scheduled-kernel-body}
-      :attributes {:storage-kind :routed-paged-kv
+      :attributes {:storage-kind (if (attention/dense-packed-route? (:route problem))
+                                   :dense-packed-kv :routed-paged-kv)
                    :route-kind (attention/route-kind (:route problem))
                    :visibility-kind (attention/visibility-kind (:visibility problem))}})))
 
