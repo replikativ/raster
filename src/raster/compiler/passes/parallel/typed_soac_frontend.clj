@@ -739,17 +739,31 @@
       :else nil)))
 
 (defn- split-trailing-recur-many
-  "Expose a counted effect loop's recurrence without moving its ordered effects."
-  [form index carry-count]
+  "Expose a counted effect loop's recurrence without moving its ordered effects.
+
+   A source `unchecked-add-int` step is equivalent to the long ForLoop step only when the
+   exclusive bound and induction origin are both retained Int values: every entered iteration
+   then has index <= Integer/MAX_VALUE-1, so the source addition cannot wrap."
+  [form index carry-count int-bounded?]
   (let [unit-step? (fn [expression]
                      (let [update (strip-index-cast expression)]
-                       (or (patterns/ordered-unit-step? update index)
+                       (or (and (not (and (seq? update)
+                                          (contains? '#{unchecked-add-int
+                                                       clojure.core/unchecked-add-int}
+                                                     (first update))))
+                                (patterns/ordered-unit-step? update index))
                            (and (seq? update) (= 2 (count update))
                                 (contains? '#{inc clojure.core/inc} (first update))
                                 (not (contains? util/*shadowing-locals* (first update)))
                                 (= index (strip-index-cast (second update))))
                            (and (seq? update) (= 3 (count update))
                                 (contains? '#{+ clojure.core/+} (first update))
+                                (not (contains? util/*shadowing-locals* (first update)))
+                                (= index (strip-index-cast (second update)))
+                                (= 1 (strip-index-cast (nth update 2))))
+                           (and int-bounded? (seq? update) (= 3 (count update))
+                                (contains? '#{unchecked-add-int clojure.core/unchecked-add-int}
+                                           (first update))
                                 (not (contains? util/*shadowing-locals* (first update)))
                                 (= index (strip-index-cast (second update)))
                                 (= 1 (strip-index-cast (nth update 2)))))))
@@ -766,14 +780,14 @@
        :updates (vec (drop 2 (last form)))}
 
       (and (seq? form) (= 'do (first form)) (= 2 (count form)))
-      (split-trailing-recur-many (second form) index carry-count)
+      (split-trailing-recur-many (second form) index carry-count int-bounded?)
 
       (and (seq? form) (form/let-head? (first form))
            (vector? (second form)) (<= 3 (count form)))
       (let [[head bindings & statements] form
             inner (if (= 1 (count statements)) (first statements)
                       (list* 'do statements))]
-        (when-let [split (split-trailing-recur-many inner index carry-count)]
+        (when-let [split (split-trailing-recur-many inner index carry-count int-bounded?)]
           (update split :body #(list head bindings %)))))))
 
 (declare store-region pointwise-input?)
@@ -880,7 +894,13 @@
                                    (= loop-index (strip-index-cast (second test)))
                                    (contains? #{:int :long :float :double} carry-dtype)
                                    (not (contains? (util/free-syms (nth test 2)) parameter)))
-                          (when-let [split (split-trailing-recur-many then loop-index 1)]
+                          (when-let [split (split-trailing-recur-many
+                                            then loop-index 1
+                                            (and (contains? '#{< clojure.core/<} (first test))
+                                                 (= :int (retained-local-dtype loop-index lower))
+                                                 (= :int (some-> (nth test 2)
+                                                                 retained-expression-tag
+                                                                 dtype/dtype-for-scalar-tag))))]
                             {:index loop-index :lower lower
                              :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
                                             :inclusive :exclusive)
@@ -1693,6 +1713,57 @@
              (loop-store-leaves top-ordinal child (conj path :loop ordinal)))
            (range) (:loops loop))))
 
+(defn- alpha-rename-effect-locals
+  "Give each nested effect scope distinct SSA locals, respecting lexical shadowing.
+
+   Regions recognized independently number their locals from zero. A loop body may therefore
+   introduce a local with the same spelling as an enclosing capture; a flat substitution map
+   would confuse the capture with the later inner binder. Rename in source order instead."
+  [effects]
+  (letfn [(substitute [environment expression]
+            (util/subst-syms environment expression))
+          (scope-locals [locals environment path]
+            (reduce (fn [[renamed environment] [ordinal {:keys [id init] :as local}]]
+                      (let [fresh (symbol (str "rstr_effect_local_"
+                                               (apply str (interpose "_" path)) "_" ordinal))]
+                        [(conj renamed (assoc local :id fresh
+                                             :init (substitute environment init)))
+                         (assoc environment id fresh)]))
+                    [[] environment] (map-indexed vector locals)))
+          (rewrite [effects environment path]
+            (mapv (fn [ordinal effect]
+                    (let [path (conj path ordinal)]
+                      (cond
+                        (:region effect)
+                        (let [region (:region effect)
+                              [locals inner-env] (scope-locals (:locals region) environment path)]
+                          {:region (assoc region
+                                          :predicate (some->> (:predicate region)
+                                                              (substitute environment))
+                                          :locals (vec locals)
+                                          :effects (rewrite (:effects region) inner-env path))})
+
+                        (:loop effect)
+                        (let [loop (:loop effect)
+                              [locals inner-env] (scope-locals (:locals loop) environment path)]
+                          {:loop (cond-> (assoc loop
+                                          :lower (substitute environment (:lower loop))
+                                          :extent (substitute environment (:extent loop))
+                                          :locals (vec locals)
+                                          :effects (rewrite (:effects loop) inner-env path))
+                                   (:carry loop)
+                                   (update :carry (fn [carry]
+                                                    (-> carry
+                                                        (update :init #(substitute environment %))
+                                                        (update :update #(substitute inner-env %))))))})
+
+                        :else
+                        (reduce (fn [store field]
+                                  (update store field #(substitute environment %)))
+                                effect [:index :predicate :value]))))
+                  (range) effects))]
+    (rewrite effects {} [])))
+
 (defn- write-region-description
   [id symbol index extent {:keys [locals stores loops] :as region} elem-type
   & {:keys [host-return array-types scalar-types]
@@ -1713,17 +1784,25 @@
                (every? (fn [{:keys [lower extent carry]}]
                          (or (nil? carry)
                              (every? (fn [bound]
-                                       (or (integer? bound)
-                                           (contains? #{:int :long}
-                                                      (or (get local-types bound)
-                                                          (retained-local-dtype bound nil)))))
+                                       (let [scalar (strip-index-cast bound)]
+                                         (or (integer? scalar)
+                                             (contains? #{:int :long}
+                                                        (or (get local-types scalar)
+                                                            (retained-local-dtype scalar nil))))))
                                      [lower extent])))
                        (loop-tree loops))
                (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
-               ;; A destination written both directly and inside a store loop would lose the work
-               ;; item's source order between the two kinds of write; such regions stay unsupported.
-               (empty? (set/intersection (set (map :out stores))
-                                         (set (map :out (mapcat #(loop-store-leaves nil % []) loops))))))
+               ;; A direct write and a loop write to the same destination may be retained when
+               ;; their coordinates are distinct constants. The source-ordered region still owns
+               ;; both effects; only genuinely overlapping/unknown coordinates are declined.
+               (every? (fn [[direct nested]]
+                         (or (not= (:out direct) (:out nested))
+                             (let [a (strip-index-cast (:index direct))
+                                   b (strip-index-cast (:index nested))]
+                               (and (integer? a) (integer? b) (not= a b)))))
+                       (for [direct stores
+                             nested (mapcat #(loop-store-leaves nil % []) loops)]
+                         [direct nested])))
       (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
             loop-stores
             (vec (mapcat (fn [ordinal loop]
@@ -1933,7 +2012,7 @@
                   :body-dtypes body-dtypes
                   :write-indices write-indices :predicates predicates
                   :conflict (when scatter? uniform-conflict)
-                  :effects (when ordered? ordered-effects)
+                  :effects (when ordered? (alpha-rename-effect-locals ordered-effects))
                   :iteration-order iteration-order
                   :result-dtypes (when ordered? result-dtypes)
                   :effect-only? (= :effect host-return)

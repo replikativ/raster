@@ -15,6 +15,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.index-expression :as index-expression]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
 (defn- contains-indexed-load?
@@ -570,10 +571,11 @@
                                 "scalar loads require a declared typed stable tensor"
                                 {:expression expression :array array :array-types array-types}))
                     (let [coordinate-value
-                          (when (contains-indexed-load? coordinate)
-                            ;; Storage coordinates are address arithmetic. Keep their composed
-                            ;; SSA in the KernelBody index width; narrowing a long launch index to
-                            ;; an element dtype would either overflow or invent a cast policy.
+                          (when (or (contains-indexed-load? coordinate)
+                                    (index-expression/requires-scalar-evaluation? coordinate))
+                            ;; Materialize nested loads and source-width wrapping arithmetic as
+                            ;; typed scalar SSA before using the result as a storage coordinate.
+                            ;; The final coordinate widens; its inner int operation must not.
                             (lower coordinate :long env))
                           coordinate-expression
                           (if coordinate-value
