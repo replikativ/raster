@@ -415,10 +415,14 @@
                                      [weights input target batch in-f out-f lr])]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations])))
-      (let [{:keys [compiler-buffer-bindings semantic-outputs memory value-versions]}
+      (let [{:keys [compiler-buffer-bindings compiler-values semantic-outputs memory
+                    value-versions]}
             (invocation-link/memory-witness (invocation-link/certify plan))]
         (is (= :unproven value-versions))
         (is (seq compiler-buffer-bindings))
+        (is (= (set (keys compiler-buffer-bindings)) (set (keys compiler-values))))
+        (is (some #(= :equation (get-in % [:definition :kind]))
+                  (vals compiler-values)))
         (is (seq semantic-outputs))
         (is (every? #(contains? (:values memory) %)
                     (vals compiler-buffer-bindings)))
