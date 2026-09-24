@@ -24,7 +24,8 @@
 
   Native assembly (requires hsdis — see `print-hsdis-build-instructions`):
     -XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly"
-  (:require [clojure.walk]
+  (:require [clojure.pprint]
+            [clojure.walk]
             [clojure.string]
             [raster.compiler.core.dispatch])
   (:import (java.lang.classfile ClassFile Instruction)
