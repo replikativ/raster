@@ -1214,6 +1214,14 @@
    validated TypedSOAC algorithm and are scheduled exactly once before backend emission."
   [source {:keys [dtype array-types scalar-types target-device] :as opts}]
   (let [source (top-level-binding-form source)
+        ;; GPU sessions enter with a walked deftm body, bypassing the forward pipeline's
+        ;; fixpoint/expand stages. Reuse that same shared expansion here so scalar helpers
+        ;; and source constants reach TypedSOAC as expressions, not opaque calls/vars.
+        source (binding [inline/*inline-scalar-bodies?* true]
+                 (-> source
+                     (inline/resolve-generic-deftm-calls (:param-env opts))
+                     (inline/expand-for-backends 3 (:param-env opts))
+                     (inline/resolve-generic-deftm-calls (:param-env opts))))
         typed (semantic-program-attempt source opts
                                         (abstract-machine-for-target target-device))
         semantic (or (:program typed) source)

@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [raster.ad.tangent :as tangent]
             [raster.ad.templates :as rt]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.ad.flatten :as flatten]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
@@ -39,11 +40,17 @@
          (and (.startsWith h "->")
               (contains? @types/soa-registry (symbol (subs h 2)))))))
 
+(def ^:dynamic *inline-scalar-bodies?*
+  "Opt in to bare scalar deftm helper tails at the direct walked-body GPU entry.
+   Other compiler entries retain their existing expansion policy until separately certified."
+  false)
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
    inlinable, as are bare value-type constructor tails (see value-ctor-call?)
-   and branch forms (if / case*) whose whole body is a single value expression
+   and branch forms (if / case*) whose whole body is a single value expression,
+   or scalar intrinsic calls whose result is a single value expression,
    the inliner substitutes into the call site (e.g. predicate/lookup helpers like
    chunk-block, block-solid?), symbols and literal values. Other bare function calls
    are not — they need let* wrapping for the inliner to decompose."
@@ -53,6 +60,9 @@
       (and (seq? body)
            (or (contains? #{:binding :scope :do :invk :par :branch}
                           (:kind (form/form-info body)))
+               (and *inline-scalar-bodies?*
+                    (op/scalar-op? (op/semantic-op body))
+                    (not (util/effectful? body)))
                (value-ctor-call? body)))))
 
 (def ^:private prim-or-array-tags
@@ -1302,7 +1312,12 @@
            ;; to the opaque get-pullback-factory closure (not GPU-lowerable).
            has-rule? (and preserve-templates? (rt/has-reverse-rule? impl-sym))
            ;; recursive callee (already being inlined) → keep as a call, don't recurse
-           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
+           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey))
+                                 ;; A canonical numeric call is already a first-class scalar
+                                 ;; operator. The direct GPU helper expansion must not turn it
+                                 ;; into an implementation body and lose its algebraic identity.
+                                 (not (and *inline-scalar-bodies?*
+                                           (intrinsics/canonical impl-sym))))
                         (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
