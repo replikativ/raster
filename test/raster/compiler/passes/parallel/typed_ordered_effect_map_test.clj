@@ -493,6 +493,105 @@
     (is (contains? names 'm))
     (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))))
 
+(raster.core/deftm city-effect-carry-unused!
+  [loc :- (Array int), visits :- (Array int), n :- Long, len :- Long] :- Void
+  (raster.par/map-void! i n
+    (loop [e (int 0) anchor (int 0)]
+      (when (< e len)
+        (when (== (raster.arrays/aget loc (+ (* i len) e)) (int 2))
+          (raster.par/atomic-add! visits 0 (int 1)))
+        (recur (int (inc e)) (int (+ anchor 1)))))))
+
+(raster.core/deftm city-effect-carry-indexed!
+  [loc :- (Array int), visits :- (Array int), n :- Long, len :- Long] :- Void
+  (raster.par/map-void! i n
+    (loop [e (int 0) anchor (int 0)]
+      (when (< e len)
+        (when (== (raster.arrays/aget loc (+ (* i len) e)) (int 2))
+          (raster.par/atomic-add! visits anchor (int 1)))
+        (recur (int (inc e)) (int (rem (+ anchor 1) 10)))))))
+
+(raster.core/deftm city-effect-carry-branch!
+  [loc :- (Array int), visits :- (Array int), n :- Long, len :- Long] :- Void
+  (raster.par/map-void! i n
+    (loop [e (int 0) anchor (int (rem i 7))]
+      (when (< e len)
+        (let [l (int (raster.arrays/aget loc (+ (* i len) e)))]
+          (when (== l (int 2))
+            (raster.par/atomic-add! visits anchor (int 1)))
+          (recur (int (inc e))
+                 (int (if (== l (int 0)) (rem i 7)
+                          (if (== l (int 1)) 9 anchor)))))))))
+
+(raster.core/deftm city-effect-carry-search!
+  [loc :- (Array int), weights :- (Array double), visits :- (Array int)
+   n :- Long, len :- Long, choices :- Long] :- Void
+  (raster.par/map-void! i n
+    (loop [e (int 0) anchor (int (rem i 7))]
+      (when (< e len)
+        (let [l (int (raster.arrays/aget loc (+ (* i len) e)))]
+          (when (== l (int 2))
+            (let [target (* 0.37 (double (inc anchor)))
+                  choice (int (loop [q (int 0) sum 0.0 hit (int -1)]
+                                (if (or (>= q (int choices)) (>= hit (int 0)))
+                                  (if (>= hit (int 0)) hit (int (dec choices)))
+                                  (let [next-sum (+ sum (raster.arrays/aget weights q))]
+                                    (recur (int (inc q)) next-sum
+                                           (int (if (< target next-sum) q -1)))))))]
+              (raster.par/atomic-add! visits choice (int 1))))
+          (recur (int (inc e))
+                 (int (if (== l (int 0)) (rem i 7)
+                          (if (== l (int 1)) 9 anchor)))))))))
+
+(raster.core/deftm city-two-effect-carry-loops!
+  [loc :- (Array int), visits :- (Array int), n :- Long, len :- Long] :- Void
+  (raster.par/map-void! i n
+    (do
+      (loop [e (int 0) anchor (int 0)]
+        (when (< e len)
+          (when (== (raster.arrays/aget loc (+ (* i len) e)) (int 2))
+            (raster.par/atomic-add! visits anchor (int 1)))
+          (recur (int (inc e)) (int (rem (+ anchor 1) 10)))))
+      (loop [e (int 0) anchor (int 0)]
+        (when (< e len)
+          (when (== (raster.arrays/aget loc (+ (* i len) e)) (int 2))
+            (raster.par/atomic-add! visits anchor (int 1)))
+          (recur (int (inc e)) (int (rem (+ anchor 1) 10))))))))
+
+(deftest effectful-counted-loop-retains-independent-carried-scalar
+  (let [loc (int-array [2 0 2 1, 0 2 2 2, 1 1 2 0])]
+    (doseq [[source expected]
+            [[#'city-effect-carry-unused! [6 0 0 0 0 0 0 0 0 0]]
+             [#'city-effect-carry-indexed! [1 1 3 1 0 0 0 0 0 0]]
+             [#'city-effect-carry-branch! [2 3 0 0 0 0 0 0 0 1]]]]
+      (let [descriptor (pipeline/compile-gpu-program source :ze:0 :dtype :double)
+            step (first (:steps descriptor))
+            kernel-body (get-in step [:artifact :attributes :kernel-body])
+            loops (filter #(= "ForLoop" (some-> % class .getSimpleName))
+                          (nested-operations (:operations kernel-body)))
+            visits (int-array 10)]
+        (is (= :map-void (:convention step)))
+        (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+        (is (= [1] (mapv (comp count :iter-args) loops))
+            "the typed effect loop owns one scalar carry beside its induction index")
+        (source loc visits 3 4)
+        (is (= expected (vec visits)))))))
+
+(deftest effectful-carried-episode-loop-composes-with-inner-search
+  (let [descriptor (pipeline/compile-gpu-program #'city-effect-carry-search!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))
+        names (set (map :name (get-in step [:artifact :abi])))]
+    (is (= :map-void (:convention step)))
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+    (is (every? names '[loc weights visits choices]))))
+
+(deftest sibling-effect-carries-remain-distinct-lexical-results
+  (let [descriptor (pipeline/compile-gpu-program #'city-two-effect-carry-loops!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))]
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))))
+
 (deftest triangular-effect-domains-retain-dynamic-or-inclusive-boundaries
   (let [source
         '(let* [effect

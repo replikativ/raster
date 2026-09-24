@@ -630,10 +630,13 @@
   (instantiate-store-loop {} loop fresh))
 
 (defn- rename-loop-tree
-  "Give every loop in a nested effect tree a deterministic path-qualified SSA index."
+  "Give every loop in a nested effect tree deterministic path-qualified SSA binders."
   [loop path]
-  (let [loop (rename-loop-index
-              loop (symbol (str "rstr_loop_index_" (apply str (interpose "_" path)))))]
+  (let [suffix (apply str (interpose "_" path))
+        loop (rename-loop-index loop (symbol (str "rstr_loop_index_" suffix)))
+        loop (cond-> loop
+               (:carry loop) (assoc-in [:carry :result]
+                                        (symbol (str "rstr_loop_carry_result_" suffix))))]
     (update loop :loops
             (fn [children]
               (mapv (fn [ordinal child]
@@ -731,6 +734,44 @@
           (update split :body #(list head bindings %))))
       :else nil)))
 
+(defn- split-trailing-recur-many
+  "Expose a counted effect loop's recurrence without moving its ordered effects."
+  [form index carry-count]
+  (let [unit-step? (fn [expression]
+                     (let [update (strip-index-cast expression)]
+                       (or (patterns/ordered-unit-step? update index)
+                           (and (seq? update) (= 2 (count update))
+                                (contains? '#{inc clojure.core/inc} (first update))
+                                (not (contains? util/*shadowing-locals* (first update)))
+                                (= index (strip-index-cast (second update))))
+                           (and (seq? update) (= 3 (count update))
+                                (contains? '#{+ clojure.core/+} (first update))
+                                (not (contains? util/*shadowing-locals* (first update)))
+                                (= index (strip-index-cast (second update)))
+                                (= 1 (strip-index-cast (nth update 2)))))))
+        recur? (fn [candidate]
+                 (and (seq? candidate) (= 'recur (first candidate))
+                      (= (+ 2 carry-count) (count candidate))
+                      (unit-step? (second candidate))))]
+    (cond
+      (recur? form)
+      {:body '(do) :updates (vec (drop 2 form))}
+
+      (and (seq? form) (= 'do (first form)) (recur? (last form)))
+      {:body (list* 'do (butlast (rest form)))
+       :updates (vec (drop 2 (last form)))}
+
+      (and (seq? form) (= 'do (first form)) (= 2 (count form)))
+      (split-trailing-recur-many (second form) index carry-count)
+
+      (and (seq? form) (form/let-head? (first form))
+           (vector? (second form)) (<= 3 (count form)))
+      (let [[head bindings & statements] form
+            inner (if (= 1 (count statements)) (first statements)
+                      (list* 'do statements))]
+        (when-let [split (split-trailing-recur-many inner index carry-count)]
+          (update split :body #(list head bindings %)))))))
+
 (declare store-region pointwise-input?)
 
 (defn- terminal-store-reduction
@@ -813,34 +854,76 @@
                              :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
                                             :inclusive :exclusive)
                              :extent (strip-index-cast (nth test 2))
-                             :body (:body split)}))))))]
+                             :body (:body split)})))))
+
+                  (and (symbol? head) (form/loop-head? head)
+                       (vector? bindings) (= 4 (count bindings))
+                       (every? symbol? (take-nth 2 bindings))
+                       (not-any? util/effectful? (take-nth 2 (rest bindings)))
+                       (= 1 (count body)))
+                  (let [[loop-index lower parameter init] bindings
+                        conditional (first body)]
+                    (when (and (seq? conditional)
+                               (contains? '#{if clojure.core/if} (first conditional))
+                               (<= 3 (count conditional) 4)
+                               (nil? (nth conditional 3 nil))
+                               (not= loop-index parameter))
+                      (let [[_ test then] conditional
+                            carry-dtype (retained-local-dtype parameter init)]
+                        (when (and (seq? test) (= 3 (count test))
+                                   (contains? '#{< <= clojure.core/< clojure.core/<=}
+                                              (first test))
+                                   (= loop-index (strip-index-cast (second test)))
+                                   (contains? #{:int :long :float :double} carry-dtype)
+                                   (not (contains? (util/free-syms (nth test 2)) parameter)))
+                          (when-let [split (split-trailing-recur-many then loop-index 1)]
+                            {:index loop-index :lower lower
+                             :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
+                                            :inclusive :exclusive)
+                             :extent (strip-index-cast (nth test 2))
+                             :body (:body split)
+                             :carry {:parameter parameter :dtype carry-dtype :init init
+                                     :update (first (:updates split))}}))))))]
     (when (and counted
                (not= (:index counted) index)
                (not (contains? (util/free-syms (:lower counted)) (:index counted)))
                (not (contains? (util/free-syms (:extent counted)) (:index counted))))
-      (when-let [region (store-region (:body counted) index)]
+      (when-let [region (store-region (:body counted) index
+                                     (get-in counted [:carry :update]))]
         (when (or (seq (:stores region)) (seq (:loops region)))
           ;; The loop index and the body locals get their own names: a source loop index may
           ;; shadow a captured scalar of the enclosing region, and the region's SSA namespace
           ;; must not confuse the two.
           (let [loop-index (symbol (str "rstr_loop_index_" (name (:index counted))))
-                renames (into {(:index counted) loop-index}
+                parameter (when-let [source (get-in counted [:carry :parameter])]
+                            (symbol (str "rstr_loop_carry_" (name source))))
+                result (when parameter
+                         (fresh-projected-id "rstr_loop_carry_result"
+                                             (util/free-syms form)))
+                renames (into (cond-> {(:index counted) loop-index}
+                                parameter (assoc (get-in counted [:carry :parameter]) parameter))
                               (map (fn [{:keys [id]}]
                                      [id (symbol (str "rstr_loop_" (name id)))])
                                    (:locals region)))]
             {:locals []
              :stores []
-             :loops [{:index loop-index
-                      :lower (:lower counted)
-                      :upper-bound (:upper-bound counted :exclusive)
-                      :extent (:extent counted)
-                      :locals (mapv (fn [{:keys [id] :as local}]
-                                      (-> local (assoc :id (get renames id))
-                                          (update :init #(util/subst-syms renames %))))
-                                    (:locals region))
-                      :stores (mapv #(substitute-store renames %) (:stores region))
-                      :loops (mapv #(substitute-loop renames %) (:loops region))
-                      :order (substitute-order (region-order region) renames)}]
+             :loops [(cond-> {:index loop-index
+                              :lower (:lower counted)
+                              :upper-bound (:upper-bound counted :exclusive)
+                              :extent (:extent counted)
+                              :locals (mapv (fn [{:keys [id] :as local}]
+                                              (-> local (assoc :id (get renames id))
+                                                  (update :init #(util/subst-syms renames %))))
+                                            (:locals region))
+                              :stores (mapv #(substitute-store renames %) (:stores region))
+                              :loops (mapv #(substitute-loop renames %) (:loops region))
+                              :order (substitute-order (region-order region) renames)}
+                       parameter
+                       (assoc :carry {:parameter parameter :result result
+                                      :dtype (get-in counted [:carry :dtype])
+                                      :init (util/subst-syms renames
+                                                             (get-in counted [:carry :init]))
+                                      :update (util/subst-syms renames (:result region))}))]
              :order [[:loop 0]]}))))))
 
 (defn- carried-store-binding
