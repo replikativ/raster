@@ -1707,8 +1707,13 @@ The immediate continuation after the verified double-buffered weighted-reduction
    effect regions this removes the complete causal-gradient compatibility kernel. Inclusive
    execution guards the final advance, including a `Long/MAX_VALUE` endpoint; ownership refuses
    to use inclusive or nonzero loops as mixed-radix address digits, but correctly ignores such a
-   loop when its index does not reach a destination address. Transformed exits and other control
-   shapes retain their source spelling until a richer canonical construct exists. This reuses the
+   loop when its index does not reach a destination address. Pure data-dependent recurrences whose
+   continuing arm always recurs now enter an ordered typed `WhileFold` with explicit carried
+   dtypes, a pure condition region and pure update regions. Its components share one verified
+   KernelBody `WhileLoop`; arrays read only by initializers remain stable typed captures. A
+   walked city-style binary search reaches the portable emitter without a source-level GPU
+   fallback. Early exits within the recurrence and effectful carried episode loops still require
+   a richer ordered effect-control region; this is not yet a city-rstr upgrade claim. This reuses the
    shared loop matcher and the enclosing retained
    dtype rather than adding a function/type registry. KernelBody consumes Fold directly as a typed
    ordered loop; conversion does not descend through arbitrary lexical bindings and therefore
