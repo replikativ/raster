@@ -119,7 +119,16 @@
                            (instance :stage-2 :b :w2 :c)
                            (instance :stage-3 :c :w3 :out)]
                :outputs [:out]})
-        report (liveness/report plan)]
+        report (liveness/report plan)
+        replay (mapv (fn [stage]
+                       {:source {:instance stage :step 0}})
+                     [:stage-0 :stage-1 :stage-2 :stage-3])
+        witness (fn [prologue replay]
+                  {:plan :four-stages :target :ze:0
+                   :record-time-prologue prologue :per-replay replay})
+        selected (liveness/report plan (witness [] replay))
+        prologue (liveness/report plan (witness [(first replay)] (subvec replay 1)))
+        split (liveness/report plan (witness [(first replay)] replay))]
     (is (= plan (link/validate! plan)) "analysis cannot mutate the executable plan")
     (is (= 576 (:current-owned-bytes report)))
     (is (= [:shadow-candidate 0 1]
@@ -132,7 +141,24 @@
            (:proposals report)))
     (is (= :public-output (get-in report [:slots :out :reason])))
     (is (= :host-initialized (get-in report [:slots :w0 :reason])))
-    (is (= :unproven (:reuse report)))))
+    (is (= :unproven (:reuse report)))
+    (is (= {:status :witnessed :left-end 1 :right-start 2}
+           (get-in selected [:proposals 0 :runtime-order])))
+    (is (= #{:alias-realization :completion-and-escape :cross-replay-initialization}
+           (get-in selected [:proposals 0 :pending])))
+    (is (= [:declined :record-time-prologue]
+           ((juxt :status :reason) (get-in prologue [:proposals 0 :runtime-order]))))
+    (is (= :declined (get-in split [:proposals 0 :status]))
+        "a mixed prologue/replay producer remains live across invocations")
+    (is (= :selected-order-overlap
+           (get-in (liveness/report plan (witness [] (vec (reverse replay))))
+                   [:proposals 0 :runtime-order :reason])))
+    (is (= :memory-order-source-missing
+           (try (liveness/report plan (witness [] [{}]))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :memory-order-plan-mismatch
+           (try (liveness/report plan (assoc (witness [] replay) :plan :other))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest shadow-liveness-does-not-split-packed-views-into-reusable-allocations
   (let [base (valid-plan)

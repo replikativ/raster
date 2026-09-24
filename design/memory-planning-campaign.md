@@ -75,3 +75,10 @@ necessary correction to source-order liveness, not a completion certificate: eve
 escape/AD retention, full initialization, and alias realization still gate actual reuse. An
 equation-first prepared program has a separate runner and explicitly declines this report until
 that runner supplies equivalent evidence.
+
+The shadow planner can consume the linked witness. It declines a proposed reuse when either
+allocation is touched by a one-time prologue (including a mixed prologue/replay semantic step),
+when the source step cannot be matched, or when the selected replay order overlaps. A witnessed
+per-replay ordering still leaves cross-replay full initialization, completion/escape, and physical
+alias realization open. In particular, a prologue-produced temporary read on each replay must
+not be recycled for a later temporary in the same replay: it would corrupt the next invocation.

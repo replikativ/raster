@@ -38,10 +38,16 @@
                 :completion :unproven}
                (gpu/graph-execution-order sess :graph)))
         (let [linked (link/map->LinkedExecutable
-                      {:session sess :graph-key :graph :phases [:phase-a :phase-b :phase-c]
+                      {:plan {:id :model-plan :target :ocl:0
+                              :instances [{:id :model
+                                           :descriptor {:steps [{} {} {}]}}]}
+                       :session sess :graph-key :graph :phases [:phase-a :phase-b :phase-c]
                        :pending-inputs (atom #{}) :closed? (atom false)})]
-          (is (= (gpu/graph-execution-order sess :graph)
-                 (link/execution-order linked))))
+          (is (= [{:phase :phase-b :kernel-phase :b
+                   :source {:instance :model :step 1}}]
+                 (:record-time-prologue (link/execution-order linked))))
+          (is (= [{:instance :model :step 0} {:instance :model :step 2}]
+                 (mapv :source (:per-replay (link/execution-order linked))))))
         (gpu/replay! sess :graph)
         (is (= [:replay [:a :c]] (last @calls)))
         (gpu/release-recorded-graph! sess :graph)

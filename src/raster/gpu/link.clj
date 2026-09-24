@@ -788,7 +788,27 @@
     (when (:prepared-program executable)
       (throw (ex-info "equation-first execution-order reporting is not yet available"
                       {:reason :link-program-execution-order-unsupported})))
-    (gpu/graph-execution-order (:session executable) (:graph-key executable))))
+    (let [phases (:phases executable)
+          sources (vec (for [instance (:instances (:plan executable))
+                             [step-index _] (map-indexed vector
+                                                         (get-in instance [:descriptor :steps]))]
+                         {:instance (:id instance) :step step-index}))]
+      (when-not (= (count phases) (count sources))
+        (throw (ex-info "linked phase count differs from source descriptor steps"
+                        {:reason :link-execution-order-phase-count
+                         :phases (count phases) :steps (count sources)})))
+      (let [source-by-phase (zipmap phases sources)
+            annotate (fn [entry]
+                       (if-let [source (get source-by-phase (:phase entry))]
+                         (assoc entry :source source)
+                         (throw (ex-info "recorded kernel phase has no linked source step"
+                                         {:reason :link-execution-order-phase
+                                          :phase (:phase entry)}))))]
+        (-> (gpu/graph-execution-order (:session executable) (:graph-key executable))
+            (assoc :plan (:id (:plan executable))
+                   :target (:target (:plan executable)))
+            (update :record-time-prologue #(mapv annotate %))
+            (update :per-replay #(mapv annotate %)))))))
 
 (defn profile!
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.
