@@ -138,6 +138,7 @@
                          (body/->ScalarStore 'out [0] (body/literal 1 :int) nil))
         literal-condition (assoc-in kernel [:operations 0 :condition-operations 1]
                                     (body/->Yield [(body/literal 1 :int)]))
+        wrong-result (assoc-in kernel [:operations 0 :results 0 :type] :long)
         unordered (assoc-in kernel [:operations 0 :attributes :association]
                             :implementation-defined)]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"pure condition"
@@ -147,6 +148,9 @@
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (is (= :kernel-body-while-shape
            (try (body/validate! unordered) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :kernel-body-while-result
+           (try (body/validate! wrong-result) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (defn workgroup-kernel-body

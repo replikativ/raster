@@ -1796,6 +1796,10 @@
                           {:reason :kernel-body-while-condition :condition condition})))
         (reduce (fn [env [result initial update]]
                   (claim-value! claimed reserved values result "while result")
+                  (when-not (= (canonical-type (:type result)) (:type update))
+                    (throw (ex-info "kernel while-loop result type disagrees with its yielded value"
+                                    {:reason :kernel-body-while-result
+                                     :result result :initial initial :update update})))
                   (assoc env (:id result)
                          {:type (canonical-type (:type result))
                           :range (scalar-range/for-dtype (:type result))
