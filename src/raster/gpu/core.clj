@@ -721,6 +721,20 @@
                                              {:prepared (keys (:prepared @sess))}))))
                        phase-keys)
          prepareds (vec (mapcat prepared-bindings entries))
+         ordered-bindings (vec (mapcat (fn [phase entry]
+                                        (map (fn [prepared]
+                                               {:phase phase
+                                                :kernel-phase (:phase prepared)
+                                                :const-prologue? (boolean (:const-prologue? prepared))})
+                                             (prepared-bindings entry)))
+                                      phase-keys entries))
+         execution-order {:record-time-prologue
+                          (mapv #(dissoc % :const-prologue?)
+                                (filter :const-prologue? ordered-bindings))
+                          :per-replay
+                          (mapv #(dissoc % :const-prologue?)
+                                (remove :const-prologue? ordered-bindings))
+                          :completion :unproven}
          prologue-prepareds (filterv :const-prologue? prepareds)
          replay-prepareds (filterv (complement :const-prologue?) prepareds)
          prologue-graph (when (seq prologue-prepareds) (record-fn prologue-prepareds))
@@ -735,15 +749,29 @@
                  (catch Exception e
                    (destroy-recorded-graph-entry! device-id prologue-graph)
                    (throw e)))
-         entry (if (or prologue-graph profile?)
-                 {::recorded-graph true
-                  :replay-graph graph
-                  :prologue-graph prologue-graph
-                  :profile? (boolean profile?)}
-                 graph)]
+         entry {::recorded-graph true
+                :replay-graph graph
+                :prologue-graph prologue-graph
+                :profile? (boolean profile?)
+                :execution-order execution-order}]
      (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
      (swap! sess assoc-in [:graphs graph-key] entry)
      graph)))
+
+(defn graph-execution-order
+  "Return the bound graph's selected record-time prologue and per-replay kernel order.
+   This is an execution-order witness, not a device completion or storage-reuse certificate.
+   Prologue kernels have already run during recording; only :per-replay runs on replay!."
+  [sess graph-key]
+  (let [state @sess]
+    (when (:closed? state)
+      (throw (ex-info "cannot inspect a closed GPU session"
+                      {:reason :gpu-execution-order-closed :graph-key graph-key})))
+    (let [entry (get-in state [:graphs graph-key])]
+      (when-not entry
+        (throw (ex-info "no recorded graph to inspect"
+                        {:reason :gpu-execution-order-missing :graph-key graph-key})))
+      (:execution-order entry))))
 
 (defn replay!
   "Execute a recorded command graph once (synchronous). Reads current buffer contents."

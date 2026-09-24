@@ -779,6 +779,17 @@
             {:phase phase :executable (gpu/execution-info (:session executable) phase)})
           (:phases executable))))
 
+(defn execution-order
+  "Report the selected record-time prologue and per-replay kernel order of a linked descriptor.
+   A source-order memory report alone cannot justify storage reuse when constant transforms are
+   hoisted. This report does not attest completion, escape safety, or alias realization."
+  [executable]
+  (let [executable (ensure-live! executable :execution-order)]
+    (when (:prepared-program executable)
+      (throw (ex-info "equation-first execution-order reporting is not yet available"
+                      {:reason :link-program-execution-order-unsupported})))
+    (gpu/graph-execution-order (:session executable) (:graph-key executable))))
+
 (defn profile!
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.
 

@@ -64,3 +64,14 @@ ergonomics task. Those are
 real workload oracles for the broader compiler agenda, not reasons to postpone memory planning
 until a cluster scheduler exists. Revisit external JAX/MLIR/Mojo and scientific/LLM baselines at
 measured milestones, not in every edit/test cycle.
+
+## Execution-order witness
+
+`LinkPlan/memory-report` records source step submission order. The selected executable can expand
+one step into several kernels, and graph recording may lift cacheable constant transforms into a
+one-time prologue. `gpu/graph-execution-order` and `gpu.link/execution-order` report those selected
+record-time and per-replay kernel partitions without exposing backend graph handles. This is a
+necessary correction to source-order liveness, not a completion certificate: event boundaries,
+escape/AD retention, full initialization, and alias realization still gate actual reuse. An
+equation-first prepared program has a separate runner and explicitly declines this report until
+that runner supplies equivalent evidence.
