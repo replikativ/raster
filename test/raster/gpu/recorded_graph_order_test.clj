@@ -50,3 +50,26 @@
         (is (= :gpu-execution-order-missing
                (try (gpu/graph-execution-order sess :graph)
                     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest one-semantic-phase-can-split-between-prologue-and-replay
+  (let [sess (atom {:device-id :ocl:0
+                    :prepared {:phase (gpu/->BoundExecutableStep
+                                       [{:phase :constant-transform :const-prologue? true}
+                                        {:phase :value-kernel}]
+                                       {} [])}
+                    :graphs {} :closed? false})
+        resolve-runtime (fn [_device-id name]
+                          (case name
+                            "record-graph!" (fn [prepareds & _] {:prepareds prepareds})
+                            "replay-graph!" (fn [_])
+                            (throw (ex-info "unexpected runtime call" {:name name}))))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolve-runtime
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) (fn [& _] nil)}
+      (fn []
+        (gpu/record-graph! sess [:phase] :graph)
+        (is (= {:record-time-prologue
+                [{:phase :phase :kernel-phase :constant-transform}]
+                :per-replay [{:phase :phase :kernel-phase :value-kernel}]
+                :completion :unproven}
+               (gpu/graph-execution-order sess :graph)))))))
