@@ -995,6 +995,10 @@
         [statement initializer] bindings]
     (when (and (form/let-head? head) (vector? bindings) (= 2 (count bindings))
                (symbol? statement)
+               ;; A result consumed by the continuation is a value-carrying loop, even when
+               ;; its body also has stores. Treating it as an effect-only statement leaves that
+               ;; result free in the next equation (notably Q8_K's packed block sum).
+               (not (contains? (util/free-syms (list* 'do tail)) statement))
                (or (true? (:raster.effect/effectful (meta statement)))
                    (util/effect-loop-statement? initializer)))
       (when-let [loop-region (counted-store-loop initializer index)]
