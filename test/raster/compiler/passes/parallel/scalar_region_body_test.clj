@@ -546,16 +546,21 @@
                         :decline! decline!}))
         selected (lower '(int (if (== x x) 0 1)) :int {'x :long})
         outside (lower '(byte (if (== x x) 0 128)) :byte {'x :long})
+        branch-cast-options (fn [lowered]
+                              (let [region (last (:operations lowered))]
+                                (mapv #(get-in (first (get region %)) [:expression :options])
+                                      [:then-operations :else-operations])))
         fold (list 'fold
                    {:accumulator 'acc :index 'j :identity 0.0 :dtype :float
                     :extent 'n :association :ordered}
                    (dialect/lambda-form ['acc 'j] ['acc]))
         folded (lower (list 'float fold) :float {'n :long})]
-    (is (= {:rounding :exact :overflow :exact}
-           (get-in (last (:operations selected)) [:expression :options]))
+    (is (= (repeat 2 {:rounding :exact :overflow :exact})
+           (branch-cast-options selected))
         "the agreeing literal branch ranges prove the checked narrowing total")
-    (is (= {:rounding :exact :overflow :trap}
-           (get-in (last (:operations outside)) [:expression :options]))
+    (is (= [{:rounding :exact :overflow :exact}
+            {:rounding :exact :overflow :trap}]
+           (branch-cast-options outside))
         "a branch outside the destination range preserves the checked trap")
     (is (= :float (:type folded)))
     (is (some #(instance? raster.compiler.ir.kernel_body.ForLoop %)
