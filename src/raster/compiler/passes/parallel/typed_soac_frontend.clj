@@ -1764,15 +1764,68 @@
                   (range) effects))]
     (rewrite effects {} [])))
 
+(defn- alpha-rename-source-region
+  "Normalize lexical locals before collecting flat type and effect facts. Independently
+   recognized nested regions reuse rstr_local_N; their source-order scopes must be made
+   distinct before a flat fact map can safely be built."
+  [region]
+  (letfn [(encode-order [owner order]
+            (mapv (fn [[kind value]]
+                    (case kind
+                      :region {:region (-> value
+                                           (dissoc :order)
+                                           (assoc :effects (encode-order owner (:order value))))}
+                      :store (nth (:stores owner) value)
+                      :loop {:loop (-> (nth (:loops owner) value)
+                                       (dissoc :order)
+                                       (assoc :effects (encode-order
+                                                        (nth (:loops owner) value)
+                                                        (region-order (nth (:loops owner) value)))))}))
+                  order))
+          (decode-order [effects output]
+            (mapv (fn [effect]
+                    (let [[kind value] (cond
+                                         (:region effect) [:region (:region effect)]
+                                         (:loop effect) [:loop (:loop effect)]
+                                         :else [:store effect])]
+                      (case kind
+                        :region [:region (-> value
+                                             (dissoc :effects)
+                                             (assoc :order (decode-order (:effects value) output)))]
+                        :store (let [ordinal (count (:stores @output))]
+                                 (swap! output update :stores conj value)
+                                 [:store ordinal])
+                        :loop (let [body (atom {:stores [] :loops []})
+                                    order (decode-order (:effects value) body)
+                                    ordinal (count (:loops @output))]
+                                (swap! output update :loops conj
+                                       (merge (dissoc value :effects) @body {:order order}))
+                                [:loop ordinal])))) effects))]
+    (let [output (atom {:stores [] :loops []})
+          effects (alpha-rename-effect-locals (encode-order region (region-order region)))
+          order (decode-order effects output)]
+      (merge region @output {:order order}))))
+
 (defn- write-region-description
   [id symbol index extent {:keys [locals stores loops] :as region} elem-type
   & {:keys [host-return array-types scalar-types]
       :or {host-return :effect array-types {} scalar-types {}}}]
-  (let [order (region-order region)
+  (let [region (assoc region :loops (vec (map-indexed (fn [ordinal loop]
+                                                        (rename-loop-tree loop [ordinal]))
+                                                      (or loops []))))
+        lexical-ids (map :id (concat (:locals region)
+                                     (order-locals (region-order region))
+                                     (mapcat :locals (loop-tree (:loops region)))
+                                     (mapcat #(order-locals (:order %))
+                                             (loop-tree (:loops region)))))
+        region (if (= (count lexical-ids) (count (distinct lexical-ids)))
+                 region
+                 (alpha-rename-source-region region))
+        locals (:locals region)
+        stores (:stores region)
+        loops (:loops region)
+        order (region-order region)
         analysis-locals (vec (concat locals (order-locals order)))
-        loops (vec (map-indexed (fn [ordinal loop]
-                                  (rename-loop-tree loop [ordinal]))
-                                (or loops [])))
         loop-region-locals (vec (mapcat #(order-locals (:order %)) (loop-tree loops)))
         local-types (into (into (into (assoc scalar-types index :long)
                                      (map (juxt :id :dtype)) analysis-locals)
@@ -1793,13 +1846,17 @@
                        (loop-tree loops))
                (or (= :effect host-return) (and (empty? loops) (= 1 (count stores))))
                ;; A direct write and a loop write to the same destination may be retained when
-               ;; their coordinates are distinct constants. The source-ordered region still owns
-               ;; both effects; only genuinely overlapping/unknown coordinates are declined.
+               ;; their coordinates are distinct constants, or when both are the same atomic
+               ;; reduction. The latter's destination dtype/operator is certified below by the
+               ;; ordinary reducing-scatter conflict contract. All other unknown overlaps decline.
                (every? (fn [[direct nested]]
                          (or (not= (:out direct) (:out nested))
                              (let [a (strip-index-cast (:index direct))
                                    b (strip-index-cast (:index nested))]
-                               (and (integer? a) (integer? b) (not= a b)))))
+                               (or (and (integer? a) (integer? b) (not= a b))
+                                   (and (:reduction-op direct)
+                                        (= (:reduction-op direct)
+                                           (:reduction-op nested)))))))
                        (for [direct stores
                              nested (mapcat #(loop-store-leaves nil % []) loops)]
                          [direct nested])))
@@ -2012,7 +2069,7 @@
                   :body-dtypes body-dtypes
                   :write-indices write-indices :predicates predicates
                   :conflict (when scatter? uniform-conflict)
-                  :effects (when ordered? (alpha-rename-effect-locals ordered-effects))
+                  :effects (when ordered? ordered-effects)
                   :iteration-order iteration-order
                   :result-dtypes (when ordered? result-dtypes)
                   :effect-only? (= :effect host-return)
