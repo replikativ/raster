@@ -763,7 +763,15 @@
 
 (defn -main
   [& [root]]
-  (let [root (or root "gpu-compile-gates")]
-    (doseq [target [:cuda :hip]
-            file (emit-target! root target)]
-      (println file))))
+  (let [root (or root "gpu-compile-gates")
+        compile-equation equation-first/compile]
+    (with-redefs [equation-first/compile
+                  (fn [source & options]
+                    (try
+                      (apply compile-equation source options)
+                      (catch Exception error
+                        (throw (ex-info (str "public compile fixture failed: " source)
+                                        {:fixture source} error)))))]
+      (doseq [target [:cuda :hip]
+              file (emit-target! root target)]
+        (println file)))))
