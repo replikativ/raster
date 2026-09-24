@@ -62,7 +62,14 @@
 
 (defn- extract-io
   [body index outputs & {:keys [accumulator]}]
-  (let [inputs (par/collect-aget-arrays body)
+  (let [nested-reads (into #{}
+                           (comp (filter dialect/while-fold-form?)
+                                 (mapcat #(get-in (dialect/while-fold-parts %)
+                                                   [:attributes :identities]))
+                                 (mapcat descriptor/aget-reads)
+                                 (keep :sym))
+                           (tree-seq coll? seq body))
+        inputs (set/union (par/collect-aget-arrays body) nested-reads)
         written (par/collect-aset-arrays body)
         excluded (set/union inputs (set outputs) written #{index}
                             (if accumulator #{accumulator} #{})
@@ -372,6 +379,42 @@
          :matched matched
          :dtypes dtypes}))))
 
+(defn- source-while-fold-info
+  "Retain a pure data-dependent source recurrence as an ordered typed while fold."
+  [expression]
+  (when-let [{:keys [carry-syms carry-inits continue-expr update-exprs exit-expr]
+              :as matched}
+             (when-not (or (patterns/match-ordered-reduce-loop expression)
+                           (patterns/match-ordered-product-loop expression))
+               (patterns/match-ordered-while-loop expression))]
+    (let [dtypes (mapv (fn [carry init]
+                         (some-> (retained-local-dtype carry init) dtype/canon))
+                       carry-syms carry-inits)
+          identities (mapv numeric-constant/literal-or-original carry-inits)]
+      (when (and (every? some? dtypes) (every? some? identities)
+                 (not-any? util/effectful?
+                           (concat carry-inits [continue-expr exit-expr] update-exprs)))
+        {:product
+         (list 'while-fold
+               {:accumulators carry-syms :identities identities
+                :dtypes dtypes :association :ordered}
+               (dialect/lambda-form carry-syms [] [continue-expr])
+               (dialect/lambda-form carry-syms [] update-exprs))
+         :matched matched
+         :dtypes dtypes}))))
+
+(defn- source-ordered-fold-info [expression]
+  (or (source-product-fold-info expression)
+      (source-while-fold-info expression)))
+
+(defn- ordered-fold-component [fold ordinal]
+  (list (if (dialect/while-fold-form? fold) 'while-component 'product-component)
+        fold ordinal))
+
+(defn- ordered-fold-attributes [fold]
+  (:attributes ((if (dialect/while-fold-form? fold)
+                  dialect/while-fold-parts dialect/product-fold-parts) fold)))
+
 (defn- fresh-projected-id
   [base occupied]
   (first (remove occupied
@@ -385,7 +428,7 @@
    the sole name visible to the surrounding scalar region, so this is alpha-equivalent scalar
    normalization rather than a new fusion or reassociation rule."
   [aggregate expression occupied]
-  (when-let [{:keys [product matched dtypes]} (source-product-fold-info expression)]
+  (when-let [{:keys [product matched dtypes]} (source-ordered-fold-info expression)]
     (let [{:keys [carry-syms exit-expr]} matched
           component-ids
           (:ids
@@ -400,7 +443,7 @@
                    (map vector (range) dtypes)))
           components
           (mapv (fn [id ordinal dtype]
-                  [id (with-meta (list 'product-component product ordinal)
+                  [id (with-meta (ordered-fold-component product ordinal)
                         {:tag (dtype/scalar-tag-for-dtype dtype)
                          :raster.type/tag (dtype/scalar-tag-for-dtype dtype)})])
                 component-ids (range) dtypes)
@@ -419,10 +462,10 @@
    (fn [form]
      (if-let [{:keys [product matched dtypes]}
               (when (and (seq? form) (contains? #{'loop 'loop*} (first form)))
-                (source-product-fold-info form))]
+                (source-ordered-fold-info form))]
        (let [components
              (mapv (fn [ordinal component-dtype]
-                     (with-meta (list 'product-component product ordinal)
+                     (with-meta (ordered-fold-component product ordinal)
                        {:tag (dtype/scalar-tag-for-dtype component-dtype)
                         :raster.type/tag (dtype/scalar-tag-for-dtype component-dtype)}))
                    (range) dtypes)]
@@ -452,15 +495,14 @@
         candidate (first (keep-indexed
                           (fn [i [_ expression]]
                             (when-let [info (and (seq? expression)
-                                                (source-product-fold-info expression))]
+                                                (source-ordered-fold-info expression))]
                               [i info]))
                           pairs))]
     (if-not candidate
       bindings
       (let [[product-index {:keys [product matched]}] candidate
             aggregate (first (nth pairs product-index))
-            component-count (count (get-in (dialect/product-fold-parts product)
-                                           [:attributes :dtypes]))
+            component-count (count (:dtypes (ordered-fold-attributes product)))
             aliases (into {}
                           (keep-indexed
                            (fn [i [id expression]]
@@ -488,10 +530,9 @@
                 (mapcat
                  (fn [ordinal]
                    (let [id (get-in aliases [ordinal :id])
-                         component (list 'product-component product ordinal)
+                         component (ordered-fold-component product ordinal)
                          tag (dtype/scalar-tag-for-dtype
-                              (nth (get-in (dialect/product-fold-parts product)
-                                           [:attributes :dtypes]) ordinal))]
+                              (nth (:dtypes (ordered-fold-attributes product)) ordinal))]
                      [id (with-meta component {:tag tag :raster.type/tag tag})]))
                  (range component-count))
                 (mapcat identity (projected-product-pairs aggregate (second pair) occupied)))
@@ -509,7 +550,7 @@
                  (every? (comp simple-symbol? :id) locals))
         {:locals locals :body (first results)}))
     (if-let [{:keys [matched]} (and (seq? expression)
-                                    (source-product-fold-info expression))]
+                                    (source-ordered-fold-info expression))]
       (let [occupied (util/free-syms expression #{})
             aggregate-id (fresh-projected-id "rstr_product_result" occupied)
             result-dtype (retained-local-dtype aggregate-id (:exit-expr matched))
@@ -3769,8 +3810,22 @@
   [expressions array index]
   (let [reads (filter (fn [{:keys [sym]}]
                         (and (symbol? sym) (= (name array) (name sym))))
-                      (mapcat descriptor/aget-reads expressions))]
+                      (mapcat descriptor/aget-reads expressions))
+        ;; A loop initializer is evaluated before entering its carried region. The generic
+        ;; pointwise elementizer does not rewrite values nested in a WhileFold's attribute map;
+        ;; keep those arrays as typed stable captures rather than silently dropping their ABI.
+        initializer-read?
+        (some (fn [form]
+                (let [initializers
+                      (when (dialect/while-fold-form? form)
+                        (get-in (dialect/while-fold-parts form)
+                                [:attributes :identities]))]
+                  (some #(and (symbol? (:sym %))
+                              (= (name array) (name (:sym %))))
+                        (mapcat descriptor/aget-reads initializers))))
+              (mapcat #(tree-seq coll? seq %) expressions))]
     (and (seq reads)
+         (not initializer-read?)
          (every? #(= index (descriptor/unwrap-int-cast (:idx %))) reads))))
 
 (defn- elementize

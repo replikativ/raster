@@ -1749,10 +1749,12 @@
           results (:results operation)
           initials (mapv #(scalar-value-info! (:initial %) values) iter-args)
           condition-operations (:condition-operations operation)
-          forbidden-condition? (some #(not (contains?
-                                            #{"IndexCompute" "ScalarCompute" "ScalarLoad"}
-                                            (some-> % class .getSimpleName)))
-                                     (pop condition-operations))
+          forbidden-condition? (some #(and (operation? %)
+                                           (not (contains?
+                                                 #{"IndexCompute" "ScalarCompute" "ScalarLoad"
+                                                   "Yield" "IfRegion"}
+                                                 (some-> % class .getSimpleName))))
+                                     (tree-seq coll? seq condition-operations))
           unsupported-body? (some #(and (operation? %)
                                         (not (contains?
                                               #{"IndexCompute" "ScalarCompute" "ScalarLoad"

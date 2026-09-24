@@ -30,6 +30,21 @@
         (recur (inc q) (+ acc (aget weights q)))
         (aset out i acc)))))
 
+(deftm city-like-binary-search!
+  [starts :- (Array int), ends :- (Array int), cdf :- (Array double),
+   targets :- (Array double), out :- (Array int), n :- Long] :- Void
+  (par/map-void! i n
+    (let [^int selected
+          (loop [^int lo (int (aget starts i))
+                 ^int hi (int (aget ends i))]
+            (if (>= lo hi)
+              lo
+              (let [^int mid (int (quot (+ lo hi) 2))]
+                (if (< (aget targets i) (aget cdf mid))
+                  (recur lo mid)
+                  (recur (inc mid) hi)))))]
+      (aset out i selected))))
+
 (deftm canonical-operator-dot
   [left :- (Array float), right :- (Array float), n :- Long] :- Double
   (par/reduce acc 0.0 i n
@@ -64,6 +79,22 @@
                       {'n :long 'nc :long})]
     (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))))
+
+(deftest walked-city-like-binary-search-is-a-typed-while-loop
+  (let [source (first (gpu/get-walked-body #'city-like-binary-search! :int))
+        array-types {'starts :int 'ends :int 'cdf :double
+                     'targets :double 'out :int}
+        scalar-types {'n :long}
+        scheduled (pipeline/schedule-parallel-form
+                   source {:dtype :int :target-device :ocl:0
+                           :array-types array-types :scalar-types scalar-types})
+        operation (first (:operations (first (:equations (:form scheduled)))))
+        artifact (when operation
+                   (segop-opencl/generate-scheduled-segmap-kernel
+                    operation :array-types array-types :scalar-types scalar-types))]
+    (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (re-find #"while \(1\)" (:source artifact)))))
 
 (deftest helper-expansion-preserves-canonical-numeric-reductions
   (let [source (first (gpu/get-walked-body #'canonical-operator-dot :float))

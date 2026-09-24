@@ -46,6 +46,63 @@
     (is (= 2 (count (:results loop))))
     (is (= 2 (count (:values (peek (:operations loop))))))))
 
+(deftest ordered-while-components-share-one-data-dependent-loop
+  (let [fold '(while-fold {:accumulators [lo hi]
+                          :identities [start end]
+                          :dtypes [:int :int]
+                          :association :ordered}
+                (lambda [lo hi] (region [] [(clojure.core/< lo hi)]))
+                (lambda [lo hi]
+                  (region [] [(clojure.core/inc lo) hi])))
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {}
+                  :scalar-types {'start :int 'end :int} :index-scope #{}
+                  :lower-index (fn [expression _] expression)
+                  :decline! (fn [rule message data]
+                              (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:lower-region lowerer)
+                 {:bindings []
+                  :results [(list 'while-component fold 0)
+                            (list 'while-component fold 1)]}
+                 [:int :int] {} {'start :int 'end :int})
+        loops (filter #(instance? raster.compiler.ir.kernel_body.WhileLoop %)
+                      (:operations lowered))]
+    (is (= [:int :int] (:types lowered)))
+    (is (= 1 (count loops)) "component projections must not duplicate a while loop")
+    (is (= 2 (count (:iter-args (first loops)))))
+    (is (= 2 (count (:results (first loops)))))))
+
+(deftest data-dependent-binary-search-reaches-kernel-body
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (let* [^int selected
+                        (loop* [^int lo (int (clojure.core/aget starts i))
+                                ^int hi (int (clojure.core/aget ends i))]
+                          (if (clojure.core/>= lo hi)
+                            lo
+                            (let* [^int mid (int (quot (clojure.core/+ lo hi) 2))]
+                              (if (clojure.core/< (clojure.core/aget targets i)
+                                                  (clojure.core/aget cdf mid))
+                                (recur lo mid)
+                                (recur (clojure.core/inc mid) hi)))))]
+                   (clojure.core/aset output (raster.par/unique-index i) selected)))]
+           effect)
+        options {:dtype :int
+                 :array-types {'starts :int 'ends :int 'targets :double
+                               'cdf :double 'output :int}
+                 :scalar-types {'n :long}}
+        routed (route/attempt source :int (:array-types options) options)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (:program routed) {:dtype :int :target-device :ocl:0}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :int :min-elements 1)
+        kernel (first (:kernels emitted))]
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+    (is (re-find #"while \(1\)" (:source kernel)))))
+
 (deftest branchy-product-updates-share-loads-and-multi-result-control
   (let [shared-let '[^{:raster.type/tag float} value (clojure.core/aget x i)]
         product

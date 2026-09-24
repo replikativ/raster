@@ -871,6 +871,67 @@
                      :result (nth (:results lowered-product) ordinal)
                      :type (nth (:types lowered-product) ordinal)})
 
+                  (dialect/while-component-form? expression)
+                  (let [[_ while-fold ordinal] expression
+                        cached (get @product-fold-cache while-fold)
+                        first-use? (nil? cached)
+                        lowered-loop
+                        (or cached
+                            (let [{:keys [attributes condition update]}
+                                  (dialect/while-fold-parts while-fold)
+                                  accumulators (:accumulators attributes)
+                                  dtypes (mapv canon-type (:dtypes attributes))
+                                  condition-region (dialect/lambda-parts condition)
+                                  update-region (dialect/lambda-parts update)
+                                  _ (when-not (and (= accumulators (:parameters condition-region)
+                                                     (:parameters update-region))
+                                                   (empty? (:locals condition-region))
+                                                   (empty? (:locals update-region))
+                                                   (= 1 (count (:body-results condition-region)))
+                                                   (= (count accumulators)
+                                                      (count (:body-results update-region))))
+                                      (decline! :typed-while-fold-shape
+                                                "while fold regions must agree with typed carries"
+                                                {:expression expression}))
+                                  initials (mapv (fn [identity type] (lower identity type env))
+                                                 (:identities attributes) dtypes)
+                                  carries (mapv (fn [_] (fresh "while-carry")) accumulators)
+                                  results (mapv (fn [_] (fresh "while-result")) accumulators)
+                                  substitutions (zipmap accumulators carries)
+                                  loop-env (into env (map vector carries dtypes))
+                                  condition-expression
+                                  (util/subst-syms substitutions
+                                                   (first (:body-results condition-region)))
+                                  condition-value (lower condition-expression :predicate loop-env)
+                                  update-expressions
+                                  (mapv #(util/subst-syms substitutions %)
+                                        (:body-results update-region))
+                                  updates (lower-product-results update-expressions dtypes loop-env)
+                                  operation
+                                  (body/->WhileLoop
+                                   (mapv (fn [carry initial]
+                                           (body/->LoopArg (body/value carry (:type initial))
+                                                           (:result initial)))
+                                         carries initials)
+                                   (conj (vec (:operations condition-value))
+                                         (body/->Yield [(:result condition-value)]))
+                                   (conj (vec (:operations updates))
+                                         (body/->Yield (:results updates)))
+                                   (mapv (fn [result type] (body/value result type)) results dtypes)
+                                   {:association :ordered :source-order true})
+                                  lowered {:operations (conj (vec (mapcat :operations initials))
+                                                             operation)
+                                           :results results :types dtypes}]
+                              (swap! product-fold-cache assoc while-fold lowered)
+                              lowered))]
+                    (when-not (< -1 ordinal (count (:results lowered-loop)))
+                      (decline! :typed-while-fold-component
+                                "while fold component ordinal is outside its carried tuple"
+                                {:expression expression :ordinal ordinal}))
+                    {:operations (if first-use? (:operations lowered-loop) [])
+                     :result (nth (:results lowered-loop) ordinal)
+                     :type (nth (:types lowered-loop) ordinal)})
+
                   (and (seq? expression) (contains? #{'loop 'loop*} (first expression)))
                   (if-let [{:keys [acc-sym acc-init index-sym bound-expr else-expr update-expr
                                    inclusive? index-init]}
