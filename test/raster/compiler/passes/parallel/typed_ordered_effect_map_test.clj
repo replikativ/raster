@@ -628,24 +628,47 @@
               (let [salt (int (+ key e))
                     lane (int (+ salt anchor))
                     base (int (+ lane loc))
-                    slot (int (rem base 8))]
+                    slot (int (rem base 8))
+                    alpha 1.0 beta 2.0 delta 3.0 lon 4.0 lat 5.0]
                 (raster.par/atomic-add! visits
                                         (unchecked-add-int (* slot 2) anchor)
                                         (int 1))
-                (raster.par/atomic-add! counts 1 (int 1))))
+                (raster.par/atomic-add! counts
+                                        (unchecked-add-int 2 slot) (int 1))))
             (recur (int (unchecked-add-int e 1)) (int (+ anchor 1)))))))))
 
-(deftest direct-and-loop-effects-retain-disjoint-coordinates-and-lexical-scopes
+(deftest direct-and-loop-atomics-retain-dynamic-coordinates-and-lexical-scopes
   (let [descriptor (pipeline/compile-gpu-program #'city-retail-ordered-scopes!
                                                  :ze:0 :dtype :double)
         step (first (:steps descriptor))]
     (is (= :map-void (:convention step)))
     (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
     (let [starts (int-array [0]) offsets (int-array [2 2 2])
-          visits (int-array 24) counts (int-array 2)]
+          visits (int-array 24) counts (int-array 10)]
       (city-retail-ordered-scopes! starts offsets visits counts 1)
-      (is (= [1 2] (vec counts)))
+      (is (= [1 0 0 0 0 0 0 1 0 1] (vec counts)))
       (is (= 2 (reduce + visits))))))
+
+(deftest nested-effect-local-shadowing-precedes-flat-type-facts
+  (let [source {:locals [{:id 'rstr_local_0 :dtype :int :init 0}]
+                :stores [{:out 'counts :index 0 :value 1}]
+                :loops [{:index 'e :lower 'rstr_local_0 :extent 2
+                         :locals []
+                         :stores [{:out 'counts :index 'rstr_local_0 :value 1}]
+                         :loops []
+                         :order [[:region {:locals [{:id 'rstr_local_0
+                                                     :dtype :double :init 2.0}]
+                                            :order [[:store 0]]}]]}]
+                :order [[:store 0] [:loop 0]]}
+        normalized (#'frontend/alpha-rename-source-region source)
+        loop (first (:loops normalized))
+        inner (second (first (:order loop)))
+        inner-id (-> inner :locals first :id)]
+    (is (= 'rstr_local_0 (:lower loop)))
+    (is (not= 'rstr_local_0 inner-id))
+    (is (= :double (-> inner :locals first :dtype)))
+    (is (= inner-id (-> loop :stores first :index)))
+    (is (= [[:store 0] [:loop 0]] (:order normalized)))))
 
 (deftest unchecked-int-loop-step-needs-a-proved-int-exclusive-bound
   (let [tail '(recur (int (unchecked-add-int e 1)) anchor)]
