@@ -503,6 +503,29 @@
              {:expected expected :actual (:certificate lowering)}))
     lowering))
 
+(defn memory-witness
+  "Join a verified typed invocation's compiler storage identities to its LinkPlan memory facts.
+
+   Compiler values may share a storage identity, so these are bindings rather than proofs of
+   independent value versions. The returned report makes no release/reuse/completion decision."
+  [lowering]
+  (let [{:keys [plan certificate]} (verify! lowering)
+        report (link/memory-report plan)
+        bindings (:compiler-buffer-bindings certificate)]
+    (doseq [[compiler-value storage-id] bindings]
+      (when-not (contains? (:values report) storage-id)
+        (fail! :invocation-memory-binding
+               "a compiler value has no validated logical storage in the LinkPlan"
+               {:compiler-value compiler-value :storage storage-id :plan (:id plan)})))
+    {:source-dialect (:source-dialect certificate)
+     :target-dialect (:target-dialect certificate)
+     :plan (:id plan)
+     :compiler-buffer-bindings bindings
+     :public-buffer-bindings (:public-buffer-bindings certificate)
+     :semantic-outputs (:semantic-outputs certificate)
+     :memory report
+     :value-versions :unproven}))
+
 (defn certify
   "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness."
   [plan]
