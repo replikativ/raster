@@ -19,6 +19,19 @@
    'min :min, 'clojure.core/min :min
    'max :max, 'clojure.core/max :max})
 
+(def ^:private wrapping-int-operators
+  '#{unchecked-add-int unchecked-subtract-int unchecked-multiply-int
+     clojure.core/unchecked-add-int clojure.core/unchecked-subtract-int
+     clojure.core/unchecked-multiply-int})
+
+(defn requires-scalar-evaluation?
+  "Whether an index contains narrowing arithmetic that exact index algebra cannot replay.
+   Its typed scalar SSA result may still be used as a coordinate."
+  [expression]
+  (boolean (some #(and (seq? %)
+                       (contains? wrapping-int-operators (descriptor/semantic-op %)))
+                 (tree-seq coll? seq expression))))
+
 (def ^:private casts
   '#{int long clojure.core/int clojure.core/long})
 

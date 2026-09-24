@@ -8,6 +8,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.core]
             [raster.arrays]
@@ -591,6 +592,65 @@
                                                  :ze:0 :dtype :double)
         step (first (:steps descriptor))]
     (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))))
+
+(raster.core/deftm city-conditional-two-arm-effects!
+  [visits :- (Array int), counts :- (Array int), n :- Long] :- Void
+  (raster.par/map-void! i n
+    (if (== (rem i 3) 0)
+      (raster.par/atomic-add! counts 2 (int 1))
+      (when (< i 5)
+        (raster.par/atomic-add! visits i (int 1))
+        (raster.par/atomic-add! counts 1 (int 1))))))
+
+(deftest effectful-if-arms-retain-typed-boolean-guards
+  (let [descriptor (pipeline/compile-gpu-program #'city-conditional-two-arm-effects!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))
+        visits (int-array 8)
+        counts (int-array 3)]
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+    (city-conditional-two-arm-effects! visits counts 8)
+    (is (= [0 1 1 0 1 0 0 0] (vec visits)))
+    (is (= [0 3 3] (vec counts)))))
+
+(raster.core/deftm city-retail-ordered-scopes!
+  [starts :- (Array int), offsets :- (Array int), visits :- (Array int),
+   counts :- (Array int), n :- Long] :- Void
+  (raster.par/map-void! i n
+    (let [start (int (raster.arrays/aget starts i))
+          end (int (raster.arrays/aget offsets (unchecked-add-int start 1)))
+          key (int (+ start 3))]
+      (raster.par/atomic-add! counts 0 (int 1))
+      (loop [e (int start) anchor (int 0)]
+        (when (< e end)
+          (let [loc (int (raster.arrays/aget offsets e))]
+            (when (== loc (int 2))
+              (let [salt (int (+ key e))
+                    lane (int (+ salt anchor))
+                    base (int (+ lane loc))
+                    slot (int (rem base 8))]
+                (raster.par/atomic-add! visits
+                                        (unchecked-add-int (* slot 2) anchor)
+                                        (int 1))
+                (raster.par/atomic-add! counts 1 (int 1))))
+            (recur (int (unchecked-add-int e 1)) (int (+ anchor 1)))))))))
+
+(deftest direct-and-loop-effects-retain-disjoint-coordinates-and-lexical-scopes
+  (let [descriptor (pipeline/compile-gpu-program #'city-retail-ordered-scopes!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))]
+    (is (= :map-void (:convention step)))
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+    (let [starts (int-array [0]) offsets (int-array [2 2 2])
+          visits (int-array 24) counts (int-array 2)]
+      (city-retail-ordered-scopes! starts offsets visits counts 1)
+      (is (= [1 2] (vec counts)))
+      (is (= 2 (reduce + visits))))))
+
+(deftest unchecked-int-loop-step-needs-a-proved-int-exclusive-bound
+  (let [tail '(recur (int (unchecked-add-int e 1)) anchor)]
+    (is (nil? (#'frontend/split-trailing-recur-many tail 'e 1 false)))
+    (is (some? (#'frontend/split-trailing-recur-many tail 'e 1 true)))))
 
 (deftest triangular-effect-domains-retain-dynamic-or-inclusive-boundaries
   (let [source

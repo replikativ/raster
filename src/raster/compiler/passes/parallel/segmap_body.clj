@@ -267,7 +267,8 @@
                       (decline! :explicit-store-target
                                 "map store targets an undeclared result"
                                 {:operation (:id segmap) :statement form :target array}))
-                  coordinate-value (when (contains-indexed-load? coordinate)
+                  coordinate-value (when (or (contains-indexed-load? coordinate)
+                                             (index-expression/requires-scalar-evaluation? coordinate))
                                      ((:lower lowerer) coordinate :long environment))
                   coordinate-expression (if coordinate-value
                                           (:result coordinate-value)
@@ -389,7 +390,9 @@
             (decline! :effect-destination
                       "ordered effect targets an undeclared result"
                       {:operation (:id segmap) :effect effect}))
-          (let [coordinate-value (when (contains-indexed-load? destination-index)
+          (let [coordinate-value (when (or (contains-indexed-load? destination-index)
+                                           (index-expression/requires-scalar-evaluation?
+                                            destination-index))
                                    ((:lower lowerer) destination-index :long environment))
                 coordinate-expression (if coordinate-value
                                         (:result coordinate-value)
