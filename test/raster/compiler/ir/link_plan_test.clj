@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.link-plan-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.analysis.physical-liveness :as liveness]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -102,6 +103,52 @@
     (is (= (link/initialization-contract plan) (:initialization report)))
     (is (= [:unproven :unproven :unproven]
            ((juxt :reuse :release :completion) report)))))
+
+(deftest shadow-liveness-finds-only-disjoint-local-allocations
+  (let [plan (link/make
+              {:id :four-stages :target :ze:0
+               :nodes [(n :x :input (float-array 16))
+                       (n :w0 :constant (float-array 16))
+                       (n :w1 :constant (float-array 16))
+                       (n :w2 :constant (float-array 16))
+                       (n :w3 :constant (float-array 16))
+                       (n :a :internal) (n :b :internal) (n :c :internal)
+                       (n :out :output)]
+               :instances [(instance :stage-0 :x :w0 :a)
+                           (instance :stage-1 :a :w1 :b)
+                           (instance :stage-2 :b :w2 :c)
+                           (instance :stage-3 :c :w3 :out)]
+               :outputs [:out]})
+        report (liveness/report plan)]
+    (is (= plan (link/validate! plan)) "analysis cannot mutate the executable plan")
+    (is (= 576 (:current-owned-bytes report)))
+    (is (= [:shadow-candidate 0 1]
+           ((juxt :reason :first-order :last-order) (get-in report [:slots :a]))))
+    (is (= [:shadow-candidate 2 3]
+           ((juxt :reason :first-order :last-order) (get-in report [:slots :c]))))
+    (is (= [{:from :a :to :c :after-order 1 :before-order 2 :bytes 64
+             :status :shadow
+             :pending #{:runtime-order :alias-realization :completion-and-escape}}]
+           (:proposals report)))
+    (is (= :public-output (get-in report [:slots :out :reason])))
+    (is (= :host-initialized (get-in report [:slots :w0 :reason])))
+    (is (= :unproven (:reuse report)))))
+
+(deftest shadow-liveness-does-not-split-packed-views-into-reusable-allocations
+  (let [base (valid-plan)
+        packed (mapv (fn [[id offset]]
+                       (link/node {:id id :dtype :float :shape [16] :device :ze:0
+                                   :role :internal :allocation-id :qkv-packed
+                                   :byte-size 192 :byte-offset offset}))
+                     [[:q 0] [:k 64] [:v 128]])
+        plan (link/make {:id :packed-views :target :ze:0
+                         :nodes (concat (vals (:nodes base)) packed)
+                         :instances (:instances base) :outputs (:outputs base)})
+        report (liveness/report plan)]
+    (is (= #{:q :k :v} (set (get-in report [:slots :qkv-packed :nodes]))))
+    (is (= :multi-view (get-in report [:slots :qkv-packed :reason])))
+    (is (not-any? #(or (= :qkv-packed (:from %)) (= :qkv-packed (:to %)))
+                  (:proposals report)))))
 
 (deftest borrowing-storage-preserves-code-and-extracts-owner-obligations
   (let [original (valid-plan)
