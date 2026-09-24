@@ -472,6 +472,22 @@
          (or (extent? (:extent value)) (seq? (:extent value)))
          (= :ordered (:association value)))))
 
+(defn while-fold-attributes?
+  "Typed ordered scalar carries for a data-dependent loop. No associativity is implied."
+  [value]
+  (let [accumulators (:accumulators value)
+        identities (:identities value)
+        dtypes (:dtypes value)]
+    (and (map? value)
+         (vector? accumulators) (seq accumulators)
+         (every? symbol? accumulators)
+         (= (count accumulators) (count (distinct accumulators)))
+         (vector? identities) (= (count accumulators) (count identities))
+         (every? #(or (scalar-literal? %) (symbol? %) (seq? %)) identities)
+         (vector? dtypes) (= (count accumulators) (count dtypes))
+         (every? #(and (keyword? %) (dtype/known? %) (= % (dtype/canon %))) dtypes)
+         (= :ordered (:association value)))))
+
 (defn segmented-fold-map-attributes?
   "Attributes for independent segments containing dependent folds and a final dense map.
 
@@ -555,6 +571,7 @@
              [pra product-reduce-attributes?]
              [fa fold-attributes?]
              [pfa product-fold-attributes?]
+             [wfa while-fold-attributes?]
              [sfma segmented-fold-map-attributes?]
              [ca scan-attributes?]
              [sca scalar-convert-attributes?]
@@ -569,6 +586,7 @@
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
           (raster.compiler.ir.soac-dialect/scalar-convert ?sca ?s:operand)
           (product-component ?pf:product ?lit:ordinal)
+          (while-component ?wf:product ?lit:ordinal)
           (write ?s:destination-index ?s:predicate ?s:value)
           [(?:* s)]
           (.invk ?sym:impl (?:* s:args))
@@ -608,6 +626,9 @@
 
   (ProductFold [pf :enforce]
                (product-fold ?pfa ?l))
+
+  (WhileFold [wf :enforce]
+             (while-fold ?wfa ?l:condition ?l:update))
 
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
@@ -999,6 +1020,21 @@
   (and (seq? value) (= 'product-component (first value)) (= 3 (count value))
        (product-fold-form? (second value)) (integer? (nth value 2))))
 
+(defn while-fold-form?
+  [value]
+  (and (seq? value) (= 'while-fold (first value)) (= 4 (count value))))
+
+(defn while-fold-parts
+  [value]
+  (when (while-fold-form? value)
+    (let [[_ attributes condition update] value]
+      {:attributes attributes :condition condition :update update})))
+
+(defn while-component-form?
+  [value]
+  (and (seq? value) (= 'while-component (first value)) (= 3 (count value))
+       (while-fold-form? (second value)) (integer? (nth value 2))))
+
 (defn scalar-convert-form?
   "True for a typed source conversion embedded in a scalar region."
   [value]
@@ -1042,6 +1078,41 @@
                          "scalar conversion requires one descriptor-derived typed policy"
                          {:equation equation-id :expression expression}))
                 (walk-expression! operand bound))
+
+              (while-component-form? expression)
+              (let [[_ while-fold ordinal] expression
+                    {:keys [attributes condition update]} (while-fold-parts while-fold)
+                    accumulators (:accumulators attributes)
+                    identities (:identities attributes)
+                    condition-region (lambda-parts condition)
+                    update-region (lambda-parts update)
+                    local-bound (into bound accumulators)]
+                (when-not (and (while-fold-attributes? attributes)
+                               (< -1 ordinal (count accumulators))
+                               (= accumulators (:parameters condition-region)
+                                  (:parameters update-region))
+                               (empty? (set/intersection bound (set accumulators)))
+                               (empty? (:locals condition-region))
+                               (empty? (:locals update-region))
+                               (= 1 (count (:body-results condition-region)))
+                               (= (count accumulators)
+                                  (count (:body-results update-region)))
+                               (every? #(empty? (util/free-syms % bound)) identities)
+                               (not-any? util/effectful? identities))
+                  (fail! :typed-soac-while-fold
+                         "ordered while fold requires closed typed carries and scalar regions"
+                         {:equation equation-id :fold while-fold :ordinal ordinal}))
+                (doseq [initializer identities]
+                  (walk-expression! initializer bound))
+                (doseq [result (concat (:body-results condition-region)
+                                       (:body-results update-region))]
+                  (walk-expression! result local-bound)
+                  (when (or (seq (util/free-syms result local-bound))
+                            (util/effectful? result)
+                            (some write-form? (tree-seq coll? seq result)))
+                    (fail! :typed-soac-while-fold
+                           "ordered while fold condition and updates must be closed and pure"
+                           {:equation equation-id :fold while-fold :result result}))))
 
               (product-component-form? expression)
               (let [[_ product ordinal] expression

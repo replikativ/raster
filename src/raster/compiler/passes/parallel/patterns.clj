@@ -868,6 +868,43 @@
                  :update-exprs update-exprs
                  :scoped-update-exprs update-exprs}))))))))
 
+(defn match-ordered-while-loop
+  "Match a pure data-dependent recurrence whose continuing arm always recurs.
+
+   The matcher only exposes source structure. Purity and retained carry types are checked by
+   TypedSOAC before a target may schedule it. In particular, mixed recur/side-effect leaves are
+   not silently turned into a scalar fold."
+  [loop-form]
+  (when (and (seq? loop-form) (contains? loop-heads (first loop-form))
+             (= 3 (count loop-form)) (vector? (second loop-form))
+             (even? (count (second loop-form))))
+    (let [pairs (vec (partition 2 (second loop-form)))
+          carry-syms (mapv first pairs)
+          carry-inits (mapv second pairs)
+          body-form (last loop-form)]
+      (when (and (seq pairs) (every? symbol? carry-syms)
+                 (= (count carry-syms) (count (set carry-syms)))
+                 (seq? body-form) (= 'if (first body-form)) (= 4 (count body-form)))
+        (let [[_ test then-branch else-branch] body-form
+              then-updates (mapv #(projected-recur-argument
+                                    then-branch % (count pairs)) (range (count pairs)))
+              else-updates (mapv #(projected-recur-argument
+                                    else-branch % (count pairs)) (range (count pairs)))
+              continuing? (cond
+                            (every? some? then-updates) :then
+                            (every? some? else-updates) :else)
+              exit-expr (if (= continuing? :then) else-branch then-branch)]
+          (when (and continuing?
+                     (not-any? #(and (seq? %) (= 'recur (first %)))
+                               (tree-seq coll? seq exit-expr)))
+            {:carry-syms carry-syms
+             :carry-inits carry-inits
+             :continue-expr (if (= continuing? :then)
+                              test (list 'if test false true))
+             :exit-expr exit-expr
+             :update-exprs (if (= continuing? :then)
+                             then-updates else-updates)}))))))
+
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.
 	valid-op? is a predicate over the reduction operator symbol.

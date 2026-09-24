@@ -130,6 +130,9 @@
         (= 'product-fold head)
         {:kind :product-fold :introduces-scope? true :liftable? false :head head}
 
+        (= 'while-fold head)
+        {:kind :while-fold :introduces-scope? true :liftable? false :head head}
+
         (= 'effect-region head)
         {:kind :effect-region :introduces-scope? true :liftable? false :head head}
 
@@ -422,6 +425,34 @@
                          (list 'lambda parameters'
                                (list 'region locals' (vec body))))))}))))
 
+        ;; Both regions of a data-dependent scalar loop share the same carried parameters.
+        :while-fold
+        (let [[_ attributes [_ condition-parameters [_ condition-locals condition-results]]
+               [_ update-parameters [_ update-locals update-results]]] form]
+          (when (and (map? attributes)
+                     (vector? condition-parameters)
+                     (= condition-parameters update-parameters)
+                     (vector? condition-locals) (empty? condition-locals)
+                     (vector? update-locals) (empty? update-locals)
+                     (vector? condition-results) (vector? update-results))
+            (let [condition-count (count condition-results)
+                  parameter-count (count condition-parameters)]
+              {:sequential? true
+               :scopes [{:binders condition-parameters
+                         :inits (vec (repeat parameter-count nil))
+                         :body (into condition-results update-results)}]
+               :outer (:identities attributes)
+               :rebuild
+               (fn [[{:keys [binders body]}] identities]
+                 (let [parameters (vec binders)
+                       attributes' (assoc attributes :accumulators parameters
+                                          :identities (vec identities))]
+                   (rl form 'while-fold attributes'
+                       (list 'lambda parameters
+                             (list 'region [] (vec (take condition-count body))))
+                       (list 'lambda parameters
+                             (list 'region [] (vec (drop condition-count body)))))))})))
+
         ;; An effect-region's result binders enter scope only after their loop initializer.
         ;; Nil binder slots retain intervening stores in the same sequential spine.
         :effect-region
@@ -474,11 +505,11 @@
         ;; (matched as :call by form-info, so dispatch on head here)
         :call
         (cond
-          (= 'product-component head)
+          (contains? #{'product-component 'while-component} head)
           (let [[_ product ordinal] form]
             (when (and (= 3 (count form)) (integer? ordinal))
               {:sequential? false :scopes [] :outer [product]
-               :rebuild (fn [_ [product']] (rl form 'product-component product' ordinal))}))
+               :rebuild (fn [_ [product']] (rl form head product' ordinal))}))
 
           (= 'letfn* head)
           (let [[_ bindings & body] form
@@ -572,7 +603,8 @@
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
-  (contains? #{:scope :lambda :par :fold :product-fold :effect-region :effect-loop}
+  (contains? #{:scope :lambda :par :fold :product-fold :while-fold
+               :effect-region :effect-loop}
              (:kind (form-info form))))
 
 (defn call-form?

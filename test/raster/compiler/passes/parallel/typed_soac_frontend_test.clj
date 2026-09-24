@@ -2251,3 +2251,34 @@
     (is (= program (dialect/validate! program)))
     (is (some dialect/product-component-form? expressions))
     (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %))) expressions))))
+
+(deftest nested-data-dependent-binary-search-becomes-ordered-while-fold
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (let* [^int selected
+                        (loop* [^int lo (int (clojure.core/aget starts i))
+                                ^int hi (int (clojure.core/aget ends i))]
+                          (if (clojure.core/>= lo hi)
+                            lo
+                            (let* [^int mid (int (quot (clojure.core/+ lo hi) 2))]
+                              (if (clojure.core/< (clojure.core/aget target i)
+                                                  (clojure.core/aget cdf mid))
+                                (recur lo mid)
+                                (recur (clojure.core/inc mid) hi)))))]
+                   (clojure.core/aset output (raster.par/unique-index i) selected)))]
+           effect)
+        program (frontend/form->program
+                 source {:dtype :int
+                         :array-types {'starts :int 'ends :int 'target :double
+                                       'cdf :double 'output :int}
+                         :scalar-types {'n :long}})
+        equation (when program (first (dialect/equations program)))
+        expressions (when equation (tree-seq coll? seq equation))]
+    (is (some? program))
+    (when program
+      (is (= program (dialect/validate! program)))
+      (is (some dialect/while-component-form? expressions))
+      (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
+                    expressions)))))
