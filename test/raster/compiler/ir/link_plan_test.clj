@@ -77,6 +77,32 @@
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
 
+(deftest memory-report-retains-ordered-physical-facts-without-claiming-reuse
+  (let [plan (valid-plan)
+        report (link/memory-report plan)
+        accesses (:accesses report)]
+    (is (= :two-layers (:plan report)))
+    (is (= :ze:0 (:target report)))
+    (is (= #{:x :w0 :w1 :hidden :out} (set (keys (:values report)))))
+    (is (= {:value :hidden :role :internal :allocation :hidden
+            :byte-offset 0 :byte-length 64 :dtype :float :shape [16]
+            :strides [1] :device :ze:0 :memory-space :device
+            :ownership :owned :host-initializer? false :output? false}
+           (get-in report [:nodes :hidden])))
+    (is (= {:byte-size 64 :device :ze:0 :memory-space :device
+            :ownership :owned :alignment 1 :coherence :device-only}
+           (get-in report [:allocations :hidden])))
+    (is (= #{} (:aliases report)))
+    (is (= [[0 :layer-0 :x :read] [0 :layer-0 :w0 :read]
+            [0 :layer-0 :hidden :write] [1 :layer-1 :hidden :read]
+            [1 :layer-1 :w1 :read] [1 :layer-1 :out :write]]
+           (mapv (juxt :order :instance :node :access) accesses)))
+    (is (every? (comp false? :complete-write?) accesses)
+        "legacy ABI write permissions do not certify a complete overwrite")
+    (is (= (link/initialization-contract plan) (:initialization report)))
+    (is (= [:unproven :unproven :unproven]
+           ((juxt :reuse :release :completion) report)))))
+
 (deftest borrowing-storage-preserves-code-and-extracts-owner-obligations
   (let [original (valid-plan)
         {:keys [plan allocations initializers initialization]} (link/borrow-owned-storage original)]

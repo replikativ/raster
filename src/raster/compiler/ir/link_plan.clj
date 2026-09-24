@@ -1188,6 +1188,64 @@
               (update accesses (get node-values node) merge-access access))
             {} (mapcat :facts (instance-access-facts plan)))))
 
+(defn memory-report
+  "Report the validated logical/physical memory facts of a LinkPlan without allocating storage.
+
+   :accesses are ordered submission facts, not completion events or a proof that storage can be
+   reused. In particular, this report does not infer donation, release, cross-plan lifetimes, or
+   asynchronous transfer completion. Such decisions require additional ownership/event evidence."
+  [plan]
+  (let [{:keys [plan effect-evidence]} (validate-with-effect-evidence! plan)
+        node-values (into {} (mapcat (fn [[value-id value]]
+                                      (map (fn [{:keys [node]}] [node value-id])
+                                           (:leaves value)))
+                                    (:values plan)))
+        accesses (vec
+                  (mapcat (fn [order {:keys [instance step phase facts complete-writes]}]
+                            (map (fn [{:keys [node access field]}]
+                                   {:order order :instance instance :step step :phase phase
+                                    :value (get node-values node) :node node :field field
+                                    :access access
+                                    :complete-write? (boolean (and complete-writes
+                                                                   (contains? complete-writes node)))})
+                                 facts))
+                          (range) (:step-facts effect-evidence)))
+        nodes (into {}
+                    (map (fn [[node-id {:keys [role view source]}]]
+                           (let [{:keys [allocation byte-offset byte-length dtype shape strides]} view]
+                             [node-id {:value (get node-values node-id)
+                                       :role role :allocation (:id allocation)
+                                       :byte-offset byte-offset :byte-length byte-length
+                                       :dtype dtype :shape shape :strides strides
+                                       :device (:device allocation)
+                                       :memory-space (:memory-space allocation)
+                                       :ownership (:ownership allocation)
+                                       :host-initializer? (boolean source)
+                                       :output? (boolean (some #{node-id} (:outputs plan)))}]))
+                    (:nodes plan)))
+        allocations (into {}
+                          (map (fn [[_ {:keys [view]}]]
+                                 (let [{:keys [id byte-size device memory-space ownership
+                                               alignment coherence]} (:allocation view)]
+                                   [id {:byte-size byte-size :device device
+                                        :memory-space memory-space :ownership ownership
+                                        :alignment alignment :coherence coherence}]))
+                          (:nodes plan)))]
+    {:plan (:id plan) :target (:target plan)
+     :values (into {} (map (fn [[value-id value]]
+                             [value-id {:abstract (:abstract value)
+                                        :leaves (:leaves value)
+                                        :physical-layout (:physical-layout value)}]))
+                   (:values plan))
+     :nodes nodes
+     :allocations allocations
+     :aliases (:aliases plan)
+     :accesses accesses
+     :initialization (:initialization effect-evidence)
+     :reuse :unproven
+     :release :unproven
+     :completion :unproven}))
+
 (defn- normalize-plan
   [{:keys [id target nodes values instances outputs aliases attributes]
     :or {outputs [] aliases #{} attributes {}}}]
