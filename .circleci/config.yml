@@ -104,7 +104,7 @@ jobs:
       - run:
           name: Emit scheduled KernelBody CUDA and HIP sources
           command: >-
-            clojure -M:gpu-compile-fixtures
+            clojure -J-Dclojure.main.report=stderr -M:gpu-compile-fixtures
             -m raster.compiler.backend.gpu.kernel-body-compile-fixtures
             gpu-compile-gates
       - persist_to_workspace:
