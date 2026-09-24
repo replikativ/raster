@@ -1216,14 +1216,14 @@
                     (update store :predicate
                             #(if (contains? #{true 1} %)
                                predicate
-                               (list 'if predicate % 0))))
+                               (list 'if predicate % false))))
                   (:stores then-region))
              (map (fn [store]
                     (update store :predicate
-                            #(let [else-predicate (list 'if predicate 0 1)]
+                            #(let [else-predicate (list 'if predicate false true)]
                                (if (contains? #{true 1} %)
                                  else-predicate
-                                 (list 'if else-predicate % 0)))))
+                                 (list 'if else-predicate % false)))))
                   (:stores else-region)))))}))
 
     (and (seq? body) (= 'case* (first body)))

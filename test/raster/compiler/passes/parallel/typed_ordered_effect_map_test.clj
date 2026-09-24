@@ -592,6 +592,26 @@
         step (first (:steps descriptor))]
     (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))))
 
+(raster.core/deftm city-conditional-two-arm-effects!
+  [visits :- (Array int), counts :- (Array int), n :- Long] :- Void
+  (raster.par/map-void! i n
+    (if (== (rem i 3) 0)
+      (raster.par/atomic-add! counts 2 (int 1))
+      (when (< i 5)
+        (raster.par/atomic-add! visits i (int 1))
+        (raster.par/atomic-add! counts 1 (int 1))))))
+
+(deftest effectful-if-arms-retain-typed-boolean-guards
+  (let [descriptor (pipeline/compile-gpu-program #'city-conditional-two-arm-effects!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))
+        visits (int-array 8)
+        counts (int-array 3)]
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
+    (city-conditional-two-arm-effects! visits counts 8)
+    (is (= [0 1 1 0 1 0 0 0] (vec visits)))
+    (is (= [0 3 3] (vec counts)))))
+
 (deftest triangular-effect-domains-retain-dynamic-or-inclusive-boundaries
   (let [source
         '(let* [effect
