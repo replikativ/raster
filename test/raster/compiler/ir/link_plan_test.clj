@@ -158,7 +158,32 @@
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (is (= :memory-order-plan-mismatch
            (try (liveness/report plan (assoc (witness [] replay) :plan :other))
-                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [memory (link/memory-report plan)
+          certified (update memory :accesses
+                            (fn [accesses]
+                              (mapv (fn [access]
+                                      (if (and (= :write (:access access))
+                                               (contains? #{:a :c} (:node access)))
+                                        (assoc access :complete-write? true)
+                                        access))
+                                    accesses)))]
+      (with-redefs [link/memory-report (constantly certified)]
+        (let [proposal (first (:proposals (liveness/report plan (witness [] replay))))]
+          (is (= :witnessed (:cross-replay-initialization proposal)))
+          (is (= #{:alias-realization :completion-and-escape}
+                 (:pending proposal)))))
+      (with-redefs [link/memory-report (constantly
+                                        (update certified :accesses
+                                                (fn [accesses]
+                                                  (mapv (fn [access]
+                                                          (if (= :c (:node access))
+                                                            (assoc access :complete-write? false)
+                                                            access))
+                                                        accesses))))]
+        (is (= :unproven
+               (get-in (liveness/report plan (witness [] replay))
+                       [:proposals 0 :cross-replay-initialization])))))))
 
 (deftest shadow-liveness-does-not-split-packed-views-into-reusable-allocations
   (let [base (valid-plan)
