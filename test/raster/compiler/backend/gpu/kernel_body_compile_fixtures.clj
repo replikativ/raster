@@ -669,6 +669,10 @@
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "scalar-while"
+                          (body-emit/emit-scalar-kernel
+                           "scalar_while" (body-fixtures/scalar-while-body)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "trapping-arithmetic"
                           (body-emit/emit-scalar-kernel
                            "trapping_arithmetic" (body-fixtures/trapping-arithmetic-body)

@@ -365,7 +365,7 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private scalar-operation-kinds
-  #{"IndexCompute" "ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop"
+  #{"IndexCompute" "ScalarCompute" "ScalarLoad" "ScalarStore" "AtomicRMW" "Yield" "IfRegion" "ForLoop" "WhileLoop"
     "PipelineYield" "PipelinedFor"
     "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait" "Guard"})
 
@@ -380,7 +380,10 @@
              (when (or (record-kind? "ForLoop" operation)
                        (record-kind? "PipelinedFor" operation)
                        (record-kind? "Guard" operation))
-               (scalar-body-operations (:operations operation)))))
+               (scalar-body-operations (:operations operation)))
+             (when (record-kind? "WhileLoop" operation)
+               (concat (scalar-body-operations (:condition-operations operation))
+                       (scalar-body-operations (:operations operation))))))
    operations))
 
 (defn- scalar-expressions
@@ -464,6 +467,12 @@
        (concat [(:id (:index operation))]
                (map (comp :id :binding) (:iter-args operation))
                (map :id (:results operation))
+               (scalar-defined-ids (:operations operation)))
+
+       (record-kind? "WhileLoop" operation)
+       (concat (map (comp :id :binding) (:iter-args operation))
+               (map :id (:results operation))
+               (scalar-defined-ids (:condition-operations operation))
                (scalar-defined-ids (:operations operation)))
 
        (record-kind? "PipelinedFor" operation)
@@ -1107,6 +1116,59 @@
             else-source
             (emit-yield-assignments results (:values else-yield)
                                     (update else-context :names merge (:names result-context))
+                                    (inc depth))
+            (indent-lines depth "}"))
+       result-context])
+
+    (record-kind? "WhileLoop" operation)
+    (let [results (:results operation)
+          result-context (reduce add-value context results)
+          loop-context (reduce (fn [ctx arg] (add-value ctx (:binding arg)))
+                               result-context (:iter-args operation))
+          initializers (apply str
+                              (map (fn [result arg]
+                                     (indent-lines depth
+                                                   (str (target-type
+                                                         (get-in result-context
+                                                                 [:types (:id result)]))
+                                                        " "
+                                                        (get-in result-context
+                                                                [:names (:id result)])
+                                                        " = "
+                                                        (emit-scalar-value (:initial arg) context)
+                                                        ";")))
+                                   results (:iter-args operation)))
+          bindings (apply str
+                          (map (fn [arg result]
+                                 (let [binding (:binding arg)]
+                                   (indent-lines (inc depth)
+                                                 (str (target-type
+                                                       (get-in loop-context
+                                                               [:types (:id binding)]))
+                                                      " "
+                                                      (get-in loop-context
+                                                              [:names (:id binding)])
+                                                      " = "
+                                                      (get-in result-context
+                                                              [:names (:id result)])
+                                                      ";"))))
+                               (:iter-args operation) results))
+          condition-ops (pop (:condition-operations operation))
+          condition-yield (peek (:condition-operations operation))
+          [condition-source condition-context]
+          (emit-scalar-operations condition-ops loop-context (inc depth))
+          condition (emit-scalar-value (first (:values condition-yield)) condition-context)
+          body-ops (pop (:operations operation))
+          body-yield (peek (:operations operation))
+          [body-source body-context]
+          (emit-scalar-operations body-ops loop-context (inc depth))]
+      [(str initializers
+            (indent-lines depth "while (1) {")
+            bindings condition-source
+            (indent-lines (inc depth) (str "if (!(" condition ")) break;"))
+            body-source
+            (emit-yield-assignments results (:values body-yield)
+                                    (update body-context :names merge (:names result-context))
                                     (inc depth))
             (indent-lines depth "}"))
        result-context])

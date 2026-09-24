@@ -118,6 +118,37 @@
 
 (declare command-available? compile-c-family-source)
 
+(deftest scalar-while-loop-has-one-target-neutral-c-family-lowering
+  (let [kernel (fixtures/scalar-while-body)]
+    (is (body/kernel-body? (body/validate! kernel)))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (let [source (opencl/emit-scalar-kernel
+                    "scalar_while" kernel {:target-dialect target})]
+        (is (str/includes? source "while (1) {") (name target))
+        (is (str/includes? source "if (!(rstr_continue_p)) break;") (name target))
+        (is (str/includes? source "rstr_final_cursor = rstr_next_cursor;")
+            (name target))
+        (when (and (= :opencl-portable target) (command-available? "clang"))
+          (let [{:keys [exit err]}
+                (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0" "-fsyntax-only"
+                          "-" :in source)]
+            (is (zero? exit) err))))))
+  (let [kernel (fixtures/scalar-while-body)
+        impure (assoc-in kernel [:operations 0 :condition-operations 0]
+                         (body/->ScalarStore 'out [0] (body/literal 1 :int) nil))
+        literal-condition (assoc-in kernel [:operations 0 :condition-operations 1]
+                                    (body/->Yield [(body/literal 1 :int)]))
+        unordered (assoc-in kernel [:operations 0 :attributes :association]
+                            :implementation-defined)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"pure condition"
+                          (body/validate! impure)))
+    (is (= :kernel-body-while-condition
+           (try (body/validate! literal-condition) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :kernel-body-while-shape
+           (try (body/validate! unordered) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (defn workgroup-kernel-body
   "Small production-shaped fixture shared with the hardware-free vendor compiler gates."
   []
