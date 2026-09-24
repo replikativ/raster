@@ -43,6 +43,7 @@
 (defrecord IfRegion [condition then-operations else-operations results])
 (defrecord LoopArg [binding initial])
 (defrecord ForLoop [index lower upper step iter-args operations results attributes])
+(defrecord WhileLoop [iter-args condition-operations operations results attributes])
 (defrecord AsyncLoopArg [binding initial])
 (defrecord PipelineYield [values groups])
 (defrecord PipelinedFor
@@ -422,6 +423,7 @@
                "raster.compiler.ir.kernel_body.Yield"
                "raster.compiler.ir.kernel_body.IfRegion"
                "raster.compiler.ir.kernel_body.ForLoop"
+               "raster.compiler.ir.kernel_body.WhileLoop"
                "raster.compiler.ir.kernel_body.PipelineYield"
                "raster.compiler.ir.kernel_body.PipelinedFor"
                "raster.compiler.ir.kernel_body.Collective"
@@ -820,6 +822,29 @@
                           {:index index :scope scope})))
         (validate-operations! (:operations operation) storage fragments masks
                               (conj scope (:id index)) epilogue-abi))
+
+      (record-kind? "raster.compiler.ir.kernel_body.WhileLoop" operation)
+      (do
+        (when-not (and (vector? (:iter-args operation))
+                       (every? #(record-kind? "raster.compiler.ir.kernel_body.LoopArg" %)
+                               (:iter-args operation))
+                       (vector? (:condition-operations operation))
+                       (seq (:condition-operations operation))
+                       (vector? (:operations operation))
+                       (seq (:operations operation))
+                       (vector? (:results operation))
+                       (= (count (:iter-args operation)) (count (:results operation)))
+                       (map? (:attributes operation))
+                       (= :ordered (get-in operation [:attributes :association])))
+          (throw (ex-info "kernel while-loop requires typed carried values and two regions"
+                          {:reason :kernel-body-while-shape :loop operation})))
+        (doseq [arg (:iter-args operation)]
+          (value-spec! "while carried binding" (:binding arg)))
+        (doseq [result (:results operation)] (value-spec! "while result" result))
+        (validate-operations! (:condition-operations operation)
+                              storage fragments masks scope epilogue-abi)
+        (validate-operations! (:operations operation)
+                              storage fragments masks scope epilogue-abi))
 
       (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
       (let [index (:index operation)
@@ -1719,6 +1744,68 @@
                                          (:uniformity yielded-info)]))))
                 values (map vector results yielded initials))))
 
+    (record-kind? "raster.compiler.ir.kernel_body.WhileLoop" operation)
+    (let [iter-args (:iter-args operation)
+          results (:results operation)
+          initials (mapv #(scalar-value-info! (:initial %) values) iter-args)
+          condition-operations (:condition-operations operation)
+          forbidden-condition? (some #(not (contains?
+                                            #{"IndexCompute" "ScalarCompute" "ScalarLoad"}
+                                            (some-> % class .getSimpleName)))
+                                     (pop condition-operations))
+          unsupported-body? (some #(and (operation? %)
+                                        (not (contains?
+                                              #{"IndexCompute" "ScalarCompute" "ScalarLoad"
+                                                "ScalarStore" "AtomicRMW" "Yield" "IfRegion"
+                                                "ForLoop" "WhileLoop"}
+                                              (some-> % class .getSimpleName))))
+                                  (tree-seq coll? seq (:operations operation)))]
+      (when (or forbidden-condition? unsupported-body?)
+        (throw (ex-info "divergent while-loop requires a pure condition and scalar body"
+                        {:reason :kernel-body-while-effects :operation operation})))
+      (let [condition-yield (terminal-yield! "kernel while condition"
+                                             condition-operations)]
+        (when-not (and (= 1 (count (:values condition-yield)))
+                       (value-id? (first (:values condition-yield))))
+          (throw (ex-info "kernel while condition must yield one predicate SSA value"
+                          {:reason :kernel-body-while-condition
+                           :condition condition-yield}))))
+      (doseq [[arg initial] (map vector iter-args initials)]
+        (claim-value! claimed reserved values (:binding arg) "while carried binding")
+        (when-not (= (canonical-type (:type (:binding arg))) (:type initial))
+          (throw (ex-info "kernel while-loop initial value type disagrees with its binding"
+                          {:reason :kernel-body-while-initial :arg arg :initial initial}))))
+      (let [loop-values (into values
+                              (map (fn [arg initial]
+                                     [(:id (:binding arg))
+                                      (assoc (conservative-loop-info
+                                              initial (:type (:binding arg)))
+                                             :uniformity lane-varying)])
+                                   iter-args initials))
+            condition (first
+                       (validate-region!
+                        "kernel while condition" condition-operations
+                        [(value :while-condition :predicate)] loop-values
+                        (assoc context :control-uniformity lane-varying)))
+            yielded (validate-region!
+                     "kernel while body" (:operations operation)
+                     (mapv :binding iter-args) loop-values
+                     (assoc context :control-uniformity lane-varying))]
+        (when-not (= :predicate (:type condition))
+          (throw (ex-info "kernel while condition must yield a predicate"
+                          {:reason :kernel-body-while-condition :condition condition})))
+        (reduce (fn [env [result initial update]]
+                  (claim-value! claimed reserved values result "while result")
+                  (when-not (= (canonical-type (:type result)) (:type update))
+                    (throw (ex-info "kernel while-loop result type disagrees with its yielded value"
+                                    {:reason :kernel-body-while-result
+                                     :result result :initial initial :update update})))
+                  (assoc env (:id result)
+                         {:type (canonical-type (:type result))
+                          :range (scalar-range/for-dtype (:type result))
+                          :uniformity lane-varying}))
+                values (map vector results initials yielded))))
+
     (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
     (let [index (:index operation)
           lower-info (expression-info! (:lower operation) values)
@@ -1908,6 +1995,9 @@
   (cond
     (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
     [(:then-operations operation) (:else-operations operation)]
+
+    (record-kind? "raster.compiler.ir.kernel_body.WhileLoop" operation)
+    [(:condition-operations operation) (:operations operation)]
 
     (or (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
         (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)

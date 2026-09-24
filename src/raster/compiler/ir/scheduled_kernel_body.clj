@@ -36,6 +36,8 @@
   (cond
     (record-kind? "IfRegion" operation)
     (concat (:then-operations operation) (:else-operations operation))
+    (record-kind? "WhileLoop" operation)
+    (concat (:condition-operations operation) (:operations operation))
     (or (record-kind? "ForLoop" operation) (record-kind? "PipelinedFor" operation)
         (record-kind? "Guard" operation))
     (:operations operation)

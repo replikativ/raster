@@ -22,6 +22,34 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn scalar-while-body
+  "One lane-local, loop-carried condition shared by verifier and all C-family gates."
+  []
+  (body/make
+   {:id :scalar-while-test
+    :parameters [(body/->KernelParameter
+                  'out :output :int [1] :global
+                  (layout/row-major [1] :int) :result)]
+    :operations
+    [(body/->WhileLoop
+      [(body/->LoopArg (body/value 'cursor :int) (body/literal 0 :int))]
+      [(body/->ScalarCompute
+        (body/value 'continue? :predicate)
+        (body/scalar-expression :lt :predicate ['cursor (body/literal 3 :int)]))
+       (body/->Yield ['continue?])]
+      [(body/->ScalarCompute
+        (body/value 'next-cursor :int)
+        (body/scalar-expression :+ :int ['cursor (body/literal 1 :int)]
+                                {:overflow :wrap}))
+       (body/->Yield ['next-cursor])]
+      [(body/value 'final-cursor :int)]
+      {:association :ordered})
+     (body/->ScalarStore 'out [0] 'final-cursor nil)]
+    :schedule {}
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn- unary-scalar-body [id expression input-type output-type width]
   (let [builder (scalar/make-lowerer
                  {:array-types {'x input-type} :arrays #{'x} :scalar-types {'lane :int}
