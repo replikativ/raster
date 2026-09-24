@@ -506,21 +506,52 @@
 (defn memory-witness
   "Join a verified typed invocation's compiler storage identities to its LinkPlan memory facts.
 
-   Compiler values may share a storage identity, so these are bindings rather than proofs of
-   independent value versions. The returned report makes no release/reuse/completion decision."
+   Compiler values may share a storage identity; physical destination names with no semantic
+   SSA definition are marked :storage-only. These are bindings rather than proofs of independent
+   value versions. The returned report makes no release/reuse/completion decision."
   [lowering]
   (let [{:keys [plan certificate]} (verify! lowering)
         report (link/memory-report plan)
-        bindings (:compiler-buffer-bindings certificate)]
+        bindings (:compiler-buffer-bindings certificate)
+        ;; verify! already revalidates the bound EmittedParallelProgramCall through LinkPlan.
+        emitted (get-in plan [:instances 0 :call :program])
+        definitions (into {}
+                          (mapcat (fn [{:keys [id results]}]
+                                    (map (fn [value] [value {:kind :equation :id id}]) results)))
+                          (:equations emitted))
+        uses (reduce (fn [sites {:keys [id operands]}]
+                       (reduce (fn [sites value]
+                                 (update sites value (fnil conj []) id))
+                               sites (distinct operands)))
+                     {} (:equations emitted))
+        inputs (set (:inputs emitted))
+        outputs (set (:outputs emitted))]
     (doseq [[compiler-value storage-id] bindings]
       (when-not (contains? (:values report) storage-id)
         (fail! :invocation-memory-binding
                "a compiler value has no validated logical storage in the LinkPlan"
+               {:compiler-value compiler-value :storage storage-id :plan (:id plan)}))
+      (when-not (contains? (:values emitted) compiler-value)
+        (fail! :invocation-memory-value
+               "a linked buffer has no typed value in its emitted program"
                {:compiler-value compiler-value :storage storage-id :plan (:id plan)})))
     {:source-dialect (:source-dialect certificate)
      :target-dialect (:target-dialect certificate)
      :plan (:id plan)
      :compiler-buffer-bindings bindings
+     :compiler-values
+     (into {}
+           (map (fn [[compiler-value storage-id]]
+                  [compiler-value
+                   {:abstract (get-in emitted [:values compiler-value])
+                    :storage storage-id
+                    :definition (or (get definitions compiler-value)
+                                    (when (contains? inputs compiler-value)
+                                      {:kind :program-input})
+                                    {:kind :storage-only})
+                    :uses (get uses compiler-value [])
+                    :public-output? (contains? outputs compiler-value)}]))
+           bindings)
      :public-buffer-bindings (:public-buffer-bindings certificate)
      :semantic-outputs (:semantic-outputs certificate)
      :memory report

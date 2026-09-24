@@ -275,11 +275,20 @@
     (is (every? link-plan/link-plan?
                 (map compiled/plan [functional effect state])))
     (is (invocation-link/certificate? (compiled/certificate functional)))
-    (let [{:keys [compiler-buffer-bindings memory value-versions]}
+    (let [{:keys [compiler-buffer-bindings compiler-values memory value-versions]}
           (invocation-link/memory-witness (:lowering functional))]
       (is (= :unproven value-versions))
+      (is (= (set (keys compiler-buffer-bindings)) (set (keys compiler-values))))
       (is (every? #(contains? (:values memory) %)
                   (vals compiler-buffer-bindings)))
+      (is (every? #(= (:storage (val %)) (get compiler-buffer-bindings (key %)))
+                  compiler-values))
+      (is (every? #(contains? (:definition %) :kind) (vals compiler-values)))
+      (is (some #(= :equation (get-in % [:definition :kind]))
+                (vals compiler-values)))
+      (is (some #(= :storage-only (get-in % [:definition :kind]))
+                (vals compiler-values))
+          "a physical result destination is not a second semantic SSA version")
       (is (seq (:accesses memory)))
       (is (= [:unproven :unproven]
              ((juxt :reuse :completion) memory))))
