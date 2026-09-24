@@ -43,7 +43,8 @@
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
    inlinable, as are bare value-type constructor tails (see value-ctor-call?)
-   and branch forms (if / case*) whose whole body is a single value expression
+   and branch forms (if / case*) whose whole body is a single value expression,
+   or scalar intrinsic calls whose result is a single value expression,
    the inliner substitutes into the call site (e.g. predicate/lookup helpers like
    chunk-block, block-solid?), symbols and literal values. Other bare function calls
    are not — they need let* wrapping for the inliner to decompose."
@@ -53,6 +54,8 @@
       (and (seq? body)
            (or (contains? #{:binding :scope :do :invk :par :branch}
                           (:kind (form/form-info body)))
+               (and (op/scalar-op? (op/semantic-op body))
+                    (not (util/effectful? body)))
                (value-ctor-call? body)))))
 
 (def ^:private prim-or-array-tags

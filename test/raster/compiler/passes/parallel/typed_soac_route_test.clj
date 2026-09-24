@@ -512,6 +512,48 @@
               (:operations loop-operation))
         "the scoped let-bound value remains a load inside the ordered loop body")))
 
+(deftest terminal-store-reduction-enters-the-typed-effect-map
+  (let [acc (with-meta 'acc {:raster.type/tag 'double})
+        loop-form (list 'loop* ['q 0 acc 0.0]
+                        '(if (< q nc)
+                           (recur (inc q) (+ acc (clojure.core/aget weights q)))
+                           (clojure.core/aset out i acc)))
+        source (list 'let* ['step (list 'raster.par/map-void! 'i 'n loop-form)] 'step)
+        options {:dtype :double :target-device :ocl:0
+                 :array-types {'weights :double 'out :double}
+                 :scalar-types {'n :long 'nc :long}}
+        routed (route/attempt source :double (:array-types options) options)
+        scheduled (:form (segop-lower/segop-lower-pass (:program routed) options))
+        operation (first (:operations (first (:equations scheduled))))
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :array-types (:array-types options)
+                  :scalar-types (:scalar-types options))]
+    (is (nil? (:declined routed)))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (some #(= "ForLoop" (some-> % class .getSimpleName))
+              (kernel-body-operations artifact)))
+    (is (= 1 (count (scalar-stores artifact)))
+        "the terminal store is emitted once, after the ordered recurrence")))
+
+(deftest terminal-store-reduction-does-not-move-effects-or-loop-dependent-addresses
+  (let [acc (with-meta 'acc {:raster.type/tag 'double})
+        effectful (list 'loop* ['q 0 acc 0.0]
+                        '(if (< q nc)
+                           (do (clojure.core/aset scratch q acc)
+                               (recur (inc q) (+ acc 1.0)))
+                           (clojure.core/aset out i acc)))
+        address (list 'loop* ['q 0 acc 0.0]
+                      '(if (< q nc)
+                         (recur (inc q) (+ acc 1.0))
+                         (clojure.core/aset out q acc)))
+        carried-address (list 'loop* ['q 0 acc 0.0]
+                              '(if (< q nc)
+                                 (recur (inc q) (+ acc 1.0))
+                                 (clojure.core/aset out (long acc) acc)))]
+    (is (nil? (#'frontend/terminal-store-reduction effectful 'i)))
+    (is (nil? (#'frontend/terminal-store-reduction address 'i)))
+    (is (nil? (#'frontend/terminal-store-reduction carried-address 'i)))))
+
 (deftest typed-inout-preserves-sequential-jvm-semantics
   (let [source '(let* [step (raster.par/map! target i n float
                                              (* (clojure.core/aget target i) 2.0))]

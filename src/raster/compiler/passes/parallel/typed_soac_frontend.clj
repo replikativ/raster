@@ -692,6 +692,48 @@
 
 (declare store-region pointwise-input?)
 
+(defn- terminal-store-reduction
+  "Expose a pure ordered recurrence whose only exit writes its final carry.
+
+   A map-void body may spell `(loop ... (if test (recur ...) (aset out i acc)))`.
+   The store is executed exactly once, after the recurrence.  Project it into a
+   typed value loop followed by that same store; the existing ordered Fold and
+   effect ownership checks then certify the two pieces.  Do not move a store
+   out of a branchy or effectful recurrence."
+  [expression index]
+  (when (and (seq? expression) (form/loop-head? (first expression))
+             (= 3 (count expression)))
+    (let [[head bindings conditional] expression
+          [_ test then exit] (when (seq? conditional) conditional)]
+      (when (and (vector? bindings) (= 4 (count bindings))
+                 (seq? conditional) (= 'if (first conditional))
+                 (= 4 (count conditional))
+                 (descriptor/aset-call? exit)
+                 (not (util/effectful? then)))
+        (let [[out coordinate value] (descriptor/call-args exit)
+              loop-bindings (set (take-nth 2 bindings))
+              value-loop (with-meta
+                           (list head bindings (with-meta (list 'if test then value)
+                                                    (meta conditional)))
+                           (meta expression))
+              matched (patterns/match-ordered-reduce-loop value-loop)
+              result-type (when matched
+                            (retained-local-dtype (:acc-sym matched) (:acc-init matched)))]
+          (when (and (= value (:acc-sym matched)) result-type
+                     (empty? (set/intersection loop-bindings
+                                               (util/free-syms coordinate)))
+                     (empty? (set/intersection loop-bindings
+                                               (util/free-syms out))))
+            (let [result (with-meta
+                           (fresh-projected-id "rstr_terminal_loop_value"
+                                               (util/free-syms expression))
+                           {:tag (dtype/scalar-tag-for-dtype result-type)
+                            :raster.type/tag (dtype/scalar-tag-for-dtype result-type)})]
+              (store-region
+               (list 'let* [result value-loop]
+                     (with-meta (list (first exit) out coordinate result) (meta exit)))
+               index))))))))
+
 (defn- counted-store-loop
   "Recognize a counted loop of stores inside an effect-map body.
 
@@ -1061,7 +1103,8 @@
     (and (seq? body) (symbol? (first body))
          (or (form/loop-head? (first body))
              (contains? '#{dotimes clojure.core/dotimes} (first body))))
-    (counted-store-loop body index)
+    (or (terminal-store-reduction body index)
+        (counted-store-loop body index))
 
     ;; `collect!` is a source-level ownership primitive nested inside map-void!, not a separate
     ;; parallel equation. Expand it here so its atomic ticket and certified SoA scatters enter the
