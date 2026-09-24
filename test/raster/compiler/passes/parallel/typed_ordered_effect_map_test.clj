@@ -670,6 +670,28 @@
     (is (= inner-id (-> loop :stores first :index)))
     (is (= [[:store 0] [:loop 0]] (:order normalized)))))
 
+(deftest recursive-source-regions-never-recycle-generated-local-ids
+  ;; Independent recognizer calls used to restart at rstr_local_0. An enclosing region could
+  ;; then confuse a captured key with a newly bound splitmix temporary before late alpha-renaming.
+  (with-bindings {#'frontend/*region-local-counter* (atom -1)}
+    (let [first-region (#'frontend/store-region
+                        '(let* [^long key (long 17)]
+                           (raster.par/atomic-add! counts key (int 1))) 'i)
+          second-region (#'frontend/store-region
+                         '(let* [^long mixed (long (clojure.core/+ rstr_local_0 1))]
+                            (raster.par/atomic-add! counts mixed (int 1))) 'i)
+          first-id (-> first-region :locals first :id)
+          second-id (-> second-region :locals first :id)]
+      (is (some? first-region))
+      (is (some? second-region))
+      (is (not= first-id second-id))
+      (is (some #{first-id} (tree-seq coll? seq (-> second-region :locals first :init))))
+      (is (= first-id (-> first-region :stores first :index)))
+      (is (= second-id (-> second-region :stores first :index)))))
+  (with-bindings {#'frontend/*region-local-counter* (atom -1)
+                  #'frontend/*region-local-source-symbols* #{'rstr_local_0}}
+    (is (= 'rstr_local_1 (#'frontend/fresh-region-local-id!)))))
+
 (deftest unchecked-int-loop-step-needs-a-proved-int-exclusive-bound
   (let [tail '(recur (int (unchecked-add-int e 1)) anchor)]
     (is (nil? (#'frontend/split-trailing-recur-many tail 'e 1 false)))

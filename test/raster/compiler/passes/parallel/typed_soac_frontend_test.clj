@@ -1237,15 +1237,19 @@
         program (frontend/form->program
                  (list 'let* ['effect expression] 'effect)
                  {:dtype :float :array-types {'x :float 'out :float}})
+        repeated (frontend/form->program
+                  (list 'let* ['effect expression] 'effect)
+                  {:dtype :float :array-types {'x :float 'out :float}})
         equation (first (dialect/equations program))
         {:keys [locals body-results]}
         (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
-    (is (= [{:id 'rstr_local_0 :dtype :float
-             :init '(+ %element0 1.0)}
-            {:id 'rstr_local_1 :dtype :float
-             :init '(* rstr_local_0 rstr_local_0)}]
-           locals))
-    (is (= '[(float rstr_local_1)] body-results))))
+    (let [[shifted squared] locals]
+      (is (= program repeated) "generated local IDs are deterministic per compile")
+      (is (= [:float :float] (mapv :dtype locals)))
+      (is (not= (:id shifted) (:id squared)))
+      (is (= '(+ %element0 1.0) (:init shifted)))
+      (is (= (list '* (:id shifted) (:id shifted)) (:init squared)))
+      (is (= [(list 'float (:id squared))] body-results)))))
 
 (deftest pointwise-effect-map-retains-a-source-written-checked-cast
   (let [program (frontend/form->program
@@ -1314,7 +1318,9 @@
     (is (= 'effect-map (dialect/operation-kind equation)))
     (is (= :independent (:iteration-order attributes)))
     (is (= 'effect-when (first guarded)))
-    (is (= '(clojure.core/>= rstr_local_0 0) (:predicate parts)))
+    (is (= 'clojure.core/>= (first (:predicate parts))))
+    (is (symbol? (second (:predicate parts))))
+    (is (= 0 (nth (:predicate parts) 2)))
     (is (= [:long] (mapv :dtype (:locals (:region parts)))))
     (is (= :reduce (-> parts :region :body-results first dialect/effect-parts :conflict :kind)))
     (is (= program (dialect/validate! program)))))

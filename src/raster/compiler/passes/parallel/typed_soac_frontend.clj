@@ -678,27 +678,37 @@
   (map-region-order order #(update % :init (partial util/subst-syms substitutions))
                     #(util/subst-syms substitutions %) 0 0))
 
-(defn- rebase-region-locals
-  "Move a recursively recognized region behind `offset` lexical SSA values.
+(def ^:dynamic ^:private *region-local-counter* nil)
+(def ^:dynamic ^:private *region-local-source-symbols* #{})
 
-   Every nested scope initially numbers its locals from zero.  Rebasing before composing scopes
-   gives the combined region one deterministic, collision-free SSA namespace. Counted store
-   loops keep their own body locals; only their references to the enclosing locals are renamed."
-  [{:keys [locals stores loops] :as region} offset]
-  (let [renames (into {}
-                      (map-indexed
-                       (fn [ordinal {:keys [id]}]
-                         [id (symbol (str "rstr_local_" (+ offset ordinal)))])
-                       (concat locals (order-locals (region-order region)))))
-        rename-local (fn [{:keys [id] :as local}]
-                       (-> local (assoc :id (get renames id))
-                           (update :init #(util/subst-syms renames %))))]
-    (cond-> {:locals (mapv rename-local locals)
-     :stores (mapv #(substitute-store renames %) stores)
-     :loops (mapv #(substitute-loop renames %) (or loops []))
-     :order (map-region-order (region-order region) rename-local
-                              #(util/subst-syms renames %) 0 0)}
-      (contains? region :result) (assoc :result (util/subst-syms renames (:result region))))))
+(defn- source-symbols [source]
+  (set (filter symbol? (tree-seq coll? seq source))))
+
+(defn- fresh-region-local-id!
+  "Allocate a deterministic SSA name across the entire source-description pass, not once per
+   recursive let region. The old post-hoc flat rebase could mistake a captured outer value for
+   a later inner binding with the same generated spelling before lexical alpha-renaming ran."
+  []
+  (when-not *region-local-counter*
+    (throw (ex-info "source region recognition requires a compiler-local SSA supply"
+                    {:reason :raster/bug})))
+  (loop [ordinal (swap! *region-local-counter* inc)]
+    (let [candidate (symbol (str "rstr_local_" ordinal))]
+      (if (contains? *region-local-source-symbols* candidate)
+        (recur (swap! *region-local-counter* inc))
+        candidate))))
+
+(defn- region-local-id-collision?
+  [region]
+  (letfn [(loop-locals [loops]
+            (mapcat (fn [loop]
+                      (concat (:locals loop) (order-locals (:order loop))
+                              (loop-locals (:loops loop))))
+                    loops))]
+    (let [ids (map :id (concat (:locals region)
+                               (order-locals (region-order region))
+                               (loop-locals (:loops region))))]
+      (not= (count ids) (count (distinct ids))))))
 
 (defn- split-trailing-recur
   "Split a counted loop's tail recurrence from its ordered stores. Carried loops require the
@@ -1116,24 +1126,23 @@
             (when (every? (comp some? #(nth % 2)) typed)
               (let [{:keys [locals substitutions]}
                     (reduce (fn [{:keys [locals substitutions]} [binding init local-dtype]]
-                              (let [id (symbol (str "rstr_local_" (count locals)))]
+                              (let [id (fresh-region-local-id!)]
                                 {:locals (conj locals
                                                {:id id :dtype local-dtype
                                                 :init (util/subst-syms substitutions init)})
                                  :substitutions (assoc substitutions binding id)}))
-                            {:locals [] :substitutions {}} typed)
-                    nested (rebase-region-locals nested-region (count locals))]
+                            {:locals [] :substitutions {}} typed)]
                 (cond-> {:locals (into locals
                                (map #(update % :init
                                              (fn [init]
                                                (util/subst-syms substitutions init))))
-                               (:locals nested))
+                               (:locals nested-region))
                  :stores (mapv #(substitute-store substitutions %)
-                               (:stores nested))
-                 :loops (mapv #(substitute-loop substitutions %) (:loops nested))
-                 :order (substitute-order (region-order nested) substitutions)}
-                  (contains? nested :result)
-                  (assoc :result (util/subst-syms substitutions (:result nested))))))))))))
+                               (:stores nested-region))
+                 :loops (mapv #(substitute-loop substitutions %) (:loops nested-region))
+                 :order (substitute-order (region-order nested-region) substitutions)}
+                  (contains? nested-region :result)
+                  (assoc :result (util/subst-syms substitutions (:result nested-region))))))))))))
 
     (and (seq? body) (= 'do (first body)))
     (let [expressions (vec (rest body))]
@@ -1144,8 +1153,7 @@
                      (every? (comp empty? :locals) groups))
             (reduce (fn [{:keys [stores loops order]} group]
                       (let [store-offset (count stores)
-                            loop-offset (count loops)
-                            group (rebase-region-locals group (count (order-locals order)))]
+                            loop-offset (count loops)]
                         {:locals []
                          :stores (into stores (:stores group))
                          :loops (into loops (:loops group))
@@ -1813,14 +1821,9 @@
   (let [region (assoc region :loops (vec (map-indexed (fn [ordinal loop]
                                                         (rename-loop-tree loop [ordinal]))
                                                       (or loops []))))
-        lexical-ids (map :id (concat (:locals region)
-                                     (order-locals (region-order region))
-                                     (mapcat :locals (loop-tree (:loops region)))
-                                     (mapcat #(order-locals (:order %))
-                                             (loop-tree (:loops region)))))
-        region (if (= (count lexical-ids) (count (distinct lexical-ids)))
-                 region
-                 (alpha-rename-source-region region))
+        region (if (region-local-id-collision? region)
+                 (alpha-rename-source-region region)
+                 region)
         locals (:locals region)
         stores (:stores region)
         loops (:loops region)
@@ -3983,6 +3986,8 @@
          tagged (fn [kind?]
                   (set (filter #(kind? (types/sym-type-tag %)) binders)))]
      (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+               *region-local-counter* (atom -1)
+               *region-local-source-symbols* (source-symbols source)
                *declared-kinds*
                {:arrays (into (set (keys array-types))
                               (tagged #(some? (dtype/dtype-for-array-tag %))))
@@ -4001,7 +4006,9 @@
    form->program, so reporting cannot become a second legality implementation."
   [source {:keys [array-types scalar-types values] :as options}]
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
-                                                             values)]
+                                                             values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
@@ -4945,7 +4952,9 @@
    compiler correctness defect."
   [source {:keys [array-types scalar-types values] :as options}]
   (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
-                                                             values)]
+                                                             values)
+            *region-local-counter* (atom -1)
+            *region-local-source-symbols* (source-symbols source)]
     (form->program* source options)))
 
 (defn- allocation-contracts
