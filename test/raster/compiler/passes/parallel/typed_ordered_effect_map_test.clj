@@ -9,6 +9,8 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.core]
+            [raster.arrays]
             [raster.abm.firms.phases :as firms-phases]
             [raster.par]))
 
@@ -461,6 +463,35 @@
       (is (nil? (execute out 2 3 2)))
       (is (= [3.0 6.0 3.0 6.0] (vec out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
+
+(raster.core/deftm city-nested-search-effect!
+  [loc :- (Array int), cdf :- (Array double), visits :- (Array int)
+   n :- Long, len :- Long, m :- Long] :- Void
+  (raster.par/map-void! i n
+    (loop [e (int 0)]
+      (when (< e len)
+        (when (== (raster.arrays/aget loc (+ (* i len) e)) (int 2))
+          (let [d (int (loop [lo (int 0) hi (int (dec m))]
+                         (if (>= lo hi) lo
+                             (let [mid (int (quot (+ lo hi) 2))]
+                               (if (< 0.37 (raster.arrays/aget cdf mid))
+                                 (recur lo mid) (recur (int (inc mid)) hi))))))]
+            (raster.par/atomic-add! visits d (int 1))))
+        (recur (int (inc e)))))))
+
+(deftest nested-effect-loop-guard-and-search-retain-read-captures
+  ;; City day kernels search inside an episode loop, then atomically record the result.
+  ;; The guard and search are nested ordered-region expressions, not loop bounds or stores;
+  ;; both still contribute tensor/scalar captures and the equation's memory-read effect.
+  (let [descriptor (pipeline/compile-gpu-program #'city-nested-search-effect!
+                                                 :ze:0 :dtype :double)
+        step (first (:steps descriptor))
+        names (set (map :name (get-in step [:artifact :abi])))]
+    (is (= :map-void (:convention step)))
+    (is (contains? names 'loc))
+    (is (contains? names 'cdf))
+    (is (contains? names 'm))
+    (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))))
 
 (deftest triangular-effect-domains-retain-dynamic-or-inclusive-boundaries
   (let [source
