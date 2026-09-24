@@ -2280,5 +2280,8 @@
     (when program
       (is (= program (dialect/validate! program)))
       (is (some dialect/while-component-form? expressions))
+      (is (= #{'cdf 'starts 'ends}
+             (set (get-in (dialect/operation-parts equation)
+                          [:attributes :attributes :stable-array-captures]))))
       (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
                     expressions)))))

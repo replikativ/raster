@@ -3817,12 +3817,9 @@
         initializer-read?
         (some (fn [form]
                 (let [initializers
-                      (cond
-                        (dialect/while-fold-form? form)
-                        (get-in (dialect/while-fold-parts form) [:attributes :identities])
-
-                        (and (seq? form) (form/loop-head? (first form)))
-                        (:carry-inits (patterns/match-ordered-while-loop form)))]
+                      (when (dialect/while-fold-form? form)
+                        (get-in (dialect/while-fold-parts form)
+                                [:attributes :identities]))]
                   (some #(and (symbol? (:sym %))
                               (= (name array) (name (:sym %))))
                         (mapcat descriptor/aget-reads initializers))))
