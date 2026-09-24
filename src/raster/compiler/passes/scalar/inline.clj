@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [raster.ad.tangent :as tangent]
             [raster.ad.templates :as rt]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.ad.flatten :as flatten]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
@@ -39,6 +40,11 @@
          (and (.startsWith h "->")
               (contains? @types/soa-registry (symbol (subs h 2)))))))
 
+(def ^:dynamic *inline-scalar-bodies?*
+  "Opt in to bare scalar deftm helper tails at the direct walked-body GPU entry.
+   Other compiler entries retain their existing expansion policy until separately certified."
+  false)
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
@@ -54,7 +60,8 @@
       (and (seq? body)
            (or (contains? #{:binding :scope :do :invk :par :branch}
                           (:kind (form/form-info body)))
-               (and (op/scalar-op? (op/semantic-op body))
+               (and *inline-scalar-bodies?*
+                    (op/scalar-op? (op/semantic-op body))
                     (not (util/effectful? body)))
                (value-ctor-call? body)))))
 
@@ -1305,7 +1312,12 @@
            ;; to the opaque get-pullback-factory closure (not GPU-lowerable).
            has-rule? (and preserve-templates? (rt/has-reverse-rule? impl-sym))
            ;; recursive callee (already being inlined) → keep as a call, don't recurse
-           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
+           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey))
+                                 ;; A canonical numeric call is already a first-class scalar
+                                 ;; operator. The direct GPU helper expansion must not turn it
+                                 ;; into an implementation body and lose its algebraic identity.
+                                 (not (and *inline-scalar-bodies?*
+                                           (intrinsics/canonical impl-sym))))
                         (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info

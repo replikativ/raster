@@ -6,6 +6,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.gpu.core :as gpu]
+            [raster.numeric]
             [raster.par :as par]))
 
 (def ^:const scale 0.5)
@@ -28,6 +29,12 @@
       (if (< q nc)
         (recur (inc q) (+ acc (aget weights q)))
         (aset out i acc)))))
+
+(deftm canonical-operator-dot
+  [left :- (Array float), right :- (Array float), n :- Long] :- Double
+  (par/reduce acc 0.0 i n
+              (raster.numeric/+ acc
+                                (raster.numeric/* (aget left i) (aget right i)))))
 
 (defn- emitted-body
   [v array-types scalar-types]
@@ -57,3 +64,12 @@
                       {'n :long 'nc :long})]
     (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))))
+
+(deftest helper-expansion-preserves-canonical-numeric-reductions
+  (let [source (first (gpu/get-walked-body #'canonical-operator-dot :float))
+        scheduled (pipeline/schedule-parallel-form
+                   source {:dtype :float :target-device :ocl:0
+                           :array-types {'left :float 'right :float}
+                           :scalar-types {'n :long}})]
+    (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
+    (is (nil? (get-in scheduled [:stats :typed-soac-declined])))))
