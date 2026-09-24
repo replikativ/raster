@@ -27,6 +27,7 @@
                 k-format v-format k-layout v-layout visibility output]
          :as problem} (attention/validate! problem)
         specs (attention/buffer-specs problem)
+        packed? (attention/dense-packed-route? route)
         output-spec (get specs output)
         combine (scalar-region ['left 'right]
                                '(raster.numeric/* left right) accumulator-dtype)
@@ -47,11 +48,12 @@
                    :duplicate-policy (when (attention/csr-visibility? visibility)
                                        (:duplicate-policy visibility))
                    :buffers (attention/visibility-buffer-ids visibility)}
-      :storage {:kind :routed-paged-kv
+      :storage {:kind (if packed? :dense-packed-kv :routed-paged-kv)
                 :route-kind (attention/route-kind route)
                 :page-size (:page-size problem)
                 :physical-pages (:physical-pages problem)
-                :route-shape (select-keys route [:pages-per-sequence :page-index-capacity])
+                :route-shape (select-keys route [:pages-per-sequence :page-index-capacity
+                                                 :total-tokens])
                 :route route
                 :buffers (attention/route-buffer-ids route)
                 :k-format k-format :v-format v-format
@@ -60,12 +62,14 @@
               :axis {:name :qk-component :extent qk-head-dim}
               :head-map {:kind :grouped-query :query-heads q-heads :kv-heads kv-heads}
               :left {:kind :packed-query :buffer (:values query) :dtype q-dtype}
-              :right {:kind :routed-key :buffer (:k-pages problem) :dtype k-dtype}
+              :right {:kind (if packed? :packed-key :routed-key)
+                      :buffer (:k-pages problem) :dtype k-dtype}
               :combine combine
               :arguments []
               :finalize score-finalize}
       :weight weight
-      :value {:kind :routed-value :buffer (:v-pages problem)
+      :value {:kind (if packed? :packed-value :routed-value)
+              :buffer (:v-pages problem)
               :dtype v-dtype :components value-head-dim}
       :numerator (swr/reduction {:operator :sum :identity 0.0
                                  :map-region numerator-map})

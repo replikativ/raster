@@ -33,6 +33,7 @@
         {:keys [id query route output q-heads kv-heads qk-head-dim value-head-dim
                 q-dtype k-dtype v-dtype output-dtype accumulator-dtype scale visibility]
          :as problem} (attention-problem plan)
+        packed? (attention/dense-packed-route? route)
         expected-segments [{:name :query-token :extent (:total-tokens query)}
                            {:name :query-head :extent q-heads}]
         expected-score {:kind :dot
@@ -40,7 +41,8 @@
                         :head-map {:kind :grouped-query
                                    :query-heads q-heads :kv-heads kv-heads}
                         :left {:kind :packed-query :buffer (:values query) :dtype q-dtype}
-                        :right {:kind :routed-key :buffer (:k-pages problem) :dtype k-dtype}}
+                        :right {:kind (if packed? :packed-key :routed-key)
+                                :buffer (:k-pages problem) :dtype k-dtype}}
         expected-membership {:kind :logical-attention-visibility
                              :visibility-kind (attention/visibility-kind visibility)
                              :position-filter (into {} (attention/position-filter visibility))
@@ -51,6 +53,8 @@
                    (= [:segmented-weighted-reduction id] (:id plan))
                    (= expected-segments (:segment-axes plan))
                    (= expected-membership (:membership plan))
+                   (= (if packed? :dense-packed-kv :routed-paged-kv)
+                      (get-in plan [:storage :kind]))
                    (= (attention/route-kind route) (get-in plan [:storage :route-kind]))
                    (= route (get-in plan [:storage :route]))
                    (= (attention/route-buffer-ids route) (get-in plan [:storage :buffers]))
@@ -58,7 +62,8 @@
                                                   [:kind :axis :head-map :left :right]))
                    (= (list 'raster.numeric/* 'dot (double scale))
                       (get-in plan [:score :finalize :body]))
-                   (= {:kind :routed-value :buffer (:v-pages problem)
+                   (= {:kind (if packed? :packed-value :routed-value)
+                       :buffer (:v-pages problem)
                        :dtype v-dtype :components value-head-dim}
                       (:value plan))
                    (= accumulator-dtype (:accumulator-dtype plan))
@@ -87,21 +92,25 @@
    (let [identity (assoc (select-keys problem
                                       [:batch-size :q-heads :kv-heads :qk-head-dim :value-head-dim
                                        :page-size :physical-pages :scale :k-format :v-format
-                                       :k-layout :v-layout :q-dtype :output-dtype])
+                                       :k-layout :v-layout :q-dtype :k-dtype :v-dtype
+                                       :output-dtype])
                          :schedule schedule-identity)
          visibility (:visibility problem)
          identity (assoc identity
                          :route-kind (attention/route-kind (:route problem))
                          :route-shape (select-keys (:route problem)
                                                    [:pages-per-sequence
-                                                    :page-index-capacity])
+                                                    :page-index-capacity :total-tokens])
                          :visibility-kind (attention/visibility-kind visibility)
                          :visibility-shape
                          (cond-> {:position-filter (into {} (attention/position-filter visibility))}
                            (attention/csr-visibility? visibility)
                            (assoc :key-index-capacity (:key-index-capacity visibility)))
                          :total-query-tokens (get-in problem [:query :total-tokens]))]
-     (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity)))))))
+     (format (if (attention/dense-packed-route? (:route problem))
+               "raster_attention_dense_packed_%08x"
+               "raster_attention_fp16_%08x")
+             (bit-and 0xffffffff (long (hash identity)))))))
 
 (defn- cooperative-plan!
   [plan schedule]
@@ -116,7 +125,9 @@
                       (get-in schedule [:numerical-mode :score-accumulate]))
                    (= (:accumulator-dtype plan)
                       (get-in schedule [:numerical-mode :state-accumulate]))
-                   (= :routed-paged-kv (get-in schedule [:attributes :storage-kind]))
+                   (= (if (attention/dense-packed-route? (:route problem))
+                        :dense-packed-kv :routed-paged-kv)
+                      (get-in schedule [:attributes :storage-kind]))
                    (= (attention/route-kind (:route problem))
                       (get-in schedule [:attributes :route-kind]))
                    (= (attention/visibility-kind (:visibility problem))
@@ -136,22 +147,34 @@
 
 (defn- ordered-abi
   [problem]
-  (let [{:keys [query k-pages v-pages route visibility output q-dtype output-dtype]} problem
+  (let [{:keys [query k-pages v-pages route visibility output q-dtype k-dtype v-dtype
+                output-dtype]} problem
+        packed? (attention/dense-packed-route? route)
         common [(kabi/slot (:values query) :input q-dtype :c-name "q" :role :query)
                 (kabi/slot (:row-offsets query) :input :int
                            :c-name "q_row_offsets" :role :query-rows)
                 (kabi/slot (:positions query) :input :int
                            :c-name "q_positions" :role :query-positions)
-                (kabi/slot k-pages :input :half :c-name "k_pages" :role :key-cache)
-                (kabi/slot v-pages :input :half :c-name "v_pages" :role :value-cache)]
+                (kabi/slot k-pages :input k-dtype
+                           :c-name (if packed? "k_values" "k_pages") :role :key-cache)
+                (kabi/slot v-pages :input v-dtype
+                           :c-name (if packed? "v_values" "v_pages") :role :value-cache)]
         route-slots
-        (if (attention/dense-paged-route? route)
+        (cond
+          packed?
+          [(kabi/slot (:row-offsets route) :input :int
+                      :c-name "kv_row_offsets" :role :kv-row-offsets)
+           (kabi/slot (:start-positions route) :input :int
+                      :c-name "kv_start_positions" :role :kv-start-positions)]
+
+          (attention/dense-paged-route? route)
           [(kabi/slot (:page-table route) :input :int
                       :c-name "page_table" :role :page-routing)
            (kabi/slot (:lengths route) :input :int
                       :c-name "kv_lengths" :role :kv-lengths)
            (kabi/slot (:start-positions route) :input :int
                       :c-name "kv_start_positions" :role :kv-start-positions)]
+          :else
           [(kabi/slot (:page-offsets route) :input :int
                       :c-name "page_offsets" :role :page-row-offsets)
            (kabi/slot (:page-indices route) :input :int
@@ -204,11 +227,18 @@
       :launch (:launch kernel-body)
       :effects {:kind :attention :reads inputs :writes [output]}
       :provenance {:operation-id (:id problem) :semantic-op :attention
-                   :algebra-plan-id (:id plan) :lowering :fp16-reference}
-      :attributes {:strategy :fp16-reference :optimization-tier :reference
+                   :algebra-plan-id (:id plan)
+                   :lowering (if (attention/dense-packed-route? route)
+                               :dense-packed-reference :fp16-reference)}
+      :attributes {:strategy (if (attention/dense-packed-route? route)
+                               :dense-packed-reference :fp16-reference)
+                   :optimization-tier :reference
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)
-                   :storage-dtype :half :q-dtype (:q-dtype problem)
+                   :storage-dtype (when (= (:k-dtype problem) (:v-dtype problem))
+                                    (:k-dtype problem))
+                   :storage-dtypes [(:k-dtype problem) (:v-dtype problem)]
+                   :q-dtype (:q-dtype problem)
                    :output-dtype (:output-dtype problem) :accumulator-dtype :float
                    :route-kind (attention/route-kind route)
                    :visibility-kind (attention/visibility-kind (:visibility problem))
@@ -221,7 +251,7 @@
                    :complexity :quadratic-in-qk-head-dim}})))
 
 (defn emit-fp16-cooperative
-  "Emit one subgroup per query segment for routed FP16 K/V attention.
+  "Emit one subgroup per query segment for dense-packed or routed-paged K/V attention.
 
    The artifact preserves the reference leaf's complete ordered ABI and logical effects.  Only
    its target-neutral SegmentedWeightedReductionSchedule, launch mapping and target body differ.
@@ -253,12 +283,17 @@
        :provenance {:operation-id (:id problem) :semantic-op :attention
                     :algebra-plan-id (:id plan)
                     :lowering :subgroup-online-score-reuse}
-       :attributes {:strategy :routed-paged-subgroup-online-score-reuse
+       :attributes {:strategy (if (attention/dense-packed-route? route)
+                                :dense-packed-subgroup-online-score-reuse
+                                :routed-paged-subgroup-online-score-reuse)
                     :optimization-tier :subgroup
                     :algebra :segmented-weighted-reduction
                     :algebra-key (swr/algebra-key plan)
                     :segmented-weighted-reduction-schedule schedule
-                    :storage-dtype :half :q-dtype (:q-dtype problem)
+                    :storage-dtype (when (= (:k-dtype problem) (:v-dtype problem))
+                                     (:k-dtype problem))
+                    :storage-dtypes [(:k-dtype problem) (:v-dtype problem)]
+                    :q-dtype (:q-dtype problem)
                     :output-dtype (:output-dtype problem) :accumulator-dtype :float
                     :route-kind (attention/route-kind route)
                     :visibility-kind (attention/visibility-kind (:visibility problem))

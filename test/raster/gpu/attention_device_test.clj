@@ -240,8 +240,14 @@
                 (:start-positions route) :kv-start-positions
                 (:output problem) :output}]
     (merge common
-           (if (attention/dense-paged-route? route)
+           (cond
+             (attention/dense-packed-route? route)
+             {(:row-offsets route) :kv-row-offsets}
+
+             (attention/dense-paged-route? route)
              {(:page-table route) :page-table (:lengths route) :kv-lengths}
+
+             :else
              {(:page-offsets route) :page-offsets (:page-indices route) :page-indices
               (:last-page-lengths route) :last-page-lengths})
            (when (attention/csr-visibility? (:visibility problem))
@@ -346,6 +352,102 @@
     (gp/gpu-skip! "FP32-I/O packed attention over FP16 KV on Level Zero")
     (run-mixed-io-case :ze:0 :subgroup-score-reuse
                        :routed-paged-subgroup-online-score-reuse)))
+
+(defn- packed-f32-case!
+  [device-id policy]
+  (let [query (attention/packed-query-batch
+               {:values 'q :row-offsets 'q-row-offsets :positions 'q-positions
+                :total-tokens 3})
+        kv-route (attention/dense-packed-route
+                  {:row-offsets 'kv-row-offsets :start-positions 'kv-start-positions
+                   :total-tokens 5})
+        problem (attention/make
+                 {:id :packed-f32-device :query query :route kv-route
+                  :k-pages 'k-pages :v-pages 'v-pages :output 'output
+                  :batch-size 3 :q-heads 2 :kv-heads 1
+                  :qk-head-dim 2 :value-head-dim 2
+                  :q-dtype :float :k-dtype :float :v-dtype :float
+                  :output-dtype :float :scale 1.0
+                  :k-layout :token-head-major :v-layout :token-head-major
+                  :visibility (attention/visibility
+                               {:causal? true :window-left 1 :window-right 0})})
+        q-offsets (int-array [0 1 2 3])
+        q-positions (int-array [2 4 10])
+        kv-offsets (int-array [0 2 2 5])
+        kv-starts (int-array [1 0 9])
+        q (float-array [1 0, 0 1, 1 1, 1 -1, 1 0, 0 1])
+        k (float-array [1 0, 0 1, 8 8, 1 0, 0 1])
+        v (float-array [2 0, 0 4, 99 99, 3 0, 0 5])
+        descriptor (assoc (hardware/descriptor-for device-id)
+                          :segmented-weighted-reduction-schedule policy)
+        routed (route/route! problem descriptor)
+        specs (attention/buffer-specs problem)
+        expected
+        (vec (mapcat
+              (fn [query-token]
+                (let [batch query-token
+                      begin (aget kv-offsets batch)
+                      end (aget kv-offsets (inc batch))
+                      position (aget q-positions query-token)
+                      start (aget kv-starts batch)]
+                  (mapcat
+                   (fn [head]
+                     (let [q-base (* (+ (* query-token 2) head) 2)
+                           tokens (filter #(visible? (attention/position-filter
+                                                      (:visibility problem))
+                                                     position (+ start (- % begin)))
+                                          (range begin end))
+                           scores (mapv (fn [token]
+                                          (+ (* (aget q q-base) (aget k (* token 2)))
+                                             (* (aget q (inc q-base))
+                                                (aget k (inc (* token 2)))))) tokens)
+                           maximum (when (seq scores) (reduce max scores))
+                           weights (mapv #(Math/exp (- (double %) maximum)) scores)
+                           denominator (reduce + 0.0 weights)]
+                       (for [component (range 2)]
+                         (if (zero? denominator)
+                           0.0
+                           (/ (reduce + 0.0
+                                      (map (fn [token weight]
+                                             (* weight (aget v (+ (* token 2) component))))
+                                           tokens weights))
+                              denominator)))))
+                   (range 2))))
+              (range 3)))
+        allocations {:q [:float (get-in specs ['q :elements]) q]
+                     :q-row-offsets [:int 4 q-offsets]
+                     :q-positions [:int 3 q-positions]
+                     :k-pages [:float (get-in specs ['k-pages :elements]) k]
+                     :v-pages [:float (get-in specs ['v-pages :elements]) v]
+                     :kv-row-offsets [:int 4 kv-offsets]
+                     :kv-start-positions [:int 3 kv-starts]
+                     :output [:float (get-in specs ['output :elements]) nil]}]
+    (is (= (if (= :reference policy)
+             :dense-packed-reference
+             :dense-packed-subgroup-online-score-reuse)
+           (:strategy routed)))
+    (attention/validate-routing! problem
+                                 {:row-offsets kv-offsets :start-positions kv-starts})
+    (gpu/with-gpu-session [session device-id]
+      (gpu/alloc! session allocations)
+      (let [handle (gpu/bind-kernel-graph!
+                    session [:attention :packed-f32 policy] (:graph routed)
+                    (graph-bindings problem) {})]
+        (try
+          (gpu/run-kernel-graph! session handle)
+          (let [actual ^floats (gpu/download session :output)]
+            (is (= (count expected) (alength actual)))
+            (is (every? true?
+                        (map (fn [wanted got]
+                               (< (Math/abs (- (double wanted) (double got))) 1.0e-5))
+                             expected actual))))
+          (finally (gpu/release-kernel-graph! session handle)))))))
+
+(deftest level-zero-dense-packed-f32-kv-matches-independent-reference
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "dense-packed F32 K/V attention on Level Zero")
+    (do (packed-f32-case! :ze:0 :reference)
+        (packed-f32-case! :ze:0 :subgroup-score-reuse))))
 
 (deftest level-zero-packed-bidirectional-segments-match-reference
   (if-not @gp/gpu-available?

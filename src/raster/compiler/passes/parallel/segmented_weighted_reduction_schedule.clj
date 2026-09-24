@@ -15,11 +15,13 @@
   [{:keys [membership storage source-operation]}]
   (if (= :csr (:visibility-kind membership))
     (get-in source-operation [:visibility :key-index-capacity])
-    (let [page-size (:page-size storage)]
-      (* page-size
-         (case (:route-kind storage)
-           :dense-paged (get-in storage [:route-shape :pages-per-sequence])
-           :csr-paged (get-in storage [:route-shape :page-index-capacity]))))))
+    (if (= :dense-packed-kv (:kind storage))
+      (get-in storage [:route-shape :total-tokens])
+      (let [page-size (:page-size storage)]
+        (* page-size
+           (case (:route-kind storage)
+             :dense-paged (get-in storage [:route-shape :pages-per-sequence])
+             :csr-paged (get-in storage [:route-shape :page-index-capacity])))))))
 
 (defn- schedule-value
   [plan subgroup-size membership-tiling strategy layout-swizzle]
@@ -82,9 +84,9 @@
 (defn- plan-subgroup-online*
   "Plan one subgroup per segment with one shared score and lane-strided value accumulators.
 
-   The first executable storage rows are dense or CSR paged FP16 KV with either contiguous
-   interval or explicitly indexed CSR membership. Those are legality constraints of this
-   schedule, not new semantic operation kinds."
+   Executable storage rows are dense-packed FP16/FP32 or dense/CSR paged FP16 K/V with either
+   contiguous interval or explicitly indexed CSR membership. Those are legality constraints
+   of this schedule, not new semantic operation kinds."
   [plan desc strategy tile-size]
   (let [{:keys [membership storage score value operands output accumulator-dtype] :as plan}
         (swr/validate! plan)
@@ -119,11 +121,16 @@
       (decline :score-reuse-visibility-unsupported
                {:visibility-kind (:visibility-kind membership)})
 
-      (not= :routed-paged-kv (:kind storage))
+      (not (contains? #{:routed-paged-kv :dense-packed-kv} (:kind storage)))
       (decline :score-reuse-storage-unsupported {:storage (:kind storage)})
 
-      (not (contains? #{:dense-paged :csr-paged} (:route-kind storage)))
+      (not (contains? #{:dense-packed :dense-paged :csr-paged} (:route-kind storage)))
       (decline :score-reuse-route-unsupported {:route-kind (:route-kind storage)})
+
+      (not= (= :dense-packed-kv (:kind storage))
+            (= :dense-packed (:route-kind storage)))
+      (decline :score-reuse-storage-route-mismatch
+               {:storage-kind (:kind storage) :route-kind (:route-kind storage)})
 
       (or (not= :none (get-in storage [:k-format :quantization]))
           (not= :none (get-in storage [:v-format :quantization])))
@@ -134,14 +141,17 @@
       (decline :score-reuse-accumulator-unsupported {:actual accumulator-dtype})
 
       (let [route-operands (case (:route-kind storage)
+                             :dense-packed 2
                              :dense-paged 3
                              :csr-paged 4)
             visibility-operands (if (= :csr (:visibility-kind membership)) 2 0)
             expected-count (+ 5 route-operands visibility-operands)]
         (not (and (= expected-count (count operand-dtypes))
                   (contains? #{:half :float} (first operand-dtypes))
-                  (= [:int :int :half :half]
-                     (subvec operand-dtypes 1 5))
+                  (= [:int :int] (subvec operand-dtypes 1 3))
+                  (every? #(contains? (if (= :dense-packed-kv (:kind storage))
+                                        #{:half :float} #{:half}) %)
+                          (subvec operand-dtypes 3 5))
                   (every? #(= :int %) (subvec operand-dtypes 5))
                   (contains? #{:half :float} (:dtype output)))))
       (decline :score-reuse-storage-dtypes-unsupported
@@ -192,6 +202,11 @@
                                      (get-in desc [:cache :slm])
                                      (:shared-local-memory desc)
                                      65536))})
+
+      (and (= :subgroup-online-tiled-history strategy)
+           (= :dense-packed-kv (:kind storage)))
+      (decline :tiled-history-dense-packed-unimplemented
+               {:storage-kind (:kind storage)})
 
       (and (= :subgroup-online-tiled-history strategy)
            (not (and (pos-int? tile-size) (<= tile-size Integer/MAX_VALUE))))

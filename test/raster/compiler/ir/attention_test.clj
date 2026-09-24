@@ -23,6 +23,14 @@
            :start-positions 'kv-start-positions :page-index-capacity 7}
           (apply hash-map overrides))))
 
+(defn- packed-route
+  [& overrides]
+  (attention/dense-packed-route
+   (merge {:row-offsets 'kv-row-offsets
+           :start-positions 'kv-start-positions
+           :total-tokens 6}
+          (apply hash-map overrides))))
+
 (defn- csr-visibility
   [& overrides]
   (attention/csr-visibility
@@ -70,6 +78,35 @@
     (is (= 96 (get-in (attention/buffer-specs dense) ['output :elements])))
     (is (= {:dtype :half :quantization :none} (:k-format dense)))
     (is (= {:dtype :half :quantization :none} (:v-format dense)))))
+
+(deftest dense-packed-kv-keeps-physical-layout-separate-from-query-rows
+  (let [packed (problem :route (packed-route)
+                        :page-size nil :physical-pages nil
+                        :k-layout :token-head-major :v-layout :token-head-major
+                        :q-dtype :float :k-dtype :float :v-dtype :float
+                        :output-dtype :float)
+        routing {:row-offsets [0 3 3 6]
+                 :start-positions [0 0 10]}]
+    (is (= :dense-packed (attention/route-kind (:route packed))))
+    (is (= [3 0 3] (attention/logical-route-lengths packed routing)))
+    (is (= '[q q-row-offsets q-positions k-pages v-pages
+             kv-row-offsets kv-start-positions]
+           (attention/ordered-input-buffer-ids packed)))
+    (is (= [6 2 8] (:k-pages (attention/layouts packed))))
+    (is (= [6 2 6] (:v-pages (attention/layouts packed))))
+    (is (= [4] (:kv-row-offsets (attention/layouts packed))))
+    (is (= 96 (get-in (attention/buffer-specs packed) ['output :elements])))
+    (is (= :attention-invalid-kv-offsets
+           (try
+             (attention/validate-routing! packed
+                                          (assoc routing :row-offsets [0 3 7 6]))
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :attention-invalid-kv-position-range
+           (try
+             (attention/validate-routing! packed
+                                          (assoc routing :start-positions
+                                                 [0 0 Integer/MAX_VALUE]))
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest packed-query-and-route-values-are-validated-before-upload
   (let [dense (problem)

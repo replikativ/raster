@@ -28,6 +28,12 @@
    {:page-table 'page-table :lengths 'kv-lengths
     :start-positions 'kv-start-positions :pages-per-sequence 3}))
 
+(defn- packed-route
+  []
+  (attention/dense-packed-route
+   {:row-offsets 'kv-row-offsets :start-positions 'kv-start-positions
+    :total-tokens 6}))
+
 (defn- csr-route
   []
   (attention/csr-paged-route
@@ -58,6 +64,42 @@
 (def ^:private intel-desc
   {:device-type :gpu :vendor "Intel" :subgroup-size 16
    :max-workgroup-size 256})
+
+(deftest dense-packed-f32-routes-through-the-same-reduction-algebra
+  (let [packed (problem :route (packed-route)
+                        :page-size nil :physical-pages nil
+                        :k-layout :token-head-major :v-layout :token-head-major
+                        :q-dtype :float :k-dtype :float :v-dtype :float
+                        :output-dtype :float)
+        reference (route/route! packed
+                                (assoc intel-desc
+                                       :segmented-weighted-reduction-schedule :reference))
+        scheduled (route/route! packed intel-desc)
+        reference-source (get-in reference [:artifact :source])
+        scheduled-source (get-in scheduled [:artifact :source])]
+    (is (= :dense-packed-reference (:strategy reference)))
+    (is (= :dense-packed-subgroup-online-score-reuse (:strategy scheduled)))
+    (is (= :dense-packed-kv (get-in reference [:plan :storage :kind])))
+    (is (= (kexec/common-view (:artifact reference))
+           (kexec/common-view (:artifact scheduled))))
+    (is (= '[q q-row-offsets q-positions k-pages v-pages
+             kv-row-offsets kv-start-positions output]
+           (get-in reference [:artifact :arguments])))
+    (is (= [:float :int :int :float :float :int :int :float]
+           (mapv :dtype (get-in reference [:artifact :abi]))))
+    (is (str/includes? reference-source "kv_row_offsets["))
+    (is (str/includes? reference-source "k_values["))
+    (is (str/includes? scheduled-source "sub_group_reduce_add"))))
+
+(deftest dense-packed-measured-dispatch-keeps-its-own-reference-strategy
+  (let [packed (problem :route (packed-route)
+                        :page-size nil :physical-pages nil
+                        :k-layout :token-head-major :v-layout :token-head-major
+                        :q-dtype :float :k-dtype :float :v-dtype :float
+                        :output-dtype :float)
+        dispatch (route/measured-dispatch packed intel-desc)]
+    (is (= :dense-packed-reference (:default-strategy dispatch)))
+    (is (= :dense-packed-reference (get-in dispatch [:selector :strategy])))))
 
 (defn- operation-tree
   [operations]
@@ -319,6 +361,33 @@
         (is (= :explicit-shuffle-down-tree
                (get-in artifact [:attributes :target-collective-association])))
         (is (str/includes? (:source artifact) "extern \"C\" __global__ void"))
+        (is (str/includes? (:source artifact) "__shfl_down"))))))
+
+(deftest dense-packed-f32-preserves-body-and-abi-across-c-family-targets
+  (let [packed (problem :route (packed-route)
+                        :page-size nil :physical-pages nil
+                        :k-layout :token-head-major :v-layout :token-head-major
+                        :q-dtype :float :k-dtype :float :v-dtype :float
+                        :output-dtype :float)
+        descriptor {:device-type :gpu :subgroup-size 32 :max-workgroup-size 1024}
+        plan (:plan (route/route! packed
+                                  (assoc descriptor
+                                         :segmented-weighted-reduction-schedule :reference)))
+        scheduled (:schedule (schedule-pass/plan-subgroup-online plan descriptor))
+        opencl (attention-emit/emit-fp16-cooperative plan scheduled :opencl-portable)]
+    (doseq [[dialect target] [[:cuda :cuda-c] [:hip :hip-cpp]]]
+      (let [artifact (attention-emit/emit-fp16-cooperative plan scheduled dialect)]
+        (is (= target (:target artifact)))
+        (is (= (:abi opencl) (:abi artifact)))
+        (is (= (:arguments opencl) (:arguments artifact)))
+        (is (= (:effects opencl) (:effects artifact)))
+        (is (= (select-keys (get-in opencl [:attributes :kernel-body])
+                            [:id :parameters :allocations :indices :schedule :launch
+                             :provenance :attributes])
+               (select-keys (get-in artifact [:attributes :kernel-body])
+                            [:id :parameters :allocations :indices :schedule :launch
+                             :provenance :attributes])))
+        (is (str/includes? (:source artifact) "kv_row_offsets"))
         (is (str/includes? (:source artifact) "__shfl_down"))))))
 
 (deftest pipelined-attention-preserves-one-body-and-abi-across-c-family-targets
