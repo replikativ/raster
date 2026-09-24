@@ -16,6 +16,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.dl.array-ops :as ops]
             [raster.dl.attention :as attn]
             [raster.arrays :as ra]
@@ -414,6 +415,17 @@
                                      [weights input target batch in-f out-f lr])]
       (is (= :none (get-in compilation [:stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations])))
+      (let [{:keys [compiler-buffer-bindings semantic-outputs memory value-versions]}
+            (invocation-link/memory-witness (invocation-link/certify plan))]
+        (is (= :unproven value-versions))
+        (is (seq compiler-buffer-bindings))
+        (is (seq semantic-outputs))
+        (is (every? #(contains? (:values memory) %)
+                    (vals compiler-buffer-bindings)))
+        (is (every? #(contains? (:values memory) (second %)) semantic-outputs))
+        (is (seq (:accesses memory)))
+        (is (= :unproven (:reuse memory))
+            "resident AD compilation is not proof that its tape storage can be reused"))
       (testing "direct AD/SGD updates replay over resident weights without host reupload"
         (if-not @gp/gpu-available?
           (gp/gpu-skip! "gpu-ad-full-train-step-execution")

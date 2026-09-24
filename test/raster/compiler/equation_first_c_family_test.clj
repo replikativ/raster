@@ -275,6 +275,14 @@
     (is (every? link-plan/link-plan?
                 (map compiled/plan [functional effect state])))
     (is (invocation-link/certificate? (compiled/certificate functional)))
+    (let [{:keys [compiler-buffer-bindings memory value-versions]}
+          (invocation-link/memory-witness (:lowering functional))]
+      (is (= :unproven value-versions))
+      (is (every? #(contains? (:values memory) %)
+                  (vals compiler-buffer-bindings)))
+      (is (seq (:accesses memory)))
+      (is (= [:unproven :unproven]
+             ((juxt :reuse :completion) memory))))
     (is (= :invocation-link-certificate
            (:reason
             (reason-of
