@@ -53,11 +53,16 @@
                   (dialect/make (dialect/facts program)
                                 (mapv #(walk/postwalk f %) (dialect/equations program))
                                 (dialect/outputs program)))
+        row-index-plus? (fn [form loop-index]
+                          (and (seq? form) (= 'clojure.core/+ (first form))
+                               (= 3 (count form))
+                               (seq? (second form))
+                               (= 'clojure.core/long (first (second form)))
+                               (symbol? (second (second form)))
+                               (= (list 'clojure.core/long loop-index) (nth form 2))))
         shifted (rewrite
-                 #(if (= '(clojure.core/+ (clojure.core/long rstr_local_0)
-                                           (clojure.core/long rstr_loop_index_1)) %)
-                    '(clojure.core/+ (clojure.core/long rstr_local_0)
-                                     (clojure.core/long rstr_loop_index_1) 1)
+                 #(if (row-index-plus? % 'rstr_loop_index_1)
+                    (list 'clojure.core/+ (second %) (nth % 2) 1)
                     %))
         guarded (rewrite
                  #(if (and (seq? %) (= 'effect (first %)))
@@ -69,8 +74,7 @@
               (tree-seq coll? seq (dialect/equations program)))
         carry-dependent
         (rewrite
-         #(if (= '(clojure.core/+ (clojure.core/long rstr_local_0)
-                                  (clojure.core/long rstr_loop_index_0)) %)
+         #(if (row-index-plus? % 'rstr_loop_index_0)
             (list 'clojure.core/+ % carry-parameter) %))
         mismatched-domain
         (rewrite
@@ -81,6 +85,8 @@
         (rewrite
          #(if (and (seq? %) (= 'effect (first %)))
             (apply list (assoc (vec %) 5 (symbol "%destination0"))) %))]
+    (is (not= program shifted) "the cross-row mutation must find the source index")
+    (is (not= program carry-dependent) "the carry mutation must find the source index")
     (doseq [[label candidate] [[:neighboring-row shifted]
                                [:guarded guarded]
                                [:carry-dependent carry-dependent]
