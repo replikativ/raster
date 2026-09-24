@@ -634,9 +634,13 @@
   [loop path]
   (let [suffix (apply str (interpose "_" path))
         loop (rename-loop-index loop (symbol (str "rstr_loop_index_" suffix)))
-        loop (cond-> loop
-               (:carry loop) (assoc-in [:carry :result]
-                                        (symbol (str "rstr_loop_carry_result_" suffix))))]
+        ;; Only the effect-only recognizer invents a result nobody consumes. A result-valued
+        ;; loop exports its source binder to subsequent effects, so renaming it here would leave
+        ;; those uses free (the Q8_K block sum is one such continuation).
+        loop (cond-> (dissoc loop :synthetic-carry-result?)
+               (:synthetic-carry-result? loop)
+               (assoc-in [:carry :result]
+                         (symbol (str "rstr_loop_carry_result_" suffix))))]
     (update loop :loops
             (fn [children]
               (mapv (fn [ordinal child]
@@ -919,7 +923,8 @@
                               :loops (mapv #(substitute-loop renames %) (:loops region))
                               :order (substitute-order (region-order region) renames)}
                        parameter
-                       (assoc :carry {:parameter parameter :result result
+                       (assoc :synthetic-carry-result? true
+                              :carry {:parameter parameter :result result
                                       :dtype (get-in counted [:carry :dtype])
                                       :init (util/subst-syms renames
                                                              (get-in counted [:carry :init]))
