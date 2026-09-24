@@ -112,6 +112,59 @@
             (* 2.0 epsilon))))
      (range (count primal)))))
 
+(deftest packed-segments-are-block-diagonal-with-window-and-vjp
+  (let [make-problem
+        (fn [visibility]
+          (attention/make
+           {:id :packed-segments
+            :query (attention/packed-query-batch
+                    {:values 'q :row-offsets 'q-offsets
+                     :positions 'q-positions :total-tokens 4})
+            :k-pages 'k :v-pages 'v :output 'output
+            :route (attention/dense-packed-route
+                    {:row-offsets 'kv-offsets :start-positions 'starts
+                     :total-tokens 3})
+            :batch-size 4 :q-heads 1 :kv-heads 1
+            :qk-head-dim 2 :value-head-dim 2
+            :page-size nil :physical-pages nil
+            :q-dtype :float :k-dtype :float :v-dtype :float :output-dtype :float
+            :accumulator-dtype :float :scale 1.0
+            :k-layout :token-head-major :v-layout :token-head-major
+            :visibility visibility}))
+        global (make-problem (attention/visibility))
+        local (make-problem (attention/visibility
+                             {:window-left 0 :window-right 0}))
+        values {'q [1.0 0.0, 0.0 1.0, 1.0 1.0, 9.0 9.0]
+                'k [1.0 0.0, 0.0 1.0, 10.0 10.0]
+                'v [2.0 3.0, 5.0 7.0, 11.0 13.0]
+                'q-offsets [0 2 2 3 4] 'kv-offsets [0 2 2 3 3]
+                'q-positions [0 1 0 0] 'starts [0 0 0 0]
+                'd-output [0.3 -0.2, 0.4 0.1, -0.1 0.2, 0.8 0.6]}
+        output (vec (reference/reference-forward global values))
+        local-output (vec (reference/reference-forward local values))
+        e (Math/exp 1.0)
+        first-weight (/ e (+ e 1.0))
+        expected [(+ (* first-weight 2.0) (* (- 1 first-weight) 5.0))
+                  (+ (* first-weight 3.0) (* (- 1 first-weight) 7.0))
+                  (+ (* (- 1 first-weight) 2.0) (* first-weight 5.0))
+                  (+ (* (- 1 first-weight) 3.0) (* first-weight 7.0))
+                  11.0 13.0, 0.0 0.0]
+        vjp (attention-ad/make
+             {:id :packed-segments-vjp :primal global
+              :output-cotangent 'd-output
+              :cotangents {:query 'd-q :key 'd-k :value 'd-v}})
+        gradients (reference/reference-vjp vjp values)]
+    (is (arrays-close? output expected 1.0e-12)
+        "packed row offsets prevent cross-question scores even with extreme other-row keys")
+    (is (arrays-close? local-output [2.0 3.0, 5.0 7.0, 11.0 13.0, 0.0 0.0]
+                       1.0e-12)
+        "a padded query tail is a row with no keys and has neutral output")
+    (doseq [[role buffer] [[:query 'q] [:key 'k] [:value 'v]]]
+      (is (arrays-close? (get gradients role)
+                         (numerical-gradient global values buffer 1.0e-5)
+                         1.0e-5)
+          (str "packed segmented " role " cotangent matches finite differences")))))
+
 (deftest dense-and-csr-routes-have-identical-forward-and-vjp-semantics
   (let [dense-data (data :dense-paged)
         csr-data (data :csr-paged)

@@ -3,6 +3,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.passes.parallel.attention-route :as route]
+            [raster.compiler.reference.attention :as attention-reference]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as device-probe]))
@@ -414,6 +415,10 @@
                               denominator)))))
                    (range 2))))
               (range 3)))
+        oracle (attention-reference/reference-forward
+                problem {'q q 'q-row-offsets q-offsets 'q-positions q-positions
+                         'k-pages k 'v-pages v 'kv-row-offsets kv-offsets
+                         'kv-start-positions kv-starts})
         allocations {:q [:float (get-in specs ['q :elements]) q]
                      :q-row-offsets [:int 4 q-offsets]
                      :q-positions [:int 3 q-positions]
@@ -426,6 +431,11 @@
              :dense-packed-reference
              :dense-packed-subgroup-online-score-reuse)
            (:strategy routed)))
+    (is (every? true?
+                (map (fn [independent interpreted]
+                       (< (Math/abs (- (double independent) (double interpreted))) 1.0e-9))
+                     expected oracle))
+        "schedule-free packed oracle agrees with the independent masked reference")
     (attention/validate-routing! problem
                                  {:row-offsets kv-offsets :start-positions kv-starts})
     (gpu/with-gpu-session [session device-id]
