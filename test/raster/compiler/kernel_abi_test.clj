@@ -123,6 +123,10 @@
                                      map-abi [:x :out] [{:type :float :value 2.0}])))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"pointer count"
                         (kabi/validate-split-binding! map-abi [:x] [{:type :float :value 2.0}])))
+  (is (= [{:name 'scale :role :parameter :kernel-dtype :float}]
+         (let [error (try (kabi/validate-split-binding! map-abi [:x :out] [])
+                          (catch clojure.lang.ExceptionInfo error error))]
+           (:required-scalars (ex-data error)))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar dtype"
                         (kabi/validate-split-binding! map-abi [:x :out]
                                                       [{:type :int :value 2}]))))
