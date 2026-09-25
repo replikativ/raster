@@ -64,3 +64,12 @@
                  (catch clojure.lang.ExceptionInfo error
                    (:reason (ex-data error))))]
     (is (= :index-expression-overflow reason))))
+
+(deftest explicit-floating-to-integer-index-cast-uses-typed-scalar-ssa
+  (let [floating-product (with-meta '(clojure.core/* u 8.0)
+                           {:raster.type/tag 'double})]
+    (is (index-expression/requires-scalar-evaluation?
+         (list 'clojure.core/int floating-product)))
+    (is (not (index-expression/requires-scalar-evaluation?
+              (list 'clojure.core/int
+                    (with-meta '(clojure.core/rem i 4) {:raster.type/tag 'long})))))))

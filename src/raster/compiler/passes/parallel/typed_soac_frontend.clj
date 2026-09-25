@@ -84,7 +84,13 @@
   (if (and (seq? expression)
            (contains? #{'long 'int 'clojure.core/long 'clojure.core/int}
                       (first expression))
-           (= 2 (count expression)))
+           (= 2 (count expression))
+           ;; An explicit float-to-integer conversion owns truncation semantics. It is not
+           ;; redundant index decoration and must reach typed scalar lowering intact.
+           (not (contains? #{:float :double}
+                           (some-> (or (:raster.type/tag (meta (second expression)))
+                                       (:tag (meta (second expression))))
+                                   dtype/dtype-for-scalar-tag dtype/canon))))
     (second expression)
     expression))
 

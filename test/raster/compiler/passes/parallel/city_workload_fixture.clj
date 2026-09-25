@@ -6,6 +6,11 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.par :as par]))
 
+(deftm cast-coordinate-histogram!
+  [values :- (Array double), counts :- (Array int), n :- Long] :- Void
+  (par/map-void! i n
+    (par/atomic-add! counts (int (* (aget values i) 8.0)) (int 1))))
+
 ;; Literals are written out inside the kernels: a var reference, even a
 ;; ^:const one, reaches the C emitter as a bare symbol (`earth_m`).
 (deftm haversine-m
