@@ -1539,3 +1539,15 @@ microsecond cooperative median. The run was non-stationary and is recorded as di
 evidence, not a portable throughput claim. Correctness covers widths 1, 17 and 513 plus a three-row
 case, and the actual library kernel is part of the nvcc/hipcc fixture corpus. This validates the
 algebra/schedule seam on a real decode bottleneck without introducing an RMSNorm compiler rule.
+
+### 2026-09-25 — city language-coverage follow-up (not a current upgrade gate)
+
+The city-rstr GPU day kernels now compile and agree with their JVM counterparts on Raster
+0.2.951, including the multi-carry effectful episode loop. Keep the remaining probes in
+`~/.cache/claude-city/raster-probe` on the language-coverage agenda: P10/P13 have nested
+two-exit search loops, P14 has multiple `recur` sites, and P20f still declines with
+`:no-lowering-rule`. City can use the supported one-exit/one-recur spellings, so these
+do not block the present generated-kernel performance work. When revisiting them, first
+retain a typed control-flow region and its effect/SSA ownership facts, then check GPU/JVM
+results for the full city kernels. Do not quietly reintroduce source-level fallback or
+interpret a successful compile as numerical validation.
