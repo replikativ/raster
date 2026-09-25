@@ -89,7 +89,8 @@
   "Close a validated single-launch contraction descriptor into one executable compiler value."
   [{:keys [strategy kernel-name source abi arguments wg grid out-elems dtype out-dtype]
     :as descriptor}]
-  (when-not (every? (set arguments) (klaunch/expression-references out-elems))
+  (when-not (or (some #(= out-elems %) arguments)
+                (every? (set arguments) (klaunch/expression-references out-elems)))
     (throw (ex-info "contract descriptor: symbolic :out-elems references unbound artifact values"
                     {:strategy strategy :out-elems out-elems :arguments arguments})))
   (kart/make
