@@ -1339,10 +1339,11 @@
 
    It consumes contraction facts, preserves a typed result transform and derives its ABI from
    KernelBody; no target source is reconstructed from a compatibility SegRed."
-  [contract-facts out-sym & {:keys [tile descriptor operation-id]}]
-  (let [{:keys [kernel-body bindings dims tile]}
+  [contract-facts out-sym & {:keys [tile descriptor operation-id scalar-types]}]
+  (let [{:keys [kernel-body bindings dims tile runtime-scalar-values output-count]}
         (register-tiled-body/lower
-         contract-facts (cond-> {:operation-id operation-id :descriptor descriptor}
+         contract-facts (cond-> {:operation-id operation-id :descriptor descriptor
+                                :scalar-types scalar-types}
                           tile (assoc :tile tile)))
         row (:row bindings)
         col (:col bindings)
@@ -1372,6 +1373,8 @@
      :micro [(:thread-m tile) (:thread-n tile)]
      :workgroup (get-in kernel-body [:launch :workgroup-size])
      :dims dims
+     :runtime-scalar-values runtime-scalar-values
+     :output-count output-count
      :kernel-body kernel-body
      :emission-route :kernel-body
      :epilogue-operands (mapv :name (filter #(= :input (:kind %)) epilogue-slots))

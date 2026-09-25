@@ -1,0 +1,24 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-25"
+ :base-revision "ba13c556"
+ :branch "compiler/symbolic-register-tiled"
+ :device "Intel(R) Arc(TM) Graphics"
+ :precision :f32-input-f32-accumulation
+ :route :generated-register-tiled-kernel-body
+ :clock :device-event-span
+ :warmups 4
+ :measured-replays 12
+ :notes "One warm nREPL on a shared laptop. Inputs and output remain resident during measurement; every shape matched the independent double-accumulation CPU oracle exactly for these dyadic inputs. Early replays are transient. Compare with the earlier portable-segred record only as directional evidence, not a stationary paired speedup, tuning winner, or SOTA claim."
+ :cases
+ [{:shape [1 256 256]
+   :samples-ns [74791 75937 74270 268541 78541 76458 86250 79895 79791 79062 76354 74375]
+   :median-ns 77499.5 :max-absolute-error 0.0}
+  {:shape [8 256 256]
+   :samples-ns [187291 89687 88750 86458 90000 89375 79687 88333 87916 89895 89895 89062]
+   :median-ns 89218.5 :max-absolute-error 0.0}
+  {:shape [127 65 33]
+   :samples-ns [50208 64478 64686 64375 28854 20625 29687 20729 20937 20625 19895 19166]
+   :median-ns 24895.5 :max-absolute-error 0.0}
+  {:shape [256 256 256]
+   :samples-ns [274166 256249 112395 110416 113437 112500 110000 108750 112083 113229 110312 108229]
+   :median-ns 112239.0 :max-absolute-error 0.0}]}

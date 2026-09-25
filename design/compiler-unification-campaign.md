@@ -1551,3 +1551,22 @@ do not block the present generated-kernel performance work. When revisiting them
 retain a typed control-flow region and its effect/SSA ownership facts, then check GPU/JVM
 results for the full city kernels. Do not quietly reintroduce source-level fallback or
 interpret a successful compile as numerical validation.
+
+### 2026-09-25 — runtime-shaped cooperative register tiling
+
+The public typed contraction keeps symbolic `m/n/k` through one semantic ABI while the
+register-tiled KernelBody now consumes those scalar bounds directly. Its tile-local loads,
+stores, barriers and accumulation are still compiler-generated and target-neutral; there is no
+new GEMM source template. The router preserves source `int`/`long` scalar dtypes, widens local
+K offsets explicitly when necessary, derives the output count as checked launch IR, and retains
+the portable reduction as another executable alternative. Candidate graph composition now
+matches logical buffer identities independent of physical A/B argument order. A flat read of a
+2-D destination declines the tiled leaf rather than constructing an invalid rank-one load.
+The selector sends products beyond int-sized resident capacity to the portable path, whose own
+binding still checks capacity, so a Long-valued extent cannot silently overflow tiled address
+arithmetic. General symbolic bound expressions remain a documented decline.
+
+The opt-in public Arc oracle passes batch-one, multi-row, square and awkward-tail shapes, and
+the generated symbolic body compiles to CUDA PTX and HIP syntax without hardware. The square
+shape's local device-event median moved from approximately 393 to 112 microseconds, with
+non-stationary early replays; see the raw comparison protocol for the measurement limits.

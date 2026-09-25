@@ -8,6 +8,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]))
 
 (def ^:private small-tile
@@ -70,6 +71,41 @@
         (let [compiled (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                  "-fsyntax-only" "-" :in opencl)]
           (is (zero? (:exit compiled)) (:err compiled)))))))
+
+(deftest symbolic-bounds-stay-in-the-register-tiled-abi-and-launch
+  (let [form '(raster.par/contract C [[i m] [j n]] [[p k]]
+                (* (aget A (+ (* i k) p)) (aget B (+ (* p n) j)))
+                :init (float 0.0))
+        routed (route/route-contraction form :dtype :float
+                                        :candidate-families #{:register-tiled :portable})
+        long-routed (route/route-contraction
+                     form :dtype :float
+                     :candidate-families #{:register-tiled :portable}
+                     :scalar-types '{m :long n :long k :long})
+        kernel (:kernel-body routed)
+        long-kernel (:kernel-body long-routed)
+        values {'m 8 'n 7 'k 5}]
+    (is (= :regtiled (:strategy routed)))
+    (is (body/kernel-body? kernel))
+    (is (= '[A B C m n k register-output-elements]
+           (mapv :name (:abi routed))))
+    (is (= [8 7 5 56]
+           (mapv #(launch/resolve-expression (fn [id] (get values id)) (:value %))
+                 (:scalar-args routed))))
+    (is (= [1 1]
+           (mapv #(launch/resolve-expression (fn [id] (get values id)) %)
+                 (get-in kernel [:launch :group-count]))))
+    (is (= :regtiled (:strategy long-routed)))
+    (is (= [:long :long :long :int]
+           (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi long-routed)))))
+    (is (body/kernel-body? long-kernel)
+        "long bounds and explicit exact widening of local tile offsets validate as one body")
+    (doseq [dialect [:opencl-intel :cuda :hip]]
+      (is (string? (body-emit/emit-scalar-kernel
+                    "symbolic_register_tile" kernel {:target-dialect dialect})))
+      (is (string? (body-emit/emit-scalar-kernel
+                    "symbolic_long_register_tile" long-kernel
+                    {:target-dialect dialect}))))))
 
 (deftest result-transform-is-alpha-renamed-per-microtile-store
   (let [epilogue {:acc 'acc

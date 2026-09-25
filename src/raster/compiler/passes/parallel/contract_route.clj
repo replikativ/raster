@@ -411,7 +411,8 @@
             {::declines [{:leaf :dpas :reason :mixed-operand-storage}
                          {:leaf :regtiled :reason :mixed-operand-storage}]}
             (route-2free-1contract out-sym dtype desc tile
-                                  epilogue contract-facts operation-id candidate-families)))]
+                                  epilogue contract-facts operation-id candidate-families
+                                  scalar-types)))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
@@ -915,16 +916,32 @@
 (defn- common-logical-interface
   [candidates operation operation-id epilogue]
   (let [interfaces (mapv (comp artifact-logical-interface :artifact) candidates)
-        arguments (mapv second (first interfaces))]
+        ;; The portable leaf historically defines the public buffer order. A tiled leaf may
+        ;; legally reverse its physical operand slots (A/B are roles, not a public call order).
+        ;; Match by semantic argument before checking slot contracts; each candidate graph still
+        ;; binds its own physical ABI in its own order.
+        canonical (or (some (fn [[candidate interface]]
+                              (when (= :portable (:family candidate)) interface))
+                            (map vector candidates interfaces))
+                      (first interfaces))
+        arguments (mapv second canonical)]
     (doseq [[candidate interface] (map vector candidates interfaces)]
-      (when-not (= arguments (mapv second interface))
+      (when-not (and (= (count arguments) (count interface))
+                     (= (set arguments) (set (map second interface))))
         (throw (ex-info "typed contraction candidates have different logical ABI arguments"
                         {:reason :typed-contraction-candidate-interface-arguments
                          :operation operation-id
                          :family (:family candidate)
                          :expected arguments
                          :actual (mapv second interface)}))))
-    (let [abi
+    (let [interfaces (mapv (fn [interface]
+                             (let [by-argument (into {} (map (fn [[slot argument]]
+                                                               [argument slot])) interface)]
+                               (mapv (fn [argument]
+                                       [(get by-argument argument) argument])
+                                     arguments)))
+                           interfaces)
+          abi
           (mapv
            (fn [index argument]
              (let [slots (mapv #(first (nth % index)) interfaces)
@@ -1417,6 +1434,42 @@
                       cases)))
       (update :default #(if (= old-strategy %) new-strategy %))))
 
+(defn- guard-register-tiled-selector
+  "Keep the tile's int-width block coordinates within the resident int-sized buffer contract.
+
+   The semantic bounds may be Long scalars. A checked product above the buffer limit must take
+   the portable leaf (whose own binding still validates capacity), not wrap a tiled address."
+  [selector candidates facts]
+  (if-not (and (some #(= :regtiled (:strategy %)) candidates)
+               (some #(= :portable-segred (:strategy %)) candidates)
+               (some symbol? (map second (concat (:free-axes facts)
+                                                 (:contract-axes facts)))))
+    selector
+    (let [[[_ m] [_ n]] (:free-axes facts)
+          [[_ k]] (:contract-axes facts)
+          guards (mapv (fn [dimensions]
+                         {:expression (apply klaunch/product dimensions)
+                          :op :> :value Integer/MAX_VALUE
+                          :strategy :portable-segred})
+                       [[m n] [m k] [k n]])]
+      (case (:kind selector)
+        :fixed-strategy
+        {:kind :runtime-expression-cases :cases guards :default (:strategy selector)}
+
+        :runtime-expression-cases
+        (update selector :cases #(into guards %))
+
+        :runtime-predicate-cases
+        (update selector :cases
+                #(into (mapv (fn [guard]
+                               {:conditions [(dissoc guard :strategy)]
+                                :strategy (:strategy guard)}) guards)
+                       %))
+
+        (throw (ex-info "register-tiled runtime guard needs a composable selector"
+                        {:reason :register-tiled-selector-guard
+                         :selector selector}))))))
+
 (defn route-typed-contraction-dispatch
   "Normalize legal typed contraction leaves behind one logical ABI-compatible dispatch.
 
@@ -1453,7 +1506,8 @@
         selector (if (seq (:alternatives mixed))
                    (replace-selector-strategy (:selector mixed)
                                               :f32-scalar fallback-strategy)
-                   {:kind :fixed-strategy :strategy default-strategy})]
+                   {:kind :fixed-strategy :strategy default-strategy})
+        selector (guard-register-tiled-selector selector candidates (:facts context))]
     (kdispatch/make
      {:id dispatch-id
       :alternatives alternatives
@@ -1585,7 +1639,7 @@
    shape could express neither: a decline is usually LEGITIMATE (symbolic dims, a non-`+` combine and
    a non-product body are all perfectly good contractions that merely are not tiled-leaf shaped), and
    it is always worth REPORTING."
-  [out-sym dtype desc tile epilogue contract-facts operation-id candidate-families]
+  [out-sym dtype desc tile epilogue contract-facts operation-id candidate-families scalar-types]
   (let [acc (volatile! [])
         note! (fn [d] (vswap! acc conj d) nil)
         ;; The matrix leaf stores whole tiles through fragment registers; a result transform
@@ -1636,7 +1690,8 @@
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
           (if register-tiled?
             (let [rt (sco/generate-register-tiled-kernel-body
-                      contract-facts out-sym :operation-id operation-id :descriptor desc)
+                      contract-facts out-sym :operation-id operation-id :descriptor desc
+                      :scalar-types scalar-types)
                   [bm bn _bk] (:block rt)
                   [M N _L] (:dims rt)]
               {:strategy :regtiled
@@ -1646,7 +1701,7 @@
                :source (:source rt)
                :array-params (:array-params rt)
                :abi (:abi rt)
-               :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
+               :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (:output-count rt)
                :kernel-body (:kernel-body rt)
                :emission-route (:emission-route rt)
                :fused-epilogue (boolean epilogue)
@@ -1654,7 +1709,8 @@
                :epilogue-scalars (:epilogue-scalars rt)
                :wg (:workgroup rt)
                :grid [(ceil-div N bn) (ceil-div M bm)]
-               :scalar-args []                             ; regtiled bakes dims → no scalar params
+               :scalar-args (descriptor-scalar-arguments
+                             (:abi rt) (:runtime-scalar-values rt))
                :dims (:dims rt)})
             (do
               (note! (decline :regtiled :schedule-family-disabled nil

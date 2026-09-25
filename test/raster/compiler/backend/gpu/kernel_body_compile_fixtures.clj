@@ -253,6 +253,22 @@
     (body-emit/emit-scalar-kernel
      "register_tiled_contraction" kernel-body {:target-dialect dialect})))
 
+(defn- symbolic-register-tiled-contraction-source
+  [dialect]
+  (let [facts (contraction-facts/from-components
+               {:out 'C
+                :free-axes [['i 'm] ['j 'n]]
+                :contract-axes [['p 'k]]
+                :body '(raster.numeric/*
+                        (clojure.core/aget A (clojure.core/+ (clojure.core/* i k) p))
+                        (clojure.core/aget B (clojure.core/+ (clojure.core/* p n) j)))
+                :dtype :float})
+        kernel-body (:kernel-body
+                     (register-tiled-body/lower
+                      facts {:scalar-types '{m :long n :long k :long}}))]
+    (body-emit/emit-scalar-kernel
+     "symbolic_register_tiled_contraction" kernel-body {:target-dialect dialect})))
+
 (defn- segmented-fold-map-artifact
   [dialect]
   (let [source
@@ -607,6 +623,8 @@
                             (cooperative-segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
+           (write-source! directory suffix "symbolic-register-tiled-contraction"
+                          (symbolic-register-tiled-contraction-source dialect))
            (write-source! directory suffix "layout-cast"
                           (:source
                            (layout-transform/emit-cast-kernel
