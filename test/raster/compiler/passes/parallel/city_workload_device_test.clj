@@ -55,7 +55,12 @@
       (let [ki (first (gpu/compile! session kernel-key kernel {:dtype :double}))]
         (gpu/alloc! session buffers)
         (gpu/invoke! session kernel-key {} (typed-scalars (:abi ki) values) n)
-        (into {} (map (fn [key] [key (vec (gpu/download session key))]) outputs)))
+        (assoc (into {} (map (fn [key] [key (vec (gpu/download session key))]) outputs))
+               :required-scalars
+               (mapv :name (filter #(and (= :scalar (:kind %))
+                                          (not= :bound (:role %))) (:abi ki)))
+               :stable-inputs
+               (set (map :name (filter #(= :no-write-alias (:aliasing %)) (:abi ki))))))
       (finally (gpu/close-session! session)))))
 
 (defn- common-buffers [{:keys [n nc ncell] :as input}]
@@ -113,6 +118,11 @@
                               [:revenue3 :visits3 :counts])]
         (is (= (vec retail-visits) (:visits retail)))
         (is (= (vec retail-counts) (:counts retail)))
+        (is (= [] (:required-scalars retail))
+            "the resident params/dims loads are not extra public launch scalars")
+        (is (every? (:stable-inputs retail) '[params dims]))
         (is (= (vec revenue) (:revenue3 spend)))
         (is (= (vec spend-visits) (:visits3 spend)))
-        (is (= (vec spend-counts) (:counts spend)))))))
+        (is (= (vec spend-counts) (:counts spend)))
+        (is (= '[n] (:required-scalars spend)))
+        (is (every? (:stable-inputs spend) '[params3 dims]))))))

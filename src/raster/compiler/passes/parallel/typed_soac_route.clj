@@ -690,6 +690,7 @@
   ([form dtype array-types]
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
+                                 resident-uniform-input-loads?
                                  scalar-types values abstract-machine]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
@@ -704,6 +705,10 @@
                {:declined decline})
              (let [[typed-result typed-stats]
                    (fusion/fusion-fixpoint typed-input abstract-machine)
+                   [typed-result uniform-stats]
+                   (if resident-uniform-input-loads?
+                     (resident/inline-uniform-input-loads typed-result)
+                     [typed-result {:resident-uniform-input-loads 0}])
                    [typed-result resident-stats]
                    (if resident-reductions?
                      (resident/realize typed-result)
@@ -719,12 +724,12 @@
                                          (:kind (fusion/equation-info %)))
                              (dialect/equations typed-result))
                  {:declined {:reason :no-certified-parallel-equation
-                             :stats (merge typed-stats resident-stats ownership-stats)}}
+                             :stats (merge typed-stats uniform-stats resident-stats ownership-stats)}}
                  (if-let [decline (sequential-continuation-decline typed-result)]
                    {:declined decline}
                    (let [{:keys [source realized]} (realize-source form typed-result)]
                      {:program (envelope typed-result source realized)
-                      :stats (merge typed-stats resident-stats initialization-stats ownership-stats
+                      :stats (merge typed-stats uniform-stats resident-stats initialization-stats ownership-stats
                                     {:route :typed-soac :typed-validated true
                                      :front-end :analyzed-source})}))))))
          (catch clojure.lang.ExceptionInfo exception

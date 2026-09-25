@@ -2297,6 +2297,8 @@
                          (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
                            (kabi/validate-physical-pointer-dtypes!
                             abi (physical-pointer-dtypes arrays))
+                           (kabi/validate-logical-pointer-aliases!
+                            abi arrays kcall/pointer-overlaps?)
                            binding))
          checked-scalars (when split-binding
                            (mapv kexec/physical-runtime-scalar
@@ -2468,6 +2470,8 @@
                          (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
                            (kabi/validate-physical-pointer-dtypes!
                             abi (physical-pointer-dtypes arrays))
+                           (kabi/validate-logical-pointer-aliases!
+                            abi arrays kcall/pointer-overlaps?)
                            binding))
          checked-scalars (when split-binding
                            (mapv kexec/physical-runtime-scalar
