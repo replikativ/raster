@@ -7,6 +7,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]))
@@ -92,6 +93,15 @@
     (is (= [8 7 5]
            (mapv #(launch/resolve-expression (fn [id] (get values id)) (:value %))
                  (:scalar-args routed))))
+    (let [arguments (mapv (fn [slot]
+                            (if (= :scalar (:kind slot))
+                              {:type (:kernel-dtype slot)
+                               :value (get values (:name slot))}
+                              (Object.)))
+                          (:abi routed))
+          call (kcall/make (:artifact routed) arguments)]
+      (is (= 56 (kcall/resolve-value call (:out-elems routed)))
+          "the output extent is derived from ABI-bound dimensions at invocation"))
     (is (= [1 1]
            (mapv #(launch/resolve-expression (fn [id] (get values id)) %)
                  (get-in kernel [:launch :group-count]))))
