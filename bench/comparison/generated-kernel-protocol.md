@@ -61,7 +61,14 @@ Both paths matched the CPU oracle. At the larger shape, Raster's default portabl
 reduction was materially slower than default CLBlast SGEMM (393 versus 174 microseconds median);
 this identifies a generated-schedule optimization opportunity, not a correctness or typing gap.
 The small shape favored Raster in this run (163 versus 195 microseconds median), but Raster's
-samples varied substantially. Neither observation is sufficient for automatic tuning.
+samples varied substantially, including a second run that fell from 389 to 160 microseconds
+within its twelve measured replays. Neither observation is sufficient for automatic tuning.
+The compiler evidence gives the architectural cause of the default route: `gemm-mnk!` retains
+symbolic `m/n/k`, while the current register-tiled leaf requires literal dimensions and declines
+with `:symbolic-dims`; `:f32-scalar` correctly excludes the FP16 matrix-instruction family.
+The next general compiler slice should specialize these shape arguments from a validated runtime
+shape or make the register-tiled schedule itself symbolic. It should preserve the public typed
+contraction and its ABI, and compare the resulting schedule at several shapes before promotion.
 
 ### Public dynamic GEMM/activation probe
 

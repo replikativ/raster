@@ -60,6 +60,7 @@
            :kernel-names (mapv :kernel-name (:profile (first profiles)))
            :compile-ns compile-ns :bind-ns bind-ns
            :schedule-precision (get-in prepared [:schedule :precision])
+           :compilation (canary/compilation-evidence prepared)
            :max-absolute-error (max pre-error post-error)})
         (finally (compiled/close! instance))))))
 
