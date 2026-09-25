@@ -75,6 +75,14 @@ microsecond median, versus 393 microseconds for the earlier portable route; the 
 are visibly transient and the runs were not paired. The result is a useful generated-schedule
 acceptance check, not an automatic tuning decision or a CLBlast victory claim. The same public
 program was also checked at batch one, multi-row and awkward-tail shapes against the CPU oracle.
+An additional [bracketed diagnostic run](../results/strict-f32-symbolic-tile-bracket-20260925.edn)
+places CLBlast before and after Raster at `[256,256,256]`: Raster's generated tile has a 104 µs
+median, while CLBlast has 173 µs before and 159 µs after. At `[8,256,256]` the medians are
+90 µs and 142 µs respectively. The raw series show substantial transients, especially at the
+small shape, so these numbers establish that the generated schedule is competitive on this Arc
+under the stated protocol, not that it is a stable winner or the right selector for other shapes,
+devices, precisions or activation epilogues. A randomized stationary comparison and explicit
+correctness-guarded selection remain necessary before promoting a measured policy.
 
 ### Public dynamic GEMM/activation probe
 

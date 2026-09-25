@@ -1,0 +1,29 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-25"
+ :revision "2006b1e8ad02f8c4bfa70c1503a1e609cb53e5e2"
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :precision :strict-f32
+ :inputs :deterministic-dyadic-f32
+ :oracle :independent-double-accumulation-cpu
+ :clock :device-event-span
+ :warmups 4
+ :measured-replays 12
+ :order [:clblast-256-before :raster-256 :raster-8 :clblast-8 :clblast-256-after]
+ :notes "Sequential runs on a shared laptop, not a randomized paired experiment. Both programs retained inputs and output on the GPU. Raster compiled the public gemm-mnk! with :f32-scalar and selected the generated register-tiled KernelBody; CLBlast 1.7.0 used its default tuning database. All outputs matched the CPU oracle exactly for these dyadic inputs. Several device-event series contain large transients, and the two profiling implementations differ. These observations are diagnostic, not stationary autotuning evidence or a claim of general superiority."
+ :runs
+ [{:id :clblast-256-before :shape [256 256 256] :median-ns 172630.0
+   :samples-ns [181042 175156 168438 170833 172031 172552 172135 173281 173334 175521 172708 170052]
+   :max-absolute-error 0.0}
+  {:id :raster-256 :shape [256 256 256] :strategy :regtiled :median-ns 103750.0
+   :samples-ns [169479 104687 103750 103750 102708 103333 103437 168645 175208 103750 103958 103541]
+   :max-absolute-error 0.0}
+  {:id :raster-8 :shape [8 256 256] :strategy :regtiled :median-ns 89635.0
+   :samples-ns [132500 142604 92708 86562 85937 137708 137500 81770 85833 81145 136354 81666]
+   :max-absolute-error 0.0}
+  {:id :clblast-8 :shape [8 256 256] :median-ns 142317.5
+   :samples-ns [149166 145365 141823 149531 143333 148021 140000 141614 142812 109948 66718 63541]
+   :max-absolute-error 0.0}
+  {:id :clblast-256-after :shape [256 256 256] :median-ns 158567.5
+   :samples-ns [367553 162083 159895 155729 157657 158593 158438 158542 156354 160730 162292 158073]
+   :max-absolute-error 0.0}]}
