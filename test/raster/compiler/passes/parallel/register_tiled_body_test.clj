@@ -87,16 +87,16 @@
         values {'m 8 'n 7 'k 5}]
     (is (= :regtiled (:strategy routed)))
     (is (body/kernel-body? kernel))
-    (is (= '[A B C m n k register-output-elements]
+    (is (= '[A B C m n k]
            (mapv :name (:abi routed))))
-    (is (= [8 7 5 56]
+    (is (= [8 7 5]
            (mapv #(launch/resolve-expression (fn [id] (get values id)) (:value %))
                  (:scalar-args routed))))
     (is (= [1 1]
            (mapv #(launch/resolve-expression (fn [id] (get values id)) %)
                  (get-in kernel [:launch :group-count]))))
     (is (= :regtiled (:strategy long-routed)))
-    (is (= [:long :long :long :int]
+    (is (= [:long :long :long]
            (mapv :kernel-dtype (filter #(= :scalar (:kind %)) (:abi long-routed)))))
     (is (body/kernel-body? long-kernel)
         "long bounds and explicit exact widening of local tile offsets validate as one body")

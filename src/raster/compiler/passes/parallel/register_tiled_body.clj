@@ -97,12 +97,6 @@
   [prefix & parts]
   (symbol (apply str prefix (map #(str "-" %) parts))))
 
-(defn- output-count-id
-  [used]
-  (first (remove used
-                 (cons 'register-output-elements
-                       (map #(identifier "register-output-elements" %) (range))))))
-
 (defn- add [& values] (apply body/expression :add values))
 (defn- mul [& values] (apply body/expression :mul values))
 (defn- div [left right] (body/expression :floor-div left right))
@@ -214,12 +208,11 @@
                       {:dimensions [M N K] :occupied occupied-ids}))
         output-count (when (or (symbol? M) (symbol? N))
                        (launch/product M N))
-        output-count-parameter (when output-count
-                                 (output-count-id (into occupied-ids symbolic-dimensions)))
-        runtime-scalars (cond-> symbolic-dimensions
-                          output-count (conj output-count-parameter))
-        runtime-scalar-values (cond-> symbolic-dimensions
-                                output-count (conj output-count))
+        ;; The product is a host-side output extent derived from M and N, not an independent
+        ;; kernel input. Publishing it as a fourth scalar made callers supply a redundant value
+        ;; and allowed that value to disagree with the dimension arguments.
+        runtime-scalars symbolic-dimensions
+        runtime-scalar-values symbolic-dimensions
         row-shape [M K]
         col-shape [K N]
         out-shape [M N]
