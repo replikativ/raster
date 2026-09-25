@@ -71,6 +71,20 @@
                                 [:ep-loc :int 9] [:ep-minute :int 9]]]
           [key [dtype size (get input key)]])))
 
+(deftest explicit-floating-to-integer-coordinate-matches-jvm
+  (if-not @probe/gpu-available?
+    (probe/gpu-skip! "explicit floating-to-integer coordinate")
+    (let [values (double-array [0.0 0.124 0.125 0.249 0.5 0.624 0.875 0.999])
+          expected (int-array 8)
+          _ (city/cast-coordinate-histogram! values expected (alength values))
+          device (run-device :cast-coordinate-histogram
+                             #'city/cast-coordinate-histogram!
+                             {:values [:double (alength values) values]
+                              :counts [:int 8 (int-array 8)]}
+                             {"n" (alength values)} (alength values) [:counts])]
+      (is (= (vec expected) (:counts device)))
+      (is (= [2 2 0 0 2 0 0 2] (:counts device))))))
+
 (deftest city-day-kernels-match-their-jvm-source
   (if-not @probe/gpu-available?
     (probe/gpu-skip! "city source-to-device parity")

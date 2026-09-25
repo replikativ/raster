@@ -25,11 +25,20 @@
      clojure.core/unchecked-multiply-int})
 
 (defn requires-scalar-evaluation?
-  "Whether an index contains narrowing arithmetic that exact index algebra cannot replay.
+  "Whether an index contains source arithmetic or conversion that exact index algebra cannot replay.
    Its typed scalar SSA result may still be used as a coordinate."
   [expression]
   (boolean (some #(and (seq? %)
-                       (contains? wrapping-int-operators (descriptor/semantic-op %)))
+                       (or (contains? wrapping-int-operators (descriptor/semantic-op %))
+                           (and (= 2 (count %))
+                                (descriptor/cast-op? (first %))
+                                (contains? #{:int :long}
+                                           (dtype/dtype-for-scalar-tag
+                                            (descriptor/cast-result-tag (first %))))
+                                (contains? #{:float :double}
+                                           (dtype/dtype-for-scalar-tag
+                                            (or (:raster.type/tag (meta (second %)))
+                                                (:tag (meta (second %)))))))))
                  (tree-seq coll? seq expression))))
 
 (def ^:private casts
