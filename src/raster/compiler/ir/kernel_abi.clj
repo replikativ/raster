@@ -224,7 +224,9 @@
                       {:expected (count pointer-bindings) :actual (count pointers) :abi abi})))
     (when-not (= (count user-slots) (count scalars))
       (throw (ex-info "kernel ABI scalar count does not match binding"
-                      {:expected (count user-slots) :actual (count scalars) :abi abi})))
+                      {:expected (count user-slots) :actual (count scalars)
+                       :required-scalars (mapv #(select-keys % [:name :role :kernel-dtype]) user-slots)
+                       :abi abi})))
     (doseq [[slot value] (map vector user-slots scalars)
             :when (map? value)]
       (when-not (= (:kernel-dtype slot) (:type value))
