@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-ordered-effect-map-test
   (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
@@ -508,6 +509,24 @@
     (is (= [6] (vec choice)))
     (is (zero? (get-in jvm [:stats :fallback])))
     (is (= (dialect/validate! algorithm) algorithm))))
+
+(deftest branch-local-plain-store-never-silently-disappears
+  ;; This indirect episode store still needs a shared-ownership proof. Until it has one,
+  ;; compilation must decline instead of publishing a kernel that only writes the diary.
+  (let [source (walk/postwalk
+                (fn [form]
+                  (if (= form '(raster.par/atomic-add! choice 0 (int 1)))
+                    '(clojure.core/aset choice i (int 7))
+                    form))
+                branch-store-then-loop-source)
+        result (route/attempt source :double {'diary :int 'choice :int}
+                              {:scalar-types {'n :long}})]
+    (if-let [program (:program result)]
+      (is (str/includes? (pr-str (first (dialect/equations
+                                          (-> program :equations first :algorithm))))
+                         "choice"))
+      (is (= :sequential-effect-continuation
+             (get-in result [:declined :reason]))))))
 
 (raster.core/deftm city-nested-search-effect!
   [loc :- (Array int), cdf :- (Array double), visits :- (Array int)
