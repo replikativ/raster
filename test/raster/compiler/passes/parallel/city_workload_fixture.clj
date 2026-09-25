@@ -27,6 +27,18 @@
                   (par/atomic-add! counts (unchecked-add-int 1 class) (int 1))))
               (recur (int (inc e))))))))))
 
+(deftm branch-diary-before-choice-loop!
+  [diary :- (Array int), choice :- (Array int), n :- Long] :- Void
+  (par/map-void! i n
+    (if (< i n)
+      (do
+        (aset diary i (int 1))
+        (loop [e (int 0)]
+          (when (< e 2)
+            (par/atomic-add! choice 0 (int 1))
+            (recur (int (inc e))))))
+      (aset diary i (int -1)))))
+
 ;; Literals are written out inside the kernels: a var reference, even a
 ;; ^:const one, reaches the C emitter as a bare symbol (`earth_m`).
 (deftm haversine-m

@@ -1205,6 +1205,26 @@
                                {:tag value-tag :raster.type/tag value-tag})
                              expression)))]
       (cond
+        ;; A branch may contain an ordered loop as well as direct stores. Flattening only its
+        ;; stores silently discards the loop (and every effect in it). Keep each branch's full
+        ;; source-order region under its guard, rebasing the inventory ordinals independently.
+        (and then-region else-region
+             (or (seq (:loops then-region)) (seq (:loops else-region))))
+        (let [then-stores (vec (:stores then-region))
+              then-loops (vec (:loops then-region))
+              else-stores (vec (:stores else-region))
+              else-loops (vec (:loops else-region))]
+          {:locals []
+           :stores (into then-stores else-stores)
+           :loops (into then-loops else-loops)
+           :order [[:region {:predicate predicate
+                             :locals (vec (:locals then-region))
+                             :order (region-order then-region)}]
+                   [:region {:predicate (list 'if predicate false true)
+                             :locals (vec (:locals else-region))
+                             :order (map-region-order (region-order else-region) identity
+                                                      (count then-stores) (count then-loops))}]]})
+
         ;; Both branches store once to the same destination and at least one branch owns
         ;; locals: one predicated store of a value-if over the two scoped branch values.
         (and then-region else-region aligned?
@@ -1323,6 +1343,25 @@
     (cond-> region
       (and region (some? result-expression) (not (contains? region :result)))
       (assoc :result result-expression))))
+
+(defn- source-effect-destinations
+  "Conservative source-side witness for ordinary stores and atomic additions. A successful
+   region recognition must account for every destination named by an effectful source call."
+  [body]
+  (into #{}
+        (keep (fn [form]
+                (cond
+                  (descriptor/aset-call? form) (descriptor/aset-array-sym form)
+                  (atomic-add-call? form) (first (descriptor/call-args form)))))
+        (filter seq? (tree-seq coll? seq body))))
+
+(declare loop-store-leaves)
+
+(defn- region-effect-destinations
+  [{:keys [stores loops]}]
+  (into (set (map :out stores))
+        (map :out)
+        (mapcat #(loop-store-leaves nil % []) loops)))
 
 (defn- independent-stores?
   [_locals stores]
@@ -2743,10 +2782,12 @@
     (let [{:keys [idx bound body elem-type]}
           (par/extract-par-map-void-info expression)]
       (when-let [region (store-region body idx)]
-        (write-region-description id symbol idx bound region
-                                (dtype/canon (or elem-type default-dtype))
-                                :host-return (or (::host-return (meta expression)) :effect)
-                                :array-types array-types :scalar-types scalar-types)))
+        (when (set/subset? (source-effect-destinations body)
+                           (region-effect-destinations region))
+          (write-region-description id symbol idx bound region
+                                    (dtype/canon (or elem-type default-dtype))
+                                    :host-return (or (::host-return (meta expression)) :effect)
+                                    :array-types array-types :scalar-types scalar-types))))
 
     :else nil))
 
