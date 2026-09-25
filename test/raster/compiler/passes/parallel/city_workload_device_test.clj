@@ -101,6 +101,22 @@
       (is (= [4 3 3] (vec expected)))
       (is (= (vec expected) (:counts device))))))
 
+(deftest plain-diary-store-before-choice-loop-matches-jvm
+  (if-not @probe/gpu-available?
+    (probe/gpu-skip! "plain store before branch-local effect loop")
+    (let [diary (int-array 3)
+          choice (int-array 1)
+          _ (city/branch-diary-before-choice-loop! diary choice 3)
+          device (run-device :branch-diary-before-choice-loop
+                             #'city/branch-diary-before-choice-loop!
+                             {:diary [:int 3 (int-array 3)]
+                              :choice [:int 1 (int-array 1)]}
+                             {"n" 3} 3 [:diary :choice])]
+      (is (= [1 1 1] (vec diary)))
+      (is (= [6] (vec choice)))
+      (is (= (vec diary) (:diary device)))
+      (is (= (vec choice) (:choice device))))))
+
 (deftest city-day-kernels-match-their-jvm-source
   (if-not @probe/gpu-available?
     (probe/gpu-skip! "city source-to-device parity")

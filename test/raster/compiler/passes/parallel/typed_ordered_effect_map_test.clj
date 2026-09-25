@@ -465,6 +465,50 @@
       (is (= [3.0 6.0 3.0 6.0] (vec out)))
       (is (zero? (get-in jvm [:stats :fallback]))))))
 
+(def ^:private branch-store-then-loop-source
+  '(let* [effect
+          (raster.par/map-void!
+           i n
+           (if (< i n)
+             (do
+               (clojure.core/aset diary i (int 1))
+               (loop* [e (int 0)]
+                 (if (< e (int 2))
+                   (do
+                     (raster.par/atomic-add! choice 0 (int 1))
+                     (recur (inc e))))))
+             (clojure.core/aset diary i (int -1))))]
+     effect))
+
+(deftest branch-store-before-effect-loop-retains-the-loop
+  ;; A previous branch merge projected only :stores and silently dropped the branch's :loops.
+  ;; This shape occurs in the city choice kernel: a diary store precedes the episode walk.
+  (let [result (route/attempt branch-store-then-loop-source :double
+                              {'diary :int 'choice :int}
+                              {:scalar-types {'n :long}})
+        algorithm (-> result :program :equations first :algorithm)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          (:program result) {:target-device :ze:0 :dtype :double}))
+        operation (first (get-in scheduled [:equations 0 :operations]))
+        artifact (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :dtype :double :target-dialect :opencl-intel
+                  :array-types {'diary :int 'choice :int}
+                  :scalar-types {'n :long})
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[diary choice n] (:form jvm)))
+        diary (int-array 3)
+        choice (int-array 1)]
+    (is (= :typed-soac (get-in result [:stats :route])))
+    (is (= 2 (count (get-in operation [:scalar-region :effects]))))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (str/includes? (:source artifact) "for ("))
+    (is (str/includes? (:source artifact) "choice"))
+    (is (nil? (execute diary choice 3)))
+    (is (= [1 1 1] (vec diary)))
+    (is (= [6] (vec choice)))
+    (is (zero? (get-in jvm [:stats :fallback])))
+    (is (= (dialect/validate! algorithm) algorithm))))
+
 (raster.core/deftm city-nested-search-effect!
   [loc :- (Array int), cdf :- (Array double), visits :- (Array int)
    n :- Long, len :- Long, m :- Long] :- Void
