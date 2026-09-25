@@ -205,6 +205,8 @@
            :validation {:passed? true :comparison :exact
                         :oracle :host-binary16-rounded-dot-plus-f32-bias
                         :every-candidate? true}
+           :selection {:default-strategy (:default-strategy choice)
+                       :selector (:selector choice)}
            :scope {:public-compiler-path? true :timing-source :device-event
                    :cache-state :warm-resident :transfers-included? false
                    :residency residency
