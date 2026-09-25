@@ -86,6 +86,7 @@ REPL:
 (linear/run! {:shape [32 256 256]
               :revision "<git revision>"
               :environment "<machine/driver identity>"
+              :target :ocl:0
               :rounds 12 :warmup-rounds 4
               :residency :all-stages
               :matrix-tiles :default})
@@ -118,6 +119,9 @@ the event span with the sum of kernel durations before attributing a slow candid
 generated arithmetic; a multi-kernel OpenCL route can spend much more time between launches
 than inside its kernels. The `:selection` field records the unmodified compiler default and
 selector beside those measurements. This trace is diagnostic evidence, not a tuning promotion.
+The same probe also accepts `:target :ze:0`, retaining the source, precision, buffers, oracle,
+candidate identities, and measurement phases for an OpenCL/Level Zero comparison on the Arc.
+Backend event clocks may still differ; compare each backend's event span and kernel sum separately.
 
 The dynamic prebound slice can be measured with the same probe by adding
 `:composed-variant :relu-prebound` and `:timing-source :device-event`. This source computes `m*n`

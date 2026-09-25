@@ -14,7 +14,7 @@
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
-            [raster.gpu.ocl-runtime :as ocl]))
+            [raster.runtime.hardware :as hardware]))
 
 (def ^:private compared-strategies
   [:portable-segred :xmx-direct :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs])
@@ -36,13 +36,13 @@
                  (every? #(and (integer? %) (pos? %)) shape)
                  (string? revision) (seq revision)
                  (string? environment) (seq environment)
-                 (= :ocl:0 target)
+                 (contains? #{:ocl:0 :ze:0} target)
                  (contains? #{:all-stages :constant-weights} residency)
                  (or (contains? #{:default :finite} matrix-tiles)
                      (and (vector? matrix-tiles) (seq matrix-tiles)))
                  (integer? rounds) (<= 2 rounds 120) (even? rounds)
                  (integer? warmup-rounds) (<= 0 warmup-rounds 30))
-    (throw (ex-info "linear probe requires Arc OpenCL, positive [rows,in,out], identities and bounded rounds"
+    (throw (ex-info "linear probe requires Arc OpenCL or Level Zero, positive [rows,in,out], identities and bounded rounds"
                     {:target target :shape shape :residency residency :matrix-tiles matrix-tiles
                      :rounds rounds :warmup-rounds warmup-rounds})))
   (let [[rows in out] shape
@@ -198,7 +198,7 @@
                 replay-counts (atom {})]
           {:kind :public-linear-schedule-comparison
            :version 2 :shape shape :revision revision :environment environment
-           :target target :device (ocl/selected-device-info)
+           :target target :device (hardware/device-signature target)
            :input-recipe {:activation :index-mod13-minus6-over8
                           :weight :index-mod11-minus5-over8
                           :bias :index-mod7-minus3-over4}
