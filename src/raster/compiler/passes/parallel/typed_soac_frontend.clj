@@ -743,6 +743,10 @@
       (and (seq? form) (= 'do (first form)) (step? (last form)))
       {:body (list* 'do (butlast (rest form)))
        :update (when carried? (nth (last form) 2))}
+      ;; The walker may retain a singleton `do` between the counted loop's guard and its
+      ;; lexical `let`. It does not change the recurrence's effect order or scope.
+      (and (seq? form) (= 'do (first form)) (= 2 (count form)))
+      (split-trailing-recur (second form) index carried?)
       ;; (let* [...] stmt… (recur …)) — the closed-core spelling puts the statements directly
       ;; in the let body; normalize them into one `do` before the recursive recognition.
       (and (seq? form) (symbol? (first form)) (form/let-head? (first form)) (<= 3 (count form)))
