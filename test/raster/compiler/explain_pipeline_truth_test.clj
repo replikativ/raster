@@ -43,9 +43,9 @@
       (testing "and says which numbers the hardware reported vs which came from a table"
         (is (re-find #"provenance: \d+ detected, \d+ catalogued" s))))))
 
-(deftest a-declined-conversion-is-visible-even-though-the-form-did-not-change
+(deftest symbolic-contraction-reaches-the-tiled-schedule-and-reports-its-alternative
   (if-not @gp/gpu-available?
-    (gp/gpu-skip! "explain-pipeline: declines")
+    (gp/gpu-skip! "explain-pipeline: symbolic contraction")
     (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)
           stage-section (fn [label]
                           (second (re-find (re-pattern (str "--- Stage \\d+: " label
@@ -58,13 +58,12 @@
         (is (re-find #":segops-lowered 1" (str segop-lower)))
         (is (not (re-find #"DECLINED a conversion" (str segop-lower)))
             "segop-lower no longer declines"))
-      (testing "the backend stage that declines the typed contraction dispatch (symbolic dims) says
-                so in its own stats, so the decline is visible where it happens"
-        (is (re-find #":typed-contraction-dispatch-declines" (str backend)))
-        (is (re-find #"DECLINED a conversion" (str backend))))
-      (testing "the kernel section names the leaf, the headline reason, and every leaf that refused"
+      (testing "the backend accepts the symbolic tiled contraction without a source fallback"
+        (is (re-find #":ze-contracts 1" (str backend)))
+        (is (re-find #":fallback 0" (str backend)))
+        (is (not (re-find #"DECLINED a conversion" (str backend)))))
+      (testing "the kernel section names the tiled leaf and its portable alternative"
         (is (re-find #"--- Kernels ---" s))
+        (is (re-find #"strategy=:regtiled" s))
         (is (re-find #"strategy=:portable-segred" s))
-        (is (re-find #"fallback-reason=:symbolic-dims" s))
-        (is (re-find #"declined :dpas: :dtype-not-dpas" s))
-        (is (re-find #"declined :regtiled: :symbolic-dims" s))))))
+        (is (not (re-find #"declined :regtiled: :symbolic-dims" s)))))))

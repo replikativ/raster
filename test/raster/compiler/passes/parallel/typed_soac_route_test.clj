@@ -1285,8 +1285,8 @@
     (is (= :contraction (:phase operation)))
     (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
     (is (some? (:artifact directly-routed)))
-    (is (= [:portable] (mapv :family (:candidates candidate-routes))))
-    (is (= #{:matrix :register-tiled}
+    (is (= [:register-tiled :portable] (mapv :family (:candidates candidate-routes))))
+    (is (= #{:matrix}
            (set (map :candidate-family (:declines candidate-routes)))))
     (is (not-any? #(= :schedule-family-disabled (:reason %))
                   (:declines candidate-routes)))
@@ -1428,17 +1428,18 @@
                             :shared-local-memory 131072})]
       (if declined?
         (do
-          (is (= [:portable-segred] (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
+          (is (= (if batched? [:portable-segred] [:regtiled :portable-segred])
+                 (mapv kdispatch/alternative-strategy (:alternatives dispatch))))
           (is (= :mixed-dpas-index-width-not-lowered
                  (get-in dispatch [:attributes :matrix-graph-decline :reason]))))
         (let [{:keys [abi arguments]} (executable/common-view (kdispatch/default-alternative dispatch))]
           (is (= (if batched? #{:portable-segred :xmx-batched}
-                               #{:portable-segred :xmx-direct :xmx-split-k
+                               #{:regtiled :portable-segred :xmx-direct :xmx-split-k
                                  :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs})
                  (set (map kdispatch/alternative-strategy (:alternatives dispatch)))))
           (doseq [[dimensions expected]
                   (cond-> [[{'m 16 'n 32 'k 32} (if batched? :xmx-batched :xmx-direct)]
-                           [{'m 16 'n 16 'k 32} :portable-segred]
+                           [{'m 16 'n 16 'k 32} (if batched? :portable-segred :regtiled)]
                            [{'m 2147483648 'n 32 'k 32} :portable-segred]
                            [{'m 3 'n 32 'k 48} (if batched? :portable-segred :xmx-direct)]]
                     batched? (conj [{'batch 2147483648 'm 16 'n 32 'k 32} :portable-segred]))
@@ -1493,17 +1494,17 @@
                  (kdispatch/alternative-strategy
                   (kdispatch/select-alternative dispatch
                                                 [:a :b :c m n k])))]
-    (is (= [:portable-segred :xmx-direct :xmx-split-k
+    (is (= [:regtiled :portable-segred :xmx-direct :xmx-split-k
             :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs]
            strategies))
     (is (apply = (map :abi (:alternatives dispatch))))
     (is (apply = (map :arguments (:alternatives dispatch))))
     (is (= '[A B C m n k] (:arguments (first (:alternatives dispatch)))))
     (is (= :xmx-direct (select 512 512 512)))
-    (is (= :portable-segred (select 512 510 512))
-        "a misaligned half row pitch cannot enter the DPAS graph")
-    (is (= :portable-segred (select 512 512 510))
-        "a partial matrix K fragment cannot enter the DPAS graph")
+    (is (= :regtiled (select 512 510 512))
+        "a misaligned half row pitch cannot enter DPAS but can use register tiling")
+    (is (= :regtiled (select 512 512 510))
+        "a partial matrix K fragment cannot enter DPAS but can use register tiling")
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
@@ -1641,19 +1642,19 @@
       (let [tunable (contract-route/route-typed-contraction-dispatch
                      algorithm operation :dtype :float :desc descriptor
                      :precision :mixed-f16-f32 :split-factors [2 8])]
-        (is (= #{:portable-segred :xmx-direct :xmx-split-k
+        (is (= #{:regtiled :portable-segred :xmx-direct :xmx-split-k
                  :xmx-split-k-2 :xmx-split-k-8
                  :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs}
                (set (map kdispatch/alternative-strategy (:alternatives tunable)))))
         (is (= 8 (get-in tunable [:attributes :candidate-schedules
                                   :xmx-split-k-8 :split-factor])))))
-    (testing "a non-DPAS target keeps the same semantic contraction on portable schedules"
+    (testing "a non-DPAS target keeps the same semantic contraction on non-matrix schedules"
       (let [portable (contract-route/route-typed-contraction-dispatch
                       algorithm operation :dtype :float
                       :desc (assoc descriptor :backend :cuda
                                    :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
                       :precision :mixed-f16-f32)]
-        (is (= [:portable-segred]
+        (is (= [:regtiled :portable-segred]
                (mapv kdispatch/alternative-strategy (:alternatives portable))))
         (is (= :mixed-dpas-target-capability
                (get-in portable [:attributes :matrix-graph-decline :reason])))))))
@@ -1695,8 +1696,8 @@
         tile-strategies (into direct-strategies (into dynamic-strategies fused-strategies))]
     (is (> (count tiles) 1))
     (is (= (count strategies) (count (set strategies))))
-    (is (= (+ 2 (* 3 (count tiles))) (count strategies))
-        "portable/split plus materialized, dynamic-LHS and fully fused alternatives per tile")
+    (is (= (+ 3 (* 3 (count tiles))) (count strategies))
+        "register-tiled/portable/split plus materialized, dynamic-LHS and fully fused alternatives per tile")
     (is (= tile-strategies (set (filter tile-strategies strategies))))
     (doseq [strategy dynamic-strategies]
       (is (= {:lhs :tile-local :rhs :materialized}
@@ -1713,8 +1714,8 @@
                    :precision :mixed-f16-f32 :matrix-tiles requested)
           bounded-strategies (set (map kdispatch/alternative-strategy
                                        (:alternatives bounded)))]
-      (is (= 8 (count bounded-strategies))
-          "portable/split plus three policies for the analytic and one requested tile")
+      (is (= 9 (count bounded-strategies))
+          "register-tiled/portable/split plus three policies for the analytic and one requested tile")
       (is (= requested (get-in bounded [:attributes :candidate-schedules
                                         :xmx-direct :matrix-tiles])))
       (is (contains? bounded-strategies
@@ -2151,7 +2152,7 @@
         matrix-graph (kdispatch/alternative scheduled :xmx-direct)
         contract-artifact (-> matrix-graph :nodes last :operation)
         body (get-in contract-artifact [:attributes :kernel-body])]
-    (is (= [:portable-segred :xmx-direct
+    (is (= [:regtiled :portable-segred :xmx-direct
             :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs]
            (mapv kdispatch/alternative-strategy (:alternatives scheduled)))
         "split-K waits until its final combine can own the result transform")

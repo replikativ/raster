@@ -137,6 +137,27 @@
               (is (= expected (vec (link/download resident (:node output)))))))
           (finally (compiled/close! live)))))))
 
+(deftest dynamic-public-gemm-selects-tiled-body-and-preserves-tail-results
+  (doseq [shape [[3 4 5] [127 65 33]]]
+    (let [args (canary/gemm-arguments shape)
+          prepared (canary/prepare-gemm :ocl:0 args shape
+                                        {:variant :plain :gemm-precision :f32-scalar
+                                         :constants ['B]})
+          evidence (canary/compilation-evidence prepared)
+          alternatives (mapcat :alternatives (:steps evidence))]
+      (is (= 1 (:resident-step-count evidence)))
+      (is (= [:regtiled :portable-segred] (mapv :strategy alternatives)))
+      (is (every? #(= {:kernel-body 1} (:emission-routes %)) alternatives))
+      (when @probe/opencl-available?
+        (let [live (compiled/instantiate! prepared)]
+          (try
+            (link/run! (:executable live))
+            (let [output (some #(when (= 'C (:sym %)) %) (:out-tree live))
+                  actual (vec (link/download (:executable live) (:node output)))
+                  expected (vec (canary/gemm-reference (first args) (second args) shape))]
+              (is (= expected actual)))
+            (finally (compiled/close! live))))))))
+
 (deftest public-prebound-extent-overflow-precedes-output-mutation
   (let [f (pipeline/compile-aot #'canary/gemm-relu-prebound! :dtype :float)
         output (float-array [17])]

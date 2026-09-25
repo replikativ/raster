@@ -97,6 +97,12 @@
   [prefix & parts]
   (symbol (apply str prefix (map #(str "-" %) parts))))
 
+(defn- output-count-id
+  [used]
+  (first (remove used
+                 (cons 'register-output-elements
+                       (map #(identifier "register-output-elements" %) (range))))))
+
 (defn- add [& values] (apply body/expression :add values))
 (defn- mul [& values] (apply body/expression :mul values))
 (defn- div [left right] (body/expression :floor-div left right))
@@ -137,8 +143,11 @@
      [] {:unroll false})))
 
 (defn lower
-  "Apply one static cooperative register-tiled schedule to verified contraction facts."
-  [contract-facts {:keys [tile descriptor operation-id]}]
+  "Apply one cooperative register-tiled schedule to verified contraction facts.
+
+   Literal and scalar-bound dimensions share the same tile body. Other symbolic expressions
+   decline until they can be projected to checked, typed scalar ABI values."
+  [contract-facts {:keys [tile descriptor operation-id scalar-types]}]
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "register-tiled scheduling requires verified contraction facts"
                     {:reason :raster/bug :facts contract-facts})))
@@ -162,10 +171,10 @@
             (decline! :not-2-free
                       "register-tiled schedule requires exactly two free axes and one reduction axis"
                       {:free-axes free-axes :contract-axes contract-axes}))
-        _ (when-not (every? number? (concat (map second free-axes)
-                                            (map second contract-axes)))
+        dimensions (mapv second (concat free-axes contract-axes))
+        _ (when-not (every? #(or (and (integer? %) (pos? %)) (symbol? %)) dimensions)
             (decline! :symbolic-dims
-                      "register-tiled schedule requires literal dims"
+                      "register-tiled schedule requires positive literal or scalar-bound dimensions"
                       {:free-axes free-axes :contract-axes contract-axes}))
         _ (when-not (additive? combine)
             (decline! :non-plus-combine
@@ -183,6 +192,34 @@
         {:keys [row col]} (:bindings layout-verdict)
         [[i M] [j N]] free-axes
         [[k K]] contract-axes
+        symbolic-dimensions (vec (filter symbol? [M N K]))
+        dimension-dtypes (into {}
+                               (map (fn [dimension]
+                                      [dimension (dtype/canon
+                                                  (or (get scalar-types dimension) :int))]))
+                               symbolic-dimensions)
+        k-index-dtype (get dimension-dtypes K :int)
+        _ (when-not (every? #{:int :long} (vals dimension-dtypes))
+            (decline! :symbolic-dimension-dtype
+                      "register-tiled dimensions need integer scalar dtypes"
+                      {:dimensions dimension-dtypes}))
+        occupied-ids (set (concat [row col out]
+                                  (map :sym (:operands epilogue))
+                                  (map :sym (:scalars epilogue))))
+        _ (when (or (not= (count symbolic-dimensions)
+                          (count (distinct symbolic-dimensions)))
+                    (some occupied-ids symbolic-dimensions))
+            (decline! :symbolic-dimension-identity
+                      "register-tiled dimensions need distinct scalar identities"
+                      {:dimensions [M N K] :occupied occupied-ids}))
+        output-count (when (or (symbol? M) (symbol? N))
+                       (launch/product M N))
+        output-count-parameter (when output-count
+                                 (output-count-id (into occupied-ids symbolic-dimensions)))
+        runtime-scalars (cond-> symbolic-dimensions
+                          output-count (conj output-count-parameter))
+        runtime-scalar-values (cond-> symbolic-dimensions
+                                output-count (conj output-count))
         row-shape [M K]
         col-shape [K N]
         out-shape [M N]
@@ -192,12 +229,24 @@
         ;; A result transform that reads the destination reads the element this thread stores;
         ;; the destination is then one read-write parameter.
         destination-read? (boolean (some #(= out (:sym %)) (:operands epilogue)))
+        _ (when-let [view (some #(when (= out (:sym %)) %) (:operands epilogue))]
+            (when-not (= out-shape (axis-map/shape (:map view)))
+              (decline! :destination-read-layout
+                        "register-tiled result transform needs the destination's 2-D view"
+                        {:destination out :expected out-shape
+                         :actual (axis-map/shape (:map view))})))
         base-parameters
         [(body/->KernelParameter row :input dtype row-shape :global row-layout :lhs)
          (body/->KernelParameter col :input dtype col-shape :global col-layout :rhs)
          (body/->KernelParameter out (if destination-read? :inout :output) dtype out-shape
                                  :global out-layout :result)]
-        parameters (into (vec base-parameters) (transform-parameters epilogue base-parameters))
+        parameters (into (vec base-parameters)
+                         (concat
+                          (map #(body/->KernelParameter % :scalar
+                                                        (get dimension-dtypes % :int)
+                                                        [] nil nil :dimension)
+                               runtime-scalars)
+                          (transform-parameters epilogue base-parameters)))
         parameter-map (into {} (map (juxt :id identity)) parameters)
         row-allocation 'register-tile-a
         col-allocation 'register-tile-b
@@ -233,6 +282,10 @@
         col-stage-row #(div % block-n)
         col-stage-col #(modulo % block-n)
         k-block 'register-k-block
+        k-coordinate (fn [offset]
+                       (add k-block (if (= :long k-index-dtype)
+                                      (body/index-cast offset :long :exact)
+                                      offset)))
         row-valid-mask :register-a-valid
         col-valid-mask :register-b-valid
         masks
@@ -241,10 +294,10 @@
           [(body/->Mask
             row-valid-mask
             [(body/predicate :lt (add block-row (row-stage-row row-stage-index)) M)
-             (body/predicate :lt (add k-block (row-stage-col row-stage-index)) K)])
+             (body/predicate :lt (k-coordinate (row-stage-col row-stage-index)) K)])
            (body/->Mask
             col-valid-mask
-            [(body/predicate :lt (add k-block (col-stage-row col-stage-index)) K)
+            [(body/predicate :lt (k-coordinate (col-stage-row col-stage-index)) K)
              (body/predicate :lt (add block-col (col-stage-col col-stage-index)) N)])]
           (for [mm (range thread-m) nn (range thread-n)]
             (body/->Mask
@@ -316,7 +369,7 @@
           :source-coordinates
           (fn [index]
             [(add block-row (row-stage-row index))
-             (add k-block (row-stage-col index))])
+             (k-coordinate (row-stage-col index))])
           :valid-mask row-valid-mask})
         stage-col
         (staging-loop
@@ -326,12 +379,14 @@
           :row-coordinate col-stage-row :col-coordinate col-stage-col
           :source-coordinates
           (fn [index]
-            [(add k-block (col-stage-row index))
+            [(k-coordinate (col-stage-row index))
              (add block-col (col-stage-col index))])
           :valid-mask col-valid-mask})
         outer-loop
         (body/->ForLoop
-         (body/value k-block :int) 0 K block-k
+         (body/value k-block k-index-dtype)
+         (if (= :long k-index-dtype) (body/index-cast 0 :long :exact) 0)
+         K block-k
          (mapv (fn [binding]
                  (body/->LoopArg (body/value binding dtype) (body/literal 0 dtype)))
                outer-accumulator-bindings)
@@ -340,6 +395,8 @@
          (mapv #(body/value % dtype) accumulator-results)
          {})
         semantic-region (scalar-region-lower/make-region epilogue)
+        store-coordinate-scope (into #{block-row block-col local-row local-col}
+                                     symbolic-dimensions)
         stores
         (vec
          (mapcat
@@ -352,9 +409,9 @@
                      row-source (list '+ block-row (list '* local-row thread-m) mm)
                      col-source (list '+ block-col (list '* local-col thread-n) nn)
                      coordinates [(contraction-body/lower-index
-                                   row-source #{block-row block-col local-row local-col})
+                                   row-source store-coordinate-scope)
                                   (contraction-body/lower-index
-                                   col-source #{block-row block-col local-row local-col})]
+                                   col-source store-coordinate-scope)]
                      lowered
                      (when semantic-region
                        (scalar-region-lower/lower
@@ -369,7 +426,7 @@
                                   (contraction-body/lower-index
                                    (walk/postwalk-replace
                                     {i row-source j col-source} coordinate)
-                                   #{block-row block-col local-row local-col}))
+                                   store-coordinate-scope))
                                 (axis-map/coordinate-exprs %))
                          :predicate store-mask}))]
                  (concat (:operations lowered)
@@ -404,4 +461,6 @@
                     :result-transform epilogue}})
      :bindings (:bindings layout-verdict)
      :dims [M N K]
+     :runtime-scalar-values runtime-scalar-values
+     :output-count (or output-count (* M N))
      :tile tile}))

@@ -9,7 +9,7 @@
 
    Two things are true at once, and the old shape could express neither:
 
-     • a decline is usually LEGITIMATE — symbolic dims, a non-`+` combine, a non-product body are
+     • a decline is usually LEGITIMATE — unsupported symbolic expressions, a non-`+` combine, a non-product body are
        all perfectly good contractions that merely are not tiled-leaf shaped;
      • it is always worth REPORTING.
 
@@ -23,7 +23,7 @@
 (defn- mm
   [m n k & {:keys [sym-dims combine]}]
   (concat (list 'raster.par/contract 'C
-                [['i (if sym-dims 'M m)] ['j n]] [['l k]]
+                [['i (if sym-dims '(+ M 1) m)] ['j n]] [['l k]]
                 (list 'raster.numeric/*
                       (list 'clojure.core/aget 'A
                             (list 'clojure.core/+ (list 'clojure.core/* 'i k) 'l))
@@ -48,14 +48,14 @@
       (is (= :dtype-not-dpas (:fallback-reason r)) "existing key kept")
       (is (= [[:dpas :dtype-not-dpas]] (mapv (juxt :leaf :reason) (:declines r))))))
 
-  (testing "symbolic dims: BOTH tensorize leaves refuse, so we land on the general leaf — which
+  (testing "non-scalar symbolic bound expressions: BOTH tiled leaves refuse, so we land on the general leaf — which
             previously recorded NOTHING AT ALL, not even a :fallback-reason key"
     (let [r (route (mm 128 128 128 :sym-dims true) :half)
           by-leaf (into {} (map (juxt :leaf identity)) (:declines r))]
       (is (= :portable-segred (:strategy r)))
       (is (= #{:dpas :regtiled} (set (keys by-leaf))) "both attempts itemized")
       (is (= :symbolic-dims (:reason (get by-leaf :regtiled))))
-      (is (re-find #"literal dims" (str (:message (get by-leaf :regtiled))))
+      (is (re-find #"literal or scalar-bound" (str (:message (get by-leaf :regtiled))))
           "the emitter's own sentence survives — it is the thing that was being thrown away")
       (is (= :symbolic-dims (:fallback-reason r))
           "the headline reason is the DECISIVE (last) decline — the leaf that would otherwise have
