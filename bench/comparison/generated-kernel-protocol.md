@@ -112,6 +112,12 @@ an exact member of the target descriptor's family and compiles only that bounded
 analytic seed; candidate identities and legality remain compiler-derived.
 The probe records emitted signatures, kernel counts, raw interleaved device-event samples and
 stationarity diagnostics, and never updates the tuning cache.
+It also retains `:comparison :replay-profiles` in chronological order, including warmups. Each
+entry names the candidate, replay index, phase, and the complete device event profile. Compare
+the event span with the sum of kernel durations before attributing a slow candidate to its
+generated arithmetic; a multi-kernel OpenCL route can spend much more time between launches
+than inside its kernels. The `:selection` field records the unmodified compiler default and
+selector beside those measurements. This trace is diagnostic evidence, not a tuning promotion.
 
 The dynamic prebound slice can be measured with the same probe by adding
 `:composed-variant :relu-prebound` and `:timing-source :device-event`. This source computes `m*n`

@@ -194,6 +194,8 @@
                   (throw (ex-info "linear schedule failed the exact rounded-input oracle"
                                   {:strategy strategy :expected-head (take 8 expected)
                                    :actual-head (take 8 actual)}))))))
+          (let [replay-profiles (atom [])
+                replay-counts (atom {})]
           {:kind :public-linear-schedule-comparison
            :version 2 :shape shape :revision revision :environment environment
            :target target :device (ocl/selected-device-info)
@@ -203,6 +205,8 @@
            :validation {:passed? true :comparison :exact
                         :oracle :host-binary16-rounded-dot-plus-f32-bias
                         :every-candidate? true}
+           :selection {:default-strategy (:default-strategy choice)
+                       :selector (:selector choice)}
            :scope {:public-compiler-path? true :timing-source :device-event
                    :cache-state :warm-resident :transfers-included? false
                    :residency residency
@@ -216,7 +220,7 @@
                    :validation-included? false :promotion? false}
            :candidates (mapv #(dissoc % :handle :poison! :profile! :close!) @bound)
            :comparison
-           (update
+           (->
             (measurement/measure-interleaved!
              (mapv (fn [{:keys [id poison! profile!]}]
                      {:id id
@@ -224,17 +228,24 @@
                       (fn []
                         (poison!)
                         (let [profile (profile!)
+                              replay-index (get (swap! replay-counts update id (fnil inc -1)) id)
                               duration (:device-wall-ms profile)]
                           (when-not (and (number? duration)
                                          (Double/isFinite (double duration))
                                          (not (neg? (double duration))))
                             (throw (ex-info "linear probe requires a finite device-event span"
                                             {:strategy id :profile profile})))
+                          (swap! replay-profiles conj
+                                 {:candidate id :replay-index replay-index
+                                  :sampling-phase (if (< replay-index warmup-rounds)
+                                                    :warmup :measurement)
+                                  :profile profile})
                           (* 1.0e6 duration)))})
                    @bound)
              :rounds rounds :warmup-rounds warmup-rounds
              :timing-source :device-event)
-            :measurements #(update-vals % (fn [measurement] (into {} measurement))))}
+            (update :measurements #(update-vals % (fn [measurement] (into {} measurement))))
+            (assoc :replay-profiles @replay-profiles))})
           (finally
             (doseq [{:keys [close!]} (reverse @bound)]
               (close!))))))))
