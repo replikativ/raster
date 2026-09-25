@@ -22,6 +22,54 @@ establishes accelerator competitiveness.
 
 ## Baseline selection
 
+### Strict-FP32 OpenCL SGEMM reference (opt-in)
+
+`bench/comparison/clblast_sgemm.cpp` supplies an external, source-built CLBlast 1.7.0
+SGEMM baseline; `bench/raster_strict_gemm.clj` runs Raster's public `gemm-mnk!` contraction
+with `:gemm-precision :f32-scalar`. Both use row-major A `[M,K]`, B `[K,N]`, C `[M,N]`,
+the canary's deterministic dyadic FP32 inputs, `alpha=1`, `beta=0`, and a separate
+double-accumulation CPU oracle (maximum absolute error at most `1e-4`). This is *not*
+a comparison with Raster's mixed-FP16/XMX schedules. Both retain inputs and output on
+the device through four warmups and twelve measured replays. Compilation, binding,
+uploads, downloads and validation are excluded from the device-event samples and
+reported separately where applicable. The measured value is the whole queue/event
+span, not the sum of kernel durations; Raster also prints the latter for diagnosis.
+
+For the CLBlast source at commit `87f18d7f0718ea416dfab66c303d11deeff94f3f`,
+build outside CI (replace the paths with local directories):
+
+```sh
+cmake -S /path/to/CLBlast -B target/clblast-build -DCMAKE_BUILD_TYPE=Release \
+  -DTUNERS=OFF -DSAMPLES=OFF -DCLIENTS=OFF -DTESTS=OFF
+cmake --build target/clblast-build --parallel 2
+c++ -std=c++14 -O2 -I/path/to/CLBlast/include bench/comparison/clblast_sgemm.cpp \
+  -L$PWD/target/clblast-build -Wl,-rpath,$PWD/target/clblast-build \
+  -lclblast -lOpenCL -o target/clblast_sgemm
+target/clblast_sgemm 8 256 256
+clojure -M:bench -m raster-strict-gemm 8 256 256
+```
+
+The CLBlast run currently selects the first Intel OpenCL GPU and uses CLBlast's
+default tuning database. Its result is a reproducible external reference, not a
+claim about tuned vendor-library peak performance. Record the exact device, driver,
+source revision and thermal/load context before comparing medians. Repeat with
+interleaved runs if the device is shared or nonstationary; do not promote a schedule
+from one pair of measurements. Neither benchmark is part of the ordinary test suite.
+The first [raw Arc comparison](../results/strict-f32-clblast-raster-20260925.edn) contains
+`[8,256,256]` and `[256,256,256]` with separate-process, non-interleaved device samples.
+Both paths matched the CPU oracle. At the larger shape, Raster's default portable segmented
+reduction was materially slower than default CLBlast SGEMM (393 versus 174 microseconds median);
+this identifies a generated-schedule optimization opportunity, not a correctness or typing gap.
+The small shape favored Raster in this run (163 versus 195 microseconds median), but Raster's
+samples varied substantially, including a second run that fell from 389 to 160 microseconds
+within its twelve measured replays. Neither observation is sufficient for automatic tuning.
+The compiler evidence gives the architectural cause of the default route: `gemm-mnk!` retains
+symbolic `m/n/k`, while the current register-tiled leaf requires literal dimensions and declines
+with `:symbolic-dims`; `:f32-scalar` correctly excludes the FP16 matrix-instruction family.
+The next general compiler slice should specialize these shape arguments from a validated runtime
+shape or make the register-tiled schedule itself symbolic. It should preserve the public typed
+contraction and its ABI, and compare the resulting schedule at several shapes before promotion.
+
 ### Public dynamic GEMM/activation probe
 
 In a test or bench REPL, use the same public functions as the existing production canary:

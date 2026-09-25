@@ -1,0 +1,33 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-25"
+ :raster-revision "c931433a"
+ :clblast-revision "87f18d7f0718ea416dfab66c303d11deeff94f3f"
+ :device "Intel(R) Arc(TM) Graphics"
+ :opencl-driver "26.05.37020.3"
+ :precision :f32-input-f32-accumulation
+ :layout :row-major-mnk
+ :warmups 4
+ :measured-replays 12
+ :clock :device-event-span
+ :selection :default-untuned
+ :raster-route {:strategy :portable-segred
+                :emission-route :kernel-body
+                :register-tiled-decline :symbolic-dims
+                :matrix-graph-decline :precision-policy}
+ :notes "Separate sequential processes on a shared laptop, not interleaved. CLBlast uses its default tuning database; Raster uses the public typed contraction dispatch. Host-side compile/bind/uploads/downloads excluded. Correctness verified against a double-accumulation CPU oracle before and after replay; all maximum absolute errors were zero for these dyadic inputs. The two queues' profiling implementations differ. These observations do not select a schedule or establish SOTA throughput."
+ :cases
+ [{:shape [8 256 256]
+   :clblast {:samples-ns [195000 195989 194844 195001 194323 194635 195625 194687 194636 197188 194740 194687]
+             :median-ns 194792.0 :max-absolute-error 0.0}
+   :raster {:samples-ns [205625 145000 145312 198333 199062 197812 145416 162187 218125 163854 161458 161250]
+            :median-ns 163020.5 :max-absolute-error 0.0
+            :kernel "raster_typed_contraction_dispatch_fa0f7973_portable_segred"
+            :compile-ns 7565341084 :bind-ns 1096901419
+            :repeat-samples-ns [389062 355625 348437 348958 349166 330416 221458 217604 161041 159687 160208 160312]}}
+  {:shape [256 256 256]
+   :clblast {:samples-ns [360469 179688 175104 164479 165416 165625 164896 169896 172604 178385 192813 198802]
+             :median-ns 173854.0 :max-absolute-error 0.0}
+   :raster {:samples-ns [450416 393854 450312 392395 391041 385520 393020 388020 390833 450625 391875 458958]
+            :median-ns 392707.5 :max-absolute-error 0.0
+            :kernel "raster_typed_contraction_dispatch_fa0f7973_portable_segred"
+            :compile-ns 5353389053 :bind-ns 320067589}}]}
