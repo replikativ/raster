@@ -235,6 +235,26 @@
     {:pointer-slots pointer-slots :pointer-bindings pointer-bindings
      :scalar-slots user-slots :bound-slot (first bound-slots)}))
 
+(defn validate-logical-pointer-aliases!
+  "Enforce no-write-alias for the logical pointer vector used by split resident binders.
+   Composite values are checked conservatively as whole logical bindings; KernelCall performs
+   the more precise physical-view check after composite expansion."
+  [abi pointers overlaps?]
+  (let [groups (logical-pointer-slot-groups abi)]
+    (when-not (= (count groups) (count pointers))
+      (throw (ex-info "kernel ABI logical pointer count does not match binding"
+                      {:expected (count groups) :actual (count pointers)})))
+    (doseq [[input-group input] (map vector groups pointers)
+            :when (some #(= :no-write-alias (:aliasing %)) (:slots input-group))
+            [output-group output] (map vector groups pointers)
+            :when (and (some writable? (:slots output-group))
+                       (overlaps? input output))]
+      (throw (ex-info "kernel stable input overlaps a writable output"
+                      {:reason :kernel-abi-no-write-alias
+                       :input-binding (:binding input-group)
+                       :output-binding (:binding output-group)})))
+    pointers))
+
 (defn validate-physical-pointer-dtypes!
   "Check the storage dtype of every PHYSICAL pointer value after logical values (notably SoAs)
    have been expanded. `actual-dtypes` must follow the emitted C signature order. This is kept

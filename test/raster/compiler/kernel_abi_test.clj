@@ -131,6 +131,18 @@
                         (kabi/validate-split-binding! map-abi [:x :out]
                                                       [{:type :int :value 2}]))))
 
+(deftest split-resident-binding-enforces-stable-input-aliasing
+  (let [abi [(kabi/slot 'params :input :double :aliasing :no-write-alias)
+             (kabi/slot 'out :output :double)
+             (kabi/slot '_n_bound :scalar :int :role :bound)]
+        same (Object.)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
+                          (kabi/validate-logical-pointer-aliases!
+                           abi [same same] identical?)))
+    (is (= [same :other]
+           (kabi/validate-logical-pointer-aliases!
+            abi [same :other] identical?)))))
+
 (deftest soa-physical-slots-collapse-to-one-logical-binding
   (let [abi [(kabi/slot 'particles_x :output :float :binding 'particles :field :x :role :inout)
              (kabi/slot 'particles_id :output :int :binding 'particles :field :id :role :inout)

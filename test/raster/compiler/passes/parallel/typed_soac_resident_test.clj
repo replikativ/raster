@@ -13,6 +13,52 @@
                                   {:dtype :double :array-types {'x :double 'out :double}
                                    :scalar-types {'scale :double}}))))
 
+(deftest resident-uniform-load-is-a-stable-device-capture
+  (let [source '(let* [^double alpha (clojure.core/aget params 0)
+                       result (raster.par/map-void! i n
+                                (clojure.core/aset out i (+ alpha (clojure.core/aget out i))))]
+                  result)
+        program (frontend/form->program source
+                                        {:dtype :double
+                                         :array-types {'params :double 'out :double}
+                                         :scalar-types {'n :long}})
+        [result stats] (resident/inline-uniform-input-loads program)
+        infos (mapv fusion/equation-info (dialect/equations result))
+        effect (first (filter #(contains? #{:map :effect-map} (:kind %)) infos))]
+    (is (= 1 (:resident-uniform-input-loads stats)))
+    (is (not-any? #(some #{'alpha} (:results %)) infos))
+    (is (some #{'params} (:captures effect)))
+    (is (some #{'params} (get-in effect [:attributes :attributes :stable-array-captures])))
+    (is (not (some #{'alpha} (:captures effect))))
+    (is (= result (dialect/validate! result)))))
+
+(deftest resident-uniform-load-never-moves-a-launch-extent
+  (let [source '(let* [^long n (clojure.core/aget dims 0)
+                       result (raster.par/map-void! i n
+                                (clojure.core/aset out i (double i)))]
+                  result)
+        program (frontend/form->program source
+                                        {:dtype :double
+                                         :array-types {'dims :long 'out :double}})
+        [result stats] (resident/inline-uniform-input-loads program)]
+    (is (zero? (:resident-uniform-input-loads stats)))
+    (is (some (fn [equation] (some #{'n} (nth equation 2))) (dialect/equations result)))
+    (is (= result (dialect/validate! result)))))
+
+(deftest resident-uniform-load-never-crosses-a-write-to-its-source
+  (let [source '(let* [^double alpha (clojure.core/aget params 0)
+                       result (raster.par/map-void! i n
+                                (clojure.core/aset params i (+ alpha (double i))))]
+                  result)
+        program (frontend/form->program source
+                                        {:dtype :double
+                                         :array-types {'params :double}
+                                         :scalar-types {'n :long}})
+        [result stats] (resident/inline-uniform-input-loads program)]
+    (is (zero? (:resident-uniform-input-loads stats)))
+    (is (some (fn [equation] (some #{'alpha} (nth equation 2))) (dialect/equations result)))
+    (is (= result (dialect/validate! result)))))
+
 (deftest result-transform-integral-casts-state-their-rounding
   (doseq [source [:int :long] target [:float :double]]
     (let [region (body/->ScalarRegion ['acc 'width] (list (symbol (name target)) 'width)

@@ -7,6 +7,7 @@
    depending on a resident reduction are beta-reduced into their parallel consumers, so no device
    value is reconstructed or synchronized through host scalar control."
   (:require [clojure.set :as set]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
@@ -114,19 +115,16 @@
               :else value))]
     (expand id #{})))
 
-(defn- rewrite-lambda-consumer
-  [info values scalar-defs dependent roots]
+(defn- rewrite-lambda-captures
+  "Substitute captured scalar equations without reconstructing a source-shaped kernel.
+   `stable-captures` are newly introduced array reads that must keep the no-write-alias contract."
+  [info values replacements stable-captures]
   (let [{:keys [accumulators elements capture-parameters destination-parameters]}
         (parameter-parts info)
         capture-substitutions
         (into {}
               (map (fn [[parameter capture]]
-                     [parameter
-                      (cond
-                        (contains? roots capture) (list 'clojure.core/aget capture 0)
-                        (contains? dependent capture)
-                        (scalar-expression scalar-defs dependent roots capture)
-                        :else capture)]))
+                     [parameter (get replacements capture capture)]))
               (map vector capture-parameters (:captures info)))
         global-locals (mapv #(update % :init
                                      (fn [init]
@@ -145,6 +143,7 @@
         new-parameters (mapv #(symbol (str "%capture" %)) (range (count referenced-values)))
         body-substitutions (zipmap referenced-values new-parameters)
         stable-after (set (filter #(or (contains? stable-before %)
+                                       (contains? stable-captures %)
                                        (resident-scalar-value? (get values %)))
                                   referenced-values))]
     (assoc info
@@ -159,6 +158,19 @@
            :attributes (assoc-in (:attributes info) [:attributes :stable-array-captures]
                                  (vec (filter stable-after referenced-values))))))
 
+(defn- rewrite-lambda-consumer
+  [info values scalar-defs dependent roots]
+  (let [replacements
+        (into {}
+              (keep (fn [capture]
+                      (cond
+                        (contains? roots capture)
+                        [capture (list 'clojure.core/aget capture 0)]
+                        (contains? dependent capture)
+                        [capture (scalar-expression scalar-defs dependent roots capture)])))
+              (:captures info))]
+    (rewrite-lambda-captures info values replacements #{})))
+
 (defn- rewrite-consumer
   [info values scalar-defs dependent roots]
   ;; Only a lexical consumer of a realized/dependent scalar needs a new buffer load. Besides
@@ -171,6 +183,98 @@
             (empty? (set/intersection affected (set (:captures info)))))
       info
       (rewrite-lambda-consumer info values scalar-defs dependent roots))))
+
+(defn- uniform-input-load
+  "Recognize an ordered scalar equation that reads one immutable program input.
+   A launch extent or host-visible result is never a candidate for this transformation."
+  [info input-values values]
+  (let [{:keys [kind results captures parameters locals body-results]} info
+        expression (first body-results)
+        arguments (when (descriptor/aget-call? expression)
+                    (vec (descriptor/call-args expression)))
+        array (first captures)
+        index (second arguments)]
+    (when (and (= :scalar kind) (= 1 (count results)) (= 1 (count captures))
+               (= 1 (count parameters)) (empty? locals) (= 1 (count body-results))
+               (= 2 (count arguments)) (= (first arguments) (first parameters))
+               (integer? index) (not (neg? index))
+               (contains? input-values array)
+               (seq (:shape (get values array))))
+      {:result (first results) :array array :index index})))
+
+(defn inline-uniform-input-loads
+  "Move a single-use uniform input load into its resident map/effect-map consumer.
+
+   The input remains a stable, no-write-alias array capture. This is a device-side read of the
+   currently bound buffer, not a host-side download or a cached copy of allocation-time data.
+   Extent values, host-visible scalar results, non-input storage and arrays written anywhere in
+   this program remain ordered scalar equations. The JVM route does not apply this pass."
+  [program]
+  (let [program (dialect/validate! program)
+        facts (dialect/facts program)
+        equations (dialect/equations program)
+        infos (mapv operation-info equations)
+        input-values (set (:inputs facts))
+        outputs (set (dialect/outputs program))
+        uses (group-by first (use-sites equations))
+        kinds (into {} (map (juxt :id :kind)) infos)
+        written (set (concat (mapcat :destinations infos)
+                             (mapcat (fn [equation]
+                                       (map :destination
+                                            (or (dialect/result-storage facts (second equation)) [])))
+                                     equations)))
+        candidates
+        (into {}
+              (keep (fn [info]
+                      (when-let [{:keys [result array] :as load}
+                                 (uniform-input-load info input-values (:values facts))]
+                        (let [sites (get uses result)]
+                          (when (and (not (contains? outputs result))
+                                     (not (contains? written array))
+                                     (= 1 (count sites))
+                                     (= :capture (get-in (first sites) [1 :role]))
+                                     (contains? #{:map :effect-map}
+                                                (get kinds (get-in (first sites) [1 :equation]))))
+                            [result load])))))
+              infos)]
+    (if (empty? candidates)
+      [program {:resident-uniform-input-loads 0}]
+      (let [removed (set (keys candidates))
+            rewritten
+            (->> infos
+                 (remove #(and (= :scalar (:kind %)) (some removed (:results %))))
+                 (mapv (fn [info]
+                         (if (and (contains? #{:map :effect-map} (:kind info))
+                                  (some removed (:captures info)))
+                           (let [loads (keep candidates (:captures info))
+                                 replacements (into {}
+                                                    (map (fn [{:keys [result array index]}]
+                                                           [result (list 'clojure.core/aget array index)]))
+                                                    loads)
+                                 stable (set (map :array loads))]
+                             (rewrite-lambda-captures info (:values facts) replacements stable))
+                           info)))
+                 (mapv emit-equation))
+            equation-ids (set (map second rewritten))
+            definitions (set (mapcat #(nth % 2) rewritten))
+            references (set (mapcat (fn [equation]
+                                      (cond-> (dialect/operation-inputs equation)
+                                        (dialect/value-id? (dialect/operation-extent equation))
+                                        (conj (dialect/operation-extent equation))))
+                                    rewritten))
+            inputs (vec (sort-by pr-str (set/difference references definitions)))
+            storage (set (mapcat (fn [equation]
+                                   (map :destination
+                                        (or (dialect/result-storage facts (second equation)) [])))
+                                 rewritten))
+            live-values (set/union definitions references storage outputs)
+            facts (-> facts
+                      (assoc :values (select-keys (:values facts) live-values) :inputs inputs)
+                      (update :equations select-keys equation-ids)
+                      (assoc-in [:attributes :resident-uniform-input-loads]
+                                (vec (sort-by pr-str removed))))]
+        [(dialect/make facts rewritten (dialect/outputs program))
+         {:resident-uniform-input-loads (count removed)}]))))
 
 (defn realize
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.
