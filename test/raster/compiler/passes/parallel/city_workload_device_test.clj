@@ -85,6 +85,22 @@
       (is (= (vec expected) (:counts device)))
       (is (= [2 2 0 0 2 0 0 2] (:counts device))))))
 
+(deftest singleton-do-before-episode-loop-preserves-effects
+  (if-not @probe/gpu-available?
+    (probe/gpu-skip! "singleton do before episode loop")
+    (let [locations (int-array [2 0 2 2 0 2 2 2])
+          values (double-array [0.1 0.9 0.6 0.2 0.3 0.8 0.4 0.7])
+          expected (int-array 3)
+          _ (city/episode-class-histogram! locations values expected 4)
+          device (run-device :episode-class-histogram
+                             #'city/episode-class-histogram!
+                             {:locations [:int 8 locations]
+                              :values [:double 8 values]
+                              :counts [:int 3 (int-array 3)]}
+                             {"n" 4} 4 [:counts])]
+      (is (= [4 3 3] (vec expected)))
+      (is (= (vec expected) (:counts device))))))
+
 (deftest city-day-kernels-match-their-jvm-source
   (if-not @probe/gpu-available?
     (probe/gpu-skip! "city source-to-device parity")

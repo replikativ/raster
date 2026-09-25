@@ -11,6 +11,22 @@
   (par/map-void! i n
     (par/atomic-add! counts (int (* (aget values i) 8.0)) (int 1))))
 
+(deftm episode-class-histogram!
+  [locations :- (Array int), values :- (Array double), counts :- (Array int),
+   n :- Long] :- Void
+  (par/map-void! i n
+    (do
+      (par/atomic-add! counts 0 (int 1))
+      (loop [e (int 0)]
+        (when (< e 2)
+          (let [location (int (aget locations (+ (* i 2) e)))]
+            (do
+              (when (== location (int 2))
+                (let [u (aget values (+ (* i 2) e))
+                      class (int (if (< u 0.5) 0 1))]
+                  (par/atomic-add! counts (unchecked-add-int 1 class) (int 1))))
+              (recur (int (inc e))))))))))
+
 ;; Literals are written out inside the kernels: a var reference, even a
 ;; ^:const one, reaches the C emitter as a bare symbol (`earth_m`).
 (deftm haversine-m
