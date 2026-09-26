@@ -194,6 +194,20 @@
   [form & children]
   (with-meta (apply list children) (meta form)))
 
+(defn- effect-result-path
+  "Location of an effect's exported declaration. Its initializer does not bind the result;
+   the enclosing sequential effect region introduces it only for subsequent effects."
+  [effect]
+  (when (seq? effect)
+    (cond
+      (and (= 'effect-loop (first effect))
+           (symbol? (get-in (second effect) [:carry :result])))
+      [1 :carry :result]
+
+      (and (= 'effect (first effect)) (= 7 (count effect))
+           (symbol? (:result (nth effect 6))))
+      [6 :result])))
+
 (defn- lambda-strip
   "Split an ftm/fn* arity tail (everything after the param vector) into
    [type-prefix source-bodies walked-body]:
@@ -453,7 +467,7 @@
                        (list 'lambda parameters
                              (list 'region [] (vec (drop condition-count body)))))))})))
 
-        ;; An effect-region's result binders enter scope only after their loop initializer.
+        ;; An effect-region's result binders enter scope only after their effect initializer.
         ;; Nil binder slots retain intervening stores in the same sequential spine.
         :effect-region
         (let [[_ locals effects result] form]
@@ -461,9 +475,9 @@
                      (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))) locals))
             (let [result? (= 4 (count form))
               local-count (count locals)
-              carry? (fn [effect] (when (and (seq? effect) (= 'effect-loop (first effect)))
-                                    (get-in (second effect) [:carry :result])))
-              result-binders (mapv carry? effects)]
+              result-paths (mapv effect-result-path effects)
+              result-binders (mapv (fn [effect path] (when path (get-in (vec effect) path)))
+                                   effects result-paths)]
             {:sequential? true
              :scopes [{:binders (into (mapv second locals) result-binders)
                        :inits (into (mapv #(nth % 3) locals) effects)
@@ -473,14 +487,23 @@
              (fn [[{:keys [binders inits body]}] _]
                (let [locals' (mapv (fn [local id init] (rl local (first local) id (nth local 2) init))
                                    locals (take local-count binders) (take local-count inits))
-                     effects' (mapv (fn [effect original-result result]
-                                      (if original-result
-                                        (apply rl effect (first effect)
-                                               (assoc-in (second effect) [:carry :result] result)
-                                               (nnext effect))
+                     effects' (mapv (fn [effect path result]
+                                      (if path
+                                        (apply rl effect (assoc-in (vec effect) path result))
                                         effect))
-                                    (drop local-count inits) result-binders (drop local-count binders))]
+                                    (drop local-count inits) result-paths (drop local-count binders))]
                  (apply rl form 'effect-region locals' effects' (when result? body))))})))
+
+        ;; The result declaration is not an input use. Conflict/dtype fields are static
+        ;; contracts, while destination, coordinate, guard and contribution are lexical uses.
+        :effect
+        (when (or (= 6 (count form)) (and (= 7 (count form)) (effect-result-path form)))
+          (let [[head destination conflict coordinate predicate value result] form]
+            {:sequential? false :scopes []
+             :outer [destination coordinate predicate value]
+             :rebuild (fn [_ [destination coordinate predicate value]]
+                        (apply rl form head destination conflict coordinate predicate value
+                               (when result [result])))}))
 
         :effect-loop
         (let [[_ attributes extent] form
