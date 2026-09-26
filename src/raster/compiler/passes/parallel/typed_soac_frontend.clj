@@ -810,49 +810,51 @@
         (when-let [split (split-trailing-recur-many inner index carry-count int-bounded?)]
           (update split :body #(list head bindings %)))))))
 
-(declare store-region pointwise-input?)
+(declare store-region pointwise-input? source-effect-destinations)
 
 (defn- terminal-store-reduction
-  "Expose a pure ordered recurrence whose only exit writes its final carry.
+  "Project a pure counted recurrence before its ordered terminal effect region.
 
-   A map-void body may spell `(loop ... (if test (recur ...) (aset out i acc)))`.
-   The store is executed exactly once, after the recurrence.  Project it into a
-   typed value loop followed by that same store; the existing ordered Fold and
-   effect ownership checks then certify the two pieces.  Do not move a store
-   out of a branchy or effectful recurrence."
+   Scalar and product carries use the existing ordered Fold machinery. All components are
+   bound before the exit, so terminal writes cannot change a later component's recurrence.
+   The exit itself remains an ordered region: its reads and stores must not be floated into
+   the component bindings. Final induction values and effects during recurrence decline."
   [expression index]
   (when (and (seq? expression) (form/loop-head? (first expression))
              (= 3 (count expression)))
-    (let [[head bindings conditional] expression
-          [_ test then exit] (when (seq? conditional) conditional)]
-      (when (and (vector? bindings) (= 4 (count bindings))
-                 (seq? conditional) (= 'if (first conditional))
-                 (= 4 (count conditional))
-                 (descriptor/aset-call? exit)
-                 (not (util/effectful? then)))
-        (let [[out coordinate value] (descriptor/call-args exit)
-              loop-bindings (set (take-nth 2 bindings))
-              value-loop (with-meta
-                           (list head bindings (with-meta (list 'if test then value)
-                                                    (meta conditional)))
-                           (meta expression))
-              matched (patterns/match-ordered-reduce-loop value-loop)
-              result-type (when matched
-                            (retained-local-dtype (:acc-sym matched) (:acc-init matched)))]
-          (when (and (= value (:acc-sym matched)) result-type
-                     (empty? (set/intersection loop-bindings
-                                               (util/free-syms coordinate)))
-                     (empty? (set/intersection loop-bindings
-                                               (util/free-syms out))))
-            (let [result (with-meta
-                           (fresh-projected-id "rstr_terminal_loop_value"
-                                               (util/free-syms expression))
-                           {:tag (dtype/scalar-tag-for-dtype result-type)
-                            :raster.type/tag (dtype/scalar-tag-for-dtype result-type)})]
-              (store-region
-               (list 'let* [result value-loop]
-                     (with-meta (list (first exit) out coordinate result) (meta exit)))
-               index))))))))
+    (when-let [matched (or (patterns/match-ordered-reduce-loop expression)
+                          (patterns/match-ordered-product-loop expression))]
+      (let [[head bindings conditional] expression
+            [_ test then exit] conditional
+            scalar? (contains? matched :acc-sym)
+            carries (if scalar? [(:acc-sym matched)] (:carry-syms matched))
+            inits (if scalar? [(:acc-init matched)] (:carry-inits matched))
+            dtypes (mapv retained-local-dtype carries inits)
+            value-loop (with-meta
+                         (list head bindings
+                               (with-meta (list 'if test then (if scalar? (first carries) carries))
+                                 (meta conditional)))
+                         (meta expression))
+            product (when-not scalar? (:product (source-product-fold-info value-loop)))]
+        (when (and (every? some? dtypes) (or scalar? product)
+                   (not-any? util/effectful?
+                             (concat inits [(:index-init matched) (:bound-expr matched) then]))
+                   (not (contains? (util/free-syms exit) (:index-sym matched))))
+          (let [occupied (set (filter symbol? (tree-seq coll? seq expression)))
+                ids (mapv (fn [ordinal component-dtype]
+                            (with-meta
+                              (fresh-projected-id (str "rstr_terminal_loop_value_" ordinal) occupied)
+                              {:tag (dtype/scalar-tag-for-dtype component-dtype)
+                               :raster.type/tag (dtype/scalar-tag-for-dtype component-dtype)}))
+                          (range) dtypes)
+                values (if scalar? [value-loop]
+                           (mapv (fn [ordinal id]
+                                   (with-meta (ordered-fold-component product ordinal) (meta id)))
+                                 (range) ids))]
+            (store-region
+             (list 'let* (vec (mapcat vector ids values))
+                   (util/subst-syms (zipmap carries ids) exit))
+             index)))))))
 
 (defn- counted-store-loop
   "Recognize a counted loop of stores inside an effect-map body.
@@ -1171,6 +1173,24 @@
                                                               store-offset loop-offset))}))
                     {:locals [] :stores [] :loops [] :order []}
                     groups)))))
+
+    ;; A branch decision is a value at entry, not an expression that may be re-read after
+    ;; a terminal store. Snapshot a memory-dependent decision when either branch writes
+    ;; that memory. Keep the snapshot lexical so enclosing effect sequences do not hoist it.
+    (and (seq? body)
+         (contains? #{'if 'clojure.core/if} (first body))
+         (<= 3 (count body) 4)
+         (seq (set/intersection (par/collect-aget-arrays (second body))
+                                (source-effect-destinations body))))
+    (let [[head predicate & branches] body
+          decision (fresh-region-local-id!)
+          snapshot (with-meta (list 'if predicate 1 0) {:raster.type/tag 'int})]
+      (when-let [region (store-region
+                        (list* head (list 'clojure.core/== decision 1) branches) index)]
+        {:locals [] :stores (:stores region) :loops (:loops region)
+         :order [[:region {:locals (into [{:id decision :dtype :int :init snapshot}]
+                                         (:locals region))
+                           :order (region-order region)}]]}))
 
     (and (seq? body)
          (contains? #{'if 'clojure.core/if} (first body))
@@ -2037,7 +2057,9 @@
                           (independent-stores? locals stores)
                           (or (= :unique uniform-conflict)
                               (dialect/reducing-scatter-conflict? uniform-conflict)))
-            ordered? (and (not dense-pointwise?) (not scatter?) (= :effect host-return)
+            ;; Dense addresses do not imply independent stores: a later value can read an
+            ;; earlier destination. Keep such same-row dependencies in the ordered region.
+            ordered? (and (not pointwise?) (not scatter?) (= :effect host-return)
                           (every? some? effect-contracts)
                           (every? (fn [[_ grouped]]
                                     (= 1 (count (set (map :effect-conflict grouped)))))

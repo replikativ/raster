@@ -552,7 +552,13 @@
                                  (clojure.core/aset out (long acc) acc)))]
     (is (nil? (#'frontend/terminal-store-reduction effectful 'i)))
     (is (nil? (#'frontend/terminal-store-reduction address 'i)))
-    (is (nil? (#'frontend/terminal-store-reduction carried-address 'i)))))
+    (is (= :sequential
+           (-> (route/attempt
+                (list 'let* ['step (list 'raster.par/map-void! 'i 'n carried-address)] 'step)
+                :double {'out :double} {:scalar-types {'n :long 'nc :long}})
+               :program :equations first :algorithm dialect/equations first
+               dialect/operation-parts :attributes :iteration-order))
+        "a final-carry address cannot imply independent work items")))
 
 (deftest typed-inout-preserves-sequential-jvm-semantics
   (let [source '(let* [step (raster.par/map! target i n float
