@@ -58,6 +58,11 @@ KernelBody lowering together. `ir/form`'s sequential result binders are part of 
 changing only the source matcher would be incomplete. Pure and effectful tuples should share
 type/SSA mechanisms without conflating their effect sequencing.
 
+The shared lexical scope authority also covers existing result-producing atomics: their
+inputs use the preceding scope and their result binds only subsequent effects. Substitution
+and alpha normalization preserve declarations and static conflict contracts. This closes a
+scope inconsistency before generalizing effect-loop result tuples; it adds no new dialect.
+
 ## Working rhythm
 
 - One bounded JVM/REPL; focused affected tests locally. Full suites run in CI.

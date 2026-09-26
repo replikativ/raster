@@ -56,3 +56,49 @@
     (is (= (:result carry) (last (last effects))))
     (is (= (list '+ (:parameter carry) (:id (first locals))) (:update carry)))
     (is (= (:index loop) (last (:init (first locals)))))))
+
+(defn- atomic-region []
+  (list 'effect-region []
+        [(list 'effect 'counts (dialect/reducing-scatter-conflict '+ :int) 0 true 'seed
+               {:result 'ticket :dtype :int})
+         (list 'effect 'out :unique 'ticket true 'seed)]))
+
+(deftest atomic-results-use-the-same-sequential-scope-as-loop-results
+  (let [r (atomic-region) scope (form/scope-info r)]
+    (is (= ['ticket nil] (get-in scope [:scopes 0 :binders])))
+    (is (= #{'counts 'out 'seed} (util/free-syms r)))
+    (is (= r ((:rebuild scope) (:scopes scope) (:outer scope))))
+    (let [atomic (first (nth r 2))]
+      (is (= #{'counts 'seed} (util/free-syms atomic)))
+      (is (contains? (util/free-syms (list 'effect-region []
+                                         [(nth (nth r 2) 1) atomic])) 'ticket)
+          "the result is unavailable before its effect"))))
+
+(deftest atomic-result-substitution-and-alpha-renaming-preserve-declarations
+  (let [r (atomic-region)
+        substituted (util/subst-syms {'seed 'ticket} r)
+        renamed (util/alpha-convert r)]
+    (doseq [form [substituted renamed]]
+      (let [[atomic store] (nth form 2)
+            result (:result (nth atomic 6))]
+        (is (not= 'ticket result))
+        (is (= result (nth store 3)))
+        (is (= :int (:dtype (nth atomic 6))))
+        (is (= (nth (first (nth r 2)) 2) (nth atomic 2)))))
+    (is (= 'ticket (nth (first (nth substituted 2)) 5)))
+    (is (= #{'counts 'out 'ticket} (util/free-syms substituted)))
+    (is (= (util/free-syms r) (util/free-syms renamed)))
+    (is (= (util/alpha-normalize r) (util/alpha-normalize renamed)))))
+
+(deftest atomic-rebinding-preserves-metadata-and-static-contracts
+  (let [r (atomic-region)
+        atomic (with-meta (first (nth r 2)) {:line 17})
+        declaration (with-meta (nth atomic 6) {:line 18})
+        atomic (with-meta (apply list (assoc (vec atomic) 6 declaration)) (meta atomic))
+        r (list 'effect-region [] [atomic (second (nth r 2))])
+        rebound (util/subst-syms {'seed 'ticket '+ 'changed-operator} r)
+        actual (first (nth rebound 2))]
+    (is (= (meta atomic) (meta actual)))
+    (is (= (meta declaration) (meta (nth actual 6))))
+    (is (= (nth atomic 2) (nth actual 2)) "the conflict algebra is not a lexical use")
+    (is (not= 'ticket (:result (nth actual 6))))))
