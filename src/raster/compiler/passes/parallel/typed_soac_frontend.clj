@@ -1180,8 +1180,12 @@
     (and (seq? body)
          (contains? #{'if 'clojure.core/if} (first body))
          (<= 3 (count body) 4)
-         (seq (set/intersection (par/collect-aget-arrays (second body))
-                                (source-effect-destinations body))))
+         (let [destinations (source-effect-destinations body)]
+           ;; One terminal effect evaluates its guard before its only write already. Avoid
+           ;; introducing a continuation scope where there is no repeated decision to protect.
+           (and (> (count destinations) 1)
+                (seq (set/intersection (par/collect-aget-arrays (second body))
+                                       (set destinations))))))
     (let [[head predicate & branches] body
           decision (fresh-region-local-id!)
           snapshot (with-meta (list 'if predicate 1 0) {:raster.type/tag 'int})]
@@ -1366,9 +1370,10 @@
 
 (defn- source-effect-destinations
   "Conservative source-side witness for ordinary stores and atomic additions. A successful
-   region recognition must account for every destination named by an effectful source call."
+   region recognition must account for every destination named by an effectful source call.
+   Retain repeated destinations so guard snapshotting can distinguish one write from several."
   [body]
-  (into #{}
+  (into []
         (keep (fn [form]
                 (cond
                   (descriptor/aset-call? form) (descriptor/aset-array-sym form)
@@ -2804,7 +2809,7 @@
     (let [{:keys [idx bound body elem-type]}
           (par/extract-par-map-void-info expression)]
       (when-let [region (store-region body idx)]
-        (when (set/subset? (source-effect-destinations body)
+        (when (set/subset? (set (source-effect-destinations body))
                            (region-effect-destinations region))
           (write-region-description id symbol idx bound region
                                     (dtype/canon (or elem-type default-dtype))
