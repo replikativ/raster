@@ -6,6 +6,27 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.par :as par]))
 
+(deftm terminal-moments!
+  [weights :- (Array double), sums :- (Array double), squares :- (Array double),
+   n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [q 0 total 0.0 square 0.0]
+      (if (< q nc)
+        (let [v (aget weights (+ (* i nc) q))]
+          (recur (inc q) (+ total v) (+ square (* v v))))
+        (do (aset sums i total)
+            (aset squares i square))))))
+
+(deftm terminal-branch-snapshot!
+  [left :- (Array double), right :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [q 0 a 1.0 b 2.0]
+      (if (< q nc)
+        (recur (inc q) b a)
+        (if (> (aget left i) 0.0)
+          (do (aset left i -1.0) (aset right i b))
+          (do (aset left i -2.0) (aset right i a)))))))
+
 (deftm cast-coordinate-histogram!
   [values :- (Array double), counts :- (Array int), n :- Long] :- Void
   (par/map-void! i n

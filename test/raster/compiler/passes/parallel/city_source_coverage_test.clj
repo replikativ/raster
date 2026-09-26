@@ -1,8 +1,13 @@
 (ns raster.compiler.passes.parallel.city-source-coverage-test
   (:refer-clojure :exclude [aget aset])
   (:require [clojure.test :refer [deftest is]]
+            [clojure.walk :as walk]
             [raster.arrays :refer [aget aset]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.backend.jvm.segop-simd :as segop-simd]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.compiler.passes.parallel.city-workload-fixture :as city]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.gpu.core :as gpu]
@@ -29,6 +34,25 @@
       (if (< q nc)
         (recur (inc q) (+ acc (aget weights q)))
         (aset out i acc)))))
+
+(deftm terminal-swap-and-read!
+  [left :- (Array double), right :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [q 0 a 1.0 b 2.0]
+      (if (< q nc)
+        (recur (inc q) b a)
+        (do (aset left i a)
+            (aset right i (+ b (aget left i))))))))
+
+(deftm terminal-read-before-write!
+  [values :- (Array double), out :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [q 0 a 0.0 b 0.0]
+      (if (< q nc)
+        (let [v (aget values i)]
+          (recur (inc q) (+ a v) (+ b (* 2.0 v))))
+        (do (aset values i a)
+            (aset out i b))))))
 
 (deftm city-like-binary-search!
   [starts :- (Array int), ends :- (Array int), cdf :- (Array double),
@@ -61,7 +85,7 @@
         artifact (when operation
                    (segop-opencl/generate-scheduled-segmap-kernel
                     operation :array-types array-types :scalar-types scalar-types))]
-    {:scheduled scheduled :artifact artifact}))
+    {:scheduled scheduled :artifact artifact :operation operation}))
 
 (deftest walked-scalar-helpers-and-constants-use-the-shared-typed-route
   (doseq [v [#'city-like-helper-map! #'city-like-constant-map!]]
@@ -79,6 +103,84 @@
                       {'n :long 'nc :long})]
     (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
     (is (= :kernel-body (get-in artifact [:attributes :emission-route])))))
+
+(deftest walked-terminal-moments-share-one-ordered-recurrence
+  (let [{:keys [scheduled artifact operation]}
+        (emitted-body #'city/terminal-moments!
+                      {'weights :double 'sums :double 'squares :double}
+                      {'n :long 'nc :long})
+        operations (tree-seq #(and (map? %) (contains? % :operations))
+                             :operations (get-in artifact [:attributes :kernel-body]))]
+    (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (= 1 (count (filter #(= "ForLoop" (some-> % class .getSimpleName)) operations))))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (= :kernel-body
+             (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :target-dialect target
+                      :array-types {'weights :double 'sums :double 'squares :double}
+                      :scalar-types {'n :long 'nc :long})
+                     [:attributes :emission-route]))))
+    (let [execute (eval (list 'fn '[weights sums squares n nc]
+                              (segop-simd/compile-segmap operation (:out-sym operation) 'double)))]
+      (doseq [nc [0 1 7]]
+        (let [weights (double-array (range (max 1 (* 3 nc))))
+              sums (double-array 3) squares (double-array 3)
+              expected-sums (double-array 3) expected-squares (double-array 3)]
+          (city/terminal-moments! weights expected-sums expected-squares 3 nc)
+          (execute weights sums squares 3 nc)
+          (is (= (vec expected-sums) (vec sums)))
+          (is (= (vec expected-squares) (vec squares))))))))
+
+(deftest terminal-effects-follow-simultaneous-carry-updates
+  (let [{:keys [operation]} (emitted-body #'terminal-swap-and-read!
+                                         {'left :double 'right :double}
+                                         {'n :long 'nc :long})
+        execute (eval (list 'fn '[left right n nc]
+                            (segop-simd/compile-effect-segmap operation)))]
+    (doseq [nc [0 1 2 7]]
+      (let [left (double-array [-77 -77]) right (double-array [-77 -77])]
+        (execute left right 2 nc)
+        (is (= (vec (repeat 2 (if (odd? nc) 2.0 1.0))) (vec left)))
+        (is (= [3.0 3.0] (vec right)) "second store observes the first terminal store")))))
+
+(deftest terminal-write-cannot-change-another-fold-component
+  (let [{:keys [operation]} (emitted-body #'terminal-read-before-write!
+                                         {'values :double 'out :double}
+                                         {'n :long 'nc :long})
+        execute (eval (list 'fn '[values out n nc]
+                            (segop-simd/compile-segmap operation (:out-sym operation) 'double)))]
+    (doseq [nc [0 1 3]]
+      (let [values (double-array [3 5]) out (double-array 2)]
+        (execute values out 2 nc)
+        (is (= (mapv #(* (double nc) %) [3.0 5.0]) (vec values)))
+        (is (= (mapv #(* 2.0 nc %) [3.0 5.0]) (vec out)))))))
+
+(deftest cross-row-terminal-reads-are-not-certified-independent
+  (let [source (first (gpu/get-walked-body #'terminal-swap-and-read! :double))
+        source (walk/postwalk
+                #(if (= % '(clojure.core/aget left i))
+                   '(clojure.core/aget left (mod (inc i) n)) %) source)
+        result (route/attempt (list 'let* ['result source] 'result)
+                              :double {'left :double 'right :double}
+                              {:scalar-types {'n :long 'nc :long}})
+        attrs (-> result :program :equations first :algorithm
+                  dialect/equations first dialect/operation-parts :attributes)]
+    (is (= :sequential (:iteration-order attrs)))))
+
+(deftest terminal-branch-decision-precedes-its-writes
+  (let [{:keys [operation]} (emitted-body #'city/terminal-branch-snapshot!
+                                         {'left :double 'right :double}
+                                         {'n :long 'nc :long})
+        execute (eval (list 'fn '[left right n nc]
+                            (segop-simd/compile-effect-segmap operation)))]
+    (doseq [nc [0 1 2]]
+      (let [left (double-array [1 -1]) right (double-array 2)
+            expected-left (double-array [1 -1]) expected-right (double-array 2)]
+        (city/terminal-branch-snapshot! expected-left expected-right 2 nc)
+        (execute left right 2 nc)
+        (is (= (vec expected-left) (vec left)))
+        (is (= (vec expected-right) (vec right)))))))
 
 (deftest walked-city-like-binary-search-is-a-typed-while-loop
   (let [source (first (gpu/get-walked-body #'city-like-binary-search! :int))

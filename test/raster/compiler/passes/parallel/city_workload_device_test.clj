@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.city-workload-fixture :as city]
             [raster.dl.gpu-grad-parity :as probe]
+            [raster.gpu.device-probe :as opencl]
             [raster.gpu.core :as gpu]))
 
 (defn- inputs []
@@ -49,8 +50,8 @@
                       :int (int v) :long (long v) :float (float v) :double (double v))}))
         (filter #(and (= :scalar (:kind %)) (not= :bound (:role %))) abi)))
 
-(defn- run-device [kernel-key kernel buffers values n outputs]
-  (let [session (gpu/make-session :ze:0)]
+(defn- run-device [kernel-key kernel buffers values n outputs & [device]]
+  (let [session (gpu/make-session (or device :ze:0))]
     (try
       (let [ki (first (gpu/compile! session kernel-key kernel {:dtype :double}))]
         (gpu/alloc! session buffers)
@@ -62,6 +63,38 @@
                :stable-inputs
                (set (map :name (filter #(= :no-write-alias (:aliasing %)) (:abi ki))))))
       (finally (gpu/close-session! session)))))
+
+(deftest terminal-moments-match-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "terminal moments on " device))
+      (doseq [nc [0 1 7]]
+        (let [n 3 weights (double-array (range (max 1 (* n nc))))
+              sums (double-array n) squares (double-array n)
+              _ (city/terminal-moments! weights sums squares n nc)
+              actual (run-device :terminal-moments #'city/terminal-moments!
+                                 {:weights [:double (alength weights) weights]
+                                  :sums [:double n (double-array (repeat n -77))]
+                                  :squares [:double n (double-array (repeat n -77))]}
+                                 {"n" n "nc" nc} n [:sums :squares] device)]
+          (is (= (vec sums) (:sums actual)) (str device " width=" nc))
+          (is (= (vec squares) (:squares actual)) (str device " width=" nc)))))))
+
+(deftest terminal-branch-decision-matches-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "terminal branch snapshot on " device))
+      (doseq [nc [0 1 2]]
+        (let [left (double-array [1 -1]) right (double-array 2)
+              _ (city/terminal-branch-snapshot! left right 2 nc)
+              actual (run-device :terminal-branch #'city/terminal-branch-snapshot!
+                                 {:left [:double 2 (double-array [1 -1])]
+                                  :right [:double 2 (double-array 2)]}
+                                 {"n" 2 "nc" nc} 2 [:left :right] device)]
+          (is (= (vec left) (:left actual)) (str device " width=" nc))
+          (is (= (vec right) (:right actual)) (str device " width=" nc)))))))
 
 (defn- common-buffers [{:keys [n nc ncell] :as input}]
   (into {}

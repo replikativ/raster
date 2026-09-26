@@ -5,6 +5,10 @@ subsequent chronological notes remain the detailed history, not a reduction of t
 production migration must retain numerical, ABI, ownership and resource contracts; isolated emitter
 coverage is not a completed vertical. The north star remains the architectural specification.
 
+The current local-first landing order and completion gates are in
+[compiler-consolidation.md](compiler-consolidation.md). The checkpoint below and chronological
+notes retain the wider campaign and its implementation history.
+
 ## Current eight-item checkpoint — 2026-09-23
 
 This section supersedes historical "next" and "still required" statements below where the cited
