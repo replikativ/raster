@@ -60,7 +60,10 @@
     (let [descriptor (pipeline/compile-gpu-program #'accumulate-gemm! target :dtype :float)
           step (first (:steps descriptor))
           executable (default-executable step)
-          artifact (default-artifact step)]
+          artifact (default-artifact step)
+          result-slot (some #(when (contains? #{:output :inout} (:kind %)) %)
+                            (:abi artifact))
+          result-c-name (or (:c-name result-slot) (some-> result-slot :name name))]
       (testing (str target)
         (is (= [:executable] (mapv :convention (:steps descriptor))))
         (is (= '[[A :input] [B :input] [C :inout]]
@@ -68,7 +71,10 @@
                           :when (not= :scalar (:kind slot))]
                       [(:name slot) (:kind slot)]))))
         (is (empty? (:allocs descriptor)))
-        (is (re-find #"__global float\* C" (:source artifact))
+        (is (and result-c-name
+                 (re-find (re-pattern (str "__global float\\* "
+                                           (java.util.regex.Pattern/quote result-c-name)))
+                          (:source artifact)))
             "the destination pointer is writable: no const qualifier")))))
 
 (defn- run-on-device

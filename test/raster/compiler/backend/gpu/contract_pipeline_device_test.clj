@@ -164,11 +164,19 @@
       ;; real bug through — the descriptor supplied 1 scalar arg where the kernel declares 4
       ;; (int k, int m, int n, int _nseg), so a caller would have mis-bound at launch. The
       ;; descriptor validator caught it; assert usability here, not merely non-crashing.
-      (is (= 4 (count (:scalar-args r)))
-          "the symbolic axis bounds must be bound as int params, before the trailing count")
-      (is (= '[k m n] (mapv :value (butlast (:scalar-args r))))
-          "…in the kernel's declared (name-sorted) order")
-      (is (= (:out-elems r) (:value (last (:scalar-args r)))))
-      (is (= [256] (get-in call [:geometry :workgroup-size])))
-      (is (= [2] (get-in call [:geometry :group-count]))
-          "the artifact resolves its symbolic ceil-div grid from ordered ABI values"))))
+      (case (:strategy r)
+        :regtiled
+        (do
+          (is (= '[m n k] (mapv :value (:scalar-args r)))
+              "the tiled body binds only the three independent dimensions")
+          (is (= [16 16] (get-in call [:geometry :workgroup-size])))
+          (is (= [1 1] (get-in call [:geometry :group-count]))))
+        :portable-segred
+        (do
+          (is (= 4 (count (:scalar-args r)))
+              "the portable descriptor binds dimensions and its trailing count")
+          (is (= '[k m n] (mapv :value (butlast (:scalar-args r)))))
+          (is (= (:out-elems r) (:value (last (:scalar-args r)))))
+          (is (= [256] (get-in call [:geometry :workgroup-size])))
+          (is (= [2] (get-in call [:geometry :group-count]))
+              "the artifact resolves its symbolic ceil-div grid from ordered ABI values"))))))

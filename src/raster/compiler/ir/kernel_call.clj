@@ -293,8 +293,15 @@
    is used for artifact attributes such as a contraction's logical output extent; backends still
    receive no convention-specific positional metadata."
   [call compiler-value]
-  (let [{:keys [artifact arguments]} (validate! call)]
-    ((argument-resolver artifact arguments) compiler-value)))
+  (let [{:keys [artifact arguments]} (validate! call)
+        resolver (argument-resolver artifact arguments)]
+    ;; A derived extent may be an explicit launch expression over bound dimension scalars,
+    ;; rather than a redundant scalar ABI slot. Preserve the older directly-bound expression
+    ;; identity first: some portable descriptors intentionally bind that entire expression.
+    (if (and (not (some #(= compiler-value %) (:arguments artifact)))
+             (klaunch/expression? compiler-value))
+      (klaunch/resolve-expression resolver compiler-value)
+      (resolver compiler-value))))
 
 (defn make
   "Construct a checked call from an artifact and complete ABI-ordered runtime values.
