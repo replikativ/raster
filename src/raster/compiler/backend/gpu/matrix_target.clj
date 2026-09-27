@@ -3,7 +3,7 @@
 
    Contraction scheduling chooses the matrix instruction and records the complete execution in a
    KernelBody. This namespace performs only the final target spelling. It is deliberately the one
-   fork at which DPAS and MMA diverge; callers may not select a target template directly or pass a
+   fork at which DPAS, MMA and MFMA diverge; callers may not select a target template directly or pass a
    second tile/launch/ABI description beside the body."
   (:require [raster.compiler.backend.gpu.cuda-codegen :as cuda-codegen]
             [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-source]
