@@ -69,6 +69,25 @@
     (is (= 3 (count (:locals region))))
     (is (= '[p1 p2 p3] (mapv :id (:locals region))))))
 
+(deftest numerical-equations-are-projected-once-before-dependency-selection
+  (let [calls (atom [])
+        project #'frontend/operation-equation
+        original @project
+        source '(let* [y (raster.par/pmap i n float (* (aget x i) 2.0))
+                       z (raster.par/pmap j n float (+ (aget y j) 1.0))]
+                  z)
+        program (with-redefs-fn
+                  {project (fn [description]
+                             (swap! calls conj (:id description))
+                             (original description))}
+                  #(frontend/form->program source
+                                           {:dtype :float :array-types {'x :float}
+                                            :scalar-types {'n :long}}))]
+    (is (some? program))
+    (is (= [0 1] @calls))
+    (is (= [0 1] (mapv second (dialect/equations program))))
+    (is (= '[z] (dialect/outputs program)))))
+
 (deftest map-let-spines-require-complete-scalar-type-evidence
   (doseq [body ['(let* [p (* x x)] p)
                 '(let* [^float p (* x x) ^float p (* p p)] p)

@@ -4230,15 +4230,21 @@
                   (seq? expression)
                   (descriptor/alloc-op? (descriptor/semantic-op expression)))))))
 
+(defn- soac-description?
+  "The closed numerical operation subset projected by operation-equation. Host/scalar
+   descriptions are deliberately separate; storage analysis and admission share this boundary."
+  [description]
+  (contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
+               :product-reduce :segmented-fold-map :scan}
+             (:kind description)))
+
 (defn- physical-output-symbols
   "Every buffer some operation writes, closed under host renamings: a binding that merely
    renames a buffer (`out y`) shares its physical identity, so a write through the alias is a
    write to the allocation it names and that allocation is generated scaffolding as well."
   [descriptions]
   (let [written (reduce set/union #{}
-                        (map #(if (contains? #{:map :scatter :effect-map :stencil :reduce
-                                               :segmented-reduce :contract :product-reduce
-                                               :segmented-fold-map :scan} (:kind %))
+                        (map #(if (soac-description? %)
                                 (:outputs %) #{})
                              descriptions))
         renamings (keep #(when (and (= :scalar (:kind %)) (symbol? (:expr %)))
@@ -4986,6 +4992,22 @@
                  (vec (concat [accumulator] elements capture-parameters))
                  [result])))))
 
+(defn- operation-equation
+  "Project one admitted numerical description. Construct each equation once, before dependency
+   selection, so scalar liveness and the final program consume the same projection."
+  [description]
+  (case (:kind description)
+    :map (map-equation description)
+    :contract (contract-equation description)
+    :scatter (scatter-equation description)
+    :effect-map (effect-map-equation description)
+    :stencil (stencil-equation description)
+    :reduce (reduce-equation description)
+    :segmented-reduce (segmented-reduce-equation description)
+    :product-reduce (product-reduce-equation description)
+    :segmented-fold-map (segmented-fold-map-equation description)
+    :scan (scan-equation description)))
+
 (defn- scalar-result
   [{:keys [sym expr]} scalar-dtypes scalar-types]
   (let [expression-tag (when (instance? clojure.lang.IObj expr)
@@ -5048,9 +5070,7 @@
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
-        operations (filter #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
-                                         :product-reduce :segmented-fold-map :scan} (:kind %))
-                           descriptions)
+        operations (filter soac-description? descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter :effect-map :stencil) (:results %)
                                               :scan [(:sym %)]
@@ -5425,19 +5445,14 @@
                          values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
-                 (some #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
-                                     :product-reduce :segmented-fold-map :scan}
-                                   (:kind %))
-                       descriptions)
+                 (some soac-description? descriptions)
                  ;; Body expressions are projected as host results, not equations. They therefore
                  ;; cannot contain an unrepresented parallel leaf; structured control or the
                  ;; compatibility scheduler must retain that lexical operation instead.
                  (not-any? contains-parallel-form? body)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
-              (filterv #(contains? #{:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
-                                     :product-reduce :segmented-fold-map :scan} (:kind %))
-                       descriptions)
+              (filterv soac-description? descriptions)
               physical-outputs (physical-output-symbols descriptions)
               ;; Source descriptions retain the same authoritative local scalar contracts used
               ;; during admission.  Thread them into AbstractValue construction as well: a
@@ -5449,17 +5464,9 @@
                           (assoc types sym scalar-dtype)
                           types))
                       scalar-types descriptions)
-              operation-equations (mapv #(case (:kind %) :map (map-equation %)
-                                               :contract (contract-equation %)
-                                               :scatter (scatter-equation %)
-                                               :effect-map (effect-map-equation %)
-                                               :stencil (stencil-equation %)
-                                               :reduce (reduce-equation %)
-                                               :segmented-reduce (segmented-reduce-equation %)
-                                               :product-reduce (product-reduce-equation %)
-                                               :segmented-fold-map (segmented-fold-map-equation %)
-                                               :scan (scan-equation %))
-                                        operation-descriptions)
+              operation-equations (mapv operation-equation operation-descriptions)
+              operation-equations-by-id (zipmap (map :id operation-descriptions)
+                                                operation-equations)
               outputs (terminal-results descriptions body)
               required-scalars (selected-scalars descriptions operation-equations outputs)
               scalar-descriptions
@@ -5481,8 +5488,8 @@
               (set/union allocation-capacity-scalar-ids normalized-extent-scalar-ids)
               {:keys [equations equation-descriptions]}
               (reduce (fn [{:keys [scalar-dtypes] :as state} description]
-                        (case (:kind description)
-                          :scalar
+                        (cond
+                          (= :scalar (:kind description))
                           (if (contains? required-scalars (:sym description))
                             (let [equation (scalar-equation description scalar-dtypes
                                                            source-scalar-types)
@@ -5492,23 +5499,15 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :scatter :effect-map :stencil :reduce :contract :segmented-reduce
-                                :product-reduce :segmented-fold-map :scan)
+                          (soac-description? description)
                           (-> state
-                              (update :equations conj
-                                      (case (:kind description)
-                                        :contract (contract-equation description)
-                                        :map (map-equation description)
-                                        :scatter (scatter-equation description)
-                                        :effect-map (effect-map-equation description)
-                                        :stencil (stencil-equation description)
-                                        :reduce (reduce-equation description)
-                                        :segmented-reduce (segmented-reduce-equation description)
-                                        :product-reduce (product-reduce-equation description)
-                                        :segmented-fold-map
-                                        (segmented-fold-map-equation description)
-                                        :scan (scan-equation description)))
-                              (update :equation-descriptions conj description))))
+                              (update :equations conj (get operation-equations-by-id (:id description)))
+                              (update :equation-descriptions conj description))
+
+                          :else
+                          (fail! :unsupported-operation-description
+                                 "admitted source description has no equation projection"
+                                 {:description description})))
                       {:equations [] :equation-descriptions [] :scalar-dtypes {}}
                       descriptions)
               equation-info (mapv (fn [equation]

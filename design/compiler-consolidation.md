@@ -168,6 +168,34 @@ admission lease against later runtime device changes. Cache canonicalization of 
 remains a follow-up. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
+### Remaining reduction boundary, in landing order
+
+The indexed dot/weight/scatter/normalize recognizer already proves a generic
+`SegmentedWeightedReductionPlan`. Retain that exact plan in the common `ParallelProgram`
+equation spine; do not add an attention-specific semantic API or recover its mathematics from
+an emitted ABI. The logical result is distinct from the physical output buffer and is joined
+through the existing `:result-storage` contract.
+
+1. Validate the internal algorithm boundary: ordered operands, scalar dependencies, exact
+   buffer/result types and shapes, read/write effects, and logical-to-physical output binding.
+   An admitted but unscheduled plan must decline explicitly with its equation and source site.
+2. Admit protected source markers through the existing sequential description builder. Ordinary
+   SOAC runs retain their fusion pipeline; interleave the existing plans without a second source
+   walker. Preserve allocation/scalar dependencies and invocation contracts. Internal boundary
+   support alone does **not** close public equation-first coverage.
+3. Certify fixed-reference `ScheduledKernelBody` emission against the source plan and exercise
+   public resident execution on OpenCL and Level Zero, including empty/unequal segments.
+4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
+   its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
+   common arguments once and allocate only the selected alternative's scratch.
+
+The source frontend now projects each ordinary numerical equation once, shared by dependency
+selection and final construction, and uses one numerical-description predicate for admission
+and storage analysis. This removes duplication before mixed-plan admission; it does not change
+the supported source language. The plan's older private scalar vocabulary is separate cleanup
+debt: reuse its validator now, then converge it on the canonical typed scalar authority rather
+than enlarging or copying the whitelist.
+
 Both orchestration paths now use one typed contraction boundary validator before emission.
 It joins the equation identity and checks dtype, iteration space and physical input/output storage;
 the older router's private implementation and the weaker equation-first projection are removed.
