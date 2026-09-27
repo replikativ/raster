@@ -697,6 +697,26 @@
                   (if (< i n) (recur (inc i) (+ a 1.0)) a))]]
     (is (nil? (patterns/match-ordered-product-loop form)))))
 
+(deftest counted-and-while-loops-share-tail-projection-not-bound-proofs
+  (let [source '(loop* [i 0 a 1.0 b 2.0]
+                  (if (< i n)
+                    (if (odd? i)
+                      (recur (inc i) b a)
+                      (recur (inc i) (+ a 1.0) (+ b 2.0)))
+                    [a b]))
+        counted (patterns/match-ordered-product-loop source)
+        ordered (patterns/match-ordered-while-loop source)]
+    (is (= '[(if (odd? i) b (+ a 1.0)) (if (odd? i) a (+ b 2.0))]
+           (:update-exprs counted)))
+    (is (= (:update-exprs counted) (subvec (:update-exprs ordered) 1))))
+  (let [source '(loop* [i 0 a 1.0 b 2.0]
+                  (if (< i n)
+                    (if (odd? i) [a b] (recur (inc i) b a))
+                    [a b]))]
+    (is (nil? (patterns/match-ordered-product-loop source))
+        "an early exit is not a counted product fold")
+    (is (some? (patterns/match-ordered-while-loop source)))))
+
 (deftest ordered-product-loop-retains-a-pure-exit-projection
   (let [matched (patterns/match-ordered-product-loop
                  '(loop* [i 0 a 0.0 b 0.0]
