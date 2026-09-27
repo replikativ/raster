@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]))
 
@@ -37,6 +38,51 @@
 (defn- reason-of [thunk]
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
+
+(defn- conditioned-fixture []
+  (scheduled/make
+   (-> (fixture)
+       (update :body update :parameters into
+               [(body/->KernelParameter 'n :scalar :int [] nil nil :bound)
+                (body/->KernelParameter 'next-n :scalar :int [] nil nil :bound)])
+       (assoc :arguments ['input 'output 'rows (launch/sum 'rows 1)]
+              :preconditions [{:expression 'n :op :> :value 0}
+                              {:expression 'next-n :op :<= :value 8}
+                              {:expression (launch/product 'n 'next-n) :op :<= :value 42}])
+       (dissoc :scalar-bindings))))
+
+(deftest scheduled-preconditions-use-physical-integral-scalar-identities
+  (let [value (conditioned-fixture)]
+    (is (= value (scheduled/validate! value)))
+    (doseq [symbol ['rows 'input 'unknown]]
+      (is (= :kernel-precondition-scope
+             (reason-of #(scheduled/validate!
+                          (assoc value :preconditions [{:expression symbol :op :> :value 0}]))))))
+    (is (= :kernel-preconditions
+           (reason-of #(scheduled/validate! (assoc value :preconditions nil)))))
+    (is (= :kernel-precondition-scope
+           (reason-of #(scheduled/make
+                        (-> value
+                            (assoc-in [:body :parameters 2 :dtype] :float)
+                            (assoc :arguments '[input output rows next-rows])
+                            (dissoc :scalar-bindings)))))
+        "floating scalar slots are not checked integer-expression inputs")))
+
+(deftest scheduled-preconditions-survive-target-projection-and-graph-preflight
+  (let [value (conditioned-fixture)]
+    (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [artifact (target/emit-artifact "conditioned" value dialect)
+            graph (target/emit-static-dense-graph "conditioned" value dialect)]
+        (is (= (:preconditions value) (:preconditions artifact)))
+        (is (= artifact (scheduled/validate-artifact-projection! value artifact)))
+        (is (= graph (graph-call/preflight! graph {'rows {:type :int :value 6}})))
+        (doseq [rows [0 7 8]]
+          (is (= :kernel-precondition-failed
+                 (reason-of #(graph-call/preflight! graph {'rows {:type :int :value rows}})))))
+        (doseq [conditions [[] (assoc-in (:preconditions value) [2 :value] 100)]]
+          (is (= :scheduled-kernel-body-artifact-projection
+                 (reason-of #(scheduled/validate-artifact-projection!
+                              value (assoc artifact :preconditions conditions))))))))))
 
 (deftest static-dense-body-graph-retains-source-and-required-capacities
   (let [value (-> (fixture)

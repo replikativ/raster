@@ -13,10 +13,12 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.numerical-contract :as numerics]))
 
 (defrecord ScheduledKernelBody
-           [source body arguments scalar-bindings effects legality numerics provenance attributes])
+           [source body arguments scalar-bindings effects legality numerics provenance attributes
+            preconditions])
 
 (defn scheduled-kernel-body?
   [value]
@@ -169,7 +171,8 @@
   (when-not (scheduled-kernel-body? scheduled)
     (fail! :scheduled-kernel-body-type "expected a ScheduledKernelBody"
            {:actual (type scheduled)}))
-  (let [{:keys [source arguments scalar-bindings effects legality numerics provenance attributes]
+  (let [{:keys [source arguments scalar-bindings effects legality numerics provenance attributes
+                preconditions]
          kernel-body :body} scheduled
         kernel-body (body/validate! kernel-body)
         expected-uses (derive-uses kernel-body arguments)]
@@ -181,6 +184,11 @@
              "scheduled body arguments cannot contain nil compiler values"
              {:arguments arguments}))
     (validate-scalar-bindings! kernel-body arguments scalar-bindings)
+    (precondition/validate!
+     preconditions
+     (into #{} (keep (fn [{:keys [id kind dtype]}]
+                       (when (and (= :scalar kind) (contains? #{:int :long} dtype)) id)))
+           (:parameters kernel-body)))
     (when-not (and (map? effects) (keyword? (:kind effects)))
       (fail! :scheduled-kernel-body-effects
              "scheduled body requires a named canonical effects map"
@@ -215,11 +223,12 @@
     scheduled))
 
 (defn make
-  [{:keys [source body arguments scalar-bindings effects legality numerics provenance attributes]
-    :or {provenance {} attributes {}}}]
+  [{:keys [source body arguments scalar-bindings effects legality numerics provenance attributes
+           preconditions]
+    :or {provenance {} attributes {} preconditions []}}]
   (let [scalar-bindings (or scalar-bindings (derive-scalar-bindings body arguments))]
     (validate! (->ScheduledKernelBody source body arguments scalar-bindings effects legality
-                                      numerics provenance attributes))))
+                                      numerics provenance attributes preconditions))))
 
 (defn validate-against-node!
   "Require this refinement to implement one exact node in its complete KernelGraph context."
@@ -325,7 +334,8 @@
              [:effects (:effects scheduled) (:effects emitted)]
              [:launch (realized-launch scheduled) (:launch emitted)]
              [:body (:body scheduled) (get-in emitted [:attributes :kernel-body])]
-             [:preconditions (or (:preconditions intel-requirements) []) (:preconditions emitted)]
+             [:preconditions (into (:preconditions scheduled) (:preconditions intel-requirements))
+              (:preconditions emitted)]
              [:abi expected-abi actual-abi]]]
       (when-not (= expected actual)
         (fail! :scheduled-kernel-body-artifact-projection
