@@ -6,6 +6,7 @@
    contract, never a proof that different floating-point schedules are interchangeable."
   (:require [raster.compiler.ir.emitted-parallel-equation :as equation]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]))
 
 (defrecord EmittedEquationDispatch [alternatives dispatch numerical-policy])
@@ -54,7 +55,12 @@
         (fail! :equation-dispatch-numerical-policy
                "dispatch requires an explicit exact/reassociated numerical permission set"
                {:policy numerical-policy}))
-      (when-not (= (mapv :graph alternatives) (:alternatives selection))
+      ;; Generated kernels may contain NaN literals. Clojure structural equality cannot compare
+      ;; independently decoded copies of those graphs, even when their floating-point bits match.
+      (when-not (and (= (count alternatives) (count (:alternatives selection)))
+                     (every? true?
+                             (map semantic-fingerprint/equivalent?
+                                  (map :graph alternatives) (:alternatives selection))))
         (fail! :equation-dispatch-executables
                "dispatch alternatives differ from independently certified emitted graphs" {}))
       (when-not (every? #(= (:algorithm first-candidate) (:algorithm %))
@@ -75,8 +81,13 @@
         (fail! :equation-dispatch-numerics
                "candidate numerical mode is not authorized by the equation policy"
                {:modes modes :permitted-modes allowed}))
-      (let [default-index (.indexOf (mapv :graph alternatives)
-                                   (dispatch/default-alternative selection))]
+      (let [default-graph (dispatch/default-alternative selection)
+            default-index (first (keep-indexed
+                                  (fn [index candidate]
+                                    (when (semantic-fingerprint/equivalent?
+                                           (:graph candidate) default-graph)
+                                      index))
+                                  alternatives))]
         (when-not (= :exact (nth modes default-index))
           (fail! :equation-dispatch-default-numerics
                  "the safe fallback must retain exact evaluation order"
@@ -97,7 +108,8 @@
   [value]
   (let [value (validate! value)
         default (dispatch/default-alternative (:dispatch value))]
-    (some #(when (= default (:graph %)) %) (:alternatives value))))
+    (some #(when (semantic-fingerprint/equivalent? default (:graph %)) %)
+          (:alternatives value))))
 
 (defn boundary-equation
   "Return the exact equation for shared storage/ABI inspection.

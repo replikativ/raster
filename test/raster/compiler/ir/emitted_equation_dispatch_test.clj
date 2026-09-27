@@ -1,15 +1,23 @@
 (ns raster.compiler.ir.emitted-equation-dispatch-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
+
+(def ^:private artifact-identity
+  {:semantic-request-fingerprint "equation-dispatch-request"
+   :compiler-build-fingerprint "equation-dispatch-build"
+   :source-dependency-fingerprint "equation-dispatch-source"
+   :target-descriptor-fingerprint "equation-dispatch-target"})
 
 (defn- register-target!
   []
@@ -108,6 +116,25 @@
     (is (= 2 (count (:kernels dispatched))))
     (is (= :indexed-segmented-reduction-subgroup-score-reuse
            (executable/strategy (-> linked :instances first :call :steps last :graph))))))
+
+(deftest certified-dispatch-survives-persistent-artifact-round-trip
+  (register-target!)
+  (let [original (compilation :dispatch-reassociated)
+        restored (artifact/open artifact-identity
+                                (artifact/decode
+                                 (artifact/encode
+                                  (artifact/seal artifact-identity original))))
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]]
+    (is (semantic-fingerprint/equivalent? original restored))
+    (is (equation-dispatch/emitted-equation-dispatch?
+         (-> restored :emitted :equations last :operations first)))
+    (is (= (executable/strategy
+            (-> (equation-first/lower original arguments)
+                :instances first :call :steps last :graph))
+           (executable/strategy
+            (-> (equation-first/lower restored arguments)
+                :instances first :call :steps last :graph))))))
 
 (deftest reassociated-dispatch-declines-an-unproved-target
   (let [target-id :ocl:unproved-equation-dispatch-test]
