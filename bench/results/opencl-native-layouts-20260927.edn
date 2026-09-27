@@ -1,0 +1,31 @@
+{:kind :public-linear-schedule-diagnostic
+ :base-revision "5efc39d33764b6e0b3f45359a2c79d0b8c3f5d03"
+ :change :explicit-native-layout-types-and-long-event-offsets
+ :baseline-file "local-projection-20260927.edn"
+ :target :ocl:0 :device "Intel(R) Arc(TM) Graphics / 0x64a0 / OpenCL 3.0 NEO"
+ :environment "arc-local-consolidation-20260927-shared-laptop"
+ :driver-build :not-recorded
+ :shape [8 256 256] :shape-order [:rows :input-width :output-width]
+ :precision :mixed-f16-f32 :residency :constant-weights
+ :warmups 3 :rounds 8 :timing-source :device-event
+ :transfers-included? false :one-time-weight-prologue-included? false
+ :binding-included? false :promotion? false
+ :oracle :exact-host-binary16-rounded-dot-plus-f32-bias
+ :every-candidate-valid? true
+ :remaining-launch-reflection-warnings []
+ :samples-unit :nanoseconds
+ :samples
+ {:portable-segred [54791.0 54895.0 54687.0 54791.0 55000.0 82395.0 53437.0 55416.0]
+  :xmx-direct [41354.0 52708.0 42708.0 42500.0 43957.0 48437.0 49479.0 53229.0]
+  :xmx-direct-dynamic-lhs [26354.0 25520.0 24479.0 25000.0 25312.0 31979.0 24375.0 25416.0]
+  :xmx-direct-tile-inputs [122500.0 122916.0 124687.0 126040.99999999999
+                          126145.0 132395.0 123645.0 127290.99999999999]}
+ :stationary {:portable-segred false :xmx-direct false
+              :xmx-direct-dynamic-lhs false :xmx-direct-tile-inputs true}
+ :materialized-profile-unit :milliseconds
+ :materialized-profile-columns [:device-wall-ms :kernel-total-ms]
+ :materialized-profiles
+ [[0.041354 0.020832000000000003] [0.052708 0.021561999999999998]
+  [0.042708 0.021665999999999998] [0.0425 0.021249999999999998]
+  [0.043957 0.021145] [0.048437 0.017915999999999998]
+  [0.049479 0.028332] [0.053229 0.021977999999999998]]}

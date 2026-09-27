@@ -51,7 +51,21 @@ Reproduction in a bench/test REPL:
   :environment "<machine/driver/load identity>"})
 ```
 
-Next: isolate the OpenCL submission/event gap without weakening dependency barriers; retain whole
-graph spans alongside kernel sums. Then repeat the existing matched strict-FP32 CLBlast protocol
+The follow-up isolated a substantial Raster-side contribution: unresolved Java FFM memory-layout
+types caused reflective `MemorySegment.get/set` dispatch in launch setup. Instrumented native
+enqueue calls took roughly 14–45 µs while complete enqueue wrappers took roughly 158–468 µs in
+the captured tail. Supplying the existing concrete native layout types and integral event offsets
+removed all reflection warnings in the launch/event hot path. No kernel, queue order, barrier,
+precision policy or ownership rule changed.
+
+The [final repeated diagnostic](../bench/results/opencl-native-layouts-20260927.edn), with the same
+un-instrumented protocol, retained exact parity for every candidate. The materialized graph's
+reported median fell from 506 µs to 44 µs; its kernel-duration sum remained around 18–28 µs.
+The materialized series was still nonstationary, and these were not randomized A/B runs. This
+supports removing avoidable runtime reflection, not a global speedup claim or selector promotion.
+Focused tests cover 1–3D native launch marshalling without a driver, repeated profiled/unprofiled
+graphs on both local backends, and transfer/event ownership.
+
+Next: repeat the existing matched strict-FP32 CLBlast protocol
 and the external pretrained fixtures under controlled load. Do not compare these mixed-precision
 samples to strict-FP32 BLAS, or infer end-to-end Laya latency from this small projection.

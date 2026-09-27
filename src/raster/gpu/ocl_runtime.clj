@@ -17,7 +17,8 @@
   (:import [java.lang.foreign
             Arena FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout
-            AddressLayout]
+            AddressLayout ValueLayout$OfInt ValueLayout$OfLong ValueLayout$OfFloat
+            ValueLayout$OfDouble]
            [java.lang.invoke MethodHandle])
   (:require [clojure.string :as str]
             [raster.compiler.core.dtype :as dt]
@@ -136,11 +137,13 @@
 ;; Layout helpers
 ;; ================================================================
 
-(def ^:private PTR ValueLayout/ADDRESS)
-(def ^:private I32 ValueLayout/JAVA_INT)
-(def ^:private I64 ValueLayout/JAVA_LONG)
-(def ^:private F32 ValueLayout/JAVA_FLOAT)
-(def ^:private F64 ValueLayout/JAVA_DOUBLE)
+;; Preserve the native layout types so MemorySegment get/set select their overload directly.
+;; Reflection here is paid per work-dimension and per event, between dependent kernel launches.
+(def ^:private ^AddressLayout PTR ValueLayout/ADDRESS)
+(def ^:private ^ValueLayout$OfInt I32 ValueLayout/JAVA_INT)
+(def ^:private ^ValueLayout$OfLong I64 ValueLayout/JAVA_LONG)
+(def ^:private ^ValueLayout$OfFloat F32 ValueLayout/JAVA_FLOAT)
+(def ^:private ^ValueLayout$OfDouble F64 ValueLayout/JAVA_DOUBLE)
 
 (defn- read-int
   "Read an int from a segment at offset 0."
@@ -1632,7 +1635,7 @@
     (if (empty? launches)
       {:complete? true}
       (let [arena (Arena/ofShared)
-            event-outs (.allocate arena (* 8 (if profile? (count launches) 1)))
+            event-outs (.allocate arena (long (* 8 (if profile? (count launches) 1))))
             status-out (.allocate arena I32)]
         (try
           (when (and profile? @(:profile-state graph))
@@ -1641,13 +1644,13 @@
           (doseq [[index {:keys [bound group-count]}] (map-indexed vector launches)]
             (enqueue-bound! bound group-count
                             (if (or profile? (= index (dec (count launches))))
-                              (.asSlice event-outs (if profile? (* 8 index) 0) 8)
+                              (.asSlice event-outs (long (if profile? (* 8 index) 0)) 8)
                               MemorySegment/NULL)
                             queue))
           (cl-call! "clFlush" @h-clFlush [queue])
           (let [events (when profile?
-                         (mapv #(.get event-outs PTR (* 8 %)) (range (count launches))))
-                final-offset (if profile? (* 8 (dec (count launches))) 0)
+                         (mapv #(.get event-outs PTR (long (* 8 %))) (range (count launches))))
+                final-offset (long (if profile? (* 8 (dec (count launches))) 0))
                 token {:event (.get event-outs PTR final-offset)
                        :event-array (.asSlice event-outs final-offset 8)
                        :status-out status-out
