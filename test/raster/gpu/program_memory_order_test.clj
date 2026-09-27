@@ -159,6 +159,31 @@
           (is (= 0 (get-in result [:memory :allocations-saved])))
           (is (= expected (vec (get (:outputs result) (first (:outputs preserved)))))))))))
 
+(deftest reusable-private-scope-keeps-one-binding-and-detached-snapshots
+  (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 device/gpu-available? device/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "reusable private execution on " target))
+      (let [args (arguments)
+            linked (lowered target args)
+            input-id (first (keep (fn [[id node]] (when (identical? (last args) (:source node)) id))
+                                 (:nodes linked)))
+            output-id (first (:outputs linked))
+            replacement (double-array [2 3])
+            instantiate link/instantiate!
+            bindings (atom 0)
+            snapshots
+            (with-redefs [link/instantiate! (fn [plan] (swap! bindings inc) (instantiate plan {}))]
+              (with-open [execute (link/private-executor! linked)]
+                [(execute) (execute {input-id replacement})]))]
+        (is (= 1 @bindings))
+        (is (= (vec (apply four-layers args))
+               (vec (get-in (first snapshots) [:outputs output-id]))))
+        (is (= (vec (apply four-layers (conj (pop args) replacement)))
+               (vec (get-in (second snapshots) [:outputs output-id]))))
+        (is (= [1 1] (mapv #(get-in % [:memory :allocations-saved]) snapshots)))
+        (is (= [16 16] (mapv #(get-in % [:memory :bytes-saved]) snapshots)))))))
+
 (deftest private-realization-does-not-trust-an-internal-role-as-exclusivity
   (let [linked (lowered :ocl:0 (arguments))
         borrowed (:plan (plan/borrow-owned-storage linked))]

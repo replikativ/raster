@@ -964,6 +964,76 @@
           (try (close! executable) (catch Throwable _))
           (throw error))))))
 
+(defn private-executor!
+  "Prepare a reusable, confined host-result execution scope for an owned equation-first plan.
+
+   Returns a callable Closeable, not an inspectable LinkedExecutable. Calling it with no arguments
+   replays current inputs; a map argument supplies exact host arrays/MemorySegments for
+   :input/:state node IDs. Overlapping update views are rejected rather than ordered by map order.
+   The entire update batch is validated before any upload. Each call returns the same detached
+   {:outputs ... :memory ...} shape as evaluate!; previous snapshots never alias device storage.
+
+   The validated graph and private temporaries stay resident between calls. Invocation and close
+   are serialized. A runtime upload, execution or download failure invalidates the scope and
+   attempts cleanup; malformed or incomplete updates reject without changing it. No session,
+   internal view or AD tape handle escapes.
+   This is not yet a zero-copy resident-output composition boundary."
+  [plan]
+  (let [{:keys [executable memory]} (prepare-private-reuse! plan)
+        lock (Object.)
+        closed? (atom false)
+        close-scope! (fn []
+                       (locking lock
+                         (when (compare-and-set! closed? false true)
+                           (close! executable))))
+        execute (fn [updates]
+                  (locking lock
+                    (when @closed?
+                      (throw (ex-info "private execution scope is closed"
+                                      {:reason :link-private-scope-closed})))
+                    (when-not (map? updates)
+                      (throw (ex-info "private execution updates require a node-to-host-array map"
+                                      {:reason :link-private-updates})))
+                    ;; Validate all keys, roles and sources before the first mutable operation.
+                    (doseq [[node-id source] updates]
+                      (let [node (get-in executable [:plan :nodes node-id])]
+                        (when-not (contains? #{:input :state} (:role node))
+                          (throw (ex-info "private execution only accepts public input/state updates"
+                                          {:reason :link-private-input :node node-id :role (:role node)})))
+                        (when-not source
+                          (throw (ex-info "private input updates require a host source"
+                                          {:reason :link-private-input-source :node node-id})))
+                        (link-plan/validate-node-source! node source)))
+                    (when-let [overlaps (seq (bview/overlapping-id-pairs
+                                             (map (fn [node-id]
+                                                    [node-id (get-in executable [:plan :nodes node-id :view])])
+                                                  (keys updates))))]
+                      (throw (ex-info "private input updates overlap in device storage"
+                                      {:reason :link-private-input-overlap :overlaps overlaps})))
+                    (when-let [missing (seq (set/difference
+                                            (or (some-> executable :pending-inputs deref) #{})
+                                            (set (keys updates))))]
+                      (throw (ex-info "private execution needs all uninitialized inputs before replay"
+                                      {:reason :link-pending-inputs :nodes (set missing)})))
+                    (try
+                      (doseq [[node-id source] updates]
+                        (upload! executable node-id source))
+                      (run! executable)
+                      {:outputs (into {} (map (fn [node-id] [node-id (download executable node-id)]))
+                                      (get-in executable [:plan :outputs]))
+                       :memory memory}
+                      (catch Throwable error
+                        (try (close-scope!)
+                             (catch Throwable cleanup-error
+                               (.addSuppressed error cleanup-error)))
+                        (throw error)))))]
+    (reify
+      java.io.Closeable
+      (close [_] (close-scope!))
+      clojure.lang.IFn
+      (invoke [_] (execute {}))
+      (invoke [_ updates] (execute updates)))))
+
 (defn evaluate!
   "Execute an owned straight-line equation-first LinkPlan and return detached host outputs.
 
@@ -976,9 +1046,5 @@
 
    Returns {:outputs {node-id primitive-array} :memory allocation-delta-report}."
   [plan]
-  (let [{:keys [executable memory]} (prepare-private-reuse! plan)]
-    (with-open [executable executable]
-      (run! executable)
-      {:outputs (into {} (map (fn [node-id] [node-id (download executable node-id)]))
-                      (get-in executable [:plan :outputs]))
-       :memory memory})))
+  (with-open [execute (private-executor! plan)]
+    (execute)))

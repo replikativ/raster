@@ -199,6 +199,13 @@ one allocation and retains two-replay JVM parity. General resident reuse/escape 
 structured-loop order and AD tape retention remain open. No existing lifetime pass is
 superseded by this narrow GPU proof; keep their distinct JVM/source coverage.
 
+The private host-result boundary now has a reusable callable executor: one binding remains
+resident across serialized invocations, with fully checked host input/state updates and detached
+output snapshots. `evaluate!` delegates to it. No internal view, resident output lease or AD tape
+handle escapes; ordinary inspectable `LinkedExecutable` and `Compiled` behavior is unchanged.
+This removes repeated construction within that confined scope, not host output copies or the
+remaining resident-composition ownership obligations.
+
 - One bounded JVM/REPL; focused affected tests locally. Full suites run in CI.
 - One reviewer at structural boundaries or before landing a risky change; no permanent agent swarm.
 - Each slice states which existing path it replaces and what remains unsupported. Tests that
