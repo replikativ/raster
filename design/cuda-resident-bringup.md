@@ -35,6 +35,8 @@ NVRTC requires explicit toolkit include paths and uses small virtual C headers f
 `stdint.h`/`math.h` names in the current CUDA preamble; host glibc headers are not a valid
 substitute. The public equation-first map fixture has compiled to PTX with NVRTC 12.4 on
 this machine, without an NVIDIA device. This is transport evidence only.
+An NVRTC-equipped host should run the optional transport test with
+`RASTER_REQUIRE_NVRTC=1` so missing native coverage is a failure, not a skip.
 
 Do not mark `:cuda` a resident backend merely because a library or `nvcc` is present.
 The backend entry must declare its memory space, coherence, slice ownership, transfer

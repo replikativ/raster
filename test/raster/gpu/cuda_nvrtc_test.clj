@@ -33,7 +33,9 @@
                        (catch clojure.lang.ExceptionInfo e e))]
         (is (= :nvrtc-compilation (:reason (ex-data error))))
         (is (seq (:log (ex-data error))))))
-    (println "[NVRTC SKIP] CUDA runtime compilation library is not installed")))
+    (if (= "1" (System/getenv "RASTER_REQUIRE_NVRTC"))
+      (is false "NVRTC is required for this test run but is not installed")
+      (println "[NVRTC SKIP] CUDA runtime compilation library is not installed"))))
 
 (deftest runtime-facing-entry-rejects-non-cuda-artifacts
   (let [error (try (nvrtc/compile-artifact-ptx
