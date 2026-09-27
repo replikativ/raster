@@ -82,7 +82,10 @@ nonstationary timing samples and from still-unexecuted native CUDA/HIP claims.
 
 Memory proof progress: straight-line equation-first replay order now joins real typed complete
 writes. An opt-in host-result-only execution scope realizes one full-allocation temporary pair
-and checks the selected order after rebinding. The four-layer OpenCL/Level Zero oracle saves
+and checks actual bound order against the selected graph order before launch. Selected order is
+projected from validated equation calls before allocation, so this boundary binds once rather
+than allocating and binding an otherwise-unused baseline. Runtime observation shares the same
+source-step composition. The four-layer OpenCL/Level Zero oracle saves
 one allocation and retains two-replay JVM parity. General resident reuse/escape contracts,
 structured-loop order and AD tape retention remain open. No existing lifetime pass is
 superseded by this narrow GPU proof; keep their distinct JVM/source coverage.

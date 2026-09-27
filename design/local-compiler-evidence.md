@@ -23,6 +23,11 @@ The ordinary test suite remains untimed. CI discovers generic and precision/subg
 OpenCL gates; missing optional capabilities produce visible skips rather than claiming execution.
 Compilation-only CUDA/HIP gates remain separate from device acceptance.
 
+The private host-result memory boundary projects order from already selected, validated equation
+graphs before allocating; it no longer binds a baseline executable. It still compares the actual
+bound order before launch and checks the owned allocation delta. This does not extend reuse to
+inspectable resident handles, structured-loop replay, or AD tapes.
+
 ## Projection diagnostic, not a promoted baseline
 
 The existing `bench/public_linear_schedule_probe.clj` was rerun at `[8,256,256]`, with constant

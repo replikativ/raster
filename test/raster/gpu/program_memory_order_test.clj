@@ -5,6 +5,7 @@
             [raster.compiler.equation-first :as equation]
             [raster.compiler.analysis.physical-liveness :as liveness]
             [raster.compiler.ir.link-plan :as plan]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.passes.local-storage-reuse :as reuse]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
@@ -38,6 +39,13 @@
     (is (= :unproven (:reuse report)))
     (is (= :unproven (:completion order)))))
 
+(defn- selected-order [linked]
+  (let [instance (first (:instances linked))]
+    (-> (program-call/execution-order (:call instance))
+        (assoc :plan (:id linked) :target (:target linked))
+        (update :per-replay
+                #(mapv (fn [entry] (assoc-in entry [:source :instance] (:id instance))) %)))))
+
 (deftest typed-program-order-meets-complete-write-evidence
   (let [linked (lowered :ocl:0 (arguments))
         call (get-in linked [:instances 0 :call])
@@ -59,6 +67,7 @@
                        :per-replay (mapv #(hash-map :kernel-phase (:id %))
                                          (get-in handle [:graph :nodes]))})]
         (let [order (link/execution-order executable)]
+          (is (= (selected-order linked) order))
           (assert-candidate linked order)
           (let [report (liveness/report linked order)
                 candidate (first (:proposals report))
@@ -109,6 +118,7 @@
             expected (vec (apply four-layers args))
             linked (lowered target args)]
         (with-open [executable (link/instantiate! linked)]
+          (is (= (selected-order linked) (link/execution-order executable)))
           (assert-candidate linked (link/execution-order executable))
           (dotimes [_ 2]
             (link/run! executable)
@@ -152,28 +162,25 @@
              (try (link/evaluate! borrowed)
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
-(deftest private-rebinding-verifies-proofs-and-closes-on-failure
+(deftest private-binding-verifies-proofs-and-closes-on-failure
   (let [linked (lowered :ocl:0 (arguments))
-        instance (first (:instances linked))
-        order {:plan (:id linked) :target (:target linked) :completion :unproven
-               :record-time-prologue []
-               :per-replay (mapv #(hash-map :source {:instance (:id instance) :step %})
-                                 (range (count (get-in instance [:call :steps]))))}]
+        order (selected-order linked)]
     (doseq [[failure expected] [[:order :link-private-reuse-order-changed]
                               [:count :link-private-reuse-allocation-count]
                               [:bind :injected] [:run :injected] [:download :injected]]]
-      (let [created (atom []) closed (atom []) launched (atom false)
+      (let [created (atom []) closed (atom []) launched (atom false) bindings (atom 0)
             fail! #(throw (ex-info "injected lifecycle failure" {:reason :injected}))]
         (with-redefs [link/instantiate!
                   (fn [plan]
-                    (when (and (= failure :bind) (seq @created)) (fail!))
+                    (swap! bindings inc)
+                    (when (= failure :bind) (fail!))
                     (let [e (link/map->LinkedExecutable {:plan plan :ordinal (count @created)})]
                       (swap! created conj e)
                       e))
                   link/instantiation-report
-                  (fn [e] {:owned-allocations (if (or (zero? (:ordinal e)) (= failure :count)) 7 6)})
+                  (fn [_] {:owned-allocations (if (= failure :count) 7 6)})
                   link/execution-order
-                  (fn [e] (if (and (= failure :order) (pos? (:ordinal e)))
+                  (fn [_] (if (= failure :order)
                             (update order :per-replay #(vec (reverse %))) order))
                   link/close! (fn [e] (swap! closed conj (:ordinal e)))
                   link/run! (fn [_] (reset! launched true) (when (= failure :run) (fail!)))
@@ -181,5 +188,6 @@
       (is (= expected
              (try (link/evaluate! linked)
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-      (is (= (if (= failure :bind) [0] [0 1]) @closed))
+      (is (= 1 @bindings) "the proof must not instantiate a baseline")
+      (is (= (if (= failure :bind) [] [0]) @closed))
       (is (= (contains? #{:run :download} failure) @launched)))))))

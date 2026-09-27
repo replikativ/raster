@@ -103,17 +103,17 @@ passes must remain until their successful cases have equivalent coverage.
 ## First realized reuse: confined host-result execution
 
 `gpu.link/evaluate!` is an opt-in, owned, host-result-only boundary for a straight-line
-equation-first plan. It obtains selected order from a private baseline binding, closes that
-binding, realizes one full-allocation single-view pair with the same complete allocation
-contract (including coherence), and revalidates aliases/effects. A fresh binding must have
-the same selected order and one fewer owned allocation before execution. It then uses the
+equation-first plan. It projects prebind order from validated, selected equation graphs,
+realizes one full-allocation single-view pair with the same complete allocation contract
+(including coherence), and revalidates aliases/effects. Its single binding must have the same
+actual order and the predicted owned allocation count before execution. It then uses the
 existing synchronous runner and downloads only declared outputs; no session, callback or
 resident view escapes. Ordinary `instantiate!` and its inspectable internal views are unchanged.
 
 The tiny four-layer oracle saves one 16-byte allocation on both OpenCL and Level Zero, with
 two optimized replays matching the JVM. This proves a local storage decision, **not** broad
-model savings or a latency improvement. The baseline binding and second binding are deliberate
-proof overhead. No-candidate plans retain distinct storage. Public outputs, host-initialized
+model savings or a measured latency improvement. The former baseline binding is removed;
+runtime verification remains mandatory. No-candidate plans retain distinct storage. Public outputs, host-initialized
 buffers, borrowed storage, incompatible coherence and partial-allocation views are excluded.
 
 A reusable resident facade with explicit private temporaries is the next ownership step; do
