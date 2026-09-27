@@ -88,6 +88,11 @@ not thresholds. The structural finding is repeated derivation/validation of a la
 emitted plan despite one compiled kernel and nine resident nodes. Any optimization should reuse
 verified effect/certificate evidence only when the exact plan and its role/output boundary remain
 bound to that evidence; removing checks by convention would weaken the compiler contract.
+The first consolidation removes only adjacent duplicate work: equation-first certification now
+validates the final role/output projection once, and runtime validation returns the initialization
+contract from the same effect analysis. A post-change bounded Arc replay in the raw record still
+matches ggml bit-for-bit. Background load and separate runs preclude a claimed wall-time speedup;
+the remaining equation-lowering and certification phases are the next compiler-cost targets.
 
 ## Baseline selection
 

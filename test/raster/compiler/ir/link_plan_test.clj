@@ -78,6 +78,17 @@
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
 
+(deftest certified-effect-facts-recheck-descriptor-binder-roles
+  (let [{:keys [plan effect-evidence]}
+        (link/validate-with-effect-evidence! (valid-plan))
+        mutated (assoc-in plan [:instances 0 :roles 'x] :constant)
+        failure (try
+                  (link/validate-with-certified-effect-facts!
+                   mutated (:step-facts effect-evidence))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= :link-role-mismatch (:reason failure)))))
+
 (deftest memory-report-retains-ordered-physical-facts-without-claiming-reuse
   (let [plan (valid-plan)
         report (link/memory-report plan)

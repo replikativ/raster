@@ -143,9 +143,12 @@
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [instantiation-started (System/nanoTime)
          timings (volatile! {})
-         plan (timed-phase! timings :plan-validation #(link-plan/validate! plan))
-         initialization (timed-phase! timings :initialization-contract
-                                       #(link-plan/initialization-contract plan))
+         validated (timed-phase! timings :plan-validation
+                                 #(link-plan/validate-with-effect-evidence! plan))
+         plan (:plan validated)
+         ;; The same validation already derived ordered initialization from its verified ABI
+         ;; facts. Re-running initialization-contract would parse and analyze the plan again.
+         initialization (get-in validated [:effect-evidence :initialization])
          program-instances (filterv link-plan/program-link-instance? (:instances plan))
          _ (when (and (seq program-instances) (not= 1 (count (:instances plan))))
              (throw (ex-info

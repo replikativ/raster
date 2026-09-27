@@ -124,6 +124,29 @@
   (let [output (float-array 8)]
     (raster.par/map! output i domain float (raster.arrays/aget input i))))
 
+(deftest certified-effect-facts-recheck-program-binder-roles
+  (let [compiled (equation-first/compile #'fixed-capacity-prefix
+                                         {:target :cuda:0 :dtype :float})
+        plan (equation-first/lower compiled [(float-array 4) 4])
+        {:keys [effect-evidence]} (link-plan/validate-with-effect-evidence! plan)
+        call (get-in plan [:instances 0 :call])
+        compiler-value
+        (some (fn [[value-id logical-id]]
+                (let [node-id (get-in plan [:values logical-id :leaves 0 :node])]
+                  (when (and (contains? #{:input :state}
+                                        (get-in plan [:nodes node-id :role]))
+                             (some? (get-in plan [:nodes node-id :source])))
+                    value-id)))
+              (:buffers call))
+        _ (is (some? compiler-value))
+        mutated (assoc-in plan [:instances 0 :roles compiler-value] :constant)
+        failure (try
+                  (link-plan/validate-with-certified-effect-facts!
+                   mutated (:step-facts effect-evidence))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= :program-link-role-mismatch (:reason failure)))))
+
 (deftest symbolic-logical-demand-is-checked-against-concrete-capacity
   (doseq [target [:cuda:0 :hip:0]]
     (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target target :dtype :float})]

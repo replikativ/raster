@@ -43,4 +43,20 @@
   :instantiation-phases-ns {:plan-validation 7883502870
                             :initialization-contract 7591939668
                             :binding 3666484735}}
- :interpretation "The template process cache works, but LinkPlan lowering and runtime admission remain costly on a hit. Several separately timed validation/effect-analysis boundaries each traverse the same one-instance, nine-node compiled plan. Proof-preserving reuse of certified immutable evidence should be investigated before removing any validation."}
+ :post-dedup-cold
+ {:status :diagnostic-not-paired
+  :validation {:oracle :raster.quant.ggml/vec-dot
+               :comparison :raw-float-bits :every-replay? true :passed? true}
+  :preparation-ns 71000264801
+  :template {:cache-hit? false :miss-reason :compulsory
+             :resolution-ns 11340303362 :stabilization-attempts 2}
+  :link-plan-lowering-ns 35187133307
+  :lowering-phases-ns {:equation-lower 27202694794
+                       :role-projection 213231
+                       :invocation-certification 7982139843}
+  :instantiation-ns 14677603052
+  :instantiation-phases-ns {:plan-validation 10318734653
+                            :binding 4281644258}
+  :device-event-samples-ns [19583.333333333336 13229.166666666668]
+  :stationary? false}
+ :interpretation "The template process cache works, but LinkPlan lowering and runtime admission remain costly on a hit. The post-dedup run passed the bit-exact oracle and no longer repeats adjacent validation/initialization derivation, but it was not paired under stable device load and is not a speedup measurement. Further reuse needs an exact certificate-to-plan boundary, especially when roles or outputs change."}

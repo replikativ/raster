@@ -326,7 +326,7 @@
       (doseq [prepared [automatic register-tiled register-tiled-again]
               :let [report (compiled/preparation-report prepared)
                     phases (:phases-ns report)]]
-        (is (= #{:equation-lower :link-plan-validation :invocation-certification}
+        (is (= #{:equation-lower :role-projection :invocation-certification}
                (set (keys phases))))
         (is (every? #(and (integer? %) (not (neg? %))) (vals phases)))
         (is (<= (reduce + (vals phases)) (:link-plan-lowering-ns report))))
