@@ -326,6 +326,13 @@ fold-map-specific copies of this dtype check are removed, while their distinct e
 equivalence checks remain. Explicit matrix/packed-storage conversions still use separate typed
 buffers or value conversions; pointer reinterpretation is not an implicit exception to this rule.
 
+The flat half-input contraction route now preserves an explicitly declared FP32 result through
+its matrix KernelBody, OpenCL pointer ABI and descriptor. A half-typed register/portable fallback
+may not claim that result: it declines before allocation when the matrix leaf cannot lower the
+requested output type. This closes a silent half-output miscompile; it does not yet make the
+production matrix scheduler admit CUDA WMMA or HIP MFMA. Those target rows must preserve this
+same result contract and carry their own numerical/admission evidence.
+
 ScheduledKernelBody also retains ordered scalar preconditions in the existing checked
 launch/storage expression algebra. They refer to physical integral scalar parameters, including
 derived bindings, and precede target-specific requirements in the emitted artifact. The projection

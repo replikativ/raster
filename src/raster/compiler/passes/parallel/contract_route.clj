@@ -350,6 +350,17 @@
            :schedule (segred-body/scalar-workgroup-tree-schedule
                       operator grid :block-local))))
 
+(defn- require-declared-output-dtype!
+  [contract-facts descriptor]
+  (when-let [declared (:out-dtype contract-facts)]
+    (let [expected (dtype/canon declared)]
+      (when-not (= expected (:out-dtype descriptor))
+        (throw (ex-info "contraction leaf cannot preserve the declared output dtype"
+                        {:reason :contraction-output-dtype-not-lowered
+                         :expected expected :actual (:out-dtype descriptor)
+                         :strategy (:strategy descriptor)})))))
+  descriptor)
+
 (defn route-contraction
   "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
 
@@ -418,7 +429,9 @@
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
-    (validate-descriptor
+    (require-declared-output-dtype!
+     contract-facts
+     (validate-descriptor
      (epilogue-honoured-or-refused
       epilogue
       (cond
@@ -612,7 +625,7 @@
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
-              (seq declines) (assoc :fallback-reason (:reason (last declines)))))))))))
+              (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))))
 
 (defn- families-for-precision
   "Restrict candidate families to the compile's precision policy.
@@ -1629,7 +1642,7 @@
              :source (:source dpas)
              :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
              :abi (:abi dpas)
-             :dtype :half :out-dtype :half :out-elems (* M N)
+             :dtype :half :out-dtype (:dtype dpas) :out-elems (* M N)
              :tile (:tile dpas)                          ; the DERIVED tile actually emitted
              :kernel-body (:kernel-body dpas)             ; scheduled target-neutral body, when present
              :fused-epilogue (boolean epilogue)
