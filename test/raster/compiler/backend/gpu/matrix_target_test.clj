@@ -70,12 +70,12 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"no builtin"
            (matrix-target/emit-matrix-kernel "mma_as_dpas" body :opencl-intel))))
-    (testing "unimplemented families decline at the single target boundary"
+    (testing "the wrong instruction family declines at the single target boundary"
       (try
         (matrix-target/emit-matrix-kernel "mma_as_mfma" body :hip)
-        (is false "HIP matrix target unexpectedly accepted an unimplemented MFMA row")
+        (is false "HIP matrix target unexpectedly accepted a CUDA MMA instruction")
         (catch clojure.lang.ExceptionInfo exception
-          (is (= :matrix-target-dialect-not-lowered (:reason (ex-data exception)))))))))
+          (is (= :hip-mfma-instruction-unsupported (:reason (ex-data exception)))))))))
 
 (deftest scheduled-matrix-entry-no-longer-implies-opencl
   (let [emitted
